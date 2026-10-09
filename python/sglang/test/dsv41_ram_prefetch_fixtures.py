@@ -38,24 +38,24 @@ def x_token_bytes() -> int:
 
 
 def prefetch_rig(
-    tmp_path, *, nodes=1, capacity=None, staging=None, share=2, pool=True, tokens=1, hot=False
+    tmp_path, *, nodes=1, capacity=None, staging=None, share=2, pool=True, tokens=1, hot=False, rows=ROWS
 ) -> PrefetchRig:
     """One node: 7 slots a row, 3 staging, `share` pooled, 6 experts. Two nodes: 8 slots split by HALVES, 1 staging and
     `share` pooled per group, 8 experts. CPU experts on every group (one fake-kernel worker each), every row
     registered, split[n] = n so every eligible lane is the CPU's; rows of `tokens` staged inputs; with `hot`, a GPU hot
-    page."""
+    page; `rows` streamed rows."""
     experts = 6 if nodes == 1 else 8
     capacity = (7 if nodes == 1 else 8) if capacity is None else capacity
     staging = (3 if nodes == 1 else 1) if staging is None else staging
-    s = ram_miss_setup(tmp_path, capacity=capacity, experts=experts)
+    s = ram_miss_setup(tmp_path, capacity=capacity, experts=experts, layers=rows)
     page = new_page(pin=False, wire=wire_layout(LANES, nodes))
     host = ExpertStreamHost(
         s.tables,
         page=page,
-        slot_map=torch.full((ROWS, experts), -1, dtype=torch.int32),
+        slot_map=torch.full((rows, experts), -1, dtype=torch.int32),
         variant="instr",
         hot_page=new_hot_page(experts, pin=False) if hot else None,
-        **({"node_ranges": HALVES} if nodes == 2 else {}),
+        **({"node_ranges": [[(0, 4)] * rows, [(4, 8)] * rows]} if nodes == 2 else {}),
     )
     try:
         host.reserve_staging(staging)
@@ -64,8 +64,8 @@ def prefetch_rig(
         host.enable_copy_engine(-1)
         host.arm_copy_engine()
         table = 16 + 4 * LANES * (1 + tokens) if tokens > 1 else 0
-        x_rows = torch.zeros((ROWS, tokens * x_token_bytes() + table), dtype=torch.uint8)
-        shape = (ROWS, 2 * nodes, HIDDEN) if tokens == 1 else (ROWS, 2 * nodes, tokens, HIDDEN)
+        x_rows = torch.zeros((rows, tokens * x_token_bytes() + table), dtype=torch.uint8)
+        shape = (rows, 2 * nodes, HIDDEN) if tokens == 1 else (rows, 2 * nodes, tokens, HIDDEN)
         out_rows = torch.zeros(shape, dtype=torch.float32)
         kernel = host.test_kernel_address()
         cores = sorted(os.sched_getaffinity(0))
@@ -73,7 +73,7 @@ def prefetch_rig(
             host.enable_cpu_experts(
                 kernel, list(range(LANES + 1)), [cores[g % len(cores)]], x_rows, out_rows, threads=1, group=g
             )
-        for row in range(ROWS):
+        for row in range(rows):
             host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
     except BaseException:
         host.stop()
@@ -120,9 +120,9 @@ def gate(logits) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def enable(rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores=None) -> None:
-    """Row 0 targets row 1 with `logits`' gate; row 1, the last, targets nothing."""
+    """Row 0 targets row 1 with `logits`' gate; every later row targets nothing."""
     w, bias = gate(logits)
-    targets = torch.tensor([[1, 0], [-1, -1]], dtype=torch.int64)
+    targets = torch.tensor([[1, 0]] + [[-1, -1]] * (rig.x_rows.shape[0] - 1), dtype=torch.int64)
     rig.host.enable_ram_prefetch(
         targets,
         w,

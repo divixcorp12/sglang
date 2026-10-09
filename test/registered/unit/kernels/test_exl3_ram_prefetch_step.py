@@ -108,19 +108,69 @@ def test_a_candidate_whose_target_record_was_served_first_is_dropped(tmp_path):
 
 
 def test_a_record_of_another_row_or_an_older_target_record_leaves_the_job_live(tmp_path):
-    """Staleness is the target row's own last record: row 1's record before the source, and row 0's after it, keep the
-    job. Mutant: stale once the group handled the source's seq + 1 -- red."""
-    rig = prefetch_rig(tmp_path)
+    """Staleness is the source's and target's own records: row 1's record before the source, and row 2's after it,
+    keep the job. Mutant: stale once the group handled the source's seq + 1 -- red."""
+    rig = prefetch_rig(tmp_path, rows=3)
     try:
         enable(rig, LOGITS)
         older = rig.sim.post(1, [])
         assert rig.host.pump() == 1 and rig.sim.wait_handled(older)
         trigger(rig)
-        other = rig.sim.post(0, [])
+        other = rig.sim.post(2, [])
         assert rig.host.pump() == 1 and rig.sim.wait_handled(other)
         assert rig.host.spec_pump(0)
         c = rig.host.counters()
         assert (c["spec_dropped"], c["spec_issued"]) == (0, 1) and _landed(rig.host, 1) == [2]
+    finally:
+        rig.host.stop()
+
+
+def test_a_later_record_of_the_source_row_makes_the_job_stale(tmp_path):
+    """The next forward reached the source row, so the target's record was served too, perhaps lapped unseen."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS)
+        trigger(rig)
+        later = rig.sim.post(0, [])
+        assert rig.host.pump() == 1 and rig.sim.wait_handled(later)
+        assert rig.host.spec_pump(0)
+        c = rig.host.counters()
+        assert (c["spec_dropped"], c["spec_issued"]) == (1, 0) and _landed(rig.host, 1) == []
+    finally:
+        rig.host.stop()
+
+
+def test_a_job_never_reclaims_its_own_pick(tmp_path):
+    """One entry, two picks on one group: the second finds only the first's entry and is dropped, not read over it."""
+    rig = prefetch_rig(tmp_path, share=1)
+    try:
+        enable(rig, LOGITS, per_token=2, per_layer=2)
+        trigger(rig)
+        assert rig.host.spec_pump(0)
+        c = rig.host.counters()
+        assert (c["spec_issued"], c["spec_landed"], c["spec_dropped"]) == (1, 1, 1) and _landed(rig.host, 1) == [2]
+    finally:
+        rig.host.stop()
+
+
+def test_a_reader_failure_empties_the_pool_entry(tmp_path):
+    """The reader's own failure (an EIO part), not inject_spec's. Mutant: land_pool_row leaves a failed entry
+    reading -- red."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS)
+        load(rig, 0, [5])  # the demand read before the fault is installed
+        rig.host.inject_fault(part=0, part_error=5)
+        trigger(rig)
+        assert rig.host.spec_pump(0)
+        c = rig.host.counters()
+        assert (c["spec_issued"], c["spec_failed"], c["spec_landed"], c["read_errors"]) == (1, 1, 0, 0)
+        assert all(e["state"] == "empty" for e in rig.host.spec_pool(1))
+        rig.host.inject_fault()
+        rows = c["rows_read"]
+        forced(rig, 1, [2])
+        c = rig.host.counters()
+        assert c["rows_read"] == rows + 1 and c["spec_used"] == 0
     finally:
         rig.host.stop()
 
