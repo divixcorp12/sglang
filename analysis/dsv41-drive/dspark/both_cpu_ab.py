@@ -35,7 +35,9 @@ DRAFT_ONLY = {
     "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "0",
 }
 # Every arm but the prefetch's states the RAM prefetch off, so a shell that exports it cannot carry it into an arm.
-PREFETCH_OFF = {"SGLANG_DSV41_RAM_PREFETCH": "0"}
+PREFETCH_OFF = {"SGLANG_DSV41_RAM_PREFETCH": "0", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": ""}
+# The GPU scorer's margin floors fit by spec_margin.py's admission sweep (the file says on what).
+MARGIN_FLOORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ram_prefetch_margin_floors.json")
 # arm: (overrides on base_env, DSpark argv)
 ARMS = {
     "prod": ({**PREFETCH_OFF}, False),
@@ -61,6 +63,7 @@ ARMS = {
             "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
             "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
             "SGLANG_DSV41_RAM_PREFETCH_SCORER": "cpu",
+            "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
         },
         True,
     ),
@@ -79,6 +82,11 @@ ARMS["dspark-both-prefetch-gpu-topk"] = (
     {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
     True,
 )
+# The GPU arm reading only the candidates at or over their target row's margin floor.
+ARMS["dspark-both-prefetch-gpu-floors"] = (
+    {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": MARGIN_FLOORS},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -87,6 +95,7 @@ REFERENCE = {
     "dspark-both-prefetch-topk": "dspark-both",
     "dspark-both-prefetch-gpu": "dspark-both",
     "dspark-both-prefetch-gpu-topk": "dspark-both",
+    "dspark-both-prefetch-gpu-floors": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
