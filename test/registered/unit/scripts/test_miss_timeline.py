@@ -65,6 +65,7 @@ def test_record_timeline(trace):
     assert r["last_wait_ms"] == pytest.approx(1.5)
     assert r["last_wait_hit_ms"] == pytest.approx(0.5)
     assert r["last_wait_draft_ms"] == pytest.approx(0.0)
+    assert r["dma_ms"] == pytest.approx(1.0)
 
 
 def test_layer_gain_takes_the_later_group(trace):

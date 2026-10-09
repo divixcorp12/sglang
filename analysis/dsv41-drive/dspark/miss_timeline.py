@@ -117,6 +117,7 @@ def records(out_dir: str) -> list[dict]:
             "last": "cpu" if key not in dma or chain_end >= dma[key] else "dma",
             "done_ms": ms(done[key] - t0),
             "done_ns": done[key],
+            "dma_ms": ms(dma[key] - t0) if key in dma else None,
             # The last landed row's wait for the thread: what kept the record from ending one lane after its last read.
             "last_wait_ms": ms(lw1 - lw0),
             "last_wait_hit_ms": ms(busy_within([(hit[0]["start"], hit[0]["end"])], lw0, lw1)) if hit else 0.0,
@@ -161,7 +162,8 @@ def summarize(recs: list[dict]) -> dict:
         "layer_gain_ms_total": round(sum(gain.values()), 1),
         "layers_with_misses": len(gain),
         "by_misses": {str(m): {"records": len(rs), **{k: med([r[k] for r in rs]) for k in keys},
-                               "batches": med([r["batches"] for r in rs])}
+                               "batches": med([r["batches"] for r in rs]),
+                               "dma_ms": med([r["dma_ms"] for r in rs if r["dma_ms"] is not None])}
                       for m, rs in sorted(by_m.items())},
     }
 
