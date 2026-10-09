@@ -11,10 +11,13 @@ on any topology; ``from_env`` gathers the machine's.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Iterable, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 # NVMe completion interrupts are pinned to these cores on divix01.
 RESERVED_CORES = frozenset(range(64, 72))
@@ -361,8 +364,20 @@ def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
 def _spec_cores(plan: NodePlan, topology: Topology, affinity: frozenset[int], assigned: set[int]) -> tuple[int, ...]:
     """A group's speculative-thread cores: the server's affinity on its node less every assigned core and its SMT
     sibling. With none spare it shares the RAM thread's core (spec 2026-10-08-dsv41-ram-prefetch-design)."""
-    spare = tuple(c for c in topology.node_cpus[plan.node] if c in affinity and not (topology.siblings[c] & assigned))
-    return spare or ((plan.ram,) if plan.ram is not None else ())
+    spare = tuple(
+        c
+        for c in topology.node_cpus[plan.node]
+        if c in affinity and c not in RESERVED_CORES and not (topology.siblings[c] & assigned)
+    )
+    if spare or plan.ram is None:
+        return spare
+    logger.warning(
+        "numa node%d: no spare core for the RAM prefetch's speculative thread; it shares the busy-polling RAM "
+        "thread's core %d, which time-slices the RAM thread",
+        plan.node,
+        plan.ram,
+    )
+    return (plan.ram,)
 
 
 def _copy_core(gpu, overrides, topology, affinity, draft=()) -> int:
