@@ -1381,8 +1381,9 @@ class RamTier {
     spec_->hold.store(true, std::memory_order_seq_cst);
     for (auto& spec : spec_->groups)
       spec->bell.ring();
+    // `idle` rather than the thread object, which a racing stop_spec joins: a thread not running is idle.
     for (auto& spec : spec_->groups)
-      while (spec->thread.joinable() && !spec->idle.load(std::memory_order_seq_cst))
+      while (!spec->idle.load(std::memory_order_seq_cst))
         std::this_thread::sleep_for(std::chrono::microseconds(20));
   }
 
