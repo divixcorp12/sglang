@@ -5307,6 +5307,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+        if envs.SGLANG_DSV41_RAM_PREFETCH.get():
+            from sglang.srt.layers.moe.ram_prefetch import register_moe_gates
+
+            register_moe_gates(
+                {i: self.model.layers[i] for i in range(self.model.start_layer, self.model.end_layer)},
+                self.config.num_experts_per_tok,
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

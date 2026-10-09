@@ -403,8 +403,8 @@ class NativePinnedSlotTable:
 
     @property
     def reserved_rows(self) -> int:
-        """The row's staging slots: the service's lanes own them, so ``assign`` never hands one out."""
-        return self.service.staging_for(self.capacity)
+        """The row's staging and RAM prefetch pool slots: the service owns them, so ``assign`` never hands one out."""
+        return self.service.staging_for(self.capacity) + self.service.pool_slots()
 
     @property
     def _row(self) -> int:
@@ -921,6 +921,10 @@ class Exl3RamMissService:
                 "lower SGLANG_MOE_HOT_GPU_MB"
             )
 
+    def pool_slots(self) -> int:
+        """The RAM prefetch pool's slots in every row: its share per NUMA group."""
+        return self._spec_share * self.host.nodes if self._spec_share else 0
+
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
         return min(self.staging_width(), capacity - 1)
@@ -1060,6 +1064,14 @@ class Exl3RamMissService:
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
             host.reserve_staging(self.staging_width())
+            spec_share = (
+                envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if envs.SGLANG_DSV41_RAM_PREFETCH.get() else 0
+            )
+            if spec_share:
+                if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+                    raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
+                # Right after the staging slots, before the hot cache fills any slot.
+                host.reserve_spec_pool(spec_share)
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
             if copy_engine:
@@ -1077,6 +1089,8 @@ class Exl3RamMissService:
                 cpu_experts = self._start_cpu_experts(
                     cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned
                 )
+            if spec_share:
+                self._enable_ram_prefetch(host, list(tables.layer_ids), numa, cpu_experts)
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -1123,6 +1137,7 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host = page, slot_map, host
+        self._spec_share = spec_share
         self.numa = numa
         self.hot_page = hot_page
         self.copy_engine = copy_engine
@@ -1143,13 +1158,14 @@ class Exl3RamMissService:
             share_recorder.register_pre_forward_observer(self._set_prefill_share)
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, "
-            "copy engine %s, CPU experts %s, build %s",
+            "copy engine %s, CPU experts %s, RAM prefetch %s, build %s",
             len(tables.layer_ids),
             len(tables.paths),
             tables.slot_bytes,
             cfg.ram_miss_timeout_ms,
             "on" if copy_engine else "off",
             "on" if cpu_experts is not None else "off",
+            f"share {spec_share}" if spec_share else "off",
             self.host.variant,
         )
 
@@ -1227,6 +1243,37 @@ class Exl3RamMissService:
             pin=pin,
             tokens=tokens,
             calibration_lanes=victims,
+        )
+
+    @staticmethod
+    def _enable_ram_prefetch(host, layer_ids, numa, cpu_experts) -> None:
+        """Start the RAM prefetch over the pool reserved at start: the router gates the model registered at load,
+        copied to host memory once, and each group's speculative thread on its plan's spare cores."""
+        from sglang.srt.layers.moe.ram_prefetch import prefetch_tables, registered_gates
+
+        if cpu_experts is None:
+            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
+        # Off node 0, which the tier keeps near full (DSV41_REFERENCE.md section 33.12).
+        node = numa.plans[-1].node if numa.nodes > 1 else None
+        tables = prefetch_tables(layer_ids, registered_gates(), hidden=cpu_experts.services[0].hidden, node=node)
+        per_token = envs.SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN.get()
+        per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
+        host.enable_ram_prefetch(
+            tables.targets,
+            tables.gates,
+            tables.bias,
+            top_k=tables.top_k,
+            per_token=per_token,
+            per_layer=per_layer,
+            cores=[list(plan.spec) for plan in numa.plans],
+        )
+        logger.info(
+            "exl3 RAM miss prefetch: %d of %d rows target the next layer, %d per token, %d per layer, cores %s",
+            int((tables.targets[:, 0] >= 0).sum()),
+            len(layer_ids),
+            per_token,
+            per_layer,
+            [plan.spec for plan in numa.plans],
         )
 
     def before_host_use(self) -> None:
