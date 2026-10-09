@@ -426,3 +426,10 @@ def test_the_speculative_pool_adds_its_share_to_the_spill_room():
     """The pool's kSpec slots are never victims, so a forced miss's room needs them on top (RAM prefetch)."""
     assert module.spill_room_shortfall([(0, 69), (69, 139)], staging=8, lanes=36, hot=24, pool=2) == [(0, 69, 70)]
     assert module.spill_room_shortfall([(0, 80), (80, 161)], staging=8, lanes=36, hot=24, pool=2) == []
+
+
+def test_a_rows_reserved_slots_count_the_speculative_pool():
+    """The pool's share per row and group is never assigned, so the eager LRU must not count on it either."""
+    service = SimpleNamespace(staging_for=lambda capacity: 8, _spec_share=2, host=SimpleNamespace(nodes=2))
+    service.pool_slots = lambda: module.Exl3RamMissService.pool_slots(service)
+    assert module.NativePinnedSlotTable.reserved_rows.fget(SimpleNamespace(service=service, capacity=40)) == 12
