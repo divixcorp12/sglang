@@ -138,10 +138,11 @@ def test_a_gpu_miss_beside_a_pooled_forced_miss_publishes_its_pieces(tmp_path):
         rows = rig.host.counters()["rows_read"]
         req = rig.sim.post(1, [2, 4], captured=True, cpu_on=True, forced_from=1)
         assert req.kinds == [LaneKind.MISS_GPU, LaneKind.MISS_CPU] and req.slots[1] == -1
+        empty = rig.sim.piece_word(req, 1)  # the pooled lane's word as posted, before any read
         rig.host.pump()
         assert rig.sim.wait_served(req, timeout_s=10.0) and rig.sim.copy_wait(req, timeout_s=10.0)
         assert rig.sim.piece_word(req, 0) == piece_word(req.gen, ALL_PIECES)
-        assert rig.sim.piece_word(req, 1) != piece_word(req.gen, ALL_PIECES)
+        assert rig.sim.piece_word(req, 1) == empty
         counters = rig.host.counters()
         assert counters["rows_read"] == rows + 1 and counters["spec_used"] == 1
         assert rig.host.mapping(1)[4] == slot and _same_row(rig, 1, slot, 4)
