@@ -91,20 +91,60 @@ def test_the_private_build_caches_reach_every_arms_server(monkeypatch):
         assert overrides["SGLANG_EXL3_BUILD_DIR"] == "/private/exl3"
 
 
+PROBE = [{"session_id": "s0", "tokens": [{"token": 1, "top": [[1, -0.1], [2, -2.0]]}]}]
+
+
+def _arm_run(root, arm, rows_read=2000, used=0, warmups=(100,), probe=PROBE, timed_tokens=100):
+    run = root / "servers" / arm / "run-1"
+    run.mkdir(parents=True)
+    (run / "results.jsonl").write_text(
+        json.dumps({"decode_tokens_per_sec": 2.0, "completion_tokens": timed_tokens, "spec_tokens_details": {}}) + "\n"
+    )
+    for n, tokens in enumerate(warmups, 1):
+        (run / f"results-warmup-{n}.jsonl").write_text(json.dumps({"completion_tokens": tokens}) + "\n")
+    counters = {"rows_read": rows_read, "spec_issued": 900, "spec_used": used}
+    (run / "server.log").write_text("noise\nexl3 RAM miss thread counters " + json.dumps(counters) + "\n")
+    if probe is not None:
+        (root / f"{arm}.probe.json").write_text(json.dumps(probe))
+
+
 def test_summarize_reports_the_ram_counters_and_the_prefetch_arms_text_against_its_a(tmp_path):
     ab = _ab()
-    for arm, rows_read, used in (("dspark-both", 3000, 0), ("dspark-both-prefetch", 2000, 700)):
-        run = tmp_path / "servers" / arm / "run-1"
-        run.mkdir(parents=True)
-        (run / "results.jsonl").write_text(
-            json.dumps({"decode_tokens_per_sec": 2.0, "completion_tokens": 100, "spec_tokens_details": {}}) + "\n"
-        )
-        counters = {"rows_read": rows_read, "spec_issued": 900, "spec_used": used}
-        (run / "server.log").write_text("noise\nexl3 RAM miss thread counters " + json.dumps(counters) + "\n")
-        probe = [{"session_id": "s0", "tokens": [{"token": 1, "top": [[1, -0.1], [2, -2.0]]}]}]
-        (tmp_path / f"{arm}.probe.json").write_text(json.dumps(probe))
+    _arm_run(tmp_path, "dspark-both", rows_read=3000)
+    _arm_run(tmp_path, "dspark-both-prefetch", rows_read=2000, used=700)
     summary = ab.summarize(str(tmp_path))
     b = summary["dspark-both-prefetch"]
     assert b["ram"]["spec_used"] == 700 and b["ram"]["rows_read"] == 2000
-    assert b["ram_rows_per_timed_token"] == 20.0 and summary["dspark-both"]["ram_rows_per_timed_token"] == 30.0
+    assert b["warmup_rounds"] == 1 and b["lifetime_tokens"] == 200
+    assert b["ram_rows_per_token_lifetime"] == 10.0 and summary["dspark-both"]["ram_rows_per_token_lifetime"] == 15.0
+    assert "ram_rows_per_timed_token" not in b
     assert b["text_vs_reference"]["pass"] is True
+
+
+def test_the_lifetime_ratio_counts_every_warmup_round_the_server_ran(tmp_path):
+    ab = _ab()
+    _arm_run(tmp_path, "dspark-both", rows_read=5000, warmups=(100, 100, 100, 100))
+    summary = ab.summarize(str(tmp_path))["dspark-both"]
+    assert summary["warmup_rounds"] == 4 and summary["lifetime_tokens"] == 500
+    assert summary["ram_rows_per_token_lifetime"] == 10.0 and summary["ram"]["rows_read"] == 5000
+
+
+def test_a_probe_pair_that_cannot_be_compared_is_recorded_not_raised(tmp_path):
+    ab = _ab()
+    other = [{**PROBE[0], "session_id": "s1"}]
+    _arm_run(tmp_path, "prod", probe=PROBE)
+    _arm_run(tmp_path, "dspark-both", probe=PROBE)
+    _arm_run(tmp_path, "dspark-both-prefetch", probe=other)
+    summary = ab.summarize(str(tmp_path))
+    assert "different prompts" in summary["dspark-both-prefetch"]["text_vs_reference"]["error"]
+    assert "different prompts" in summary["dspark-both-prefetch"]["text_vs_prod"]["error"]
+    assert (tmp_path / "summary.json").exists()
+
+
+def test_a_missing_reference_probe_is_recorded(tmp_path):
+    ab = _ab()
+    _arm_run(tmp_path, "dspark-both", probe=None)
+    _arm_run(tmp_path, "dspark-both-prefetch")
+    summary = ab.summarize(str(tmp_path))
+    assert summary["dspark-both-prefetch"]["text_vs_reference"] == "missing reference probe"
+    assert "text_vs_reference" not in summary["dspark-both"]
