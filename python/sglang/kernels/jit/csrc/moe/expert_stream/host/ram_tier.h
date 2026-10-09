@@ -19,6 +19,7 @@
 #include <future>
 
 #include "../row_layout.h"
+#include "../spec_candidates.h"
 #include "copy_engine.h"
 #include "host_copy_backend.h"
 #include "numa_distributor.h"
@@ -1058,12 +1059,14 @@ class RamTier {
   }
 
   // Enables the RAM prefetch over the reserved pool: per group a speculative thread (RamThread starts it with the
-  // service threads) fed by the group's service with every record that staged a CPU input. Needs CPU experts on every
-  // group, whose records stage that input. On the owner, before the service thread starts.
+  // service threads) fed by the group's service. The CPU scorer gets every record that staged a CPU input and scores
+  // it; the GPU scorer (config.candidates) gets every record of a row with a target and reads its candidate slot. Needs
+  // CPU experts on every group. On the owner, before the service thread starts.
   void enable_ram_prefetch(RamPrefetchConfig config) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("enable_ram_prefetch");
     const std::string prefix = error_prefix<Layout>() + "RAM prefetch: ";
+    const bool gpu = config.candidates != nullptr;
     if (threaded_.load()) throw std::runtime_error(prefix + "enable it before the service thread starts");
     if (spec_ != nullptr) throw std::runtime_error(prefix + "it is already enabled");
     if (pool_ == nullptr) throw std::runtime_error(prefix + "reserve_spec_pool first");
@@ -1071,7 +1074,7 @@ class RamTier {
       throw std::runtime_error(prefix + "the target table has one entry per streamed row");
     for (int64_t row = 0; row < layers_; ++row) {
       const int32_t target = config.target[row], gate = config.gate[row];
-      if ((target < 0) != (gate < 0) || target >= layers_ || target == row || gate >= config.gate_count)
+      if ((target < 0) != (gate < 0) || target >= layers_ || target == row || (!gpu && gate >= config.gate_count))
         throw std::runtime_error(
             prefix + "row " + std::to_string(row) + " names target " + std::to_string(target) + " with gate " +
             std::to_string(gate));
@@ -1081,7 +1084,9 @@ class RamTier {
     } catch (const std::invalid_argument& error) {
       throw std::runtime_error(prefix + error.what());
     }
-    if (config.gates == nullptr || config.bias == nullptr || config.gate_count < 1)
+    if (gpu && config.gate_count != 0)
+      throw std::runtime_error(prefix + "the GPU scorer reads the device's gates: pass none");
+    if (!gpu && (config.gates == nullptr || config.bias == nullptr || config.gate_count < 1))
       throw std::runtime_error(prefix + "it needs at least one gate");
     if (static_cast<int>(config.cores.size()) != groups())
       throw std::runtime_error(prefix + "one core list per NUMA group");
@@ -1090,7 +1095,7 @@ class RamTier {
         throw std::runtime_error(
             prefix + "it needs CPU experts on group " + std::to_string(g) + ", whose records stage the scorer's input");
     const CpuExpertConfig& cpu = dist_.group(0).cpu->config();
-    if (config.hidden != cpu.hidden)
+    if (!gpu && config.hidden != cpu.hidden)
       throw std::runtime_error(
           prefix + "the gate's hidden size " + std::to_string(config.hidden) + " is not the CPU rows' " +
           std::to_string(cpu.hidden));
@@ -1101,7 +1106,7 @@ class RamTier {
     spec->tokens_max = cpu.tokens;
     for (int g = 0; g < groups(); ++g) {
       auto group = std::make_unique<SpecGroup>(std::string(Layout::kName) + "-spec" + std::to_string(g));
-      group->scorer.reserve(spec->tokens_max, config.hidden, experts_);
+      if (!gpu) group->scorer.reserve(spec->tokens_max, config.hidden, experts_);
       group->skip.assign(static_cast<size_t>(experts_), 0);
       group->packed.reserve(1);
       group->cores = config.cores[g];
@@ -2152,24 +2157,27 @@ class RamTier {
     std::atomic_thread_fence(std::memory_order_seq_cst);
   }
 
-  // Service thread, after any whole record: hands it to the group's speculative thread when it staged a CPU input and
-  // its row has a target. A full ring drops it: the service never waits.
+  // Service thread, after any whole record: hands it to the group's speculative thread when its row has a target and,
+  // with the CPU scorer, it staged a CPU input (the GPU scorer scores every record). A full ring drops it: the service
+  // never waits.
   void offer_spec(Group& group, const Request& request) {
     if (request.row < 0 || request.row >= layers_) return;
     SpecGroup& spec = *spec_->groups[group.index];
     if (spec_->config.target[request.row] < 0) return;
-    bool staged = false;
-    for (const Lane& lane : request.lanes)
-      staged |= lane.kind == Wire::kKindHitCpu || lane.kind == Wire::kKindMissCpu;
-    if (!staged) return;
     int64_t tokens = 1;
-    if (spec_->tokens_max > 1) {
-      uint32_t live;
-      std::memcpy(&live, spec_->x_base + request.row * spec_->x_stride + spec_->tokens_max * spec_->x_token_bytes, 4);
-      tokens = live;
-      if (tokens < 1 || tokens > spec_->tokens_max) {
-        count<kSpecDropped>(group);
-        return;
+    if (spec_->config.candidates == nullptr) {
+      bool staged = false;
+      for (const Lane& lane : request.lanes)
+        staged |= lane.kind == Wire::kKindHitCpu || lane.kind == Wire::kKindMissCpu;
+      if (!staged) return;
+      if (spec_->tokens_max > 1) {
+        uint32_t live;
+        std::memcpy(&live, spec_->x_base + request.row * spec_->x_stride + spec_->tokens_max * spec_->x_token_bytes, 4);
+        tokens = live;
+        if (tokens < 1 || tokens > spec_->tokens_max) {
+          count<kSpecDropped>(group);
+          return;
+        }
       }
     }
     if (!spec.ring.push(SpecJob{request.seq, request.row, tokens})) {
@@ -2213,6 +2221,10 @@ class RamTier {
       spec_count<kSpecDropped>(spec);
       return;
     }
+    if (config.candidates != nullptr) {
+      serve_gpu_job(g, job, target, threaded);
+      return;
+    }
     int64_t start = 0;
     if constexpr (Build::kMetrics) start = now_ns();
     fill_spec_skip(target, job.seq, spec.skip.data());
@@ -2235,6 +2247,95 @@ class RamTier {
       uint64_t pick = 0;  // spec_submit's gen: rank << 32 | the margin's fp32 bits
       if constexpr (Build::kMetrics) pick = (static_cast<uint64_t>(ranks[i]) << 32) | std::bit_cast<uint32_t>(margins[i]);
       spec_read(g, job.row, target, job.seq, chosen[i], pick);
+    }
+  }
+
+  // A candidate slot as read_candidates finds it: ready, not yet (an older record's, or open: seq word 0), or lapped (a
+  // later record's, also when it changed across the copy).
+  enum class CandRead { kReady, kNotYet, kLapped };
+  struct CandSlot {
+    int count = 0;
+    int32_t expert[wire::SpecCandidates::kMaxCandidates];
+    int32_t rank[wire::SpecCandidates::kMaxCandidates];
+    float margin[wire::SpecCandidates::kMaxCandidates];
+  };
+
+  // Copies `seq`'s slot as read_gpu_hot copies a hot record: acquire the seq, copy, acquire fence, re-check. A count
+  // above kMaxCandidates is clamped (the kernel writes none).
+  CandRead read_candidates(uint32_t seq, CandSlot* out) const {
+    using Cand = wire::SpecCandidates;
+    const uint8_t* slot = spec_->config.candidates + Cand::slot_offset(seq);
+    const uint32_t first = load_acquire(slot + Cand::kCandSeq);
+    if (first != seq) return first != 0 && reached(first, skip_zero(seq + 1u)) ? CandRead::kLapped : CandRead::kNotYet;
+    uint8_t bytes[Cand::kCandPayloadBytes];
+    std::memcpy(bytes, slot, sizeof(bytes));
+    std::atomic_thread_fence(std::memory_order_acquire);
+    asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
+    if (load_acquire(slot + Cand::kCandSeq) != seq) return CandRead::kLapped;
+    uint16_t count;
+    std::memcpy(&count, bytes + Cand::kCandCount, 2);
+    out->count = std::min<int>(count, Cand::kMaxCandidates);
+    for (int i = 0; i < out->count; ++i) {
+      const uint8_t* entry = bytes + Cand::kCandEntries + i * Cand::kCandEntryBytes;
+      uint16_t expert;
+      std::memcpy(&expert, entry + Cand::kCandExpert, 2);
+      out->expert[i] = expert;
+      out->rank[i] = entry[Cand::kCandRank];
+      std::memcpy(&out->margin[i], entry + Cand::kCandMargin, 4);
+    }
+    return CandRead::kReady;
+  }
+
+  // Polls `seq`'s slot until it is ready or lapped: _mm_pause for kCandSpinNs, then kCandSleepNs sleeps, up to
+  // kCandWaitNs. kNotYet when it never became ready.
+  CandRead await_candidates(uint32_t seq, CandSlot* out) const {
+    const int64_t start = now_ns();
+    for (;;) {
+      const CandRead read = read_candidates(seq, out);
+      if (read != CandRead::kNotYet) return read;
+      const int64_t waited = now_ns() - start;
+      if (waited >= kCandWaitNs) return CandRead::kNotYet;
+      if (waited < kCandSpinNs)
+        _mm_pause();
+      else
+        std::this_thread::sleep_for(std::chrono::nanoseconds(kCandSleepNs));
+    }
+  }
+
+  // serve_spec_job with the GPU scorer: waits for the record's slot, then reads, in the GPU's order, the first
+  // per_layer candidates still unmapped here and not pooled before, its own group's only. Both groups read the same slot
+  // and pass the same filters, so the layer's budget holds over both. The GPU skipped the hot ones.
+  void serve_gpu_job(int g, const SpecJob& job, int64_t target, bool threaded) {
+    SpecGroup& spec = *spec_->groups[g];
+    int64_t start = 0;
+    if constexpr (Build::kMetrics) start = now_ns();
+    CandSlot slot;
+    const CandRead read = await_candidates(job.seq, &slot);
+    if constexpr (Build::kMetrics) {
+      stats_.add(kSpecScored);
+      stats_.add(kSpecScoreNs, now_ns() - start);
+    }
+    if (read == CandRead::kNotYet) {
+      spec_count<kSpecLate>(spec);
+      return;
+    }
+    if (read == CandRead::kLapped || slot.count == 0) {
+      spec_count<kSpecDropped>(spec);
+      return;
+    }
+    int taken = 0;
+    for (int i = 0; i < slot.count && taken < spec_->config.per_layer; ++i) {
+      const int32_t expert = slot.expert[i];
+      if (expert >= experts_ || __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
+          pool_->pooled_before(target, expert, job.seq))
+        continue;
+      ++taken;
+      if (Wire::home(expert) != g) continue;
+      if (threaded && !spec_wait_unheld(spec)) return;  // a quiescer waits for one row, not the whole job
+      uint64_t pick = 0;  // spec_submit's gen: rank << 32 | the margin's fp32 bits
+      if constexpr (Build::kMetrics)
+        pick = (static_cast<uint64_t>(slot.rank[i]) << 32) | std::bit_cast<uint32_t>(slot.margin[i]);
+      spec_read(g, job.row, target, job.seq, expert, pick);
     }
   }
 

@@ -128,10 +128,19 @@ struct RamPrefetchConfig {
   int per_layer = 0;
   bool top_k_only = false;  // walk each token's predicted top_k alone (GateScorer::choose)
   std::vector<std::vector<int>> cores;  // per group: its speculative thread's cores; empty inherits the caller's
+  // The GPU scorer's candidate page (../spec_candidates.h), pinned memory the caller keeps alive; null: the CPU
+  // scorer scores each record's staged input.
+  const uint8_t* candidates = nullptr;
 };
 
-// One record handed from a group's service thread to its speculative thread: a record of `row` that staged `tokens`
-// live inputs.
+// The GPU scorer's wait for a record's candidate slot: spin, then sleep in steps (the speculative thread may share its
+// core with the polling RAM thread), up to kCandWaitNs; a slot not ready by then counts spec_late.
+constexpr int64_t kCandWaitNs = 200'000;
+constexpr int64_t kCandSpinNs = 20'000;
+constexpr int64_t kCandSleepNs = 10'000;
+
+// One record handed from a group's service thread to its speculative thread: a record of `row`; with the CPU scorer,
+// one that staged `tokens` live inputs.
 struct SpecJob {
   uint32_t seq = 0;
   int64_t row = 0;

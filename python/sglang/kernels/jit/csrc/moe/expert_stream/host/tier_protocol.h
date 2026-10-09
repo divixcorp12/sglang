@@ -60,6 +60,7 @@ enum Counter : int {
   kSpecDropped,
   kSpecFailed,
   kSpecDelayed,
+  kSpecLate,  // GPU scorer: a record's candidate slot not ready within kCandWaitNs
   // ... the scorer's records scored and their scoring time in ns (metrics).
   kSpecScored,
   kSpecScoreNs,
@@ -88,6 +89,7 @@ constexpr bool is_core_counter(int k) {
     case kSpecDropped:
     case kSpecFailed:
     case kSpecDelayed:
+    case kSpecLate:
       return true;
     default:
       return false;

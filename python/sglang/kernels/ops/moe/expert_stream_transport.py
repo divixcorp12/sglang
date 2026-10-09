@@ -28,7 +28,7 @@ import os
 import struct
 import sys
 import weakref
-from typing import TYPE_CHECKING, Iterable, Optional, Sequence
+from typing import Iterable, NamedTuple, Optional, Sequence, TYPE_CHECKING
 
 import msgspec
 import torch
@@ -1078,6 +1078,50 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
     )
 
 
+# The GPU scorer's candidate page (csrc/moe/expert_stream/spec_candidates.h): CAND_RECORDS slots of CAND_STRIDE bytes,
+# slot (seq - 1) % CAND_RECORDS; u32 seq, u16 count, u16 flags, then CAND_MAX entries (u16 expert, u8 rank, pad, f32).
+CAND_MAX = 8
+CAND_RECORDS = 16
+CAND_STRIDE = 128
+CAND_ENTRIES = 8
+CAND_ENTRY_BYTES = 8
+CAND_PAGE_BYTES = CAND_RECORDS * CAND_STRIDE
+CAND_FLAG_OVERSIZE = 1
+
+
+def new_candidate_page(*, pin: bool) -> torch.Tensor:
+    """A zeroed candidate page; pinned (the select kernel writes it through UVA) for a real device."""
+    return torch.zeros(CAND_PAGE_BYTES, dtype=torch.uint8, pin_memory=pin)
+
+
+def candidate_offset(seq: int) -> int:
+    """The byte offset of record ``seq``'s slot."""
+    return ((int(seq) - 1) % CAND_RECORDS) * CAND_STRIDE
+
+
+class CandidateRead(NamedTuple):
+    status: str  # "ready", "not_yet" (an older record's, or open) or "lapped" (a later record's): ram_tier.h CandRead
+    count: int = 0
+    flags: int = 0
+    picks: tuple = ()  # (expert, rank, margin) per candidate, best margin first
+
+
+def read_candidates(page: torch.Tensor, seq: int) -> CandidateRead:
+    """Record ``seq``'s slot as the host reads it, without the torn-copy check: read it while no kernel writes."""
+    off = candidate_offset(seq)
+    raw = bytes(page[off : off + CAND_ENTRIES + CAND_MAX * CAND_ENTRY_BYTES].tolist())
+    word, count, flags = struct.unpack_from("<IHH", raw)
+    seq &= 0xFFFFFFFF
+    if word != seq:
+        following = (seq + 1) & 0xFFFFFFFF or 1
+        lapped = word != 0 and ((word - following) & 0xFFFFFFFF) < 0x80000000
+        return CandidateRead("lapped" if lapped else "not_yet")
+    picks = tuple(
+        struct.unpack_from("<HBxf", raw, CAND_ENTRIES + i * CAND_ENTRY_BYTES) for i in range(min(count, CAND_MAX))
+    )
+    return CandidateRead("ready", count, flags, picks)
+
+
 WORDS = {"demand_head": 0}
 # Order of the C++ counters (``host/tier_protocol.h``). Demand rows per layer come only
 # from ``ExpertStreamHost.layer_rows()``: one word per layer written by the tier's
@@ -1113,6 +1157,7 @@ COUNTERS = (
     "spec_dropped",
     "spec_failed",
     "spec_delayed",
+    "spec_late",
     "spec_scored",
     "spec_score_ns",
 )
@@ -1142,6 +1187,7 @@ CORE_COUNTERS = (
     "spec_dropped",
     "spec_failed",
     "spec_delayed",
+    "spec_late",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -1756,25 +1802,57 @@ class ExpertStreamHost:
     def enable_ram_prefetch(
         self,
         targets: torch.Tensor,
-        gates: torch.Tensor,
-        bias: torch.Tensor,
+        gates: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
         *,
         top_k: int,
         per_token: int,
         per_layer: int,
         cores: Sequence[Sequence[int]],
         top_k_only: bool = False,
+        candidates: Optional[torch.Tensor] = None,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
-        ``gates`` bf16 ``[n, experts, hidden]`` and ``bias`` fp32 ``[n, experts]`` are host tensors this host keeps
-        alive; ``cores`` is each NUMA group's speculative-thread core list (empty: the caller's affinity)."""
+        ``cores`` is each NUMA group's speculative-thread core list (empty: the caller's affinity). CPU scorer:
+        ``gates`` bf16 ``[n, experts, hidden]`` and ``bias`` fp32 ``[n, experts]``, host tensors this host keeps alive.
+        GPU scorer: ``candidates`` (``new_candidate_page``), which the select kernel writes, and no gates."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
-        if gates.dtype != torch.bfloat16 or gates.dim() != 3 or gates.device.type != "cpu" or not gates.is_contiguous():
-            raise ValueError("gates must be a contiguous host bf16 [n, experts, hidden] tensor")
-        if bias.dtype != torch.float32 or tuple(bias.shape) != tuple(gates.shape[:2]) or bias.device.type != "cpu":
-            raise ValueError("bias must be a host fp32 [n, experts] tensor")
+        if candidates is not None:
+            if gates is not None or bias is not None:
+                raise ValueError("the GPU scorer reads the device's gates: pass gates=None and bias=None")
+            if (
+                candidates.dtype != torch.uint8
+                or candidates.device.type != "cpu"
+                or not candidates.is_contiguous()
+                or candidates.numel() != CAND_PAGE_BYTES
+            ):
+                raise ValueError(
+                    f"candidates must be a contiguous host uint8 tensor of {CAND_PAGE_BYTES} bytes (new_candidate_page)"
+                )
+            gate_bytes = torch.empty((0, 0), dtype=torch.uint8)
+            bias = torch.empty((0, 0), dtype=torch.float32)
+            hidden = 0
+        else:
+            if (
+                gates is None
+                or gates.dtype != torch.bfloat16
+                or gates.dim() != 3
+                or gates.device.type != "cpu"
+                or not gates.is_contiguous()
+            ):
+                raise ValueError("gates must be a contiguous host bf16 [n, experts, hidden] tensor")
+            if (
+                bias is None
+                or bias.dtype != torch.float32
+                or tuple(bias.shape) != tuple(gates.shape[:2])
+                or bias.device.type != "cpu"
+            ):
+                raise ValueError("bias must be a host fp32 [n, experts] tensor")
+            gate_bytes = gates.view(gates.shape[0], -1).view(torch.uint8)
+            bias = bias.contiguous()
+            hidden = int(gates.shape[2])
         if len(cores) != self.nodes:
             raise ValueError(f"one core list per NUMA group ({self.nodes}), got {len(cores)}")
         table = torch.full((self.nodes, max(1, max(len(own) for own in cores))), -1, dtype=torch.int64)
@@ -1782,20 +1860,20 @@ class ExpertStreamHost:
             for j, core in enumerate(own):
                 check_not_reserved(int(core))
                 table[g, j] = int(core)
-        bias = bias.contiguous()
         self._module.expert_stream_enable_ram_prefetch(
             self.handle,
             targets.to(torch.int64).contiguous(),
-            gates.view(gates.shape[0], -1).view(torch.uint8),
+            gate_bytes,
             bias,
             table,
-            int(gates.shape[2]),
+            hidden,
             int(top_k),
             int(per_token),
             int(per_layer),
             int(bool(top_k_only)),
+            candidates if candidates is not None else torch.empty(0, dtype=torch.uint8),
         )
-        self.ram_prefetch_tensors = (gates, bias)
+        self.ram_prefetch_tensors = (gates, bias, candidates)
 
     def spec_pump(self, group: int = 0) -> bool:
         """Test only: serve NUMA group ``group``'s next speculative job on the calling thread (no service thread)."""

@@ -736,9 +736,11 @@ struct HostExports {
   }
 
   // Enables the RAM prefetch (RamTier::enable_ram_prefetch). `targets` int64 [rows, 2]: per source row its target row
-  // and that row's gate index, or -1 -1. `gates` uint8 [n, experts * hidden * 2] (bf16 [experts, hidden] each) and
-  // `bias` float32 [n, experts], host memory the caller keeps alive. `cores` int64 [groups, width]: each group's
-  // speculative thread's cores, -1 padding (none: the caller's affinity). Cores 64-71 are refused.
+  // and that row's gate index, or -1 -1. CPU scorer: `gates` uint8 [n, experts * hidden * 2] (bf16 [experts, hidden]
+  // each) and `bias` float32 [n, experts], host memory the caller keeps alive, and `candidates` empty. GPU scorer:
+  // `candidates` uint8 [SpecCandidates::kCandPageBytes], pinned memory the caller keeps alive, `gates` and `bias`
+  // [0, 0], `hidden` unused. `cores` int64 [groups, width]: each group's speculative thread's cores, -1 padding (none:
+  // the caller's affinity). Cores 64-71 are refused.
   static void enable_ram_prefetch(
       int64_t handle,
       TensorView targets,
@@ -749,11 +751,14 @@ struct HostExports {
       int64_t top_k,
       int64_t per_token,
       int64_t per_layer,
-      int64_t top_k_only) {
+      int64_t top_k_only,
+      TensorView candidates) {
     using namespace host;
+    using Cand = expert_stream::wire::SpecCandidates;
     auto cpu = SymbolicDevice{};
     auto host_mem = SymbolicDevice{};
     auto host_bias = SymbolicDevice{};
+    auto host_page = SymbolicDevice{};
     auto rows = SymbolicSize{"rows"};
     auto n = SymbolicSize{"gates"};
     expert_stream::verify_named(
@@ -764,25 +769,37 @@ struct HostExports {
         "bias", TensorMatcher({n, -1}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_bias), bias);
     expert_stream::verify_named(
         "cores", TensorMatcher({Wire::kNodes, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
+    expert_stream::verify_named(
+        "candidates",
+        TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_page),
+        candidates);
     const auto tier = find(handle);
-    if (hidden < 1 || bias.size(1) != tier->experts() || gates.size(1) != tier->experts() * hidden * 2)
+    const bool gpu = candidates.size(0) != 0;
+    if (gpu) {
+      if (candidates.size(0) != Cand::kCandPageBytes || gates.size(0) != 0)
+        throw std::runtime_error(
+            error_prefix<Layout>() + "RAM prefetch: the GPU scorer takes a candidate page of " +
+            std::to_string(Cand::kCandPageBytes) + " bytes and no gates");
+    } else if (hidden < 1 || bias.size(1) != tier->experts() || gates.size(1) != tier->experts() * hidden * 2) {
       throw std::runtime_error(
           error_prefix<Layout>() +
           "RAM prefetch: the gates are not bf16 [n, experts, hidden] with an fp32 bias per expert");
+    }
     expert_stream::RamPrefetchConfig config;
     const auto* t = static_cast<const int64_t*>(targets.data_ptr());
     for (int64_t row = 0; row < targets.size(0); ++row) {
       config.target.push_back(static_cast<int32_t>(t[2 * row]));
       config.gate.push_back(static_cast<int32_t>(t[2 * row + 1]));
     }
-    config.gates = static_cast<const uint16_t*>(gates.data_ptr());
-    config.bias = static_cast<const float*>(bias.data_ptr());
+    config.gates = gpu ? nullptr : static_cast<const uint16_t*>(gates.data_ptr());
+    config.bias = gpu ? nullptr : static_cast<const float*>(bias.data_ptr());
     config.gate_count = gates.size(0);
     config.hidden = hidden;
     config.top_k = static_cast<int>(top_k);
     config.per_token = static_cast<int>(per_token);
     config.per_layer = static_cast<int>(per_layer);
     config.top_k_only = top_k_only != 0;
+    config.candidates = gpu ? static_cast<const uint8_t*>(candidates.data_ptr()) : nullptr;
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int g = 0; g < Wire::kNodes; ++g) {
       std::vector<int> own;
