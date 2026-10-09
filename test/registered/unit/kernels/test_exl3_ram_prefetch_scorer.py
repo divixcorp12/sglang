@@ -8,50 +8,13 @@ import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport as es
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_ram_prefetch_fixtures import exact_gate_case as _exact_case
+from sglang.test.dsv41_ram_prefetch_fixtures import gate_reference as reference
+from sglang.test.dsv41_ram_prefetch_fixtures import lead_gate_case as _lead_case
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 DEPTH = 12
-
-
-def reference(x, w, bias, skip, *, top_k, per_token, per_layer, top_k_only=False, meta=False):
-    logits = x.float() @ w.float().T
-    scores = torch.where(logits > 20, logits, torch.log1p(torch.exp(logits))).sqrt() + bias
-    scores = torch.where(scores.isnan(), torch.tensor(float("-inf")), scores)  # a NaN score ranks below every other
-    best, ranks = {}, {}
-    experts = w.shape[0]
-    for m in range(x.shape[0]):
-        s = scores[m]
-        order = sorted(range(experts), key=lambda e: (-float(s[e]), e))[: min(DEPTH, experts)]
-        walk = order[:top_k] if top_k_only else order
-        kth = s[order[top_k - 1]]
-        picked = 0
-        for rank, e in enumerate(walk):
-            if picked >= per_token:
-                break
-            if skip[e]:
-                continue
-            # an fp32 subtraction, as the host's; equal scores (also two infinities) give 0, -inf stays above unpicked
-            margin = 0.0 if s[e] == kth else max(float(s[e] - kth), -3.4028234663852886e38)
-            # an expert's rank is its position in the token that gave its best margin, the lowest on a tie
-            if e not in best or margin > best[e] or (margin == best[e] and rank < ranks[e]):
-                ranks[e] = rank
-            best[e] = max(best.get(e, float("-inf")), margin)
-            picked += 1
-    chosen = [e for e, _ in sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))][:per_layer]
-    return [(e, ranks[e], best[e]) for e in chosen] if meta else chosen
-
-
-def _exact_case(seed, tokens=3, experts=16, hidden=64):
-    """Small non-negative integers with a constant 21 term: every logit is an integer above 20, exact in fp32 in any
-    summation order, so softplus is the identity and host and torch produce the same fp32 scores bit for bit."""
-    g = torch.Generator().manual_seed(seed)
-    x = torch.randint(0, 4, (tokens, hidden), generator=g).to(torch.float16)
-    x[:, 0] = 1
-    w = torch.randint(0, 4, (experts, hidden), generator=g).to(torch.bfloat16)
-    w[:, 0] = 21
-    bias = torch.randperm(experts, generator=g).float() * 1e-3
-    return x, w, bias
 
 
 @pytest.mark.parametrize("seed", range(8))
@@ -147,17 +110,6 @@ def test_a_choice_outside_the_hosts_bounds_is_refused(kw, why):
     x, w, bias = _exact_case(0)
     with pytest.raises(Exception, match=why):
         es.score_gate(x, w, bias, [False] * 16, **kw)
-
-
-def _lead_case(seed, tokens=3, experts=16, hidden=16):
-    """_exact_case with a lead term of 128, so x may go negative while every logit stays an exact integer above 20."""
-    g = torch.Generator().manual_seed(seed)
-    x = torch.randint(-2, 4, (tokens, hidden), generator=g).to(torch.float16)
-    x[:, 0] = 1
-    w = torch.randint(0, 4, (experts, hidden), generator=g).to(torch.bfloat16)
-    w[:, 0] = 128
-    bias = torch.randperm(experts, generator=g).float() * 1e-3
-    return x, w, bias
 
 
 KW = dict(top_k=6, per_token=2, per_layer=4)

@@ -442,3 +442,9 @@ def test_the_candidate_page_layout_is_the_python_mirror():
     }
     assert {k: found.get(k) for k in want} == want
     assert ram_miss.CAND_PAGE_BYTES == ram_miss.CAND_RECORDS * ram_miss.CAND_STRIDE == 2048
+
+
+def test_the_spec_kernels_bounds_are_the_python_mirror():
+    spec = _constants(CSRC / "expert_stream" / "spec_score.cuh")
+    assert (spec["kSelectMaxExperts"], spec["kSpecDepth"]) == (ram_miss.SPEC_SELECT_MAX_EXPERTS, ram_miss.SPEC_DEPTH)
+    assert spec["kSelectMaxTokens"] == lease.CPU_TOKENS_MAX
