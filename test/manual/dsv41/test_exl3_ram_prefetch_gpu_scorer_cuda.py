@@ -5,12 +5,17 @@ seq word stored last. Task 4 adds a captured post with its scoring replayed thro
 Run on divix01 under cc-gpu.lock, with PYTHONPATH pointing at the tree under test.
 """
 
+import random
+
 import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
+from lease_chain_rig import EXPERTS, TOP_K, Chain  # noqa: E402
+
 from sglang.kernels.ops.moe import expert_stream_transport as es  # noqa: E402
+from sglang.srt.layers.moe.ram_prefetch import SpecScoreRow  # noqa: E402
 from sglang.test.dsv41_ram_prefetch_fixtures import exact_gate_case, gate_reference, lead_gate_case  # noqa: E402
 
 KEEP = es.CAND_MAX  # a reference per_layer that lists every candidate the GPU writes
@@ -176,3 +181,56 @@ def test_the_seq_word_is_stored_last():
     got = _candidates(x.to(BF16), w, bias, top_k=6, per_token=1, seq=5, page=page, module=module)
     assert got.status == "not_yet"
     assert int(page[off : off + 4].view(torch.int32)[0]) == 0 and int(page[off + 4 : off + 6].view(torch.int16)[0]) == 1
+
+
+def _step(c, experts, row=0):
+    c.plan(experts, row)
+    c.gather(row)
+    snapshot = c.snapshot(row)
+    torch.cuda.synchronize()
+    c.check(experts, snapshot, row)
+
+
+def test_a_captured_post_and_its_scoring_replay_the_reference_candidates(tmp_path):
+    """The production row backend's post with its scoring, captured once, replayed with new inputs, hot sets and
+    plans twice round the 16-slot ring: each replay's slot holds the reference's candidates for that replay's x past
+    its hot slots and row 1's device map. Mutant: score a copy of x taken at capture -- red."""
+    c = Chain(tmp_path)
+    try:
+        x16, w16, bias = exact_gate_case(0, tokens=1, experts=EXPERTS)
+        x = x16.to(BF16).cuda()
+        hot = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+        page = es.new_candidate_page(pin=True)
+        c.dev.enable_spec_scorer(page, top_k=TOP_K, per_token=2, top_k_only=False)
+        backend = c.backends[0]
+        backend.spec_expected = True
+        backend.spec_score = SpecScoreRow(w16.cuda(), bias.cuda(), 1, hot, 4)
+        backend.cpu_input = (x, None)  # the scoring reads x alone: this rig's rows have no CPU experts
+        _step(c, [0, 1], 0)  # loads both kernels and scores eagerly
+        _step(c, [2, 3], 1)
+        _step(c, [2, 3], 1)  # applies row 1's delta: 2 and 3 mapped in the device map
+        assert c.handled()
+        mapped = {e for e, slot in enumerate(c.device_map(1)) if slot >= 0}
+        assert {2, 3} <= mapped
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            c.gather(0)
+        rng = random.Random(11)
+        for i in range(2 * es.CAND_RECORDS + 1):
+            xi = exact_gate_case(100 + i, tokens=1, experts=EXPERTS)[0]
+            hot_i = rng.sample(range(EXPERTS), 4)
+            with torch.cuda.stream(stream):
+                x.copy_(xi.to(BF16))
+                hot.copy_(torch.tensor(hot_i, dtype=torch.int64))
+                c.plan(rng.sample(range(EXPERTS), rng.randint(1, TOP_K)), 0)
+                graph.replay()
+            stream.synchronize()
+            seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
+            skip = [e in hot_i or e in mapped for e in range(EXPERTS)]
+            want = gate_reference(xi, w16, bias, skip, top_k=TOP_K, per_token=2, per_layer=KEEP, meta=True)
+            got = es.read_candidates(page, seq)
+            assert got.status == "ready" and list(got.picks) == want, i
+        assert c.handled()
+    finally:
+        c.close()

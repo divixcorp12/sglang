@@ -9,13 +9,17 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
+from sglang.kernels.ops.moe.expert_stream_transport import CAND_PAGE_BYTES, new_candidate_page
 from sglang.srt.layers.moe.ram_prefetch import (
+    GpuScorer,
     RouterGate,
     clear_router_gates,
     prefetch_tables,
+    prefetch_targets,
     register_moe_gates,
     register_router_gate,
     registered_gates,
+    spec_score_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -100,3 +104,91 @@ def test_the_service_enables_the_host_with_the_registered_gates_options_and_spar
     assert calls[1][1]["top_k_only"] is True
     with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_CPU_EXPERTS"):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, None)
+
+
+def _numa():
+    return SimpleNamespace(
+        nodes=1, plans=[NodePlan(group=0, node=0, ram=17, cpu=(8, 9), sq=None, busy_poll=True, spec=(0, 1))]
+    )
+
+
+def test_the_gpu_scorer_enables_the_host_with_a_candidate_page_and_no_host_gate_copy():
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    calls = []
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("gpu"):
+        scorer = module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    (targets, gates, bias), kw = calls[0]
+    assert targets.tolist() == [[1, 0], [-1, -1]] and gates is None and bias is None
+    page = kw.pop("candidates")
+    assert page.dtype == torch.uint8 and page.numel() == CAND_PAGE_BYTES and not page.is_pinned()
+    assert kw == dict(top_k=6, per_token=1, per_layer=1, cores=[[0, 1]], top_k_only=False)
+    assert scorer.candidates is page and scorer.picked.gates[0].weight is gate.weight
+    assert (scorer.per_token, scorer.top_k_only, scorer.picked.top_k) == (1, False, 6)
+
+
+def test_the_cpu_scorer_returns_no_gpu_scorer_and_an_unknown_one_is_refused():
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: None)
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+    assert module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu) is None
+    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("tpu"):
+        with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER"):
+            module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+
+
+def test_the_gpu_scorers_table_has_a_row_once_its_target_attached():
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    picked = prefetch_targets([0, 1, 2], registered_gates(), hidden=8)
+    hot = torch.full((3,), -1, dtype=torch.int64)
+    assert spec_score_rows(picked, {}) == {}
+    rows = spec_score_rows(picked, {1: (hot, 3)})
+    assert list(rows) == [0]
+    entry = rows[0]
+    assert (entry.target, entry.hot_capacity) == (1, 3) and entry.hot_slots is hot
+    assert torch.equal(entry.weight, gate.weight) and torch.equal(entry.bias, gate.bias)
+
+
+@pytest.mark.parametrize(
+    "weight_dtype, bias_dtype, why",
+    [(torch.float16, torch.float32, "bf16 or fp32 gate"), (torch.bfloat16, torch.bfloat16, "fp32 bias")],
+)
+def test_a_gate_the_kernels_cannot_read_is_refused_when_the_table_is_built(weight_dtype, bias_dtype, why):
+    gate = _gate()
+    register_router_gate(1, gate.weight.to(weight_dtype), gate.bias.to(bias_dtype), 6)
+    picked = prefetch_targets([0, 1], registered_gates(), hidden=8)
+    with pytest.raises(ValueError, match=why):
+        spec_score_rows(picked, {1: (torch.full((3,), -1, dtype=torch.int64), 3)})
+
+
+def test_the_service_binds_each_row_as_its_target_attaches_and_flags_rows_with_a_target():
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    svc = module.Exl3RamMissService()
+    picked = prefetch_targets([0, 1], registered_gates(), hidden=8)
+    svc._spec_gpu = GpuScorer(picked, new_candidate_page(pin=False), per_token=1, top_k_only=False)
+    hot0, hot1 = (torch.full((3,), -1, dtype=torch.int64) for _ in range(2))
+    b0 = SimpleNamespace(spec_expected=False, spec_score=None, hot_slots=hot0, hot_capacity=3)
+    b1 = SimpleNamespace(spec_expected=False, spec_score=None, hot_slots=hot1, hot_capacity=3)
+    svc._note_spec_row(0, b0)
+    assert b0.spec_expected and b0.spec_score is None  # row 1, its target, has not attached
+    svc._note_spec_row(1, b1)
+    assert b0.spec_score.target == 1 and b0.spec_score.hot_slots is hot1
+    assert not b1.spec_expected and b1.spec_score is None
+
+
+def test_the_candidate_page_and_the_score_scratch_are_quarantined(monkeypatch):
+    """The select kernel writes the page through UVA: a shutdown that cannot establish the GPU stopped keeps it."""
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    svc = module.Exl3RamMissService()
+    page = new_candidate_page(pin=False)
+    svc._spec_gpu = GpuScorer(prefetch_targets([0, 1], registered_gates(), hidden=8), page, 1, False)
+    owned = []
+    monkeypatch.setattr(module, "quarantine_host_slabs", owned.extend)
+    svc._quarantine("test")
+    assert any(t is page for t in owned)

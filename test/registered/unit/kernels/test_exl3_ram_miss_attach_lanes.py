@@ -255,7 +255,7 @@ class _Side:
         self.copy_engine_captured = False
 
     def __getattr__(self, name):
-        if name in ("post", "stream", "copy_wait"):
+        if name in ("post", "stream", "copy_wait", "spec_score"):
             return lambda *args, **kwargs: self.calls.append((name, kwargs))
         raise AttributeError(name)
 
@@ -450,3 +450,32 @@ def test_the_pool_room_is_checked_per_group_as_the_host_reserves_it(ranges, widt
     capacity, nodes = ranges[-1][1], len(ranges)
     assert capacity - min(width, capacity - 1) - 2 * nodes >= 2 * nodes
     assert module.pool_room_shortfall(ranges, staging_width=width, share=2) == short
+
+
+def test_a_row_with_a_target_scores_right_after_its_post(monkeypatch):
+    """The scoring kernels follow the post on its stream, before C1: the host learns the record and its candidates
+    while this layer still runs (spec 2026-10-09, Approach A)."""
+    streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
+    backend, side = _captured_backend(monkeypatch, lambda: streamer)
+    entry = SimpleNamespace(target=1)
+    backend.spec_expected, backend.spec_score = True, entry
+    backend.post(0, _CapturedPlan())
+    assert [name for name, _ in side.calls] == ["post", "spec_score", "copy", "stream", "copy_wait"]
+    assert side.calls[1][1]["entry"] is entry and side.calls[1][1]["x"] is backend.cpu_input[0]
+
+
+def test_a_row_whose_target_has_not_attached_is_refused_before_anything_posts(monkeypatch):
+    """The table is built at attach, before capture; a post without its entry would freeze a graph that never scores."""
+    streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
+    backend, side = _captured_backend(monkeypatch, lambda: streamer)
+    backend.spec_expected = True
+    with pytest.raises(RuntimeError, match="row 0 posted before its target row attached"):
+        backend.post(0, _CapturedPlan())
+    assert not side.calls
+
+
+def test_a_row_without_a_target_posts_the_chain_alone(monkeypatch):
+    streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
+    backend, side = _captured_backend(monkeypatch, lambda: streamer)
+    backend.post(0, _CapturedPlan())
+    assert [name for name, _ in side.calls] == ["post", "copy", "stream", "copy_wait"]

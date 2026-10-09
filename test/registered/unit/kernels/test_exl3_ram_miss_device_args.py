@@ -4,6 +4,7 @@ import ast
 import operator
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -448,3 +449,37 @@ def test_the_spec_kernels_bounds_are_the_python_mirror():
     spec = _constants(CSRC / "expert_stream" / "spec_score.cuh")
     assert (spec["kSelectMaxExperts"], spec["kSpecDepth"]) == (ram_miss.SPEC_SELECT_MAX_EXPERTS, ram_miss.SPEC_DEPTH)
     assert spec["kSelectMaxTokens"] == lease.CPU_TOKENS_MAX
+
+
+def test_the_gpu_scorer_takes_a_candidate_page_of_the_slots_size():
+    with pytest.raises(ValueError, match="candidates must be a contiguous CPU uint8 tensor"):
+        _device().enable_spec_scorer(torch.zeros(10, dtype=torch.uint8), top_k=2, per_token=1, top_k_only=False)
+
+
+def test_the_gpu_scorer_refuses_more_experts_than_the_select_kernel_holds():
+    """Review Focus 5: refused at start, not overflowing the select kernel's shared arrays inside a replay."""
+    with pytest.raises(ValueError, match="1024"):
+        _device(experts=1025).enable_spec_scorer(
+            ram_miss.new_candidate_page(pin=False), top_k=2, per_token=1, top_k_only=False
+        )
+
+
+def test_the_gpu_scorer_refuses_a_choice_outside_the_kernels_bounds():
+    for top_k, per_token in ((0, 1), (5, 1), (2, 0), (2, 13)):
+        with pytest.raises(ValueError, match="top_k|per_token"):
+            _device().enable_spec_scorer(
+                ram_miss.new_candidate_page(pin=False), top_k=top_k, per_token=per_token, top_k_only=False
+            )
+
+
+def test_the_gpu_scorer_sizes_its_scratch_by_the_rows_tokens():
+    dev = _device()
+    dev.enable_spec_scorer(ram_miss.new_candidate_page(pin=False), top_k=2, per_token=1, top_k_only=False)
+    assert tuple(dev.spec_scores.shape) == (dev.cpu_tokens_max, 4) and dev.spec_scores.dtype == torch.float32
+    with pytest.raises(RuntimeError, match="already enabled"):
+        dev.enable_spec_scorer(ram_miss.new_candidate_page(pin=False), top_k=2, per_token=1, top_k_only=False)
+
+
+def test_scoring_before_the_gpu_scorer_is_enabled_is_refused():
+    with pytest.raises(RuntimeError, match="enable_spec_scorer"):
+        _device().spec_score(SimpleNamespace(target=0), None)
