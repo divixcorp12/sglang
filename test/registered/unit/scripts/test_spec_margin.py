@@ -125,3 +125,26 @@ def test_a_per_layer_rule_admits_only_cells_at_or_above_the_floor():
     test = [_pick(5, 0, 0.0, True)] * 4 + [_pick(5, 1, 0.0, True)] + [_pick(5, 1, 0.0, False)] * 3
     row = m.evaluate("per-layer rank", m.per_layer_rule(train, key=lambda p: p["rank"], floor=0.5, alpha=20), test)
     assert (row["kept"], row["used"], row["precision"], row["used_kept_share"]) == (4, 4, 1.0, 0.8)
+
+
+def test_a_layers_floor_is_the_lowest_edge_of_its_top_run_of_admitted_bins():
+    m = _module()
+    # Layer 7: [0.5, inf) and [0.25, 0.5) used, [0.1, 0.25) not, [-0.1, 0) used: the run from the top stops at 0.25.
+    train = ([_pick(7, 0, 0.6, True)] * 40 + [_pick(7, 0, 0.3, True)] * 40 + [_pick(7, 0, 0.2, False)] * 40
+             + [_pick(7, 0, -0.05, True)] * 40 + [_pick(8, 0, 0.6, False)] * 40)
+    floors = m.margin_floors(train, floor=0.5, alpha=0)
+    assert floors[7] == 0.25
+    assert floors[8] == float("inf")
+    rule = m.floor_rule(floors)
+    assert [rule(_pick(7, 0, x, False)) for x in (0.25, 0.24, -0.05)] == [True, False, False]
+    assert rule(_pick(9, 0, 5.0, False)) is True  # a layer the fit never saw keeps every read
+
+
+def test_a_sweep_fit_on_another_run_scores_every_pick_of_this_one():
+    m = _module()
+    fit = [_pick(3, 0, 0.6, True)] * 30 + [_pick(3, 5, -0.05, False)] * 30
+    picks = [_pick(3, 0, 0.6, True, ns=i) for i in range(10)] + [_pick(3, 5, -0.05, False, ns=20 + i) for i in range(10)]
+    sw = m.sweep(picks, alpha=20, train=fit)
+    assert (sw["train"], sw["test"]) == (60, 20)
+    floor_row = next(r for r in sw["rows"] if r["bin"] == "per-layer min margin >= 0.5")
+    assert (floor_row["kept"], floor_row["used"]) == (10, 10)
