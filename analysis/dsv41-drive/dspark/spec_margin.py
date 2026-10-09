@@ -9,12 +9,19 @@ Timing (host CLOCK_MONOTONIC, per used read): submit->land is the read with its 
 the prediction had over the demand; land->use is the slack, 0 for a promoted read whose demand waited for the landing
 (spec_use is stamped after the wait, so a promoted read's true need came earlier than its use event says).
 
-Usage: spec_margin.py 'PREFIX.*.jsonl' [--json OUT]
+Admission sweep (the expert-prediction handoff's E6/E7 on recorded reads): the run is split at the largest time
+gap in its middle third (a session boundary), rules are fit on the first part and scored on the second. A per-layer
+rule admits a (target layer, bin) cell when its used rate, shrunk toward the pooled rate of its bin by ``--alpha``
+pseudo-reads, reaches the floor. Only issued reads are recorded, so a rule can only be scored as a subset of them,
+and dropping a read is scored as losing its use: the cache effects of reads not made are not modelled.
+
+Usage: spec_margin.py 'PREFIX.*.jsonl' [--json OUT] [--alpha 20]
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import glob
 import json
 import struct
@@ -47,7 +54,8 @@ def join(events: list[dict]) -> list[dict]:
     for e in events:
         if e["event"] == "spec_submit":
             rank, margin = unpack_gen(int(e["gen"]))
-            picks[(e["row"], e["seq"], e["a"])] = {"rank": rank, "margin": margin, "group": e["group"],
+            picks[(e["row"], e["seq"], e["a"])] = {"layer": e["row"], "rank": rank, "margin": margin,
+                                                   "group": e["group"],
                                                    "landed": False, "used": False, "submit_ns": e["ns"],
                                                    "land_ns": None, "use_ns": None}
     for e in events:
@@ -79,7 +87,103 @@ def bins(picks: list[dict], top_k: int) -> dict:
     inside = [p for p in picks if p["rank"] < top_k]
     outside = [p for p in picks if p["rank"] >= top_k]
     return {"all": _row("all", picks), "inside_top_k": _row(f"rank < {top_k}", inside),
-            "outside_top_k": _row(f"rank >= {top_k}", outside), "by_rank": by_rank, "by_margin": by_margin}
+            "outside_top_k": _row(f"rank >= {top_k}", outside), "by_rank": by_rank, "by_margin": by_margin,
+            "by_layer": [_row(str(t), [p for p in picks if p["layer"] == t]) for t in sorted({p["layer"] for p in picks})],
+            "by_stratum": [_row(s, [p for p in picks if stratum(p["layer"]) == s])
+                           for s in sorted({stratum(p["layer"]) for p in picks})]}
+
+
+FLOORS = (0.3, 0.4, 0.5, 0.6)
+
+
+def stratum(layer: int) -> str:
+    """The handoff's architecture strata, by target layer: Engram sits at 1 and 14, the encoder ends at 19, the
+    bounded prefill replay starts at 21, DSpark taps 37-39."""
+    if layer in (1, 14):
+        return "enters engram"
+    if layer in (2, 15):
+        return "leaves engram"
+    if layer == 20:
+        return "19->20"
+    if layer == 21:
+        return "replay start"
+    if layer >= 37:
+        return "late"
+    return "interior"
+
+
+def margin_bin(p: dict) -> int:
+    return bisect.bisect_right(MARGIN_EDGES, p["margin"])
+
+
+def rank_margin(p: dict) -> tuple[int, int]:
+    return min(p["rank"], 3), margin_bin(p)
+
+
+def session_split(picks: list[dict]) -> int:
+    """The submit time that opens the second part: the later side of the largest gap in the middle third."""
+    t = sorted(p["submit_ns"] for p in picks)
+    lo, hi = int(0.35 * len(t)), int(0.65 * len(t))
+    i = max(range(lo, hi), key=lambda j: t[j + 1] - t[j])
+    return t[i + 1]
+
+
+def cell_rates(train: list[dict], key, alpha: float) -> dict:
+    """Used rate per (layer, key) shrunk toward the pooled rate of its key; pooled rates under (None, key)."""
+    pooled, cells = {}, {}
+    for p in train:
+        if not p["landed"]:
+            continue
+        for k, table in (((None, key(p)), pooled), ((p["layer"], key(p)), cells)):
+            n, u = table.get(k, (0, 0))
+            table[k] = (n + 1, u + p["used"])
+    rates = {k: u / n for k, (n, u) in pooled.items()}
+    for (layer, k), (n, u) in cells.items():
+        rates[(layer, k)] = (u + alpha * rates[(None, k)]) / (n + alpha)
+    return rates
+
+
+def per_layer_rule(train: list[dict], key, floor: float, alpha: float):
+    rates = cell_rates(train, key, alpha)
+    return lambda p: rates.get((p["layer"], key(p)), rates.get((None, key(p)), 0.0)) >= floor
+
+
+def pooled_rule(train: list[dict], key, floor: float):
+    rates = cell_rates(train, key, 0)
+    return lambda p: rates.get((None, key(p)), 0.0) >= floor
+
+
+def evaluate(label: str, rule, test: list[dict]) -> dict:
+    landed = [p for p in test if p["landed"]]
+    kept = [p for p in landed if rule(p)]
+    used_all = sum(p["used"] for p in landed)
+    used = sum(p["used"] for p in kept)
+    return {"bin": label, "kept": len(kept), "kept_share": round(len(kept) / len(landed), 3) if landed else None,
+            "used": used, "precision": round(used / len(kept), 3) if kept else None,
+            "used_kept_share": round(used / used_all, 3) if used_all else None,
+            "wasted": len(kept) - used}
+
+
+def sweep(picks: list[dict], alpha: float) -> dict:
+    split = session_split(picks)
+    train = [p for p in picks if p["submit_ns"] < split]
+    test = [p for p in picks if p["submit_ns"] >= split]
+    rows = [evaluate("all (no rule)", lambda p: True, test)]
+    rows += [evaluate(f"rank < {k}", lambda p, k=k: p["rank"] < k, test) for k in (1, 2, 3, 4)]
+    keys = (("rank", lambda p: p["rank"]), ("margin", margin_bin), ("rank x margin", rank_margin))
+    for floor in FLOORS:
+        for name, key in keys:
+            rows.append(evaluate(f"pooled {name} >= {floor}", pooled_rule(train, key, floor), test))
+            rows.append(evaluate(f"per-layer {name} >= {floor}", per_layer_rule(train, key, floor, alpha), test))
+    return {"train": len(train), "test": len(test), "alpha": alpha, "rows": rows}
+
+
+def sweep_table(rows: list[dict]) -> str:
+    out = ["| rule | kept | kept share | used | precision | used kept share | wasted |",
+           "|---|---:|---:|---:|---:|---:|---:|"]
+    out += [f"| {r['bin']} | {r['kept']} | {r['kept_share']} | {r['used']} | {r['precision']} | "
+            f"{r['used_kept_share']} | {r['wasted']} |" for r in rows]
+    return "\n".join(out)
 
 
 def _quantiles(values: list[float]) -> dict:
@@ -113,6 +217,7 @@ def main() -> int:
     p.add_argument("pattern")
     p.add_argument("--top-k", type=int, default=6)
     p.add_argument("--json")
+    p.add_argument("--alpha", type=float, default=20.0)
     a = p.parse_args()
     paths = sorted(glob.glob(a.pattern))
     if not paths:
@@ -128,14 +233,22 @@ def main() -> int:
         return 1
     result = bins(picks, a.top_k)
     result["timing"] = timing(picks)
+    result["sweep"] = sweep(picks, a.alpha)
     print(table([result["all"], result["inside_top_k"], result["outside_top_k"]]))
     print()
     print(table(result["by_rank"]))
     print()
     print(table(result["by_margin"]))
     print()
+    print(table(result["by_stratum"]))
+    print()
+    print(table(result["by_layer"]))
+    print()
     for name, q in result["timing"].items():
         print(name, json.dumps(q))
+    sw = result["sweep"]
+    print(f"\nadmission sweep: fit on {sw['train']} reads, scored on {sw['test']}, alpha {sw['alpha']:g}")
+    print(sweep_table(sw["rows"]))
     if a.json:
         with open(a.json, "w") as f:
             json.dump({**result, "files": paths}, f, indent=1)
