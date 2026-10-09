@@ -267,3 +267,52 @@ def test_the_summary_pairs_sessions_and_reports_reads_still_in_flight(tmp_path):
     assert g["paired_gain_pct_vs_reference"] == pytest.approx({"s0": 10.0, "s1": -5.0, "s2": 20.0})
     assert g["paired_gain_pct_median"] == pytest.approx(10.0)
     assert g["spec_in_flight_at_use"] == pytest.approx(0.1) and g["ram"]["spec_late"] == 3
+
+
+def _baseline(root, ms=(100.0, 100.0, 100.0)):
+    _session_rows(root, "dspark-both", list(ms))
+    (root / "dspark-both.probe.json").write_text("{}")
+    (root / "dspark-both.metrics.jsonl").write_text("{}\n")
+    (root / "commit.txt").write_text("abc123\n")
+
+
+def test_a_saved_baseline_is_imported_instead_of_rerunning_the_reference_arm(monkeypatch, tmp_path):
+    ab = _ab()
+    base, out = tmp_path / "base", tmp_path / "out"
+    _baseline(base)
+    ran = []
+    monkeypatch.setattr(ab, "run_timed", lambda arm, o: ran.append(("timed", arm)) or _session_rows(out, arm, [90.0, 95.0, 110.0]) or 0)
+    monkeypatch.setattr(ab, "run_probe", lambda arm, o: ran.append(("probe", arm)) or 0)
+    monkeypatch.setattr(ab, "_compare", lambda a, b: {"ok": True})
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(out), "dspark-both-prefetch-gpu-floors", "--baseline", str(base)])
+    ab.main()
+    assert ran == [("timed", "dspark-both-prefetch-gpu-floors"), ("probe", "dspark-both-prefetch-gpu-floors")]
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["dspark-both"]["baseline_from"] == {"dir": str(base), "commit": "abc123"}
+    assert summary["dspark-both-prefetch-gpu-floors"]["paired_gain_pct_median"] == 5.0
+    assert (out / "dspark-both.probe.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["dspark-both.probe.json", "dspark-both.metrics.jsonl", "servers"])
+def test_a_baseline_missing_any_of_its_files_is_refused_before_any_arm_runs(monkeypatch, tmp_path, missing):
+    import shutil
+
+    ab = _ab()
+    base = tmp_path / "base"
+    _baseline(base)
+    target = base / missing
+    shutil.rmtree(target) if target.is_dir() else target.unlink()
+    monkeypatch.setattr(ab, "run_timed", lambda arm, o: pytest.fail("ran an arm"))
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path / "out"), "dspark-both-prefetch-gpu-floors", "--baseline", str(base)])
+    with pytest.raises(SystemExit, match="baseline"):
+        ab.main()
+
+
+def test_a_baseline_cannot_be_both_imported_and_rerun(monkeypatch, tmp_path):
+    ab = _ab()
+    base = tmp_path / "base"
+    _baseline(base)
+    monkeypatch.setattr(ab, "run_timed", lambda arm, o: pytest.fail("ran an arm"))
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path / "out"), "dspark-both", "--baseline", str(base)])
+    with pytest.raises(SystemExit, match="baseline"):
+        ab.main()
