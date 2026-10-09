@@ -195,6 +195,10 @@ class BasicCpuExpertEngine {
   int64_t tokens() const {
     return config_.tokens;
   }
+  /// The tables and geometry it was enabled with: the RAM prefetch's scorer reads the staged inputs through them.
+  const CpuExpertConfig& config() const {
+    return config_;
+  }
 
   /// The tokens that route calibration lane `lane` of a `tokens`-token verify: token lane % tokens, and for every
   /// fourth lane the next token too. 1.25 tokens per lane is the 1.23 the target's CPU jobs measure (cpu_shape events,

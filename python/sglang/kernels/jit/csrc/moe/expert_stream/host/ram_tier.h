@@ -22,6 +22,7 @@
 #include "host_copy_backend.h"
 #include "numa_distributor.h"
 #include "ram_prefetch.h"
+#include "gate_scorer.h"
 #include "split_calibration.h"
 
 namespace sglang {
@@ -280,6 +281,8 @@ class RamTier {
         }
       }
       if (!skip) handle_record(group, request);
+      // Every group sees the record, served or skipped, so both groups score the same jobs.
+      if (spec_ != nullptr) offer_spec(group, request);
     }
     if (g == 0) end_stage();
     group.handled.store(group.next_demand, std::memory_order_release);
@@ -569,11 +572,13 @@ class RamTier {
       _mm_prefetch(reinterpret_cast<const char*>(hot + line), _MM_HINT_T0);
   }
 
-  // Replaces the row's hot set with the record's bitmap, for the group's own experts.
+  // Replaces the row's hot set with the record's bitmap, for the group's own experts. Relaxed atomic stores: the RAM
+  // prefetch's scorers read every expert's flag from any group's thread (fill_spec_skip).
   void apply_gpu_hot(Group& group, const Request& request) {
     Tier& tier = tiers_[request.row];
     for (int64_t expert = group.index; expert < experts_; expert += Wire::kNodes)
-      tier.hot[expert] = (request.hot_bitmap[expert / 8] >> (expert % 8)) & 1;
+      std::atomic_ref<uint8_t>(tier.hot[expert])
+          .store((request.hot_bitmap[expert / 8] >> (expert % 8)) & 1, std::memory_order_relaxed);
   }
 
   // ---- The copy engine ----
@@ -1049,6 +1054,61 @@ class RamTier {
     }
   }
 
+  // Enables the RAM prefetch over the reserved pool: per group a speculative thread (RamThread starts it with the
+  // service threads) fed by the group's service with every record that staged a CPU input. Needs CPU experts on every
+  // group, whose records stage that input. On the owner, before the service thread starts.
+  void enable_ram_prefetch(RamPrefetchConfig config) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("enable_ram_prefetch");
+    const std::string prefix = error_prefix<Layout>() + "RAM prefetch: ";
+    if (threaded_.load()) throw std::runtime_error(prefix + "enable it before the service thread starts");
+    if (spec_ != nullptr) throw std::runtime_error(prefix + "it is already enabled");
+    if (pool_ == nullptr) throw std::runtime_error(prefix + "reserve_spec_pool first");
+    if (static_cast<int64_t>(config.target.size()) != layers_ || static_cast<int64_t>(config.gate.size()) != layers_)
+      throw std::runtime_error(prefix + "the target table has one entry per streamed row");
+    for (int64_t row = 0; row < layers_; ++row) {
+      const int32_t target = config.target[row], gate = config.gate[row];
+      if ((target < 0) != (gate < 0) || target >= layers_ || target == row || gate >= config.gate_count)
+        throw std::runtime_error(
+            prefix + "row " + std::to_string(row) + " names target " + std::to_string(target) + " with gate " +
+            std::to_string(gate));
+    }
+    try {
+      check_gate_choice(experts_, config.top_k, config.per_token, config.per_layer);
+    } catch (const std::invalid_argument& error) {
+      throw std::runtime_error(prefix + error.what());
+    }
+    if (config.gates == nullptr || config.bias == nullptr || config.gate_count < 1)
+      throw std::runtime_error(prefix + "it needs at least one gate");
+    if (static_cast<int>(config.cores.size()) != groups())
+      throw std::runtime_error(prefix + "one core list per NUMA group");
+    for (int g = 0; g < groups(); ++g)
+      if (dist_.group(g).cpu == nullptr)
+        throw std::runtime_error(
+            prefix + "it needs CPU experts on group " + std::to_string(g) + ", whose records stage the scorer's input");
+    const CpuExpertConfig& cpu = dist_.group(0).cpu->config();
+    if (config.hidden != cpu.hidden)
+      throw std::runtime_error(
+          prefix + "the gate's hidden size " + std::to_string(config.hidden) + " is not the CPU rows' " +
+          std::to_string(cpu.hidden));
+    auto spec = std::make_unique<SpecState>();
+    spec->x_base = cpu.x_base;
+    spec->x_stride = cpu.x_stride;
+    spec->x_token_bytes = cpu.x_token_bytes;
+    spec->tokens_max = cpu.tokens;
+    for (int g = 0; g < groups(); ++g) {
+      auto group = std::make_unique<SpecGroup>(std::string(Layout::kName) + "-spec" + std::to_string(g));
+      group->scorer.reserve(spec->tokens_max, config.hidden, experts_);
+      group->skip.assign(static_cast<size_t>(experts_), 0);
+      group->packed.reserve(1);
+      group->cores = config.cores[g];
+      group->row_seq = std::make_unique<std::atomic<uint32_t>[]>(static_cast<size_t>(layers_));
+      spec->groups.push_back(std::move(group));
+    }
+    spec->config = std::move(config);
+    spec_ = std::move(spec);
+  }
+
   // The number of eager-path map changes since the last take, {row, expert, slot} each with slot -1 an unmap: the bulk
   // delta that map_bulk_apply writes on the device. Owner only (a paused caller). Joins a running fill first, so a
   // failed fill's unmaps are counted.
@@ -1226,28 +1286,45 @@ class RamTier {
     const int g = Wire::home(expert);
     const int32_t id = static_cast<int32_t>(expert);
     int i = -1;
-    int64_t slot = -1;
     {
       std::lock_guard<std::mutex> lock(pool_->mutex(g));
       for (int k = 0; k < pool_->share() && i < 0; ++k)
         if (pool_->entry(row, g, k).word.load(std::memory_order_relaxed) == kPoolEmpty) i = k;
       if (i < 0) throw std::runtime_error(prefix + "no empty pool entry");
-      slot = pool_->entry(row, g, i).slot;
-      pool_->entry(row, g, i).word.store(pool_word(kPoolReading, id), std::memory_order_release);
+      PoolEntry& entry = pool_->entry(row, g, i);
+      entry.for_seq.store(0, std::memory_order_relaxed);  // no source record: every job sees it pooled before
+      entry.word.store(pool_word(kPoolReading, id), std::memory_order_release);
     }
     std::vector<uint8_t> packed;
-    const int result = dist_.group(g).reader.read(
-        row, std::span<const int32_t>(&id, 1), std::span<const int64_t>(&slot, 1), 1, [](size_t) { return false; },
-        nullptr, &packed);
-    _mm_sfence();
-    PoolEntry& entry = pool_->entry(row, g, i);
-    if (result != 1) {
-      entry.word.store(kPoolEmpty, std::memory_order_release);
-      throw std::runtime_error(prefix + "the read failed");
+    if (land_pool_row(g, row, i, id, &packed) != 1) throw std::runtime_error(prefix + "the read failed");
+    return pool_->entry(row, g, i).slot;
+  }
+
+  // Test only (InstrBuild): serves group g's next speculative job on the caller, as its speculative thread would;
+  // false when the ring is empty. Refused while the service thread runs.
+  bool spec_pump(int g)
+    requires(Build::kFaults)
+  {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    if (spec_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the RAM prefetch is not enabled");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "spec_pump while the service thread runs");
+    if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
+    SpecJob job;
+    if (!spec_->groups[g]->ring.pop(&job)) return false;
+    serve_spec_job(g, job);
+    return true;
+  }
+
+  // Test only (InstrBuild; ProdBuild throws): each speculative read sleeps `delay_ns` first, holding the reader's turn,
+  // and with `fail` is reported failed without reading.
+  void inject_spec(int64_t delay_ns, bool fail) {
+    if constexpr (!Build::kFaults) {
+      (void)delay_ns, (void)fail;
+      test_only("inject_spec");
+    } else {
+      faults_.spec_delay_ns.store(delay_ns);
+      faults_.spec_fail.store(fail);
     }
-    entry.landed.store(pool_->next_landing(), std::memory_order_relaxed);
-    entry.word.store(pool_word(kPoolLanded, id), std::memory_order_release);
-    return slot;
   }
 
   // Writes every counter with relaxed reads: a core counter is the sum of its writers' blocks (each word has one
@@ -1260,17 +1337,51 @@ class RamTier {
         if (i == kSpinCpu && g > 0) break;
         core += dist_.group(g).core.get(i);
       }
+      if (spec_ != nullptr)
+        for (const auto& spec : spec_->groups)
+          core += spec->core.get(i);
       out[i] = core + copy_core_.get(i) + stats_.get(i);
     }
   }
 
-  // Group g's own core counters: its service thread's block.
+  // Group g's own core counters: its service thread's block and its speculative thread's.
   void group_counters(int g, int64_t* out) const {
     for (int i = 0; i < kCounterCount; ++i)
-      out[i] = dist_.group(g).core.get(i);
+      out[i] = dist_.group(g).core.get(i) + (spec_ != nullptr ? spec_->groups[g]->core.get(i) : 0);
   }
 
  private:
+  // One group's speculative state (enable_ram_prefetch): its job ring from the group's service thread, the turn on the
+  // group's reader, its busy episode for the watchdog and its own counter block (one writer each).
+  struct SpecGroup {
+    explicit SpecGroup(const std::string& name) : trace(name) {}
+    SpscRing<SpecJob, 64> ring;  // arbitrary: one job per CPU record, the thread drains it every ~layer
+    Doorbell bell;
+    std::mutex turn;  // the group's reader: one demand read (read_rows) or one speculative read at a time
+    std::atomic<uint64_t> busy{0};
+    uint64_t episodes = 0;
+    std::atomic<bool> idle{true};
+    GateScorer scorer;
+    std::vector<uint8_t> skip;
+    std::vector<uint8_t> packed;
+    std::vector<int> cores;
+    // Per row: the seq of its last record the group's service handled, 0 before any. Service stores, scorer loads.
+    std::unique_ptr<std::atomic<uint32_t>[]> row_seq;
+    std::thread thread;
+    LineCounters<kCounterCount> core;
+    [[no_unique_address]] JobTrace<Build::kMetrics> trace;
+  };
+  struct SpecState {
+    RamPrefetchConfig config;
+    const uint8_t* x_base = nullptr;  // the CPU rows' staged inputs (CpuExpertConfig)
+    int64_t x_stride = 0;
+    int64_t x_token_bytes = 0;
+    int64_t tokens_max = 1;
+    std::vector<std::unique_ptr<SpecGroup>> groups;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> hold{false};
+  };
+
   // Test only (InstrBuild): inject()'s read delay, standing in for a slow read.
   void fault_delay(int64_t ns) {
     std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
@@ -1931,6 +2042,143 @@ class RamTier {
     return slot;
   }
 
+  template <Counter K>
+  void spec_count(SpecGroup& spec, int64_t n = 1) {
+    count_into<K>(spec.core, n);
+  }
+
+  // Service thread, after any whole record: notes the row's seq, and hands the record to the group's speculative
+  // thread when it staged a CPU input and its row has a target. A full ring drops it: the service never waits.
+  void offer_spec(Group& group, const Request& request) {
+    if (request.row < 0 || request.row >= layers_) return;
+    SpecGroup& spec = *spec_->groups[group.index];
+    spec.row_seq[request.row].store(request.seq, std::memory_order_release);
+    if (spec_->config.target[request.row] < 0) return;
+    bool staged = false;
+    for (const Lane& lane : request.lanes)
+      staged |= lane.kind == Wire::kKindHitCpu || lane.kind == Wire::kKindMissCpu;
+    if (!staged) return;
+    int64_t tokens = 1;
+    if (spec_->tokens_max > 1) {
+      uint32_t live;
+      std::memcpy(&live, spec_->x_base + request.row * spec_->x_stride + spec_->tokens_max * spec_->x_token_bytes, 4);
+      tokens = live;
+      if (tokens < 1 || tokens > spec_->tokens_max) {
+        count<kSpecDropped>(group);
+        return;
+      }
+    }
+    if (!spec.ring.push(SpecJob{request.seq, request.row, tokens})) {
+      count<kSpecDropped>(group);
+      return;
+    }
+    spec.bell.ring();
+  }
+
+  // True once the group served a record of `target` after `source_seq`: the read would land behind its own record.
+  static bool spec_stale(const SpecGroup& spec, int64_t target, uint32_t source_seq) {
+    const uint32_t last = spec.row_seq[target].load(std::memory_order_acquire);
+    return last != 0 && reached(last, skip_zero(source_seq + 1u));
+  }
+
+  // The scorer's skips for `target`: an expert VRAM-hot there, mapped there (the host mirror), or pooled from another
+  // source record. Lock-free loads of words other groups' threads write; a race costs at most a boundary candidate.
+  void fill_spec_skip(int64_t target, uint32_t source_seq, uint8_t* skip) {
+    Tier& tier = tiers_[target];
+    for (int64_t expert = 0; expert < experts_; ++expert) {
+      const bool hot = std::atomic_ref<uint8_t>(tier.hot[expert]).load(std::memory_order_relaxed) != 0;
+      const bool mapped = __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0;
+      skip[expert] = hot || mapped || pool_->pooled_before(target, static_cast<int32_t>(expert), source_seq);
+    }
+  }
+
+  // Speculative thread (or spec_pump): scores `job`'s target row and reads this group's picks into the pool. Both
+  // groups compute the same list from the same input and state, so the layer's budget holds over both.
+  void serve_spec_job(int g, const SpecJob& job) {
+    SpecGroup& spec = *spec_->groups[g];
+    const RamPrefetchConfig& config = spec_->config;
+    const int64_t target = config.target[job.row];
+    if (spec_stale(spec, target, job.seq)) {
+      spec_count<kSpecDropped>(spec);
+      return;
+    }
+    fill_spec_skip(target, job.seq, spec.skip.data());
+    const int64_t gate = config.gate[job.row];
+    int32_t chosen[GateScorer::kMaxPerLayer];
+    const int n = spec.scorer.choose(
+        spec_->x_base + job.row * spec_->x_stride, job.tokens, spec_->x_token_bytes,
+        config.gates + gate * experts_ * config.hidden, config.bias + gate * experts_, experts_, config.hidden,
+        config.top_k, config.per_token, config.per_layer, spec.skip.data(), chosen);
+    for (int i = 0; i < n; ++i)
+      if (Wire::home(chosen[i]) == g) spec_read(g, target, job.seq, chosen[i]);
+  }
+
+  // Reads `expert`'s row of `target` into a pool entry of group g under the group's reader turn, so a demand read
+  // waits for at most this one row. Dropped when stale, or when the expert was mapped or pooled meanwhile.
+  void spec_read(int g, int64_t target, uint32_t source_seq, int32_t expert) {
+    SpecGroup& spec = *spec_->groups[g];
+    std::lock_guard<std::mutex> turn(spec.turn);
+    if (spec_stale(spec, target, source_seq) ||
+        __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
+        pool_->find(target, g, expert) >= 0) {
+      spec_count<kSpecDropped>(spec);
+      return;
+    }
+    int i = -1;
+    {
+      std::lock_guard<std::mutex> lock(pool_->mutex(g));
+      i = pool_->claimable_locked(target, g);  // never a swapped entry: its victim may still be mapped
+      if (i < 0) {
+        spec_count<kSpecDropped>(spec);
+        return;
+      }
+      PoolEntry& entry = pool_->entry(target, g, i);
+      entry.for_seq.store(source_seq, std::memory_order_relaxed);
+      entry.word.store(pool_word(kPoolReading, expert), std::memory_order_release);
+    }
+    spec_count<kSpecIssued>(spec);
+    spec.busy.store(++spec.episodes, std::memory_order_release);
+    bool fail = false;
+    if constexpr (Build::kFaults) {
+      if (const int64_t ns = faults_.spec_delay_ns.load()) fault_delay(ns);
+      fail = faults_.spec_fail.load();
+    }
+    int result = 0;
+    if (fail)
+      pool_->entry(target, g, i).word.store(kPoolEmpty, std::memory_order_release);
+    else
+      result = land_pool_row(g, target, i, expert, &spec.packed);
+    spec.busy.store(0, std::memory_order_release);
+    if (result == 1) {
+      spec_count<kSpecLanded>(spec);
+    } else {
+      spec_count<kSpecFailed>(spec);
+    }
+  }
+
+  // Reads `expert`'s row of `row` into group g's pool entry i, which the caller claimed (kPoolReading), then lands the
+  // entry, or empties it when the read failed. Returns the read's result, 1 when the row landed.
+  int land_pool_row(int g, int64_t row, int i, int32_t expert, std::vector<uint8_t>* packed) {
+    PoolEntry& entry = pool_->entry(row, g, i);
+    const int64_t slot = entry.slot;  // stable: only a swap changes it, and a swap takes a landed entry
+    int result = 0;
+    try {
+      result = dist_.group(g).reader.read(
+          row, std::span<const int32_t>(&expert, 1), std::span<const int64_t>(&slot, 1), 1,
+          [](size_t) { return false; }, nullptr, packed);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "ERROR %spool read: %s\n", error_prefix<Layout>().c_str(), error.what());
+    }
+    _mm_sfence();  // the row's bytes before the landed word
+    if (result == 1) {
+      entry.landed.store(pool_->next_landing(), std::memory_order_relaxed);
+      entry.word.store(pool_word(kPoolLanded, expert), std::memory_order_release);
+    } else {
+      entry.word.store(kPoolEmpty, std::memory_order_release);
+    }
+    return result;
+  }
+
   // The row's publisher, right after it publishes `request`'s delta: every group's entry swapped by this record becomes
   // empty, so no speculative read lands in a victim the device may still map. A reporter's swaps precede its report,
   // which the publisher's report acquires, so each is in place by now.
@@ -2270,6 +2518,7 @@ class RamTier {
   std::vector<Tier> tiers_;       // the owner's, with every other non-atomic member: the tier has no mutex
   // The speculative pool, once reserved (reserve_spec_pool); null with the RAM prefetch off.
   std::unique_ptr<SpecPool> pool_;
+  std::unique_ptr<SpecState> spec_;  // null with the RAM prefetch off
   std::atomic<int64_t> prefill_share_{0};  // any thread stores it, relaxed; see set_prefill_share
   std::atomic<bool> threaded_{false};
   // The pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_ serializes Python-side callers
@@ -2285,6 +2534,8 @@ class RamTier {
     ReadFault pending_fault{};
     std::atomic<bool> fault_pending{false};
     std::array<std::atomic<int64_t>, Wire::kNodes> group_stall_ns{};  // inject_group_stall, once per group
+    std::atomic<int64_t> spec_delay_ns{0};  // inject_spec: each speculative read sleeps first, holding the turn
+    std::atomic<bool> spec_fail{false};
   };
   struct NoTierFaults {};
   [[no_unique_address]] std::conditional_t<Build::kFaults, TierFaults, NoTierFaults> faults_;

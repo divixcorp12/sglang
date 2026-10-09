@@ -8,7 +8,7 @@
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
 //              publish_piece: one synchronous read through the reader, with traces and injected faults
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
-//              trace_clock_reads, spec_place
+//              trace_clock_reads, spec_place, spec_pump, inject_spec
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
@@ -1189,6 +1189,26 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (RamTier::spec_pump): serves group `group`'s next speculative job on the caller; 1 if it served one.
+  static int64_t spec_pump(int64_t handle, int64_t group) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)group;
+      test_only("spec_pump");
+    } else {
+      return find(handle)->spec_pump(static_cast<int>(group)) ? 1 : 0;
+    }
+  }
+
+  // Test only (RamTier::inject_spec): each speculative read sleeps `delay_ns` first, and with `fail` fails. InstrBuild.
+  static void inject_spec(int64_t handle, int64_t delay_ns, int64_t fail) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)delay_ns, (void)fail;
+      test_only("inject_spec");
+    } else {
+      find(handle)->inject_spec(delay_ns, fail != 0);
+    }
+  }
+
   // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
   static void inject_fault(int64_t handle, TensorView fault) {
     if constexpr (!Build::kFaults) {
@@ -1306,6 +1326,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_group_stall, Exports::inject_group_stall);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_place, Exports::spec_place);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_pump, Exports::spec_pump);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_spec, Exports::inject_spec);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_score_gate, Exports::score_gate);

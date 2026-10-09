@@ -117,6 +117,8 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "inject_fault",
     "inject_group_stall",
     "spec_place",
+    "spec_pump",
+    "inject_spec",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
@@ -1742,6 +1744,59 @@ class ExpertStreamHost:
             {"group": g, "slot": slot, "state": SPEC_POOL_STATES[state], "expert": expert}
             for g, slot, state, expert in out.tolist()
         ]
+
+    def enable_ram_prefetch(
+        self,
+        targets: torch.Tensor,
+        gates: torch.Tensor,
+        bias: torch.Tensor,
+        *,
+        top_k: int,
+        per_token: int,
+        per_layer: int,
+        cores: Sequence[Sequence[int]],
+    ) -> None:
+        """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
+        the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
+        ``gates`` bf16 ``[n, experts, hidden]`` and ``bias`` fp32 ``[n, experts]`` are host tensors this host keeps
+        alive; ``cores`` is each NUMA group's speculative-thread core list (empty: the caller's affinity)."""
+        from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
+
+        if gates.dtype != torch.bfloat16 or gates.dim() != 3 or gates.device.type != "cpu" or not gates.is_contiguous():
+            raise ValueError("gates must be a contiguous host bf16 [n, experts, hidden] tensor")
+        if bias.dtype != torch.float32 or tuple(bias.shape) != tuple(gates.shape[:2]) or bias.device.type != "cpu":
+            raise ValueError("bias must be a host fp32 [n, experts] tensor")
+        if len(cores) != self.nodes:
+            raise ValueError(f"one core list per NUMA group ({self.nodes}), got {len(cores)}")
+        table = torch.full((self.nodes, max(1, max(len(own) for own in cores))), -1, dtype=torch.int64)
+        for g, own in enumerate(cores):
+            for j, core in enumerate(own):
+                check_not_reserved(int(core))
+                table[g, j] = int(core)
+        bias = bias.contiguous()
+        self._module.expert_stream_enable_ram_prefetch(
+            self.handle,
+            targets.to(torch.int64).contiguous(),
+            gates.view(gates.shape[0], -1).view(torch.uint8),
+            bias,
+            table,
+            int(gates.shape[2]),
+            int(top_k),
+            int(per_token),
+            int(per_layer),
+        )
+        self.ram_prefetch_tensors = (gates, bias)
+
+    def spec_pump(self, group: int = 0) -> bool:
+        """Test only: serve NUMA group ``group``'s next speculative job on the calling thread (no service thread)."""
+        _refuse_test_only("spec_pump", self.variant)
+        return bool(self._module.expert_stream_spec_pump(self.handle, int(group)))
+
+    def inject_spec(self, delay_s: float = 0.0, fail: bool = False) -> None:
+        """Test only: each speculative read sleeps ``delay_s`` first, holding the reader's turn; with ``fail`` it is
+        reported failed without reading."""
+        _refuse_test_only("inject_spec", self.variant)
+        self._module.expert_stream_inject_spec(self.handle, int(delay_s * 1e9), int(fail))
 
     def take_bulk_delta(self) -> torch.Tensor:
         """Return the eager paths' map changes since the last call.

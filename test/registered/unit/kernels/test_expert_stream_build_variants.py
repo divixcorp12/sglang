@@ -132,6 +132,8 @@ RAW_EXPORTS = {
     "inject_fault": lambda m, h: m.expert_stream_inject_fault(h, ops._fault_tensor(part=0, part_error=5)),
     "inject_group_stall": lambda m, h: m.expert_stream_inject_group_stall(h, 0, 0),
     "spec_place": lambda m, h: m.expert_stream_spec_place(h, 0, 0),
+    "spec_pump": lambda m, h: m.expert_stream_spec_pump(h, 0),
+    "inject_spec": lambda m, h: m.expert_stream_inject_spec(h, 0, 0),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),
     "copy_engine_ballast": lambda m, h: m.expert_stream_copy_engine_ballast(h, 0, 0, 0),
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),

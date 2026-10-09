@@ -735,6 +735,69 @@ struct HostExports {
     tier->spec_pool(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
+  // Enables the RAM prefetch (RamTier::enable_ram_prefetch). `targets` int64 [rows, 2]: per source row its target row
+  // and that row's gate index, or -1 -1. `gates` uint8 [n, experts * hidden * 2] (bf16 [experts, hidden] each) and
+  // `bias` float32 [n, experts], host memory the caller keeps alive. `cores` int64 [groups, width]: each group's
+  // speculative thread's cores, -1 padding (none: the caller's affinity). Cores 64-71 are refused.
+  static void enable_ram_prefetch(
+      int64_t handle,
+      TensorView targets,
+      TensorView gates,
+      TensorView bias,
+      TensorView cores,
+      int64_t hidden,
+      int64_t top_k,
+      int64_t per_token,
+      int64_t per_layer) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    auto host_mem = SymbolicDevice{};
+    auto host_bias = SymbolicDevice{};
+    auto rows = SymbolicSize{"rows"};
+    auto n = SymbolicSize{"gates"};
+    expert_stream::verify_named(
+        "targets", TensorMatcher({rows, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), targets);
+    expert_stream::verify_named(
+        "gates", TensorMatcher({n, -1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), gates);
+    expert_stream::verify_named(
+        "bias", TensorMatcher({n, -1}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_bias), bias);
+    expert_stream::verify_named(
+        "cores", TensorMatcher({Wire::kNodes, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
+    const auto tier = find(handle);
+    if (hidden < 1 || bias.size(1) != tier->experts() || gates.size(1) != tier->experts() * hidden * 2)
+      throw std::runtime_error(
+          error_prefix<Layout>() +
+          "RAM prefetch: the gates are not bf16 [n, experts, hidden] with an fp32 bias per expert");
+    expert_stream::RamPrefetchConfig config;
+    const auto* t = static_cast<const int64_t*>(targets.data_ptr());
+    for (int64_t row = 0; row < targets.size(0); ++row) {
+      config.target.push_back(static_cast<int32_t>(t[2 * row]));
+      config.gate.push_back(static_cast<int32_t>(t[2 * row + 1]));
+    }
+    config.gates = static_cast<const uint16_t*>(gates.data_ptr());
+    config.bias = static_cast<const float*>(bias.data_ptr());
+    config.gate_count = gates.size(0);
+    config.hidden = hidden;
+    config.top_k = static_cast<int>(top_k);
+    config.per_token = static_cast<int>(per_token);
+    config.per_layer = static_cast<int>(per_layer);
+    const auto* c = static_cast<const int64_t*>(cores.data_ptr());
+    for (int g = 0; g < Wire::kNodes; ++g) {
+      std::vector<int> own;
+      for (int64_t j = 0; j < cores.size(1); ++j) {
+        const int64_t core = c[g * cores.size(1) + j];
+        if (core < 0) continue;
+        if (core >= CPU_SETSIZE || (core >= 64 && core <= 71))
+          throw std::runtime_error(
+              error_prefix<Layout>() + "RAM prefetch: core " + std::to_string(core) +
+              " is out of range or reserved (64-71 take NVMe completion interrupts)");
+        own.push_back(static_cast<int>(core));
+      }
+      config.cores.push_back(std::move(own));
+    }
+    tier->enable_ram_prefetch(std::move(config));
+  }
+
   // The eager paths' map changes since the last call: bulk_delta_count, then take_bulk_delta into int32 [that, 3] of
   // {row, expert, slot}. A paused caller only; the count call joins a running fill first, so its unmaps are counted.
   static int64_t bulk_delta_count(int64_t handle) {
@@ -1050,6 +1113,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_reserve_spec_pool, Exports::reserve_spec_pool);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_share, Exports::spec_share);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_pool, Exports::spec_pool);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_ram_prefetch, Exports::enable_ram_prefetch); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                     \

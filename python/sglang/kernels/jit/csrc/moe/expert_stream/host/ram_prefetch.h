@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace sglang::expert_stream {
 
@@ -38,7 +39,7 @@ inline int32_t pool_expert(uint32_t word) {
 struct PoolEntry {
   int32_t slot = -1;  // under the group's mutex
   std::atomic<uint32_t> word{kPoolEmpty};
-  std::atomic<uint32_t> for_seq{0};  // the target record the read was issued for
+  std::atomic<uint32_t> for_seq{0};  // the source record whose scoring issued the read
   std::atomic<uint64_t> landed{0};   // landing order: with no empty entry, the oldest landed one is reclaimed
   uint64_t freed_at = 0;             // swapped: the map chain whose delta evicts the victim; under the group's mutex
 };
@@ -110,6 +111,28 @@ class SpecPool {
   std::unique_ptr<PoolEntry[]> entries_;
   std::unique_ptr<std::mutex[]> mutexes_;
   std::atomic<uint64_t> landings_{0};
+};
+
+// The RAM prefetch's settings (RamTier::enable_ram_prefetch).
+struct RamPrefetchConfig {
+  std::vector<int32_t> target;  // per source row: the next streamed layer's row, or -1 (none, or no biased gate)
+  std::vector<int32_t> gate;    // per source row: the target's index in gates and bias, or -1
+  const uint16_t* gates = nullptr;  // bf16 [gate_count, experts, hidden], host memory the caller keeps alive
+  const float* bias = nullptr;      // fp32 [gate_count, experts]
+  int64_t gate_count = 0;
+  int64_t hidden = 0;
+  int top_k = 0;
+  int per_token = 0;
+  int per_layer = 0;
+  std::vector<std::vector<int>> cores;  // per group: its speculative thread's cores; empty inherits the caller's
+};
+
+// One record handed from a group's service thread to its speculative thread: a record of `row` that staged `tokens`
+// live inputs.
+struct SpecJob {
+  uint32_t seq = 0;
+  int64_t row = 0;
+  int64_t tokens = 1;
 };
 
 }  // namespace sglang::expert_stream
