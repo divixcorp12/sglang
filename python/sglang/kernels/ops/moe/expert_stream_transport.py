@@ -2782,6 +2782,9 @@ class ExpertStreamDevice:
         self._spec = None
         self.spec_candidates = None
         self.spec_scores = None
+        # The stream the scoring forks onto (spec_score) until spec_join; None on a CPU device.
+        self.spec_stream = None
+        self._spec_forked = False
 
     def _kernels(self):
         """Return the device module, loading it on first use."""
@@ -2877,17 +2880,37 @@ class ExpertStreamDevice:
         self.spec_scores = torch.empty(
             (self.cpu_tokens_max, self.experts), dtype=torch.float32, device=self.state.device
         )
+        if torch.device(self.state.device).type == "cuda":
+            self.spec_stream = torch.cuda.Stream(device=self.state.device)
 
     def spec_score(self, entry, x: Optional[torch.Tensor]) -> None:
         """Score the record this device just posted: layer T's MoE input ``x`` (bf16 [tokens, hidden] or [hidden], or
         None) against ``entry`` (a ``SpecScoreRow``), then publish its candidates to the record's slot. A record of no
-        input or more than cpu_tokens_max tokens publishes count 0. Right after ``post``, on its stream."""
+        input or more than cpu_tokens_max tokens publishes count 0. Right after ``post``: forks onto ``spec_stream``
+        until ``spec_join``, so the post's stream goes on to C1 without waiting for it."""
         if self._spec is None:
             raise RuntimeError("the GPU scorer is not enabled on this device (enable_spec_scorer)")
         self._check_row(entry.target)
-        top_k, per_token, top_k_only = self._spec
         tokens = 0 if x is None else (int(x.shape[0]) if x.dim() == 2 else 1)
         module = self._kernels()
+        if self.spec_stream is None:
+            self._spec_launch(entry, x, tokens, module)
+            return
+        # A wait_stream fork, which a breakable capture tracks and joins at a segment end if spec_join has not.
+        self.spec_stream.wait_stream(torch.cuda.current_stream(self.spec_stream.device))
+        with torch.cuda.stream(self.spec_stream):
+            self._spec_launch(entry, x, tokens, module)
+        self._spec_forked = True
+
+    def spec_join(self) -> None:
+        """Make the current stream wait for the scoring spec_score forked: before anything that may post again (the
+        record's seq), free ``x`` or rewrite the score scratch."""
+        if self._spec_forked:
+            torch.cuda.current_stream(self.spec_stream.device).wait_stream(self.spec_stream)
+            self._spec_forked = False
+
+    def _spec_launch(self, entry, x, tokens: int, module) -> None:
+        top_k, per_token, top_k_only = self._spec
         if 1 <= tokens <= self.cpu_tokens_max:
             run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
         run_spec_select(

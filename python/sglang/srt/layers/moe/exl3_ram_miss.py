@@ -691,7 +691,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             spill=self.spill,
         )
         if self.spec_expected:
-            # Layer T+1's gate on this layer's input, published before C1 so the host can read it while this layer runs.
+            # Layer T+1's gate on this layer's input, forked off this stream so C1 does not wait for it; joined below.
             side.spec_score(entry=self.spec_score, x=self.cpu_input[0] if self.cpu_input is not None else None)
         side.copy_engine_captured |= captured
         copy_expert_row_segments_gpu(
@@ -706,6 +706,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             self.stream_maps[tag],
         )
         side.copy_wait(plan.count, plan.slots, self.copy_sm_table)
+        if self.spec_expected:
+            # After the copy wait the scoring overlapped; before the next post rewrites the seq it published under.
+            side.spec_join()
         self._delivered = plan.count
 
 
