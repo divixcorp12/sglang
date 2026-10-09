@@ -89,6 +89,22 @@ ARMS["dspark-both-prefetch-gpu-floors"] = (
     {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": MARGIN_FLOORS},
     True,
 )
+# The dynamic mirror root choice (design 2026-10-09-dsv41-drive-aware-reads, change (3)) is off in every arm but the
+# cap arm, pinned so a shell that exports it cannot carry it into one.
+MIRROR_STATIC = {"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": "0", "SGLANG_MOE_EXPERT_MIRROR_CAPS": ""}
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm.update(MIRROR_STATIC)
+# The GPU arm with a per-drive in-flight cap: each sub-read picks its root late, skipping a root with that many
+# sub-reads in flight. Roots in arm_env.EXPERT_MIRROR_DIRS order: nvme0, nvme4 (the SPCC, DSV41_REFERENCE.md 33.16),
+# nvme2.
+ARMS["dspark-both-prefetch-gpu-cap"] = (
+    {
+        **ARMS["dspark-both-prefetch-gpu"][0],
+        "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": "1",
+        "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2,4",
+    },
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -98,6 +114,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu": "dspark-both",
     "dspark-both-prefetch-gpu-topk": "dspark-both",
     "dspark-both-prefetch-gpu-floors": "dspark-both",
+    "dspark-both-prefetch-gpu-cap": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (

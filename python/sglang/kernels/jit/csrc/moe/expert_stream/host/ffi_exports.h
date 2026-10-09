@@ -952,6 +952,16 @@ struct HostExports {
     find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
   }
 
+  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC's caps, one int64 per mirror root (empty: off), on every group's reader
+  // (RamTier::set_mirror_caps). Paused or before the thread starts.
+  static void set_mirror_caps(int64_t handle, TensorView caps) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("caps", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), caps);
+    const auto* data = static_cast<const int64_t*>(caps.data_ptr());
+    find(handle)->set_mirror_caps(std::span<const int64_t>(data, static_cast<size_t>(caps.size(0))));
+  }
+
   // The tier's drive load (DriveLoad::snapshot, kDriveLoadWords words): relaxed reads, callable while the service runs.
   static void drive_load(int64_t handle, TensorView out) {
     using namespace host;
@@ -1160,6 +1170,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_group_counters, Exports::group_counters);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_drive_load, Exports::drive_load);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_mirror_caps, Exports::set_mirror_caps);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                 \

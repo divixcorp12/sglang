@@ -50,7 +50,7 @@ from sglang.srt.layers.moe.exl3_expert_format import (
     RowSegment,
 )
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
-from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
+from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy, mirror_caps
 from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
@@ -1106,6 +1106,20 @@ class Exl3RamMissService:
             sq_thread_cpus=[-1 if p.sq is None else p.sq for p in numa.plans],
         )
         try:
+            # SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (validated at launch): before the thread
+            # starts, every group's reader picks each sub-read's root under these caps.
+            caps = mirror_caps(
+                envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get(),
+                envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get(),
+                envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get(),
+            )
+            if caps is not None:
+                host.set_mirror_caps(caps)
+            logger.info(
+                "exl3 RAM miss mirror roots: %s",
+                "static split" if caps is None
+                else "dynamic, in-flight caps " + ",".join(str(c) for c in caps),
+            )
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
             host.reserve_staging(self.staging_width())

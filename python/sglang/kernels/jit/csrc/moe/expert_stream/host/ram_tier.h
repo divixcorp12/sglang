@@ -1435,6 +1435,16 @@ class RamTier {
     }
   }
 
+  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC: every group's reader picks each sub-read's root under `caps`, one in-flight cap
+  // per mirror root (ReaderCore::set_mirror_caps); empty turns it off. Demand and speculative reads both go through
+  // the groups' readers, so both choose. On the owner (before the thread starts, or paused).
+  void set_mirror_caps(std::span<const int64_t> caps) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("set_mirror_caps");
+    for (int g = 0; g < dist_.size(); ++g)
+      dist_.group(g).reader.set_mirror_caps(caps);
+  }
+
   // The drive load (drive_load.h), kDriveLoadWords words, relaxed reads from any thread: exact once every reader is
   // idle, as at the shutdown line.
   void drive_load(int64_t* out) const {
