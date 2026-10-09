@@ -724,3 +724,28 @@ def test_ram_prefetch_options_outside_the_hosts_bounds_are_refused(model_dir, na
     assert expert_stream_requirements_for(args, args).label == "EXL3"
     with pytest.raises(ValueError, match=f"{name} must be in"):
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, **{name: value})
+
+
+def test_the_ram_prefetch_scorer_defaults_to_the_cpu():
+    """The GPU scorer is opt-in until its A/B is accepted (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer-design)."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get() == "cpu"
+
+
+def test_the_gpu_scorer_runs_on_the_prefetch_and_the_captured_copy_engine_post(model_dir):
+    """gpu needs the prefetch it feeds, and the copy-engine post whose capture the scoring kernels follow."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": False}
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu runs after the copy-engine post"):
+        _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_an_unknown_ram_prefetch_scorer_is_refused_whether_or_not_the_prefetch_is_on(model_dir, prefetch):
+    """A typo must not fall back to the CPU scorer silently, nor pass while the prefetch is off."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=prefetch, SGLANG_DSV41_RAM_PREFETCH_SCORER="tpu")
