@@ -419,3 +419,26 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_the_candidate_page_layout_is_the_python_mirror():
+    """spec_candidates.h's literal offsets against expert_stream_transport's CAND_* and read_candidates' struct
+    formats (<IHH header, <HBxf entry)."""
+    text = (CSRC / "expert_stream" / "spec_candidates.h").read_text()
+    found = {k: int(v) for k, v in re.findall(r"static constexpr \w+ (k\w+) = (\d+);", text)}
+    want = {
+        "kMaxCandidates": ram_miss.CAND_MAX,
+        "kCandRecords": ram_miss.CAND_RECORDS,
+        "kCandSeq": 0,
+        "kCandCount": 4,
+        "kCandFlags": 6,
+        "kCandEntries": ram_miss.CAND_ENTRIES,
+        "kCandEntryBytes": ram_miss.CAND_ENTRY_BYTES,
+        "kCandExpert": 0,
+        "kCandRank": 2,
+        "kCandMargin": 4,
+        "kCandStride": ram_miss.CAND_STRIDE,
+        "kCandFlagOversize": ram_miss.CAND_FLAG_OVERSIZE,
+    }
+    assert {k: found.get(k) for k in want} == want
+    assert ram_miss.CAND_PAGE_BYTES == ram_miss.CAND_RECORDS * ram_miss.CAND_STRIDE == 2048

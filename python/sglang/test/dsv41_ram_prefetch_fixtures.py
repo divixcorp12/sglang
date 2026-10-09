@@ -5,12 +5,19 @@ the fake kernel, every eligible lane the CPU's, driven by ChainSim."""
 from __future__ import annotations
 
 import os
+import struct
 from dataclasses import dataclass
 
 import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_hot_page, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import (
+    ExpertStreamHost,
+    candidate_offset,
+    new_candidate_page,
+    new_hot_page,
+    new_page,
+)
 from sglang.test.dsv41_chain_sim import ChainSim, SimRequest
 from sglang.test.dsv41_ram_miss_fixtures import RamMissSetup, fake_cpu_layer, ram_miss_setup
 
@@ -159,3 +166,34 @@ def trigger(rig: PrefetchRig, *, tokens: int = 1, resident: int = 5) -> SimReque
     req = rig.sim.post(0, [resident], captured=True, cpu_on=True)
     _served(rig, req)
     return req
+
+
+def enable_gpu(rig: PrefetchRig, *, targets=None, top_k=2, per_token=1, per_layer=1) -> torch.Tensor:
+    """The GPU scorer on the rig (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer-design): row 0 targets row 1 unless
+    `targets` (int64 [rows, 2]) says otherwise. Returns the candidate page, which the test writes as the select kernel
+    would (write_candidate_slot)."""
+    rows = rig.x_rows.shape[0]
+    if targets is None:
+        targets = torch.tensor([[1, 0]] + [[-1, -1]] * (rows - 1), dtype=torch.int64)
+    page = new_candidate_page(pin=False)
+    rig.host.enable_ram_prefetch(
+        targets,
+        None,
+        None,
+        top_k=top_k,
+        per_token=per_token,
+        per_layer=per_layer,
+        cores=[[] for _ in range(rig.host.nodes)],
+        candidates=page,
+    )
+    return page
+
+
+def write_candidate_slot(page: torch.Tensor, seq: int, picks, *, flags: int = 0, slot_seq=None) -> None:
+    """Writes `seq`'s slot as the select kernel does: the count, flags and (expert, rank, margin) entries, then the seq
+    word. `slot_seq` stores another word instead: a later record's (a lapping select) or 0 (a slot still open)."""
+    off = candidate_offset(seq)
+    payload = struct.pack("<HH", len(picks), flags) + b"".join(struct.pack("<HBxf", e, r, m) for e, r, m in picks)
+    page[off + 4 : off + 4 + len(payload)] = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    word = (seq if slot_seq is None else slot_seq) & 0xFFFFFFFF
+    page[off : off + 4] = torch.frombuffer(bytearray(struct.pack("<I", word)), dtype=torch.uint8)
