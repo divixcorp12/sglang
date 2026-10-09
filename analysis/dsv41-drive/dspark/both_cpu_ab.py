@@ -38,16 +38,36 @@ DRAFT_ONLY = {
 ARMS = {
     "prod": ({}, False),
     "dspark-draft-only": ({**arm_env.dspark_env(), **DRAFT_ONLY}, True),
-    "dspark-both": (arm_env.dspark_env(), True),
+    # States the RAM prefetch off, so a captured shell cannot carry it into the A of the prefetch pair.
+    "dspark-both": ({**arm_env.dspark_env(), "SGLANG_DSV41_RAM_PREFETCH": "0"}, True),
     # Experiment-only; retire with plan 2026-10-07-dsv41-row-weighted-serving-experiment. B arms, one source at a time.
     "dspark-both-rw-draft": ({**arm_env.dspark_env(), "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "draft"}, True),
     "dspark-both-rw-target": ({**arm_env.dspark_env(), "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"}, True),
+    # NVMe-to-RAM prefetch (spec 2026-10-08-dsv41-ram-prefetch-design, The A/B): the replay's best arm, h=1, one
+    # candidate per token, one row per layer, a pool of 2 per row and group (the options' defaults).
+    "dspark-both-prefetch": ({**arm_env.dspark_env(), "SGLANG_DSV41_RAM_PREFETCH": "1"}, True),
 }
+# Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
+PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
+# An arm whose outputs are also compared with its A's, not only with prod's.
+REFERENCE = {"dspark-both-prefetch": "dspark-both"}
+COUNTER_MARKER = "exl3 RAM miss thread counters "
+RAM_KEYS = (
+    "rows_read",
+    "spec_issued",
+    "spec_landed",
+    "spec_used",
+    "spec_promoted",
+    "spec_dropped",
+    "spec_failed",
+    "spec_delayed",
+)
 
 
 def _overrides(arm: str, out: str) -> dict:
     overrides, _ = ARMS[arm]
-    return {**overrides, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")}
+    passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
+    return {**overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")}
 
 
 def _probe_overrides(arm: str, out: str) -> dict:
@@ -123,6 +143,17 @@ def _results(out: str, arm: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def _server_counters(out: str, arm: str):
+    """The last counters line of the arm's timed server: the service's lifetime (warm-up and the timed set)."""
+    runs = sorted(os.listdir(os.path.join(out, "servers", arm)))
+    path = os.path.join(out, "servers", arm, runs[-1], "server.log")
+    if not os.path.exists(path):
+        return None
+    with open(path, errors="replace") as f:
+        lines = [line for line in f if COUNTER_MARKER in line]
+    return json.loads(lines[-1].split(COUNTER_MARKER, 1)[1]) if lines else None
+
+
 def summarize(out: str) -> dict:
     sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
     import dspark_text_band
@@ -157,6 +188,20 @@ def summarize(out: str) -> dict:
             with open(probes[arm]) as f:
                 other = json.load(f)
             entry["text_vs_prod"] = dspark_text_band.compare(base, other)
+        counters = _server_counters(out, arm)
+        if counters:
+            entry["ram"] = {k: counters.get(k) for k in RAM_KEYS}
+            entry["ram"]["scope"] = "server lifetime: warm-up and the timed set"
+            tokens = sum(r["completion_tokens"] for r in rows)
+            entry["ram_rows_per_timed_token"] = counters["rows_read"] / tokens if tokens else None
+        reference = REFERENCE.get(arm)
+        ref_probes = {a: os.path.join(out, f"{a}.probe.json") for a in (reference, arm)} if reference else {}
+        if ref_probes and all(os.path.exists(p) for p in ref_probes.values()):
+            with open(ref_probes[reference]) as f:
+                base = json.load(f)
+            with open(ref_probes[arm]) as f:
+                other = json.load(f)
+            entry["text_vs_reference"] = dspark_text_band.compare(base, other)
         summary[arm] = entry
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
