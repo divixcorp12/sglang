@@ -94,7 +94,7 @@ def test_the_private_build_caches_reach_every_arms_server(monkeypatch):
 PROBE = [{"session_id": "s0", "tokens": [{"token": 1, "top": [[1, -0.1], [2, -2.0]]}]}]
 
 
-def _arm_run(root, arm, rows_read=2000, used=0, warmups=(100,), probe=PROBE, timed_tokens=100):
+def _arm_run(root, arm, rows_read=2000, used=0, warmups=(100,), probe=PROBE, timed_tokens=100, counters=None):
     run = root / "servers" / arm / "run-1"
     run.mkdir(parents=True)
     (run / "results.jsonl").write_text(
@@ -102,7 +102,7 @@ def _arm_run(root, arm, rows_read=2000, used=0, warmups=(100,), probe=PROBE, tim
     )
     for n, tokens in enumerate(warmups, 1):
         (run / f"results-warmup-{n}.jsonl").write_text(json.dumps({"completion_tokens": tokens}) + "\n")
-    counters = {"rows_read": rows_read, "spec_issued": 900, "spec_used": used}
+    counters = counters or {"rows_read": rows_read, "spec_issued": 900, "spec_used": used}
     (run / "server.log").write_text("noise\nexl3 RAM miss thread counters " + json.dumps(counters) + "\n")
     if probe is not None:
         (root / f"{arm}.probe.json").write_text(json.dumps(probe))
@@ -127,6 +127,24 @@ def test_the_lifetime_ratio_counts_every_warmup_round_the_server_ran(tmp_path):
     summary = ab.summarize(str(tmp_path))["dspark-both"]
     assert summary["warmup_rounds"] == 4 and summary["lifetime_tokens"] == 500
     assert summary["ram_rows_per_token_lifetime"] == 10.0 and summary["ram"]["rows_read"] == 5000
+
+
+def test_the_summary_reports_drive_load_and_wasted_reads_per_lifetime_token(tmp_path):
+    ab = _ab()
+    counters = {"rows_read": 2000, "spec_issued": 900, "spec_landed": 800, "spec_used": 700}
+    _arm_run(tmp_path, "dspark-both-prefetch", counters=counters)
+    b = ab.summarize(str(tmp_path))["dspark-both-prefetch"]
+    assert b["lifetime_tokens"] == 200 and b["ram_rows_per_token_lifetime"] == 10.0
+    assert b["nvme_rows_per_token_lifetime"] == 14.5
+    assert b["spec_wasted_per_token_lifetime"] == 0.5
+
+
+def test_the_drive_load_fields_need_their_counters(tmp_path):
+    ab = _ab()
+    _arm_run(tmp_path, "dspark-both", counters={"rows_read": 2000})
+    a = ab.summarize(str(tmp_path))["dspark-both"]
+    assert a["ram_rows_per_token_lifetime"] == 10.0
+    assert "nvme_rows_per_token_lifetime" not in a and "spec_wasted_per_token_lifetime" not in a
 
 
 def test_a_probe_pair_that_cannot_be_compared_is_recorded_not_raised(tmp_path):

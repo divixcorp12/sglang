@@ -56,6 +56,20 @@ def test_a_pool_row_is_invisible_to_the_device_until_a_forced_miss_swaps_it_in(t
         rig.host.stop()
 
 
+def test_a_record_whose_misses_all_came_from_the_pool_counts_served_and_reads_nothing(tmp_path):
+    """The stage record says served, so the counters do too; rows_read still counts only real reads."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        rig.host.spec_place(1, 4)
+        before = rig.host.counters()
+        forced(rig, 1, [4])
+        after = rig.host.counters()
+        assert after["served"] == before["served"] + 1 and after["touch_only"] == before["touch_only"]
+        assert after["rows_read"] == before["rows_read"]
+    finally:
+        rig.host.stop()
+
+
 def test_the_swap_still_evicts_its_victim_in_the_delta(tmp_path):
     """Mutant: skip the victim's eviction entry in the forced loop -- red on the delta."""
     rig = prefetch_rig(tmp_path)
