@@ -2122,8 +2122,10 @@ class RamTier {
     entry.freed_at = request.chain;
     entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
     count<kSpecUsed>(group);
-    if constexpr (Build::kMetrics)
-      spec_->groups[g]->trace.emit("spec_use", request.row, request.gen, request.seq, g, expert, slot);
+    if constexpr (Build::kMetrics) {
+      if (spec_ != nullptr)  // the pool exists without the speculative state in some tests
+        spec_->groups[g]->trace.emit("spec_use", request.row, request.gen, request.seq, g, expert, slot);
+    }
     return slot;
   }
 
