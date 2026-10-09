@@ -7596,6 +7596,124 @@ state and threads), `ram_thread.h` (pause and watchdog), `python/sglang/srt/laye
 `exl3_ram_miss.py` (`_enable_ram_prefetch`). Tests: `test_exl3_ram_prefetch_{pool,swap,scorer,step,thread,events}.py`,
 `test_ram_prefetch_tables.py`. Driver arm: `analysis/dsv41-drive/dspark/both_cpu_ab.py` `dspark-both-prefetch`.
 
+### 33.15 NVMe-to-RAM prefetch scored on the GPU: cost, timing and two reversed A/Bs (2026-10-09)
+
+**Verdict: rejected by the spec's rule; the default stays the CPU scorer, and the prefetch stays off.** As planned,
+the GPU scorer lost: 12.78 -> 11.32 tok/s. Its kernels cost 107.5 us per layer on the post's stream, over the
+0.1 ms criterion. A rewritten score kernel (87 -> 6 us) and a side-stream fork removed that cost. The second reversed
+A/B is a tie: 13.03 -> 13.08 tok/s by the median (+0.4%), paired median -1.1%, 3 of 8 sessions faster, sign test
+p 0.86. The read-timing criterion is met: 13.0% of used reads were still in flight at use, against 42% with the CPU
+scorer. The reads now land in time, but the prefetch saves 2.4 RAM misses per token while adding 9.9 NVMe rows per
+token, and that does not pay.
+
+**What runs** (spec `docs/superpowers/specs/2026-10-09-dsv41-ram-prefetch-gpu-scorer-design.md`, plan
+`docs/superpowers/plans/2026-10-09-dsv41-ram-prefetch-gpu-scorer.md`). With `SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu`,
+after each post of a row with a target, two kernels inside the decode graph (first on the post's stream, after the
+fix below forked off it) score the next layer's gate on this layer's MoE input. They rank it as `GateScorer::choose` does, past the experts VRAM-hot or
+RAM-mapped in that layer, and publish up to 8 candidates per record to a 16-slot pinned page by seqlock. Each group's
+speculative thread waits up to 200 us for the record's slot. It then reads, in the GPU's order, the first `per_layer`
+candidates still unmapped and not pooled, reading only its own group's. The CPU scorer stays the default.
+
+**Kernel cost.** From a `--cuda-graph-trace=node` trace of one session
+(`/mnt/nvme1/dsv41-nsys/gpu-nsys-20261009-033747/`, `spec-kernels.csv`). Graph mode is refused with the copy engine,
+and a graph-mode kernel table leaves out the graph body. The trace is read only for these kernels, never for ms/token.
+
+| kernel | instances | avg (ns) | stddev (ns) |
+|---|---:|---:|---:|
+| `exl3_ram_prefetch_score_kernel<bf16>` | 117 | 69,767 | 237 |
+| `exl3_ram_prefetch_select_kernel` | 117 | 37,694 | 12,848 |
+| (for scale) `exl3_ram_miss_post_kernel` | 120 | 119,388 | 9,321 |
+
+Per layer that is 107.5 us, 7.5% over the 0.1 ms criterion. The score kernel moves about 5.5 MB of bf16 gate weights
+per layer in 70 us, about 80 GB/s, far under the card's bandwidth. It runs 48 blocks with scalar loads (final review
+M1). The kernels sit before C1 on the layer's stream, so a 39-row decode step pays about 4.2 ms for them.
+
+**Read timing.** The instrumented capture `margin-gpu-20261009-035316` (8 sessions, GPU scorer), against the CPU
+scorer's `margin-20261009-002539`:
+
+| | CPU scorer | GPU scorer |
+|---|---:|---:|
+| host time per record before the read (scoring, or the wait for the slot) | 1,822 us | 20.5 us |
+| used reads still in flight at use (`spec_promoted / spec_used`) | 0.418 (992 / 2373) | 0.188 (477 / 2531) |
+| late slots (`spec_late`) | n/a | 0 |
+| read p50 (issue to land) | 2.0 ms | 1.99 ms |
+| lead p50 (issue to use) | 3.8 ms | 4.63 ms |
+| slack p50 (land to use) | 0.4 ms | 1.68 ms |
+| precision at use | 0.488 (2373 / 4861) | 0.448 (2531 / 5650) |
+
+By rank, the GPU capture's precision is 0.554, 0.541, 0.529, 0.441, 0.360, 0.312 for ranks 0-5, and 0.164 for ranks 6
+and up.
+
+**First A/B, as planned: rejected** (`ab-gpu-20261009-040647`, commit `876a541c15`, B first then A, 8 sessions).
+The median went 78.27 -> 88.40 ms/token (12.78 -> 11.32 tok/s), 12.9% slower. Paired by session, B was faster in 5
+of 8 sessions (median +2.6%, sign test p 0.36). One session, BKR, doubled (128.7 -> 247.7 ms/token; TTFT
+8.9 -> 11.1 s). Text B vs A passed (353 tokens, 3 flips, max gap 1.0). B's server-lifetime counters: issued 11289,
+used 4938, promoted 871 (17.6% of used), late 0, dropped 153, demand reads delayed 587. RAM rows per token fell
+22.4 -> 19.5, and NVMe rows per token rose 22.4 -> 31.7.
+
+**The fix: a faster score kernel, and the scoring off the post's stream.** Commit `4b7529f368` scores each expert in
+its own block (384 blocks of 128 threads) with 16-byte gate loads, reducing over the block. A scalar loop covers an
+unaligned input or a hidden size off the load width. Measured by `test/manual/dsv41/bench_exl3_ram_prefetch_score.py`
+(40 gates, 220 MB, past L2, CUDA events):
+
+| tokens | score before | score after | gate read after | select |
+|---:|---:|---:|---:|---:|
+| 1 | 87.3 us | 5.95 us | 925 GB/s | 11.6 us |
+| 3 | 87.5 us | 6.68 us | 824 GB/s | 12.3 us |
+| 6 | 126.9 us | 7.98 us | 690 GB/s | 14.3 us |
+
+Commit `5c72378732` forks both kernels onto a stream the device owns (`ExpertStreamDevice.spec_stream`) right after
+the post, and joins it at the end of the post, after C1, the stream kernel and the copy wait are enqueued. The
+scoring then overlaps the layer's copy wait instead of delaying C1. The join comes before the next post can rewrite
+the seq the select kernel publishes under, and before `x` or the score scratch can be reused. The fork is a
+`wait_stream`, which the breakable capture tracks and auto-joins if an Engram break ends the segment first; a join
+after that is skipped. The select kernel writes only the pinned host page, so a side-stream ordering defect cannot
+change model output.
+
+**Second A/B: a tie, rejected** (`ab-gpu2-20261009-054403`, commit `5c72378732`, B first then A, 8 sessions, 104 GiB
+tier, counters off, private caches):
+
+| arm | tok/s (median) | ms/token (median) | accept length | RAM rows / token | NVMe rows / token |
+|---|---:|---:|---:|---:|---:|
+| `dspark-both` (A) | 13.03 | 76.73 | 3.60 | 21.8 | 21.8 |
+| `dspark-both-prefetch-gpu` (B) | 13.08 | 76.43 | 3.66 | 19.4 | 31.7 |
+
+Paired per-session gain (A -> B, % of A): BKR +2.1, CDW -1.7, DISCA -1.9, ETR +6.3, TSCO -11.0, VLO -4.0, WRK +2.8,
+K -0.5; median -1.1, 3 of 8 faster (`paired.txt`: sign test p 0.86). Text B vs A: pass, 2 flips, max gap 0.5. B's
+speculative rows (server lifetime): issued 11672, landed 11672, used 5070, promoted 661 (13.0% of used), late 0,
+dropped 70, failed 0, demand reads delayed 401; 6.9 wasted rows per token. Per-token rates are over the server's
+lifetime (1209 / 952 tokens). The first A/B's BKR outlier did not recur (129.1 ms/token against A's 131.8).
+
+**Reading.** The GPU scorer fixed what it was built to fix: reads issue about 20 us after the host learns of a record
+instead of about 1.8 ms later, land a median 1.7 ms before use instead of 0.4 ms, and 13% of used reads are still in
+flight instead of 42%. Once its own cost was off the critical path, B matches A. The limit is now the prediction:
+precision at use is about 0.43-0.45, so each saved RAM miss costs about four NVMe reads, and the extra drive
+traffic delays demand reads (401 delayed). A margin threshold or a top-k-only walk (the capture's precision is 0.55 at
+rank 0 and 0.16 past rank 5) is the next lever; this section does not test it.
+
+**Provenance.** Commits: as planned `876a541c15` (python tree registered as `ram-prefetch-gpu-scorer-876a541c15`);
+with the fixes `5c72378732` (`ram-prefetch-gpu-scorer-5c72378732`). A/Bs
+`divix01:/data/models/slang/nvfp4-work/ram-prefetch/ab-gpu-20261009-040647/` and `.../ab-gpu2-20261009-054403/`
+(`summary.json`, `verdict.json`, `paired.txt`, `modules.sha256`, `exl3-ext.sha256`); capture
+`.../margin-gpu-20261009-035316/`; trace `/mnt/nvme1/dsv41-nsys/gpu-nsys-20261009-033747/` (run dir
+`.../ram-prefetch/gpu-nsys-20261009-033747/`). Host modules prod l40 `295bf224`/`6d49becc`, l40_n2 `d3db7fc1`/`2d96b6da`,
+l8 `9d58ce92`/`57fb8032`; device modules `ac51f664`, `4c13c63c`, `caa85b5b`; EXL3 extension `38e3dba193bb`.
+`server-env-actual.json` shows PREFETCH 0 for A, and PREFETCH 1 with SCORER gpu, per-token 1, per-layer 1, share 2,
+top-k-only 0 for B. Units at `5c72378732`: `test/registered/unit/kernels/test_*exl3*.py test_*expert*.py` 1980
+passed, 4 failed, 23 skipped; the 4 reds (the clock-guard test, the ownership test's Phase 1 `turn` mutex, two ptx
+checks) fail identically at the merge-base `6818b92db6`. `layers/moe` tables and service 108 passed;
+`test_expert_stream_requirements_exl3.py` 91; the scripts 22; GPU (`test/manual/dsv41/` gpu scorer, lease kernels,
+lease ordering, copy engine) 289. The attach-before-capture order holds: `model_runner.py:672` `load_model`, `:681`
+`maybe_init_expert_hot_cache`, `expert_hot_cache.py:1557` `_attach_formats`, then `init_cuda_graphs` from
+`tp_worker.py:476` / `scheduler.py:1123`. The A/B driver runs arms in the order given (`both_cpu_ab.py:305`). RAM
+counters are server lifetime.
+
+**Pointers.** Code: `expert_stream/spec_score.cuh` (both kernels), `expert_stream/spec_candidates.h`, `ram_tier.h`
+(`serve_gpu_job`, `read_candidates`, `await_candidates`), `ram_prefetch.py` (`spec_score_rows`),
+`expert_stream_transport.py` (`ExpertStreamDevice.spec_score` / `spec_join`), `exl3_ram_miss.py` (`_bind_spec_scores`,
+the post). Tests: `test_exl3_ram_prefetch_gpu_host.py`, `test/manual/dsv41/test_exl3_ram_prefetch_gpu_scorer_cuda.py`;
+bench `test/manual/dsv41/bench_exl3_ram_prefetch_score.py`. Arms `dspark-both-prefetch-gpu{,-topk}`.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
