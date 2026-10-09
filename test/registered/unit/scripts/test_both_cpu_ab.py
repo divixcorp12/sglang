@@ -67,6 +67,7 @@ def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_i
         "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
         "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
         "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
+        "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
     }
     a, b = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-prefetch"][0]
     assert a["SGLANG_DSV41_RAM_PREFETCH"] == "0"
@@ -81,11 +82,24 @@ def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_i
     assert ab._overrides("dspark-both", "/out")["SGLANG_DSV41_RAM_PREFETCH"] == "0"
 
 
+def test_the_top_k_only_arm_differs_from_the_prefetch_arm_in_that_option_alone(monkeypatch):
+    ab = _ab()
+    b, c = ab.ARMS["dspark-both-prefetch"][0], ab.ARMS["dspark-both-prefetch-topk"][0]
+    assert c["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] == "1"
+    assert {k: v for k, v in c.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"} == {
+        k: v for k, v in b.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"
+    }
+    assert ab.ARMS["dspark-both-prefetch-topk"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-topk"] == "dspark-both"
+    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY", "0")
+    assert ab._overrides("dspark-both-prefetch-topk", "/out")["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] == "1"
+
+
 def test_every_arm_but_the_prefetch_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH", "1")
     for arm in ab.ARMS:
-        expected = "1" if arm == "dspark-both-prefetch" else "0"
+        expected = "1" if arm.startswith("dspark-both-prefetch") else "0"
         assert ab._overrides(arm, "/out")["SGLANG_DSV41_RAM_PREFETCH"] == expected, arm
         assert ab._probe_overrides(arm, "/out")["SGLANG_DSV41_RAM_PREFETCH"] == expected, arm
 

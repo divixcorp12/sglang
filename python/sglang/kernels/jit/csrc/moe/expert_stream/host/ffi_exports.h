@@ -748,7 +748,8 @@ struct HostExports {
       int64_t hidden,
       int64_t top_k,
       int64_t per_token,
-      int64_t per_layer) {
+      int64_t per_layer,
+      int64_t top_k_only) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     auto host_mem = SymbolicDevice{};
@@ -781,6 +782,7 @@ struct HostExports {
     config.top_k = static_cast<int>(top_k);
     config.per_token = static_cast<int>(per_token);
     config.per_layer = static_cast<int>(per_layer);
+    config.top_k_only = top_k_only != 0;
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int g = 0; g < Wire::kNodes; ++g) {
       std::vector<int> own;

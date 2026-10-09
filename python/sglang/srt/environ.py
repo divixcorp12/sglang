@@ -2008,6 +2008,9 @@ class Envs:
     SGLANG_DSV41_RAM_PREFETCH_PER_LAYER = EnvInt(1)
     # Pool slots per row and NUMA group, taken out of the tier at start.
     SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE = EnvInt(2)
+    # Pick only among each token's predicted top_k: a layer whose predicted experts are all cached reads nothing,
+    # rather than an expert the gate ranks below top_k (the 2026-10-08 A/B's unused reads, DSV41_REFERENCE.md 33.14).
+    SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

@@ -61,12 +61,15 @@ class GateScorer {
     x_.assign(static_cast<size_t>(tokens * hidden), 0.0f);
     score_.assign(static_cast<size_t>(tokens * experts), 0.0f);
     best_.assign(static_cast<size_t>(experts), 0.0f);
+    rank_.assign(static_cast<size_t>(experts), 0);
     order_.assign(static_cast<size_t>(experts), 0);
     picks_.reserve(static_cast<size_t>(experts));
   }
 
   // Scores fp16 rows `x_token_bytes` apart against bf16 `w` [experts, hidden] plus `bias`, passing over `skip[e] != 0`;
   // writes up to per_layer experts to `out`, best margin first, and returns how many. Call check_gate_choice first.
+  // `top_k_only` walks each token's top_k alone (a pick the gate predicts it routes), not kDepth. `ranks` and
+  // `margins`, when given, receive each pick's position in the token that gave its best margin and that margin.
   // A NaN score (a NaN input or bias) ranks below every other, in id order; a margin between equal scores is 0.
   // Throws std::invalid_argument for sizes beyond what reserve() sized.
   int choose(
@@ -81,7 +84,10 @@ class GateScorer {
       int per_token,
       int per_layer,
       const uint8_t* skip,
-      int32_t* out) {
+      int32_t* out,
+      bool top_k_only = false,
+      int32_t* ranks = nullptr,
+      float* margins = nullptr) {
     if (tokens < 0 || tokens > tokens_ || hidden != hidden_ || experts != experts_)
       throw std::invalid_argument("the scorer was reserved for other sizes");
     for (int64_t t = 0; t < tokens; ++t) {
@@ -98,6 +104,7 @@ class GateScorer {
     }
     std::fill(best_.begin(), best_.begin() + experts, -std::numeric_limits<float>::infinity());
     const int64_t depth = std::min<int64_t>(kDepth, experts);
+    const int64_t walk = top_k_only ? top_k : depth;
     for (int64_t t = 0; t < tokens; ++t) {
       const float* s = &score_[t * experts];
       std::iota(order_.begin(), order_.begin() + experts, 0);
@@ -106,11 +113,12 @@ class GateScorer {
       });
       const float kth = s[order_[top_k - 1]];
       int picked = 0;
-      for (int64_t i = 0; i < depth && picked < per_token; ++i) {
+      for (int64_t i = 0; i < walk && picked < per_token; ++i) {
         const int32_t e = order_[i];
         if (skip[e]) continue;
         // Equal scores (also two infinities) give 0, and -inf - finite stays above best_'s unpicked sentinel.
         const float margin = s[e] == kth ? 0.0f : std::max(s[e] - kth, std::numeric_limits<float>::lowest());
+        if (margin > best_[e] || (margin == best_[e] && i < rank_[e])) rank_[e] = static_cast<int32_t>(i);
         best_[e] = std::max(best_[e], margin);
         ++picked;
       }
@@ -123,6 +131,10 @@ class GateScorer {
     });
     const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(per_layer), picks_.size()));
     std::copy_n(picks_.begin(), n, out);
+    for (int i = 0; i < n; ++i) {
+      if (ranks != nullptr) ranks[i] = rank_[picks_[i]];
+      if (margins != nullptr) margins[i] = best_[picks_[i]];
+    }
     return n;
   }
 
@@ -146,6 +158,7 @@ class GateScorer {
   std::vector<float> x_;      // [tokens, hidden]
   std::vector<float> score_;  // [tokens, experts]
   std::vector<float> best_;   // [experts]: an expert's best margin over the tokens, -inf when not picked
+  std::vector<int32_t> rank_;  // [experts]: its position in the token that gave best_, the lowest on a tie
   std::vector<int32_t> order_;
   std::vector<int32_t> picks_;
 };

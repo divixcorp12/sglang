@@ -1304,15 +1304,19 @@ def score_gate(
     top_k: int,
     per_token: int,
     per_layer: int,
+    top_k_only: bool = False,
+    return_meta: bool = False,
     layout: str = "exl3",
     variant: Optional[str] = None,
-) -> list[int]:
+) -> list:
     """The RAM prefetch's gate scorer (``host/gate_scorer.h``): ``x`` fp16 ``[tokens, >= hidden]`` (columns past
     ``hidden`` are row padding), ``w`` bf16 ``[experts, hidden]``, ``bias`` fp32 ``[experts]``, skipping ``skip``;
-    returns the chosen experts, best first. Both builds."""
+    returns the chosen experts, best first, or with ``return_meta`` ``(expert, rank, margin)`` triples. ``top_k_only``
+    walks each token's predicted ``top_k`` alone. Both builds."""
     if x.dtype != torch.float16 or w.dtype != torch.bfloat16 or bias.dtype != torch.float32:
         raise ValueError("score_gate takes an fp16 x, a bf16 w and an fp32 bias")
     out = torch.full((int(per_layer),), -1, dtype=torch.int64)
+    meta = torch.zeros((int(per_layer), 2), dtype=torch.float32)
     n = int(
         _host_module(layout, variant).expert_stream_score_gate(
             x.contiguous().view(torch.uint8),
@@ -1322,9 +1326,13 @@ def score_gate(
             int(top_k),
             int(per_token),
             int(per_layer),
+            int(bool(top_k_only)),
             out,
+            meta,
         )
     )
+    if return_meta:
+        return [(int(e), int(r), float(m)) for e, (r, m) in zip(out[:n].tolist(), meta[:n].tolist())]
     return out[:n].tolist()
 
 
@@ -1755,6 +1763,7 @@ class ExpertStreamHost:
         per_token: int,
         per_layer: int,
         cores: Sequence[Sequence[int]],
+        top_k_only: bool = False,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
@@ -1784,6 +1793,7 @@ class ExpertStreamHost:
             int(top_k),
             int(per_token),
             int(per_layer),
+            int(bool(top_k_only)),
         )
         self.ram_prefetch_tensors = (gates, bias)
 

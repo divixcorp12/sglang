@@ -59,14 +59,20 @@ ARMS = {
             "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
             "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
             "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
+            "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
         },
         True,
     ),
 }
+# The same, picking only among each token's predicted top_k (DSV41_REFERENCE.md 33.14's unused reads).
+ARMS["dspark-both-prefetch-topk"] = (
+    {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
-REFERENCE = {"dspark-both-prefetch": "dspark-both"}
+REFERENCE = {"dspark-both-prefetch": "dspark-both", "dspark-both-prefetch-topk": "dspark-both"}
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
     "rows_read",

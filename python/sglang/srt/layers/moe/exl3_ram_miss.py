@@ -1284,6 +1284,7 @@ class Exl3RamMissService:
         tables = prefetch_tables(layer_ids, registered_gates(), hidden=cpu_experts.services[0].hidden, node=node)
         per_token = envs.SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN.get()
         per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
+        top_k_only = envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.get()
         host.enable_ram_prefetch(
             tables.targets,
             tables.gates,
@@ -1292,13 +1293,15 @@ class Exl3RamMissService:
             per_token=per_token,
             per_layer=per_layer,
             cores=[list(plan.spec) for plan in numa.plans],
+            top_k_only=top_k_only,
         )
         logger.info(
-            "exl3 RAM miss prefetch: %d of %d rows target the next layer, %d per token, %d per layer, cores %s",
+            "exl3 RAM miss prefetch: %d of %d rows target the next layer, %d per token, %d per layer%s, cores %s",
             int((tables.targets[:, 0] >= 0).sum()),
             len(layer_ids),
             per_token,
             per_layer,
+            ", predicted top-k only" if top_k_only else "",
             [plan.spec for plan in numa.plans],
         )
 

@@ -126,6 +126,7 @@ struct RamPrefetchConfig {
   int top_k = 0;
   int per_token = 0;
   int per_layer = 0;
+  bool top_k_only = false;  // walk each token's predicted top_k alone (GateScorer::choose)
   std::vector<std::vector<int>> cores;  // per group: its speculative thread's cores; empty inherits the caller's
 };
 

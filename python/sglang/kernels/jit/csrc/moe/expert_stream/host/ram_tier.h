@@ -2218,10 +2218,13 @@ class RamTier {
     fill_spec_skip(target, job.seq, spec.skip.data());
     const int64_t gate = config.gate[job.row];
     int32_t chosen[GateScorer::kMaxPerLayer];
+    int32_t ranks[GateScorer::kMaxPerLayer];
+    float margins[GateScorer::kMaxPerLayer];
     const int n = spec.scorer.choose(
         spec_->x_base + job.row * spec_->x_stride, job.tokens, spec_->x_token_bytes,
         config.gates + gate * experts_ * config.hidden, config.bias + gate * experts_, experts_, config.hidden,
-        config.top_k, config.per_token, config.per_layer, spec.skip.data(), chosen);
+        config.top_k, config.per_token, config.per_layer, spec.skip.data(), chosen, config.top_k_only,
+        Build::kMetrics ? ranks : nullptr, Build::kMetrics ? margins : nullptr);
     if constexpr (Build::kMetrics) {
       stats_.add(kSpecScored);
       stats_.add(kSpecScoreNs, now_ns() - start);
@@ -2229,13 +2232,16 @@ class RamTier {
     for (int i = 0; i < n; ++i) {
       if (Wire::home(chosen[i]) != g) continue;
       if (threaded && !spec_wait_unheld(spec)) return;  // a quiescer waits for one row, not the whole job
-      spec_read(g, job.row, target, job.seq, chosen[i]);
+      uint64_t pick = 0;  // spec_submit's gen: rank << 32 | the margin's fp32 bits
+      if constexpr (Build::kMetrics) pick = (static_cast<uint64_t>(ranks[i]) << 32) | std::bit_cast<uint32_t>(margins[i]);
+      spec_read(g, job.row, target, job.seq, chosen[i], pick);
     }
   }
 
   // Reads `expert`'s row of `target` into a pool entry of group g under the group's reader turn, so a demand read
   // waits for at most this one row. Dropped when stale, or when the expert was mapped or pooled meanwhile.
-  void spec_read(int g, int64_t source, int64_t target, uint32_t source_seq, int32_t expert) {
+  void spec_read(int g, int64_t source, int64_t target, uint32_t source_seq, int32_t expert,
+                 [[maybe_unused]] uint64_t pick = 0) {
     SpecGroup& spec = *spec_->groups[g];
     // A demand blocked on the turn goes first: the unlocking thread would otherwise retake it before the woken demand.
     // Unbounded, but by the one demand read the flag stands for, which the watchdog times.
@@ -2273,7 +2279,7 @@ class RamTier {
     if constexpr (Build::kMetrics) {
       slot = pool_->entry(target, g, i).slot;  // stable until a swap, which takes a landed entry
       // row = target row, seq = source record seq, a = expert, b = slot, c = source row; spec_use's c joins on seq.
-      spec.trace.emit("spec_submit", target, 0, source_seq, g, expert, slot, source);
+      spec.trace.emit("spec_submit", target, pick, source_seq, g, expert, slot, source);
     }
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;

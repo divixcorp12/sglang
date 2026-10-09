@@ -1248,7 +1248,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // f32 [experts], skip uint8 [experts]; writes the chosen experts to out int64 [per_layer] and returns how many. Both builds: a pure function.
   static int64_t score_gate(
       TensorView x, TensorView w, TensorView bias, TensorView skip, int64_t top_k, int64_t per_token, int64_t per_layer,
-      TensorView out) {
+      int64_t top_k_only, TensorView out, TensorView meta) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     auto T = SymbolicSize{"tokens"};
@@ -1260,6 +1260,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     expert_stream::verify_named("bias", TensorMatcher({E}).with_dtype<float>().with_device<kDLCPU>(cpu), bias);
     expert_stream::verify_named("skip", TensorMatcher({E}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), skip);
     expert_stream::verify_named("out", TensorMatcher({per_layer}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("meta", TensorMatcher({per_layer, 2}).with_dtype<float>().with_device<kDLCPU>(cpu), meta);
     const int64_t experts = w.size(0);
     const int64_t hidden = w.size(1) / 2;
     if (w.size(1) % 2 != 0 || hidden < 1) throw std::runtime_error("score_gate: w rows are bf16");
@@ -1274,14 +1275,21 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     expert_stream::GateScorer scorer;
     scorer.reserve(x.size(0), hidden, experts);
     int32_t chosen[expert_stream::GateScorer::kMaxPerLayer];
+    int32_t ranks[expert_stream::GateScorer::kMaxPerLayer];
+    float margins[expert_stream::GateScorer::kMaxPerLayer];
     const int n = scorer.choose(
         static_cast<const uint8_t*>(x.data_ptr()), x.size(0), x.size(1), static_cast<const uint16_t*>(w.data_ptr()),
         static_cast<const float*>(bias.data_ptr()), experts, hidden, static_cast<int>(top_k),
-        static_cast<int>(per_token), static_cast<int>(per_layer), static_cast<const uint8_t*>(skip.data_ptr()), chosen);
+        static_cast<int>(per_token), static_cast<int>(per_layer), static_cast<const uint8_t*>(skip.data_ptr()), chosen,
+        top_k_only != 0, ranks, margins);
     if (n < 0 || n > per_layer) throw std::logic_error("score_gate: the scorer chose more than per_layer experts");
     auto* result = static_cast<int64_t*>(out.data_ptr());
-    for (int i = 0; i < n; ++i)
+    auto* m = static_cast<float*>(meta.data_ptr());
+    for (int i = 0; i < n; ++i) {
       result[i] = chosen[i];
+      m[2 * i] = static_cast<float>(ranks[i]);
+      m[2 * i + 1] = margins[i];
+    }
     return n;
   }
 };
