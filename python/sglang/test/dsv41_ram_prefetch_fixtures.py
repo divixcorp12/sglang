@@ -121,7 +121,7 @@ def gate(logits) -> tuple[torch.Tensor, torch.Tensor]:
     return w, torch.zeros((1, experts), dtype=torch.float32)
 
 
-def enable(rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores=None) -> None:
+def enable(rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores=None, top_k_only=False) -> None:
     """Row 0 targets row 1 with `logits`' gate; every later row targets nothing."""
     w, bias = gate(logits)
     targets = torch.tensor([[1, 0]] + [[-1, -1]] * (rig.x_rows.shape[0] - 1), dtype=torch.int64)
@@ -133,6 +133,7 @@ def enable(rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores
         per_token=per_token,
         per_layer=per_layer,
         cores=cores if cores is not None else [[] for _ in range(rig.host.nodes)],
+        top_k_only=top_k_only,
     )
 
 

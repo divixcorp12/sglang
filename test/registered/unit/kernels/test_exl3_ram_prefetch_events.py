@@ -5,6 +5,8 @@ spec_use: row, gen, seq = the demand record that swapped the entry in, c = the e
 
 import collections
 import json
+import math
+import struct
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_prefetch_fixtures import LOGITS, enable, forced, load, prefetch_rig, trigger
@@ -84,3 +86,24 @@ def test_a_failed_speculative_read_emits_submit_but_no_land(tmp_path, monkeypatc
     events = _events(tmp_path)
     assert _counts(events) == {"spec_submit": 1}
     assert (events[0]["row"], events[0]["seq"], events[0]["c"]) == (1, trig.seq, 0)
+
+
+def test_spec_submit_carries_the_picks_rank_and_margin_in_gen(tmp_path, monkeypatch):
+    """gen = rank << 32 | the margin's fp32 bits, for spec_margin.py. LOGITS' top_k 2 ranks 2 (40) then 4 (35): the
+    pick is 2, rank 0, margin sqrt(40) - sqrt(35) in fp32. Mutant: emit 0 for gen -- red."""
+    (tmp_path / "rig").mkdir()
+    rig = prefetch_rig(tmp_path / "rig")
+    try:
+        monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+        enable(rig, LOGITS)
+        trigger(rig)
+        assert rig.host.spec_pump(0)
+    finally:
+        rig.host.stop()
+    submit = next(e for e in _events(tmp_path) if e["event"] == "spec_submit")
+    rank = submit["gen"] >> 32
+    margin = struct.unpack("<f", struct.pack("<I", submit["gen"] & 0xFFFFFFFF))[0]
+    f32 = lambda v: struct.unpack("<f", struct.pack("<f", v))[0]
+    expected = f32(f32(math.sqrt(40.0)) - f32(math.sqrt(35.0)))
+    assert (submit["a"], rank) == (2, 0)
+    assert margin == expected

@@ -14,27 +14,32 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 DEPTH = 12
 
 
-def reference(x, w, bias, skip, *, top_k, per_token, per_layer):
+def reference(x, w, bias, skip, *, top_k, per_token, per_layer, top_k_only=False, meta=False):
     logits = x.float() @ w.float().T
     scores = torch.where(logits > 20, logits, torch.log1p(torch.exp(logits))).sqrt() + bias
     scores = torch.where(scores.isnan(), torch.tensor(float("-inf")), scores)  # a NaN score ranks below every other
-    best = {}
+    best, ranks = {}, {}
     experts = w.shape[0]
     for m in range(x.shape[0]):
         s = scores[m]
         order = sorted(range(experts), key=lambda e: (-float(s[e]), e))[: min(DEPTH, experts)]
+        walk = order[:top_k] if top_k_only else order
         kth = s[order[top_k - 1]]
         picked = 0
-        for e in order:
+        for rank, e in enumerate(walk):
             if picked >= per_token:
                 break
             if skip[e]:
                 continue
             # an fp32 subtraction, as the host's; equal scores (also two infinities) give 0, -inf stays above unpicked
             margin = 0.0 if s[e] == kth else max(float(s[e] - kth), -3.4028234663852886e38)
+            # an expert's rank is its position in the token that gave its best margin, the lowest on a tie
+            if e not in best or margin > best[e] or (margin == best[e] and rank < ranks[e]):
+                ranks[e] = rank
             best[e] = max(best.get(e, float("-inf")), margin)
             picked += 1
-    return [e for e, _ in sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))][:per_layer]
+    chosen = [e for e, _ in sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))][:per_layer]
+    return [(e, ranks[e], best[e]) for e in chosen] if meta else chosen
 
 
 def _exact_case(seed, tokens=3, experts=16, hidden=64):
@@ -204,8 +209,9 @@ def test_nan_scores_rank_last_in_id_order_whatever_the_comparison_sort_does(seed
 def _raw(x, w, bias, skip, *, top_k=6, per_token=2, per_layer=4):
     """The FFI as a direct caller sees it: x, w as raw bytes, no wrapper to even the strides."""
     out = torch.full((per_layer,), -1, dtype=torch.int64)
+    meta = torch.zeros((per_layer, 2), dtype=torch.float32)
     return es._host_module("exl3", None).expert_stream_score_gate(
-        x, w, bias, torch.tensor(skip, dtype=torch.uint8), top_k, per_token, per_layer, out
+        x, w, bias, torch.tensor(skip, dtype=torch.uint8), top_k, per_token, per_layer, 0, out, meta
     )
 
 
@@ -248,3 +254,39 @@ def test_a_bias_or_skip_of_the_wrong_length_is_refused():
         _raw(xb, wb, bias[:8].contiguous(), [False] * 16)
     with pytest.raises(Exception):
         _raw(xb, wb, bias, [False] * 8)
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("top_k, per_token, per_layer", [(6, 1, 1), (6, 2, 4), (6, 3, 8), (2, 1, 2)])
+def test_top_k_only_walks_each_tokens_predicted_top_k_alone(seed, top_k, per_token, per_layer):
+    """A pick past the token's top_k is one the gate predicts it will not route. Mutant (gate_scorer.h): walk the
+    full depth under top_k_only -- red."""
+    x, w, bias = _exact_case(seed)
+    g = torch.Generator().manual_seed(200 + seed)
+    skip = (torch.rand(w.shape[0], generator=g) < 0.5).tolist()
+    kw = dict(top_k=top_k, per_token=per_token, per_layer=per_layer, top_k_only=True)
+    assert es.score_gate(x, w, bias, skip, **kw) == reference(x, w, bias, skip, **kw)
+
+
+def test_top_k_only_picks_nothing_when_every_predicted_expert_is_skipped():
+    """One token, its top 6 all skipped: the full walk still picks rank 6, top_k_only picks nothing."""
+    x, w, bias = _exact_case(0, tokens=1)
+    s = reference(x, w, bias, [False] * 16, top_k=6, per_token=6, per_layer=8)
+    skip = [e in s[:6] for e in range(16)]
+    kw = dict(top_k=6, per_token=1, per_layer=1)
+    assert es.score_gate(x, w, bias, skip, **kw) == reference(x, w, bias, skip, **kw) != []
+    assert es.score_gate(x, w, bias, skip, top_k_only=True, **kw) == []
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("top_k_only", [False, True])
+def test_each_pick_reports_its_rank_and_margin(seed, top_k_only):
+    """The rank and margin the speculative thread's spec_submit event carries. Mutants: the rank of the last token
+    that picked the expert rather than of its best margin, or a margin off by the kth score -- red."""
+    x, w, bias = _exact_case(seed, tokens=4)
+    g = torch.Generator().manual_seed(300 + seed)
+    skip = (torch.rand(w.shape[0], generator=g) < 0.4).tolist()
+    kw = dict(top_k=6, per_token=3, per_layer=8, top_k_only=top_k_only)
+    got = es.score_gate(x, w, bias, skip, return_meta=True, **kw)
+    assert got == reference(x, w, bias, skip, meta=True, **kw)
+    assert all(rank < 6 for _, rank, _ in got) or not top_k_only

@@ -349,3 +349,20 @@ def test_enable_refuses_what_the_step_could_not_serve(tmp_path):
             )
     finally:
         host.stop()
+
+
+@pytest.mark.parametrize("top_k_only, picks", [(False, [0]), (True, [])])
+def test_top_k_only_reads_nothing_when_the_predicted_top_k_is_cached(tmp_path, top_k_only, picks):
+    """top_k 2: 2 and 4 are the predicted pair, 2 VRAM-hot and 4 mapped. The full walk reads rank 2's expert 0;
+    top_k_only reads nothing. Mutant: enable_ram_prefetch drops top_k_only on its way to the config -- red."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS, top_k_only=top_k_only)
+        load(rig, 1, [4])
+        rig.host.set_hot(1, [2])
+        trigger(rig)
+        assert rig.host.spec_pump(0)
+        assert _landed(rig.host, 1) == picks
+        assert rig.host.counters()["spec_issued"] == len(picks)
+    finally:
+        rig.host.stop()
