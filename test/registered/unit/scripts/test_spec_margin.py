@@ -68,3 +68,16 @@ def test_main_refuses_a_trace_that_dropped_events(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr("sys.argv", ["spec_margin.py", str(tmp_path / "e.*.jsonl")])
     assert m.main() == 1
     assert "dropped" in capsys.readouterr().err
+
+
+def test_timing_reports_the_read_the_lead_and_the_slack_of_used_reads():
+    m = _module()
+    picks = [
+        {"submit_ns": 0, "land_ns": 2_000_000, "use_ns": 5_000_000},
+        {"submit_ns": 0, "land_ns": 3_000_000, "use_ns": None},
+        {"submit_ns": 0, "land_ns": None, "use_ns": None},
+    ]
+    t = m.timing(picks)
+    assert t["read_ms (landed)"]["n"] == 2
+    assert t["lead_ms submit->use (used)"] == {"n": 1, "p10": 5.0, "p50": 5.0, "p90": 5.0, "p99": 5.0, "min": 5.0}
+    assert t["slack_ms land->use (used)"]["p50"] == 3.0
