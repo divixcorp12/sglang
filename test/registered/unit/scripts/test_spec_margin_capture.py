@@ -47,7 +47,7 @@ def test_the_counter_summary_reads_the_last_counters_line(tmp_path):
 def test_the_capture_runs_any_ab_arm_and_leaves_its_scorer_alone_unless_asked():
     cap = _capture()
     off = cap.server_env("/out", False, arm="dspark-both")
-    assert off["SGLANG_DSV41_RAM_PREFETCH"] == "0" and off["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "cpu"
+    assert off["SGLANG_DSV41_RAM_PREFETCH"] == "0" and "SGLANG_DSV41_RAM_PREFETCH_SCORER" not in off
     floors = cap.server_env("/out", False, arm="dspark-both-prefetch-gpu-floors")
     assert floors["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu"
     assert floors["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"].endswith("ram_prefetch_margin_floors.json")
