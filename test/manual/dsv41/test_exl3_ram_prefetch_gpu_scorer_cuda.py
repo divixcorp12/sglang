@@ -262,3 +262,33 @@ def test_records_wider_than_one_token_tile_rank_as_the_reference(tokens):
     x, w, bias = exact_gate_case(5, tokens=tokens)
     got = _candidates(x.to(BF16), w, bias, top_k=6, per_token=1, tokens_max=tokens)
     assert list(got.picks) == gate_reference(x, w, bias, [False] * 16, top_k=6, per_token=1, per_layer=KEEP, meta=True)
+
+
+def test_the_scoring_runs_on_the_devices_own_stream_until_joined(tmp_path, monkeypatch):
+    """Both kernels launch on the device's spec stream, forked from the post's; spec_join makes the post's stream wait
+    for them. Mutant: launch on the current stream -- red."""
+    c = Chain(tmp_path)
+    try:
+        x16, w16, bias = exact_gate_case(0, tokens=1, experts=EXPERTS)
+        page = es.new_candidate_page(pin=True)
+        c.dev.enable_spec_scorer(page, top_k=TOP_K, per_token=2, top_k_only=False)
+        hot = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+        seen = []
+        for name in ("run_spec_score", "run_spec_select"):
+            real = getattr(es, name)
+            monkeypatch.setattr(es, name, lambda *a, _real=real, **kw: seen.append(torch.cuda.current_stream()) or _real(*a, **kw))
+        main = torch.cuda.current_stream()
+        c.dev.state[es.STATE_WORDS["posted"]] = 3
+        c.dev.spec_score(SpecScoreRow(w16.cuda(), bias.cuda(), 1, hot, 4), x16.to(BF16).cuda())
+        c.dev.spec_join()
+        main.synchronize()
+        assert len(seen) == 2 and all(s == c.dev.spec_stream and s != main for s in seen)
+        want = gate_reference(x16, w16, bias, [e in _mapped(c) for e in range(EXPERTS)], top_k=TOP_K, per_token=2,
+                              per_layer=KEEP, meta=True)
+        assert list(es.read_candidates(page, 3).picks) == want
+    finally:
+        c.close()
+
+
+def _mapped(c):
+    return {e for e, slot in enumerate(c.device_map(1)) if slot >= 0}

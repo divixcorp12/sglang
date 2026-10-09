@@ -255,7 +255,7 @@ class _Side:
         self.copy_engine_captured = False
 
     def __getattr__(self, name):
-        if name in ("post", "stream", "copy_wait", "spec_score"):
+        if name in ("post", "stream", "copy_wait", "spec_score", "spec_join"):
             return lambda *args, **kwargs: self.calls.append((name, kwargs))
         raise AttributeError(name)
 
@@ -453,14 +453,14 @@ def test_the_pool_room_is_checked_per_group_as_the_host_reserves_it(ranges, widt
 
 
 def test_a_row_with_a_target_scores_right_after_its_post(monkeypatch):
-    """The scoring kernels follow the post on its stream, before C1: the host learns the record and its candidates
-    while this layer still runs (spec 2026-10-09, Approach A)."""
+    """The scoring forks off the post's stream before C1 and joins it after the copy wait is enqueued, so it overlaps
+    this layer's copy wait instead of delaying C1, and the next post cannot overwrite the seq it publishes under."""
     streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
     backend, side = _captured_backend(monkeypatch, lambda: streamer)
     entry = SimpleNamespace(target=1)
     backend.spec_expected, backend.spec_score = True, entry
     backend.post(0, _CapturedPlan())
-    assert [name for name, _ in side.calls] == ["post", "spec_score", "copy", "stream", "copy_wait"]
+    assert [name for name, _ in side.calls] == ["post", "spec_score", "copy", "stream", "copy_wait", "spec_join"]
     assert side.calls[1][1]["entry"] is entry and side.calls[1][1]["x"] is backend.cpu_input[0]
 
 
