@@ -163,6 +163,29 @@ def _server_counters(out: str, arm: str):
     return json.loads(lines[-1].split(COUNTER_MARKER, 1)[1]) if lines else None
 
 
+def _warmup_tokens(out: str, arm: str) -> list[int]:
+    """Completion tokens of each warm-up round the arm's timed server ran (run_arm.sh's results-warmup-N.jsonl)."""
+    runs = sorted(os.listdir(os.path.join(out, "servers", arm)))
+    run = os.path.join(out, "servers", arm, runs[-1])
+    tokens = []
+    for name in sorted(os.listdir(run)):
+        if name.startswith("results-warmup-") and name.endswith(".jsonl"):
+            with open(os.path.join(run, name)) as f:
+                tokens.append(sum(json.loads(line).get("completion_tokens") or 0 for line in f if line.strip()))
+    return tokens
+
+
+def _compare(base_path: str, other_path: str):
+    with open(base_path) as f:
+        base = json.load(f)
+    with open(other_path) as f:
+        other = json.load(f)
+    try:
+        return dspark_text_band.compare(base, other)
+    except ValueError as error:
+        return {"error": str(error)}
+
+
 def summarize(out: str) -> dict:
     sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
     import dspark_text_band
@@ -192,25 +215,23 @@ def summarize(out: str) -> dict:
                 entry["reverify_ct"] = graphed["verify_overflow_ct"]
         probes = {a: os.path.join(out, f"{a}.probe.json") for a in ("prod", arm)}
         if arm != "prod" and all(os.path.exists(p) for p in probes.values()):
-            with open(probes["prod"]) as f:
-                base = json.load(f)
-            with open(probes[arm]) as f:
-                other = json.load(f)
-            entry["text_vs_prod"] = dspark_text_band.compare(base, other)
+            entry["text_vs_prod"] = _compare(probes["prod"], probes[arm])
         counters = _server_counters(out, arm)
         if counters:
             entry["ram"] = {k: counters.get(k) for k in RAM_KEYS}
             entry["ram"]["scope"] = "server lifetime: warm-up and the timed set"
-            tokens = sum(r["completion_tokens"] for r in rows)
-            entry["ram_rows_per_timed_token"] = counters["rows_read"] / tokens if tokens else None
+            # The counters are server-lifetime, so the denominator is too: warm-up rounds plus the timed set.
+            warmups = _warmup_tokens(out, arm)
+            lifetime = sum(warmups) + sum(r["completion_tokens"] for r in rows)
+            entry["warmup_rounds"] = len(warmups)
+            entry["lifetime_tokens"] = lifetime
+            entry["ram_rows_per_token_lifetime"] = counters["rows_read"] / lifetime if lifetime else None
         reference = REFERENCE.get(arm)
         ref_probes = {a: os.path.join(out, f"{a}.probe.json") for a in (reference, arm)} if reference else {}
-        if ref_probes and all(os.path.exists(p) for p in ref_probes.values()):
-            with open(ref_probes[reference]) as f:
-                base = json.load(f)
-            with open(ref_probes[arm]) as f:
-                other = json.load(f)
-            entry["text_vs_reference"] = dspark_text_band.compare(base, other)
+        if reference and not os.path.exists(ref_probes[reference]):
+            entry["text_vs_reference"] = "missing reference probe"
+        elif reference and os.path.exists(ref_probes[arm]):
+            entry["text_vs_reference"] = _compare(ref_probes[reference], ref_probes[arm])
         summary[arm] = entry
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
