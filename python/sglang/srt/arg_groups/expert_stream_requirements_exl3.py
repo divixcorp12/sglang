@@ -343,13 +343,23 @@ def _check_ram_prefetch() -> None:
     Runs on the post-parse pass only (the pass before ``parse_cuda_graph_config`` returns first), ahead of the backend
     rules: a disabled decode graph returns early, and the option must not pass silently.
     """
+    from sglang.srt.layers.moe import ram_prefetch
+
+    scorer = envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get()
+    if scorer not in ram_prefetch.SCORERS:
+        raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of {ram_prefetch.SCORERS}, got {scorer!r}")
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
+        if scorer == "gpu":
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.
         raise ValueError("SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS=1")
-    from sglang.srt.layers.moe import ram_prefetch
-
+    if scorer == "gpu" and not envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get():
+        raise ValueError(
+            "SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu runs after the copy-engine post captured in the decode graph; "
+            "set SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1"
+        )
     for name, high in (
         ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", ram_prefetch.MAX_PER_TOKEN),
         ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", ram_prefetch.MAX_PER_LAYER),

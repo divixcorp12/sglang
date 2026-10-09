@@ -2011,6 +2011,9 @@ class Envs:
     # Pick only among each token's predicted top_k: a layer whose predicted experts are all cached reads nothing,
     # rather than an expert the gate ranks below top_k (the 2026-10-08 A/B's unused reads, DSV41_REFERENCE.md 33.14).
     SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
+    # Where the next layer's gate is scored: "cpu", each group's speculative thread on the record's staged input, or
+    # "gpu", two kernels after the layer's post inside the decode graph (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer).
+    SGLANG_DSV41_RAM_PREFETCH_SCORER = EnvStr("cpu")
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

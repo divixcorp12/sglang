@@ -14,6 +14,9 @@ MAX_PER_TOKEN = 12
 MAX_PER_LAYER = 8
 MAX_SPEC_SHARE = 4
 
+# SGLANG_DSV41_RAM_PREFETCH_SCORER's values.
+SCORERS = ("cpu", "gpu")
+
 
 @dataclass(frozen=True)
 class RouterGate:
