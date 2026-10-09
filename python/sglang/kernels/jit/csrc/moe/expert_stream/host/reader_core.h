@@ -1315,7 +1315,7 @@ class ReaderCore {
       ExtentDesc& d = descs_[index];
       if (d.legs == 0) {
         // First preparation: with the dynamic root choice, the sub-read's root is picked now, from the load as it is
-        // when the read is actually issued, before its legs are cut by that root's device limits.
+        // when the read is issued, before its legs are cut by that root's device limits.
         if (dynamic_) choose_root(index);
         plan_legs(index);
       }
@@ -1325,10 +1325,18 @@ class ReaderCore {
       unsigned n = 0;
       for (unsigned l = 0; l < d.legs; ++l)
         n += legs[l].state == LegState::Idle ? 1u : 0u;
-      if (!(c.pending + n <= c.capacity || c.pending == 0)) break;
+      bool room = c.pending + n <= c.capacity || c.pending == 0;
       if constexpr (requires(const Reader& reader) { reader.sq_space(); }) {
-        if (n > 1 && io_.sq_space() < n) break;
+        room = room && !(n > 1 && io_.sq_space() < n);
       }
+      if (!room) {
+        // Not issued: a fresh sub-read under the dynamic choice chooses again when credit lets it go, so the choice
+        // sees the load at issue, not the load of the turn it first waited at the queue head.
+        if (dynamic_ && fresh) d.legs = 0;
+        break;
+      }
+      // Issued: the dynamic choice is final, so it is counted now (once: only a fresh sub-read is issued first).
+      if (dynamic_ && fresh) note_root(index);
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
       d.queued = false;
@@ -1766,7 +1774,8 @@ class ReaderCore {
     io_.drain(pending);
   }
 
-  // The dynamic root choice for piece-stream descriptor `index`, at its first preparation (set_mirror_caps). A root is
+  // The dynamic root choice for piece-stream descriptor `index`, at its first preparation (set_mirror_caps), and again
+  // at each refill turn while it waits for credit (refill undoes an unissued plan). A root is
   // open while its sub-reads in flight, demand and speculative, over every reader of the drive load, are below its
   // cap. Among the open roots the one with the fewest bytes in flight wins; a tie goes to the sub-read's own root,
   // then to the lowest root. With every root at its cap the sub-read keeps its own root: the choice never blocks or
@@ -1775,7 +1784,9 @@ class ReaderCore {
   void choose_root(uint32_t index) {
     Read& read = sub_reads_[index];
     const int64_t parts = t_.parts;
-    const int own = static_cast<int>(read.file % parts);
+    // The sub-read's own root is its descriptor's part (it may have chosen another before, while it waited for credit).
+    const int own = static_cast<int>((index / subs_) % static_cast<size_t>(parts));
+    read.file = alt_file_[static_cast<size_t>(read.file * parts + own)];
     int best = -1;
     int64_t best_bytes = 0;
     for (int q = 0; q < static_cast<int>(parts); ++q) {
@@ -1786,11 +1797,16 @@ class ReaderCore {
         best_bytes = bytes;
       }
     }
-    if (best >= 0 && best != own) {
-      read.file = alt_file_[static_cast<size_t>(read.file * parts + best)];
-      load_->redirected(own, best);
-    }
-    on_trace([&](StageRecord& t) { count_drive_extent(t, read.file); });
+    if (best >= 0 && best != own) read.file = alt_file_[static_cast<size_t>(read.file * parts + best)];
+  }
+
+  // The dynamic choice of descriptor `index` is final (its first issue): counts a redirect and the trace's extent.
+  void note_root(uint32_t index) {
+    const int64_t file = sub_reads_[index].file;
+    const int own = static_cast<int>((index / subs_) % static_cast<size_t>(t_.parts));
+    const int root = DriveLoad::root_of(file, t_.parts);
+    if (root != own) load_->redirected(own, root);
+    on_trace([&](StageRecord& t) { count_drive_extent(t, file); });
   }
 
   // The trace's per-drive extent count: one more extent reads `file`.

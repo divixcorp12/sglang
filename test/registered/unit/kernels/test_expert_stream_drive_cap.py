@@ -141,7 +141,7 @@ def test_every_sub_read_redirected_reads_the_eager_bytes(tmp_path):
     assert subs[1] == 0 and subs[0] > 0
     for row in (0, 1):
         got = read_rows_drive_load(
-            s.tables, row, experts, slots, piece_stream=True, poison=True, mirror_caps=(1, 8),
+            s.tables, row, experts, slots, piece_stream=True, poison=True, mirror_caps=(1, 64),
             preload=preload_reads(1, 0))
         assert got["a"] == 1 and rows_exact(s, row, experts, slots), row
         after = got["after_a"]
@@ -189,7 +189,7 @@ def test_a_root_fault_follows_the_drive_not_the_part(tmp_path):
     0 capped every sub-read reads root 1: a root-1 fault fires, a part-1 fault (no sub-read has part 1) cannot."""
     s = ram_miss_setup(tmp_path, capacity=8, experts=8, mirror_weights=(1.0, 0.0), hidden=256, inter=512)
     experts, slots = [1, 2], [0, 1]
-    common = dict(piece_stream=True, mirror_caps=(1, 8), preload=preload_reads(1, 0))
+    common = dict(piece_stream=True, mirror_caps=(1, 64), preload=preload_reads(1, 0))
     on_root = read_rows_drive_load(s.tables, ROW, experts, slots, root=1, part_error=errno.EIO, **common)
     assert on_root["a"] == 0 and idle(on_root["after_a"])
     on_part = read_rows_drive_load(s.tables, ROW, experts, slots, part=1, part_error=errno.EIO, **common)

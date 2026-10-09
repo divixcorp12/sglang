@@ -809,5 +809,5 @@ def test_the_mirror_caps_parser():
 
     assert mirror_caps(False, "", THREE_ROOTS) is None
     assert mirror_caps(True, " 4, 2 ,4 ", THREE_ROOTS) == (4, 2, 4)
-    with pytest.raises(ValueError, match="more than 4"):
+    with pytest.raises(ValueError, match="at most 4 mirror roots"):
         mirror_caps(True, "1,1,1,1,1", ":".join(f"/r{i}" for i in range(5)))
