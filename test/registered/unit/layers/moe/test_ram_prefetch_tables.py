@@ -94,6 +94,9 @@ def test_the_service_enables_the_host_with_the_registered_gates_options_and_spar
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
     (targets, gates, bias), kw = calls[0]
     assert targets.tolist() == [[1, 0], [-1, -1]] and torch.equal(gates[0], gate.weight)
-    assert kw == dict(top_k=6, per_token=1, per_layer=2, cores=[[0, 1]])
+    assert kw == dict(top_k=6, per_token=1, per_layer=2, cores=[[0, 1]], top_k_only=False)
+    with envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.override(True):
+        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
+    assert calls[1][1]["top_k_only"] is True
     with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_CPU_EXPERTS"):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, None)
