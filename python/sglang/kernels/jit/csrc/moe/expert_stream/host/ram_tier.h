@@ -16,6 +16,7 @@
 #pragma once
 
 #include <bit>
+#include <future>
 
 #include "../row_layout.h"
 #include "copy_engine.h"
@@ -152,6 +153,7 @@ class RamTier {
   // and the counter blocks, so it must stop before they are destroyed; the CPU thread stops last because the copy
   // thread reads its done().
   ~RamTier() {
+    stop_spec();  // the speculative threads read through the groups' readers into the pool's slabs
     fill_join();  // the fill thread reads through group 0's reader into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
     for (int g = 0; g < dist_.size(); ++g)
@@ -280,6 +282,7 @@ class RamTier {
           skip = true;
         }
       }
+      if (spec_ != nullptr) note_serving(group, request);
       if (!skip) handle_record(group, request);
       // Every group sees the record, served or skipped, so both groups score the same jobs.
       if (spec_ != nullptr) offer_spec(group, request);
@@ -1204,7 +1207,7 @@ class RamTier {
   }
 
   // Replaces the row's hot set. A VRAM-hot row is decode's: kept prefill-owned it could never be a victim and would
-  // hold the share down, so it is disowned.
+  // hold the share down, so it is disowned. Plain stores: the owner's pause quiesced the scorers (quiesce_spec).
   void set_hot(int64_t row, const int64_t* experts, int64_t count) {
     row_capacity(row);
     std::lock_guard<std::mutex> caller(caller_mutex_);
@@ -1311,7 +1314,7 @@ class RamTier {
     if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
     SpecJob job;
     if (!spec_->groups[g]->ring.pop(&job)) return false;
-    serve_spec_job(g, job);
+    serve_spec_job(g, job, /*threaded=*/false);
     return true;
   }
 
@@ -1325,6 +1328,74 @@ class RamTier {
       faults_.spec_delay_ns.store(delay_ns);
       faults_.spec_fail.store(fail);
     }
+  }
+
+  // ---- The speculative threads (RamThread drives them with the service threads) ----
+
+  // Starts each group's speculative thread, pinned to its cores. Throws, after joining them, when one cannot be
+  // pinned. A no-op with the RAM prefetch off.
+  void start_spec() {
+    if (spec_ == nullptr) return;
+    spec_->stop.store(false);
+    spec_->hold.store(false);
+    std::vector<std::promise<int>> pinned(spec_->groups.size());
+    for (size_t g = 0; g < spec_->groups.size(); ++g) {
+      std::promise<int>* pin = &pinned[g];
+      spec_->groups[g]->thread = std::thread([this, g, pin] {
+        const int error = pin_spec(static_cast<int>(g));
+        pin->set_value(error);
+        if (error == 0) run_spec(static_cast<int>(g));
+      });
+    }
+    int failed = -1;
+    int error = 0;
+    for (size_t g = 0; g < pinned.size(); ++g) {
+      const int e = pinned[g].get_future().get();
+      if (failed < 0 && e != 0) {
+        failed = static_cast<int>(g);
+        error = e;
+      }
+    }
+    if (failed >= 0) {
+      stop_spec();
+      throw std::runtime_error(
+          error_prefix<Layout>() + "could not pin the speculative thread of group " + std::to_string(failed) + ": " +
+          std::strerror(error));
+    }
+  }
+
+  // Stops and joins the speculative threads; each finishes the read it is in first. Idempotent.
+  void stop_spec() {
+    if (spec_ == nullptr) return;
+    spec_->stop.store(true, std::memory_order_seq_cst);
+    for (auto& spec : spec_->groups)
+      spec->bell.ring();
+    for (auto& spec : spec_->groups)
+      if (spec->thread.joinable()) spec->thread.join();
+  }
+
+  // Holds the speculative threads between reads and returns once none reads or scores: a pausing caller and a prefill
+  // fill use the readers, and set_hot writes the hot flags the scorer reads. Unbounded; the watchdog times a hung read.
+  void quiesce_spec() {
+    if (spec_ == nullptr) return;
+    spec_->hold.store(true, std::memory_order_seq_cst);
+    for (auto& spec : spec_->groups)
+      spec->bell.ring();
+    for (auto& spec : spec_->groups)
+      while (spec->thread.joinable() && !spec->idle.load(std::memory_order_seq_cst))
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+
+  void resume_spec() {
+    if (spec_ == nullptr) return;
+    spec_->hold.store(false, std::memory_order_seq_cst);
+    for (auto& spec : spec_->groups)
+      spec->bell.ring();
+  }
+
+  // The watchdog's marker for group g's speculative read: nonzero while one is in flight, a new value per read.
+  uint64_t spec_busy_episode(int g) const {
+    return spec_ == nullptr ? 0 : spec_->groups[g]->busy.load(std::memory_order_acquire);
   }
 
   // Writes every counter with relaxed reads: a core counter is the sum of its writers' blocks (each word has one
@@ -2026,12 +2097,19 @@ class RamTier {
 
   // A forced miss's pool row: when group g's pool of the row holds `expert` landed, returns the entry's slot and gives
   // the entry `victim`, swapped until the record's delta publishes (release_swapped); else -1 and the miss is read.
-  // Takes the group's pool mutex itself; the caller holds the tier lock.
+  // An entry still reading the expert is waited for first. Takes the group's pool mutex itself.
   int32_t take_pooled_locked(Group& group, const Request& request, int32_t expert, int32_t victim) {
     const int g = group.index;
     const int i = pool_->find(request.row, g, expert);
     if (i < 0) return -1;
     PoolEntry& entry = pool_->entry(request.row, g, i);
+    if (entry.word.load(std::memory_order_acquire) == pool_word(kPoolReading, expert)) {
+      // Promotion: the demand waits for the one speculative read in flight rather than read the row again; the
+      // service's busy episode times the wait.
+      count<kSpecPromoted>(group);
+      while (entry.word.load(std::memory_order_acquire) == pool_word(kPoolReading, expert))
+        _mm_pause();
+    }
     std::lock_guard<std::mutex> lock(pool_->mutex(g));
     if (entry.word.load(std::memory_order_acquire) != pool_word(kPoolLanded, expert)) return -1;
     const int32_t slot = entry.slot;
@@ -2047,12 +2125,20 @@ class RamTier {
     count_into<K>(spec.core, n);
   }
 
-  // Service thread, after any whole record: notes the row's seq, and hands the record to the group's speculative
-  // thread when it staged a CPU input and its row has a target. A full ring drops it: the service never waits.
+  // Service thread, before any whole record is handled: notes its row's seq, so a job whose source or target row is in
+  // service is stale. The fence pairs with spec_read's: a forced miss either sees the pool read and promotes it, or
+  // spec_read sees this seq and drops the read.
+  void note_serving(Group& group, const Request& request) {
+    if (request.row < 0 || request.row >= layers_) return;
+    spec_->groups[group.index]->row_seq[request.row].store(request.seq, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
+
+  // Service thread, after any whole record: hands it to the group's speculative thread when it staged a CPU input and
+  // its row has a target. A full ring drops it: the service never waits.
   void offer_spec(Group& group, const Request& request) {
     if (request.row < 0 || request.row >= layers_) return;
     SpecGroup& spec = *spec_->groups[group.index];
-    spec.row_seq[request.row].store(request.seq, std::memory_order_release);
     if (spec_->config.target[request.row] < 0) return;
     bool staged = false;
     for (const Lane& lane : request.lanes)
@@ -2097,9 +2183,9 @@ class RamTier {
     }
   }
 
-  // Speculative thread (or spec_pump): scores `job`'s target row and reads this group's picks into the pool. Both
-  // groups compute the same list from the same input and state, so the layer's budget holds over both.
-  void serve_spec_job(int g, const SpecJob& job) {
+  // Speculative thread (`threaded`) or spec_pump: scores `job`'s target row and reads this group's picks into the
+  // pool. Both groups compute the same list from the same input and state, so the layer's budget holds over both.
+  void serve_spec_job(int g, const SpecJob& job, bool threaded) {
     SpecGroup& spec = *spec_->groups[g];
     const RamPrefetchConfig& config = spec_->config;
     const int64_t target = config.target[job.row];
@@ -2114,8 +2200,11 @@ class RamTier {
         spec_->x_base + job.row * spec_->x_stride, job.tokens, spec_->x_token_bytes,
         config.gates + gate * experts_ * config.hidden, config.bias + gate * experts_, experts_, config.hidden,
         config.top_k, config.per_token, config.per_layer, spec.skip.data(), chosen);
-    for (int i = 0; i < n; ++i)
-      if (Wire::home(chosen[i]) == g) spec_read(g, job.row, target, job.seq, chosen[i]);
+    for (int i = 0; i < n; ++i) {
+      if (Wire::home(chosen[i]) != g) continue;
+      if (threaded && !spec_wait_unheld(spec)) return;  // a quiescer waits for one row, not the whole job
+      spec_read(g, job.row, target, job.seq, chosen[i]);
+    }
   }
 
   // Reads `expert`'s row of `target` into a pool entry of group g under the group's reader turn, so a demand read
@@ -2141,6 +2230,13 @@ class RamTier {
       entry.for_seq.store(source_seq, std::memory_order_relaxed);
       entry.word.store(pool_word(kPoolReading, expert), std::memory_order_release);
     }
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // pairs with note_serving's
+    if (spec_stale(spec, source, target, source_seq)) {
+      // A record of the row went into service meanwhile; a forced miss that saw the claim waits for this store.
+      pool_->entry(target, g, i).word.store(kPoolEmpty, std::memory_order_release);
+      spec_count<kSpecDropped>(spec);
+      return;
+    }
     spec_count<kSpecIssued>(spec);
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;
@@ -2160,6 +2256,50 @@ class RamTier {
     } else {
       spec_count<kSpecFailed>(spec);
     }
+  }
+
+  // Names group g's speculative thread and pins it to its cores; returns 0 or the errno.
+  int pin_spec(int g) {
+    SpecGroup& spec = *spec_->groups[g];
+    const std::string name = std::string(Layout::kName) + "-spec" + std::to_string(g);
+    pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+    if (spec.cores.empty()) return 0;
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    for (const int core : spec.cores)
+      CPU_SET(core, &cpus);
+    return pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+  }
+
+  // Group g's speculative thread: serves its ring, sleeping on its doorbell when the ring is empty.
+  void run_spec(int g) {
+    SpecGroup& spec = *spec_->groups[g];
+    while (spec_wait_unheld(spec)) {
+      SpecJob job;
+      if (spec.ring.pop(&job)) {
+        serve_spec_job(g, job, /*threaded=*/true);
+        continue;
+      }
+      spec.idle.store(true, std::memory_order_seq_cst);
+      spec.bell.sleep_unless([&] {
+        return !spec.ring.empty() || spec_->hold.load(std::memory_order_relaxed) ||
+               spec_->stop.load(std::memory_order_relaxed);
+      });
+    }
+    spec.idle.store(true, std::memory_order_seq_cst);
+  }
+
+  // A speculative thread before a job or a read: marks it busy, or waits marked idle while quiesced; false once
+  // stopped. `idle` is stored before `hold` is loaded, both seq_cst, so a quiescer that saw `idle` knows none starts.
+  bool spec_wait_unheld(SpecGroup& spec) {
+    while (!spec_->stop.load(std::memory_order_acquire)) {
+      spec.idle.store(false, std::memory_order_seq_cst);
+      if (!spec_->hold.load(std::memory_order_seq_cst)) return true;
+      spec.idle.store(true, std::memory_order_seq_cst);
+      while (spec_->hold.load(std::memory_order_acquire) && !spec_->stop.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    return false;
   }
 
   // Reads `expert`'s row of `row` into group g's pool entry i, which the caller claimed (kPoolReading), then lands the
@@ -2346,6 +2486,15 @@ class RamTier {
       std::span<const int32_t> lanes,
       CpuMissBatch* misses,
       StageRecord* cur) {
+    // The group's reader takes turns with its speculative thread: a demand waits for at most the one speculative row.
+    std::unique_lock<std::mutex> turn;
+    if (spec_ != nullptr) {
+      turn = std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock);
+      if (!turn.owns_lock()) {
+        count<kSpecDelayed>(group);
+        turn.lock();
+      }
+    }
     const bool publishing = init_piece_words_locked(group, request, lanes, plan.idx);
     bool fail_reads = false;
     if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only

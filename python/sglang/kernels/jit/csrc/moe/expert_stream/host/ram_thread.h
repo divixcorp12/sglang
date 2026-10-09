@@ -93,6 +93,15 @@ class RamThread {
           (Wire::kNodes > 1 ? " of group " + std::to_string(failed) : std::string()) + " to core " +
           std::to_string(cpu_cores_[failed]) + ": " + std::strerror(error));
     }
+    try {
+      tier_->start_spec();
+    } catch (...) {
+      stop_.store(true);
+      for (std::thread& thread : threads_)
+        thread.join();
+      tier_->set_threaded(false);
+      throw;
+    }
     watchdog_ = std::thread([this] { watch(); });
   }
 
@@ -102,6 +111,8 @@ class RamThread {
   /// prefill fill a pausing caller left running is joined by stop_thread's final settle (RamTier::final_settle), under
   /// caller_mutex(); the fill thread writes no tier state, so that join is the only edge it needs.
   void stop() {
+    // First: a service thread promoting a pool row waits for its read, which must finish while the services run.
+    tier_->stop_spec();
     stop_.store(true);
     for (std::thread& thread : threads_)
       if (thread.joinable()) thread.join();
@@ -120,8 +131,13 @@ class RamThread {
   /// pause() loads them all (acquire), then sets the tier's parked_ (release), which later callers acquire in
   /// caller_owns(). Each pause has its own odd epoch, so a pause right after a resume cannot take the previous pause's
   /// acknowledgement for its own.
+  ///
+  /// The speculative threads are quiesced first, without a bound and ignoring `timeout_ns`: a hung speculative read is
+  /// the watchdog's to abort.
   PauseResult pause(int64_t timeout_ns) {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
+    // The paused caller and a prefill fill use the readers the speculative reads take turns on.
+    tier_->quiesce_spec();
     const uint64_t epoch = (pause_epoch_.load(std::memory_order_relaxed) | 1u) + 2u;
     pause_epoch_.store(epoch);
     const int64_t deadline = now_ns() + timeout_ns;
@@ -168,6 +184,7 @@ class RamThread {
   void resume_locked() {
     tier_->fill_join();
     tier_->set_parked(false);
+    tier_->resume_spec();
     const uint64_t epoch = pause_epoch_.load(std::memory_order_relaxed);
     if (epoch & 1u) pause_epoch_.store(epoch + 1u, std::memory_order_release);
   }
@@ -233,18 +250,20 @@ class RamThread {
 
   /// What the watchdog last saw, per group and for the copy gate.
   struct WatchState {
-    std::vector<uint64_t> episode;      // each group's busy episode, 0: idle
+    std::vector<uint64_t> episode;      // each group's busy episode, then each speculative one; 0: idle
     std::vector<int64_t> episode_since;  // when the watchdog first saw it
     uint32_t gate = 0;                   // the gate word last seen closed, 0: open
     int64_t gate_since = 0;
   };
 
-  /// The watchdog: aborts the process, instead of hanging decode, when one demand or fill stays in service on a group
-  /// for fatal_wait_ns (a hung read, timed as one busy episode, RamTier::busy_episode), or when the copy wait's gate
-  /// stays closed on one value past the copy-wait timeout (the copy thread is stuck in a driver call, and the device's
-  /// wait must still end). It reads the clock every 20 ms on its own thread, so a stuck read cannot silence it.
+  /// The watchdog: aborts the process, instead of hanging decode, when one demand or fill stays in service on a group,
+  /// or one speculative read stays in flight, for fatal_wait_ns (a hung read, timed as one busy episode), or when the
+  /// copy wait's gate stays closed on one value past the copy-wait timeout (the copy thread is stuck in a driver call,
+  /// and the device's wait must still end). It reads the clock every 20 ms on its own thread, so a stuck read cannot
+  /// silence it.
   void watch() {
-    WatchState seen{std::vector<uint64_t>(threads_.size(), 0), std::vector<int64_t>(threads_.size(), 0)};
+    const size_t episodes = 2 * threads_.size();  // each group's service, then each group's speculative read
+    WatchState seen{std::vector<uint64_t>(episodes, 0), std::vector<int64_t>(episodes, 0)};
     while (!watch_stop_.load()) {
       const int64_t now = now_ns();
       const int stuck = stuck_group(seen, now);
@@ -253,17 +272,20 @@ class RamThread {
     }
   }
 
-  /// The first group whose busy episode has lasted past fatal_wait_ns, or -1.
+  /// The first busy episode that has lasted past fatal_wait_ns, or -1: index g is group g's service, groups + g its
+  /// speculative read.
   int stuck_group(WatchState& seen, int64_t now) const {
+    const size_t groups = threads_.size();
     int stuck = -1;
-    for (size_t g = 0; g < threads_.size(); ++g) {
-      const uint64_t busy = tier_->busy_episode(static_cast<int>(g));
-      if (busy != seen.episode[g]) {
-        seen.episode[g] = busy;
-        seen.episode_since[g] = now;
+    for (size_t i = 0; i < 2 * groups; ++i) {
+      const int g = static_cast<int>(i % groups);
+      const uint64_t busy = i < groups ? tier_->busy_episode(g) : tier_->spec_busy_episode(g);
+      if (busy != seen.episode[i]) {
+        seen.episode[i] = busy;
+        seen.episode_since[i] = now;
       }
-      if (stuck < 0 && seen.episode[g] != 0 && now - seen.episode_since[g] > fatal_wait_ns_)
-        stuck = static_cast<int>(g);
+      if (stuck < 0 && seen.episode[i] != 0 && now - seen.episode_since[i] > fatal_wait_ns_)
+        stuck = static_cast<int>(i);
     }
     return stuck;
   }
@@ -279,17 +301,20 @@ class RamThread {
     return seen.gate != 0 && now - seen.gate_since > tier_->copy_wait_timeout_ns();
   }
 
-  /// Reports the hang (group `stuck`'s request, or the copy gate when -1) and aborts without a core dump.
+  /// Reports the hang (`stuck` from stuck_group, or the copy gate when -1) and aborts without a core dump.
   [[noreturn]] void abort_hung(int stuck) const {
+    const int groups = static_cast<int>(threads_.size());
     const bool request = stuck >= 0;
+    const bool speculative = stuck >= groups;
     const std::string why = request ? "" : tier_->copy_stall();
-    const std::string group = request && threads_.size() > 1 ? "group " + std::to_string(stuck) + ": " : "";
+    const std::string group = request && groups > 1 ? "group " + std::to_string(stuck % groups) + ": " : "";
     std::fprintf(
         stderr,
         "FATAL %s%s%s for %.1f s%s; aborting instead of hanging decode\n",
         error_prefix<typename Tier::Layout>().c_str(),
         group.c_str(),
-        request ? "a request stayed in service" : "a copy wait held the decode stream",
+        !request ? "a copy wait held the decode stream"
+                 : (speculative ? "a speculative read stayed in service" : "a request stayed in service"),
         static_cast<double>(request ? fatal_wait_ns_ : tier_->copy_wait_timeout_ns()) / 1e9,
         why.c_str());
     std::fflush(stderr);
