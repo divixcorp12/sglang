@@ -98,6 +98,11 @@ ARMS["dspark-both-prefetch-gpu-floors"] = (
     {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": MARGIN_FLOORS},
     True,
 )
+# The GPU-prefetch arm with the miss-aware split cut on: does the prefetch add to the cut.
+ARMS["dspark-both-prefetch-gpu-misscut"] = (
+    {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -108,6 +113,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-topk": "dspark-both",
     "dspark-both-prefetch-gpu-floors": "dspark-both",
     "dspark-both-misscut": "dspark-both",
+    "dspark-both-prefetch-gpu-misscut": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
