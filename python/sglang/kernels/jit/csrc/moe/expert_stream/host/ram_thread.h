@@ -272,12 +272,12 @@ class RamThread {
     }
   }
 
-  /// The first busy episode that has lasted past fatal_wait_ns, or -1: index g is group g's service, groups + g its
-  /// speculative read.
+  /// A busy episode that has lasted past fatal_wait_ns, or -1: index g is group g's service, groups + g its
+  /// speculative read. A speculative one is preferred: a service promoting its pool row waits on it.
   int stuck_group(WatchState& seen, int64_t now) const {
     const size_t groups = threads_.size();
     int stuck = -1;
-    for (size_t i = 0; i < 2 * groups; ++i) {
+    for (size_t i = 2 * groups; i-- > 0;) {
       const int g = static_cast<int>(i % groups);
       const uint64_t busy = i < groups ? tier_->busy_episode(g) : tier_->spec_busy_episode(g);
       if (busy != seen.episode[i]) {

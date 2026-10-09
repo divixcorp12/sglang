@@ -1338,19 +1338,21 @@ class RamTier {
     if (spec_ == nullptr) return;
     spec_->stop.store(false);
     spec_->hold.store(false);
-    std::vector<std::promise<int>> pinned(spec_->groups.size());
+    std::vector<std::future<int>> pins;
     for (size_t g = 0; g < spec_->groups.size(); ++g) {
-      std::promise<int>* pin = &pinned[g];
-      spec_->groups[g]->thread = std::thread([this, g, pin] {
+      SpecGroup& spec = *spec_->groups[g];
+      spec.pinned = std::promise<int>();  // a previous start's thread was joined by stop_spec
+      pins.push_back(spec.pinned.get_future());
+      spec.thread = std::thread([this, g, &spec] {
         const int error = pin_spec(static_cast<int>(g));
-        pin->set_value(error);
+        spec.pinned.set_value(error);
         if (error == 0) run_spec(static_cast<int>(g));
       });
     }
     int failed = -1;
     int error = 0;
-    for (size_t g = 0; g < pinned.size(); ++g) {
-      const int e = pinned[g].get_future().get();
+    for (size_t g = 0; g < pins.size(); ++g) {
+      const int e = pins[g].get();
       if (failed < 0 && e != 0) {
         failed = static_cast<int>(g);
         error = e;
@@ -1430,6 +1432,8 @@ class RamTier {
     SpscRing<SpecJob, 64> ring;  // arbitrary: one job per CPU record, the thread drains it every ~layer
     Doorbell bell;
     std::mutex turn;  // the group's reader: one demand read (read_rows) or one speculative read at a time
+    std::atomic<int> demand_waiting{0};  // demand reads blocked on `turn`, which spec_read lets go first
+    std::promise<int> pinned;  // start_spec: 0 pinned, else the errno; a member, so it outlives the set_value
     std::atomic<uint64_t> busy{0};
     uint64_t episodes = 0;
     std::atomic<bool> idle{true};
@@ -2212,6 +2216,9 @@ class RamTier {
   // waits for at most this one row. Dropped when stale, or when the expert was mapped or pooled meanwhile.
   void spec_read(int g, int64_t source, int64_t target, uint32_t source_seq, int32_t expert) {
     SpecGroup& spec = *spec_->groups[g];
+    // A demand blocked on the turn goes first: the unlocking thread would otherwise retake it before the woken demand.
+    while (spec.demand_waiting.load(std::memory_order_seq_cst) != 0)
+      _mm_pause();
     std::lock_guard<std::mutex> turn(spec.turn);
     if (spec_stale(spec, source, target, source_seq) ||
         __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
@@ -2234,6 +2241,7 @@ class RamTier {
     std::atomic_thread_fence(std::memory_order_seq_cst);  // pairs with note_serving's
     if (spec_stale(spec, source, target, source_seq)) {
       // A record of the row went into service meanwhile; a forced miss that saw the claim waits for this store.
+      // A landed entry reclaimed by the claim is lost with it, which only wastes its read.
       pool_->entry(target, g, i).word.store(kPoolEmpty, std::memory_order_release);
       spec_count<kSpecDropped>(spec);
       return;
@@ -2297,8 +2305,10 @@ class RamTier {
       spec.idle.store(false, std::memory_order_seq_cst);
       if (!spec_->hold.load(std::memory_order_seq_cst)) return true;
       spec.idle.store(true, std::memory_order_seq_cst);
-      while (spec_->hold.load(std::memory_order_acquire) && !spec_->stop.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
+      // resume_spec and stop_spec ring the doorbell after their stores.
+      spec.bell.sleep_unless([&] {
+        return !spec_->hold.load(std::memory_order_relaxed) || spec_->stop.load(std::memory_order_relaxed);
+      });
     }
     return false;
   }
@@ -2493,7 +2503,10 @@ class RamTier {
       turn = std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock);
       if (!turn.owns_lock()) {
         count<kSpecDelayed>(group);
+        std::atomic<int>& waiting = spec_->groups[group.index]->demand_waiting;
+        waiting.fetch_add(1, std::memory_order_seq_cst);  // spec_read yields the turn to a waiting demand
         turn.lock();
+        waiting.fetch_sub(1, std::memory_order_relaxed);
       }
     }
     const bool publishing = init_piece_words_locked(group, request, lanes, plan.idx);

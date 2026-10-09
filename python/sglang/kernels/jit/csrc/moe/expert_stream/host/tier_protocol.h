@@ -57,7 +57,7 @@ enum Counter : int {
   kSpecIssued,
   kSpecLanded,
   kSpecUsed,
-  kSpecPromoted,
+  kSpecPromoted,  // counts the waits, also one whose read then fails or is dropped as stale
   kSpecDropped,
   kSpecFailed,
   kSpecDelayed,
