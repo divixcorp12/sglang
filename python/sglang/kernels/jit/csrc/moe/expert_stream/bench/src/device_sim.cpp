@@ -116,7 +116,8 @@ SimRequest DeviceSim::post(
   }
   sync_row(row, deadline_ns);
 
-  // Lane typing as ram_slot_map.type_lanes with hit_copy="sm", cpu_misses=false, cpu_ok=ce_ok=true.
+  // Lane typing as ram_slot_map.type_lanes with hit_copy="sm", cpu_misses=false, cpu_ok=ce_ok=true, no forced lanes
+  // (so miss_cut, which counts forced misses, never applies).
   SimRequest r;
   r.row = row;
   r.count = count;

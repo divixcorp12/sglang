@@ -3,7 +3,8 @@
 // A C++ port of ChainSim in python/sglang/test/dsv41_chain_sim.py. DeviceSim stands in for the post kernel, the
 // staging read (S) and the copy wait (CW) of the decode stream; it is not evidence about them. Lanes are typed as
 // python/sglang/srt/layers/moe/ram_slot_map.py `type_lanes` types them, with no copy table (hit_copy="sm": a hit the
-// CPU does not take is Wire::kKindHitSm) and CPU hits only (cpu_misses=false).
+// CPU does not take is Wire::kKindHitSm) and CPU hits only (cpu_misses=false). It posts no forced lanes, so the
+// experimental split miss cut (SGLANG_DSV41_CPU_SPLIT_MISS_CUT, which counts forced misses) never applies here.
 //
 //   SimRequest   one posted record's identity and lane typing
 //   DeviceSim    the post / sync_row / copy_wait / wait_pieces operations over a request page and lease block

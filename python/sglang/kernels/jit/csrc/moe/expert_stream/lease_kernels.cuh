@@ -53,6 +53,8 @@ struct PostParams {
   int64_t hit_copy_ce;  // SGLANG_DSV41_RAM_HIT_COPY=ce: an armed captured hit goes to the copy engine
   int64_t cpu_on;
   int64_t cpu_misses;
+  int64_t miss_cut;  // experiment: SGLANG_DSV41_CPU_SPLIT_MISS_CUT (LanePolicy::miss_cut)
+  int64_t miss_cut_max;  // SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX
   // The post's outputs for the later kernels of the chain (C1 copies SM hits, S streams misses, CW waits for the copy
   // engine): each lane's kind, source slot and home node, and C1's compacted list of SM hits.
   int32_t* lane_kind;
@@ -154,6 +156,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .ce_ok = p.ce_ok[p.row] != 0,
           .cpu_ok = p.cpu_ok[p.row] != 0,
           .dst_rows = p.dst_rows[p.row],
+          .miss_cut = static_cast<int32_t>(p.miss_cut),
+          .miss_cut_max = static_cast<int32_t>(p.miss_cut_max),
       };
       // Loaded before the tag spin: the host stores split relaxed at any time, ordered by nothing (set_cpu_split in
       // host/ram_tier.h). Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes
@@ -382,6 +386,8 @@ struct LeaseProtocolKernel {
       int64_t hit_copy_ce,
       int64_t cpu_on,
       int64_t cpu_misses,
+      int64_t miss_cut,
+      int64_t miss_cut_max,
       tvm::ffi::TensorView lane_kind,
       tvm::ffi::TensorView lane_slot,
       tvm::ffi::TensorView lane_node,
@@ -497,6 +503,9 @@ struct LeaseProtocolKernel {
     }
     RuntimeCheck(cpu_on == 0 || cpu_input || captured == 0, "CPU experts: a captured post needs the CPU input");
     RuntimeCheck(
+        miss_cut >= 0 && miss_cut <= INT32_MAX && miss_cut_max >= 0 && miss_cut_max <= INT32_MAX,
+        "the split miss cut and its bound must be non-negative int32");
+    RuntimeCheck(
         lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
         "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
 
@@ -537,6 +546,8 @@ struct LeaseProtocolKernel {
         .hit_copy_ce = hit_copy_ce,
         .cpu_on = cpu_on,
         .cpu_misses = cpu_misses,
+        .miss_cut = miss_cut,
+        .miss_cut_max = miss_cut_max,
         .lane_kind = static_cast<int32_t*>(lane_kind.data_ptr()),
         .lane_slot = static_cast<int32_t*>(lane_slot.data_ptr()),
         .lane_node = static_cast<int32_t*>(lane_node.data_ptr()),

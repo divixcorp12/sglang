@@ -38,20 +38,22 @@ DRAFT_ONLY = {
 }
 # Every arm but the prefetch's states the RAM prefetch off, so a shell that exports it cannot carry it into an arm.
 PREFETCH_OFF = {"SGLANG_DSV41_RAM_PREFETCH": "0", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": ""}
+# Every arm but the miss cut's states the CPU split's miss cut off, likewise.
+MISS_CUT_OFF = {"SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
 # The GPU scorer's margin floors fit by spec_margin.py's admission sweep (the file says on what).
 MARGIN_FLOORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ram_prefetch_margin_floors.json")
 # arm: (overrides on base_env, DSpark argv)
 ARMS = {
-    "prod": ({**PREFETCH_OFF}, False),
-    "dspark-draft-only": ({**arm_env.dspark_env(), **DRAFT_ONLY, **PREFETCH_OFF}, True),
-    "dspark-both": ({**arm_env.dspark_env(), **PREFETCH_OFF}, True),
+    "prod": ({**PREFETCH_OFF, **MISS_CUT_OFF}, False),
+    "dspark-draft-only": ({**arm_env.dspark_env(), **DRAFT_ONLY, **PREFETCH_OFF, **MISS_CUT_OFF}, True),
+    "dspark-both": ({**arm_env.dspark_env(), **PREFETCH_OFF, **MISS_CUT_OFF}, True),
     # Experiment-only; retire with plan 2026-10-07-dsv41-row-weighted-serving-experiment. B arms, one source at a time.
     "dspark-both-rw-draft": (
-        {**arm_env.dspark_env(), **PREFETCH_OFF, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "draft"},
+        {**arm_env.dspark_env(), **PREFETCH_OFF, **MISS_CUT_OFF, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "draft"},
         True,
     ),
     "dspark-both-rw-target": (
-        {**arm_env.dspark_env(), **PREFETCH_OFF, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"},
+        {**arm_env.dspark_env(), **PREFETCH_OFF, **MISS_CUT_OFF, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"},
         True,
     ),
     # NVMe-to-RAM prefetch (spec 2026-10-08-dsv41-ram-prefetch-design, The A/B): the replay's best arm, h=1, one
@@ -66,10 +68,17 @@ ARMS = {
             "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
             "SGLANG_DSV41_RAM_PREFETCH_SCORER": "cpu",
             "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
+            **MISS_CUT_OFF,
         },
         True,
     ),
 }
+# Experiment: a miss-aware CPU split. A node with 1..3 forced CPU misses gives one of its split's lanes back to the
+# copy engine or GPU, since its misses queue behind the CPU-hit job (analysis/dsv41-drive/dspark/miss_timeline.py).
+ARMS["dspark-both-misscut"] = (
+    {**ARMS["dspark-both"][0], "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"},
+    True,
+)
 # The same, picking only among each token's predicted top_k (DSV41_REFERENCE.md 33.14's unused reads).
 ARMS["dspark-both-prefetch-topk"] = (
     {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
@@ -98,6 +107,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu": "dspark-both",
     "dspark-both-prefetch-gpu-topk": "dspark-both",
     "dspark-both-prefetch-gpu-floors": "dspark-both",
+    "dspark-both-misscut": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (

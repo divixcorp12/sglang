@@ -300,6 +300,10 @@ struct LanePolicy {
   bool ce_ok;        // the row's copy table is set
   bool cpu_ok;       // the row's CPU layer is registered
   int32_t dst_rows;
+  // Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX): a node with 1..miss_cut_max forced CPU misses takes miss_cut
+  // fewer of its split's lanes. 0: no cut.
+  int32_t miss_cut;
+  int32_t miss_cut_max;
   int32_t split[Wire::kNodes][Wire::kLanes + 1];  // Wire::kSplit: per node, CPU lanes per n eligible lanes
 };
 
@@ -332,6 +336,8 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kNodes][Wi
 // victim (RamTier::reserve_victims_locked). Traps where the reference raises ValueError: a plan wider than
 // Wire::kLanes, an expert out of range or repeated, a hit slot past the row's capacity, an unforced miss with no
 // staging slot on its node (live misses <= victim lanes = staging per node: an assert), a split entry above its n.
+// With policy.miss_cut > 0, a node with 1..policy.miss_cut_max forced misses (forced lanes that are not RAM hits)
+// takes policy.miss_cut fewer of its split's lanes, at least 0; forced lanes stay CPU lanes.
 // Returns false where the reference raises LaneOverflow: forced lanes with no host lanes or no CPU layer; `out` is then
 // partial. Reads no host memory; the caller loads the split table into the policy.
 SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
@@ -358,6 +364,7 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
   bool eligible[Wire::kLanes];
   int m[Wire::kNodes] = {};
   int n[Wire::kNodes] = {};
+  int forced_misses[Wire::kNodes] = {};
   const bool can_cpu = policy.host_lanes && policy.cpu_on && policy.cpu_ok;
 #pragma unroll
   for (int j = 0; j < Wire::kLanes; ++j) {
@@ -380,12 +387,15 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     if (forced && !can_cpu) return false;
     eligible[j] = !forced && can_cpu && (hit[j] || policy.cpu_misses);
     n[node] += eligible[j] ? 1 : 0;
+    forced_misses[node] += forced && !hit[j] ? 1 : 0;
   }
   int take[Wire::kNodes];
 #pragma unroll
   for (int node = 0; node < Wire::kNodes; ++node) {
     take[node] = n[node] > 0 ? policy.split[node][n[node]] : 0;
     if (take[node] < 0 || take[node] > n[node]) __trap();
+    if (policy.miss_cut > 0 && forced_misses[node] >= 1 && forced_misses[node] <= policy.miss_cut_max)
+      take[node] = take[node] > policy.miss_cut ? take[node] - policy.miss_cut : 0;
   }
   const bool copy_ok = policy.host_lanes && policy.hit_copy_ce && policy.ce_ok;
   for (int64_t j = plan.count - 1; j >= 0; --j) {

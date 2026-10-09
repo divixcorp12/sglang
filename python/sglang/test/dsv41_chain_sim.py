@@ -167,11 +167,14 @@ class ChainSim:
         slots: Optional[Sequence[int]] = None,
         chain: Optional[int] = None,
         forced_from: Optional[int] = None,
+        miss_cut: int = 0,
+        miss_cut_max: int = 3,
     ) -> SimRequest:
         """The post kernel: apply the row's pending delta, type the lanes from the replica, then the hot record, the
         record and demand_head. ``kinds``/``slots`` override the typing and ``chain`` the map-chain number (a malformed post); ``hot`` is the VRAM hot
         set the hot record carries, ``hot_seq`` the seq it names (a stale record).
-        ``forced_from`` types the lanes from it on as spill does (type_lanes)."""
+        ``forced_from`` types the lanes from it on as spill does, and ``miss_cut``/``miss_cut_max`` trim the split as
+        SGLANG_DSV41_CPU_SPLIT_MISS_CUT/_MAX do (type_lanes)."""
         experts = tuple(int(e) for e in experts)
         if experts and not self.apply_pending(row):
             raise AssertionError(f"row {row}: the host has not published delta {self.replica.map_chain[row]}")
@@ -180,7 +183,7 @@ class ChainSim:
                 experts, self.replica.ram_slot[row], self.replica.staging[row], self.split(),
                 lanes=self.wire.lanes, nodes=self.wire.nodes, captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
                 cpu_misses=cpu_misses, cpu_ok=cpu_ok, ce_ok=ce_ok,
-                forced_from=forced_from,
+                forced_from=forced_from, miss_cut=miss_cut, miss_cut_max=miss_cut_max,
             )
         else:
             # Raw ints, not LaneKind: a malformed post may name a kind the device never writes.

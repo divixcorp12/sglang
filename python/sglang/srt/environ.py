@@ -1984,6 +1984,12 @@ class Envs:
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
     # (slot-map plan, Task 0), so a served A/B decides.
     SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
+    # Experiment: a miss-aware split. A forced CPU miss runs on its node's CPU behind the record's CPU-hit job, so a
+    # node with 1.._MAX forced misses takes this many fewer of its split's lanes (they go to the copy engine or the
+    # GPU). 0 is off. Needs SGLANG_DSV41_CPU_EXPERTS.
+    SGLANG_DSV41_CPU_SPLIT_MISS_CUT = EnvInt(0)
+    # The most forced misses on a node for which the cut applies.
+    SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX = EnvInt(3)
     # DSpark draft experts on the CPU (plan 2026-10-05-dsv41-dspark-port): each draft stage keeps the experts its
     # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
     # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.

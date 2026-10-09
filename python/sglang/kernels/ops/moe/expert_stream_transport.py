@@ -2731,7 +2731,8 @@ class ExpertStreamDevice:
     (``tables.capacity``), which the post and S bound every host slot by.
     ``timeout_ms`` is the post's delta wait and S's deadline. ``hit_copy`` ("ce" or
     "sm") and ``cpu_misses`` carry ``SGLANG_DSV41_RAM_HIT_COPY`` and
-    ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``lease_pdl``
+    ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
+    ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` (ram_slot_map.type_lanes); ``lease_pdl``
     (``SGLANG_DSV41_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
     PDL.
 
@@ -2762,6 +2763,8 @@ class ExpertStreamDevice:
         lease_pdl: bool = False,
         hit_copy: str = "ce",
         cpu_misses: bool = False,
+        miss_cut: int = 0,
+        miss_cut_max: int = 3,
         lanes: int = 8,
         nodes: int = 1,
     ) -> None:
@@ -2819,6 +2822,10 @@ class ExpertStreamDevice:
             raise ValueError(f"hit_copy is 'ce' or 'sm', not {hit_copy!r}")
         self.hit_copy = hit_copy
         self.cpu_misses = bool(cpu_misses)
+        for name, value in (("miss_cut", miss_cut), ("miss_cut_max", miss_cut_max)):
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        self.miss_cut, self.miss_cut_max = int(miss_cut), int(miss_cut_max)
         state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
         # Continue from the page's head: the thread serves demand_head + 1 next, so a
         # device restarting at 1 over a used page would never be served.
@@ -3207,6 +3214,8 @@ class ExpertStreamDevice:
             int(self.hit_copy == "ce"),
             int(cpu_on),
             int(self.cpu_misses and cpu_on),
+            self.miss_cut,
+            self.miss_cut_max,
             self.lane_kind,
             self.lane_slot,
             self.lane_node,

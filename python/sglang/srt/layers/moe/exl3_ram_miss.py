@@ -1464,6 +1464,8 @@ class Exl3RamMissService:
                 lease_pdl=self.lease_pdl,
                 hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
                 cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
+                miss_cut=envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
+                miss_cut_max=envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
                 lanes=self.lanes,
                 nodes=self.wire.nodes,
             )

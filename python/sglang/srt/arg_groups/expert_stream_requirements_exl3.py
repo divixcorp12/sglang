@@ -320,7 +320,8 @@ def _check_slot_map() -> None:
     """The slot-map chain's switches.
 
     ``SGLANG_DSV41_RAM_HIT_COPY`` types how the post copies RAM hits;
-    ``SGLANG_DSV41_CPU_EXPERTS_MISSES`` lets the CPU take NVMe misses.
+    ``SGLANG_DSV41_CPU_EXPERTS_MISSES`` lets the CPU take NVMe misses;
+    ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` trim the CPU's split on nodes with forced misses.
     """
     hit_copy = envs.SGLANG_DSV41_RAM_HIT_COPY.get()
     if hit_copy not in ("ce", "sm"):
@@ -335,6 +336,13 @@ def _check_slot_map() -> None:
         raise ValueError(
             "SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1"
         )
+    for name in ("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX"):
+        value = getattr(envs, name).get()
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+    if envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        # Without CPU experts there is no split to cut: a set cut is a launch typo.
+        raise ValueError("SGLANG_DSV41_CPU_SPLIT_MISS_CUT needs SGLANG_DSV41_CPU_EXPERTS=1")
 
 
 def _check_ram_prefetch() -> None:

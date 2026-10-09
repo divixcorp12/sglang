@@ -188,6 +188,12 @@ class CpuExpertService:
             self.threads,
             self.split,
         )
+        logger.info(
+            "CPU experts group %d split miss cut: %d lanes for 1..%d forced misses on a node (0: off)",
+            self.group,
+            envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
+            envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
+        )
 
     def _capacity(self, slabs: Mapping[str, torch.Tensor]) -> int:
         """The slab row count of one layer, which every slab must agree on."""

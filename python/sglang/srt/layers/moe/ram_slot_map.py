@@ -42,6 +42,8 @@ def type_lanes(
     dst_ok: Optional[Sequence[bool]] = None,
     nodes: int = 1,
     forced_from: Optional[int] = None,
+    miss_cut: int = 0,
+    miss_cut_max: int = 3,
 ) -> tuple[list[LaneKind], list[int]]:
     """Each lane's kind and source slot: its RAM slot for a hit, the next staging slot of its home node for a miss.
 
@@ -53,7 +55,11 @@ def type_lanes(
     Lanes from ``forced_from`` on (spill, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) found no VRAM victim: each is a
     CPU lane whatever the split. A forced hit runs from its RAM slot; a forced miss gets slot -1 and no staging slot,
     since the host reads it into a RAM victim (RamTier::reserve_victims_locked). The split counts only the lanes before
-    ``forced_from``. Raises LaneOverflow when forced lanes cannot be CPU lanes (no host lanes, no CPU layer)."""
+    ``forced_from``. Raises LaneOverflow when forced lanes cannot be CPU lanes (no host lanes, no CPU layer).
+
+    Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX): a forced CPU miss runs on its node's CPU behind the record's
+    CPU-hit job, so a node with 1..``miss_cut_max`` forced misses takes ``miss_cut`` fewer of its split's lanes (at
+    least 0). Forced lanes stay CPU lanes; ``miss_cut`` 0 is the typing without the cut."""
     if len(experts) > lanes:
         raise ValueError(f"a request has at most {lanes} lanes, got {len(experts)}")
     if len(set(experts)) != len(experts):
@@ -87,6 +93,9 @@ def type_lanes(
     for node in range(nodes):
         n = sum(1 for e, ok in zip(experts, eligible) if ok and home(e) == node)
         take[node] = split[node * (lanes + 1) + n] if n else 0
+        forced_misses = sum(1 for j, e in enumerate(experts) if j >= forced_from and not hit[j] and home(e) == node)
+        if miss_cut > 0 and 1 <= forced_misses <= miss_cut_max:
+            take[node] = max(0, take[node] - miss_cut)
     cpu = [j >= forced_from for j in range(len(experts))]
     for j in reversed(range(len(experts))):
         node = home(experts[j])
