@@ -10,3 +10,4 @@
 #include "exl3_row_layout.h"
 #include "../expert_stream/lease_kernels.cuh"
 #include "../expert_stream/row_copy_kernels.cuh"
+#include "../expert_stream/spec_score.cuh"

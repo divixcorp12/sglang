@@ -2444,6 +2444,13 @@ _ROW_COPY_METHODS = {
     "expert_stream_lease_stream": "lease_stream",
     "expert_stream_lease_copy_wait": "lease_copy_wait",
 }
+_SPEC_METHODS = {
+    "expert_stream_spec_score": "score",
+    "expert_stream_spec_select": "select",
+}
+# The select kernel's bounds (spec_score.cuh kSpecDepth, kSelectMaxExperts).
+SPEC_DEPTH = 12
+SPEC_SELECT_MAX_EXPERTS = 1024
 
 
 def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
@@ -2455,6 +2462,9 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ] + [
         (name, f"RowCopyKernel<{device_layout}>::{method}")
         for name, method in _ROW_COPY_METHODS.items()
+    ] + [
+        (name, f"SpecScoreKernel::{method}")
+        for name, method in _SPEC_METHODS.items()
     ]
 
 
@@ -2499,6 +2509,36 @@ def device_module_with_hooks(
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
+    )
+
+
+def run_spec_score(x, w, bias, scores, *, module=None) -> None:
+    """The GPU scorer's score kernel (spec_score.cuh): sqrt(softplus(w @ x_t)) + bias for each row of ``x`` into the
+    same row of ``scores``. ``x`` bf16 [tokens, hidden], ``w`` bf16 or fp32 [experts, hidden], ``bias`` fp32
+    [experts], ``scores`` fp32 [tokens_max, experts], one CUDA device. ``module``: the device module (default: the
+    8-lane, one-node build)."""
+    (module or _device_module()).expert_stream_spec_score(x, w, bias, scores)
+
+
+def run_spec_select(
+    scores, tokens, *, top_k, per_token, top_k_only, hot_slots, hot_capacity, ram_slot, target, state, candidates,
+    module=None,
+) -> None:
+    """The GPU scorer's select kernel: ranks ``scores``' first ``tokens`` rows past ``hot_slots[:hot_capacity]`` and
+    the experts ``ram_slot[target]`` maps, and publishes up to CAND_MAX candidates to the slot of ``state``'s posted
+    seq in the pinned ``candidates`` page; count 0 when ``tokens`` is outside 1..scores' rows."""
+    (module or _device_module()).expert_stream_spec_select(
+        scores,
+        int(tokens),
+        int(top_k),
+        int(per_token),
+        int(bool(top_k_only)),
+        hot_slots,
+        int(hot_capacity),
+        ram_slot,
+        int(target),
+        state,
+        int(candidates.data_ptr()),
     )
 
 
