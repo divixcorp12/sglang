@@ -7745,6 +7745,90 @@ critical path at this budget: one prefetched row per layer rarely clears a layer
 `both_cpu_ab.py --baseline DIR` now imports the reference arm from an earlier A/B instead of rerunning it (about half
 the wall time; the two arms are then no longer in one window, so drift reads as the arm's effect).
 
+### 33.16 Where the prefetch's time goes: layer misses, the hidden cost, the drives, and verify width (2026-10-09)
+
+Follows §33.15's addendum, where the per-layer margin floors raised precision to 0.59 and decode still tied. Four
+offline studies on captured runs, CPU only except the captures and fio. Instrumented-build timings: compare them only
+with each other, never with an A/B's tok/s.
+
+**Tools.** `analysis/dsv41-drive/dspark/layer_misses.py` joins the InstrBuild job trace into one row per layer step
+(a record, `(row, gen)`): `copy_submit.b` summed over both NUMA groups is the record's forced CPU misses (every lane
+whose row is not in RAM, read from NVMe or swapped in from the prefetch pool, `ram_tier.h` `classify_lanes_locked`),
+each `spec_use` is one miss the pool covered, and `gate_open` minus the first `copy_submit` is the layer's wait. A
+forward is rows 0-39 once at consecutive gens. The cost of a remaining NVMe read is the slope of the wait on the
+remaining reads within (row, misses) strata, rows 1-39 (row 0 has no source layer). `--compare` matches a second run's
+uncovered records to the first's by (row, misses). `drive_busy.py` samples `/sys/block/<dev>/stat` of the three
+mirror drives every 5 ms on CLOCK_MONOTONIC and windows it to the trace's forwards. `spec_margin_capture.py --arm`
+captures any `both_cpu_ab.py` arm. Tests: `test/registered/unit/scripts/test_{layer_misses,drive_busy}.py`.
+
+**1. Misses per layer and what prefetch clears** (`margin-gpu-20261009-035316`, GPU scorer, no floors, 131 forwards).
+A forward (one DSpark verify, about 3.6 tokens) takes 266 ms; the layers' waits are 78% of it. It has 91 forced
+misses (2.3 per layer): the pool covers 19, 72 are still read. Layer 0 has the most (6.6 per forward) and same-token
+lookahead never reaches it; then 19 (5.4), 1 (4.6), 15 (4.5), 23 (3.7), 13 (3.4); the lightest are 21, 24, 25 and 28
+(0.7-1.2). Of the records with a miss, 59% got a pooled row but 13% were cleared: one read per layer against 2.3
+misses. Light layers are cleared 31-35% of the time, the heavy ones 0-4%. A layer with no miss still waits 3.0 ms; a
+miss adds 1.25 ms, of which a covered miss still costs 0.5-0.9 (the CPU miss path) and an NVMe read 0.78. That read
+cost grows with the layer's misses (0.43 / 0.67 / 0.81 / 1.14 ms at 1 / 2 / 3 / 4), as the reads queue. Clearing
+every remaining read of rows 1-39 would save about 51 ms per forward (19%); the 19 cleared reads are worth about
+15 ms (5.5%), which the A/Bs did not see.
+
+**2. The hidden cost** (`hidden-cost-20261009-141506`, both captures at `ca15769d19`: `dspark-both`, then
+`dspark-both-prefetch-gpu-floors`).
+
+| | no prefetch | margin-floors prefetch |
+|---|---:|---:|
+| forward, median | 286.5 ms | 287.9 ms |
+| layer waits per forward, median | 226.9 ms | 231.5 ms |
+| misses / covered / read per forward | 87.3 / 0 / 87.3 | 92.6 / 18.0 / 74.6 |
+| ms per extra uncovered miss (within row) | 1.15 | 1.50 |
+| speculative reads issued / used | | 4026 / 2326 (0.58) |
+
+Matched by (row, misses) among records the pool did not cover (2,937 records), the prefetch run's layers are slower
+by +0.05 ms with no miss and +0.49 / +0.58 / +1.12 / +1.72 ms with 1 / 2 / 3 / 4: nothing general (the kernels, the
+speculative threads' CPU) costs anything, but every demand NVMe read is about 0.4-0.5 ms slower while speculative
+reads run. About 18 reads saved per forward against about as much lost on the remaining 75: the A/Bs' tie. The
+prefetch run also had 5.3 more misses per forward, from the pool's 2 rows per row and group taken out of the tier,
+from a different DSpark acceptance (133 vs 127 forwards), or both; this data does not separate them.
+
+**3. The drives** (`drive-busy-20261009-145635`, `dspark-both` at `6f4c90f12d`, 131 forwards, 43 s of decode;
+fio afterwards under `rowimg-disk.lock`). The mirror source reads every row from all three roots at once, each part
+sized by `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` (equal today), so every row read waits for all three drives.
+
+| | `/mnt/nvme0` (nvme0n1, 990 EVO Plus) | `/mnt/nvme2` (nvme1n1, 990 EVO Plus) | `/mnt/nvme4` (nvme2n1, SPCC) |
+|---|---:|---:|---:|
+| decode GB/s | 1.43 | 1.43 | 1.43 |
+| decode busy share (io_ticks) | 0.41 | 0.43 | 0.55 |
+| fio, 13 MB reads, QD1: GB/s, p50 / p99 | 3.35, 3.8 / 4.1 ms | 3.38, 3.8 / 3.9 ms | 2.19, 4.0 / 29.0 ms |
+| fio QD2 | 3.55, 7.4 ms | 3.55, 7.3 ms | 2.20, 7.5 / 40.6 ms |
+| fio QD8 | 3.55, 30 ms | 3.56, 30 ms | 1.05, 114 / 186 ms |
+
+Decode reads 4.3 GB/s (1.23 GB per forward) against a combined ceiling of about 9.3; all three drives are idle at
+once for 19-42% of decode (io_ticks bounds; the stat file's in-flight count reads 0 for these polled reads, so the
+sampled estimate is void). So there is headroom, but a drive shares its bandwidth between concurrent reads (one
+13 MB read 3.8 ms, two 7.4 ms each): a speculative read on a drive a demand read needs doubles that read's time.
+That is the hidden cost, and it bounds what better accuracy alone can win. The SPCC drive reads a third of every row
+at two-thirds of the Samsungs' rate and with a 29 ms p99 at QD1; as each row waits for its slowest part, it likely
+sets many misses' latency.
+
+**4. Adaptive speculative decoding and verify width.** SGLang's `--speculative-adaptive` (varies the draft steps
+from acceptance) is EAGLE/EAGLE3-only (`adaptive_spec_params.py` `adaptive_unsupported_reason`, implemented by
+`eagle_worker_v2.py` alone); with DSPARK `_maybe_disable_adaptive` turns it off with a warning. DSpark's own
+`SGLANG_RAGGED_VERIFY_MODE=cap-accept|compact` is refused by the EXL3 gate (`expert_stream_requirements_exl3.py`,
+static only), and the decode graph holds one 6-token verify. Acceptance over 157 verifies of 5 drafts
+(`ab-floors-20261009-125556`, `dspark-both`): 0-5 accepted 15 / 20 / 15 / 12 / 11 / 27%, mean 2.63 + 1 = 3.62
+tokens, so 2.37 of 6 verified positions run on a wrong token. On the router capture (6,155 tokens) the union per
+layer by width 1-6 is 6.0 / 9.8 / 13.1 / 16.0 / 18.8 / 21.3; the experts only rejected positions need are 6.8
+(teacher-forced, a low bound) to 12.6 (random-token routes, a high bound) per layer and verify, 32-59% of the union.
+Pricing misses in proportion and at 1.15 ms, an oracle width (verify exactly the accepted tokens) would cut 11-21%
+per token; a fixed shorter width loses (about 82 ms/token at 5 and 88 at 4 against 79 at 6) because a verify's fixed
+cost is large (40 layers of about 3 ms). A real estimator recovers part of that, and needs further verify graphs and
+scratch or a host-free ragged layout.
+
+**Reading.** Prediction quality is not what limits the prefetch now; drive scheduling is. Next, in order of cost:
+(a) mirror weights by drive speed (a setting: `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS`, about 16:10:16 for nvme0:nvme4:nvme2)
+to even out the row parts' times, with or without prefetch; (b) speculative reads that leave the drives a demand read
+needs, below; (c) the verify accept count logged per forward, to split misses by verified position directly.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
