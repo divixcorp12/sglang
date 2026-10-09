@@ -176,6 +176,9 @@ def _warmup_tokens(out: str, arm: str) -> list[int]:
 
 
 def _compare(base_path: str, other_path: str):
+    sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
+    import dspark_text_band
+
     with open(base_path) as f:
         base = json.load(f)
     with open(other_path) as f:
@@ -187,9 +190,6 @@ def _compare(base_path: str, other_path: str):
 
 
 def summarize(out: str) -> dict:
-    sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
-    import dspark_text_band
-
     summary = {}
     for arm in ARMS:
         try:
