@@ -763,3 +763,51 @@ def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_pa
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"):
         _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(tmp_path / "missing.json"))
+
+
+THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
+
+
+def test_the_dynamic_mirror_root_choice_defaults_off():
+    """Off until its served A/B is accepted (design 2026-10-09-dsv41-drive-aware-reads, change (3))."""
+    assert envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get() is False
+    assert envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get() == ""
+
+
+def test_dynamic_mirror_caps_pass_with_one_positive_cap_per_root(model_dir):
+    args = _exl3_launch(model_dir)
+    _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS, SGLANG_MOE_EXPERT_MIRROR_DYNAMIC=True,
+          SGLANG_MOE_EXPERT_MIRROR_CAPS="4,2,4")
+    _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS)  # static: no caps needed
+
+
+@pytest.mark.parametrize(
+    "env, match",
+    [
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True}, "needs SGLANG_MOE_EXPERT_MIRROR_CAPS"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2"}, "lists 2 caps but"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,0,4"}, "positive integer"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,x,4"}, "positive integer"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,-1,4"}, "positive integer"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2,4"}, "silently ignored"),
+    ],
+)
+def test_bad_dynamic_mirror_caps_are_refused_at_launch(model_dir, env, match):
+    args = _exl3_launch(model_dir)
+    with pytest.raises(ValueError, match=match):
+        _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS, **env)
+
+
+def test_dynamic_mirror_caps_need_mirror_roots(model_dir):
+    args = _exl3_launch(model_dir)
+    with pytest.raises(ValueError, match="needs SGLANG_MOE_EXPERT_MIRROR_DIRS"):
+        _gate(args, SGLANG_MOE_EXPERT_MIRROR_DYNAMIC=True, SGLANG_MOE_EXPERT_MIRROR_CAPS="4")
+
+
+def test_the_mirror_caps_parser():
+    from sglang.srt.layers.moe.exl3_read_split import mirror_caps
+
+    assert mirror_caps(False, "", THREE_ROOTS) is None
+    assert mirror_caps(True, " 4, 2 ,4 ", THREE_ROOTS) == (4, 2, 4)
+    with pytest.raises(ValueError, match="more than 4"):
+        mirror_caps(True, "1,1,1,1,1", ":".join(f"/r{i}" for i in range(5)))

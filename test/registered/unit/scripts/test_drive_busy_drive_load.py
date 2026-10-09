@@ -23,10 +23,10 @@ def _module():
     return module
 
 
-def _root(demand_busy, spec_busy, overlap, demand_bytes, spec_bytes):
+def _root(demand_busy, spec_busy, overlap, demand_bytes, spec_bytes, moved_from=0, moved_to=0):
     return {"demand_reads": 0, "spec_reads": 0, "demand_inflight_bytes": 0, "spec_inflight_bytes": 0,
             "demand_bytes": demand_bytes, "spec_bytes": spec_bytes, "demand_busy_ns": demand_busy,
-            "spec_busy_ns": spec_busy, "overlap_ns": overlap}
+            "spec_busy_ns": spec_busy, "overlap_ns": overlap, "moved_from": moved_from, "moved_to": moved_to}
 
 
 def _line(elapsed, roots):
@@ -38,8 +38,8 @@ def test_the_last_line_gives_each_roots_shares_and_bytes():
     log = "\n".join([
         "INFO starting", stale, "exl3 RAM miss thread counters {}",
         "[2026-10-09 12:00:00] " + _line(10_000_000_000, [
-            _root(4_000_000_000, 1_000_000_000, 500_000_000, 3_000_000_000, 1_000_000_000),
-            _root(2_000_000_000, 0, 0, 1_000_000_000, 0),
+            _root(4_000_000_000, 1_000_000_000, 500_000_000, 3_000_000_000, 1_000_000_000, moved_to=5),
+            _root(2_000_000_000, 0, 0, 1_000_000_000, 0, moved_from=5),
         ]),
     ])
     got = _module().drive_load_report(log)
@@ -47,8 +47,17 @@ def test_the_last_line_gives_each_roots_shares_and_bytes():
     first, second = got["roots"]
     assert first == {"root": 0, "demand_busy_share": 0.4, "spec_busy_share": 0.1, "overlap_share": 0.05,
                      "overlap_of_demand": 0.125, "demand_gb": 3.0, "spec_gb": 1.0, "bytes_share": 0.8,
-                     "in_flight_at_log": 0}
+                     "in_flight_at_log": 0, "moved_from": 0, "moved_to": 5}
     assert second["demand_busy_share"] == 0.2 and second["overlap_of_demand"] == 0.0 and second["bytes_share"] == 0.2
+    assert (second["moved_from"], second["moved_to"]) == (5, 0)
+
+
+def test_a_log_from_before_the_cap_reports_no_redirects():
+    """A drive-load line written before the in-flight cap existed has no moved fields: read as 0, not refused."""
+    root = _root(5, 0, 0, 10, 0)
+    del root["moved_from"], root["moved_to"]
+    got = _module().drive_load_report(_line(100, [root]))
+    assert (got["roots"][0]["moved_from"], got["roots"][0]["moved_to"]) == (0, 0)
 
 
 def test_a_root_that_served_no_demand_has_no_overlap_ratio():

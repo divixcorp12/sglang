@@ -316,3 +316,38 @@ def test_a_baseline_cannot_be_both_imported_and_rerun(monkeypatch, tmp_path):
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path / "out"), "dspark-both", "--baseline", str(base)])
     with pytest.raises(SystemExit, match="baseline"):
         ab.main()
+
+
+DYNAMIC = "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC"
+CAPS = "SGLANG_MOE_EXPERT_MIRROR_CAPS"
+
+
+def test_the_cap_arm_is_the_gpu_arm_with_the_per_drive_in_flight_cap(monkeypatch):
+    """Design 2026-10-09-dsv41-drive-aware-reads change (3): roots nvme0, nvme4 (the SPCC), nvme2 capped at 4, 2, 4
+    sub-reads in flight; compared with dspark-both like the other prefetch arms."""
+    ab = _ab()
+    g, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-cap"][0]
+    assert (c[DYNAMIC], c[CAPS]) == ("1", "4,2,4")
+    assert {k: v for k, v in c.items() if k not in (DYNAMIC, CAPS)} == {
+        k: v for k, v in g.items() if k not in (DYNAMIC, CAPS)
+    }
+    # The caps follow the roots' order in the recipe the arms run on.
+    assert ab.arm_env.EXPERT_MIRROR_DIRS.split(":") == [
+        "/mnt/nvme0/dsv41_flash", "/mnt/nvme4/dsv41_flash", "/mnt/nvme2/dsv41_flash"]
+    assert ab.ARMS["dspark-both-prefetch-gpu-cap"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-cap"] == "dspark-both"
+    monkeypatch.setenv(DYNAMIC, "0")
+    monkeypatch.setenv(CAPS, "9,9,9")
+    assert (ab._overrides("dspark-both-prefetch-gpu-cap", "/out")[DYNAMIC],
+            ab._overrides("dspark-both-prefetch-gpu-cap", "/out")[CAPS]) == ("1", "4,2,4")
+
+
+def test_every_other_arm_pins_the_dynamic_root_choice_off_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv(DYNAMIC, "1")
+    monkeypatch.setenv(CAPS, "4,2,4")
+    for arm in ab.ARMS:
+        if arm == "dspark-both-prefetch-gpu-cap":
+            continue
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert (overrides[DYNAMIC], overrides[CAPS]) == ("0", ""), arm
