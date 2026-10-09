@@ -340,7 +340,8 @@ def _check_slot_map() -> None:
 def _check_ram_prefetch() -> None:
     """``SGLANG_DSV41_RAM_PREFETCH``'s prerequisite and its options' bounds, which the host refuses at enable too.
 
-    Checked before the backend rules: a disabled decode graph returns early, and the option must not pass silently.
+    Runs on the post-parse pass only (the pass before ``parse_cuda_graph_config`` returns first), ahead of the backend
+    rules: a disabled decode graph returns early, and the option must not pass silently.
     """
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
         return

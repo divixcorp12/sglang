@@ -25,6 +25,11 @@ DIVIX01 = {0: "0-17,36-53", 1: "18-35,54-71"}
 SERVER = frozenset(parse_cpu_list("0-7,16,36-52"))
 
 
+@pytest.fixture(autouse=True)
+def fresh_shared_spec_core_warnings():
+    tc._warned_shared_spec_cores.clear()
+
+
 def fake_sysfs(root, nodes, pairs):
     """A /sys/devices/system tree: each node's cpulist, with cpu c and c + pairs one physical core (c < pairs)."""
     for node, cpus in nodes.items():
@@ -357,6 +362,14 @@ def test_a_spec_thread_sharing_the_ram_core_is_warned_naming_the_node_and_core(d
     warnings = [r.getMessage() for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "node1" in warnings[0] and "core 35" in warnings[0] and "node0" not in warnings[0]
+
+
+def test_a_shared_spec_core_is_warned_once_per_node_and_core_across_resolves(divix01, caplog):
+    with caplog.at_level(logging.WARNING, logger=tc.__name__):
+        for _ in range(3):
+            resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+    warnings = [r for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
+    assert len(warnings) == 1
 
 
 def test_ram_prefetch_without_a_shared_core_warns_nothing(divix01, caplog):

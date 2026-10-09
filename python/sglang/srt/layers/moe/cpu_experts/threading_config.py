@@ -10,14 +10,16 @@ on any topology; ``from_env`` gathers the machine's.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Iterable, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+# (node, core) pairs already warned about: resolve runs more than once per launch.
+_warned_shared_spec_cores: set[tuple[int, int]] = set()
 
 # NVMe completion interrupts are pinned to these cores on divix01.
 RESERVED_CORES = frozenset(range(64, 72))
@@ -334,7 +336,7 @@ class ThreadingConfig:
             draft = tuple(named_draft) or _derive_draft(gpu, topology, affinity, settings, taken)
         if settings.ram_prefetch:
             assigned = taken | {s for c in draft for s in topology.siblings[c]}
-            plans = [dataclasses.replace(plan, spec=_spec_cores(plan, topology, affinity, assigned)) for plan in plans]
+            plans = [replace(plan, spec=_spec_cores(plan, topology, affinity, assigned)) for plan in plans]
         return ThreadingConfig(tuple(plans), (copy,), gpu, draft)
 
 
@@ -371,12 +373,14 @@ def _spec_cores(plan: NodePlan, topology: Topology, affinity: frozenset[int], as
     )
     if spare or plan.ram is None:
         return spare
-    logger.warning(
-        "numa node%d: no spare core for the RAM prefetch's speculative thread; it shares the busy-polling RAM "
-        "thread's core %d, which time-slices the RAM thread",
-        plan.node,
-        plan.ram,
-    )
+    if (plan.node, plan.ram) not in _warned_shared_spec_cores:
+        _warned_shared_spec_cores.add((plan.node, plan.ram))
+        logger.warning(
+            "numa node%d: no spare core for the RAM prefetch's speculative thread; it shares the busy-polling RAM "
+            "thread's core %d, which time-slices the RAM thread",
+            plan.node,
+            plan.ram,
+        )
     return (plan.ram,)
 
 
