@@ -87,6 +87,8 @@ def _served(rig: PrefetchRig, req: SimRequest) -> None:
     else:
         assert rig.host.pump() == 1
     assert rig.sim.wait_served(req, timeout_s=10.0) and rig.sim.copy_wait(req, timeout_s=10.0)
+    if rig.host.threaded and rig.sim.needs_copy_wait(req):
+        rig.sim.open_copy_gate(req)
 
 
 def load(rig: PrefetchRig, row: int, experts) -> SimRequest:
