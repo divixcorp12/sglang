@@ -2777,6 +2777,11 @@ class ExpertStreamDevice:
         # service arms its copy engine on it.
         self.copy_engine_captured = False
         self.piece_runs = piece_runs.to(device).contiguous()
+        # The GPU scorer (enable_spec_scorer): its (top_k, per_token, top_k_only), the candidate page and the score
+        # scratch; None when off.
+        self._spec = None
+        self.spec_candidates = None
+        self.spec_scores = None
 
     def _kernels(self):
         """Return the device module, loading it on first use."""
@@ -2841,6 +2846,64 @@ class ExpertStreamDevice:
         """
         self._check_row(row)
         self.map_bank["cpu_ok"][row] = 1
+
+    def enable_spec_scorer(self, candidates: torch.Tensor, *, top_k: int, per_token: int, top_k_only: bool) -> None:
+        """The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu): ``candidates`` is the host's candidate page
+        (``new_candidate_page``); scores go to an fp32 [cpu_tokens_max, experts] scratch allocated here, so this runs
+        after ``enable_cpu_experts`` and before any graph captures ``spec_score``."""
+        if self._spec is not None:
+            raise RuntimeError("the GPU scorer is already enabled on this device")
+        if (
+            candidates.dtype != torch.uint8
+            or candidates.device.type != "cpu"
+            or not candidates.is_contiguous()
+            or candidates.numel() != CAND_PAGE_BYTES
+        ):
+            raise ValueError(
+                f"candidates must be a contiguous CPU uint8 tensor of {CAND_PAGE_BYTES} bytes (new_candidate_page)"
+            )
+        if torch.device(self.state.device).type == "cuda" and not candidates.is_pinned():
+            raise ValueError("candidates must be pinned: the select kernel writes it through UVA")
+        if self.experts > SPEC_SELECT_MAX_EXPERTS:
+            raise ValueError(
+                f"the GPU scorer's select kernel holds at most {SPEC_SELECT_MAX_EXPERTS} experts, not {self.experts}"
+            )
+        if not 1 <= top_k <= min(SPEC_DEPTH, self.experts):
+            raise ValueError(f"top_k must be in 1..{min(SPEC_DEPTH, self.experts)}, got {top_k}")
+        if not 1 <= per_token <= SPEC_DEPTH:
+            raise ValueError(f"per_token must be in 1..{SPEC_DEPTH}, got {per_token}")
+        self._spec = (int(top_k), int(per_token), bool(top_k_only))
+        self.spec_candidates = candidates
+        self.spec_scores = torch.empty(
+            (self.cpu_tokens_max, self.experts), dtype=torch.float32, device=self.state.device
+        )
+
+    def spec_score(self, entry, x: Optional[torch.Tensor]) -> None:
+        """Score the record this device just posted: layer T's MoE input ``x`` (bf16 [tokens, hidden] or [hidden], or
+        None) against ``entry`` (a ``SpecScoreRow``), then publish its candidates to the record's slot. A record of no
+        input or more than cpu_tokens_max tokens publishes count 0. Right after ``post``, on its stream."""
+        if self._spec is None:
+            raise RuntimeError("the GPU scorer is not enabled on this device (enable_spec_scorer)")
+        self._check_row(entry.target)
+        top_k, per_token, top_k_only = self._spec
+        tokens = 0 if x is None else (int(x.shape[0]) if x.dim() == 2 else 1)
+        module = self._kernels()
+        if 1 <= tokens <= self.cpu_tokens_max:
+            run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
+        run_spec_select(
+            self.spec_scores,
+            tokens,
+            top_k=top_k,
+            per_token=per_token,
+            top_k_only=top_k_only,
+            hot_slots=entry.hot_slots,
+            hot_capacity=entry.hot_capacity,
+            ram_slot=self.map_bank["ram_slot"],
+            target=entry.target,
+            state=self.state,
+            candidates=self.spec_candidates,
+            module=module,
+        )
 
     def map_bulk_apply(self, bulk: torch.Tensor) -> None:
         """Apply the eager paths' map changes on the current stream.

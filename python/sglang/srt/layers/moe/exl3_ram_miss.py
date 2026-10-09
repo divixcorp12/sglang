@@ -36,6 +36,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
     ExpertStreamHost,
     host_layout,
+    new_candidate_page,
     new_hot_page,
     new_page,
     stream_segment_map,
@@ -618,6 +619,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.spill = None  # DIRECT's (overflow flag, this layer's counter) under spill; set by Exl3RamMissService.attach
         self.streamer_of = streamer_of
         self._delivered: Optional[torch.Tensor] = None
+        # The GPU scorer (Exl3RamMissService._bind_spec_scores): whether this row has a target, and its SpecScoreRow
+        # once the target row attached.
+        self.spec_expected = False
+        self.spec_score = None
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -667,6 +672,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
                 raise RuntimeError(
                     f"CPU experts: row {self.row}'s route plan has no miss order (Exl3RamMissService.attach)"
                 )
+        if self.spec_expected and self.spec_score is None:
+            raise RuntimeError(
+                f"RAM prefetch: row {self.row} posted before its target row attached; the GPU scorer's table is built "
+                "at attach"
+            )
         side = self.device_side
         side.post(
             self.row,
@@ -680,6 +690,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             cpu_input=self.cpu_input if captured and self.cpu_experts else None,
             spill=self.spill,
         )
+        if self.spec_expected:
+            # Layer T+1's gate on this layer's input, published before C1 so the host can read it while this layer runs.
+            side.spec_score(entry=self.spec_score, x=self.cpu_input[0] if self.cpu_input is not None else None)
         side.copy_engine_captured |= captured
         copy_expert_row_segments_gpu(
             self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1
@@ -802,6 +815,10 @@ class Exl3RamMissService:
         self._node_ranges = None
         # The RAM prefetch's pool slots per row and group, set at start (0: no pool).
         self._spec_share = 0
+        # The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu), set at start; its per-row table is built as rows attach.
+        self._spec_gpu = None
+        self._spec_hot: dict[int, tuple] = {}
+        self._row_backends: dict[int, object] = {}
         self._rows: dict[int, int] = {}
         self._manager = None
         # The only caller of host.pause()/resume(), which are not reentrant.
@@ -1115,8 +1132,11 @@ class Exl3RamMissService:
                 cpu_experts = self._start_cpu_experts(
                     cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned
                 )
-            if spec_share:
-                self._enable_ram_prefetch(host, list(tables.layer_ids), numa, cpu_experts)
+            spec_gpu = (
+                self._enable_ram_prefetch(host, list(tables.layer_ids), numa, cpu_experts, pin=pin)
+                if spec_share
+                else None
+            )
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -1164,6 +1184,7 @@ class Exl3RamMissService:
             raise
         self.page, self.slot_map, self.host = page, slot_map, host
         self._spec_share = spec_share
+        self._spec_gpu = spec_gpu
         self.numa = numa
         self.hot_page = hot_page
         self.copy_engine = copy_engine
@@ -1191,7 +1212,7 @@ class Exl3RamMissService:
             cfg.ram_miss_timeout_ms,
             "on" if copy_engine else "off",
             "on" if cpu_experts is not None else "off",
-            f"share {spec_share}" if spec_share else "off",
+            f"share {spec_share}, {'GPU' if spec_gpu else 'CPU'} scorer" if spec_share else "off",
             self.host.variant,
         )
 
@@ -1272,38 +1293,71 @@ class Exl3RamMissService:
         )
 
     @staticmethod
-    def _enable_ram_prefetch(host, layer_ids, numa, cpu_experts) -> None:
-        """Start the RAM prefetch over the pool reserved at start: the router gates the model registered at load,
-        copied to host memory once, and each group's speculative thread on its plan's spare cores."""
-        from sglang.srt.layers.moe.ram_prefetch import prefetch_tables, registered_gates
+    def _enable_ram_prefetch(host, layer_ids, numa, cpu_experts, *, pin: bool = False):
+        """Start the RAM prefetch over the pool reserved at start, each group's speculative thread on its plan's spare
+        cores. CPU scorer: the router gates the model registered at load, copied to host memory once; returns None.
+        GPU scorer: the targets and a candidate page (pinned when ``pin``) the host reads; returns the GpuScorer whose
+        per-row table attach builds."""
+        from sglang.srt.layers.moe.ram_prefetch import (
+            SCORERS,
+            GpuScorer,
+            prefetch_tables,
+            prefetch_targets,
+            registered_gates,
+        )
 
         if cpu_experts is None:
             raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
-        # Off node 0, which the tier keeps near full (DSV41_REFERENCE.md section 33.12).
-        node = numa.plans[-1].node if numa.nodes > 1 else None
-        tables = prefetch_tables(layer_ids, registered_gates(), hidden=cpu_experts.services[0].hidden, node=node)
+        scorer = envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get()
+        if scorer not in SCORERS:
+            raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of {SCORERS}, got {scorer!r}")
         per_token = envs.SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN.get()
         per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
         top_k_only = envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.get()
-        host.enable_ram_prefetch(
-            tables.targets,
-            tables.gates,
-            tables.bias,
-            top_k=tables.top_k,
-            per_token=per_token,
-            per_layer=per_layer,
-            cores=[list(plan.spec) for plan in numa.plans],
-            top_k_only=top_k_only,
-        )
+        hidden = cpu_experts.services[0].hidden
+        cores = [list(plan.spec) for plan in numa.plans]
+        if scorer == "gpu":
+            picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
+            candidates = new_candidate_page(pin=pin)
+            host.enable_ram_prefetch(
+                picked.targets,
+                None,
+                None,
+                top_k=picked.top_k,
+                per_token=per_token,
+                per_layer=per_layer,
+                cores=cores,
+                top_k_only=top_k_only,
+                candidates=candidates,
+            )
+            targets, result = picked.targets, GpuScorer(picked, candidates, per_token, top_k_only)
+        else:
+            # Off node 0, which the tier keeps near full (DSV41_REFERENCE.md section 33.12).
+            node = numa.plans[-1].node if numa.nodes > 1 else None
+            tables = prefetch_tables(layer_ids, registered_gates(), hidden=hidden, node=node)
+            host.enable_ram_prefetch(
+                tables.targets,
+                tables.gates,
+                tables.bias,
+                top_k=tables.top_k,
+                per_token=per_token,
+                per_layer=per_layer,
+                cores=cores,
+                top_k_only=top_k_only,
+            )
+            targets, result = tables.targets, None
         logger.info(
-            "exl3 RAM miss prefetch: %d of %d rows target the next layer, %d per token, %d per layer%s, cores %s",
-            int((tables.targets[:, 0] >= 0).sum()),
+            "exl3 RAM miss prefetch: %d of %d rows target the next layer, %s scorer, %d per token, %d per layer%s, "
+            "cores %s",
+            int((targets[:, 0] >= 0).sum()),
             len(layer_ids),
+            scorer.upper(),
             per_token,
             per_layer,
             ", predicted top-k only" if top_k_only else "",
             [plan.spec for plan in numa.plans],
         )
+        return result
 
     def before_host_use(self) -> None:
         """Begin eager pinned-tier use: drain queued device work, then pause the thread.
@@ -1411,6 +1465,11 @@ class Exl3RamMissService:
                     self.cpu_experts.x_rows, self.cpu_experts.out_rows
                 )
                 self.cpu_experts.attach_device(self.device_side)
+            if self._spec_gpu is not None:
+                spec = self._spec_gpu
+                self.device_side.enable_spec_scorer(
+                    spec.candidates, top_k=spec.picked.top_k, per_token=spec.per_token, top_k_only=spec.top_k_only
+                )
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was
             # dropped (after_host_use), so the snapshot is the source.
@@ -1496,6 +1555,8 @@ class Exl3RamMissService:
             cpu_experts=self.cpu_experts is not None,
             streamer_of=self.tables[streamer.layer_id].streamer_of,
         )
+        if self._spec_gpu is not None:
+            self._note_spec_row(row, streamer.row_backend)
         updater = manager.gpu_residency
         if self.cpu_experts is not None and getattr(updater, "victim_lanes", width) < width:
             # Spill: forced CPU misses land in RAM victims (RamTier::reserve_victims_locked), so the layer must have
@@ -1512,6 +1573,23 @@ class Exl3RamMissService:
             )
             self.host.set_copy_table(row, segments.table, dst_rows, sm_mask=sm_mask)
             self.device_side.set_row_copy(row, dst_rows)
+
+    def _note_spec_row(self, row: int, backend) -> None:
+        """attach's half of the GPU scorer's table: records the row's VRAM hot slots and rebinds every attached row."""
+        self._spec_hot[row] = (backend.hot_slots, backend.hot_capacity)
+        self._row_backends[row] = backend
+        self._bind_spec_scores()
+
+    def _bind_spec_scores(self) -> None:
+        """Gives each attached row with a target its SpecScoreRow once the target row attached. ModelRunner attaches
+        every row (maybe_init_expert_hot_cache) before it captures the decode graph, which freezes the entries."""
+        from sglang.srt.layers.moe.ram_prefetch import spec_score_rows
+
+        picked = self._spec_gpu.picked
+        rows = spec_score_rows(picked, self._spec_hot)
+        for row, backend in self._row_backends.items():
+            backend.spec_expected = int(picked.targets[row, 0]) >= 0
+            backend.spec_score = rows.get(row)
 
     def _start_route_log(self, device) -> None:
         """Trace runs only: log every graph forward's routes in a ``GraphRouteLog``.
@@ -1989,6 +2067,8 @@ class Exl3RamMissService:
             owned += [self.host.page, self.host.slot_map, self.host.lease_block]
             if self.host.hot_page is not None:
                 owned.append(self.host.hot_page)
+        if self._spec_gpu is not None:
+            owned.append(self._spec_gpu.candidates)  # the select kernel writes it through UVA
         if self.device_side is not None:
             side = self.device_side
             owned += [
@@ -2004,6 +2084,8 @@ class Exl3RamMissService:
                 side.piece_runs,
                 *side.map_bank.values(),
             ]
+            if side.spec_scores is not None:
+                owned.append(side.spec_scores)
         if self._trace_snapshot is not None:
             # A copy can still be writing this pinned block when the device barrier
             # failed.
