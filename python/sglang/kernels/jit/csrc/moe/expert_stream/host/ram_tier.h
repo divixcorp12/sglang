@@ -16,7 +16,9 @@
 #pragma once
 
 #include <bit>
+#include <cmath>
 #include <future>
+#include <limits>
 
 #include "../row_layout.h"
 #include "../spec_candidates.h"
@@ -1086,6 +1088,13 @@ class RamTier {
     }
     if (gpu && config.gate_count != 0)
       throw std::runtime_error(prefix + "the GPU scorer reads the device's gates: pass none");
+    if (!config.min_margin.empty()) {
+      if (!gpu) throw std::runtime_error(prefix + "min_margin needs the GPU scorer");
+      if (static_cast<int64_t>(config.min_margin.size()) != layers_)
+        throw std::runtime_error(prefix + "min_margin has one floor per streamed row");
+      for (const float floor : config.min_margin)
+        if (std::isnan(floor)) throw std::runtime_error(prefix + "a min_margin floor is NaN");
+    }
     if (!gpu && (config.gates == nullptr || config.bias == nullptr || config.gate_count < 1))
       throw std::runtime_error(prefix + "it needs at least one gate");
     if (static_cast<int>(config.cores.size()) != groups())
@@ -2303,8 +2312,9 @@ class RamTier {
   }
 
   // serve_spec_job with the GPU scorer: waits for the record's slot, then reads, in the GPU's order, the first
-  // per_layer candidates still unmapped here and not pooled before, its own group's only. Both groups read the same slot
-  // and pass the same filters, so the layer's budget holds over both. The GPU skipped the hot ones.
+  // per_layer candidates at or over the target row's margin floor, still unmapped here and not pooled before, its own
+  // group's only. Both groups read the same slot and pass the same filters, so the layer's budget holds over both. The
+  // GPU skipped the hot ones.
   void serve_gpu_job(int g, const SpecJob& job, int64_t target, bool threaded) {
     SpecGroup& spec = *spec_->groups[g];
     int64_t start = 0;
@@ -2323,10 +2333,12 @@ class RamTier {
       spec_count<kSpecDropped>(spec);
       return;
     }
+    const std::vector<float>& floors = spec_->config.min_margin;
+    const float floor = floors.empty() ? -std::numeric_limits<float>::infinity() : floors[target];
     int taken = 0;
     for (int i = 0; i < slot.count && taken < spec_->config.per_layer; ++i) {
       const int32_t expert = slot.expert[i];
-      if (expert >= experts_ || __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
+      if (!(slot.margin[i] >= floor) || expert >= experts_ || __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
           pool_->pooled_before(target, expert, job.seq))
         continue;
       ++taken;

@@ -1811,12 +1811,14 @@ class ExpertStreamHost:
         cores: Sequence[Sequence[int]],
         top_k_only: bool = False,
         candidates: Optional[torch.Tensor] = None,
+        min_margin: Optional[torch.Tensor] = None,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
         ``cores`` is each NUMA group's speculative-thread core list (empty: the caller's affinity). CPU scorer:
         ``gates`` bf16 ``[n, experts, hidden]`` and ``bias`` fp32 ``[n, experts]``, host tensors this host keeps alive.
-        GPU scorer: ``candidates`` (``new_candidate_page``), which the select kernel writes, and no gates."""
+        GPU scorer: ``candidates`` (``new_candidate_page``), which the select kernel writes, and no gates; optional
+        ``min_margin`` fp32 ``[layers]``, per target row the least margin a candidate needs to be read."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:
@@ -1854,6 +1856,17 @@ class ExpertStreamHost:
             gate_bytes = gates.view(gates.shape[0], -1).view(torch.uint8)
             bias = bias.contiguous()
             hidden = int(gates.shape[2])
+        if min_margin is not None:
+            if candidates is None:
+                raise ValueError("min_margin needs the GPU scorer (candidates)")
+            if (
+                min_margin.dtype != torch.float32
+                or tuple(min_margin.shape) != (targets.shape[0],)
+                or min_margin.device.type != "cpu"
+                or bool(min_margin.isnan().any())
+            ):
+                raise ValueError(f"min_margin must be a host fp32 [{targets.shape[0]}] tensor without NaN")
+            min_margin = min_margin.contiguous()
         if len(cores) != self.nodes:
             raise ValueError(f"one core list per NUMA group ({self.nodes}), got {len(cores)}")
         table = torch.full((self.nodes, max(1, max(len(own) for own in cores))), -1, dtype=torch.int64)
@@ -1873,8 +1886,9 @@ class ExpertStreamHost:
             int(per_layer),
             int(bool(top_k_only)),
             candidates if candidates is not None else torch.empty(0, dtype=torch.uint8),
+            min_margin if min_margin is not None else torch.empty(0, dtype=torch.float32),
         )
-        self.ram_prefetch_tensors = (gates, bias, candidates)
+        self.ram_prefetch_tensors = (gates, bias, candidates, min_margin)
 
     def spec_pump(self, group: int = 0) -> bool:
         """Test only: serve NUMA group ``group``'s next speculative job on the calling thread (no service thread)."""

@@ -348,6 +348,15 @@ def _check_ram_prefetch() -> None:
     scorer = envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get()
     if scorer not in ram_prefetch.SCORERS:
         raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of {ram_prefetch.SCORERS}, got {scorer!r}")
+    floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
+    if floors:
+        if scorer != "gpu":
+            # The floors filter the GPU scorer's candidate page; the CPU scorer would run without them, silently.
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu")
+        try:
+            ram_prefetch.read_margin_floors(floors)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS: {error}") from error
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
         if scorer == "gpu":
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")

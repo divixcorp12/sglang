@@ -1304,6 +1304,7 @@ class Exl3RamMissService:
         from sglang.srt.layers.moe.ram_prefetch import (
             SCORERS,
             GpuScorer,
+            load_margin_floors,
             prefetch_tables,
             prefetch_targets,
             registered_gates,
@@ -1319,9 +1320,11 @@ class Exl3RamMissService:
         top_k_only = envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.get()
         hidden = cpu_experts.services[0].hidden
         cores = [list(plan.spec) for plan in numa.plans]
+        floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
             candidates = new_candidate_page(pin=pin)
+            min_margin = load_margin_floors(floors, len(layer_ids)) if floors else None
             host.enable_ram_prefetch(
                 picked.targets,
                 None,
@@ -1332,6 +1335,7 @@ class Exl3RamMissService:
                 cores=cores,
                 top_k_only=top_k_only,
                 candidates=candidates,
+                min_margin=min_margin,
             )
             targets, result = picked.targets, GpuScorer(picked, candidates, per_token, top_k_only)
         else:
@@ -1357,7 +1361,7 @@ class Exl3RamMissService:
             scorer.upper(),
             per_token,
             per_layer,
-            ", predicted top-k only" if top_k_only else "",
+            (", predicted top-k only" if top_k_only else "") + (f", margin floors {floors}" if floors else ""),
             [plan.spec for plan in numa.plans],
         )
         return result

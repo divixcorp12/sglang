@@ -131,6 +131,9 @@ struct RamPrefetchConfig {
   // The GPU scorer's candidate page (../spec_candidates.h), pinned memory the caller keeps alive; null: the CPU
   // scorer scores each record's staged input.
   const uint8_t* candidates = nullptr;
+  // GPU scorer only: per target row, the least margin a candidate needs to be read; a candidate under it neither reads
+  // nor counts toward per_layer. Empty: no floors.
+  std::vector<float> min_margin;
 };
 
 // The GPU scorer's wait for a record's candidate slot: spin, then sleep in steps (the speculative thread may share its

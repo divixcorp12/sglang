@@ -4,6 +4,8 @@ speculative threads score with."""
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
@@ -172,3 +174,28 @@ class GpuScorer:
     candidates: torch.Tensor
     per_token: int
     top_k_only: bool
+
+
+def read_margin_floors(path: str) -> dict[int, float]:
+    """The ``min_margin`` table of a margin-floors file (``SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS``): target row ->
+    the least margin the GPU scorer's candidates need to be read. ``Infinity`` reads nothing for that row."""
+    with open(path) as f:
+        table = json.load(f).get("min_margin")
+    if not isinstance(table, dict):
+        raise ValueError(f"margin floors {path}: no min_margin table")
+    floors = {}
+    for row, value in table.items():
+        if not row.isdigit() or isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
+            raise ValueError(f"margin floors {path}: row {row!r} -> {value!r} is not a target row and a number")
+        floors[int(row)] = float(value)
+    return floors
+
+
+def load_margin_floors(path: str, rows: int) -> torch.Tensor:
+    """fp32 ``[rows]``: each target row's floor, -inf for a row the file omits."""
+    floors = torch.full((rows,), float("-inf"), dtype=torch.float32)
+    for row, value in read_margin_floors(path).items():
+        if row >= rows:
+            raise ValueError(f"margin floors {path}: target row {row} is past the {rows} streamed rows")
+        floors[row] = value
+    return floors
