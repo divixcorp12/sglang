@@ -273,23 +273,15 @@ def test_a_candidate_under_its_target_rows_floor_is_skipped_without_spending_the
         rig.host.stop()
 
 
-def test_an_infinite_floor_reads_nothing_and_a_floor_equal_to_the_margin_reads(tmp_path):
+@pytest.mark.parametrize("floor, margin, landed", [(0.5, 0.5, [2]), (float("inf"), 9.0, [])])
+def test_a_floor_equal_to_the_margin_reads_and_an_infinite_floor_reads_nothing(tmp_path, floor, margin, landed):
     rig = prefetch_rig(tmp_path, capacity=9, share=3)
     try:
-        page = enable_gpu(rig, per_layer=2, min_margin=_floors(rig, r1=0.5))
+        page = enable_gpu(rig, per_layer=2, min_margin=_floors(rig, r1=floor))
         req = _record(rig)
-        write_candidate_slot(page, req.seq, [(2, 0, 0.5)])
+        write_candidate_slot(page, req.seq, [(2, 0, margin)])
         assert rig.host.spec_pump(0)
-        assert _landed(rig.host, 1) == [2]
-    finally:
-        rig.host.stop()
-    rig = prefetch_rig(tmp_path / "inf", capacity=9, share=3)
-    try:
-        page = enable_gpu(rig, per_layer=2, min_margin=_floors(rig, r1=float("inf")))
-        req = _record(rig)
-        write_candidate_slot(page, req.seq, [(2, 0, 9.0)])
-        assert rig.host.spec_pump(0)
-        assert _landed(rig.host, 1) == [] and _counts(rig, "spec_issued") == (0,)
+        assert _landed(rig.host, 1) == landed and _counts(rig, "spec_issued") == (len(landed),)
     finally:
         rig.host.stop()
 
