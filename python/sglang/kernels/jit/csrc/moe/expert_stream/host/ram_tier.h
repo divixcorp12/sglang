@@ -2590,9 +2590,9 @@ class RamTier {
   // lane from its copy of the map, so the host checks each against the tier and fail-stops on any disagreement.
   //
   // Order: stamps, checks, the copy job (hits start at once), victims and the map delta (before any read, so a served
-  // chain always has its delta published), then the misses' reads. Sets `*rows` to the number of rows read: a miss
-  // swapped in from the pool reads none.
-  void serve_record(Group& group, const Request& request, int64_t* rows) {
+  // chain always has its delta published), then the misses' reads. Returns whether any miss was placed: read, or
+  // swapped in from the pool.
+  bool serve_record(Group& group, const Request& request) {
     StageRecord* const cur = stage_record(group);  // null in ProdBuild, so every `if (cur)` below folds away
     if (cur) cur->lanes = static_cast<int64_t>(request.lanes.size());
     if (request.row < 0 || request.row >= layers_) fail_record(request, "the row is out of range");
@@ -2616,7 +2616,7 @@ class RamTier {
       cur->status = status;
       cur->rows = read;
     }
-    *rows = read;
+    return reads;
   }
 
   // Stores piece_word(gen) into the readiness word of every kMissGpu lane, fences, and records those words as the
@@ -2645,13 +2645,11 @@ class RamTier {
   // episode so the watchdog can time it.
   void handle_record(Group& group, const Request& request) {
     begin_busy(group);
-    int64_t rows = 0;
     if (!request.lanes.empty()) {
-      serve_record(group, request, &rows);
-      if (rows == 0) {
-        count<kTouchOnly>(group);
-      } else {
+      if (serve_record(group, request)) {
         count<kServedRequests>(group);
+      } else {
+        count<kTouchOnly>(group);
       }
     } else {
       touch_request(group, request);
