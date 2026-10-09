@@ -34,15 +34,37 @@ DISK_LOCK = "/data/models/slang/nvfp4-work/rowimg-disk.lock"
 PROBE = os.path.join(REPO, "scripts", "expert_prediction", "prefetch", "logprob_probe.py")
 
 
-    rc = subprocess.run(
-        [sys.executable, os.path.join(HERE, "spec_margin.py"), os.path.join(a.out_dir, "events.*.jsonl"),
-         "--json", os.path.join(a.out_dir, "spec_margin.json")]
-    ).returncode
-    summary = counter_summary(os.path.join(a.out_dir, "server.log"))
-    with open(os.path.join(a.out_dir, "counters.json"), "w") as f:
-        json.dump(summary, f, indent=1)
-    print("counters", json.dumps(summary))
-    return rc
+def server_env(out_dir: str, top_k_only: bool, scorer: str = "cpu") -> dict:
+    overrides, _ = both_cpu_ab.ARMS["dspark-both-prefetch"]
+    return arm_env.arm_env({
+        **overrides,
+        "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1" if top_k_only else "0",
+        "SGLANG_DSV41_RAM_PREFETCH_SCORER": scorer,
+        "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": os.path.join(out_dir, "events"),
+        "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "524288",
+        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out_dir, "metrics.jsonl"),
+    })
+
+
+def counter_summary(log_path: str) -> dict:
+    """From the server's last counters line: the speculative thread's time per record (the CPU scorer's scoring, the GPU
+    scorer's wait for the slot) and the share of used reads still in flight at their demand."""
+    try:
+        with open(log_path, errors="replace") as f:
+            lines = [line for line in f if both_cpu_ab.COUNTER_MARKER in line]
+    except FileNotFoundError:
+        return {}
+    if not lines:
+        return {}
+    c = json.loads(lines[-1].split(both_cpu_ab.COUNTER_MARKER, 1)[1])
+    keys = ("spec_scored", "spec_score_ns", "spec_issued", "spec_landed", "spec_used", "spec_promoted",
+            "spec_dropped", "spec_late")
+    out = {k: c.get(k) for k in keys}
+    if c.get("spec_scored"):
+        out["wait_or_score_us_per_record"] = c["spec_score_ns"] / c["spec_scored"] / 1000
+    if c.get("spec_used"):
+        out["in_flight_at_use"] = c.get("spec_promoted", 0) / c["spec_used"]
+    return out
 
 
 def stop_server(server: subprocess.Popen, timeout: float = 300) -> None:
@@ -102,18 +124,15 @@ def main() -> int:
             stop_server(server)
     if rc != 0:
         return rc
-cd /Users/dnikolaidis/.codex/worktrees/ram-prefetch-margin
-git add analysis/dsv41-drive/dspark/both_cpu_ab.py analysis/dsv41-drive/dspark/spec_margin_capture.py
-git commit -m "Add the GPU-scorer A/B arms, a paired summary and the capture's --scorer
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01LxB2wQZv5EVNuBGUJJbkGk"
-git push origin codex/dsv41-ram-prefetch-margin
-ssh divix01 bash -s <<'REMOTE'
-set -u
-cd /data/models/slang/nvfp4-work/wt-ram-prefetch-margin && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch-margin && git log -1 --oneline
-env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/scripts/test_both_cpu_ab.py test/registered/unit/scripts/test_spec_margin_capture.py test/registered/unit/scripts/test_spec_margin.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
-REMOTE
+    rc = subprocess.run(
+        [sys.executable, os.path.join(HERE, "spec_margin.py"), os.path.join(a.out_dir, "events.*.jsonl"),
+         "--json", os.path.join(a.out_dir, "spec_margin.json")]
+    ).returncode
+    summary = counter_summary(os.path.join(a.out_dir, "server.log"))
+    with open(os.path.join(a.out_dir, "counters.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+    print("counters", json.dumps(summary))
+    return rc
 
 
 if __name__ == "__main__":
