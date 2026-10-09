@@ -52,13 +52,43 @@ def _exact_case(seed, tokens=3, experts=16, hidden=64):
     "top_k, per_token, per_layer", [(6, 1, 1), (6, 1, 3), (6, 2, 4), (6, 3, 8), (2, 1, 2), (1, 2, 5)]
 )
 def test_the_host_ranks_exactly_as_the_replays_reference(seed, top_k, per_token, per_layer):
-    """Mutants: the margin to the (top_k - 1)-th score -- red (the cross-token union order changes); per_layer + 1 rows
-    -- red (one more pick)."""
+    """Mutant: the margin to the (top_k - 1)-th score -- red (the cross-token union order changes)."""
     x, w, bias = _exact_case(seed)
     g = torch.Generator().manual_seed(100 + seed)
     skip = (torch.rand(w.shape[0], generator=g) < 0.25).tolist()
     kw = dict(top_k=top_k, per_token=per_token, per_layer=per_layer)
     assert es.score_gate(x, w, bias, skip, **kw) == reference(x, w, bias, skip, **kw)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("per_token", [1, 2, 12])
+def test_tied_scores_and_margins_go_to_the_lower_id(seed, per_token):
+    """Experts e and e + 16 share a gate row and there is no bias, so they tie in every token's ranking and in the
+    union's margins. Mutants: either sort's id tie-break dropped -- red."""
+    x, w, _ = _exact_case(seed, tokens=6, experts=16)
+    w = torch.cat([w, w])
+    bias = torch.zeros(32)
+    skip = [False] * 32
+    kw = dict(top_k=6, per_token=per_token, per_layer=8)
+    assert es.score_gate(x, w, bias, skip, **kw) == reference(x, w, bias, skip, **kw)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_rows_are_read_at_their_stride_not_the_gates_width(seed):
+    """x's rows carry padding past the gate's width, as a record's staged rows do: the host reads `hidden` values from
+    each row's start. Mutant: the stride taken as 2 * hidden -- red."""
+    x, w, bias = _exact_case(seed)
+    padded = torch.cat([x, torch.full((x.shape[0], 8), 3.0, dtype=torch.float16)], dim=1)
+    kw = dict(top_k=6, per_token=2, per_layer=4)
+    assert es.score_gate(padded, w, bias, [False] * 16, **kw) == reference(x, w, bias, [False] * 16, **kw)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_a_width_off_the_16_lane_blocks_ranks_as_the_reference(seed):
+    """hidden = 70 runs the dot product's scalar tail past its 16-lane blocks."""
+    x, w, bias = _exact_case(seed, hidden=70)
+    kw = dict(top_k=6, per_token=2, per_layer=4)
+    assert es.score_gate(x, w, bias, [False] * 16, **kw) == reference(x, w, bias, [False] * 16, **kw)
 
 
 def test_skipped_experts_are_passed_over_not_counted():

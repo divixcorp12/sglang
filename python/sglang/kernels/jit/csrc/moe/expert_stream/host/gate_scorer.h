@@ -48,9 +48,6 @@ inline float softplus(float z) {
   return z > 20.0f ? z : std::log1p(std::exp(z));
 }
 
-// Throws std::invalid_argument for a choice the scorer cannot make.
-inline void check_gate_choice(int64_t experts, int64_t top_k, int64_t per_token, int64_t per_layer);
-
 class GateScorer {
  public:
   static constexpr int kDepth = 12;       // each token's ranks walked: the replay's (verify_gate_rankings --depth)
@@ -141,6 +138,7 @@ class GateScorer {
   std::vector<int32_t> picks_;
 };
 
+// Throws std::invalid_argument for a choice the scorer cannot make.
 inline void check_gate_choice(int64_t experts, int64_t top_k, int64_t per_token, int64_t per_layer) {
   if (experts < 1 || experts > 0xFFFF) throw std::invalid_argument("the gate has 1..65535 experts");
   const int64_t depth = std::min<int64_t>(GateScorer::kDepth, experts);

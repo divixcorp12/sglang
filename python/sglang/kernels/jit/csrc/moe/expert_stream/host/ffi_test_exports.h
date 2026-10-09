@@ -1224,8 +1224,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       return static_cast<double>(now_ns() - start) / kProbe;
     }
   }
-  // x uint8 [tokens, 2 * hidden] (fp16 rows), w uint8 [experts, 2 * hidden] (bf16), bias f32 [experts], skip uint8
-  // [experts]; writes the chosen experts to out int64 [per_layer] and returns how many. Both builds: a pure function.
+  // x uint8 [tokens, row bytes >= 2 * hidden] (fp16 rows, row bytes apart), w uint8 [experts, 2 * hidden] (bf16), bias
+  // f32 [experts], skip uint8 [experts]; writes the chosen experts to out int64 [per_layer] and returns how many. Both builds: a pure function.
   static int64_t score_gate(
       TensorView x, TensorView w, TensorView bias, TensorView skip, int64_t top_k, int64_t per_token, int64_t per_layer,
       TensorView out) {
@@ -1233,15 +1233,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     auto cpu = SymbolicDevice{};
     auto T = SymbolicSize{"tokens"};
     auto E = SymbolicSize{"experts"};
-    auto B = SymbolicSize{"row bytes"};
-    expert_stream::verify_named("x", TensorMatcher({T, B}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), x);
+    auto S = SymbolicSize{"x row bytes"};
+    auto B = SymbolicSize{"w row bytes"};
+    expert_stream::verify_named("x", TensorMatcher({T, S}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), x);
     expert_stream::verify_named("w", TensorMatcher({E, B}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), w);
     expert_stream::verify_named("bias", TensorMatcher({E}).with_dtype<float>().with_device<kDLCPU>(cpu), bias);
     expert_stream::verify_named("skip", TensorMatcher({E}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), skip);
     expert_stream::verify_named("out", TensorMatcher({per_layer}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const int64_t experts = w.size(0);
-    const int64_t hidden = x.size(1) / 2;
-    if (x.size(1) % 2 != 0 || hidden < 1) throw std::runtime_error("score_gate: x rows are fp16");
+    const int64_t hidden = w.size(1) / 2;
+    if (w.size(1) % 2 != 0 || hidden < 1) throw std::runtime_error("score_gate: w rows are bf16");
+    if (x.size(1) < 2 * hidden) throw std::runtime_error("score_gate: x rows are shorter than w's");
     try {
       expert_stream::check_gate_choice(experts, top_k, per_token, per_layer);
     } catch (const std::invalid_argument& error) {

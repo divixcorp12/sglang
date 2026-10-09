@@ -1305,9 +1305,9 @@ def score_gate(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> list[int]:
-    """The RAM prefetch's gate scorer (``host/gate_scorer.h``): ``x`` fp16 ``[tokens, hidden]``, ``w`` bf16
-    ``[experts, hidden]``, ``bias`` fp32 ``[experts]``, skipping ``skip``; returns the chosen experts, best first. Both
-    builds."""
+    """The RAM prefetch's gate scorer (``host/gate_scorer.h``): ``x`` fp16 ``[tokens, >= hidden]`` (columns past
+    ``hidden`` are row padding), ``w`` bf16 ``[experts, hidden]``, ``bias`` fp32 ``[experts]``, skipping ``skip``;
+    returns the chosen experts, best first. Both builds."""
     if x.dtype != torch.float16 or w.dtype != torch.bfloat16 or bias.dtype != torch.float32:
         raise ValueError("score_gate takes an fp16 x, a bf16 w and an fp32 bias")
     out = torch.full((int(per_layer),), -1, dtype=torch.int64)
