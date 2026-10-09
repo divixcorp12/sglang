@@ -530,6 +530,17 @@ def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int, pool: in
     return [(g, hi - lo, need) for g, (lo, hi) in enumerate(ranges) if hi - lo < need]
 
 
+def pool_room_shortfall(ranges, *, staging_width: int, share: int) -> list[tuple[int, int, int, int]]:
+    """The groups of a row the host's reserve_spec_pool would refuse, as (group, lo, hi, staging): each group stages
+    min(width, its slots - 1) and needs 2 assignable slots past its ``share`` pool slots (ram_tier.h)."""
+    short = []
+    for g, (lo, hi) in enumerate(ranges):
+        staging = min(staging_width, hi - lo - 1)
+        if hi - lo - staging - share < 2:
+            short.append((g, lo, hi, staging))
+    return short
+
+
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
     """``PinnedTierRowBackend`` whose gather is the lease chain.
 
@@ -925,17 +936,18 @@ class Exl3RamMissService:
         """The RAM prefetch pool's slots in every row: its share per NUMA group."""
         return self._spec_share * self.host.nodes if self._spec_share else 0
 
-    def _check_pool_room(self, tables, share: int, nodes: int) -> None:
-        """Refuse a pool share that leaves a row fewer than 2 assignable slots per NUMA group (the host's own bound,
-        which it checks per group range)."""
+    def _check_pool_room(self, tables, share: int) -> None:
+        """Refuse a pool share the host would refuse in any group's range (pool_room_shortfall), naming the option."""
         for row, layer_id in enumerate(tables.layer_ids):
             capacity = int(tables.capacity[row])
-            staging = self.staging_for(capacity)
-            if capacity - staging - share * nodes < 2 * nodes:
+            ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
+            short = pool_room_shortfall(ranges, staging_width=self.staging_width(), share=share)
+            if short:
+                g, lo, hi, staging = short[0]
                 raise RuntimeError(
-                    f"exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE={share} leaves layer {layer_id}'s "
-                    f"{capacity}-slot row fewer than {2 * nodes} assignable slots after {staging} staging and "
-                    f"{share * nodes} pool slots: lower the share or raise the pinned tier"
+                    f"exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE={share} leaves layer {layer_id}'s group {g} "
+                    f"slots [{lo}, {hi}) fewer than 2 assignable slots after {staging} staging and {share} pool "
+                    "slots: lower the share or raise the pinned tier"
                 )
 
     def staging_for(self, capacity: int) -> int:
@@ -1083,7 +1095,7 @@ class Exl3RamMissService:
             if spec_share:
                 if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
                     raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
-                self._check_pool_room(tables, spec_share, numa.nodes)
+                self._check_pool_room(tables, spec_share)
                 # Right after the staging slots, before the hot cache fills any slot.
                 host.reserve_spec_pool(spec_share)
             copy_engine = cfg.enable_ram_miss_copy_engine
