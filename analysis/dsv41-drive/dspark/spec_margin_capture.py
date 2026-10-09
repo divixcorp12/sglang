@@ -8,7 +8,7 @@ number.
 
 Locks: rowimg-disk.lock, then cc-gpu.lock (the protocol's order); the server runs under taskset on SERVER_CORES.
 
-Usage: spec_margin_capture.py OUT_DIR [--arm ARM] [--prompts 8] [--max-tokens 128] [--top-k-only] [--scorer cpu|gpu]
+Usage: spec_margin_capture.py OUT_DIR [--arm ARM] [--no-verify-split] [--prompts 8] [--max-tokens 128] [--top-k-only] [--scorer cpu|gpu]
 """
 
 from __future__ import annotations
@@ -35,8 +35,11 @@ DISK_LOCK = "/data/models/slang/nvfp4-work/rowimg-disk.lock"
 PROBE = os.path.join(REPO, "scripts", "expert_prediction", "prefetch", "logprob_probe.py")
 
 
-def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: str = "dspark-both-prefetch") -> dict:
-    """The arm's env with the job trace on; ``top_k_only`` and ``scorer`` override the arm's only when given."""
+def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: str = "dspark-both-prefetch",
+               verify_split: bool = True) -> dict:
+    """The arm's env with the job trace on; ``top_k_only`` and ``scorer`` override the arm's only when given. With
+    ``verify_split`` it also writes the stage trace's route log, the router capture and the per-verify accept log,
+    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs."""
     overrides, _ = both_cpu_ab.ARMS[arm]
     asked = {}
     if top_k_only:
@@ -46,6 +49,9 @@ def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: s
     return arm_env.arm_env({
         **overrides,
         **asked,
+        **({"SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(out_dir, "stages.jsonl"),
+            "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(out_dir, "router"),
+            "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH": os.path.join(out_dir, "verify-accept")} if verify_split else {}),
         "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": os.path.join(out_dir, "events"),
         "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "524288",
         "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out_dir, "metrics.jsonl"),
@@ -108,9 +114,11 @@ def main() -> int:
     p.add_argument("--top-k-only", action="store_true")
     p.add_argument("--scorer", choices=("cpu", "gpu"))
     p.add_argument("--arm", choices=tuple(both_cpu_ab.ARMS), default="dspark-both-prefetch")
+    p.add_argument("--no-verify-split", dest="verify_split", action="store_false",
+                   help="skip the route log, router capture and accept log (verify_split.py's inputs)")
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
     with open(DISK_LOCK, "w") as disk, open(arm_env.GPU_LOCK, "w") as gpu:
         fcntl.flock(disk, fcntl.LOCK_EX)
@@ -136,10 +144,15 @@ def main() -> int:
         [sys.executable, os.path.join(HERE, "layer_misses.py"), events, "--json",
          os.path.join(a.out_dir, "layer_misses.json")]
     ).returncode
-    if server_env(a.out_dir, a.top_k_only, a.scorer, a.arm)["SGLANG_DSV41_RAM_PREFETCH"] == "1":
+    if server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)["SGLANG_DSV41_RAM_PREFETCH"] == "1":
         rc = rc or subprocess.run(
             [sys.executable, os.path.join(HERE, "spec_margin.py"), events, "--json",
              os.path.join(a.out_dir, "spec_margin.json")]
+        ).returncode
+    if a.verify_split:
+        rc = rc or subprocess.run(
+            [sys.executable, os.path.join(HERE, "verify_split.py"), a.out_dir, "--json",
+             os.path.join(a.out_dir, "verify_split.json")]
         ).returncode
     summary = counter_summary(os.path.join(a.out_dir, "server.log"))
     with open(os.path.join(a.out_dir, "counters.json"), "w") as f:

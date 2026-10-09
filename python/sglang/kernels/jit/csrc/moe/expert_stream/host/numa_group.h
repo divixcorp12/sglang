@@ -21,8 +21,13 @@ struct GroupRow {
 template <class Source>
 struct NumaGroup {
   using CpuExpertEngine = BasicCpuExpertEngine<typename Source::BuildType>;
-  NumaGroup(int index, int sq_thread_cpu, Tables tables, bool direct, std::vector<GroupRow> rows)
-      : index(index), sq_thread_cpu(sq_thread_cpu), reader(std::move(tables), direct), rows(std::move(rows)) {}
+  NumaGroup(int index, int sq_thread_cpu, Tables tables, bool direct, std::vector<GroupRow> rows,
+            const std::string& trace_name)
+      : index(index),
+        sq_thread_cpu(sq_thread_cpu),
+        reader(std::move(tables), direct),
+        rows(std::move(rows)),
+        trace(trace_name) {}
 
   bool owns(int64_t row, int64_t slot) const {
     return slot >= rows[row].lo && slot < rows[row].hi;
@@ -45,6 +50,8 @@ struct NumaGroup {
   PiecePublish piece_publish;
   std::vector<uint8_t> hot_scratch;
   LineCounters<kCounterCount> core;  // RamTier::count's block for this group's thread
+  // InstrBuild only: the record's demand events (miss_expert); empty in production.
+  [[no_unique_address]] JobTrace<Source::BuildType::kMetrics> trace;
 };
 
 }  // namespace sglang::expert_stream

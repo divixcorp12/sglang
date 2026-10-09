@@ -1861,6 +1861,10 @@ class Envs:
     # input and top-k weights into binary side files at this path prefix (exl3_stream_trace.RouterCapture,
     # ~410 KB per token). Setting it without the trace is refused.
     SGLANG_DSV41_ROUTER_CAPTURE_PATH = EnvStr("")
+    # Trace runs: a path prefix for one JSON line per request per verify step (its ordinal and correct drafts,
+    # speculative/verify_accept_log.py), which joins the route log's verify forwards to split misses by verified
+    # position (analysis/dsv41-drive/dspark/verify_split.py). Empty: nothing is written.
+    SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH = EnvStr("")
     # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
     # thread may take per MoE layer, in ms, before the process fails stop. The
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),

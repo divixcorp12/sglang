@@ -1509,7 +1509,8 @@ class RamTier {
         rows[row].lo = lo;
         rows[row].hi = hi;
       }
-      groups.push_back(std::make_unique<Group>(g, sq_thread_cpus[g], tables, direct, std::move(rows)));
+      groups.push_back(std::make_unique<Group>(
+          g, sq_thread_cpus[g], tables, direct, std::move(rows), std::string(Layout::kName) + "-tier" + std::to_string(g)));
     }
     return groups;
   }
@@ -2024,6 +2025,10 @@ class RamTier {
         if (lane.kind == Wire::kKindMissCpu) {
           if (!cpu_row || group.cpu->parts() < 2) fail(": a CPU miss on a row without CPU experts' miss part");
           ++job.late_cpu;
+          // a = the expert, b = its lane in the record: joins a forward's misses to its routes (verify_split.py).
+          if constexpr (Build::kMetrics)
+            group.trace.emit("miss_expert", request.row, request.gen, request.seq, group.index, lane.expert,
+                             static_cast<int64_t>(j));
         }
         plan->missing.push_back(lane.expert);
         plan->slots.push_back(lane.slot);

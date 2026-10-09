@@ -49,6 +49,7 @@ from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.verify_accept_log import get_verify_accept_log
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -790,8 +791,15 @@ class SchedulerBatchResultProcessor:
         self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
+        accept_log = get_verify_accept_log()
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            if accept_log is not None:
+                accept_log.record(
+                    req.rid,
+                    result.num_correct_drafts_per_req_cpu[i],
+                    settled=not (req.is_retracted or req.finished()),
+                )
 
             if req.is_retracted or req.finished():
                 # Nothing to settle: no worker pre-claims the bonus, so
