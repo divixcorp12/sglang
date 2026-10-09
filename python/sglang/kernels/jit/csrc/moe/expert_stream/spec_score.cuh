@@ -18,7 +18,7 @@
 namespace sglang {
 namespace device::expert_stream {
 
-constexpr int kScoreWarps = 8;           // a score block's warps; each scores one expert at a time
+constexpr int kScoreThreads = 128;       // a score block: one expert, its threads striding the hidden size
 constexpr int kScoreTokenTile = 8;       // tokens accumulated per pass over a gate row
 constexpr int kSelectThreads = 256;      // one warp per token while ordering, then thread 0 alone
 constexpr int kSelectMaxExperts = 1024;  // the select kernel's shared per-expert arrays; 32 per lane while ordering
@@ -37,6 +37,31 @@ SGL_DEVICE float gate_value(const float* w, int64_t i) {
   return w[i];
 }
 
+// One 16-byte load of a gate row: 8 bf16 or 4 fp32 values.
+template <class W>
+SGL_DEVICE void load_gate(const W* p, float (&out)[16 / sizeof(W)]) {
+  const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
+  const W* v = reinterpret_cast<const W*>(&raw);
+#pragma unroll
+  for (int i = 0; i < static_cast<int>(16 / sizeof(W)); ++i) out[i] = gate_value(v, i);
+}
+
+// The matching N bf16 inputs: 16 bytes for a bf16 gate, 8 for an fp32 one.
+template <int N>
+SGL_DEVICE void load_input(const bf16_t* p, float (&out)[N]) {
+  if constexpr (N == 8) {
+    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
+    const bf16_t* v = reinterpret_cast<const bf16_t*>(&raw);
+#pragma unroll
+    for (int i = 0; i < N; ++i) out[i] = __bfloat162float(v[i]);
+  } else {
+    const uint2 raw = __ldg(reinterpret_cast<const uint2*>(p));
+    const bf16_t* v = reinterpret_cast<const bf16_t*>(&raw);
+#pragma unroll
+    for (int i = 0; i < N; ++i) out[i] = __bfloat162float(v[i]);
+  }
+}
+
 // GateScorer's order: the higher score first, the lower id on a tie.
 SGL_DEVICE bool ranks_above(float sa, int32_t a, float sb, int32_t b) {
   return sa > sb || (sa == sb && a < b);
@@ -53,41 +78,66 @@ struct SpecScoreParams {
   int64_t tokens;
   int64_t hidden;
   int64_t experts;
+  int64_t vectorized;  // x and w 16-byte aligned and hidden a multiple of the load width: the vector loop
 };
 
-// The score kernel: one warp per expert at a time, its lanes striding the hidden size for kScoreTokenTile tokens per
-// pass, fp32 sums, then sqrt(softplus(z)) + b with torch's softplus threshold of 20. The sqrt and the add are
-// correctly rounded whatever the module's math flags, so integer logits score as the host's do, bit for bit.
+// The score kernel: one block per expert, its threads striding the hidden size in 16-byte gate loads (a scalar loop
+// covers the rest, or all of it when unaligned) for kScoreTokenTile tokens per pass, fp32 sums reduced over the block,
+// then sqrt(softplus(z)) + b with torch's softplus threshold of 20. The sqrt and the add are correctly rounded whatever
+// the module's math flags, so integer logits score as the host's do, bit for bit.
 template <class W>
-__global__ __launch_bounds__(device::expert_stream::kScoreWarps * 32) void exl3_ram_prefetch_score_kernel(
+__global__ __launch_bounds__(device::expert_stream::kScoreThreads) void exl3_ram_prefetch_score_kernel(
     const __grid_constant__ SpecScoreParams p) {
   using namespace device::expert_stream;
-  const int lane = threadIdx.x % 32;
-  const W* w = static_cast<const W*>(p.w);
-  const int64_t warps = static_cast<int64_t>(gridDim.x) * kScoreWarps;
-  for (int64_t e = static_cast<int64_t>(blockIdx.x) * kScoreWarps + threadIdx.x / 32; e < p.experts; e += warps) {
-    const W* row = w + e * p.hidden;
-    for (int64_t t0 = 0; t0 < p.tokens; t0 += kScoreTokenTile) {
-      float acc[kScoreTokenTile] = {};
-      for (int64_t h = lane; h < p.hidden; h += 32) {
-        const float wv = gate_value(row, h);
-#pragma unroll
-        for (int j = 0; j < kScoreTokenTile; ++j)
-          if (t0 + j < p.tokens) acc[j] = __fmaf_rn(wv, __bfloat162float(p.x[(t0 + j) * p.hidden + h]), acc[j]);
-      }
+  constexpr int N = 16 / sizeof(W);
+  constexpr int kWarps = kScoreThreads / 32;
+  __shared__ float partial[kWarps][kScoreTokenTile];
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int64_t e = blockIdx.x;
+  const W* row = static_cast<const W*>(p.w) + e * p.hidden;
+  const int64_t vector_end = p.vectorized != 0 ? p.hidden / N * N : 0;
+  for (int64_t t0 = 0; t0 < p.tokens; t0 += kScoreTokenTile) {
+    const int64_t live = min(static_cast<int64_t>(kScoreTokenTile), p.tokens - t0);
+    const bf16_t* x = p.x + t0 * p.hidden;
+    float acc[kScoreTokenTile] = {};
+#pragma unroll 2
+    for (int64_t h = static_cast<int64_t>(threadIdx.x) * N; h < vector_end; h += kScoreThreads * N) {
+      float wv[N];
+      load_gate<W>(row + h, wv);
 #pragma unroll
       for (int j = 0; j < kScoreTokenTile; ++j) {
-        float z = acc[j];
+        if (j < live) {
+          float xv[N];
+          load_input<N>(x + j * p.hidden + h, xv);
 #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-          z = __fadd_rn(z, __shfl_xor_sync(0xFFFFFFFFu, z, offset));
-        if (lane == 0 && t0 + j < p.tokens) {
-          const float softplus = z > 20.0f ? z : log1pf(expf(z));
-          const float s = __fadd_rn(__fsqrt_rn(softplus), p.bias[e]);
-          p.scores[(t0 + j) * p.experts + e] = isnan(s) ? neg_inf() : s;  // a NaN score ranks below every other
+          for (int i = 0; i < N; ++i) acc[j] = __fmaf_rn(wv[i], xv[i], acc[j]);
         }
       }
     }
+    for (int64_t h = vector_end + threadIdx.x; h < p.hidden; h += kScoreThreads) {
+      const float wv = gate_value(row, h);
+#pragma unroll
+      for (int j = 0; j < kScoreTokenTile; ++j)
+        if (j < live) acc[j] = __fmaf_rn(wv, __bfloat162float(x[j * p.hidden + h]), acc[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < kScoreTokenTile; ++j) {
+      float z = acc[j];
+#pragma unroll
+      for (int offset = 16; offset > 0; offset /= 2)
+        z = __fadd_rn(z, __shfl_xor_sync(0xFFFFFFFFu, z, offset));
+      if (lane == 0) partial[warp][j] = z;
+    }
+    __syncthreads();
+    if (threadIdx.x < live) {
+      float z = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) z = __fadd_rn(z, partial[w][threadIdx.x]);
+      const float softplus = z > 20.0f ? z : log1pf(expf(z));
+      const float s = __fadd_rn(__fsqrt_rn(softplus), p.bias[e]);
+      p.scores[(t0 + threadIdx.x) * p.experts + e] = isnan(s) ? neg_inf() : s;  // a NaN score ranks below every other
+    }
+    __syncthreads();  // the next pass rewrites partial
   }
 }
 
@@ -238,6 +288,10 @@ struct SpecScoreKernel {
         "x, w, bias, scores: must be contiguous");
     RuntimeCheck(
         T_.unwrap() >= 1 && T_.unwrap() <= M_.unwrap(), "x: 1..tokens_max rows (a record outside them is not scored)");
+    const bool fp32 = w.dtype().code == kDLFloat;
+    const int64_t width = fp32 ? 4 : 8;  // gate values per 16-byte load
+    const bool vectorized = H_.unwrap() % width == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+                            reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0;
     const auto params = SpecScoreParams{
         .x = static_cast<const bf16_t*>(x.data_ptr()),
         .w = w.data_ptr(),
@@ -246,11 +300,10 @@ struct SpecScoreKernel {
         .tokens = T_.unwrap(),
         .hidden = H_.unwrap(),
         .experts = E_.unwrap(),
+        .vectorized = vectorized,
     };
     const auto stream = LaunchKernel::resolve_device(scores.device());
-    const auto blocks = static_cast<unsigned>((E_.unwrap() + kScoreWarps - 1) / kScoreWarps);
-    const bool fp32 = w.dtype().code == kDLFloat;
-    LaunchKernel(dim3(blocks), dim3(kScoreWarps * 32), stream)(
+    LaunchKernel(dim3(static_cast<unsigned>(E_.unwrap())), dim3(kScoreThreads), stream)(
         fp32 ? exl3_ram_prefetch_score_kernel<float> : exl3_ram_prefetch_score_kernel<bf16_t>, params);
   }
 
