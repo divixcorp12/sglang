@@ -7714,6 +7714,37 @@ counters are server lifetime.
 the post). Tests: `test_exl3_ram_prefetch_gpu_host.py`, `test/manual/dsv41/test_exl3_ram_prefetch_gpu_scorer_cuda.py`;
 bench `test/manual/dsv41/bench_exl3_ram_prefetch_score.py`. Arms `dspark-both-prefetch-gpu{,-topk}`.
 
+**§33.15 addendum: per-layer margin floors (2026-10-09).** Following the expert-prediction handoff's E6/E7 (admit
+selectively, calibrate per layer), `spec_margin.py` now breaks the captures' reads down by target layer and sweeps
+admission rules, fit on one part and scored on another. Precision by target layer runs from 0.19 to 0.74 and the weak
+layers (6, 7, 14, 25, 28) and strong ones (19, 23, 30-39) agree across the CPU and GPU captures; margin predicts use
+better than rank (under 0: 0.14-0.18; 0.5 and up: 0.62-0.74). The per-layer minimum-margin rule at a 0.3 floor
+(alpha 20 shrinkage toward the pooled rate), fit on one capture and scored on the other, kept 89.5% / 89.2% of the
+used reads and cut the wasted ones 40% / 45%. `SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS` (GPU scorer only) loads the
+table; `serve_gpu_job` skips a candidate under its target row's floor before it counts toward `per_layer`. The
+committed table (`analysis/dsv41-drive/dspark/ram_prefetch_margin_floors.json`, fit on all of
+`margin-gpu-20261009-035316`) is margin >= 0 on strong layers, >= 0.1 on weak ones, >= 0.25 on layer 14.
+
+A/B `ab-floors-20261009-125556` (commit `1970753936`, B first, 8 sessions): **rejected, a tie**.
+
+| | `dspark-both` | `dspark-both-prefetch-gpu-floors` |
+|---|---:|---:|
+| median ms/token (tok/s) | 79.94 (12.51) | 80.98 (12.35) |
+| paired gain, median / sessions faster | | +0.6% / 5 of 8 |
+| precision (used / landed) | | 0.59 (6914 / 11682); A/B 2 0.45 |
+| in flight at use | | 14.2% |
+| RAM-miss rows per token (lifetime) | 22.7 | 17.3 |
+| NVMe rows per token (demand + speculative) | 22.7 | 24.2 |
+| wasted speculative rows per token | | 2.8; A/B 2 6.9 |
+| demand reads delayed | | 459 |
+
+Text B vs A passes (323 tokens, 5 flips, max gap 0.25). **Reading:** the floors did what the sweep said -- precision
+0.45 -> 0.59, waste per token 6.9 -> 2.8, and the prefetch now removes 5.4 RAM misses per token for 1.5 extra NVMe
+rows (A/B 2: 2.4 for 9.9) -- and decode time did not move. Removing a quarter of the RAM misses is not on the decode
+critical path at this budget: one prefetched row per layer rarely clears a layer whose other misses still gate it.
+`both_cpu_ab.py --baseline DIR` now imports the reference arm from an earlier A/B instead of rerunning it (about half
+the wall time; the two arms are then no longer in one window, so drift reads as the arm's effect).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
