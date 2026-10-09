@@ -81,6 +81,15 @@ def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_i
     assert ab._overrides("dspark-both", "/out")["SGLANG_DSV41_RAM_PREFETCH"] == "0"
 
 
+def test_every_arm_but_the_prefetch_pins_it_off_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH", "1")
+    for arm in ab.ARMS:
+        expected = "1" if arm == "dspark-both-prefetch" else "0"
+        assert ab._overrides(arm, "/out")["SGLANG_DSV41_RAM_PREFETCH"] == expected, arm
+        assert ab._probe_overrides(arm, "/out")["SGLANG_DSV41_RAM_PREFETCH"] == expected, arm
+
+
 def test_the_private_build_caches_reach_every_arms_server(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_JIT_CACHE_DIR", "/private/jit")
