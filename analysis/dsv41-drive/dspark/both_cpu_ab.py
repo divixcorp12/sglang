@@ -60,6 +60,7 @@ ARMS = {
             "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
             "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
             "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
+            "SGLANG_DSV41_RAM_PREFETCH_SCORER": "cpu",
         },
         True,
     ),
@@ -69,10 +70,24 @@ ARMS["dspark-both-prefetch-topk"] = (
     {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
     True,
 )
+# The same arm scored on the GPU after each layer's post (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer-design).
+ARMS["dspark-both-prefetch-gpu"] = (
+    {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu"},
+    True,
+)
+ARMS["dspark-both-prefetch-gpu-topk"] = (
+    {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
-REFERENCE = {"dspark-both-prefetch": "dspark-both", "dspark-both-prefetch-topk": "dspark-both"}
+REFERENCE = {
+    "dspark-both-prefetch": "dspark-both",
+    "dspark-both-prefetch-topk": "dspark-both",
+    "dspark-both-prefetch-gpu": "dspark-both",
+    "dspark-both-prefetch-gpu-topk": "dspark-both",
+}
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
     "rows_read",
@@ -83,6 +98,7 @@ RAM_KEYS = (
     "spec_dropped",
     "spec_failed",
     "spec_delayed",
+    "spec_late",
 )
 
 
@@ -165,6 +181,24 @@ def _results(out: str, arm: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def _ms_by_session(out: str, arm: str) -> dict:
+    return {
+        r["session_id"]: 1000.0 / r["decode_tokens_per_sec"]
+        for r in _results(out, arm)
+        if r.get("session_id") is not None and r.get("decode_tokens_per_sec")
+    }
+
+
+def _paired_gain_pct(out: str, reference: str, arm: str):
+    """Per session (by session_id), the arm's ms/token gain over its reference's, in % of the reference's; None when
+    the two share no session."""
+    try:
+        a, b = _ms_by_session(out, reference), _ms_by_session(out, arm)
+    except FileNotFoundError:
+        return None
+    return {k: 100.0 * (a[k] - b[k]) / a[k] for k in sorted(set(a) & set(b))} or None
+
+
 def _server_counters(out: str, arm: str):
     """The last counters line of the arm's timed server: the service's lifetime (warm-up and the timed set)."""
     runs = sorted(os.listdir(os.path.join(out, "servers", arm)))
@@ -233,6 +267,9 @@ def summarize(out: str) -> dict:
         if counters:
             entry["ram"] = {k: counters.get(k) for k in RAM_KEYS}
             entry["ram"]["scope"] = "server lifetime: warm-up and the timed set"
+            if counters.get("spec_used"):
+                # Used reads still in flight at their demand (the GPU scorer's success criterion: under 15%).
+                entry["spec_in_flight_at_use"] = counters.get("spec_promoted", 0) / counters["spec_used"]
             # The counters are server-lifetime, so the denominator is too: warm-up rounds plus the timed set.
             warmups = _warmup_tokens(out, arm)
             lifetime = sum(warmups) + sum(r["completion_tokens"] for r in rows)
@@ -250,6 +287,11 @@ def summarize(out: str) -> dict:
             entry["text_vs_reference"] = "missing reference probe"
         elif reference and os.path.exists(ref_probes[arm]):
             entry["text_vs_reference"] = _compare(ref_probes[reference], ref_probes[arm])
+        if reference:
+            paired = _paired_gain_pct(out, reference, arm)
+            if paired:
+                entry["paired_gain_pct_vs_reference"] = paired
+                entry["paired_gain_pct_median"] = statistics.median(paired.values())
         summary[arm] = entry
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
