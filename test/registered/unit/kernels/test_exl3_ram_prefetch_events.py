@@ -114,7 +114,7 @@ def test_every_forced_miss_leaves_a_miss_expert_event_on_its_group(tmp_path, mon
     group's trace is built with the tier, so the prefix is set before the rig."""
     monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
     (tmp_path / "rig").mkdir()
-    rig = prefetch_rig(tmp_path / "rig")
+    rig = prefetch_rig(tmp_path / "rig", capacity=9, share=1)  # room for two victims
     try:
         load(rig, 1, [4])
         req = forced(rig, 1, [2, 4, 5])
