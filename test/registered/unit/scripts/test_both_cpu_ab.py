@@ -211,6 +211,23 @@ def test_the_gpu_arm_differs_from_the_prefetch_arm_in_the_scorer_alone(monkeypat
     assert ab._overrides("dspark-both-prefetch-gpu", "/out")["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu"
 
 
+def test_the_floors_arm_differs_from_the_gpu_arm_in_the_committed_margin_floors_alone(monkeypatch):
+    from sglang.srt.layers.moe.ram_prefetch import load_margin_floors
+
+    ab = _ab()
+    g, f = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-floors"][0]
+    key = "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"
+    assert {k: v for k, v in f.items() if k != key} == {k: v for k, v in g.items() if k != key}
+    assert g[key] == "" and ab.PREFETCH_OFF[key] == ""
+    floors = load_margin_floors(f[key], rows=40)
+    assert floors[0] == float("-inf") and floors[14] == 0.25
+    assert ab.ARMS["dspark-both-prefetch-gpu-floors"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-floors"] == "dspark-both"
+    monkeypatch.setenv(key, "/elsewhere.json")
+    assert ab._overrides("dspark-both-prefetch-gpu-floors", "/out")[key] == f[key]
+    assert ab._overrides("dspark-both", "/out")[key] == ""
+
+
 def test_the_driver_runs_the_arms_in_the_order_given(monkeypatch, tmp_path):
     """The reversed A/B (B first) relies on it."""
     ab = _ab()

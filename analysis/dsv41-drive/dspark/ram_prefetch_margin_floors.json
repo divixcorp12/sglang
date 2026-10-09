@@ -1,0 +1,7 @@
+{
+ "about": "Per-target-row margin floors for the GPU-scored RAM prefetch (SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS). spec_margin.py's per-layer min margin rule at floor 0.3, alpha 20, fit on every read of the GPU-scorer capture. Cross-check (fit on the CPU capture, scored on this one): 89.5% of used reads kept, wasted reads 3119 -> 1882, precision 0.448 -> 0.546.",
+ "fit": "divix01:/data/models/slang/nvfp4-work/ram-prefetch/margin-gpu-20261009-035316 (8 sessions, 5650 reads); admission-sweep-20261009/fit-gpu-all.json",
+ "floor": 0.3,
+ "alpha": 20,
+ "min_margin": {"1": 0.1, "2": 0.1, "3": 0.1, "4": 0.1, "5": 0.0, "6": 0.1, "7": 0.1, "8": 0.1, "9": 0.1, "10": 0.1, "11": 0.1, "12": 0.0, "13": 0.0, "14": 0.25, "15": 0.0, "16": 0.1, "17": 0.0, "18": 0.1, "19": 0.0, "20": 0.1, "21": 0.0, "22": 0.0, "23": 0.0, "24": 0.1, "25": 0.1, "26": 0.0, "27": 0.0, "28": 0.1, "29": 0.0, "30": 0.0, "31": 0.0, "32": 0.0, "33": 0.0, "34": 0.0, "35": 0.0, "36": 0.0, "37": 0.0, "38": 0.0, "39": 0.1}
+}
