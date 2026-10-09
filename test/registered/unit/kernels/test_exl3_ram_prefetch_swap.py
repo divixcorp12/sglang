@@ -80,7 +80,8 @@ def test_a_record_served_wholly_from_the_pool_stamps_a_zero_width_read(tmp_path)
         rig.host.enable_trace()
         rig.host.spec_place(1, 4)
         forced(rig, 1, [4])
-        (record,) = [r for r in rig.host.drain_trace() if r["kind"] == 0 and r["rows"] == 0 and r["status"] == 1]
+        (record,) = [r for r in rig.host.drain_trace() if r["kind"] == "demand" and r["status"] == "served"]
+        assert record["rows"] == 0
         assert record["reserved"] > 0
         for stamp in ("submit", "first_cqe", "last_cqe", "pack_start", "pack_end"):
             assert record[stamp] == record["reserved"], stamp
