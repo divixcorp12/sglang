@@ -1524,3 +1524,10 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
                 cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36
             )
     assert sources == ["target"]
+
+
+def test_ram_prefetch_without_cpu_experts_is_refused_at_start(tiers):
+    service, _, _ = tiers
+    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS"):
+            service.ensure_started()
