@@ -6,7 +6,8 @@
 // (test_only()); the rest (reading, geometry, counters) work in both, and tools use some of them on a live module.
 //
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
-//              publish_piece: one synchronous read through the reader, with traces and injected faults
+//              publish_piece: one synchronous read through the reader, with traces and injected faults;
+//              read_rows_drive_load: two readers over one DriveLoad
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
 //              trace_clock_reads, spec_place, spec_pump, inject_spec
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
@@ -345,6 +346,104 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       out[9] = reader.min_cut_bytes();
       out[10] = reader.leg_stride();
     }
+  }
+
+  // Two readers over the same tables count into one DriveLoad (drive_load.h), as the tier's groups do. Reader A reads
+  // `experts` into `slots` with `fault` (laid out as read_rows_faulted's; word 22 turns piece streaming on for both),
+  // then reader B reads `then_experts` into `then_slots` with none (no second read when there are none). `mode` bit 0
+  // makes A's read speculative, bit 1 B's; bit 2 nests B's read inside A's, at the first progress turn that finds A
+  // with sub-reads in flight. `out` (4 + 3 * kDriveLoadWords int64): A's result (-2 when it threw), B's (-9 when it did
+  // not run), A's sub-reads in flight when B ran nested, 1 when A threw; then the DriveLoad snapshot after the nested B
+  // (zeros when not nested), after A returned (or threw), and after B (the same as the second when B ran nested). Both
+  // builds: ProdBuild refuses a fault, as read_rows_traced does.
+  static void read_rows_drive_load(
+      TensorView extents,
+      TensorView starts,
+      TensorView file_sizes,
+      TensorView segments,
+      TensorView slabs,
+      TensorView row_bytes,
+      TensorView buffer_regions,
+      std::string paths,
+      std::string source_paths,
+      int64_t slot_bytes,
+      int64_t row_images,
+      int64_t direct,
+      int64_t row,
+      TensorView experts,
+      TensorView slots,
+      TensorView then_experts,
+      TensorView then_slots,
+      int64_t step,
+      TensorView fault,
+      int64_t mode,
+      TensorView out) {
+    using namespace host;
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
+    auto cpu = SymbolicDevice{};
+    verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+    verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+    verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+    verify_named("then_experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_experts);
+    verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
+    verify_named(
+        "out", TensorMatcher({4 + 3 * kDriveLoadWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    check_fault_words<Layout>(fault);
+    const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+    auto* o = static_cast<int64_t*>(out.data_ptr());
+    std::fill(o, o + 4 + 3 * kDriveLoadWords, 0);
+    o[1] = -9;
+    auto tables = [&] {
+      return tables_from<Layout>(
+          extents,
+          starts,
+          file_sizes,
+          segments,
+          slabs,
+          row_bytes,
+          buffer_regions,
+          paths,
+          source_paths,
+          slot_bytes,
+          row_images);
+    };
+    DriveLoad load;
+    Source a(tables(), direct != 0), b(tables(), direct != 0);
+    for (Source* reader : {&a, &b}) {
+      if (f[22] != 0) reader->set_piece_stream(true);
+      reader->set_drive_load(&load);
+    }
+    if (!a.open() || !b.open()) {
+      o[0] = 0;
+      return;
+    }
+    a.set_read_kind((mode & 1) != 0 ? kSpecRead : kDemandRead);
+    b.set_read_kind((mode & 2) != 0 ? kSpecRead : kDemandRead);
+    install_fault(a, f, "a fault on read_rows_drive_load");
+    const int64_t parts = a.tables().parts;
+    const auto then_ids = ids_of(then_experts);
+    const auto then_at = slots_of(then_slots);
+    auto read_b = [&] {
+      o[1] = b.read(row, then_ids, then_at, kBounceRows, abandon_after(0));
+    };
+    bool nested = (mode & 4) != 0 && !then_ids.empty();
+    auto progress = [&] {
+      if (!nested || a.drive_share_reads() == 0) return;
+      nested = false;
+      o[2] = a.drive_share_reads();
+      read_b();
+      load.snapshot(o + 4, parts);
+    };
+    const size_t at = f[18] > 0 ? static_cast<size_t>(f[18]) : static_cast<size_t>(step);
+    try {
+      o[0] = a.read(row, ids_of(experts), slots_of(slots), at, abandon_after(f[17]), nullptr, nullptr, SIZE_MAX, progress);
+    } catch (const std::exception&) {
+      o[0] = -2;
+      o[3] = 1;
+    }
+    load.snapshot(o + 4 + kDriveLoadWords, parts);
+    if (o[1] == -9 && !then_ids.empty()) read_b();
+    load.snapshot(o + 4 + 2 * kDriveLoadWords, parts);
   }
 
   // Test only: the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
@@ -1314,6 +1413,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_drop, Exports::kernel_drop);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_drive_load, Exports::read_rows_drive_load); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_sqes, Exports::read_rows_sqes);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_publish_piece, Exports::publish_piece);               \

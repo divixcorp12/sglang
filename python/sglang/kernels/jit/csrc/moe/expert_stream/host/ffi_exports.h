@@ -952,6 +952,15 @@ struct HostExports {
     find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
   }
 
+  // The tier's drive load (DriveLoad::snapshot, kDriveLoadWords words): relaxed reads, callable while the service runs.
+  static void drive_load(int64_t handle, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "out", TensorMatcher({expert_stream::kDriveLoadWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    find(handle)->drive_load(static_cast<int64_t*>(out.data_ptr()));
+  }
+
   // Bit k set: counter k is a core counter (is_core_counter), kept by the production build. Python's CORE_COUNTERS
   // is checked against it.
   static int64_t core_counter_mask() {
@@ -1150,6 +1159,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_hot, Exports::set_hot);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_group_counters, Exports::group_counters);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_drive_load, Exports::drive_load);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                 \

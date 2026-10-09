@@ -15,6 +15,7 @@
 
 #include "../row_layout.h"
 #include "build_policy.h"
+#include "drive_load.h"
 #include "file_reader.h"
 #include "piece_geometry.h"
 #include "read_cuts.h"
@@ -130,6 +131,30 @@ class ReaderCore {
 
   bool piece_stream() const {
     return piece_stream_;
+  }
+
+  // Where this reader counts its reads in flight per root (drive_load.h): the tier points every reader at its one
+  // DriveLoad; a reader on its own (tests, tools) counts into its own. Call it on an idle reader.
+  void set_drive_load(DriveLoad* load) {
+    load_ = load != nullptr ? load : &own_load_;
+  }
+  const DriveLoad& drive_load() const {
+    return *load_;
+  }
+
+  // The kind the next read()s count as (kDemandRead, the default, or kSpecRead). The tier's speculative read sets it
+  // for its one read and clears it, on the thread that holds the reader. Call it on an idle reader.
+  void set_read_kind(int kind) {
+    kind_ = kind;
+  }
+
+  // Test only: the sub-reads this reader counts in flight now, its share of the DriveLoad (0 between reads).
+  int64_t drive_share_reads() const {
+    int64_t reads = 0;
+    for (const auto& root : mine_)
+      for (const auto& kind : root)
+        reads += kind.reads;
+    return reads;
   }
 
   // Pieces a readiness word refused to publish, over the reader's life (each also failed its read). A metric: 0 in
@@ -815,6 +840,7 @@ class ReaderCore {
   // Starts a read() with every descriptor retired and every bank free. This is also what makes a failed call safe to
   // follow: drain() has already retired the kernel's side of everything.
   void reset_pipeline() {
+    release_drive_share();
     for (auto& d : descs_)
       d = ExtentDesc{};
     for (auto& r : rows_)
@@ -1231,6 +1257,7 @@ class ReaderCore {
   void refill() {
     Call& c = c_;
     int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
+    clock_ = 0;            // and at most one for the drive load (DriveLoad::change)
     while (c.queue_count > 0) {
       const uint32_t index = queue_[c.queue_head];
       ExtentDesc& d = descs_[index];
@@ -1277,6 +1304,7 @@ class ReaderCore {
         g.state = LegState::Inflight;
         ++d.legs_inflight;
         ++c.pending;
+        count_drive(d, d.legs_inflight == 1 ? 1 : 0, remaining);  // the sub-read's first leg in flight counts the read
         if constexpr (Build::kFaults) {
           if (faults_.sqe_log) {
             faults_.sqe_log->push_back(
@@ -1345,6 +1373,7 @@ class ReaderCore {
       c.soft_errors = 0;
     }
     const int64_t returned = trace_stamp();
+    clock_ = 0;  // the drive load's clock for this reap: read at most once (DriveLoad::change)
     completions_.clear();
     again_.clear();
     const unsigned seen = io_.reap(completions_);
@@ -1371,6 +1400,7 @@ class ReaderCore {
     completions_.assign(faults_.held.begin(), faults_.held.end());
     faults_.held.clear();
     again_.clear();
+    clock_ = 0;
     const int64_t released = trace_stamp();
     for (size_t k = 0; k < completions_.size(); ++k)
       process(completions_[k], released);
@@ -1447,6 +1477,9 @@ class ReaderCore {
     Leg& g = legs_[static_cast<size_t>(index) * leg_stride_ + l];
     g.state = LegState::Idle;
     --d.legs_inflight;
+    // The leg's bytes leave flight whatever it returned (done is unchanged since it was prepared), and the sub-read's
+    // last leg reaped takes its read back; a retry or a short leg counts again when it is prepared again.
+    count_drive(d, d.legs_inflight == 0 ? -1 : 0, -(g.bytes - g.done));
     int res = completion.res;
     bool eof = false;  // fault (short_is_eof): this completion ends the sub-read
     add_metric(&ReaderMetrics::cqes);
@@ -1484,6 +1517,7 @@ class ReaderCore {
     }
     g.done += res;
     d.done += res;
+    load_->landed(DriveLoad::root_of(d.read->file, t_.parts), kind_, res);
     if (eof) {
       d.expected -= g.expected - g.done;
       g.expected = g.done;
@@ -1669,7 +1703,31 @@ class ReaderCore {
   // ring's (0) and would terminate.
   void drain(unsigned pending) {
     c_.pending = 0;
+    release_drive_share();  // drained completions never reach process(): before io_.drain, which may throw
     io_.drain(pending);
+  }
+
+  // Adds `reads` sub-reads and `bytes` bytes of descriptor `d`'s root to the shared drive load, and to this reader's
+  // share of it.
+  void count_drive(const ExtentDesc& d, int reads, int64_t bytes) {
+    const int root = DriveLoad::root_of(d.read->file, t_.parts);
+    mine_[root][kind_].reads += reads;
+    mine_[root][kind_].bytes += bytes;
+    load_->change(root, kind_, reads, bytes, clock_);
+  }
+
+  // Takes this reader's share back out of the shared drive load and zeroes it: what a failed read left counted (its
+  // drained completions never reach process()). A no-op after a read that returned normally.
+  void release_drive_share() {
+    clock_ = 0;
+    for (int root = 0; root < kMaxDrives; ++root) {
+      for (int kind = 0; kind < 2; ++kind) {
+        Share& share = mine_[root][kind];
+        if (share.reads == 0 && share.bytes == 0) continue;
+        load_->change(root, kind, static_cast<int>(-share.reads), -share.bytes, clock_);
+        share = Share{};
+      }
+    }
   }
 
   Tables t_;
@@ -1720,6 +1778,18 @@ class ReaderCore {
   size_t rows_busy_[kBanks] = {};  // rows not yet packed, per bank: the packing references
   size_t bank_live_[kBanks] = {};  // extents not yet retired, per bank: the I/O references
   uint32_t generation_ = 0;
+  // The drive load (drive_load.h): functional state, in both builds. `load_` is the tier's, or `own_load_` for a reader
+  // on its own; `mine_` is this reader's share of it per root and kind, which every read() return leaves at 0; `clock_`
+  // is the turn's clock for it (0 until read).
+  struct Share {
+    int64_t reads = 0;
+    int64_t bytes = 0;
+  };
+  DriveLoad own_load_;
+  DriveLoad* load_ = &own_load_;
+  int kind_ = kDemandRead;
+  int64_t clock_ = 0;
+  Share mine_[kMaxDrives][2] = {};
   // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
   [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
   [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;

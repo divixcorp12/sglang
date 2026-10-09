@@ -23,6 +23,7 @@
 #include "../row_layout.h"
 #include "../spec_candidates.h"
 #include "copy_engine.h"
+#include "drive_load.h"
 #include "host_copy_backend.h"
 #include "numa_distributor.h"
 #include "ram_prefetch.h"
@@ -140,6 +141,8 @@ class RamTier {
       Group& group = dist_.group(g);
       // The service streams every miss lane piece by piece: the reader must publish pieces.
       group.reader.set_piece_stream(true);
+      // Every group's reader counts into the tier's one drive load: the groups' rings read the same drives.
+      group.reader.set_drive_load(&drive_load_);
       // The request path's buffers, sized once: nothing on it grows after construction.
       group.hot_scratch.assign(static_cast<size_t>((experts_ + 7) / 8), 0);
       group.packed.reserve(kWanted);
@@ -1432,6 +1435,12 @@ class RamTier {
     }
   }
 
+  // The drive load (drive_load.h), kDriveLoadWords words, relaxed reads from any thread: exact once every reader is
+  // idle, as at the shutdown line.
+  void drive_load(int64_t* out) const {
+    drive_load_.snapshot(out, dist_.group(0).reader.tables().parts);
+  }
+
   // Group g's own core counters: its service thread's block and its speculative thread's.
   void group_counters(int g, int64_t* out) const {
     for (int i = 0; i < kCounterCount; ++i)
@@ -2474,13 +2483,16 @@ class RamTier {
     PoolEntry& entry = pool_->entry(row, g, i);
     const int64_t slot = entry.slot;  // stable: only a swap changes it, and a swap takes a landed entry
     int result = 0;
+    Source& reader = dist_.group(g).reader;
+    reader.set_read_kind(kSpecRead);  // the drive load counts this read as speculative
     try {
-      result = dist_.group(g).reader.read(
+      result = reader.read(
           row, std::span<const int32_t>(&expert, 1), std::span<const int64_t>(&slot, 1), 1,
           [](size_t) { return false; }, nullptr, packed);
     } catch (const std::exception& error) {
       std::fprintf(stderr, "ERROR %spool read: %s\n", error_prefix<Layout>().c_str(), error.what());
     }
+    reader.set_read_kind(kDemandRead);
     _mm_sfence();  // the row's bytes before the landed word
     if (result == 1) {
       entry.landed.store(pool_->next_landing(), std::memory_order_relaxed);
@@ -2874,6 +2886,7 @@ class RamTier {
   // Counters, see count(). One line-private block per writer thread; the metrics only in InstrBuild.
   LineCounters<kCounterCount> copy_core_;  // copy thread only (each group's service thread has its own, in Group::core)
   [[no_unique_address]] Stats<Build::kMetrics, kCounterCount> stats_;  // InstrBuild: any thread, relaxed RMW
+  DriveLoad drive_load_;  // every group's reader counts its reads in flight here (drive_load.h); relaxed atomics
   // Stage trace, InstrBuild only. cur points at stage while a traced request is in service, else null.
   struct TraceState {
     std::atomic<bool> on{false};

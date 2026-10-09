@@ -483,6 +483,104 @@ def read_rows_traced(
     return result, stage_records(record.unsqueeze(0))[0]
 
 
+# The tier's drive load (``host/drive_load.h``, ``DriveLoad::snapshot``): a header of
+# ``elapsed_ns`` (since the load's origin), ``clock_reads`` and ``roots``, then these
+# fields per root for ``DRIVE_SLOTS`` roots. Reads and bytes "in flight" are
+# instantaneous; ``*_bytes`` landed and ``*_busy_ns`` accumulate over the load's life.
+# ``overlap_ns`` is the time a root had demand and speculative reads in flight at once.
+DRIVE_SLOTS = 4  # kMaxDrives
+DRIVE_FIELDS = (
+    "demand_reads",
+    "spec_reads",
+    "demand_inflight_bytes",
+    "spec_inflight_bytes",
+    "demand_bytes",
+    "spec_bytes",
+    "demand_busy_ns",
+    "spec_busy_ns",
+    "overlap_ns",
+)
+DRIVE_LOAD_WORDS = 3 + DRIVE_SLOTS * len(DRIVE_FIELDS)
+
+
+def decode_drive_load(words) -> dict:
+    """Decode ``DRIVE_LOAD_WORDS`` int64 words into ``{"elapsed_ns", "clock_reads",
+    "roots": [one dict of DRIVE_FIELDS per root]}``."""
+    words = [int(w) for w in words]
+    roots = words[2]
+    fields = len(DRIVE_FIELDS)
+    return {
+        "elapsed_ns": words[0],
+        "clock_reads": words[1],
+        "roots": [
+            dict(zip(DRIVE_FIELDS, words[3 + q * fields : 3 + (q + 1) * fields]))
+            for q in range(roots)
+        ],
+    }
+
+
+def read_rows_drive_load(
+    tables,
+    row: int,
+    experts,
+    slots,
+    then_experts=(),
+    then_slots=(),
+    *,
+    a_spec: bool = False,
+    b_spec: bool = False,
+    nested: bool = False,
+    step: int = BOUNCE_ROWS,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    **faults,
+) -> dict:
+    """Test only: two C++ readers over ``tables`` count into one drive load, as the
+    tier's NUMA groups do.
+
+    Reader A reads ``experts`` into ``slots`` with the fault keywords of
+    ``read_rows_with_fault`` (``piece_stream`` applies to both readers); reader B then
+    reads ``then_experts`` into ``then_slots`` with none. ``a_spec``/``b_spec`` make
+    that reader's read speculative. ``nested`` runs B's read inside A's, at the first
+    turn that finds A with sub-reads in flight.
+
+    Returns ``{"a", "b"}`` (the results: 1, 0, -1; A's is -2 when it raised, B's -9
+    when it did not run), ``"a_raised"``, ``"a_in_flight"`` (A's sub-reads in flight
+    when B ran nested) and the decoded drive load ``"nested"`` (after the nested B),
+    ``"after_a"`` and ``"after_b"``. Both builds; production refuses a fault.
+    """
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    then_ids, then_at = _checked_rows(tables, row, then_experts, then_slots)
+    fault = _fault_tensor(**faults)
+    out = torch.zeros(4 + 3 * DRIVE_LOAD_WORDS, dtype=torch.int64)
+    _host_module(layout, variant).expert_stream_read_rows_drive_load(
+        *_table_args(tables),
+        row,
+        expert_ids,
+        slot_ids,
+        then_ids,
+        then_at,
+        int(step),
+        fault,
+        int(a_spec) | int(b_spec) << 1 | int(nested) << 2,
+        out,
+    )
+    words = out.tolist()
+    snaps = [
+        words[4 + k * DRIVE_LOAD_WORDS : 4 + (k + 1) * DRIVE_LOAD_WORDS]
+        for k in range(3)
+    ]
+    return {
+        "a": words[0],
+        "b": words[1],
+        "a_in_flight": words[2],
+        "a_raised": bool(words[3]),
+        "nested": decode_drive_load(snaps[0]) if nested else None,
+        "after_a": decode_drive_load(snaps[1]),
+        "after_b": decode_drive_load(snaps[2]),
+    }
+
+
 def read_rows_with_fault(
     tables,
     row: int,
@@ -2405,6 +2503,14 @@ class ExpertStreamHost:
         self._module.expert_stream_group_counters(self.handle, int(group), out)
         return dict(zip(COUNTERS, out.tolist()))
 
+    def drive_load(self) -> dict:
+        """The tier's per-root drive load (``decode_drive_load``), shared by every NUMA
+        group's reader. Callable while the service runs: relaxed reads, exact once every
+        reader is idle (as at ``stop``)."""
+        out = torch.zeros(DRIVE_LOAD_WORDS, dtype=torch.int64)
+        self._module.expert_stream_drive_load(self.handle, out)
+        return decode_drive_load(out.tolist())
+
     def layer_rows(self) -> list[int]:
         """Return the rows read for demands, per streamed layer (the RAM misses)."""
         out = torch.zeros(self.layers, dtype=torch.int64)
@@ -2433,6 +2539,9 @@ class ExpertStreamHost:
                         sys.stderr.write(
                             f"exl3 RAM miss group {group} counters " + json.dumps(self.group_counters(group)) + "\n"
                         )
+                # Per root: reads in flight (0 here), bytes landed and busy/overlap time by kind
+                # (analysis/dsv41-drive/dspark/drive_busy.py drive-load reads it).
+                sys.stderr.write("exl3 RAM miss drive load " + json.dumps(self.drive_load()) + "\n")
             finally:
                 close()
 

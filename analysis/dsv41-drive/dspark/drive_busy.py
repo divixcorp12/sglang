@@ -8,8 +8,14 @@ reports per drive its bytes and busy share, and for the set of drives the time n
 (at least the interval less every drive's busy time, at most less the busiest one's), and estimated from the samples
 whose in-flight counts were all zero.
 
+``drive-load SERVER_LOG`` needs no sampler: it reads the last ``exl3 RAM miss drive load {json}`` line a host writes at
+stop (the reader's own per-root accounting, host/drive_load.h, which polled reads leave out of /sys's in_flight) and
+reports per root, over the host's lifetime, the share of time demand reads, speculative reads, and both at once were in
+flight, and the bytes each kind landed.
+
 Usage: drive_busy.py sample OUT [--devices nvme0n1,nvme1n1,nvme2n1] [--interval-ms 5]
        drive_busy.py analyze SAMPLES 'EVENTS.*.jsonl' [--json OUT]
+       drive_busy.py drive-load SERVER_LOG [--json OUT]
 """
 
 from __future__ import annotations
@@ -120,6 +126,38 @@ def analyze(samples: list[dict], recs: list[dict]) -> dict:
     }
 
 
+DRIVE_LOAD_MARKER = "exl3 RAM miss drive load "
+
+
+def drive_load_report(text: str) -> dict:
+    """The last drive-load line of a server log, per root: busy shares by kind and their overlap over the host's
+    lifetime, and bytes by kind. Raises ValueError when the log has no such line."""
+    lines = [line for line in text.splitlines() if DRIVE_LOAD_MARKER in line]
+    if not lines:
+        raise ValueError(f"no '{DRIVE_LOAD_MARKER.strip()}' line in the log")
+    load = json.loads(lines[-1].split(DRIVE_LOAD_MARKER, 1)[1])
+    elapsed = load["elapsed_ns"]
+    if elapsed <= 0:
+        raise ValueError("the drive load has no elapsed time")
+    total = sum(r["demand_bytes"] + r["spec_bytes"] for r in load["roots"]) or 1
+    roots = []
+    for q, r in enumerate(load["roots"]):
+        roots.append({
+            "root": q,
+            "demand_busy_share": round(r["demand_busy_ns"] / elapsed, 4),
+            "spec_busy_share": round(r["spec_busy_ns"] / elapsed, 4),
+            "overlap_share": round(r["overlap_ns"] / elapsed, 4),
+            # Of the time this root served demand, the share it also had a speculative read in flight.
+            "overlap_of_demand": round(r["overlap_ns"] / r["demand_busy_ns"], 4) if r["demand_busy_ns"] else None,
+            "demand_gb": round(r["demand_bytes"] / 1e9, 3),
+            "spec_gb": round(r["spec_bytes"] / 1e9, 3),
+            "bytes_share": round((r["demand_bytes"] + r["spec_bytes"]) / total, 4),
+            "in_flight_at_log": r["demand_reads"] + r["spec_reads"],
+        })
+    return {"lines": len(lines), "elapsed_s": round(elapsed / 1e9, 3), "clock_reads": load["clock_reads"],
+            "roots": roots}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -131,9 +169,24 @@ def main() -> int:
     an.add_argument("samples")
     an.add_argument("events")
     an.add_argument("--json")
+    dl = sub.add_parser("drive-load")
+    dl.add_argument("log")
+    dl.add_argument("--json")
     a = p.parse_args()
     if a.cmd == "sample":
         sample(a.out, a.devices.split(","), a.interval_ms)
+        return 0
+    if a.cmd == "drive-load":
+        with open(a.log, errors="replace") as f:
+            try:
+                result = drive_load_report(f.read())
+            except ValueError as error:
+                print(f"refusing: {error}", file=sys.stderr)
+                return 1
+        print(json.dumps(result, indent=1))
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump(result, f, indent=1)
         return 0
     with open(a.samples) as f:
         samples = [json.loads(line) for line in f if line.strip()]
