@@ -15,7 +15,9 @@ rule admits a (target layer, bin) cell when its used rate, shrunk toward the poo
 pseudo-reads, reaches the floor. Only issued reads are recorded, so a rule can only be scored as a subset of them,
 and dropping a read is scored as losing its use: the cache effects of reads not made are not modelled.
 
-Usage: spec_margin.py 'PREFIX.*.jsonl' [--json OUT] [--alpha 20]
+``--fit 'OTHER.*.jsonl'`` fits the rules on another run instead and scores every read of this one.
+
+Usage: spec_margin.py 'PREFIX.*.jsonl' [--json OUT] [--alpha 20] [--fit 'OTHER.*.jsonl']
 """
 
 from __future__ import annotations
@@ -153,6 +155,30 @@ def pooled_rule(train: list[dict], key, floor: float):
     return lambda p: rates.get((None, key(p)), 0.0) >= floor
 
 
+def margin_floors(train: list[dict], floor: float, alpha: float) -> dict:
+    """Per target layer, the minimum margin to admit: the lowest edge of the run of admitted margin bins that starts
+    at the top bin, so the live rule is one threshold per layer. A layer whose top bin fails admits nothing (inf).
+    A bin with no reads anywhere carries no evidence and does not end the run."""
+    rates = cell_rates(train, margin_bin, alpha)
+    lows = (-float("inf"), *MARGIN_EDGES)
+    floors = {}
+    for layer in sorted({p["layer"] for p in train}):
+        edge = float("inf")
+        for b in reversed(range(len(lows))):
+            rate = rates.get((layer, b), rates.get((None, b)))
+            if rate is None:
+                continue
+            if rate < floor:
+                break
+            edge = lows[b]
+        floors[layer] = edge
+    return floors
+
+
+def floor_rule(floors: dict):
+    return lambda p: p["margin"] >= floors.get(p["layer"], -float("inf"))
+
+
 def evaluate(label: str, rule, test: list[dict]) -> dict:
     landed = [p for p in test if p["landed"]]
     kept = [p for p in landed if rule(p)]
@@ -164,10 +190,15 @@ def evaluate(label: str, rule, test: list[dict]) -> dict:
             "wasted": len(kept) - used}
 
 
-def sweep(picks: list[dict], alpha: float) -> dict:
-    split = session_split(picks)
-    train = [p for p in picks if p["submit_ns"] < split]
-    test = [p for p in picks if p["submit_ns"] >= split]
+def sweep(picks: list[dict], alpha: float, train: list[dict] | None = None) -> dict:
+    """Fit on the first sessions and score the rest, or, given ``train`` from another run, score every pick."""
+    if train is None:
+        split = session_split(picks)
+        train = [p for p in picks if p["submit_ns"] < split]
+        test = [p for p in picks if p["submit_ns"] >= split]
+    else:
+        test = picks
+    floors = {}
     rows = [evaluate("all (no rule)", lambda p: True, test)]
     rows += [evaluate(f"rank < {k}", lambda p, k=k: p["rank"] < k, test) for k in (1, 2, 3, 4)]
     keys = (("rank", lambda p: p["rank"]), ("margin", margin_bin), ("rank x margin", rank_margin))
@@ -175,7 +206,10 @@ def sweep(picks: list[dict], alpha: float) -> dict:
         for name, key in keys:
             rows.append(evaluate(f"pooled {name} >= {floor}", pooled_rule(train, key, floor), test))
             rows.append(evaluate(f"per-layer {name} >= {floor}", per_layer_rule(train, key, floor, alpha), test))
-    return {"train": len(train), "test": len(test), "alpha": alpha, "rows": rows}
+        floors[floor] = margin_floors(train, floor, alpha)
+        rows.append(evaluate(f"per-layer min margin >= {floor}", floor_rule(floors[floor]), test))
+    return {"train": len(train), "test": len(test), "alpha": alpha, "rows": rows,
+            "margin_floors": {str(f): {str(t): v for t, v in fl.items()} for f, fl in floors.items()}}
 
 
 def sweep_table(rows: list[dict]) -> str:
@@ -218,6 +252,7 @@ def main() -> int:
     p.add_argument("--top-k", type=int, default=6)
     p.add_argument("--json")
     p.add_argument("--alpha", type=float, default=20.0)
+    p.add_argument("--fit", help="fit the admission rules on this run's trace instead of this run's first sessions")
     a = p.parse_args()
     paths = sorted(glob.glob(a.pattern))
     if not paths:
@@ -233,7 +268,16 @@ def main() -> int:
         return 1
     result = bins(picks, a.top_k)
     result["timing"] = timing(picks)
-    result["sweep"] = sweep(picks, a.alpha)
+    train = None
+    if a.fit:
+        fit_paths = sorted(glob.glob(a.fit))
+        fit_events, fit_dropped = load(fit_paths) if fit_paths else ([], 0)
+        if not fit_paths or fit_dropped:
+            print(f"refusing --fit {a.fit}: {'no files' if not fit_paths else f'{fit_dropped} events dropped'}",
+                  file=sys.stderr)
+            return 1
+        train = join(fit_events)
+    result["sweep"] = sweep(picks, a.alpha, train)
     print(table([result["all"], result["inside_top_k"], result["outside_top_k"]]))
     print()
     print(table(result["by_rank"]))
