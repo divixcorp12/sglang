@@ -1,6 +1,8 @@
 """ThreadingConfig on fake sysfs trees: the design's derivation, today's one-node runtime, the override and every
 refusal (spec 2026-10-03-numa-node-distributor-design, Part 2)."""
 
+import logging
+
 import pytest
 
 from sglang.srt.layers.moe.cpu_experts import threading_config as tc
@@ -346,3 +348,26 @@ def test_without_ram_prefetch_no_plan_names_spec_cores(divix01):
     config = resolve(divix01, cpu_experts=True, threads=16)
     assert [plan.spec for plan in config.plans] == [(), ()]
     assert "spec=" not in " ".join(config.log_lines())
+
+
+def test_a_spec_thread_sharing_the_ram_core_is_warned_naming_the_node_and_core(divix01, caplog):
+    """Node 1 has no spare core, so its speculative thread time-slices the busy-polling RAM core 35; node 0 has spares."""
+    with caplog.at_level(logging.WARNING, logger=tc.__name__):
+        resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+    warnings = [r.getMessage() for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "node1" in warnings[0] and "core 35" in warnings[0] and "node0" not in warnings[0]
+
+
+def test_ram_prefetch_without_a_shared_core_warns_nothing(divix01, caplog):
+    with caplog.at_level(logging.WARNING, logger=tc.__name__):
+        resolve(divix01, nodes=(0,), cpu_experts=True, threads=16, ram_prefetch=True)
+        resolve(divix01, cpu_experts=True, threads=16)
+    assert [r for r in caplog.records if r.name == tc.__name__] == []
+
+
+def test_ram_prefetch_spec_cores_leave_out_the_reserved_cores(divix01):
+    """An affinity spanning 64-71: node 1's only spare would be a reserved core, so its thread shares the RAM core."""
+    config = resolve(divix01, affinity=SERVER | set(range(64, 72)), cpu_experts=True, threads=16, ram_prefetch=True)
+    assert config.plans[1].spec == (config.plans[1].ram,)
+    assert not set(config.plans[0].spec) & tc.RESERVED_CORES
