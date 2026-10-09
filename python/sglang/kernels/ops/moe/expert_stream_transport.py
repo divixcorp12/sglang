@@ -1831,8 +1831,9 @@ class ExpertStreamHost:
                 raise ValueError(
                     f"candidates must be a contiguous host uint8 tensor of {CAND_PAGE_BYTES} bytes (new_candidate_page)"
                 )
-            gate_bytes = torch.empty((0, 0), dtype=torch.uint8)
-            bias = torch.empty((0, 0), dtype=torch.float32)
+            # [0, 1], not [0, 0]: the FFI's contiguity check rejects the strides torch gives a [0, 0] tensor.
+            gate_bytes = torch.empty((0, 1), dtype=torch.uint8)
+            bias = torch.empty((0, 1), dtype=torch.float32)
             hidden = 0
         else:
             if (
