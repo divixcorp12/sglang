@@ -38,7 +38,7 @@ def test_a_lock_the_parent_already_holds_is_taken_without_waiting(tmp_path):
 
 def test_a_lock_another_process_holds_is_waited_on_and_the_holder_named(tmp_path):
     lock = tmp_path / "disk.lock"
-    holder = subprocess.Popen(["flock", str(lock), "sleep", "300"])
+    holder = subprocess.Popen(["flock", "-o", str(lock), "sleep", "300"])  # -o: only flock itself holds it
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and str(holder.pid) not in open("/proc/locks").read():
