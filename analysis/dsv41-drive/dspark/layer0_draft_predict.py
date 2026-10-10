@@ -176,7 +176,7 @@ def score_verify(pred: dict, routed: set, nvme, unrouted_nvme) -> dict:
     p = set(pred)
     r = {"predicted": len(p), "routed": len(routed), "hit_routed": len(p & routed), "wasted_any": len(p - routed)}
     if nvme is not None:
-        r.update(nvme=len(nvme), hit_nvme=len(p & nvme), wasted_nvme=len((p - routed) & unrouted_nvme))
+        r.update(labelled=1, nvme=len(nvme), hit_nvme=len(p & nvme), wasted_nvme=len((p - routed) & unrouted_nvme))
     return r
 
 
@@ -458,7 +458,8 @@ def evaluate(pred: Predictors, verifies: list, tokens: list, window: int) -> dic
                "precision_routed": round(c["hit_routed"] / max(1, c["predicted"]), 3),
                "wasted_any_per_verify": round(c["wasted_any"] / n, 2)}
         if c["nvme"]:
-            row.update(nvme_per_verify=round(c["nvme"] / n, 2), recall_nvme=round(c["hit_nvme"] / c["nvme"], 3),
+            n = c["labelled"]  # NVMe rates are per verify whose job forward joined (tier labels known)
+            row.update(labelled_verifies=n, nvme_per_verify=round(c["nvme"] / n, 2), recall_nvme=round(c["hit_nvme"] / c["nvme"], 3),
                        useful_nvme_per_verify=round(c["hit_nvme"] / n, 2),
                        wasted_nvme_per_verify=round(c["wasted_nvme"] / n, 2))
             if "pred_pos0" in c:

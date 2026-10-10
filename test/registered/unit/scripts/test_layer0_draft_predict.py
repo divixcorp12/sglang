@@ -90,7 +90,7 @@ def test_a_verify_scores_useful_reads_on_nvme_rows_and_wasted_reads_on_unrouted_
     nvme = {2, 5}  # routed experts read from NVMe
     unrouted_nvme = {3, 7}  # tier of experts the verify does not route (approximate)
     r = m.score_verify(pred, routed, nvme, unrouted_nvme)
-    assert r == {"predicted": 4, "routed": 4, "nvme": 2, "hit_routed": 2, "hit_nvme": 1, "wasted_nvme": 1,
+    assert r == {"predicted": 4, "routed": 4, "labelled": 1, "nvme": 2, "hit_routed": 2, "hit_nvme": 1, "wasted_nvme": 1,
                  "wasted_any": 2}
 
 
