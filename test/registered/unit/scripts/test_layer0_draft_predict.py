@@ -77,7 +77,7 @@ def test_a_bias_fit_raises_an_expert_the_scores_under_predict():
 
 def test_union_keeps_each_experts_best_confidence_over_the_live_tokens():
     m = _module()
-    scores = np.array([[0.9, 0.1, 0.5, 0.0], [0.2, 0.8, 0.6, 0.0], [0.0, 0.0, 0.0, 1.0]], np.float32)
+    scores = np.array([[0.9, 0.1, 0.5, 0.0], [0.2, 0.8, 0.6, 0.0], [0.0, 0.0, 0.0, 1.0]], np.float64)
     conf = scores  # a probability-like predictor is its own confidence
     pred = m.union_topk(scores, conf, k=2, live=2)  # token 2 is padding
     assert pred == {0: 0.9, 1: 0.8, 2: 0.6}
