@@ -140,13 +140,18 @@ RAW_EXPORTS = {
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
     "test_kernel_address": lambda m, h: m.expert_stream_test_kernel_address(0, 0, 0),
-    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 6 + 2 * 8), dtype=torch.float64)),
+    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 9 + 2 * 8), dtype=torch.float64)),
     "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
     "test_kernel_max_rows": lambda m, h: m.expert_stream_test_kernel_max_rows(1 << 16),
     "draft_test_post": lambda m, h: m.expert_stream_draft_test_post(0, 0, 1, 1, 1, 0),
     "draft_test_tear": lambda m, h: m.expert_stream_draft_test_tear(0, 1),
     "draft_test_finish_close": lambda m, h: m.expert_stream_draft_test_finish_close(0, 1, 0),
     "draft_test_poll_pause": lambda m, h: m.expert_stream_draft_test_poll_pause(0),
+    "kernel_forward_two_stage": lambda m, h: m.expert_stream_kernel_forward_two_stage(
+        0, torch.zeros((1, 4), dtype=torch.float16), torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros((1, 1)), torch.zeros((1, 4)), 1, torch.zeros(0, dtype=torch.int64), 0,
+        torch.zeros((0, 3), dtype=torch.int64), 0, torch.zeros(2, dtype=torch.int64),
+    ),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
         torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),
@@ -154,7 +159,9 @@ RAW_EXPORTS = {
 
 
 def test_every_test_only_export_is_listed_and_exported_by_both_builds():
-    assert sorted(RAW_EXPORTS) == sorted(set(ops.TEST_ONLY_EXPORTS) - {"read_rows_faulted", "read_rows_sqes"})
+    assert sorted(RAW_EXPORTS) == sorted(
+        set(ops.TEST_ONLY_EXPORTS) - {"read_rows_faulted", "read_rows_sqes", "read_rows_two_span"}
+    )
     for variant in ops.VARIANTS:
         module = ops._host_module("exl3", variant)
         for name in ops.TEST_ONLY_EXPORTS:
@@ -176,7 +183,8 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
 @pytest.mark.parametrize(
     "helper",
     (
-        "read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields",
+        "read_rows_with_fault", "read_rows_sqes", "read_rows_two_span", "seqlock_stress", "pause_ns",
+        "read_record_fields",
     ),
 )
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
@@ -184,6 +192,9 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
     calls = {
         "read_rows_with_fault": lambda: ops.read_rows_with_fault(s.tables, 0, [1], [0], [], [], variant="prod"),
         "read_rows_sqes": lambda: ops.read_rows_sqes(s.tables, 0, [1], [0], variant="prod"),
+        "read_rows_two_span": lambda: ops.read_rows_two_span(
+            s.tables, 0, [1], [0], reference=s.tables.slabs, ref_slots=[0], variant="prod"
+        ),
         "seqlock_stress": lambda: ops.seqlock_stress(0.001, variant="prod"),
         "pause_ns": lambda: ops.pause_ns(variant="prod"),
         "read_record_fields": lambda: ops.read_record_fields(

@@ -227,11 +227,12 @@ class FakeHost:
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(
-        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0
+        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0, two_stage=False
     ):
         self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
         self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
         self.keep_warm_us = keep_warm_us
+        self.two_stage = two_stage
 
     def set_cpu_layer(self, row, spec):
         self.layers[row] = spec
@@ -310,6 +311,37 @@ def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
         host = FakeHost()
         _service(host, FakeServiceTrait())
     assert host.keep_warm_us == 0
+
+
+def test_service_passes_the_two_stage_flag_to_the_host_and_logs_it(caplog):
+    """SGLANG_DSV41_CPU_TWO_STAGE reaches enable_cpu_experts, off by default, and the startup log names it."""
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        _service(host, FakeServiceTrait())
+    assert host.two_stage is False and "two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): off" in caplog.text
+    caplog.clear()
+    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True), caplog.at_level(
+        "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
+    ):
+        host = FakeHost()
+        _service(host, FakeServiceTrait())
+    assert host.two_stage is True and "two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): on" in caplog.text
+
+
+def test_service_logs_the_two_stage_waits_with_the_stats(caplog):
+    """With two-stage misses, log_stats adds the staged jobs and their wait for w2 to its line."""
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True):
+        svc = _service(host, FakeServiceTrait())
+    host.stats = {"jobs": 3, "lanes": 8, "forward_ns": 8 * 500_000, "staged_jobs": 2, "stage_two_waits": 1,
+                  "stage_two_wait_ns": 250_000}
+    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        assert svc.log_stats()["stage_two_wait_ns"] == 250_000
+    assert "2 staged jobs, 1 waited for w2 after gate/up, 0.250 ms waiting" in caplog.text
 
 
 def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
