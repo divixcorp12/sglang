@@ -9,7 +9,9 @@ speculative thread over three mirror roots, the demand load faked with inject_de
 
 Mutants (divix01, reverted): gate_root keeps the row's root without rechecking it -- red
 (test_each_piece_reads_a_root_no_demand_reads_and_moves_when_demand_arrives); boost ignored -- red
-(test_a_boosted_read_reads_its_table_roots_despite_demand, test_a_forced_miss_boosts_the_read_it_waits_on)."""
+(test_a_boosted_read_reads_its_table_roots_despite_demand, test_a_forced_miss_boosts_the_read_it_waits_on); one
+piece limit dropped -- red (the two one-root tests); ReaderCore::drain keeps the read's drive-load share -- red (the
+in-flight submit faults)."""
 
 import errno
 import faulthandler
@@ -113,8 +115,11 @@ def test_a_boosted_read_reads_its_table_roots_despite_demand(setup):
         dict(part=0, part_error=errno.EIO),
         dict(cqe_error=errno.EIO, cqe_call=2),
         dict(part=-1, root=1, part_short=4096, short_is_eof=True),
+        # Pieces still in flight when the read fails (one; every table root's, boosted): the drain settles them.
+        dict(submit_error=errno.EIO, submit_call=1, submit_first=True),
+        dict(boost=True, submit_error=errno.EIO, submit_call=1, submit_first=True),
     ],
-    ids=["part_error", "cqe_error", "part_short_eof"],
+    ids=["part_error", "cqe_error", "part_short_eof", "submit_error_in_flight", "boosted_submit_error_in_flight"],
 )
 def test_a_faulted_idle_drive_read_fails_without_abandoning_and_leaves_the_load_idle(setup, fault):
     got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], preload=(1, 0, 1) if "root" in fault else (), **fault)
