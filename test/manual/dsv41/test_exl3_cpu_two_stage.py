@@ -3,7 +3,7 @@ wait between GateUp and Middle, gives the one-stage forward's output bit for bit
 (SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1) and 4 cores in the affinity mask.
 
 Each case holds the routed slots' w2 back: their w2 slabs are poisoned, and kernel_forward_two_stage's helper thread
-restores them 50 ms into the call, then opens the gate. The forward starts at once, runs PrepareGateUp and GateUp on
+restores them 200 ms into the call, then opens the gate. The forward starts at once, runs PrepareGateUp and GateUp on
 the w13 bytes, waits, and runs Middle (the down input reads w2_suh), Down and Accumulate on the restored w2: a forward
 that read any w2 byte before its wait would read the poison."""
 
@@ -19,7 +19,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from test_cpu_expert_engines_exl3 import CAP, CORES, HIDDEN, INTER, _kernel, _on_threads, _random_slabs  # noqa: E402
 
-DELAY_S = 0.05
+# Past any case's PrepareGateUp and GateUp, which take up to ~25 ms of it on a loaded host (4 workers, 9 routes), so
+# every forward reaches its wait before the gate opens.
+DELAY_S = 0.2
 SECOND = ("w2_trellis", "w2_suh", "w2_svh")
 
 # (rows' slots, rows' weights, the slots whose w2 is still landing): one token on one expert; four verify tokens
@@ -72,7 +74,7 @@ def test_a_staged_forward_matches_the_one_stage_forward_bit_for_bit(monkeypatch,
         (s1, w1, _, one), (s2, w2, info, two), (s3, w3, _, again) = results
         assert (s1, w1, s2, w2, s3, w3) == (0, "", 0, "", 0, "")
         assert torch.isfinite(one).all() and torch.equal(one, again)
-        assert info["calls"] == 1 and info["waited_ns"] >= DELAY_S * 1e9 / 2, info
+        assert info["calls"] == 1 and info["waited_ns"] >= DELAY_S * 1e9 / 4, info
         assert torch.equal(two.view(torch.int32), one.view(torch.int32))
         for (name, slot), copy in saved.items():
             assert torch.equal(slabs[name][slot].view(torch.uint8), copy.view(torch.uint8))
