@@ -1,7 +1,9 @@
 // DriveLoad: the RAM tier's per-drive in-flight accounting, shared by every reader of the tier (design
 // docs/superpowers/specs/2026-10-09-dsv41-drive-aware-reads-design.md, section 2). With
 // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC a reader also decides with it: each sub-read picks its root by the roots' reads and
-// bytes in flight (ReaderCore::choose_root, change (3)), and the load counts those redirects.
+// bytes in flight (ReaderCore::choose_root, change (3)), and the load counts those redirects. With
+// SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE a speculative read issues each piece only to a root with no demand sub-read in
+// flight (ReaderCore::gate_root, change (2)).
 //
 //   DriveSlot    one mirror root's counts, one cache line: both NUMA groups' threads write it
 //   DriveLoad    a slot per root, the redirect counts, the tier's clock origin and its clock-read count

@@ -144,15 +144,26 @@ def test_the_tier_declares_only_the_callers_mutex():
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
     lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and no compare-exchange: the one
     the tier relies on is the lease channel's cas_gate, its open of the copy wait's gate (host/lease_channel.h,
-    LEASE_PROTOCOL.md "The lease channel")."""
+    LEASE_PROTOCOL.md "The lease channel").
+
+    The RAM prefetch (ram_prefetch.h) adds two, off the request path's own state: the pool's per-group mutex
+    (SpecPool::mutex, taken as pool_->mutex(g)) over its entries' transitions, and SpecGroup::turn, the shared
+    reader's turn between a demand read and a speculative one, which an idle-drive group
+    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
-    assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex"}
+    assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex", "turn"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
     assert "std::mutex mutex;" in _struct(code, "TraceState"), "the trace guard left TraceState"
+    assert "std::mutex turn;" in _struct(code, "SpecGroup"), "the shared reader's turn left SpecGroup"
     locked = set(re.findall(r"(?:lock_guard|unique_lock|scoped_lock)<[^>]*>\s*\w+\(([^)]*)\)", code))
-    assert locked == {"caller_mutex_", "trace_.mutex", "faults_.fault_mutex"}, locked
+    # The regex stops at the first ")": the pool's mutex reads as "pool_->mutex(g".
+    assert locked == {
+        "caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "pool_->mutex(g", "spec.turn, std::defer_lock"
+    }, locked
     assert "std::mutex mutex_" not in code and "guard(mutex_)" not in code and "self->mutex_" not in code
-    for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_", "atomic_flag", "test_and_set",
+    # pthread_ names and pins threads (pthread_setname_np, pthread_setaffinity_np); none of its locks may appear.
+    for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_mutex", "pthread_rwlock", "pthread_spin",
+                  "pthread_cond", "atomic_flag", "test_and_set",
                   ".exchange(", "futex", ".wait(", "notify_one", "notify_all", "condition_variable"):
         assert other not in code, other
     assert "compare_exchange" not in code
