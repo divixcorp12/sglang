@@ -8040,6 +8040,65 @@ Rerun the pair from the worktree at `a1f9bd023c`, with nothing else on the GPU.
   - It names any other holder before waiting.
 - Tests: `test/registered/unit/scripts/test_run_locks.py`, with a mutant that ignores the ancestor hold (red).
 
+### 33.19 Drive weights by speed lose; layer 0's experts from the draft tokens arrive too late (2026-10-10)
+
+**Mirror weights `16:10:16` (A/B `ab-weights-retry-20261010-024044`, worktree at `69e1f7744d`, split cut on in both).**
+The arm `dspark-both-weights-misscut` sets `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=16:10:16` (root order nvme0:nvme4:nvme2), so
+the SPCC (nvme4) reads 10/42 of each row instead of 1/3. The reference arm is `dspark-both-misscut`.
+
+| Session | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Median |
+|---|---|---|---|---|---|---|---|---|---|
+| misscut (equal split), ms/token | 112.7 | 61.2 | 60.0 | 119.7 | 70.7 | 81.2 | 64.9 | 120.9 | 76.0 |
+| weights `16:10:16`, ms/token | 110.6 | 63.2 | 54.3 | 125.5 | 72.0 | 84.8 | 70.9 | 115.2 | 78.4 |
+
+- Paired median: weights **2.6% slower**, slower in 5 of 8 sessions. Not adopted.
+- Why: under this load the SPCC is not much slower. Drive load over each server's lifetime (`exl3 RAM miss drive load`):
+
+  | | nvme0 | nvme4 (SPCC) | nvme2 |
+  |---|---|---|---|
+  | equal split: busy s per GB read | 0.307 | 0.323 | 0.313 |
+  | weights: GB read | 342 | 214 | 341 |
+  | weights: busy s | 102.7 | 69.2 | 104.1 |
+  | weights: busy s per GB read | 0.300 | 0.324 | 0.305 |
+
+  By busy time the SPCC costs only ~5-7% more per byte, not the ~35% that the single-drive streaming rates (2.19 vs
+  3.35 GB/s) suggest. `16:10:16` overcorrects: nvme4 is idle about a third more, and the two Samsungs, which now carry
+  ~40% more each, pace every row. A matched weighting would be about `16:15:16`, worth at most ~2-3%, near the
+  resolution of these A/Bs; not pursued.
+- The first attempt (`ab-weights-20261010-015453`) aborted in the weights arm's warm-up round 3:
+  `FATAL exl3 RAM miss: a copy wait held the decode stream for 2.0 s; group 1: its CPU job 7360 is not done`.
+  The retry passed the same point cleanly. This is the only such abort under `ram-prefetch/`. Cause unknown; if it
+  recurs (with or without weights), reproduce it offline with a CPU-experts miss over a weighted split.
+
+**Layer 0's experts predicted from the draft tokens (offline; branch `codex/dsv41-layer0-draft-predict` at
+`54144b065a`, script `analysis/dsv41-drive/dspark/layer0_draft_predict.py`, outputs
+`ram-prefetch/layer0-draft-20261010-020205/`).** Layer 0 has the most forced misses (6.6 per forward, §33.16) and the
+in-forward lookahead cannot reach it. The draft tokens are known before the verify, so the question was how well they
+predict layer 0's routed experts. Scored on `cut-timeline-20261009-221958/cut` (the only capture with true NVMe
+labels; 126 labelled verifies, 6.38 layer-0 NVMe rows per verify).
+
+| Predictor | NVMe-row recall, top-6 / top-12 per token |
+|---|---|
+| previous verify's layer-0 experts | 0.000 |
+| layer 0's gate on the normed token embedding | 0.35 (top-6) |
+| per-token lookup table, shrunk toward the embedding gate (best) | 0.567 / 0.709 |
+
+- Recall on all routed experts 0.62 / 0.75; held-out prompts 0.665 / 0.79.
+- Top-6: 3.62 useful and ~7.1 wasted reads per verify. Only candidates with confidence >= 0.8: 1.63 useful, 0.20 wasted.
+- The embedding gate is weak because layer 0's real MoE input is far from the normed embedding (median cosine 0.47).
+- **The lead is the limit.** From the end of the draft's CPU stage to layer 0's demand: p50 1.97 ms (p10 1.35, p90 2.59),
+  under one 2.2-2.4 ms row read. Only position 0's token (the last accepted one) is known ~63 ms ahead, and it routes
+  18% of layer 0's NVMe rows.
+- Value (estimate, from §33.16's per-read costs, not a replay or A/B): ~1-2 ms per forward, ~0.3-0.55 ms/token; even a
+  perfect predictor is capped near 1 ms/token by the lead. **Not built.**
+- Caveats: token ids are not logged and were recovered as the nearest normed embedding to layer 0's input (98.3% match
+  on plain decode; rejected drafts have no ground truth); unrouted experts' tiers come from a recency model (0.71
+  balanced accuracy); one capture of 8 convfinqa sessions; read queueing and evictions not simulated.
+- Found on the way: `verify_split.py` refuses this capture. Its single-offset join reaches 0.689 because the job trace
+  drops incomplete forwards; the layer-0 script joins forwards by their misses instead. `verify_split.py` is unfixed.
+- What would make it worth revisiting: a longer lead. Measure the ~60 ms between one verify's last layer and the next
+  verify's layer 0 (drive idle time there; whether the draft tokens could be published earlier).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
