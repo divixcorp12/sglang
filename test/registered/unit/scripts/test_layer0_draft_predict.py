@@ -60,7 +60,7 @@ def test_the_table_shrinks_an_unseen_token_to_its_prior_and_a_frequent_one_to_it
     prior = np.full((2, 5), 0.2, np.float32)
     s = table.scores(np.array([7, 9]), prior, beta=1.0)
     assert s[0, 0] > 0.98 and s[0, 1] > 0.98 and s[0, 4] < 0.01
-    assert np.allclose(s[1], 0.2)
+    assert np.allclose(s[1], 0.4)  # k * prior: two routings of a 0.2 share each
     assert table.seen(np.array([7, 8, 9])).tolist() == [100, 1, 0]
 
 
