@@ -123,9 +123,22 @@ def test_with_no_span_weights_the_two_span_cut_is_the_first_two_stage_cut(tmp_pa
 
 
 @pytest.mark.parametrize("name", sorted(THREE_ROOT))
-def test_span_weights_equal_to_the_mirror_weights_give_the_unweighted_cut(tmp_path, name):
+def test_span_weights_equal_to_the_mirror_weights_cut_as_the_unweighted_cut_to_a_page(tmp_path, name):
+    """The mirror's extents are its weights rounded to pages, so weights equal to the mirror's give the same shares
+    to within a page or two per root and span (not the same bytes: the golden above pins unset weights)."""
     weights = THREE_ROOT[name]
-    assert _two_span_digest(tmp_path, weights, span_weights=(weights, weights)) == TWO_SPAN_GOLDEN[name]
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
+    layers, experts = s.tables.extents.shape[:2]
+    for row in range(layers):
+        for expert in range(experts):
+            plain = piece_geometry(s.tables, row, expert, two_span=True)[0]
+            weighted = piece_geometry(s.tables, row, expert, two_span=True, span_weights=(weights, weights))[0]
+            for span in (0, 1):
+                for part in range(len(weights)):
+                    share = lambda subs: sum(  # noqa: E731
+                        sub["length"] for sub in subs if sub["k"] == span and sub["part"] == part
+                    )
+                    assert abs(share(plain) - share(weighted)) <= 2 * PAGE, (row, expert, span, part)
 
 
 # ---- The two-span cut ----
