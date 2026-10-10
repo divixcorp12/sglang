@@ -8099,6 +8099,68 @@ labels; 126 labelled verifies, 6.38 layer-0 NVMe rows per verify).
 - What would make it worth revisiting: a longer lead. Measure the ~60 ms between one verify's last layer and the next
   verify's layer 0 (drive idle time there; whether the draft tokens could be published earlier).
 
+### 33.20 The CPU expert kernel is core-bound; reading w13 first does not pay as built (2026-10-10)
+
+**Profile of the CPU expert forward (CPU only, no server; bench `exl3_cpu_optimized` at `289d28fa01`, artifacts
+`divix01:/data/models/slang/nvfp4-work/cpu-profile/`).** 10 workers on cores 6-15 (production's group 0 placement),
+the real 8-layer fixture, GCC 15 `-Ofast -march=native`, `bw` ISA. "Cold" rotates 8 layers (106 MB, 4.3x L3), so
+weights come from DRAM like a miss; "warm" keeps one 13.3 MB expert in L3.
+
+| Case | µs per lane (p50) | GB/s | IPC | Phases (µs): PrepGU / GateUp / Middle / Down / Acc | Down share |
+|---|---|---|---|---|---|
+| cold, 1 token | 414 | 32 | 1.71 | 2.3 / 251 / 3.1 / 135 / 0.2 | 0.35 |
+| warm, 1 token | 367 | 36 | 1.88 | 2.2 / 248 / 2.8 / 122 / 0.2 | 0.33 |
+| cold, 2 tokens on one expert | 570 | 23 | - | 3.9 / 377 / 5.2 / 186 / 0.4 | 0.33 |
+| cold, 6 tokens on one expert | 1607 | 8.3 | 2.00 | 11 / 1040 / 8.8 / 517 / 2.6 | 0.33 |
+
+- **Core-bound, not memory-bound.** Warm is only 11% faster than cold; 0.8% of cycles stall on an L3 miss; DRAM runs
+  at ~32 GB/s (~25% of the node's peak). Execution port 0 is ~85-90% busy during work (p5 ~70%): on Skylake-SP every
+  zmm integer multiply and shift issues on p0 only.
+- 80% of samples are in `traversal_kblock`: ~45% trellis decode (shifts, `vpmullw`/`vpmulhuw`), ~37% integer dot
+  products (`vpmaddwd`, `vpmaddubsw`), ~12% register moves and spills to the stack. Barriers and imbalance are ~5%.
+- Time per phase follows the bytes it decodes: Down (w2, 1/3 of the row) is 1/3 of the forward.
+- **SMT siblings (20 workers on 10 cores): 0% for 1-token lanes, +1% (worse) for 3 experts, -14% for an expert shared
+  by 6 tokens.** Port-0 saturation leaves no room on the single-token path. Not A/B'd.
+- **Chunk width.** Production runs `SGLANG_EXL3_CPU_MAX_M` unset (MAX_M 4, so 2 tokens per chunk), so an expert shared
+  by m tokens decodes its weights ceil(m/2) times. `-DEXL3_MAX_M=8`: 4 tokens 1056 -> 797 µs (-25%), 6 tokens -10%,
+  1-2 tokens unchanged. Not A/B'd; it is the cheapest available server experiment if lanes are multi-token.
+- A 2 ms idle before a forward adds ~50-60 µs, warm or cold (not DRAM; untested guess: AVX-512 frequency ramp or cache
+  loss).
+- The server logs 0.65-0.74 ms per lane against the bench's 0.41. Inferred, not measured: DSpark verify gives ~2 tokens
+  per lane on average, and 2 tokens cost 0.57 ms.
+- Caveats: `perf_event_paranoid=2`, so counters are user-mode only; port shares include ~5% barrier spin; the SMT probe
+  is the bench's team, 2 rounds.
+
+**Two-stage CPU misses (branch `codex/dsv41-cpu-two-stage` at `f1f002202e`, flag `SGLANG_DSV41_CPU_TWO_STAGE`, default
+off).** The profile says GateUp is ~2/3 of the forward. The row image is `w13_*` then `w2_*`, so a CPU-miss row is read
+as two spans: the w13 prefix split over the three drives first, then the w2 suffix. The CPU job starts once w13 has
+landed; worker 0 waits for a per-job gate that the tier opens when the rows are whole, before Middle (Middle reads
+`w2_suh`). GPU miss rows, speculative reads and prefill keep today's cut. Output is bit-identical to the one-stage
+forward (72/72 slab forwards on bw, avx2 and scalar; the real-kernel staged test with w2 poisoned until 50 ms).
+Estimate before the A/B: ~0.25-0.4 ms off each layer with a CPU miss, ~5% per token.
+
+A/B `ab-twostage-20261010-110433`, reference `dspark-both-misscut`, both at `f1f002202e`:
+
+| Session | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Median |
+|---|---|---|---|---|---|---|---|---|---|
+| misscut, ms/token | 117.3 | 60.4 | 53.1 | 119.3 | 69.7 | 84.9 | 69.5 | 93.6 | 77.3 |
+| two-stage, ms/token | 107.8 | 64.8 | 56.4 | 129.9 | 68.6 | 83.7 | 68.5 | 108.8 | 76.2 |
+
+- Paired median: two-stage **2.4% slower**; faster in 4 sessions, slower in 4, per-session -8% to +16%. No gain;
+  inside this A/B's noise. No abort in either arm.
+- The mechanism ran: 22.0 K of the CPU jobs were staged (group 0 8,662, group 1 13,313). 7.1 K of them (32%) finished
+  gate/up before w2 had landed and waited, 0.58 ms on average, 4.1 s in all; the other 68% found w2 already whole.
+- **The SPCC slowed.** Drive busy over the server's life: nvme0 99.5 -> 100.5 s, nvme4 105.1 -> 116.0 s, nvme2
+  101.8 -> 102.6 s, for the same bytes. Two spans give each drive two smaller reads per row in place of one; the SPCC
+  pays ~10% more per byte for that and the Samsungs do not. The SPCC already finishes each row last, so this lands on
+  every miss.
+- **The waits hold the team.** A staged job waiting for w2 keeps all 10 workers spinning, so DSpark draft work queues
+  behind it. The CPU `forward_ns` sum rose 96.6 -> 109.8 s, mostly those waits.
+- Confound: accept length 3.75 (misscut) vs 3.62 (two-stage), worth ~3.5% per token, about the whole gap. The CPU
+  output is bit-identical, so the difference is timing (reverify), not numerics; one run cannot separate it.
+- Next (2026-10-10): keep one read per drive per row. Give the w2 suffix to the two Samsungs only and the SPCC only w13,
+  then rerun; the check is nvme4's busy time back at ~105 s. Releasing the team during the wait is a second step.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
