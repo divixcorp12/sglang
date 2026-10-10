@@ -2036,6 +2036,12 @@ class Envs:
     # sweep. A candidate whose margin is under its target row's floor is not read and does not count toward the layer's
     # budget; a row the file omits keeps every candidate. Unset: no floors.
     SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS = EnvStr(None)
+    # Speculative reads only to an idle drive (design 2026-10-09-dsv41-drive-aware-reads, change (2)): each NUMA group
+    # reads its pool rows through a reader of its own, one piece at a time, from a mirror root no demand read is on,
+    # instead of taking turns with the demand reads on the group's reader. A forced miss waiting on a row lifts that.
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
+    # How long such a read waits for an idle drive before it is abandoned (its pool entry stays empty).
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

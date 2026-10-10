@@ -41,6 +41,9 @@ struct PoolEntry {
   std::atomic<uint32_t> word{kPoolEmpty};
   std::atomic<uint32_t> for_seq{0};  // the source record whose scoring issued the read
   std::atomic<uint64_t> landed{0};   // landing order: with no empty entry, the oldest landed one is reclaimed
+  // Set by a forced miss that waits on this entry's read (RamTier::take_pooled_locked); an idle-drive read
+  // (IdleRoots) then reads the rest of its row as a demand would. Cleared when the entry is claimed.
+  std::atomic<uint32_t> boost{0};
   uint64_t freed_at = 0;             // swapped: the map chain whose delta evicts the victim; under the group's mutex
 };
 
@@ -134,6 +137,10 @@ struct RamPrefetchConfig {
   // GPU scorer only: per target row, the least margin a candidate needs to be read; a candidate under it neither reads
   // nor counts toward per_layer. Empty: no floors.
   std::vector<float> min_margin;
+  // SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE: > 0 gives each group a speculative reader of its own whose reads go only to
+  // a drive no demand reads (IdleRoots), abandoned after waiting this long for one; 0 shares the group's demand reader,
+  // taking turns with the demand reads.
+  int64_t idle_deadline_ns = 0;
 };
 
 // The GPU scorer's wait for a record's candidate slot: spin, then sleep in steps (the speculative thread may share its

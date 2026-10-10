@@ -1335,6 +1335,10 @@ class Exl3RamMissService:
         hidden = cpu_experts.services[0].hidden
         cores = [list(plan.spec) for plan in numa.plans]
         floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
+        idle = dict(
+            idle_drive=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get(),
+            idle_deadline_s=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() / 1e6,
+        )
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
             candidates = new_candidate_page(pin=pin)
@@ -1350,6 +1354,7 @@ class Exl3RamMissService:
                 top_k_only=top_k_only,
                 candidates=candidates,
                 min_margin=min_margin,
+                **idle,
             )
             targets, result = picked.targets, GpuScorer(picked, candidates, per_token, top_k_only)
         else:
@@ -1365,11 +1370,12 @@ class Exl3RamMissService:
                 per_layer=per_layer,
                 cores=cores,
                 top_k_only=top_k_only,
+                **idle,
             )
             targets, result = tables.targets, None
         logger.info(
             "exl3 RAM miss prefetch: %d of %d rows target the next layer, %s scorer, %d per token, %d per layer%s, "
-            "cores %s",
+            "cores %s, %s",
             int((targets[:, 0] >= 0).sum()),
             len(layer_ids),
             scorer.upper(),
@@ -1377,6 +1383,11 @@ class Exl3RamMissService:
             per_layer,
             (", predicted top-k only" if top_k_only else "") + (f", margin floors {floors}" if floors else ""),
             [plan.spec for plan in numa.plans],
+            (
+                f"idle-drive reads (own reader per group, deadline {idle['idle_deadline_s'] * 1e3:g} ms)"
+                if idle["idle_drive"]
+                else "shared reader (turns with demand)"
+            ),
         )
         return result
 

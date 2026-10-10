@@ -741,7 +741,8 @@ struct HostExports {
   // `candidates` uint8 [SpecCandidates::kCandPageBytes], pinned memory the caller keeps alive, `gates` and `bias`
   // [0, 0], `hidden` unused. `cores` int64 [groups, width]: each group's speculative thread's cores, -1 padding (none:
   // the caller's affinity). Cores 64-71 are refused. `min_margin` float32 [rows] (GPU scorer only), per target row the
-  // least margin a candidate needs, or [0]: no floors.
+  // least margin a candidate needs, or [0]: no floors. `idle_deadline_ns` > 0: idle-drive speculative reads
+  // (RamPrefetchConfig::idle_deadline_ns), 0: the shared reader.
   static void enable_ram_prefetch(
       int64_t handle,
       TensorView targets,
@@ -754,7 +755,8 @@ struct HostExports {
       int64_t per_layer,
       int64_t top_k_only,
       TensorView candidates,
-      TensorView min_margin) {
+      TensorView min_margin,
+      int64_t idle_deadline_ns) {
     using namespace host;
     using Cand = expert_stream::wire::SpecCandidates;
     auto cpu = SymbolicDevice{};
@@ -806,6 +808,7 @@ struct HostExports {
     config.candidates = gpu ? static_cast<const uint8_t*>(candidates.data_ptr()) : nullptr;
     const auto* floors = static_cast<const float*>(min_margin.data_ptr());
     config.min_margin.assign(floors, floors + min_margin.size(0));
+    config.idle_deadline_ns = idle_deadline_ns;
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int g = 0; g < Wire::kNodes; ++g) {
       std::vector<int> own;

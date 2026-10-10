@@ -88,11 +88,14 @@ class DriveLoad {
     if (bytes > 0) slots_[root].done[kind].fetch_add(bytes, std::memory_order_relaxed);
   }
 
-  // Root `root`'s sub-reads in flight, demand and speculative, and its bytes in flight (relaxed: another reader may
-  // change them as they are read; a stale value costs one choice, not correctness).
+  // Root `root`'s sub-reads in flight, demand and speculative, its demand sub-reads alone, and its bytes in flight
+  // (relaxed: another reader may change them as they are read; a stale value costs one choice, not correctness).
   int64_t reads_in_flight(int root) const {
     const int64_t reads = slots_[root].reads.load(std::memory_order_relaxed);
     return demand_of(reads) + spec_of(reads);
+  }
+  int64_t demand_reads(int root) const {
+    return demand_of(slots_[root].reads.load(std::memory_order_relaxed));
   }
   int64_t bytes_in_flight(int root) const {
     const DriveSlot& s = slots_[root];

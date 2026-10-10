@@ -366,9 +366,17 @@ def _check_ram_prefetch() -> None:
             ram_prefetch.read_margin_floors(floors)
         except (OSError, ValueError) as error:
             raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS: {error}") from error
+    deadline = envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get()
+    if not 1 <= deadline <= ram_prefetch.MAX_IDLE_DEADLINE_US:
+        raise ValueError(
+            f"SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US must be in [1, {ram_prefetch.MAX_IDLE_DEADLINE_US}], "
+            f"got {deadline}"
+        )
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
         if scorer == "gpu":
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")
+        if envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get():
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_DSV41_RAM_PREFETCH=1")
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.

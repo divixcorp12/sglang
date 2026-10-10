@@ -1102,6 +1102,7 @@ class RamTier {
       throw std::runtime_error(prefix + "it needs at least one gate");
     if (static_cast<int>(config.cores.size()) != groups())
       throw std::runtime_error(prefix + "one core list per NUMA group");
+    if (config.idle_deadline_ns < 0) throw std::runtime_error(prefix + "the idle-drive deadline is negative");
     for (int g = 0; g < groups(); ++g)
       if (dist_.group(g).cpu == nullptr)
         throw std::runtime_error(
@@ -1123,6 +1124,20 @@ class RamTier {
       group->packed.reserve(1);
       group->cores = config.cores[g];
       group->row_seq = std::make_unique<std::atomic<uint32_t>[]>(static_cast<size_t>(layers_));
+      if (config.idle_deadline_ns > 0) {
+        // Its own ring over the same tables, counting into the tier's drive load. RowReader reads O_DIRECT only, as
+        // the group's reader does.
+        const Group& demand = dist_.group(g);
+        auto reader = std::make_unique<Source>(Tables(demand.reader.tables()), true);
+        reader->set_piece_stream(true);
+        reader->set_mirror_map();
+        reader->set_drive_load(&drive_load_);
+        reader->set_read_kind(kSpecRead);
+        reader->set_sq_thread_cpu(demand.sq_thread_cpu);
+        if (!reader->open())
+          throw std::runtime_error(prefix + "group " + std::to_string(g) + "'s speculative reader did not open");
+        group->spec_reader = std::move(reader);
+      }
       spec->groups.push_back(std::move(group));
     }
     spec->config = std::move(config);
@@ -1335,8 +1350,9 @@ class RamTier {
     return true;
   }
 
-  // Test only (InstrBuild; ProdBuild throws): each speculative read sleeps `delay_ns` first, holding the reader's turn,
-  // and with `fail` is reported failed without reading.
+  // Test only (InstrBuild; ProdBuild throws): each speculative read sleeps `delay_ns`, and with `fail` is reported
+  // failed without reading. On the shared reader it sleeps first, holding the reader's turn; on an idle-drive reader it
+  // sleeps once its first piece is in flight (counted in the drive load), so the read holds that drive meanwhile.
   void inject_spec(int64_t delay_ns, bool fail) {
     if constexpr (!Build::kFaults) {
       (void)delay_ns, (void)fail;
@@ -1344,6 +1360,19 @@ class RamTier {
     } else {
       faults_.spec_delay_ns.store(delay_ns);
       faults_.spec_fail.store(fail);
+    }
+  }
+
+  // Test only (InstrBuild; ProdBuild throws): adds reads[q] demand sub-reads to root q's drive load (negative takes
+  // them back), as another reader's demand in flight that an idle-drive read must avoid. kMaxDrives words.
+  void inject_demand_load(const int64_t* reads) {
+    if constexpr (!Build::kFaults) {
+      (void)reads;
+      test_only("inject_demand_load");
+    } else {
+      int64_t now = 0;
+      for (int q = 0; q < kMaxDrives; ++q)
+        if (reads[q] != 0) drive_load_.change(q, kDemandRead, static_cast<int>(reads[q]), 0, now);
     }
   }
 
@@ -1458,14 +1487,18 @@ class RamTier {
   }
 
  private:
-  // One group's speculative state (enable_ram_prefetch): its job ring from the group's service thread, the turn on the
-  // group's reader, its busy episode for the watchdog and its own counter block (one writer each).
+  // One group's speculative state (enable_ram_prefetch): its job ring from the group's service thread, its reader (the
+  // turn on the group's, or its own), its busy episode for the watchdog and its own counter block (one writer each).
   struct SpecGroup {
     explicit SpecGroup(const std::string& name) : trace(name) {}
     SpscRing<SpecJob, 64> ring;  // arbitrary: one job per CPU record, the thread drains it every ~layer
     Doorbell bell;
-    std::mutex turn;  // the group's reader: one demand read (read_rows) or one speculative read at a time
+    // The shared reader only: one demand read (read_rows) or one speculative read at a time on the group's reader.
+    std::mutex turn;
     std::atomic<int> demand_waiting{0};  // demand reads blocked on `turn`, which spec_read lets go first
+    // SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE: the group's speculative reader, its own ring (null: the group's reader,
+    // under `turn`). The speculative thread's alone, and the owner's while it is quiesced.
+    std::unique_ptr<Source> spec_reader;
     std::promise<int> pinned;  // start_spec: 0 pinned, else the errno; a member, so it outlives the set_value
     std::atomic<uint64_t> busy{0};
     uint64_t episodes = 0;
@@ -1582,9 +1615,10 @@ class RamTier {
     }
   }
 
-  // Service thread, before a read: installs the fault inject_fault() left, on the group's reader only this thread
-  // drives. The first group to read takes it. Returns true when it installed one. ProdBuild: nothing.
-  bool apply_pending_fault(Group& group) {
+  // Before a read: installs the fault inject_fault() left on `reader`, which only the calling thread drives (a group's
+  // service or fill on its reader, a speculative thread on the reader it reads through). The first read takes it.
+  // Returns true when it installed one. ProdBuild: nothing.
+  bool apply_pending_fault(Source& reader) {
     if constexpr (Build::kFaults) {
       if (!faults_.fault_pending.load(std::memory_order_acquire)) return false;
       ReadFault fault;
@@ -1594,9 +1628,10 @@ class RamTier {
         fault = faults_.pending_fault;
         faults_.fault_pending.store(false, std::memory_order_relaxed);
       }
-      group.reader.set_fault(fault);
+      reader.set_fault(fault);
       return true;
     }
+    (void)reader;
     return false;
   }
 
@@ -1698,7 +1733,7 @@ class RamTier {
     // and holds its busy episode.
     Group& group = dist_.group(0);
     begin_busy(group);
-    apply_pending_fault(group);                   // test only: inject_fault() acts on a fill's read as on a demand's
+    apply_pending_fault(group.reader);            // test only: inject_fault() acts on a fill's read as on a demand's
     std::vector<uint8_t>& packed = fill_packed_;  // reserved to the widest row at construction: no allocation here
     size_t landed = 0;
     auto advance = [&] {
@@ -2153,6 +2188,7 @@ class RamTier {
       // service's busy episode times the wait. The caller holds the row's tier state meanwhile, for at most that one
       // row read.
       count<kSpecPromoted>(group);
+      entry.boost.store(1, std::memory_order_release);  // an idle-drive read drops its gate for this row
       while (entry.word.load(std::memory_order_acquire) == pool_word(kPoolReading, expert))
         _mm_pause();
     }
@@ -2375,16 +2411,22 @@ class RamTier {
     }
   }
 
-  // Reads `expert`'s row of `target` into a pool entry of group g under the group's reader turn, so a demand read
-  // waits for at most this one row. Dropped when stale, or when the expert was mapped or pooled meanwhile.
+  // Reads `expert`'s row of `target` into a pool entry of group g. On the shared reader it reads under the group's
+  // reader turn, so a demand read waits for at most this one row; on an idle-drive reader (spec_reader) it takes no
+  // turn and reads only from drives no demand reads (IdleRoots). Dropped when stale, or when the expert was mapped or
+  // pooled meanwhile.
   void spec_read(int g, int64_t source, int64_t target, uint32_t source_seq, int32_t expert,
                  [[maybe_unused]] uint64_t pick = 0) {
     SpecGroup& spec = *spec_->groups[g];
-    // A demand blocked on the turn goes first: the unlocking thread would otherwise retake it before the woken demand.
-    // Unbounded, but by the one demand read the flag stands for, which the watchdog times.
-    while (spec.demand_waiting.load(std::memory_order_seq_cst) != 0)
-      _mm_pause();
-    std::lock_guard<std::mutex> turn(spec.turn);
+    const bool idle = spec.spec_reader != nullptr;
+    std::unique_lock<std::mutex> turn(spec.turn, std::defer_lock);
+    if (!idle) {
+      // A demand blocked on the turn goes first: the unlocking thread would otherwise retake it before the woken
+      // demand. Unbounded, but by the one demand read the flag stands for, which the watchdog times.
+      while (spec.demand_waiting.load(std::memory_order_seq_cst) != 0)
+        _mm_pause();
+      turn.lock();
+    }
     if (spec_stale(spec, source, target, source_seq) ||
         __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
         pool_->find(target, g, expert) >= 0) {
@@ -2401,6 +2443,7 @@ class RamTier {
       }
       PoolEntry& entry = pool_->entry(target, g, i);
       entry.for_seq.store(source_seq, std::memory_order_relaxed);
+      entry.boost.store(0, std::memory_order_relaxed);  // published by the release below
       entry.word.store(pool_word(kPoolReading, expert), std::memory_order_release);
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);  // pairs with note_serving's
@@ -2420,25 +2463,90 @@ class RamTier {
     }
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;
+    SpecPieces hooks{this, g, source, target, source_seq, 0};
     if constexpr (Build::kFaults) {
-      const bool installed = apply_pending_fault(dist_.group(g));  // reaches the reader under the turn, as for a demand
-      if (const int64_t ns = faults_.spec_delay_ns.load()) fault_delay(ns);
+      Source& reader = pool_reader(g);
+      const bool installed = apply_pending_fault(reader);  // reaches the reader this read uses, as for a demand
+      if (const int64_t ns = faults_.spec_delay_ns.load()) {
+        if (idle)
+          hooks.delay_ns = ns;
+        else
+          fault_delay(ns);
+      }
       fail = faults_.spec_fail.load();
       // The failed read replaces the one that would have met the fault: spend it, not leave it for the next demand.
-      if (fail && installed) dist_.group(g).reader.set_fault(ReadFault{});
+      if (fail && installed) reader.set_fault(ReadFault{});
     }
     int result = 0;
-    if (fail)
+    IdleRoots roots;
+    if (fail) {
       pool_->entry(target, g, i).word.store(kPoolEmpty, std::memory_order_release);
-    else
+    } else if (idle) {
+      roots.boost = &pool_->entry(target, g, i).boost;
+      roots.deadline_ns = spec_->config.idle_deadline_ns;
+      roots.give_up = &SpecPieces::give_up;
+      roots.on_piece = &SpecPieces::on_piece;
+      roots.context = &hooks;
+      result = land_pool_row(g, target, i, expert, &spec.packed, roots);
+      spec_count<kSpecDeferred>(spec, roots.deferrals);
+      spec_count<kSpecMovedRoot>(spec, roots.moves);
+      if (roots.boosted) spec_count<kSpecBoosted>(spec);
+    } else {
       result = land_pool_row(g, target, i, expert, &spec.packed);
+    }
     spec.busy.store(0, std::memory_order_release);
     if (result == 1) {
       spec_count<kSpecLanded>(spec);
       if constexpr (Build::kMetrics) spec.trace.emit("spec_land", target, 0, source_seq, g, expert, slot, source);
+    } else if (roots.abandoned) {
+      spec_count<kSpecAbandoned>(spec);
     } else {
       spec_count<kSpecFailed>(spec);
     }
+  }
+
+  // An idle-drive read's hooks (IdleRoots::give_up, on_piece), on the speculative thread.
+  struct SpecPieces {
+    RamTier* tier;
+    int g;
+    int64_t source, target;
+    uint32_t source_seq;
+    int64_t delay_ns;  // inject_spec: the first piece in flight sleeps this long (InstrBuild)
+
+    // Abandon before the next piece once the group has finished a record that made the read stale (a forced miss of
+    // that record would have boosted it, and a boosted read never asks), or the threads are held or stopped.
+    static bool give_up(void* context) {
+      const auto& self = *static_cast<const SpecPieces*>(context);
+      const SpecState& spec = *self.tier->spec_;
+      return spec.hold.load(std::memory_order_relaxed) || spec.stop.load(std::memory_order_relaxed) ||
+             self.tier->spec_settled(self.g, self.source, self.target, self.source_seq);
+    }
+    static void on_piece(void* context, int /*root*/) {
+      auto& self = *static_cast<SpecPieces*>(context);
+      if (self.delay_ns > 0) {
+        self.tier->fault_delay(self.delay_ns);
+        self.delay_ns = 0;
+      }
+    }
+  };
+
+  // True once group g has finished a record of `source` or `target` after `source_seq` (spec_stale's records): the read
+  // landed too late for it, and no forced miss of it waits on the read.
+  bool spec_settled(int g, int64_t source, int64_t target, uint32_t source_seq) const {
+    const SpecGroup& spec = *spec_->groups[g];
+    const uint32_t next = skip_zero(source_seq + 1u);
+    const uint32_t handled = dist_.group(g).handled.load(std::memory_order_acquire);
+    for (const int64_t row : {source, target}) {
+      const uint32_t last = spec.row_seq[row].load(std::memory_order_acquire);
+      if (last != 0 && reached(last, next) && reached(handled, last)) return true;
+    }
+    return false;
+  }
+
+  // The reader group g's pool rows are read through: its idle-drive reader, else the group's own.
+  Source& pool_reader(int g) {
+    if (spec_ != nullptr && spec_->groups[g]->spec_reader != nullptr) return *spec_->groups[g]->spec_reader;
+    return dist_.group(g).reader;
   }
 
   // Names group g's speculative thread and pins it to its cores; returns 0 or the errno.
@@ -2487,22 +2595,27 @@ class RamTier {
     return false;
   }
 
-  // Reads `expert`'s row of `row` into group g's pool entry i, which the caller claimed (kPoolReading), then lands the
-  // entry, or empties it when the read failed. Returns the read's result, 1 when the row landed.
-  int land_pool_row(int g, int64_t row, int i, int32_t expert, std::vector<uint8_t>* packed) {
+  // Reads `expert`'s row of `row` into group g's pool entry i, which the caller claimed (kPoolReading), through
+  // pool_reader(g) under root policy `roots`, then lands the entry, or empties it when the read failed or was
+  // abandoned. Returns the read's result, 1 when the row landed.
+  template <class Roots = TableRoots>
+  int land_pool_row(int g, int64_t row, int i, int32_t expert, std::vector<uint8_t>* packed, Roots&& roots = Roots{}) {
     PoolEntry& entry = pool_->entry(row, g, i);
     const int64_t slot = entry.slot;  // stable: only a swap changes it, and a swap takes a landed entry
     int result = 0;
-    Source& reader = dist_.group(g).reader;
-    reader.set_read_kind(kSpecRead);  // the drive load counts this read as speculative
+    Source& reader = pool_reader(g);
+    // The drive load counts this read as speculative; the group's reader goes back to demand after it (an idle-drive
+    // reader is speculative throughout).
+    const bool shared = &reader == &dist_.group(g).reader;
+    if (shared) reader.set_read_kind(kSpecRead);
     try {
       result = reader.read(
           row, std::span<const int32_t>(&expert, 1), std::span<const int64_t>(&slot, 1), 1,
-          [](size_t) { return false; }, nullptr, packed);
+          [](size_t) { return false; }, nullptr, packed, SIZE_MAX, NoProgress{}, nullptr, roots);
     } catch (const std::exception& error) {
       std::fprintf(stderr, "ERROR %spool read: %s\n", error_prefix<Layout>().c_str(), error.what());
     }
-    reader.set_read_kind(kDemandRead);
+    if (shared) reader.set_read_kind(kDemandRead);
     _mm_sfence();  // the row's bytes before the landed word
     if (result == 1) {
       entry.landed.store(pool_->next_landing(), std::memory_order_relaxed);
@@ -2682,8 +2795,9 @@ class RamTier {
       CpuMissBatch* misses,
       StageRecord* cur) {
     // The group's reader takes turns with its speculative thread: a demand waits for at most the one speculative row.
+    // An idle-drive speculative thread reads through its own reader and takes no turn.
     std::unique_lock<std::mutex> turn;
-    if (spec_ != nullptr) {
+    if (spec_ != nullptr && spec_->groups[group.index]->spec_reader == nullptr) {
       turn = std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock);
       if (!turn.owns_lock()) {
         count<kSpecDelayed>(group);
@@ -2699,7 +2813,7 @@ class RamTier {
     const bool publishing = init_piece_words_locked(group, request, lanes, plan.idx);
     bool fail_reads = false;
     if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
-      apply_pending_fault(group);
+      apply_pending_fault(group.reader);
       const int64_t delay = faults_.delay_ns.load();
       if (delay > 0 && group.demands_read >= faults_.delay_after.load()) fault_delay(delay);
       fail_reads = faults_.fail_reads.load();
@@ -2888,7 +3002,7 @@ class RamTier {
     ReadFault pending_fault{};
     std::atomic<bool> fault_pending{false};
     std::array<std::atomic<int64_t>, Wire::kNodes> group_stall_ns{};  // inject_group_stall, once per group
-    std::atomic<int64_t> spec_delay_ns{0};  // inject_spec: each speculative read sleeps first, holding the turn
+    std::atomic<int64_t> spec_delay_ns{0};  // inject_spec: each speculative read sleeps (see inject_spec)
     std::atomic<bool> spec_fail{false};
   };
   struct NoTierFaults {};

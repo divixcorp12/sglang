@@ -52,7 +52,8 @@ enum Counter : int {
   kCpuJobs,
   kCpuLanes,
   // RAM prefetch (ram_prefetch.h): speculative reads started, landed; pool rows a forced miss swapped in (promoted:
-  // still reading); candidates dropped (stale, mapped, pooled or a full ring); failed reads; demands that waited a turn.
+  // still reading); candidates dropped (stale, mapped, pooled or a full ring); failed reads; demands that waited a turn
+  // (the shared reader only).
   kSpecIssued,
   kSpecLanded,
   kSpecUsed,
@@ -61,6 +62,12 @@ enum Counter : int {
   kSpecFailed,
   kSpecDelayed,
   kSpecLate,  // GPU scorer: a record's candidate slot not ready within kCandWaitNs
+  // SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE (IdleRoots): waits for a drive no demand reads; reads abandoned (stale, past
+  // the deadline, held or stopped: not failed); reads a forced miss boosted; pieces moved off the row's earlier root.
+  kSpecDeferred,
+  kSpecAbandoned,
+  kSpecBoosted,
+  kSpecMovedRoot,
   // ... the scorer's records scored and their scoring time in ns (metrics).
   kSpecScored,
   kSpecScoreNs,
@@ -90,6 +97,10 @@ constexpr bool is_core_counter(int k) {
     case kSpecFailed:
     case kSpecDelayed:
     case kSpecLate:
+    case kSpecDeferred:
+    case kSpecAbandoned:
+    case kSpecBoosted:
+    case kSpecMovedRoot:
       return true;
     default:
       return false;

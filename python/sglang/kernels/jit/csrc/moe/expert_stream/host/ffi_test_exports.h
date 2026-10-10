@@ -7,9 +7,10 @@
 //
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
 //              publish_piece: one synchronous read through the reader, with traces and injected faults;
-//              read_rows_drive_load: two readers over one DriveLoad (fault word 20: the dynamic root choice)
+//              read_rows_drive_load: two readers over one DriveLoad (fault word 20: the dynamic root choice);
+//              read_rows_idle: one speculative read under IdleRoots
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
-//              trace_clock_reads, spec_place, spec_pump, inject_spec
+//              trace_clock_reads, spec_place, spec_pump, inject_spec, inject_demand_load
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
@@ -459,6 +460,144 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     load.snapshot(o + 4 + kDriveLoadWords, parts);
     if (o[1] == -9 && !then_ids.empty()) read_b();
     load.snapshot(o + 4 + 2 * kDriveLoadWords, parts);
+  }
+
+  // Test only, InstrBuild: one speculative read under IdleRoots (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE), recording its
+  // SQEs into `sqes` (rows of file, offset, length, bounce, as read_rows_sqes). `fault` as read_rows_faulted's (piece
+  // streaming is always on). `preload` (2 * kMaxDrives int64: demand reads, then bytes, per root) stands for other
+  // readers' demand in flight for the whole read. With `follow`, a demand read arrives on the root of the first piece
+  // once it is in flight, and stays. `boost` sets the read's boost word before it starts. `give_up_after` > 0: give_up
+  // says stop once that many pieces were issued. `out` (10 + kDriveLoadWords int64): the result (-2 when it threw),
+  // abandoned, boosted, deferrals, moves, the pieces issued, the most of the read's sub-reads in flight when one was
+  // issued, its share still counted after it returned, the SQE count, 0; then the DriveLoad snapshot after the read,
+  // with the preload and the follower taken back.
+  static void read_rows_idle(
+      TensorView extents,
+      TensorView starts,
+      TensorView file_sizes,
+      TensorView segments,
+      TensorView slabs,
+      TensorView row_bytes,
+      TensorView buffer_regions,
+      std::string paths,
+      std::string source_paths,
+      int64_t slot_bytes,
+      int64_t row_images,
+      int64_t direct,
+      int64_t row,
+      TensorView experts,
+      TensorView slots,
+      TensorView fault,
+      TensorView preload,
+      int64_t follow,
+      int64_t boost,
+      int64_t give_up_after,
+      int64_t deadline_ns,
+      TensorView sqes,
+      TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("read_rows_idle");
+    } else {
+      using namespace host;
+      check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
+      auto cpu = SymbolicDevice{};
+      verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+      verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+      verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+      verify_named(
+          "preload", TensorMatcher({2 * kMaxDrives}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), preload);
+      verify_named("sqes", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sqes);
+      verify_named("out", TensorMatcher({10 + kDriveLoadWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+      check_fault_words<Layout>(fault);
+      const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+      auto* o = static_cast<int64_t*>(out.data_ptr());
+      std::fill(o, o + 10 + kDriveLoadWords, 0);
+      DriveLoad load;
+      Source reader(
+          tables_from<Layout>(
+              extents,
+              starts,
+              file_sizes,
+              segments,
+              slabs,
+              row_bytes,
+              buffer_regions,
+              paths,
+              source_paths,
+              slot_bytes,
+              row_images),
+          direct != 0);
+      reader.set_piece_stream(true);
+      reader.set_mirror_map();
+      reader.set_drive_load(&load);
+      reader.set_read_kind(kSpecRead);
+      if (!reader.open()) return;
+      reader.set_fault(fault_from(f));
+      std::vector<typename Source::SqeRecord> log;
+      reader.set_sqe_log(&log);
+      struct Hooks {
+        Source* reader;
+        DriveLoad* load;
+        int64_t follow, give_up_after;
+        int64_t pieces = 0, widest = 0;
+        int followed = -1;  // the root the follower's demand read was added to
+      } hooks{&reader, &load, follow, give_up_after};
+      std::atomic<uint32_t> boost_word{boost != 0 ? 1u : 0u};
+      IdleRoots roots;
+      roots.boost = &boost_word;
+      roots.deadline_ns = deadline_ns;
+      roots.context = &hooks;
+      roots.give_up = [](void* context) {
+        const auto& h = *static_cast<const Hooks*>(context);
+        return h.give_up_after > 0 && h.pieces >= h.give_up_after;
+      };
+      roots.on_piece = [](void* context, int root) {
+        auto& h = *static_cast<Hooks*>(context);
+        ++h.pieces;
+        h.widest = std::max(h.widest, h.reader->drive_share_reads());
+        if (h.follow != 0 && h.followed < 0) {
+          int64_t now = 0;
+          h.load->change(root, kDemandRead, 1, 0, now);
+          h.followed = root;
+        }
+      };
+      const auto* pre = static_cast<const int64_t*>(preload.data_ptr());
+      auto add_preload = [&](int sign) {
+        int64_t now = 0;
+        for (int q = 0; q < kMaxDrives; ++q)
+          load.change(q, kDemandRead, static_cast<int>(sign * pre[q]), sign * pre[kMaxDrives + q], now);
+      };
+      add_preload(1);
+      try {
+        o[0] = reader.read(
+            row, ids_of(experts), slots_of(slots), kBounceRows, abandon_after(0), nullptr, nullptr, SIZE_MAX,
+            NoProgress{}, nullptr, roots);
+      } catch (const std::exception&) {
+        o[0] = -2;
+      }
+      add_preload(-1);
+      if (hooks.followed >= 0) {
+        int64_t now = 0;
+        load.change(hooks.followed, kDemandRead, -1, 0, now);
+      }
+      o[1] = roots.abandoned ? 1 : 0;
+      o[2] = roots.boosted ? 1 : 0;
+      o[3] = roots.deferrals;
+      o[4] = roots.moves;
+      o[5] = hooks.pieces;
+      o[6] = hooks.widest;
+      o[7] = reader.drive_share_reads();
+      o[8] = static_cast<int64_t>(log.size());
+      load.snapshot(o + 10, reader.tables().parts);
+      auto* rows = static_cast<int64_t*>(sqes.data_ptr());
+      const size_t kept = std::min<size_t>(log.size(), static_cast<size_t>(sqes.size(0)));
+      for (size_t i = 0; i < kept; ++i) {
+        rows[4 * i] = log[i].file;
+        rows[4 * i + 1] = log[i].offset;
+        rows[4 * i + 2] = log[i].length;
+        rows[4 * i + 3] = log[i].bounce;
+      }
+    }
   }
 
   // Test only: the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
@@ -1323,6 +1462,20 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (RamTier::inject_demand_load): adds `reads` (kMaxDrives int64) demand sub-reads per root to the tier's
+  // drive load; negative takes them back. InstrBuild.
+  static void inject_demand_load(int64_t handle, TensorView reads) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)reads;
+      test_only("inject_demand_load");
+    } else {
+      using namespace host;
+      auto cpu = SymbolicDevice{};
+      verify_named("reads", TensorMatcher({kMaxDrives}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), reads);
+      find(handle)->inject_demand_load(static_cast<const int64_t*>(reads.data_ptr()));
+    }
+  }
+
   // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
   static void inject_fault(int64_t handle, TensorView fault) {
     if constexpr (!Build::kFaults) {
@@ -1429,6 +1582,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_drive_load, Exports::read_rows_drive_load); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_idle, Exports::read_rows_idle);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_sqes, Exports::read_rows_sqes);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_publish_piece, Exports::publish_piece);               \
@@ -1453,6 +1607,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_place, Exports::spec_place);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_pump, Exports::spec_pump);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_spec, Exports::inject_spec);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_demand_load, Exports::inject_demand_load);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_score_gate, Exports::score_gate);
