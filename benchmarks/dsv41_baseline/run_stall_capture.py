@@ -13,6 +13,7 @@ import sys
 import time
 
 import generations
+import run_locks
 
 DIAGNOSTIC_PREFIXES = (
     "SGLANG_DSV41_EXPERT_JOB_", "SGLANG_DSV41_EXPERT_TRACE_",
@@ -98,9 +99,7 @@ def main():
                 "reference": str(args.reference),
                 "start_ns": time.monotonic_ns(), "epoch_ns": time.time_ns()}
     (args.output / "capture-command.json").write_text(json.dumps(metadata, indent=2))
-    with open("/data/models/slang/nvfp4-work/rowimg-disk.lock", "w") as disk:
-        print("waiting for rowimg-disk.lock", flush=True)
-        fcntl.flock(disk, fcntl.LOCK_EX)
+    with run_locks.take("/data/models/slang/nvfp4-work/rowimg-disk.lock"):
         with open("/data/models/slang/nvfp4-work/cc-gpu.lock", "w") as gpu:
             print("waiting for cc-gpu.lock availability", flush=True)
             while True:

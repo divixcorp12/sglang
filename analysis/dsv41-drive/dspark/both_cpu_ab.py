@@ -11,7 +11,6 @@ only: run_arm.sh takes cc-gpu.lock itself, and the probe phase takes it here (lo
 """
 
 import argparse
-import fcntl
 import json
 import os
 import shlex
@@ -27,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
 import arm_env  # noqa: E402
+import run_locks  # noqa: E402
 
 PORT = 30017
 PROBE_PORT = 30018
@@ -179,8 +179,7 @@ def run_probe(arm: str, out: str) -> int:
     _, dspark = ARMS[arm]
     env = os.environ | arm_env.arm_env(_probe_overrides(arm, out)) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = arm_env.ServerArgs(port=PROBE_PORT, dspark=dspark).argv()
-    with open(arm_env.GPU_LOCK, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(out, f"{arm}.probe-server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
                                       stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
