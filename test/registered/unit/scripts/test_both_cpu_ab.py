@@ -338,6 +338,16 @@ def test_the_prefetch_miss_cut_arm_is_the_gpu_prefetch_arm_with_the_cut_on():
     assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut"] == "dspark-both"
 
 
+def test_the_weights_arm_is_the_miss_cut_arm_with_the_mirror_weighted_by_drive_speed():
+    ab = _ab()
+    a, w = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-weights-misscut"][0]
+    assert w["SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"] == "16:10:16"  # nvme0 : nvme4 (SPCC) : nvme2, by fio rate
+    assert {k: v for k, v in w.items() if k != "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"} == {
+        k: v for k, v in a.items() if k != "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"}
+    assert ab.ARMS["dspark-both-weights-misscut"][1] is True
+    assert ab.REFERENCE["dspark-both-weights-misscut"] == "dspark-both-misscut"
+
+
 def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")

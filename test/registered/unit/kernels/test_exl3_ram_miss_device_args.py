@@ -406,7 +406,7 @@ def test_a_negative_split_miss_cut_is_refused(name):
 
 
 def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
-    """exl3_ram_miss reads the two env vars where it reads SGLANG_DSV41_CPU_EXPERTS_MISSES."""
+    """exl3_ram_miss passes the two env vars, the cut zeroed without CPU experts (split_miss_cut)."""
     import sglang.srt.layers.moe.exl3_ram_miss as service
 
     tree = ast.parse(Path(service.__file__).read_text())
@@ -414,8 +414,13 @@ def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
     assert calls
     for call in calls:
         kw = {k.arg: ast.unparse(k.value) for k in call.keywords}
-        assert kw["miss_cut"] == "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get()"
-        assert kw["miss_cut_max"] == "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get()"
+        assert kw["miss_cut"] == "miss_cut"
+        assert kw["miss_cut_max"] == "miss_cut_max"
+    text = Path(service.__file__).read_text()
+    assert (
+        "miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(), "
+        "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(), cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get())"
+    ) in " ".join(text.split())
 
 
 def test_the_chain_has_no_hit_wait_and_the_post_fills_c1s_compaction():

@@ -457,9 +457,14 @@ def test_a_negative_split_miss_cut_option_is_refused(model_dir, name):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **{name: -1})
 
 
-def test_the_split_miss_cut_is_off_by_default():
-    assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get() == 0
+def test_the_split_miss_cut_is_on_by_default():
+    assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get() == 1
     assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get() == 3
+
+
+def test_the_default_split_miss_cut_does_not_refuse_a_launch_without_cpu_experts(model_dir):
+    """Only an explicitly set cut is a launch typo without CPU experts; the default applies only where there is a split."""
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
 
 
 @pytest.mark.parametrize("value", ["ce", "sm"])

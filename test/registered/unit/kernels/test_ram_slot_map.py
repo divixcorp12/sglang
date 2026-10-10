@@ -3,7 +3,7 @@
 import pytest
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
-from sglang.srt.layers.moe.ram_slot_map import LaneKind, LaneOverflow, MapReplica, type_lanes
+from sglang.srt.layers.moe.ram_slot_map import LaneKind, LaneOverflow, MapReplica, split_miss_cut, type_lanes
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -251,3 +251,8 @@ def test_a_zero_cut_is_todays_typing():
     staging = [9, 10] + [-1] * 6
     assert _type([1, 0, 2, 7], ram, staging, cpu_on=True, forced_from=2, miss_cut=0, miss_cut_max=3) == _type(
         [1, 0, 2, 7], ram, staging, cpu_on=True, forced_from=2)
+
+
+def test_the_split_miss_cut_applies_only_with_cpu_experts():
+    assert split_miss_cut(1, 3, cpu_experts=True) == (1, 3)
+    assert split_miss_cut(1, 3, cpu_experts=False) == (0, 3)
