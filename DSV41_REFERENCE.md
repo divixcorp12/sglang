@@ -8154,8 +8154,8 @@ A/B `ab-twostage-20261010-110433`, reference `dspark-both-misscut`, both at `f1f
   101.8 -> 102.6 s, for the same bytes. Two spans give each drive two smaller reads per row in place of one; the SPCC
   pays ~10% more per byte for that and the Samsungs do not. The SPCC already finishes each row last, so this lands on
   every miss.
-- **The waits hold the team.** A staged job waiting for w2 keeps all 10 workers spinning, so DSpark draft work queues
-  behind it. The CPU `forward_ns` sum rose 96.6 -> 109.8 s, mostly those waits.
+- The waits hold the team: a staged job waiting for w2 keeps all 10 workers spinning. The CPU `forward_ns` sum rose
+  96.6 -> 109.8 s, mostly those waits. (Guessed at first to delay DSpark draft jobs; refuted below.)
 - Confound: accept length 3.75 (misscut) vs 3.62 (two-stage), worth ~3.5% per token, about the whole gap. The CPU
   output is bit-identical, so the difference is timing (reverify), not numerics; one run cannot separate it.
 - Next (2026-10-10): keep one read per drive per row. Give the w2 suffix to the two Samsungs only and the SPCC only w13,
@@ -8200,8 +8200,22 @@ thirds). Other rows keep the thirds. Reference `dspark-both-misscut`.
   | spcc13, group 0 / 1 | 37,594 / 45,414 | 135,177 / 118,695 | 88.3 / 74.1 | 9,025 / 16,351 | 2,978 / 6,511 | 0.87 / 1.79 |
 
 - Lifetime: misscut 1,081 tokens (4 warm-up rounds), spcc13 1,930 tokens (11). RAM rows per token 22.6 vs 20.0.
-- The repeat was skipped by decision (2026-10-10): the next step, releasing the team during the w2 wait so draft jobs
-  can run, was built on top first; its A/B carries spcc13 as a second reference.
+- The repeat was skipped by decision (2026-10-10) to go straight to releasing the team during the w2 wait.
+
+**Releasing the team during the w2 wait: not built, nothing could use it** (investigation only, report
+`two-stage-yield-report.md`, no code change).
+- No draft job can arrive during a wait. The draft runs on the same CUDA stream as the verify and strictly before it
+  (`LEASE_PROTOCOL.md:303`; `dspark_worker_v2.py:845`, no stream switch), so no draft record is posted while a target
+  layer's copy wait holds the stream. Two DSpark job-trace captures (2026-10-07, one-stage) agree: no draft record
+  arrived sooner than 5.2 ms after a target job ended (0 of 227 within 5 µs).
+- The only jobs queued behind a waiting job are later CPU-miss jobs of the same record, and they cannot overtake it:
+  the copy thread reads one "done up to seq" word (`cpu_experts.h:467`, `copy_engine.h:597-598`), and the record's
+  first CPU-miss job overwrites the output while later ones add to it (`ram_tier.h:2659`).
+- The narrower variant that keeps the order, running only job N+1's gate/up during job N's wait, needs a split kernel
+  entry (vtable change in the EXL3 and NVFP4 libraries) and a second scratch arena (`ForwardArena::get()` is per
+  thread). Its ceiling, from the spcc13 waits: ~0.2-0.3 ms/token, under 0.5% (estimate). Not pursued.
+- Caveat: rests mainly on the same-stream ordering; the traces are short and predate two-stage. Revisit if the draft
+  moves to its own stream or overlaps the next verify.
 
 ## Sources
 
