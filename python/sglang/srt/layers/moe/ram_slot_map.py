@@ -25,6 +25,11 @@ class LaneOverflow(ValueError):
     (exl3_ram_miss_post_kernel)."""
 
 
+def split_miss_cut(cut: int, cut_max: int, *, cpu_experts: bool) -> tuple[int, int]:
+    """The split miss cut the device applies: none without CPU experts, where there is no CPU split to cut."""
+    return (cut if cpu_experts else 0), cut_max
+
+
 def type_lanes(
     experts: Sequence[int],
     ram_slot: Sequence[int],

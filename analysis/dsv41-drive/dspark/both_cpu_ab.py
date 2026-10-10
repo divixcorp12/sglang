@@ -79,6 +79,11 @@ ARMS["dspark-both-misscut"] = (
     {**ARMS["dspark-both"][0], "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"},
     True,
 )
+# The cut arm with each row's parts sized by drive speed (fio QD1: 3.35 / 2.19 / 3.38 GB/s, DSV41_REFERENCE.md 33.16).
+ARMS["dspark-both-weights-misscut"] = (
+    {**ARMS["dspark-both-misscut"][0], "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS": "16:10:16"},
+    True,
+)
 # The same, picking only among each token's predicted top_k (DSV41_REFERENCE.md 33.14's unused reads).
 ARMS["dspark-both-prefetch-topk"] = (
     {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
@@ -113,6 +118,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-topk": "dspark-both",
     "dspark-both-prefetch-gpu-floors": "dspark-both",
     "dspark-both-misscut": "dspark-both",
+    "dspark-both-weights-misscut": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "

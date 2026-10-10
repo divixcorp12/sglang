@@ -340,8 +340,9 @@ def _check_slot_map() -> None:
         value = getattr(envs, name).get()
         if value < 0:
             raise ValueError(f"{name} must be >= 0, got {value}")
-    if envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
-        # Without CPU experts there is no split to cut: a set cut is a launch typo.
+    cut = envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT
+    if cut.is_set() and cut.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        # Without CPU experts there is no split to cut: an explicitly set cut is a launch typo (the default is on).
         raise ValueError("SGLANG_DSV41_CPU_SPLIT_MISS_CUT needs SGLANG_DSV41_CPU_EXPERTS=1")
 
 

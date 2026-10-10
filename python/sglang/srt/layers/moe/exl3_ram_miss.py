@@ -56,6 +56,7 @@ from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
+from sglang.srt.layers.moe.ram_slot_map import split_miss_cut
 
 logger = logging.getLogger(__name__)
 # NVTX ranges around the eager host-use pause's stream sync and thread pause.
@@ -1450,6 +1451,9 @@ class Exl3RamMissService:
             direct = manager.gpu_residency
             streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
         if self.device_side is None:
+            miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
+                                                    envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
+                                                    cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get())
             self.device_side = ExpertStreamDevice(
                 self.page,
                 # The host allocates the lease block; the device reads the same one.
@@ -1464,8 +1468,8 @@ class Exl3RamMissService:
                 lease_pdl=self.lease_pdl,
                 hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
                 cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
-                miss_cut=envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
-                miss_cut_max=envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
+                miss_cut=miss_cut,
+                miss_cut_max=miss_cut_max,
                 lanes=self.lanes,
                 nodes=self.wire.nodes,
             )
