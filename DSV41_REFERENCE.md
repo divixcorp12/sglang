@@ -8161,6 +8161,28 @@ A/B `ab-twostage-20261010-110433`, reference `dspark-both-misscut`, both at `f1f
 - Next (2026-10-10): keep one read per drive per row. Give the w2 suffix to the two Samsungs only and the SPCC only w13,
   then rerun; the check is nvme4's busy time back at ~105 s. Releasing the team during the wait is a second step.
 
+**Two-stage with the SPCC on w13 only (A/B `ab-spcc13-20261010-124019`, branch `codex/dsv41-cpu-two-stage` at
+`e13fd80f25`).** New knobs `SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS` / `_W2_WEIGHTS` (mirror root order; unset = the cut
+above). Arm `dspark-both-misscut-twostage-spcc13`: w13 `6:10:6`, w2 `1:0:1`, so on a CPU-miss row the SPCC reads one
+contiguous ~4.0 MB piece of w13 and each Samsung ~2.4 MB of w13 then ~2.2 MB of w2 (4.6 MB, against 4.44 MB for the
+thirds). Other rows keep the thirds. Reference `dspark-both-misscut`.
+
+| Session (driver order) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Median |
+|---|---|---|---|---|---|---|---|---|---|
+| misscut, ms/token | 109.8 | 64.9 | 54.9 | 124.6 | 72.1 | 85.2 | 69.1 | 107.9 | 78.7 |
+| spcc13, ms/token | 116.7 | 63.6 | 53.0 | 112.2 | 65.3 | 81.1 | 79.3 | 99.3 | 80.2 |
+
+- Paired median (per session id, `(ref - arm) / ref`): spcc13 **4.1% faster**, faster in 6 of 8 sessions (+2.0 to
+  +10.0%), slower in 2 (-6.3%, -14.9%). The unpaired medians point the other way (78.7 vs 80.2), as they did in the
+  first two-stage A/B; the paired figure is the one the driver reports and the one used throughout §33.
+- Accept length 3.624 vs 3.625, so last run's confound is gone. Text check passed (2 flips, within tolerance).
+- Drive busy s per GB over each server's life: nvme0 0.305 -> 0.308, **nvme4 0.320 -> 0.318**, nvme2 0.310 -> 0.315.
+  The SPCC's per-byte penalty from the first two-stage cut is gone; the Samsungs pay ~1-2% more.
+- 25.4 K staged jobs; 9.5 K (37%) waited for w2, **0.28 ms on average** (0.58 ms with the thirds), 2.7 s in all.
+- Caveats: one run. The arm needed 11 warm-up rounds to pass the stability gate (the reference 4), so lifetime
+  totals are not comparable without normalising by bytes. Per-session swings of -15% to +10% are the usual spread here.
+- Next: repeat it (arm first) before acting on it; then release the team during the w2 wait so draft jobs can run.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
