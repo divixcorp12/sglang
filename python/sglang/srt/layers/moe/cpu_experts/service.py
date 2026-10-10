@@ -170,6 +170,11 @@ class CpuExpertService:
             self.layers: dict[int, object] = {}
         keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
         self.two_stage = envs.SGLANG_DSV41_CPU_TWO_STAGE.get()
+        self.span_weights = (None, None)
+        if self.two_stage:
+            from sglang.srt.layers.moe.exl3_expert_format import two_stage_span_weights
+
+            self.span_weights = two_stage_span_weights()
         host.enable_cpu_experts(
             trait.kernel_address(),
             self.split,
@@ -180,6 +185,7 @@ class CpuExpertService:
             group=self.group,
             keep_warm_us=max(keep_warm_us, 0),
             two_stage=self.two_stage,
+            two_stage_weights=self.span_weights,
         )
         self._last_stats = host.cpu_stats(self.group)
         logger.info(
@@ -196,10 +202,13 @@ class CpuExpertService:
             envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
             envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
         )
+        span = lambda w: "mirror" if w is None else ":".join(f"{v:g}" for v in w)  # noqa: E731
         logger.info(
             "CPU experts group %d two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): %s",
             self.group,
-            "on" if self.two_stage else "off",
+            f"on, w13 weights {span(self.span_weights[0])}, w2 weights {span(self.span_weights[1])}"
+            if self.two_stage
+            else "off",
         )
 
     def _capacity(self, slabs: Mapping[str, torch.Tensor]) -> int:

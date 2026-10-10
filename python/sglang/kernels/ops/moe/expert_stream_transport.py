@@ -308,6 +308,15 @@ def _table_buffer_regions(tables) -> torch.Tensor:
     ).reshape(-1, 3)
 
 
+def _span_tensor(span_weights) -> torch.Tensor:
+    """Per-span weights (w13's, w2's: one per mirror root each) as the host's float64 [2, roots]; None: [0, 0], the
+    mirror's shares in both spans."""
+    if span_weights is None:
+        return torch.zeros((0, 0), dtype=torch.float64)
+    w13, w2 = span_weights
+    return torch.tensor([list(w13), list(w2)], dtype=torch.float64)
+
+
 def _table_args(tables, direct: bool = True) -> tuple:
     """Return the table arguments shared by every C++ reader entry.
 
@@ -708,6 +717,7 @@ def read_rows_sqes(
     *,
     step: int = BOUNCE_ROWS,
     max_sqes: int = 4096,
+    span_weights=None,
     layout: str = "exl3",
     variant: Optional[str] = None,
     **faults,
@@ -720,7 +730,8 @@ def read_rows_sqes(
     out to more than one leg), ``fanout_sqes`` (their SQEs, first attempts),
     ``cut_reads``, ``gap_cuts``, ``min_cut_bytes`` (the smallest cut in force, 0: cuts
     off) and ``leg_stride`` (the legs a read may have). Faults and ``piece_stream``
-    are as in ``read_rows_with_fault``. Instrumented build only
+    are as in ``read_rows_with_fault``; ``span_weights`` divides the two-span rows'
+    spans (``piece_geometry``). Instrumented build only
     (``TEST_ONLY_EXPORTS``).
     """
     _refuse_test_only("read_rows_sqes", variant)
@@ -739,6 +750,7 @@ def read_rows_sqes(
         record,
         sqes,
         info,
+        _span_tensor(span_weights),
     )
     (
         result,
@@ -876,6 +888,7 @@ def piece_geometry(
     expert: int,
     *,
     two_span: bool = False,
+    span_weights=None,
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> Optional[tuple[list[dict], list[dict]]]:
@@ -888,14 +901,14 @@ def piece_geometry(
     ``runs`` holds one ``(dst_lo, dst_hi)`` per segment, in segment destination
     coordinates. ``two_span`` cuts it as a two-stage CPU miss
     (``SGLANG_DSV41_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
-    second's ``k`` 1.
+    second's ``k`` 1, each span divided by ``span_weights`` (w13's, w2's) when given.
     """
     segments = int(tables.segments.shape[0])
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
         _host_module(layout, variant).expert_stream_piece_geometry(
-            *_table_args(tables)[:-1], row, expert, subs, pieces, int(bool(two_span))
+            *_table_args(tables)[:-1], row, expert, subs, pieces, int(bool(two_span)), _span_tensor(span_weights)
         )
     )
     if count < 0:
@@ -923,6 +936,7 @@ def read_rows_two_span(
     reference,
     ref_slots,
     step: int = BOUNCE_ROWS,
+    span_weights=None,
     layout: str = "exl3",
     variant: Optional[str] = None,
     **faults,
@@ -952,6 +966,7 @@ def read_rows_two_span(
         _ids(ref_slots),
         info,
         drive,
+        _span_tensor(span_weights),
     )
     result, reported, early, differed, in_flight, split = info.tolist()
     return dict(
@@ -2213,6 +2228,7 @@ class ExpertStreamHost:
         group: int = 0,
         keep_warm_us: int = 0,
         two_stage: bool = False,
+        two_stage_weights=None,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
@@ -2231,6 +2247,8 @@ class ExpertStreamHost:
         one forward of its tokens from the row's token table. ``two_stage``
         (``SGLANG_DSV41_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
         its job once w13 has landed: the gate/up GEMVs run while w2 is still being read.
+        ``two_stage_weights`` (w13's, w2's, each one weight per mirror root or None for the
+        mirror's shares) divides those two spans over the roots.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -2274,6 +2292,10 @@ class ExpertStreamHost:
             int(threads),
             int(keep_warm_us * 1e3),
             int(bool(two_stage)),
+            *(
+                torch.tensor(list(w) if w is not None else [], dtype=torch.float64)
+                for w in (two_stage_weights or (None, None))
+            ),
         )
         self.cpu_rows = (x_rows, out_rows)
 

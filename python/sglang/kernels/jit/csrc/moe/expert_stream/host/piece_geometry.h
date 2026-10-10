@@ -15,6 +15,8 @@
 
 #include "read_fault.h"
 
+#include <cmath>
+
 namespace sglang {
 namespace expert_stream {
 
@@ -138,37 +140,54 @@ inline int64_t second_stage_start(const Tables& t, uint32_t second) {
 }
 
 // A two-stage CPU miss's cut (SGLANG_DSV41_CPU_TWO_STAGE): the row's needed bytes as two spans, the first stage's
-// [0, split) and the second's [split, need_end), each divided over the reading parts in the shares the row's parts
-// read today, each part's file read at its own offsets (a mirror root holds the whole file). The split is rounded up
-// to a page, so the first span holds every first-stage byte, and the inner cuts are pages. Sub-reads are in dest
-// order, the first span's first: queued in that order, every root reads its first-span bytes before its second-span
-// bytes. A part's first-span sub-read is k = 0 and its second-span one k = 1; a share rounded to nothing is left out.
-// g.prefix is the first span's sub-read count, so pieces [0, g.prefix) hold every first-stage byte (cut_pieces maps
-// a piece's cut down, never past the split). Falls back to row_geometry's cut when the split is not inside the row or
-// the two spans would need more sub-reads than pieces (more than kPieces / 2 reading parts).
-inline bool row_geometry_two_span(const Tables& t, size_t row_index, int64_t split, RowGeometry& g, PieceRun* runs) {
+// [0, split) and the second's [split, need_end), each divided over the reading parts, each part's file read at its own
+// offsets (a mirror root holds the whole file). Span s is divided by `weights[s]` (one integer weight per part,
+// SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS), or when it is null in the shares the row's parts read today;
+// a part that reads none of the row today, or weighs 0 in a span, gets none of that span. The split is rounded up to a
+// page, so the first span holds every first-stage byte, and the inner cuts are pages. Sub-reads are in dest order, the
+// first span's first: queued in that order, every root reads its first-span bytes before its second-span bytes. A
+// part's first-span sub-read is k = 0 and its second-span one k = 1; a share rounded to nothing is left out. g.prefix
+// is the first span's sub-read count, so pieces [0, g.prefix) hold every first-stage byte (cut_pieces maps a piece's
+// cut down, never past the split). Falls back to row_geometry's cut when the split is not inside the row, a span has
+// no weight, or the two spans would need more sub-reads than pieces.
+inline bool row_geometry_two_span(
+    const Tables& t,
+    size_t row_index,
+    int64_t split,
+    RowGeometry& g,
+    PieceRun* runs,
+    const int64_t* const* weights = nullptr) {
   const size_t parts = static_cast<size_t>(t.parts);
   const size_t base = row_index * parts;
-  int reading = 0;
-  int64_t total = 0;
-  for (size_t p = 0; p < parts; ++p) {
-    reading += t.extents[base + p].length > 0 ? 1 : 0;
-    total += t.extents[base + p].length;
+  const auto weight = [&](int span, size_t p) -> int64_t {
+    const int64_t length = t.extents[base + p].length;
+    if (length <= 0) return 0;
+    return weights != nullptr && weights[span] != nullptr ? weights[span][p] : length;
+  };
+  int reading[2] = {}, subs = 0;
+  int64_t total[2] = {};
+  for (int span = 0; span < 2; ++span) {
+    for (size_t p = 0; p < parts; ++p) {
+      reading[span] += weight(span, p) > 0 ? 1 : 0;
+      total[span] += weight(span, p);
+    }
+    subs += reading[span];
   }
   const int64_t at = (split + kPage - 1) / kPage * kPage;
-  if (split <= 0 || at >= t.need_end || 2 * reading > kPieces || total <= 0) return row_geometry(t, row_index, g, runs);
+  if (split <= 0 || at >= t.need_end || subs > kPieces || total[0] <= 0 || total[1] <= 0)
+    return row_geometry(t, row_index, g, runs);
   g = RowGeometry{};
   g.start = t.starts[row_index];
   const int64_t spans[3] = {0, at, t.need_end};
   for (int span = 0; span < 2; ++span) {
     const int64_t lo = spans[span], hi = spans[span + 1];
     int64_t share = 0, from = lo;
-    int left = reading;
+    int left = reading[span];
     for (size_t p = 0; p < parts; ++p) {
+      if (weight(span, p) <= 0) continue;
       const Read& e = t.extents[base + p];
-      if (e.length <= 0) continue;
-      share += e.length;
-      const int64_t to = --left == 0 ? hi : lo + (hi - lo) * share / total / kPage * kPage;
+      share += weight(span, p);
+      const int64_t to = --left == 0 ? hi : lo + (hi - lo) * share / total[span] / kPage * kPage;
       if (to <= from) continue;
       g.sub[g.subs] = Read{e.file, e.offset - e.dest + g.start + from, to - from, g.start + from};
       g.part[g.subs] = static_cast<int>(p);
@@ -179,6 +198,25 @@ inline bool row_geometry_two_span(const Tables& t, size_t row_index, int64_t spl
     if (span == 0) g.prefix = g.subs;
   }
   return cut_pieces(t, g, runs);
+}
+
+// SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS as row_geometry_two_span takes them: each weight in units of
+// 2^-16 (empty: no weights for that span). Throws on a list that is not one non-negative weight per part, or whose
+// weights are all 0.
+inline std::vector<int64_t> span_weight_units(const std::vector<double>& weights, int64_t parts, const char* name) {
+  if (weights.empty()) return {};
+  if (static_cast<int64_t>(weights.size()) != parts)
+    throw std::runtime_error(std::string(name) + " lists " + std::to_string(weights.size()) +
+                             " weights; give one per mirror root (" + std::to_string(parts) + ")");
+  std::vector<int64_t> units;
+  int64_t sum = 0;
+  for (double w : weights) {
+    if (!(w >= 0) || w > 1e6) throw std::runtime_error(std::string(name) + " weights must be in [0, 1e6]");
+    units.push_back(static_cast<int64_t>(std::llround(w * 65536.0)));
+    sum += units.back();
+  }
+  if (sum <= 0) throw std::runtime_error(std::string(name) + " gives the span no weight");
+  return units;
 }
 
 // The initial readiness word of a lease row's piece area: generation56 << 8 | bits8, with no bit set. The service

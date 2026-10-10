@@ -146,6 +146,13 @@ class ReaderCore {
     return second_stage_;
   }
 
+  // The per-span weights of a two-span row (row_geometry_two_span's, span_weight_units), w13's then w2's; an empty one
+  // divides its span in the mirror's shares. Call it on an idle reader.
+  void set_span_weights(std::vector<int64_t> w13, std::vector<int64_t> w2) {
+    span_weights_[0] = std::move(w13);
+    span_weights_[1] = std::move(w2);
+  }
+
   // Where this reader counts its reads in flight per root (drive_load.h): the tier points every reader at its one
   // DriveLoad; a reader on its own (tests, tools) counts into its own. Call it on an idle reader.
   void set_drive_load(DriveLoad* load) {
@@ -1164,7 +1171,11 @@ class ReaderCore {
   bool plan_pieces(size_t slot, size_t row_index, RowGeometry& g, bool two) {
     const size_t segments = t_.segments.size();
     PieceRun* runs = &piece_runs_[slot * kPieces * segments];
-    if (!(two ? row_geometry_two_span(t_, row_index, second_stage_, g, runs) : row_geometry(t_, row_index, g, runs)))
+    const int64_t* weights[2] = {
+        span_weights_[0].empty() ? nullptr : span_weights_[0].data(),
+        span_weights_[1].empty() ? nullptr : span_weights_[1].data()};
+    if (!(two ? row_geometry_two_span(t_, row_index, second_stage_, g, runs, weights)
+              : row_geometry(t_, row_index, g, runs)))
       return false;
     for (int s = 0; s < g.subs; ++s) {
       if (t_.file_sizes[g.sub[s].file] - g.sub[s].offset <= 0) return false;
@@ -1826,6 +1837,7 @@ class ReaderCore {
   size_t subs_ = 1;
   // Where the layout's second stage begins in a row image (second_stage_start); 0: rows cannot be read in two spans.
   int64_t second_stage_ = 0;
+  std::vector<int64_t> span_weights_[2];  // set_span_weights
   std::vector<Read> sub_reads_;
   std::vector<PieceRun> piece_runs_;
   std::vector<iovec> iovecs_;  // direct mode: segments.size() per descriptor (size_extents)

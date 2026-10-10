@@ -62,6 +62,25 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return rows;
   }
 
+  // A test's per-span weights (float64 [2, parts]: w13's row, then w2's; [0, n]: none) as span_weight_units gives them.
+  struct SpanWeights {
+    std::vector<int64_t> span[2];
+    const int64_t* ptrs[2] = {};
+  };
+  static SpanWeights span_weights_of(TensorView weights, int64_t parts) {
+    SpanWeights out;
+    if (weights.numel() == 0) return out;
+    if (weights.dim() != 2 || weights.size(0) != 2 || weights.dtype().code != kDLFloat || weights.dtype().bits != 64)
+      throw std::runtime_error("span_weights must be float64 [2, parts]");
+    const auto* v = static_cast<const double*>(weights.data_ptr());
+    const int64_t n = weights.size(1);
+    for (int s = 0; s < 2; ++s) {
+      out.span[s] = span_weight_units(std::vector<double>(v + s * n, v + (s + 1) * n), parts, s == 0 ? "w13" : "w2");
+      out.ptrs[s] = out.span[s].data();
+    }
+    return out;
+  }
+
   // The layout's second-stage start in `t` (ReaderCore::second_stage_); 0 for a layout without one.
   static int64_t second_stage_of(const Tables& t) {
     if constexpr (requires { Layout::kSecondStageMask; }) {
@@ -299,7 +318,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       TensorView fault,
       TensorView record,
       TensorView sqes,
-      TensorView info) {
+      TensorView info,
+      TensorView span_weights) {
     if constexpr (!Build::kFaults) {
       test_only("read_rows_sqes");
     } else {
@@ -335,6 +355,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       reader.set_leg_cut_cap(f[31]);
       if (!reader.open()) return;
       reader.set_fault(fault_from(f));
+      {
+        SpanWeights w = span_weights_of(span_weights, reader.tables().parts);
+        reader.set_span_weights(std::move(w.span[0]), std::move(w.span[1]));
+      }
       std::vector<typename Source::SqeRecord> log;
       reader.set_sqe_log(&log);
       StageRecord stage;
@@ -504,7 +528,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       TensorView reference,
       TensorView ref_slots,
       TensorView info,
-      TensorView drive) {
+      TensorView drive,
+      TensorView span_weights) {
     if constexpr (!Build::kFaults) {
       test_only("read_rows_two_span");
     } else {
@@ -545,6 +570,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       reader.set_leg_cut_cap(f[31]);
       if (!reader.open()) return;
       reader.set_fault(fault_from(f));
+      {
+        SpanWeights w = span_weights_of(span_weights, t.parts);
+        reader.set_span_weights(std::move(w.span[0]), std::move(w.span[1]));
+      }
       std::vector<uint8_t> packed, prefix, seen(ids.size(), 0);
       packed.reserve(ids.size());
       prefix.reserve(ids.size());
@@ -786,7 +815,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       int64_t expert,
       TensorView subs,
       TensorView pieces,
-      int64_t two_span) {
+      int64_t two_span,
+      TensorView span_weights) {
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
@@ -812,7 +842,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
     const size_t index = static_cast<size_t>(row * t.experts + expert);
     const int64_t split = second_stage_of(t);
-    if (!(two_span != 0 && split > 0 ? row_geometry_two_span(t, index, split, g, runs.data())
+    const SpanWeights w = span_weights_of(span_weights, t.parts);
+    if (!(two_span != 0 && split > 0 ? row_geometry_two_span(t, index, split, g, runs.data(), w.ptrs)
                                      : row_geometry(t, index, g, runs.data())))
       return -1;
     auto* sub_out = static_cast<int64_t*>(subs.data_ptr());

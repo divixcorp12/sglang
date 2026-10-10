@@ -348,6 +348,13 @@ def _check_slot_map() -> None:
     if envs.SGLANG_DSV41_CPU_TWO_STAGE.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Without CPU experts there is no CPU miss to split: a set flag is a launch typo.
         raise ValueError("SGLANG_DSV41_CPU_TWO_STAGE needs SGLANG_DSV41_CPU_EXPERTS=1")
+    for name in ("SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS"):
+        if getattr(envs, name).get().strip() and not envs.SGLANG_DSV41_CPU_TWO_STAGE.get():
+            raise ValueError(f"{name} needs SGLANG_DSV41_CPU_TWO_STAGE=1")
+    if envs.SGLANG_DSV41_CPU_TWO_STAGE.get():
+        from sglang.srt.layers.moe.exl3_expert_format import two_stage_span_weights
+
+        two_stage_span_weights()
 
 
 def _check_ram_prefetch() -> None:

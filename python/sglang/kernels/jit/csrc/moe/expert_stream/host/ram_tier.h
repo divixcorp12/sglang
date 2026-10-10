@@ -713,6 +713,13 @@ class RamTier {
     if (config.two_stage && dist_.group(g).reader.second_stage() == 0)
       throw std::runtime_error(
           error_prefix<Layout>() + "two-stage CPU misses need row images whose second stage follows the first");
+    if (config.two_stage) {
+      Source& reader = dist_.group(g).reader;
+      const int64_t parts = reader.tables().parts;
+      reader.set_span_weights(
+          span_weight_units(config.span_weights[0], parts, "SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS"),
+          span_weight_units(config.span_weights[1], parts, "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS"));
+    }
     if (cpu_kernel_ != nullptr && cpu_kernel_ != config.kernel)
       throw std::runtime_error(
           error_prefix<Layout>() + "every group's CPU experts run one kernel: group " + std::to_string(g) +

@@ -410,8 +410,8 @@ def parse_mirror_roots(value: str) -> tuple[str, ...]:
     return tuple(entries)
 
 
-def parse_mirror_weights(value: str, num_roots: int) -> tuple[float, ...]:
-    """Parse ``SGLANG_MOE_EXPERT_MIRROR_WEIGHTS``: one weight per root.
+def parse_mirror_weights(value: str, num_roots: int, name: str = _MIRROR_WEIGHTS) -> tuple[float, ...]:
+    """Parse ``SGLANG_MOE_EXPERT_MIRROR_WEIGHTS`` (or another list in its format, ``name``): one weight per root.
 
     Colon-separated, non-negative and not all zero; empty means equal weights.
     """
@@ -423,23 +423,49 @@ def parse_mirror_weights(value: str, num_roots: int) -> tuple[float, ...]:
             weight = float(token)
         except ValueError:
             raise ValueError(
-                f"{_MIRROR_WEIGHTS}={value!r}: {token!r} is not a number; give "
+                f"{name}={value!r}: {token!r} is not a number; give "
                 "colon-separated non-negative numbers such as 3:1"
             ) from None
         if not math.isfinite(weight) or weight < 0:
             raise ValueError(
-                f"{_MIRROR_WEIGHTS}={value!r}: {token!r} is not a finite "
+                f"{name}={value!r}: {token!r} is not a finite "
                 "non-negative number"
             )
         weights.append(weight)
     if len(weights) != num_roots:
         raise ValueError(
-            f"{_MIRROR_WEIGHTS} lists {len(weights)} weights but {_MIRROR_DIRS} "
+            f"{name} lists {len(weights)} weights but {_MIRROR_DIRS} "
             f"lists {num_roots} roots"
         )
     if not any(weights):
-        raise ValueError(f"{_MIRROR_WEIGHTS}={value!r}: every weight is zero")
+        raise ValueError(f"{name}={value!r}: every weight is zero")
     return tuple(weights)
+
+
+_SPAN_WEIGHTS = ("SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS")
+
+
+def two_stage_span_weights() -> tuple[Optional[tuple[float, ...]], Optional[tuple[float, ...]]]:
+    """``SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS`` and ``_W2_WEIGHTS``, each one weight per mirror root (one root
+    without a mirror), or None when unset (the span keeps the mirror's shares).
+
+    Raises for a list the mirror cannot take: another root count, all zero, or a share for a root the mirror weighs 0
+    (that root reads none of a row, so the tables give it nothing to read from).
+    """
+    mirror = exl3_mirror_config()
+    roots, mirror_weights = (len(mirror[0]), mirror[1]) if mirror is not None else (1, (1.0,))
+    out = []
+    for name in _SPAN_WEIGHTS:
+        value = getattr(envs, name).get()
+        if not value.strip():
+            out.append(None)
+            continue
+        weights = parse_mirror_weights(value, roots, name)
+        for root, (weight, base) in enumerate(zip(weights, mirror_weights)):
+            if weight > 0 and base == 0:
+                raise ValueError(f"{name} gives root {root} a share, but {_MIRROR_WEIGHTS} gives it 0")
+        out.append(weights)
+    return out[0], out[1]
 
 
 def exl3_mirror_config() -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:

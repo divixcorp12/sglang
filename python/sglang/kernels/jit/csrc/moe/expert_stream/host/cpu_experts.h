@@ -132,6 +132,9 @@ struct CpuExpertConfig {
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
   bool two_stage = false;    // SGLANG_DSV41_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job (CpuJob::staged)
+  // SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS: a weight per mirror root for each span of a two-span row
+  // (empty: the mirror's shares). The tier hands them to its readers (RamTier::enable_cpu_experts).
+  std::vector<double> span_weights[2];
 };
 
 /// The CPU expert thread, its job ring and its done word.
