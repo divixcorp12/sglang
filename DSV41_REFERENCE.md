@@ -7829,6 +7829,111 @@ scratch or a host-free ragged layout.
 to even out the row parts' times, with or without prefetch; (b) speculative reads that leave the drives a demand read
 needs, below; (c) the verify accept count logged per forward, to split misses by verified position directly.
 
+### 33.17 Drive load, the miss-aware CPU split, and a per-drive in-flight cap (2026-10-09)
+
+Follows §33.16. Status at the end of 2026-10-09: the **split cut** is the one change that has gained, and it should
+be on by default. The **GPU prefetch** still ties. The **per-drive cap** loses. Mirror weights by drive speed
+(§33.16 (a)) has not been run. A/B numbers are `both_cpu_ab.py` medians of 8 sessions, in ms/token. A single
+session swings 5-15% between windows, so a pair that does not repeat in the same window is not a result.
+
+**Drive load counters** (`host/drive_load.h`, on `codex/dsv41-ram-prefetch-margin`).
+- Each mirror root counts its demand and speculative reads and bytes in flight, the bytes landed, and its busy time
+  (demand, speculative, and both at once).
+- The clock is read only when a root's count changes.
+- One `exl3 RAM miss drive load {json}` line is logged at stop. It covers the server's lifetime, warm-up included.
+- In `ab-driveload-20261009-165620` (`dspark-both-prefetch-gpu` at `316dd3fc78`):
+  - Demand busy is 101 / 105 / 102 s on nvme0 / nvme4 (SPCC) / nvme2.
+  - Demand and speculative reads overlap for only 7.6 / 9.2 / 7.7 s.
+  - The A/B was a tie: 78.48 against 79.94 for the imported `dspark-both`.
+
+**How forced misses meet the CPU split.** The tool is `analysis/dsv41-drive/dspark/miss_timeline.py`, tested by
+`test/registered/unit/scripts/test_miss_timeline.py`. It reads an InstrBuild job trace and gives one row per
+(gen, NUMA group) record with a forced CPU miss.
+- Misses are already computed as they stream in. `submit_landed_cpu_misses` (`ram_tier.h`) queues one job per batch
+  of landed rows.
+  - Rows land about 1.8-2.4 ms apart, and each job starts within about 1 µs of its row landing.
+  - Only the last row's compute, about 0.53 ms, is exposed. Sub-row streaming has little to gain.
+- The cost is the split. The calibrated `split[node][n]` gives the CPU about 0.63 of a node's eligible unforced
+  hits, as if no NVMe read were coming. That hit job (about 4 lanes, about 3 ms) is often still running on the
+  group's FIFO thread when the last miss row lands.
+- Meanwhile the record's DMA finishes about 2.5 ms before the CPU chain, and the record is done when the CPU chain
+  ends.
+- Measured on `hidden-cost-20261009-141506/off` (no prefetch):
+
+| Forced misses on the node | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| Last miss blocked behind the hit job | 59% | 42% | 26% | 13% | 10% | 6% |
+| Mean added wait (ms) | 1.13 | 0.70 | 0.36 | 0.17 | 0.15 | 0.02 |
+
+**The miss-aware split cut.** Commits `27f29e6bff` (tests) and `b0799a2f3c`.
+- In `lease_device.cuh` `type_lanes`, when a node has between 1 and `SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX` forced
+  misses (default 3), the CPU takes `SGLANG_DSV41_CPU_SPLIT_MISS_CUT` fewer of the split's lanes (default 0, so off).
+  Those lanes go to the copy engine.
+- Forced lanes always stay on the CPU.
+- The Python reference `ram_slot_map.type_lanes` and `dsv41_chain_sim` carry the same rule.
+- Startup logs `CPU experts group g split miss cut: ...`.
+- The test arm is `dspark-both-misscut`, with CUT=1 and MAX=3.
+
+| Run | Arms | ms/token | Accept length |
+|---|---|---|---|
+| `ab-misscut-20261009-172706` | cut / imported `dspark-both` | 76.14 / 79.94 (−4.8%) | 3.68 / 3.62 |
+| `ab-misscut-pair-20261009-175337` | cut / `dspark-both`, same window | 74.16 / 76.78 (−3.4%), 7 of 8 sessions faster | 3.67 / 3.67 |
+| `ab-misscut-pair2-20261009-202708` | cut / `dspark-both`, same window | 76.28 / 78.39 (−2.7%), 4 of 8 faster | 3.55 / 3.62 |
+
+All three runs have the cut ahead, by about 3%. No single pair settles it on its own.
+
+Not tried yet:
+- a cut of 2 lanes at 1 miss;
+- a cut keyed on the miss count.
+
+**The cut with GPU prefetch on.** The arm is `dspark-both-prefetch-gpu-misscut` (`4d0f5b1623`), run in
+`ab-misscut-prefetch-20261009-184637`.
+- The prefetch arm ran 78.84 and the cut-only arm 83.42 (accept 3.65 / 3.49).
+- The cut-only arm's session 1 is an outlier, with low acceptance. Without it the two arms are about even.
+- So the prefetch adds nothing on top of the cut.
+
+**Per-drive in-flight cap** (§33.16 (b), counts only). Branch `codex/dsv41-drive-cap`, commits `e9bf4f8ad2`,
+`11200d9c7f` and `06f96b6d12`; not merged into the prefetch branch.
+- `reader_core.h` `choose_root` runs when a sub-read is first prepared, and again when it is issued.
+  - It skips any root whose demand plus speculative reads in flight are at its cap.
+  - Among the open roots it picks the one with the fewest bytes in flight. A tie goes to the own root, then the
+    lowest-numbered root.
+  - When every root is capped, the sub-read keeps its own root.
+- `DriveLoad` gains `moved_from` / `moved_to`.
+- Env: `SGLANG_MOE_EXPERT_MIRROR_DYNAMIC` and `SGLANG_MOE_EXPERT_MIRROR_CAPS`.
+- The test arm is `dspark-both-prefetch-gpu-cap`, with caps 4,2,4 (the SPCC drive gets 2).
+
+Results:
+- `ab-drive-cap-20261009-185352` aborted at warm-up. Three of 12 rounds ran at 7.7-8.9 tok/s.
+  - Other prefetch arms have had single slow rounds too (6.9 and 5.0), so the abort alone was not conclusive.
+- `ab-drive-cap-rev-20261009-195000` reversed the arm order. Both arms were stable after 2 rounds.
+  - The cap arm ran 80.6 against 77.1 for `dspark-both-prefetch-gpu`: +4.5% slower, 6 of 8 sessions slower.
+  - Accept length was 3.58 against 3.68.
+  - Drive load for the cap arm:
+
+| | nvme0 | nvme4 (SPCC) | nvme2 |
+|---|---:|---:|---:|
+| Demand GB | 275 | 247 | 300 |
+| Demand busy (s) | 83.9 | 92.7 | 92.8 |
+| Moved from / to (sub-reads) | 24.1k / 24.9k | 31.1k / 16.4k | 16.6k / 30.4k |
+
+71.7k sub-reads changed drive, many of them between the two fast drives. Picking the drive with the
+fewest bytes in flight reshuffles reads that did not need to move, and that costs more than it saves. Drop the cap
+as built.
+
+If it is retried, a sub-read should move only when its own drive is at its cap, and only onto an idle drive.
+
+Unresolved on the cap branch:
+- `test_expert_stream_drive_load.py` fails depending on test order when it runs after the requirements and scripts
+  tests.
+- `environ.py`, `both_cpu_ab.py` and `test_expert_stream_requirements_exl3.py` overlap with the prefetch branch.
+
+**Next.**
+- (a) Make the split cut the default.
+- (b) Run the mirror weights by drive speed (§33.16 (a)).
+- (c) Send speculative reads only to an idle mirror drive. This is design change (2) in
+  `docs/superpowers/specs/2026-10-09-dsv41-drive-aware-reads-design.md`.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
