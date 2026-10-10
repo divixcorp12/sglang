@@ -147,6 +147,14 @@ def _pool(host, row):
     return {e["expert"]: e["state"] for e in host.spec_pool(row) if e["expert"] >= 0}
 
 
+def _waiting(rig):
+    """The job's read of expert 2 into row 1 is issued and still reading; the counters only count its deferrals once
+    it returns, so give it a moment to be in its wait."""
+    assert _until(lambda: rig.host.counters()["spec_issued"] == 1 and _pool(rig.host, 1) == {2: "reading"})
+    time.sleep(0.05)
+    assert _pool(rig.host, 1) == {2: "reading"}
+
+
 def test_a_demand_is_served_while_a_slowed_idle_drive_read_holds_a_drive(tmp_path):
     """The inverse of the shared reader's turn: the demand reads beside the speculative piece in flight (at most one
     piece shares its drive) instead of waiting for the whole row. The demand is of row 2, neither the job's source nor
@@ -193,7 +201,7 @@ def test_a_forced_miss_boosts_the_read_it_waits_on(tmp_path):
     try:
         rig.host.inject_demand_load([1] * ROOTS)
         trigger(rig)
-        assert _until(lambda: rig.host.counters()["spec_deferred"] >= 1)
+        _waiting(rig)
         rows = rig.host.counters()["rows_read"]
         start = time.monotonic()
         forced(rig, 1, [2])
@@ -214,7 +222,7 @@ def test_a_stale_read_is_abandoned_once_its_record_was_served_without_it(tmp_pat
     try:
         rig.host.inject_demand_load([1] * ROOTS)
         trigger(rig)
-        assert _until(lambda: rig.host.counters()["spec_deferred"] >= 1)
+        _waiting(rig)
         start = time.monotonic()
         req = rig.sim.post(1, [3])
         assert rig.sim.wait_served(req, timeout_s=5.0) and rig.sim.wait_handled(req, timeout_s=5.0)
@@ -230,7 +238,7 @@ def test_pause_abandons_a_waiting_read_and_the_fill_reads_alone(tmp_path):
     try:
         rig.host.inject_demand_load([1] * ROOTS)
         trigger(rig)
-        assert _until(lambda: rig.host.counters()["spec_deferred"] >= 1)
+        _waiting(rig)
         start = time.monotonic()
         rig.host.pause(10.0)
         try:
