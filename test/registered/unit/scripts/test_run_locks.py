@@ -1,6 +1,7 @@
 """run_locks.take: a lock the caller's own ancestor holds is not waited on; any other holder is waited on, by name."""
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -26,36 +27,53 @@ def _taker(path):
     return [sys.executable, "-c", TAKER.format(lib=lib, path=str(path))]
 
 
+def _spawn(argv, **kw):
+    # Own session, so _reap can kill the whole tree: a timed-out flock/bash/python chain otherwise leaves the
+    # grandchildren running, still waiting on the lock.
+    return subprocess.Popen(argv, start_new_session=True, text=True, **kw)
+
+
+def _reap(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
 def test_a_lock_the_parent_already_holds_is_taken_without_waiting(tmp_path):
     lock = tmp_path / "disk.lock"
     # bash in between: the holder is a grandparent, as under `flock LOCK bash run.sh`.
-    out = subprocess.run(["flock", str(lock), "bash", "-c", '"$@"; exit $?', "bash", *_taker(lock)],
-                         capture_output=True, text=True, timeout=20)
-    assert out.returncode == 0, out.stderr
-    assert "TAKEN" in out.stdout
-    assert "held by our parent" in out.stdout
+    proc = _spawn(["flock", str(lock), "bash", "-c", '"$@"; exit $?', "bash", *_taker(lock)],
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=20)
+    finally:
+        _reap(proc)
+    assert proc.returncode == 0, err
+    assert "TAKEN" in out
+    assert "held by our parent" in out
 
 
 def test_a_lock_another_process_holds_is_waited_on_and_the_holder_named(tmp_path):
     lock = tmp_path / "disk.lock"
-    holder = subprocess.Popen(["flock", "-o", str(lock), "sleep", "300"])  # -o: only flock itself holds it
+    holder = _spawn(["flock", "-o", str(lock), "sleep", "300"])  # -o: only flock itself holds it
+    taker = None
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and str(holder.pid) not in open("/proc/locks").read():
             time.sleep(0.05)
-        taker = subprocess.Popen(_taker(lock), stdout=subprocess.PIPE, text=True)
-        try:
-            with pytest.raises(subprocess.TimeoutExpired):
-                taker.wait(timeout=2)
-            holder.kill()
-            holder.wait()
-            out, _ = taker.communicate(timeout=10)
-        finally:
-            taker.kill()
+        taker = _spawn(_taker(lock), stdout=subprocess.PIPE)
+        with pytest.raises(subprocess.TimeoutExpired):
+            taker.wait(timeout=2)
+        _reap(holder)
+        out, _ = taker.communicate(timeout=10)
         assert f"waiting for {lock} held by pid {holder.pid}" in out
         assert out.rstrip().endswith("TAKEN")
     finally:
-        holder.kill()
+        _reap(holder)
+        if taker is not None:
+            _reap(taker)
 
 
 def test_a_free_lock_is_taken_silently(tmp_path):
