@@ -1,1 +1,1 @@
-from sglang.test.expert_stream_variant import instrumented_expert_stream_host  # noqa: F401 - autouse fixture
+from sglang.test.expert_stream_variant import *  # noqa: F401,F403 - the instrumented default (hooks)
