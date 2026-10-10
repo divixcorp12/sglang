@@ -8181,7 +8181,27 @@ thirds). Other rows keep the thirds. Reference `dspark-both-misscut`.
 - 25.4 K staged jobs; 9.5 K (37%) waited for w2, **0.28 ms on average** (0.58 ms with the thirds), 2.7 s in all.
 - Caveats: one run. The arm needed 11 warm-up rounds to pass the stability gate (the reference 4), so lifetime
   totals are not comparable without normalising by bytes. Per-session swings of -15% to +10% are the usual spread here.
-- Next: repeat it (arm first) before acting on it; then release the team during the w2 wait so draft jobs can run.
+- Paired gain per session id, `(ref - arm) / ref` in %: Double_BKR/2017 p47 +10.0; Single_CDW/2015 p35 -6.3;
+  Single_DISCA/2016 p11 +4.8; Single_ETR/2004 p261 +2.0; Single_TSCO/2018 p31 +3.4; Single_VLO/2012 p27 +7.9;
+  Single_WRK/2019 p49 -14.9; val Single_K/2013 p62 +9.4.
+- Drive load over each server's life (`exl3 RAM miss drive load`), demand busy s / GB read:
+
+  | | nvme0 | nvme4 (SPCC) | nvme2 |
+  |---|---|---|---|
+  | misscut | 94.9 / 311.1 | 99.4 / 310.5 | 96.4 / 310.5 |
+  | spcc13 | 130.3 / 423.7 | 127.8 / 402.3 | 133.2 / 423.4 |
+
+  nvme4's share of bytes falls from 33.3% to 32.2% (only CPU-miss rows use the per-span weights).
+- CPU stats at stop (`exl3 RAM miss cpu stats`):
+
+  | | jobs | lanes | forward s | staged jobs | waited | wait s |
+  |---|---|---|---|---|---|---|
+  | misscut, group 0 / 1 | 22,046 / 26,387 | 71,336 / 72,268 | 48.7 / 45.7 | 0 | 0 | 0 |
+  | spcc13, group 0 / 1 | 37,594 / 45,414 | 135,177 / 118,695 | 88.3 / 74.1 | 9,025 / 16,351 | 2,978 / 6,511 | 0.87 / 1.79 |
+
+- Lifetime: misscut 1,081 tokens (4 warm-up rounds), spcc13 1,930 tokens (11). RAM rows per token 22.6 vs 20.0.
+- The repeat was skipped by decision (2026-10-10): the next step, releasing the team during the w2 wait so draft jobs
+  can run, was built on top first; its A/B carries spcc13 as a second reference.
 
 ## Sources
 
