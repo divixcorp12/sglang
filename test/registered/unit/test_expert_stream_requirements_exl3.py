@@ -477,8 +477,54 @@ def test_the_cpu_two_stage_needs_cpu_experts(model_dir):
         _gate(launch, SGLANG_DSV41_CPU_TWO_STAGE=True)
 
 
+def _three_roots(tmp_path):
+    roots = [tmp_path / name for name in ("nvme0", "nvme4", "nvme2")]
+    for root in roots:
+        root.mkdir()
+    return ":".join(str(root) for root in roots)
+
+
+W13, W2 = "SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS"
+
+
+def test_the_span_weights_pass_with_the_two_stage_flag_and_a_matching_mirror(model_dir, tmp_path):
+    launch = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    mirror = dict(SGLANG_MOE_EXPERT_MIRROR_DIRS=_three_roots(tmp_path), SGLANG_MOE_EXPERT_MIRROR_WEIGHTS="16:10:16")
+    _gate(launch, **CPU_EXPERTS_ENV, **mirror, SGLANG_DSV41_CPU_TWO_STAGE=True, **{W13: "6:10:6", W2: "1:0:1"})
+    _gate(launch, **CPU_EXPERTS_ENV, **mirror, SGLANG_DSV41_CPU_TWO_STAGE=True, **{W13: "0:1:0"})
+
+
+@pytest.mark.parametrize("name", [W13, W2])
+def test_a_span_weight_without_the_two_stage_flag_is_refused(model_dir, tmp_path, name):
+    with pytest.raises(ValueError, match=f"{name} needs SGLANG_DSV41_CPU_TWO_STAGE=1"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **{name: "1:0:1"})
+
+
+@pytest.mark.parametrize(
+    "value, why",
+    [("1:1", "lists 2 weights but SGLANG_MOE_EXPERT_MIRROR_DIRS lists 3 roots"), ("0:0:0", "every weight is zero"),
+     ("1:x:1", "is not a number")],
+    ids=["root_count", "all_zero", "malformed"],
+)
+@pytest.mark.parametrize("name", [W13, W2])
+def test_a_bad_span_weight_list_is_refused(model_dir, tmp_path, name, value, why):
+    mirror = dict(SGLANG_MOE_EXPERT_MIRROR_DIRS=_three_roots(tmp_path), SGLANG_MOE_EXPERT_MIRROR_WEIGHTS="16:10:16")
+    with pytest.raises(ValueError, match=f"{name}=.*{why}|{name} {why}"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **mirror,
+              SGLANG_DSV41_CPU_TWO_STAGE=True, **{name: value})
+
+
+def test_a_span_weight_on_a_root_the_mirror_reads_nothing_from_is_refused(model_dir, tmp_path):
+    """A root with mirror weight 0 has no extent to read a span from."""
+    mirror = dict(SGLANG_MOE_EXPERT_MIRROR_DIRS=_three_roots(tmp_path), SGLANG_MOE_EXPERT_MIRROR_WEIGHTS="1:0:1")
+    with pytest.raises(ValueError, match=f"{W2} gives root 1 a share, but SGLANG_MOE_EXPERT_MIRROR_WEIGHTS gives it 0"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **mirror,
+              SGLANG_DSV41_CPU_TWO_STAGE=True, **{W2: "1:1:1"})
+
+
 def test_the_cpu_two_stage_is_off_by_default():
     assert envs.SGLANG_DSV41_CPU_TWO_STAGE.get() is False
+    assert envs.SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS.get() == "" and envs.SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS.get() == ""
 
 
 @pytest.mark.parametrize("value", ["ce", "sm"])

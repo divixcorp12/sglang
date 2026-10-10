@@ -227,8 +227,10 @@ class FakeHost:
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(
-        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0, two_stage=False
+        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0, two_stage=False,
+        two_stage_weights=None,
     ):
+        self.two_stage_weights = two_stage_weights
         self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
         self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
         self.keep_warm_us = keep_warm_us
@@ -328,6 +330,29 @@ def test_service_passes_the_two_stage_flag_to_the_host_and_logs_it(caplog):
         host = FakeHost()
         _service(host, FakeServiceTrait())
     assert host.two_stage is True and "two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): on" in caplog.text
+
+
+def test_service_passes_the_span_weights_to_the_host_and_logs_them(caplog):
+    """Unset: no per-span weights (the mirror's shares), named so on the line; set: parsed per root and logged."""
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True), caplog.at_level(
+        "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
+    ):
+        host = FakeHost()
+        _service(host, FakeServiceTrait())
+    assert host.two_stage_weights == (None, None)
+    assert "on, w13 weights mirror, w2 weights mirror" in caplog.text
+    caplog.clear()
+    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True), envs.SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS.override(
+        "3"
+    ), envs.SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS.override(""), caplog.at_level(
+        "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
+    ):
+        host = FakeHost()
+        _service(host, FakeServiceTrait())
+    assert host.two_stage_weights == ((3.0,), None)  # no mirror: one root
+    assert "on, w13 weights 3, w2 weights mirror" in caplog.text
 
 
 def test_service_logs_the_two_stage_waits_with_the_stats(caplog):

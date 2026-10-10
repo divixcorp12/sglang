@@ -92,6 +92,42 @@ def test_with_no_two_span_row_the_cut_and_the_sqes_are_todays(tmp_path, name):
     assert _today_digest(tmp_path, THREE_ROOT[name]) == GOLDEN[name]
 
 
+# The two-span cut with no per-span weights (both spans in the mirror's shares), as f1f002202e produced it: geometry
+# with two_span over every row, and the SQE stream of rows 0, 1 and 3 of four in two spans.
+TWO_SPAN_GOLDEN = {
+    "thirds": "0309fe9f449c543bb1ec01c288ba432dc81ef2791269d1fc6d1e65a9bd213255",
+    "drive_speed": "b31ae902ccea0b6b6f57d905ea8a5c17f9584ea1417bc52f868125326ecab880",
+    "zero_middle": "11ab5b6c148e281aebd55a90213eb3b5ef045cd78be38cd9cd5410e924e0113d",
+}
+
+
+def _two_span_digest(tmp_path, weights, **kw):
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
+    h = hashlib.sha256()
+    layers, experts = s.tables.extents.shape[:2]
+    for row in range(layers):
+        for expert in range(experts):
+            h.update(json.dumps(piece_geometry(s.tables, row, expert, two_span=True, **kw), sort_keys=True).encode())
+    result, log, info, record = read_rows_sqes(
+        s.tables, 1, [4, 1, 2, 0], [0, 1, 2, 3], piece_stream=True, two_span_rows=0b1011, **kw
+    )
+    assert result == 1
+    h.update(json.dumps(log).encode())
+    return h.hexdigest()
+
+
+@pytest.mark.parametrize("name", sorted(THREE_ROOT))
+def test_with_no_span_weights_the_two_span_cut_is_the_first_two_stage_cut(tmp_path, name):
+    """Unset per-span weights mean the mirror's shares in both spans: the two-stage cut as it first shipped."""
+    assert _two_span_digest(tmp_path, THREE_ROOT[name]) == TWO_SPAN_GOLDEN[name]
+
+
+@pytest.mark.parametrize("name", sorted(THREE_ROOT))
+def test_span_weights_equal_to_the_mirror_weights_give_the_unweighted_cut(tmp_path, name):
+    weights = THREE_ROOT[name]
+    assert _two_span_digest(tmp_path, weights, span_weights=(weights, weights)) == TWO_SPAN_GOLDEN[name]
+
+
 # ---- The two-span cut ----
 
 
@@ -170,6 +206,103 @@ def test_every_root_reads_a_two_span_rows_w13_before_any_of_its_w2(tmp_path, wei
             assert [dest < at for _, dest in mine] == sorted((dest < at for _, dest in mine), reverse=True)
     today = [(sub["file"], sub["dest"]) for sub in piece_geometry(s.tables, 1, experts[2])[0]]
     assert [(file, dest) for _, file, dest, _ in rows[2]] == today
+    split._assert_rows(s, 1, experts, slots)
+
+
+# ---- Per-span weights (SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS) ----
+
+MIRROR3 = (16.0, 10.0, 16.0)  # nvme0 : nvme4 (SPCC) : nvme2, the served mirror
+SPCC13 = ((6.0, 10.0, 6.0), (1.0, 0.0, 1.0))
+SPAN_CASES = [
+    (MIRROR3, SPCC13),
+    (MIRROR3, ((0.0, 1.0, 0.0), (1.0, 1.0, 1.0))),  # w13 on one root alone
+    (MIRROR3, ((1.0, 1.0, 1.0), (0.0, 1.0, 0.0))),  # w2 on one root alone
+    (MIRROR3, ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0))),  # each span on a root of its own; the middle root reads nothing
+    ((1.0, 1.0), ((1.0, 3.0), (3.0, 1.0))),
+]
+SPAN_IDS = ["spcc13", "w13_one_root", "w2_one_root", "one_root_each", "halves_crossed"]
+
+
+def _span_subs(subs, span):
+    return [sub for sub in subs if sub["k"] == span]
+
+
+@pytest.mark.parametrize("mirror, spans", SPAN_CASES, ids=SPAN_IDS)
+def test_each_span_is_divided_by_its_own_weights_and_the_row_is_read_once(tmp_path, mirror, spans):
+    """Every row tiles its image once, w13 (k 0) before w2 (k 1); each root's share of each span is that span's weight
+    to two pages, and a root weighted 0 in a span reads none of it. Mutants: the w2 weights ignored -- red; the spans
+    swap their weights -- red."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=mirror, hidden=256, inter=512)
+    w13_end, at = _split_at(s.tables)
+    need_end = _need_end(s.tables)
+    layers, experts = s.tables.extents.shape[:2]
+    for row in range(layers):
+        for expert in range(experts):
+            subs, pieces = piece_geometry(s.tables, row, expert, two_span=True, span_weights=spans)
+            assert [sub["k"] for sub in subs] == sorted(sub["k"] for sub in subs)
+            cursor = 0
+            for sub in subs:
+                assert sub["dest"] == cursor and sub["length"] > 0
+                cursor += sub["length"]
+            assert cursor == need_end
+            assert _span_subs(subs, 0)[-1]["dest"] + _span_subs(subs, 0)[-1]["length"] == at
+            for span, (lo, hi) in enumerate([(0, at), (at, need_end)]):
+                weights = spans[span]
+                for part, weight in enumerate(weights):
+                    got = sum(sub["length"] for sub in _span_subs(subs, span) if sub["part"] == part)
+                    assert abs(got - (hi - lo) * weight / sum(weights)) <= 2 * PAGE, (row, expert, span, part, got)
+                    if weight == 0:
+                        assert got == 0
+    assert w13_end <= at < need_end
+
+
+def test_with_spcc13_the_spcc_reads_one_contiguous_piece_of_w13_and_no_w2(tmp_path):
+    """6:10:6 / 1:0:1 over nvme0 : nvme4 : nvme2: root 1 (the SPCC) reads one sub-read per row, inside w13, about 10/22
+    of it; the Samsungs read the rest of w13 and half of w2 each."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=MIRROR3, hidden=256, inter=512)
+    w13_end, at = _split_at(s.tables)
+    layers, experts = s.tables.extents.shape[:2]
+    for row in range(layers):
+        for expert in range(experts):
+            subs, _ = piece_geometry(s.tables, row, expert, two_span=True, span_weights=SPCC13)
+            spcc = [sub for sub in subs if sub["part"] == 1]
+            assert len(spcc) == 1 and spcc[0]["k"] == 0
+            assert spcc[0]["dest"] > 0 and spcc[0]["dest"] + spcc[0]["length"] <= w13_end
+            assert abs(spcc[0]["length"] - at * 10 / 22) <= 2 * PAGE
+            assert sorted(sub["part"] for sub in _span_subs(subs, 1)) == [0, 2]
+
+
+@pytest.mark.parametrize("credit", [0, 1])
+def test_with_span_weights_every_root_still_reads_w13_first_and_rows_land_exact(tmp_path, credit):
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=MIRROR3, hidden=256, inter=512)
+    _, at = _split_at(s.tables)
+    experts, slots = [4, 1, 2, 0], [0, 1, 2, 3]
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, log, info, record = read_rows_sqes(
+        s.tables, 1, experts, slots, piece_stream=True, two_span_rows=0b1011, max_outstanding=credit,
+        span_weights=SPCC13,
+    )
+    assert result == 1
+    rows = _rows_sqes(log, s.tables, slots)
+    for o in (0, 1, 3):
+        first = [index for index, _, dest, _ in rows[o] if dest < at]
+        second = [index for index, _, dest, _ in rows[o] if dest >= at]
+        assert first and second and max(first) < min(second), (o, rows[o])
+    split._assert_rows(s, 1, experts, slots)
+
+
+def test_with_span_weights_w13_is_reported_only_once_every_first_span_piece_landed(tmp_path):
+    """The SPCC's one w13 piece (root 1, the first span's sub-read 0) held to the last, slots poisoned: w13 is reported
+    with the reference bytes in place."""
+    s = ram_miss_setup(tmp_path, capacity=8, mirror_weights=MIRROR3, hidden=256, inter=512)
+    experts, slots, ref_slots = [4, 1, 2], [0, 1, 2], [5, 6, 7]
+    reference = _reference(s, experts, ref_slots)
+    out = read_rows_two_span(
+        s.tables, 1, experts, slots, reference=reference, ref_slots=ref_slots, two_span_rows=0b111, poison=True,
+        hold_ordinal=0, part=1, sub=0, span_weights=SPCC13,
+    )
+    assert out["result"] == 1 and out["reported"] == 3 and out["differed"] == 0, out
     split._assert_rows(s, 1, experts, slots)
 
 
@@ -275,7 +408,7 @@ def _sums(s, expert):
     return total(FIRST), total(SECOND)
 
 
-def _host(tmp_path, *, two_stage, weights=(1.0, 1.0, 1.0)):
+def _host(tmp_path, *, two_stage, weights=(1.0, 1.0, 1.0), span_weights=None):
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=weights, hidden=256, inter=512)
     page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=3)
@@ -290,7 +423,7 @@ def _host(tmp_path, *, two_stage, weights=(1.0, 1.0, 1.0)):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     host.enable_cpu_experts(host.test_kernel_address(), _split(n2=2), _cores(), x_rows, out_rows, threads=2,
-                            two_stage=two_stage)
+                            two_stage=two_stage, two_stage_weights=span_weights)
     host.set_cpu_layer(ROW, slab_layer(s, ROW))
     return s, host, ChainSim(host, page, s.slabs), out_rows
 
@@ -320,13 +453,15 @@ def _assert_sums_and_part_one(s, host, req, out_rows):
     return calls
 
 
-def test_a_two_stage_cpu_miss_starts_on_w13_and_reads_w2_only_after_it_landed(tmp_path):
+@pytest.mark.parametrize("weights, span_weights", [((1.0, 1.0, 1.0), None), (MIRROR3, SPCC13)],
+                         ids=["mirror", "spcc13"])
+def test_a_two_stage_cpu_miss_starts_on_w13_and_reads_w2_only_after_it_landed(tmp_path, weights, span_weights):
     """Two CPU misses, their w2 held 200 ms after their w13 landed, every slot poisoned until read. The CPU jobs are
     staged and start before w2 lands (they wait for it, the counters show the wait), yet each forward sees the
     reference w13 at its start and the reference w2 after its wait, and part 1 sums both. Mutants: the stage-two wait
     returns at once -- red on the w2 sums and the wait; the tier never sends a job before its row is whole -- red on
     staged and the wait."""
-    s, host, sim, out_rows = _host(tmp_path, two_stage=True)
+    s, host, sim, out_rows = _host(tmp_path, two_stage=True, weights=weights, span_weights=span_weights)
     try:
         req = _serve_two_cpu_misses(s, host, sim, poison=True, suffix_delay_ns=SLOW_W2_NS)
         calls = _assert_sums_and_part_one(s, host, req, out_rows)
@@ -423,3 +558,20 @@ def test_the_watchdog_still_aborts_a_hung_w2_read_while_its_job_waits(tmp_path):
         print("reached")
     """, timeout_s=25)
     assert_aborted(result, "stayed in service")
+
+
+def test_span_weights_are_checked_at_enable(tmp_path):
+    """A weight list that names another root count, or a span with no weight, is refused when the CPU experts are
+    enabled, not at the first miss."""
+    s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0, 1.0), hidden=256, inter=512)
+    x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
+    out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
+    for bad, why in [(((1.0, 1.0), (1.0, 1.0, 1.0)), "one per mirror root"), (((1.0, 1.0, 1.0), (0.0, 0.0, 0.0)), "")]:
+        host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
+        try:
+            host.enable_copy_engine(-1)
+            with pytest.raises(Exception, match=why or "no weight"):
+                host.enable_cpu_experts(host.test_kernel_address(), NO_SPLIT, _cores(), x_rows, out_rows, threads=2,
+                                        two_stage=True, two_stage_weights=bad)
+        finally:
+            host.stop()

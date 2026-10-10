@@ -375,6 +375,28 @@ def test_every_arm_but_the_two_stage_pins_it_off_against_an_exported_shell(monke
     ab = _ab()
     monkeypatch.setenv(TWO_STAGE, "1")
     for arm in ab.ARMS:
-        want = "1" if arm == "dspark-both-misscut-twostage" else "0"
+        want = "1" if arm.startswith("dspark-both-misscut-twostage") else "0"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[TWO_STAGE] == want, arm
+
+
+SPAN = ("SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS")
+
+
+def test_the_spcc13_arm_is_the_two_stage_arm_with_the_spcc_on_w13_only():
+    ab = _ab()
+    t, c = ab.ARMS["dspark-both-misscut-twostage"][0], ab.ARMS["dspark-both-misscut-twostage-spcc13"][0]
+    assert (c[SPAN[0]], c[SPAN[1]]) == ("6:10:6", "1:0:1")  # nvme0 : nvme4 (SPCC) : nvme2
+    assert {k: v for k, v in c.items() if k not in SPAN} == {k: v for k, v in t.items() if k not in SPAN}
+    assert ab.ARMS["dspark-both-misscut-twostage-spcc13"][1] is True
+    assert ab.REFERENCE["dspark-both-misscut-twostage-spcc13"] == "dspark-both-misscut"
+
+
+def test_every_arm_but_spcc13_pins_the_span_weights_unset_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    for name in SPAN:
+        monkeypatch.setenv(name, "1:1:1")
+    for arm in ab.ARMS:
+        want = ("6:10:6", "1:0:1") if arm == "dspark-both-misscut-twostage-spcc13" else ("", "")
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert (overrides[SPAN[0]], overrides[SPAN[1]]) == want, arm
