@@ -69,7 +69,7 @@ def _post_target(draft):
 
 def _kinds():
     """The fake's calls in order: 'draft' (a stage's layer, capacity >= CAPACITY) or 'target'."""
-    width = 6 + 2 * 8
+    width = 9 + 2 * 8
     count = int(_m().expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
     out = torch.zeros((count, width), dtype=torch.float64)
     _m().expert_stream_test_kernel_calls(out)
@@ -137,7 +137,7 @@ if when in ("stop", "slow"):
             done = int(areas.channel[areas.wire.done : areas.wire.done + 8].view(torch.int64)[0]) & 0xFFFFFFFF
             print("draft done" if done == 1 else "draft not done", flush=True)
         else:
-            width = 6 + 2 * 8
+            width = 9 + 2 * 8
             count = int(m.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
             calls = torch.zeros((count, width), dtype=torch.float64)
             m.expert_stream_test_kernel_calls(calls)
