@@ -338,12 +338,42 @@ def test_the_prefetch_miss_cut_arm_is_the_gpu_prefetch_arm_with_the_cut_on():
     assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut"] == "dspark-both"
 
 
+IDLE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE"
+IDLE_DEADLINE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US"
+
+
+def test_the_idle_drive_arm_is_the_prefetch_miss_cut_arm_with_idle_drive_reads_against_the_miss_cut_arm():
+    """Design 2026-10-09-dsv41-drive-aware-reads change (2): compared with dspark-both-misscut, the same arm without
+    the prefetch, so the prefetch's net effect with idle-drive reads is what the A/B reads."""
+    ab = _ab()
+    a, c = ab.ARMS["dspark-both-prefetch-gpu-misscut"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut-idle"][0]
+    assert (c[IDLE], c[IDLE_DEADLINE]) == ("1", "4000")
+    assert {k: v for k, v in c.items() if k != IDLE} == {k: v for k, v in a.items() if k != IDLE}
+    assert ab.ARMS["dspark-both-prefetch-gpu-misscut-idle"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut-idle"] == "dspark-both-misscut"
+
+
+def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv(IDLE, "1")
+    monkeypatch.setenv(IDLE_DEADLINE, "9")
+    for arm in ab.ARMS:
+        want = ("1" if arm == "dspark-both-prefetch-gpu-misscut-idle" else "0", "4000")
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert (overrides[IDLE], overrides[IDLE_DEADLINE]) == want, arm
+
+
+def test_the_summary_keeps_the_idle_drive_counters():
+    ab = _ab()
+    assert {"spec_deferred", "spec_abandoned", "spec_boosted", "spec_moved_root"} <= set(ab.RAM_KEYS)
+
+
 def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX", "5")
     for arm in ab.ARMS:
-        want = MISS_CUT if arm.endswith("-misscut") else {
+        want = MISS_CUT if "-misscut" in arm else {
             "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert {k: overrides[k] for k in want} == want, arm

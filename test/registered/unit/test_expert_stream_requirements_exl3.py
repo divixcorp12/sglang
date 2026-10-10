@@ -786,6 +786,25 @@ def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_pa
         _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(tmp_path / "missing.json"))
 
 
+def test_idle_drive_speculative_reads_default_off_with_a_4_ms_deadline():
+    """Off until its served A/B is accepted (design 2026-10-09-dsv41-drive-aware-reads, change (2))."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get() is False
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() == 4000
+
+
+def test_idle_drive_reads_need_the_prefetch_and_a_bounded_deadline(model_dir):
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    _gate(args, **on)
+    _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=100_000)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    for deadline in (0, 100_001):
+        with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US must be in"):
+            _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=deadline)
+
+
 THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
 
 
