@@ -125,8 +125,8 @@ def test_a_faulted_idle_drive_read_fails_without_abandoning_and_leaves_the_load_
 # ---- The tier: the speculative thread on its own reader ----
 
 
-def _rig(tmp_path, *, deadline_s, delay_s=0.0, per_token=1, per_layer=1):
-    rig = prefetch_rig(tmp_path, mirror_weights=(1.0,) * ROOTS)
+def _rig(tmp_path, *, deadline_s, delay_s=0.0, per_token=1, per_layer=1, rows=2):
+    rig = prefetch_rig(tmp_path, mirror_weights=(1.0,) * ROOTS, rows=rows)
     enable(rig, LOGITS, per_token=per_token, per_layer=per_layer, idle_deadline_s=deadline_s)
     if delay_s:
         rig.host.inject_spec(delay_s=delay_s)
@@ -149,14 +149,15 @@ def _pool(host, row):
 
 def test_a_demand_is_served_while_a_slowed_idle_drive_read_holds_a_drive(tmp_path):
     """The inverse of the shared reader's turn: the demand reads beside the speculative piece in flight (at most one
-    piece shares its drive) instead of waiting for the whole row."""
-    rig = _rig(tmp_path, deadline_s=1.0, delay_s=0.5)
+    piece shares its drive) instead of waiting for the whole row. The demand is of row 2, neither the job's source nor
+    its target, so the job stays live."""
+    rig = _rig(tmp_path, deadline_s=1.0, delay_s=0.5, rows=3)
     try:
         trigger(rig)
         assert _until(lambda: rig.host.counters()["spec_issued"] == 1)
         assert _until(lambda: sum(r["spec_reads"] for r in rig.host.drive_load()["roots"]) == 1)
         start = time.monotonic()
-        req = rig.sim.post(1, [3])  # a GPU miss of row 1, not the pick
+        req = rig.sim.post(2, [3])
         assert rig.sim.wait_served(req, timeout_s=5.0)
         waited = time.monotonic() - start
         c = rig.host.counters()
