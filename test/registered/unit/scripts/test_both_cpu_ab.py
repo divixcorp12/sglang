@@ -353,7 +353,28 @@ def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkey
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX", "5")
     for arm in ab.ARMS:
-        want = MISS_CUT if arm.endswith("-misscut") else {
+        want = MISS_CUT if "-misscut" in arm else {
             "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert {k: overrides[k] for k in want} == want, arm
+
+
+TWO_STAGE = "SGLANG_DSV41_CPU_TWO_STAGE"
+
+
+def test_the_two_stage_arm_is_the_miss_cut_arm_with_the_two_stage_cpu_miss_on():
+    ab = _ab()
+    a, t = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-misscut-twostage"][0]
+    assert t[TWO_STAGE] == "1"
+    assert {k: v for k, v in t.items() if k != TWO_STAGE} == {k: v for k, v in a.items() if k != TWO_STAGE}
+    assert ab.ARMS["dspark-both-misscut-twostage"][1] is True
+    assert ab.REFERENCE["dspark-both-misscut-twostage"] == "dspark-both-misscut"
+
+
+def test_every_arm_but_the_two_stage_pins_it_off_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv(TWO_STAGE, "1")
+    for arm in ab.ARMS:
+        want = "1" if arm == "dspark-both-misscut-twostage" else "0"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[TWO_STAGE] == want, arm

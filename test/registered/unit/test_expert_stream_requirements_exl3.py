@@ -467,6 +467,20 @@ def test_the_default_split_miss_cut_does_not_refuse_a_launch_without_cpu_experts
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
 
 
+def test_the_cpu_two_stage_needs_cpu_experts(model_dir):
+    """SGLANG_DSV41_CPU_TWO_STAGE splits a CPU miss's read and forward in two; without CPU experts there is no CPU
+    miss to split, so a set flag is a launch typo. With CPU experts it passes, and off passes either way."""
+    launch = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    _gate(launch, **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_TWO_STAGE=True)
+    _gate(launch, SGLANG_DSV41_CPU_TWO_STAGE=False)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_TWO_STAGE needs SGLANG_DSV41_CPU_EXPERTS=1"):
+        _gate(launch, SGLANG_DSV41_CPU_TWO_STAGE=True)
+
+
+def test_the_cpu_two_stage_is_off_by_default():
+    assert envs.SGLANG_DSV41_CPU_TWO_STAGE.get() is False
+
+
 @pytest.mark.parametrize("value", ["ce", "sm"])
 def test_either_hit_copy_passes_with_cpu_experts(model_dir, value):
     """CPU completion uses the copy thread and the gate whichever way the hits are copied."""
