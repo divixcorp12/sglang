@@ -8013,6 +8013,24 @@ Before this change the overlap was 7.6 / 9.2 / 7.7 s (§33.17).
   - spread ties across drives;
   - allow 2 pieces in flight when the target drive is idle.
 
+**idle2** (`SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=1`, `SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=2`; arm
+`dspark-both-prefetch-gpu-misscut-idle2`, `codex/dsv41-spec-idle-drive` at `a1f9bd023c`). Run alone
+(`idle2-run-20261010-004004`):
+- Sessions: 112.7, 62.8, 56.4, 118.3, 78.6, 80.8, 71.5, 113.6 (median 79.72), accept length 3.58.
+- Faster than the idle arm in 7 of 8 sessions. Within ±6% of the cut-only arm session by session, but that arm ran in
+  another window.
+- Abandoned 9% (idle: 35%). Boosted 56% of promotions (idle: 82%).
+- Speculative bytes per drive were even at 59 / 51 / 55 GB.
+- Demand and speculative reads overlapped for 1.8 / 2.8 / 2.2 s.
+
+**TODO: the idle2 same-window A/B** (`dspark-both-misscut` against `dspark-both-prefetch-gpu-misscut-idle2`) is
+still owed. The first attempt (`ab-idle2-20261010-012903`) has no result:
+- the cut-only arm finished normally;
+- the idle2 server then died at load with "no GPU memory for the KV cache";
+- the cause was a unit-kernel suite run alongside it without `cc-gpu.lock`. Several of those files use CUDA.
+
+Rerun the pair from the worktree at `a1f9bd023c`, with nothing else on the GPU.
+
 **Run-lock fix** (`codex/dsv41-run-locks`, `5388561c06`..`1c2cb85df9`, not merged).
 - The problem: a capture launched as `flock rowimg-disk.lock bash run.sh` deadlocked on its own parent.
   `spec_margin_capture.py` flocked the same file again, which is a second owner, and waited silently for 35 minutes.
