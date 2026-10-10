@@ -7,7 +7,7 @@
 //
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
 //              publish_piece: one synchronous read through the reader, with traces and injected faults;
-//              read_rows_drive_load: two readers over one DriveLoad
+//              read_rows_drive_load: two readers over one DriveLoad (fault word 20: the dynamic root choice)
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
 //              trace_clock_reads, spec_place, spec_pump, inject_spec
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
@@ -314,6 +314,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
               row_images),
           direct != 0);
       if (f[22] != 0) reader.set_piece_stream(true);
+      reader.set_mirror_caps(mirror_caps_of(f));
       reader.set_fixed_chunk_cap(f[28]);
       reader.set_leg_cut_cap(f[31]);
       if (!reader.open()) return;
@@ -355,7 +356,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // with sub-reads in flight. `out` (4 + 3 * kDriveLoadWords int64): A's result (-2 when it threw), B's (-9 when it did
   // not run), A's sub-reads in flight when B ran nested, 1 when A threw; then the DriveLoad snapshot after the nested B
   // (zeros when not nested), after A returned (or threw), and after B (the same as the second when B ran nested). Both
-  // builds: ProdBuild refuses a fault, as read_rows_traced does.
+  // builds: ProdBuild refuses a fault, as read_rows_traced does. Fault word 20's mirror caps go to both readers.
+  // `preload` (2 * kMaxDrives int64: demand reads, then bytes, per root) is added to the load as another reader's reads
+  // in flight before A reads, and taken back once A returns (or throws), before the snapshot after A.
   static void read_rows_drive_load(
       TensorView extents,
       TensorView starts,
@@ -377,6 +380,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       int64_t step,
       TensorView fault,
       int64_t mode,
+      TensorView preload,
       TensorView out) {
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
@@ -388,6 +392,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
     verify_named(
         "out", TensorMatcher({4 + 3 * kDriveLoadWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    verify_named(
+        "preload", TensorMatcher({2 * kMaxDrives}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), preload);
     check_fault_words<Layout>(fault);
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     auto* o = static_cast<int64_t*>(out.data_ptr());
@@ -411,6 +417,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     Source a(tables(), direct != 0), b(tables(), direct != 0);
     for (Source* reader : {&a, &b}) {
       if (f[22] != 0) reader->set_piece_stream(true);
+      reader->set_mirror_caps(mirror_caps_of(f));
       reader->set_drive_load(&load);
     }
     if (!a.open() || !b.open()) {
@@ -435,12 +442,20 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       load.snapshot(o + 4, parts);
     };
     const size_t at = f[18] > 0 ? static_cast<size_t>(f[18]) : static_cast<size_t>(step);
+    const auto* pre = static_cast<const int64_t*>(preload.data_ptr());
+    auto add_preload = [&](int sign) {
+      int64_t now = 0;
+      for (int q = 0; q < kMaxDrives; ++q)
+        load.change(q, kDemandRead, static_cast<int>(sign * pre[q]), sign * pre[kMaxDrives + q], now);
+    };
+    add_preload(1);
     try {
       o[0] = a.read(row, ids_of(experts), slots_of(slots), at, abandon_after(f[17]), nullptr, nullptr, SIZE_MAX, progress);
     } catch (const std::exception&) {
       o[0] = -2;
       o[3] = 1;
     }
+    add_preload(-1);
     load.snapshot(o + 4 + kDriveLoadWords, parts);
     if (o[1] == -9 && !then_ids.empty()) read_b();
     load.snapshot(o + 4 + 2 * kDriveLoadWords, parts);

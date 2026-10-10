@@ -11,7 +11,8 @@ whose in-flight counts were all zero.
 ``drive-load SERVER_LOG`` needs no sampler: it reads the last ``exl3 RAM miss drive load {json}`` line a host writes at
 stop (the reader's own per-root accounting, host/drive_load.h, which polled reads leave out of /sys's in_flight) and
 reports per root, over the host's lifetime, the share of time demand reads, speculative reads, and both at once were in
-flight, and the bytes each kind landed.
+flight, the bytes each kind landed, and the sub-reads the dynamic root choice (SGLANG_MOE_EXPERT_MIRROR_DYNAMIC) moved
+away from and to it.
 
 Usage: drive_busy.py sample OUT [--devices nvme0n1,nvme1n1,nvme2n1] [--interval-ms 5]
        drive_busy.py analyze SAMPLES 'EVENTS.*.jsonl' [--json OUT]
@@ -153,6 +154,9 @@ def drive_load_report(text: str) -> dict:
             "spec_gb": round(r["spec_bytes"] / 1e9, 3),
             "bytes_share": round((r["demand_bytes"] + r["spec_bytes"]) / total, 4),
             "in_flight_at_log": r["demand_reads"] + r["spec_reads"],
+            # Sub-reads SGLANG_MOE_EXPERT_MIRROR_DYNAMIC sent away from / to this root (0 in older logs).
+            "moved_from": r.get("moved_from", 0),
+            "moved_to": r.get("moved_to", 0),
         })
     return {"lines": len(lines), "elapsed_s": round(elapsed / 1e9, 3), "clock_reads": load["clock_reads"],
             "roots": roots}

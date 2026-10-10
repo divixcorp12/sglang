@@ -1,9 +1,10 @@
 // DriveLoad: the RAM tier's per-drive in-flight accounting, shared by every reader of the tier (design
-// docs/superpowers/specs/2026-10-09-dsv41-drive-aware-reads-design.md, section 2). Observe-only: nothing reads it to
-// decide a read yet.
+// docs/superpowers/specs/2026-10-09-dsv41-drive-aware-reads-design.md, section 2). With
+// SGLANG_MOE_EXPERT_MIRROR_DYNAMIC a reader also decides with it: each sub-read picks its root by the roots' reads and
+// bytes in flight (ReaderCore::choose_root, change (3)), and the load counts those redirects.
 //
 //   DriveSlot    one mirror root's counts, one cache line: both NUMA groups' threads write it
-//   DriveLoad    a slot per root, the tier's clock origin and its clock-read count
+//   DriveLoad    a slot per root, the redirect counts, the tier's clock origin and its clock-read count
 //
 // Key: the root index, `file % parts`, never st_dev. Every row-image file of root q is file row * parts + q
 // (exl3_ram_miss.py), and the test fixtures put every root under one tmp_path, where an st_dev key would fold them into
@@ -46,8 +47,8 @@ static_assert(sizeof(DriveSlot) == 64, "a drive slot is one cache line");
 // The words of DriveLoad::snapshot: a header, then kDriveFields per root for kMaxDrives roots (roots past `roots` are
 // zero). Python's decode_drive_load (expert_stream_transport.py) reads the same layout.
 constexpr int kDriveHeader = 3;  // elapsed ns since the origin, clock reads, roots
-constexpr int kDriveFields = 9;  // demand reads, spec reads, demand/spec bytes in flight, demand/spec bytes landed,
-                                 // demand/spec/overlap busy ns
+constexpr int kDriveFields = 11;  // demand reads, spec reads, demand/spec bytes in flight, demand/spec bytes landed,
+                                  // demand/spec/overlap busy ns, sub-reads redirected away from / to the root
 constexpr int kDriveLoadWords = kDriveHeader + kMaxDrives * kDriveFields;
 
 class DriveLoad {
@@ -87,6 +88,23 @@ class DriveLoad {
     if (bytes > 0) slots_[root].done[kind].fetch_add(bytes, std::memory_order_relaxed);
   }
 
+  // Root `root`'s sub-reads in flight, demand and speculative, and its bytes in flight (relaxed: another reader may
+  // change them as they are read; a stale value costs one choice, not correctness).
+  int64_t reads_in_flight(int root) const {
+    const int64_t reads = slots_[root].reads.load(std::memory_order_relaxed);
+    return demand_of(reads) + spec_of(reads);
+  }
+  int64_t bytes_in_flight(int root) const {
+    const DriveSlot& s = slots_[root];
+    return s.inflight[0].load(std::memory_order_relaxed) + s.inflight[1].load(std::memory_order_relaxed);
+  }
+
+  // A sub-read of root `from` was sent to root `to` (ReaderCore::choose_root).
+  void redirected(int from, int to) {
+    moved_[from][0].fetch_add(1, std::memory_order_relaxed);
+    moved_[to][1].fetch_add(1, std::memory_order_relaxed);
+  }
+
   // Writes kDriveLoadWords words: the header, then each of the first `roots` roots' fields (relaxed reads; exact once
   // every reader is idle).
   void snapshot(int64_t* out, int64_t roots) const {
@@ -110,6 +128,8 @@ class DriveLoad {
       const bool up[3] = {d, p, d && p};
       for (int k = 0; k < 3; ++k)
         f[6 + k] = std::clamp<int64_t>(s.busy[k].load(std::memory_order_relaxed) + (up[k] ? now : 0), 0, now);
+      f[9] = moved_[q][0].load(std::memory_order_relaxed);
+      f[10] = moved_[q][1].load(std::memory_order_relaxed);
     }
   }
 
@@ -125,6 +145,7 @@ class DriveLoad {
   }
 
   DriveSlot slots_[kMaxDrives];
+  alignas(64) std::atomic<int64_t> moved_[kMaxDrives][2]{};  // per root: sub-reads redirected away from it, to it
   const int64_t origin_;
   alignas(64) std::atomic<int64_t> clock_reads_{0};
 };

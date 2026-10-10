@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Optional, Sequence
 
 # The moe package already defines PAGE_BYTES = 4096 in expert_host_arena.py and
 # expert_host_tier.py, but both pull in torch at import time. This module must
@@ -123,3 +124,40 @@ class StaticSplitPolicy(SplitPolicy):
 
     def plan(self, length: int) -> ReadSplit:
         return ReadSplit(length=length, weights=self._weights)
+
+
+# The dynamic root choice's settings (design 2026-10-09-dsv41-drive-aware-reads, change (3)): the reader picks each
+# sub-read's root late, skipping roots at their in-flight cap. Its drive load counts at most this many roots.
+MAX_DYNAMIC_ROOTS = 4
+_DYNAMIC = "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC"
+_CAPS = "SGLANG_MOE_EXPERT_MIRROR_CAPS"
+
+
+def mirror_caps(dynamic: bool, caps: str, dirs: str) -> Optional[tuple[int, ...]]:
+    """The in-flight cap per mirror root of ``SGLANG_MOE_EXPERT_MIRROR_CAPS`` when
+    ``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC`` is on, else None.
+
+    ``caps`` is comma-separated, one positive integer per root of ``dirs``
+    (``SGLANG_MOE_EXPERT_MIRROR_DIRS``, ``os.pathsep``-separated), in that order. Caps
+    set with the choice off are refused, since they would be silently ignored.
+    """
+    if not dynamic:
+        if caps.strip():
+            raise ValueError(f"{_CAPS} is set but {_DYNAMIC} is off; the caps would be silently ignored")
+        return None
+    if not dirs:
+        raise ValueError(f"{_DYNAMIC}=1 needs SGLANG_MOE_EXPERT_MIRROR_DIRS: it chooses among the mirror roots")
+    roots = len(dirs.split(os.pathsep))
+    if roots > MAX_DYNAMIC_ROOTS:
+        raise ValueError(f"{_DYNAMIC}=1 chooses among at most {MAX_DYNAMIC_ROOTS} mirror roots, not {roots}")
+    if not caps.strip():
+        raise ValueError(f"{_DYNAMIC}=1 needs {_CAPS}: one positive in-flight cap per mirror root, such as 4,2,4")
+    values = []
+    for token in caps.split(","):
+        token = token.strip()
+        if not token.isdigit() or int(token) < 1:
+            raise ValueError(f"{_CAPS}={caps!r}: {token!r} is not a positive integer")
+        values.append(int(token))
+    if len(values) != roots:
+        raise ValueError(f"{_CAPS} lists {len(values)} caps but SGLANG_MOE_EXPERT_MIRROR_DIRS lists {roots} roots")
+    return tuple(values)

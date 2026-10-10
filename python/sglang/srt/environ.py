@@ -502,6 +502,14 @@ class Envs:
     # Colon-separated relative read shares, one per root of
     # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
     SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
+    # Pick each RAM-miss sub-read's mirror root when it is issued instead of by the
+    # static split: a root whose sub-reads in flight reach its cap in
+    # SGLANG_MOE_EXPERT_MIRROR_CAPS is skipped, the fewest bytes in flight wins, and
+    # with every root capped a sub-read keeps its own root.
+    SGLANG_MOE_EXPERT_MIRROR_DYNAMIC = EnvBool(False)
+    # Comma-separated in-flight sub-read caps, one positive integer per root of
+    # SGLANG_MOE_EXPERT_MIRROR_DIRS in its order (e.g. 4,2,4); required with DYNAMIC.
+    SGLANG_MOE_EXPERT_MIRROR_CAPS = EnvStr("")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
     # Copy all host expert rows into registered memory (replaces the pinned LRU).
     SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)

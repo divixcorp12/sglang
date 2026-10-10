@@ -148,6 +148,59 @@ class ReaderCore {
     kind_ = kind;
   }
 
+  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (design 2026-10-09-dsv41-drive-aware-reads, change (3)): `caps`, one positive
+  // in-flight cap per mirror root, turns the dynamic root choice on (choose_root); empty turns it off, and the reader
+  // then reads every sub-read from its own root, as before. Piece streaming only (set it first). Every root holds
+  // every row's image at the same offsets, so a sub-read can read any root's file of its row: this builds that mirror
+  // file map and refuses the tables when any row's files are not a full mirror set (the same source and size on every
+  // root, the root being file % parts). Call it on an idle reader.
+  void set_mirror_caps(std::span<const int64_t> caps) {
+    const std::string prefix = error_prefix<Layout>() + "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC: ";
+    if (caps.empty()) {
+      dynamic_ = false;
+      alt_file_.clear();
+      return;
+    }
+    const int64_t parts = t_.parts;
+    if (!piece_stream_) throw std::runtime_error(prefix + "the dynamic root choice needs piece streaming");
+    if (static_cast<int64_t>(caps.size()) != parts) {
+      throw std::runtime_error(
+          prefix + "needs one in-flight cap per mirror root: " + std::to_string(caps.size()) + " caps for " +
+          std::to_string(parts) + " mirror roots");
+    }
+    if (parts > kMaxDrives)
+      throw std::runtime_error(prefix + "the drive load counts at most " + std::to_string(kMaxDrives) + " roots");
+    for (int64_t cap : caps)
+      if (cap < 1) throw std::runtime_error(prefix + "every in-flight cap must be positive, got " + std::to_string(cap));
+    const int64_t files = static_cast<int64_t>(t_.paths.size());
+    auto refuse = [&](int64_t file, const std::string& why) {
+      throw std::runtime_error(
+          prefix + "file " + t_.paths[static_cast<size_t>(file)] + " is not a full mirror set: " + why);
+    };
+    if (files % parts != 0) refuse(files - 1, "the file count is not a multiple of the mirror roots");
+    for (size_t i = 0; i < t_.extents.size(); ++i) {
+      const Read& e = t_.extents[i];
+      if (e.length > 0 && e.file % parts != static_cast<int64_t>(i) % parts)
+        refuse(e.file, "part " + std::to_string(static_cast<int64_t>(i) % parts) + " reads another root's file");
+    }
+    std::vector<int64_t> alt(static_cast<size_t>(files * parts));
+    for (int64_t f = 0; f < files; ++f) {
+      for (int64_t q = 0; q < parts; ++q) {
+        const int64_t other = f - f % parts + q;
+        if (t_.source_paths[static_cast<size_t>(other)] != t_.source_paths[static_cast<size_t>(f)])
+          refuse(other, "it copies " + t_.source_paths[static_cast<size_t>(other)] + ", not " +
+                            t_.source_paths[static_cast<size_t>(f)]);
+        if (t_.file_sizes[static_cast<size_t>(other)] != t_.file_sizes[static_cast<size_t>(f)])
+          refuse(other, "its size differs from its mirror's");
+        alt[static_cast<size_t>(f * parts + q)] = other;
+      }
+    }
+    alt_file_ = std::move(alt);
+    for (int64_t q = 0; q < parts; ++q)
+      caps_[q] = caps[static_cast<size_t>(q)];
+    dynamic_ = true;
+  }
+
   // Test only: the sub-reads this reader counts in flight now, its share of the DriveLoad (0 between reads).
   int64_t drive_share_reads() const {
     int64_t reads = 0;
@@ -1174,9 +1227,8 @@ class ReaderCore {
       ++bank_live_[bank];
       queue_push(index);
       on_trace([&](StageRecord& t) {
-        const size_t drive = file_drive_[extent->file];
-        t.drive_dev[drive] = drive_dev_[drive];
-        t.drive_extents[drive] += 1;
+        // With the dynamic root choice the file is decided later, at first preparation, and counted there.
+        if (!dynamic_) count_drive_extent(t, extent->file);
         const int64_t trace_slot = t.extents++;
         if (trace_slot < kTraceExtents) {
           t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
@@ -1261,17 +1313,30 @@ class ReaderCore {
     while (c.queue_count > 0) {
       const uint32_t index = queue_[c.queue_head];
       ExtentDesc& d = descs_[index];
-      if (d.legs == 0) plan_legs(index);
+      if (d.legs == 0) {
+        // First preparation: with the dynamic root choice, the sub-read's root is picked now, from the load as it is
+        // when the read is issued, before its legs are cut by that root's device limits.
+        if (dynamic_) choose_root(index);
+        plan_legs(index);
+      }
       // First attempt: nothing landed and nothing retried (a descriptor is re-queued only by a short or retried leg).
       const bool fresh = d.done == 0 && d.retries == 0;
       Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
       unsigned n = 0;
       for (unsigned l = 0; l < d.legs; ++l)
         n += legs[l].state == LegState::Idle ? 1u : 0u;
-      if (!(c.pending + n <= c.capacity || c.pending == 0)) break;
+      bool room = c.pending + n <= c.capacity || c.pending == 0;
       if constexpr (requires(const Reader& reader) { reader.sq_space(); }) {
-        if (n > 1 && io_.sq_space() < n) break;
+        room = room && !(n > 1 && io_.sq_space() < n);
       }
+      if (!room) {
+        // Not issued: a fresh sub-read under the dynamic choice chooses again when credit lets it go, so the choice
+        // sees the load at issue, not the load of the turn it first waited at the queue head.
+        if (dynamic_ && fresh) d.legs = 0;
+        break;
+      }
+      // Issued: the dynamic choice is final, so it is counted now (once: only a fresh sub-read is issued first).
+      if (dynamic_ && fresh) note_root(index);
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
       d.queued = false;
@@ -1489,7 +1554,9 @@ class ReaderCore {
       const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
       const bool leg_matches = fault.leg < 0 || static_cast<int64_t>(l) == fault.leg;
       if (fault.cqe_error != 0 && metric(&ReaderMetrics::cqes) == fault.cqe_call && leg_matches) res = -fault.cqe_error;
-      if (fault.part >= 0 && !faults_.part_fired && static_cast<int64_t>(part) == fault.part && leg_matches &&
+      const bool part_matches = fault.part < 0 || static_cast<int64_t>(part) == fault.part;
+      const bool root_matches = fault.root < 0 || DriveLoad::root_of(d.read->file, t_.parts) == fault.root;
+      if ((fault.part >= 0 || fault.root >= 0) && !faults_.part_fired && part_matches && root_matches && leg_matches &&
           (fault.sub < 0 || static_cast<int64_t>(index % subs_) == fault.sub) &&
           (fault.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault.ordinal)) {
         if (fault.part_error != 0) {
@@ -1707,6 +1774,48 @@ class ReaderCore {
     io_.drain(pending);
   }
 
+  // The dynamic root choice for piece-stream descriptor `index`, at its first preparation (set_mirror_caps), and again
+  // at each refill turn while it waits for credit (refill undoes an unissued plan). A root is
+  // open while its sub-reads in flight, demand and speculative, over every reader of the drive load, are below its
+  // cap. Among the open roots the one with the fewest bytes in flight wins; a tie goes to the sub-read's own root,
+  // then to the lowest root. With every root at its cap the sub-read keeps its own root: the choice never blocks or
+  // waits. Only the file changes: every root holds the row's image at the same offsets and size (set_mirror_caps
+  // checked), so the offset, length, destination, expectation and pieces stay the static geometry's.
+  void choose_root(uint32_t index) {
+    Read& read = sub_reads_[index];
+    const int64_t parts = t_.parts;
+    // The sub-read's own root is its descriptor's part (it may have chosen another before, while it waited for credit).
+    const int own = static_cast<int>((index / subs_) % static_cast<size_t>(parts));
+    read.file = alt_file_[static_cast<size_t>(read.file * parts + own)];
+    int best = -1;
+    int64_t best_bytes = 0;
+    for (int q = 0; q < static_cast<int>(parts); ++q) {
+      if (load_->reads_in_flight(q) >= caps_[q]) continue;
+      const int64_t bytes = load_->bytes_in_flight(q);
+      if (best < 0 || bytes < best_bytes || (bytes == best_bytes && q == own)) {
+        best = q;
+        best_bytes = bytes;
+      }
+    }
+    if (best >= 0 && best != own) read.file = alt_file_[static_cast<size_t>(read.file * parts + best)];
+  }
+
+  // The dynamic choice of descriptor `index` is final (its first issue): counts a redirect and the trace's extent.
+  void note_root(uint32_t index) {
+    const int64_t file = sub_reads_[index].file;
+    const int own = static_cast<int>((index / subs_) % static_cast<size_t>(t_.parts));
+    const int root = DriveLoad::root_of(file, t_.parts);
+    if (root != own) load_->redirected(own, root);
+    on_trace([&](StageRecord& t) { count_drive_extent(t, file); });
+  }
+
+  // The trace's per-drive extent count: one more extent reads `file`.
+  void count_drive_extent(StageRecord& t, int64_t file) {
+    const size_t drive = file_drive_[file];
+    t.drive_dev[drive] = drive_dev_[drive];
+    t.drive_extents[drive] += 1;
+  }
+
   // Adds `reads` sub-reads and `bytes` bytes of descriptor `d`'s root to the shared drive load, and to this reader's
   // share of it.
   void count_drive(const ExtentDesc& d, int reads, int64_t bytes) {
@@ -1790,6 +1899,11 @@ class ReaderCore {
   int kind_ = kDemandRead;
   int64_t clock_ = 0;
   Share mine_[kMaxDrives][2] = {};
+  // The dynamic root choice (set_mirror_caps): on or off, each root's in-flight cap, and the mirror file map,
+  // alt_file_[file * parts + q] = root q's file of `file`'s row.
+  bool dynamic_ = false;
+  int64_t caps_[kMaxDrives] = {};
+  std::vector<int64_t> alt_file_;
   // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
   [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
   [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;

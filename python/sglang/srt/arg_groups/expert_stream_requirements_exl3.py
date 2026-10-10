@@ -255,6 +255,7 @@ def _check(cfg, budgets) -> None:
         _check_dspark_cpu_experts(cfg)
     _check_row_weighted_assignment()
     _check_ram_prefetch()
+    _check_mirror_caps()
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     speculative = getattr(cfg, "speculative_algorithm", None) is not None
     if cpu_experts and graph.decode.backend != Backend.BREAKABLE:
@@ -385,6 +386,18 @@ def _check_ram_prefetch() -> None:
         value = getattr(envs, name).get()
         if not 1 <= value <= high:
             raise ValueError(f"{name} must be in [1, {high}], got {value}")
+
+
+def _check_mirror_caps() -> None:
+    """``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``'s caps, one positive in-flight cap per mirror root, refused here rather
+    than when the RAM-miss service starts (exl3_read_split.mirror_caps, which the service calls too)."""
+    from sglang.srt.layers.moe.exl3_read_split import mirror_caps
+
+    mirror_caps(
+        envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get(),
+        envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get(),
+        envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get(),
+    )
 
 
 def _check_direct_residency(budgets) -> None:
