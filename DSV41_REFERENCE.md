@@ -7934,6 +7934,94 @@ Unresolved on the cap branch:
 - (c) Send speculative reads only to an idle mirror drive. This is design change (2) in
   `docs/superpowers/specs/2026-10-09-dsv41-drive-aware-reads-design.md`.
 
+### 33.18 The split cut seen per record, and speculative reads only to an idle drive (2026-10-09)
+
+Follows §33.17. Status: the split cut stays at 1 lane. The idle-drive prefetch lost about 7% against the cut alone.
+
+**The cut, per record** (`cut-timeline-20261009-221958/cut`, `dspark-both-misscut` at `4d0f5b1623`, through
+`miss_timeline.py`). It is compared with the no-cut capture `hidden-cost-20261009-141506/off`.
+
+| Forced misses on the node | 1 | 2 | 3 | 4+ |
+|---|---:|---:|---:|---:|
+| Last miss blocked behind the hit job, no cut / cut | 59% / 42% | 28% / 19% | 10% / 8% | 0-3% |
+| Mean wait behind the hit job (ms), no cut / cut | 1.13 / 0.71 | 0.46 / 0.30 | 0.14 / 0.10 | ~0.04 |
+| DMA finishes last, no cut / cut | 3% / 20% | 0% / 3% | 0% | 0% |
+| CPU idle before the last row lands (ms), no cut / cut | 0.76 / 1.82 | 1.16 / 2.67 | 1.33 / 3.33 | |
+
+- At 1 miss the cut moved the slack to the DMA. Its median time went from 1.6 to 2.9 ms, against a CPU chain end of
+  about 3.0 ms (landing at 2.36 ms plus 0.6-0.8 ms of compute).
+- A second lane would make the DMA the tail in most records, so "2 lanes at 1 miss" is not worth an A/B.
+- Do not compare per-record done times between these two captures. Records the cut never touches (4+ misses) were
+  also about 40% slower in the cut capture, because the reads were slower that night: an implementer was building
+  and testing on divix01 during it.
+
+**Speculative reads only to an idle drive** (design change (2)). Branch `codex/dsv41-spec-idle-drive` at
+`87e0c1adfb`, built on this branch plus `codex/dsv41-drive-cap`. Flag `SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE`,
+default off. Arm `dspark-both-prefetch-gpu-misscut-idle`.
+
+How it reads:
+- Each NUMA group gets a second reader for speculative rows, with its own ring.
+- A row reads from one drive with no demand read in flight, one piece (about 2.2 MB) at a time, re-checking before
+  each piece. When the drive is busy, it moves the next piece to another idle drive or defers.
+- A wait for an idle drive has a 4 ms deadline (`SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US`). A read is abandoned
+  past that deadline, or when stale after its target layer has been handled.
+- A forced miss that finds its row mid-read boosts it to full width.
+
+**A/B** (`ab-idle-drive-20261009-225856`, against `dspark-both-misscut`, same window):
+
+| | Cut only | Cut + idle-drive prefetch |
+|---|---|---|
+| ms/token median | 98.27 | 83.93 |
+| Sessions | 112.2, 60.6, 54.0, 125.4, 168.9, 84.3, 67.6, 112.3 | 124.1, 65.0, 55.1, 127.5, 83.8, 84.1, 76.4, 127.3 |
+| Accept length | 3.54 | 3.53 |
+
+- The medians mislead. The cut-only arm's session 5 (168.9) is an outlier, and the median of 8 then falls in the
+  84-112 gap.
+- Paired by session, the idle-drive arm is slower in 6 of 8, by 2-13%, even in one, and faster only in the outlier
+  session. Without that session it is about 7% slower.
+
+The prefetch's counters (server lifetime):
+
+| Counter | Value |
+|---|---:|
+| Issued | 21,638 |
+| Landed | 14,039 |
+| Abandoned | 7,599 (35%) |
+| Deferred | 7,520 |
+| Used | 8,114 |
+| Promoted | 5,421 |
+| Boosted | 4,468 (82% of promotions) |
+| Moved root | 2,569 |
+
+Demand NVMe rows over the server lifetime were 28,868, against 34,020 for the cut-only arm.
+
+Drive load:
+
+| | nvme0 | nvme4 (SPCC) | nvme2 |
+|---|---:|---:|---:|
+| Demand + speculative overlap (s) | 6.2 | 2.3 | 2.4 |
+| Speculative GB | 179 | 38 | 32 |
+| Demand busy (s) | 115 | 120 | 117 |
+
+Before this change the overlap was 7.6 / 9.2 / 7.7 s (§33.17).
+
+**Reading.**
+- The overlap fell, but the speculative reads became too slow to be ready: a third were abandoned, and most promoted
+  rows were still in flight and had to be boosted.
+- Ties for the idle drive go to the lowest-numbered root, so nvme0 carried 72% of the speculative bytes.
+- Next, tried as a single arm before any A/B:
+  - spread ties across drives;
+  - allow 2 pieces in flight when the target drive is idle.
+
+**Run-lock fix** (`codex/dsv41-run-locks`, `5388561c06`..`1c2cb85df9`, not merged).
+- The problem: a capture launched as `flock rowimg-disk.lock bash run.sh` deadlocked on its own parent.
+  `spec_margin_capture.py` flocked the same file again, which is a second owner, and waited silently for 35 minutes.
+- The fix: `benchmarks/dsv41_baseline/run_locks.take` now takes the locks in `spec_margin_capture.py`,
+  `both_cpu_ab.py`, `capture_verify.py` and `run_stall_capture.py`.
+  - It accepts a hold by one of the script's own ancestors, found through `/proc/locks`.
+  - It names any other holder before waiting.
+- Tests: `test/registered/unit/scripts/test_run_locks.py`, with a mutant that ignores the ancestor hold (red).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
