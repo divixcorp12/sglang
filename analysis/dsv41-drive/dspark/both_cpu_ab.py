@@ -121,13 +121,28 @@ ARMS["dspark-both-prefetch-gpu-cap"] = (
 )
 # Speculative reads only to an idle drive (design 2026-10-09-dsv41-drive-aware-reads, change (2)) are off in every arm
 # but the idle arm, deadline included, pinned so a shell that exports them cannot carry them into one.
-IDLE_DRIVE_OFF = {"SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "0", "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US": "4000"}
+IDLE_DRIVE_OFF = {
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "0",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "0",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "1",
+}
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(IDLE_DRIVE_OFF)
 # The GPU-prefetch miss-cut arm with each group's speculative reads on a reader of its own, one piece at a time from a
 # drive no demand reads (DSV41_REFERENCE.md 33.16 item 2: demand reads were 0.4-0.5 ms slower beside them).
 ARMS["dspark-both-prefetch-gpu-misscut-idle"] = (
     {**ARMS["dspark-both-prefetch-gpu-misscut"][0], "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "1"},
+    True,
+)
+# The idle arm with each row's pieces spread over the idle drives and two in flight (DSV41_REFERENCE.md 33.18: one
+# drive took most speculative bytes, and one piece at a time abandoned 35% of rows).
+ARMS["dspark-both-prefetch-gpu-misscut-idle2"] = (
+    {
+        **ARMS["dspark-both-prefetch-gpu-misscut-idle"][0],
+        "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "2",
+    },
     True,
 )
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
@@ -143,6 +158,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-misscut": "dspark-both",
     "dspark-both-prefetch-gpu-cap": "dspark-both",
     "dspark-both-prefetch-gpu-misscut-idle": "dspark-both-misscut",
+    "dspark-both-prefetch-gpu-misscut-idle2": "dspark-both-misscut",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (

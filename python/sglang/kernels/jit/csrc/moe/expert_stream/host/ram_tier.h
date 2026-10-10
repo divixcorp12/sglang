@@ -1103,6 +1103,10 @@ class RamTier {
     if (static_cast<int>(config.cores.size()) != groups())
       throw std::runtime_error(prefix + "one core list per NUMA group");
     if (config.idle_deadline_ns < 0) throw std::runtime_error(prefix + "the idle-drive deadline is negative");
+    if (config.idle_pieces < 1 || config.idle_pieces > RamPrefetchConfig::kMaxIdlePieces)
+      throw std::runtime_error(
+          prefix + "idle_pieces must be in [1, " + std::to_string(RamPrefetchConfig::kMaxIdlePieces) + "], got " +
+          std::to_string(config.idle_pieces));
     for (int g = 0; g < groups(); ++g)
       if (dist_.group(g).cpu == nullptr)
         throw std::runtime_error(
@@ -2484,6 +2488,8 @@ class RamTier {
     } else if (idle) {
       roots.boost = &pool_->entry(target, g, i).boost;
       roots.deadline_ns = spec_->config.idle_deadline_ns;
+      roots.spread = spec_->config.idle_spread;
+      roots.max_inflight = spec_->config.idle_pieces;
       roots.give_up = &SpecPieces::give_up;
       roots.on_piece = &SpecPieces::on_piece;
       roots.context = &hooks;

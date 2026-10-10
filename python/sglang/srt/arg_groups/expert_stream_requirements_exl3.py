@@ -372,6 +372,11 @@ def _check_ram_prefetch() -> None:
             f"SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US must be in [1, {ram_prefetch.MAX_IDLE_DEADLINE_US}], "
             f"got {deadline}"
         )
+    pieces = envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get()
+    if not 1 <= pieces <= ram_prefetch.MAX_IDLE_PIECES:
+        raise ValueError(
+            f"SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES must be in [1, {ram_prefetch.MAX_IDLE_PIECES}], got {pieces}"
+        )
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
         if scorer == "gpu":
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")

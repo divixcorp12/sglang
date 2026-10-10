@@ -467,7 +467,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // streaming is always on). `preload` (2 * kMaxDrives int64: demand reads, then bytes, per root) stands for other
   // readers' demand in flight for the whole read. With `follow`, a demand read arrives on the root of the first piece
   // once it is in flight, and stays. `boost` sets the read's boost word before it starts. `give_up_after` > 0: give_up
-  // says stop once that many pieces were issued. `out` (10 + kDriveLoadWords int64): the result (-2 when it threw),
+  // says stop once that many pieces were issued. `spread` and `pieces`: IdleRoots::spread and max_inflight. `reads`
+  // repeats the read that many times on the one reader (stopping at the first that does not return 1), as the
+  // speculative reader reads row after row; the counts below add up over them. `out` (10 + kDriveLoadWords int64): the result (-2 when it threw),
   // abandoned, boosted, deferrals, moves, the pieces issued, the most of the read's sub-reads in flight when one was
   // issued, its share still counted after it returned, the SQE count, 0; then the DriveLoad snapshot after the read,
   // with the preload and the follower taken back.
@@ -493,6 +495,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       int64_t boost,
       int64_t give_up_after,
       int64_t deadline_ns,
+      int64_t spread,
+      int64_t pieces,
+      int64_t reads,
       TensorView sqes,
       TensorView out) {
     if constexpr (!Build::kFaults) {
@@ -546,6 +551,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       IdleRoots roots;
       roots.boost = &boost_word;
       roots.deadline_ns = deadline_ns;
+      roots.spread = spread != 0;
+      roots.max_inflight = static_cast<int>(pieces);
       roots.context = &hooks;
       roots.give_up = [](void* context) {
         const auto& h = *static_cast<const Hooks*>(context);
@@ -561,6 +568,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           h.followed = root;
         }
       };
+      IdleRoots counted;  // what the reads did, added up
       const auto* pre = static_cast<const int64_t*>(preload.data_ptr());
       auto add_preload = [&](int sign) {
         int64_t now = 0;
@@ -568,22 +576,30 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           load.change(q, kDemandRead, static_cast<int>(sign * pre[q]), sign * pre[kMaxDrives + q], now);
       };
       add_preload(1);
-      try {
-        o[0] = reader.read(
-            row, ids_of(experts), slots_of(slots), kBounceRows, abandon_after(0), nullptr, nullptr, SIZE_MAX,
-            NoProgress{}, nullptr, roots);
-      } catch (const std::exception&) {
-        o[0] = -2;
+      for (int64_t i = 0; i < std::max<int64_t>(1, reads); ++i) {
+        IdleRoots once = roots;
+        try {
+          o[0] = reader.read(
+              row, ids_of(experts), slots_of(slots), kBounceRows, abandon_after(0), nullptr, nullptr, SIZE_MAX,
+              NoProgress{}, nullptr, once);
+        } catch (const std::exception&) {
+          o[0] = -2;
+        }
+        counted.abandoned = counted.abandoned || once.abandoned;
+        counted.boosted = counted.boosted || once.boosted;
+        counted.deferrals += once.deferrals;
+        counted.moves += once.moves;
+        if (o[0] != 1) break;
       }
       add_preload(-1);
       if (hooks.followed >= 0) {
         int64_t now = 0;
         load.change(hooks.followed, kDemandRead, -1, 0, now);
       }
-      o[1] = roots.abandoned ? 1 : 0;
-      o[2] = roots.boosted ? 1 : 0;
-      o[3] = roots.deferrals;
-      o[4] = roots.moves;
+      o[1] = counted.abandoned ? 1 : 0;
+      o[2] = counted.boosted ? 1 : 0;
+      o[3] = counted.deferrals;
+      o[4] = counted.moves;
       o[5] = hooks.pieces;
       o[6] = hooks.widest;
       o[7] = reader.drive_share_reads();

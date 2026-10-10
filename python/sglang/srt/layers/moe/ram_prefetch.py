@@ -18,6 +18,8 @@ MAX_SPEC_SHARE = 4
 # SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US's bound: a read that waits for an idle drive keeps its pool entry reading
 # and, when promoted, a forced miss waiting; 100 ms is far past any useful wait and far under the watchdog's 30 s.
 MAX_IDLE_DEADLINE_US = 100_000
+# SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES's bound: host/ram_prefetch.h RamPrefetchConfig::kMaxIdlePieces.
+MAX_IDLE_PIECES = 4
 
 # SGLANG_DSV41_RAM_PREFETCH_SCORER's values.
 SCORERS = ("cpu", "gpu")

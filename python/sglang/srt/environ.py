@@ -2042,6 +2042,13 @@ class Envs:
     SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
     # How long such a read waits for an idle drive before it is abandoned (its pool entry stays empty).
     SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
+    # With idle-drive reads: spread each row's pieces over the idle drives, ties rotating from row to row, instead of
+    # keeping the row on one drive with ties to the lowest-numbered (which took 179 of 249 GB in the A/B of
+    # DSV41_REFERENCE.md 33.18).
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD = EnvBool(False)
+    # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4), each on a drive no demand
+    # reads. One read rows too slowly in that A/B: 35% abandoned, 82% of promotions boosted.
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

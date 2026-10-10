@@ -618,6 +618,9 @@ def read_rows_idle(
     boost: bool = False,
     give_up_after: int = 0,
     deadline_s: float = 1.0,
+    spread: bool = False,
+    pieces: int = 1,
+    reads: int = 1,
     layout: str = "exl3",
     variant: Optional[str] = None,
     **faults,
@@ -629,7 +632,9 @@ def read_rows_idle(
     ``preload`` (demand reads per root) stands for other readers' demand in flight for the whole read. ``follow``: a
     demand read arrives on the first piece's root once it is in flight, and stays. ``boost`` boosts the read from its
     start. ``give_up_after`` > 0 gives up once that many pieces were issued. ``deadline_s``: the longest wait for an
-    idle root.
+    idle root. ``spread`` and ``pieces``: SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD and _IDLE_PIECES. ``reads`` repeats the
+    read on the one reader, as its speculative reader reads row after row (stopping at the first that does not return
+    1); the counts and SQEs add up over them.
 
     Returns ``{"result"`` (1, 0; -2 when it raised), ``"abandoned"``, ``"boosted"``, ``"deferrals"``, ``"moves"``,
     ``"pieces"``, ``"widest"`` (the most of its sub-reads in flight when one was issued), ``"share_after"`` (its
@@ -658,6 +663,9 @@ def read_rows_idle(
         int(bool(boost)),
         int(give_up_after),
         int(deadline_s * 1e9),
+        int(bool(spread)),
+        int(pieces),
+        int(reads),
         sqes,
         out,
     )
@@ -1271,6 +1279,10 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
     return torch.zeros(
         HOT_RECORDS * hot_record_bytes(experts), dtype=torch.uint8, pin_memory=pin
     )
+
+
+# The most of a row's pieces an idle-drive read may have in flight (RamPrefetchConfig::kMaxIdlePieces).
+MAX_IDLE_PIECES = 4
 
 
 # The GPU scorer's candidate page (csrc/moe/expert_stream/spec_candidates.h): CAND_RECORDS slots of CAND_STRIDE bytes,
@@ -2017,6 +2029,8 @@ class ExpertStreamHost:
         min_margin: Optional[torch.Tensor] = None,
         idle_drive: bool = False,
         idle_deadline_s: float = 0.004,
+        idle_spread: bool = False,
+        idle_pieces: int = 1,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
@@ -2027,7 +2041,10 @@ class ExpertStreamHost:
 
         ``idle_drive`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE): each group reads its pool rows through a reader of its
         own, one piece at a time from a drive no demand reads, abandoning a read that waited ``idle_deadline_s`` for
-        one; off, the speculative reads take turns with the demand reads on the group's reader."""
+        one; off, the speculative reads take turns with the demand reads on the group's reader. With it,
+        ``idle_spread`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
+        rotating from row to row, and ``idle_pieces`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
+        row's pieces may be in flight at once."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:
@@ -2081,6 +2098,8 @@ class ExpertStreamHost:
         idle_deadline_ns = int(idle_deadline_s * 1e9) if idle_drive else 0
         if idle_drive and idle_deadline_ns < 1:
             raise ValueError(f"idle_deadline_s must be positive, got {idle_deadline_s}")
+        if not 1 <= idle_pieces <= MAX_IDLE_PIECES:
+            raise ValueError(f"idle_pieces must be in [1, {MAX_IDLE_PIECES}], got {idle_pieces}")
         table = torch.full((self.nodes, max(1, max(len(own) for own in cores))), -1, dtype=torch.int64)
         for g, own in enumerate(cores):
             for j, core in enumerate(own):
@@ -2100,6 +2119,8 @@ class ExpertStreamHost:
             candidates if candidates is not None else torch.empty(0, dtype=torch.uint8),
             min_margin if min_margin is not None else torch.empty(0, dtype=torch.float32),
             idle_deadline_ns,
+            int(bool(idle_spread)),
+            int(idle_pieces),
         )
         self.ram_prefetch_tensors = (gates, bias, candidates, min_margin)
 

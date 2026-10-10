@@ -1338,6 +1338,8 @@ class Exl3RamMissService:
         idle = dict(
             idle_drive=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get(),
             idle_deadline_s=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() / 1e6,
+            idle_spread=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get(),
+            idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
         )
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
@@ -1384,7 +1386,9 @@ class Exl3RamMissService:
             (", predicted top-k only" if top_k_only else "") + (f", margin floors {floors}" if floors else ""),
             [plan.spec for plan in numa.plans],
             (
-                f"idle-drive reads (own reader per group, deadline {idle['idle_deadline_s'] * 1e3:g} ms)"
+                f"idle-drive reads (own reader per group, deadline {idle['idle_deadline_s'] * 1e3:g} ms, "
+                f"{'spread ties' if idle['idle_spread'] else 'row on one drive'}, "
+                f"{idle['idle_pieces']} piece{'s' if idle['idle_pieces'] > 1 else ''} in flight)"
                 if idle["idle_drive"]
                 else "shared reader (turns with demand)"
             ),

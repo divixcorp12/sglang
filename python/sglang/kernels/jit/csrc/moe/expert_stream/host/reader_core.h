@@ -48,10 +48,18 @@ struct TableRoots {
 // `give_up` saying so, abandons the read (read() returns 0, `abandoned` set). `boost` set (a forced miss waits on
 // this row) drops all of that for the rest of the row: its pieces read their table roots, as many as credit allows.
 // Needs the mirror file map (set_mirror_map).
+//
+// `spread` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) drops the row's root: every piece takes the demand-free root with
+// the fewest bytes in flight, a tie going to the first root from the one after the row's previous piece (the row's
+// first piece: from the reader's rotating start, one root further per read), so idle drives share the rows rather
+// than the lowest-numbered one taking them all. `max_inflight` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES) lets that many
+// pieces be in flight at once, each gated as the first.
 struct IdleRoots {
   static constexpr bool kGated = true;
   const std::atomic<uint32_t>* boost = nullptr;  // nonzero: boosted (null: never)
   int64_t deadline_ns = 0;                       // the longest wait for an idle root
+  bool spread = false;                           // spread ties over the idle roots, no root kept for the row
+  int max_inflight = 1;                          // the row's pieces in flight at once (unboosted)
   bool (*give_up)(void*) = nullptr;              // true abandons the read before its next piece (null: never)
   void (*on_piece)(void*, int root) = nullptr;   // after each piece is prepared (null: nothing)
   void* context = nullptr;                       // give_up's and on_piece's argument
@@ -513,6 +521,12 @@ class ReaderCore {
     c.total = experts.size();
     c.batches = (c.total + step - 1) / step;
     c.max_reading = std::max<size_t>(1, max_reading_rows);
+    if constexpr (std::decay_t<RootPolicy>::kGated) {
+      if (roots.spread) {
+        c.spread_start = spread_next_;
+        spread_next_ = (spread_next_ + 1) % static_cast<int>(t_.parts);
+      }
+    }
     // Credit is the ring's alone: banks and rows in flight do not enter it.
     c.capacity = queue_depth();
     if constexpr (Build::kFaults) {
@@ -781,6 +795,7 @@ class ReaderCore {
     size_t published = 0;  // piece streaming: pieces published so far (the last_publish_delay_ns fault)
     int reads_inflight = 0;      // sub-reads with a leg in flight (count_drive)
     int gate_root = -1;          // IdleRoots: the root the row's last piece read (-1: none yet)
+    int spread_start = 0;        // IdleRoots::spread: where the row's first piece's tie-break starts
     int64_t deferred_since = 0;  // IdleRoots: when the piece at the queue head began waiting for an idle root (0: not)
   };
 
@@ -1879,10 +1894,11 @@ class ReaderCore {
 
   // IdleRoots, before sub-read `index`'s first preparation: true lets it go now, its file set to the root it reads;
   // false holds it back this turn, at the queue head and unplanned. A boosted read takes its table root, as a demand
-  // would. Otherwise one piece goes in flight at a time, from the row's root while no demand reads it, else from the
-  // demand-free root with the fewest bytes in flight; with none demand-free it waits, and past the deadline, or when
-  // give_up says so, the read is abandoned (c_.failed, roots.abandoned). Relaxed loads of every reader's load: a
-  // demand that lands between the check and the submit shares its drive with at most this one piece.
+  // would. Otherwise up to max_inflight pieces go in flight at a time, from the row's root while no demand reads it
+  // (not with spread), else from the demand-free root with the fewest bytes in flight; with none demand-free it waits,
+  // and past the deadline, or when give_up says so, the read is abandoned (c_.failed, roots.abandoned). Relaxed loads
+  // of every reader's load: a demand that lands between the check and the submit shares its drive with at most the
+  // pieces in flight.
   bool gate_root(uint32_t index, IdleRoots& roots) {
     Call& c = c_;
     const int64_t parts = t_.parts;
@@ -1894,17 +1910,17 @@ class ReaderCore {
       read.file = alt_file_[static_cast<size_t>(read.file * parts + own)];
       return true;
     }
-    if (c.reads_inflight > 0) return false;
+    if (c.reads_inflight >= roots.max_inflight) return false;
     if (roots.give_up != nullptr && roots.give_up(roots.context)) return abandon_gated(roots);
-    int root = c.gate_root >= 0 && load_->demand_reads(c.gate_root) == 0 ? c.gate_root : -1;
-    for (int q = 0; root < 0 && q < static_cast<int>(parts); ++q) {
-      if (load_->demand_reads(q) != 0) continue;
-      int best = q;
-      for (int other = q + 1; other < static_cast<int>(parts); ++other) {
-        if (load_->demand_reads(other) == 0 && load_->bytes_in_flight(other) < load_->bytes_in_flight(best))
-          best = other;
+    int root = !roots.spread && c.gate_root >= 0 && load_->demand_reads(c.gate_root) == 0 ? c.gate_root : -1;
+    if (root < 0) {
+      const int n = static_cast<int>(parts);
+      const int start = !roots.spread ? 0 : c.gate_root >= 0 ? (c.gate_root + 1) % n : c.spread_start;
+      for (int i = 0; i < n; ++i) {
+        const int q = (start + i) % n;
+        if (load_->demand_reads(q) == 0 && (root < 0 || load_->bytes_in_flight(q) < load_->bytes_in_flight(root)))
+          root = q;
       }
-      root = best;
     }
     if (root < 0) {
       const int64_t now = now_ns();
@@ -2035,6 +2051,7 @@ class ReaderCore {
   bool dynamic_ = false;
   int64_t caps_[kMaxDrives] = {};
   std::vector<int64_t> alt_file_;
+  int spread_next_ = 0;  // IdleRoots::spread: the next read's spread_start
   // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
   [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
   [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;

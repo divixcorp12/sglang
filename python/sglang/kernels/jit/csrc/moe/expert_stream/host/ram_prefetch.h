@@ -141,6 +141,10 @@ struct RamPrefetchConfig {
   // a drive no demand reads (IdleRoots), abandoned after waiting this long for one; 0 shares the group's demand reader,
   // taking turns with the demand reads.
   int64_t idle_deadline_ns = 0;
+  // With idle-drive reads: SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD and _IDLE_PIECES (IdleRoots::spread, max_inflight).
+  bool idle_spread = false;
+  int idle_pieces = 1;
+  static constexpr int kMaxIdlePieces = 4;
 };
 
 // The GPU scorer's wait for a record's candidate slot: spin, then sleep in steps (the speculative thread may share its
