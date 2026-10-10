@@ -11,7 +11,10 @@ Mutants (divix01, reverted): gate_root keeps the row's root without rechecking i
 (test_each_piece_reads_a_root_no_demand_reads_and_moves_when_demand_arrives); boost ignored -- red
 (test_a_boosted_read_reads_its_table_roots_despite_demand, test_a_forced_miss_boosts_the_read_it_waits_on); one
 piece limit dropped -- red (the two one-root tests); ReaderCore::drain keeps the read's drive-load share -- red (the
-in-flight submit faults)."""
+in-flight submit faults). Spread and pieces (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD, _IDLE_PIECES): the spread rotation
+removed -- red (test_spread_sends_consecutive_rows_first_pieces_to_every_root); max_inflight ignored (back to 1) -- red
+(the two-pieces tests); a second piece in flight reusing the row's root without the demand check -- red
+(test_two_pieces_go_in_flight_at_once_never_on_a_root_demand_reads)."""
 
 import errno
 import faulthandler
