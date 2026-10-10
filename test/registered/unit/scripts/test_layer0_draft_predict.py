@@ -122,3 +122,10 @@ def test_the_lead_runs_from_the_last_draft_end_and_from_the_previous_verifys_las
     ]
     leads = m.leads(ev)
     assert leads == {11: {"draft_end_ms": 2.5, "draft_observed_ms": 4.5, "prev_verify_end_ms": 53.5}}
+
+
+def test_job_forwards_join_the_route_line_holding_their_misses_across_a_dropped_forward():
+    m = _module()
+    routes = [[{1, 2}], [{3, 4}], [{5, 6}], [{7, 8}], [{9, 10}]]
+    job = [[{3}], [{7, 8}], [{10}]]  # route forward 2 has no job forward (dropped)
+    assert m.match_forwards(job, routes) == [(0, 1), (1, 3), (2, 4)]

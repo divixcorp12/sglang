@@ -25,7 +25,7 @@ only (so a 129,280-row table the host can index during the draft):
 * ``emb_gate_off_bias``: plus a per-expert bias fitted so each expert's predicted top-k rate matches its routed rate;
 * ``table_gate``: the table shrunk toward softmax(tau * emb_gate_off_bias) instead of popularity.
 
-A verify's prediction is the union of each live token's top-k. Scored per verify: recall on all routed experts and on
+The job trace's forwards are joined to the route log's by ``match_forwards``. A verify's prediction is the union of each live token's top-k. Scored per verify: recall on all routed experts and on
 NVMe rows (``miss_expert``), precision, useful NVMe reads (predicted NVMe rows) and wasted ones (predicted experts
 the verify does not route that sit in NVMe). The tier of an unrouted expert is not logged: it is approximated as
 "not VRAM-hot and not routed at layer 0 in the last W forwards", W calibrated on the routed experts' true labels;
@@ -48,7 +48,6 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import layer_misses  # noqa: E402
-import verify_split  # noqa: E402
 
 LAYER, HIDDEN, N_EXPERTS, TOPK = 0, 5120, 384, 6
 EPS = 1e-20  # config rms_norm_eps
@@ -215,6 +214,20 @@ def leads(events: list) -> dict:
     return out
 
 
+def match_forwards(job: list, routes: list, window: int = 40) -> list:
+    """(job forward, route line) pairs, in order: each job forward's first route line at or after the previous
+    match whose per-layer routes hold every expert it missed. The job trace drops forwards it could not complete, so
+    no single offset joins the two logs (verify_split.align's assumption fails on cut-timeline: 0.689)."""
+    out, j = [], 0
+    for i, fwd in enumerate(job):
+        for jj in range(j, min(len(routes), j + window)):
+            if all(m <= routes[jj][row] for row, m in enumerate(fwd)):
+                out.append((i, jj))
+                j = jj + 1
+                break
+    return out
+
+
 # ---- loading ---------------------------------------------------------------------------------------------------
 
 
@@ -263,13 +276,12 @@ def load_verify(name: str, d: str) -> list:
                         missed[(e["row"], e["gen"])].add(e["a"])
         fwds = layer_misses.forwards(recs, layers)
         job = [[missed.get((r["row"], r["gen"]), set()) for r in fw] for fw in fwds]
-        offset, share = verify_split.align(job, [[set(r) for r in x["routes"]] for x in lines])
-        if share < 0.99:
-            raise ValueError(f"{name}: job trace and route log do not align ({offset}: {share:.3f})")
-        for i, fw in enumerate(fwds):
-            if 0 <= i + offset < len(lines):
-                job_nvme[i + offset] = job[i][LAYER]
-                job_gen[i + offset] = fw[0]["gen"]
+        pairs = match_forwards(job, [[set(r) for r in x["routes"]] for x in lines])
+        if len(pairs) < 0.95 * len(job):
+            raise ValueError(f"{name}: only {len(pairs)} of {len(job)} job forwards found their route line")
+        for i, li in pairs:
+            job_nvme[li] = job[i][LAYER]
+            job_gen[li] = fwds[i][0]["gen"]
     out, seen = [], collections.Counter()
     for li, x in enumerate(lines):
         if x.get("phase") != "target_verify" or x.get("router") is None:
