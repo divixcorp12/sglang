@@ -805,6 +805,26 @@ def test_idle_drive_reads_need_the_prefetch_and_a_bounded_deadline(model_dir):
             _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=deadline)
 
 
+def test_idle_drive_spread_and_pieces_default_to_todays_reads():
+    """Off until their served A/B is accepted: ties to the lowest root, the row on its root, one piece in flight."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get() is False
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get() == 1
+
+
+def test_idle_drive_pieces_must_be_1_to_4_like_the_deadline_whatever_the_drive_flag(model_dir):
+    """Bounded on every launch, as the deadline is; like the deadline, neither knob is refused with the drive flag off
+    (they do nothing there)."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    for pieces in (1, 4):
+        _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=2)
+    for env in (on, CPU_EXPERTS_ENV):
+        for pieces in (0, 5):
+            with pytest.raises(ValueError, match=r"SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES must be in \[1, 4\]"):
+                _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
+
+
 THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
 
 

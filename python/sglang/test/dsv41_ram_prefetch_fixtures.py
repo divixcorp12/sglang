@@ -130,10 +130,20 @@ def gate(logits) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def enable(
-    rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores=None, top_k_only=False, idle_deadline_s=None
+    rig: PrefetchRig,
+    logits,
+    *,
+    top_k=2,
+    per_token=1,
+    per_layer=1,
+    cores=None,
+    top_k_only=False,
+    idle_deadline_s=None,
+    idle_spread=False,
+    idle_pieces=1,
 ) -> None:
     """Row 0 targets row 1 with `logits`' gate; every later row targets nothing. `idle_deadline_s`: idle-drive
-    speculative reads with that deadline (None: the shared reader)."""
+    speculative reads with that deadline, `idle_spread` and `idle_pieces` (None: the shared reader)."""
     w, bias = gate(logits)
     targets = torch.tensor([[1, 0]] + [[-1, -1]] * (rig.x_rows.shape[0] - 1), dtype=torch.int64)
     rig.host.enable_ram_prefetch(
@@ -145,7 +155,16 @@ def enable(
         per_layer=per_layer,
         cores=cores if cores is not None else [[] for _ in range(rig.host.nodes)],
         top_k_only=top_k_only,
-        **({} if idle_deadline_s is None else {"idle_drive": True, "idle_deadline_s": idle_deadline_s}),
+        **(
+            {}
+            if idle_deadline_s is None
+            else {
+                "idle_drive": True,
+                "idle_deadline_s": idle_deadline_s,
+                "idle_spread": idle_spread,
+                "idle_pieces": idle_pieces,
+            }
+        ),
     )
 
 

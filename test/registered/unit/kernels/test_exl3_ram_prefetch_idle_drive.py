@@ -127,12 +127,104 @@ def test_a_faulted_idle_drive_read_fails_without_abandoning_and_leaves_the_load_
     assert got["share_after"] == 0 and idle(got["load"])
 
 
+# ---- Spread ties (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) and pieces in flight (..._IDLE_PIECES) ----
+
+
+def _per_read(got, reads):
+    """The SQE roots of each of `reads` equal fault-free reads, in order."""
+    roots = [root for root, _, _ in got["sqes"]]
+    assert reads > 0 and len(roots) % reads == 0, got
+    n = len(roots) // reads
+    return [roots[i * n : (i + 1) * n] for i in range(reads)]
+
+
+def test_spread_sends_consecutive_rows_first_pieces_to_every_root(setup):
+    """With no load every root ties: the speculative reader's rotating start breaks the tie, one root further per row.
+    Mutant: rotation removed -- red (every row starts on root 0)."""
+    got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], spread=True, reads=ROOTS)
+    assert got["result"] == 1 and not got["abandoned"]
+    firsts = [roots[0] for roots in _per_read(got, ROOTS)]
+    assert sorted(firsts) == list(range(ROOTS)), firsts
+    assert row_exact(setup) and got["share_after"] == 0 and idle(got["load"])
+
+
+def test_spread_off_keeps_every_row_on_the_lowest_idle_root(setup):
+    """The default: ties go to the lowest root and the row stays on it."""
+    got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], reads=ROOTS)
+    assert got["result"] == 1
+    assert all(set(roots) == {0} for roots in _per_read(got, ROOTS)), got["sqes"]
+    assert got["moves"] == 0
+
+
+def test_spread_spreads_a_rows_pieces_over_the_idle_roots(setup):
+    got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], preload=(1, 0, 0), spread=True)
+    roots = [root for root, _, _ in got["sqes"]]
+    assert got["result"] == 1 and got["widest"] == 1
+    assert set(roots) == {1, 2}, roots
+    assert got["moves"] == sum(a != b for a, b in zip(roots, roots[1:])) > 0
+    assert row_exact(setup) and idle(got["load"])
+
+
+@pytest.mark.parametrize("spread", [False, True], ids=["sticky", "spread"])
+def test_two_pieces_go_in_flight_at_once_never_on_a_root_demand_reads(setup, spread):
+    """Root 0 carries demand throughout and demand arrives on the first piece's root while it is in flight: the second
+    piece, issued beside the first, already avoids it. Mutants: the limit ignored (back to 1) -- red (widest 1); the
+    demand check skipped for a second piece -- red (it reads the first piece's root)."""
+    got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], preload=(1, 0, 0), follow=True, spread=spread, pieces=2)
+    assert got["result"] == 1 and not got["abandoned"], got
+    roots = [root for root, _, _ in got["sqes"]]
+    assert got["widest"] == 2 and len(roots) == got["pieces"] >= 3, got
+    assert 0 not in roots and roots[0] not in roots[1:], roots
+    assert row_exact(setup) and got["share_after"] == 0 and idle(got["load"])
+
+
+def test_one_piece_limit_holds_by_default_with_spread_on(setup):
+    got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], spread=True)
+    assert got["result"] == 1 and got["widest"] == 1
+
+
+def test_two_pieces_with_no_load_read_two_roots_at_once_when_spread(setup):
+    got = read_rows_idle(setup.tables, ROW, [EXPERT], [0], spread=True, pieces=2)
+    roots = [root for root, _, _ in got["sqes"]]
+    assert got["result"] == 1 and got["widest"] == 2 and roots[0] != roots[1], roots
+    assert row_exact(setup) and idle(got["load"])
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        dict(),
+        dict(give_up_after=1),
+        dict(give_up_after=2),
+        dict(part=0, part_error=errno.EIO),
+        dict(cqe_error=errno.EIO, cqe_call=2),
+        dict(part=-1, root=1, part_short=4096, short_is_eof=True),
+        dict(submit_error=errno.EIO, submit_call=1, submit_first=True),
+    ],
+    ids=["clean", "give_up_1", "give_up_2", "part_error", "cqe_error", "part_short_eof", "submit_error_two_in_flight"],
+)
+@pytest.mark.parametrize("spread", [False, True], ids=["sticky", "spread"])
+def test_two_pieces_leave_the_drive_load_idle_after_every_return(setup, fault, spread):
+    got = read_rows_idle(
+        setup.tables, ROW, [EXPERT], [0], preload=(1, 0, 1) if "root" in fault else (), spread=spread, pieces=2,
+        **fault,
+    )
+    if "submit_error" in fault:
+        assert got["widest"] == 2 and got["result"] == 0 and not got["abandoned"], got
+    if "give_up_after" in fault:
+        assert got["result"] == 0 and got["abandoned"], got
+    assert got["share_after"] == 0 and idle(got["load"]), got
+
+
 # ---- The tier: the speculative thread on its own reader ----
 
 
-def _rig(tmp_path, *, deadline_s, delay_s=0.0, per_token=1, per_layer=1, rows=2):
+def _rig(tmp_path, *, deadline_s, delay_s=0.0, per_token=1, per_layer=1, rows=2, spread=False, pieces=1):
     rig = prefetch_rig(tmp_path, mirror_weights=(1.0,) * ROOTS, rows=rows)
-    enable(rig, LOGITS, per_token=per_token, per_layer=per_layer, idle_deadline_s=deadline_s)
+    enable(
+        rig, LOGITS, per_token=per_token, per_layer=per_layer, idle_deadline_s=deadline_s, idle_spread=spread,
+        idle_pieces=pieces,
+    )
     if delay_s:
         rig.host.inject_spec(delay_s=delay_s)
     rig.host.start_thread(fatal_wait_s=5.0)
@@ -270,3 +362,23 @@ def test_a_fault_reaches_the_speculative_reader_and_the_load_returns_idle(tmp_pa
         assert idle(rig.host.drive_load())
     finally:
         rig.host.stop()
+
+
+def test_spread_with_two_pieces_lands_the_row_and_leaves_the_load_idle(tmp_path):
+    rig = _rig(tmp_path, deadline_s=1.0, spread=True, pieces=2)
+    try:
+        trigger(rig)
+        assert _until(lambda: rig.host.counters()["spec_landed"] == 1)
+        c = rig.host.counters()
+        assert (c["spec_abandoned"], c["spec_failed"]) == (0, 0)
+        assert _pool(rig.host, 1) == {2: "landed"}
+        assert _until(lambda: idle(rig.host.drive_load()))
+    finally:
+        rig.host.stop()
+
+
+@pytest.mark.parametrize("pieces", [0, 5])
+def test_the_host_refuses_idle_pieces_outside_1_to_4(tmp_path, pieces):
+    rig = prefetch_rig(tmp_path, mirror_weights=(1.0,) * ROOTS)
+    with pytest.raises(ValueError, match="idle_pieces must be in"):
+        enable(rig, LOGITS, idle_deadline_s=1.0, idle_pieces=pieces)

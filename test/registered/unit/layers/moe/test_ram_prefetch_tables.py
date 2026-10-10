@@ -1,6 +1,7 @@
 """The RAM prefetch's Python side (spec 2026-10-08-dsv41-ram-prefetch-design, Phase 1): the router gates registered at
 load, the per-row target table and its host copy, and the service's call into the host (CPU)."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -86,7 +87,7 @@ def test_a_layer_registered_again_with_another_gate_is_refused():
     assert registered_gates()[1].weight is gate.weight
 
 
-def test_the_service_enables_the_host_with_the_registered_gates_options_and_spare_cores():
+def test_the_service_enables_the_host_with_the_registered_gates_options_and_spare_cores(caplog):
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
     calls = []
@@ -100,7 +101,8 @@ def test_the_service_enables_the_host_with_the_registered_gates_options_and_spar
     (targets, gates, bias), kw = calls[0]
     assert targets.tolist() == [[1, 0], [-1, -1]] and torch.equal(gates[0], gate.weight)
     assert kw == dict(
-        top_k=6, per_token=1, per_layer=2, cores=[[0, 1]], top_k_only=False, idle_drive=False, idle_deadline_s=0.004
+        top_k=6, per_token=1, per_layer=2, cores=[[0, 1]], top_k_only=False, idle_drive=False, idle_deadline_s=0.004,
+        idle_spread=False, idle_pieces=1,
     )
     with envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.override(True):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
@@ -109,6 +111,12 @@ def test_the_service_enables_the_host_with_the_registered_gates_options_and_spar
             envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.override(2500):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
     assert (calls[2][1]["idle_drive"], calls[2][1]["idle_deadline_s"]) == (True, 0.0025)
+    with envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.override(True), \
+            envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.override(True), \
+            envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.override(2), caplog.at_level(logging.INFO):
+        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
+    assert (calls[3][1]["idle_spread"], calls[3][1]["idle_pieces"]) == (True, 2)
+    assert "idle-drive reads (own reader per group, deadline 4 ms, spread ties, 2 pieces in flight)" in caplog.text
     with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_CPU_EXPERTS"):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, None)
 
@@ -133,7 +141,7 @@ def test_the_gpu_scorer_enables_the_host_with_a_candidate_page_and_no_host_gate_
     assert page.dtype == torch.uint8 and page.numel() == CAND_PAGE_BYTES and not page.is_pinned()
     assert kw == dict(
         top_k=6, per_token=1, per_layer=1, cores=[[0, 1]], top_k_only=False, min_margin=None, idle_drive=False,
-        idle_deadline_s=0.004,
+        idle_deadline_s=0.004, idle_spread=False, idle_pieces=1,
     )
     assert scorer.candidates is page and scorer.picked.gates[0].weight is gate.weight
     assert (scorer.per_token, scorer.top_k_only, scorer.picked.top_k) == (1, False, 6)
