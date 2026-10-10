@@ -260,9 +260,12 @@ def load_verify(name: str, d: str) -> list:
         with open(p) as f:
             for e in map(json.loads, f):
                 accepts[(e["rid"], e["k"])] = e["num_correct_drafts"]
-    # every layer-0 forward in order (prefill too) for the recency tier
-    order = [(x.get("forward_pass_id"), set(x["experts"])) for x in stage0]
-    pos_of = {fp: i for i, (fp, _) in enumerate(order) if fp is not None}
+    # Every forward's layer-0 experts in order, for the recency tier: graph forwards from the route log, eager ones
+    # (prefill) from the stage trace, which logs only those.
+    order = sorted([(x["forward_pass_id"], set(x["experts"])) for x in stage0 if x.get("forward_pass_id") is not None]
+                   + [(x["forward_pass_id"], set(x["routes"][LAYER])) for x in lines
+                      if x.get("forward_pass_id") is not None and x["forward_pass_id"] >= 0], key=lambda o: o[0])
+    pos_of = {fp: i for i, (fp, _) in enumerate(order)}
     job_nvme, job_gen = {}, {}
     paths = sorted(glob.glob(os.path.join(d, "events.*.jsonl")))
     if paths:
@@ -289,8 +292,13 @@ def load_verify(name: str, d: str) -> list:
         rid = (x.get("rids") or [None])[0]
         kk = seen[rid]
         seen[rid] += 1
-        live = int(x.get("forward_tokens") or t)
         r = x["router"]
+        live = int(x.get("forward_tokens") or t)
+        # A few captured rows inside the live count are all zero (an unwritten ring slot): not a token.
+        while live and not np.any(np.asarray(xs[r, LAYER, live - 1])):
+            live -= 1
+        if not live:
+            continue
         fp = x.get("forward_pass_id")
         hist = [s for _, s in order[:pos_of[fp]]] if fp in pos_of else None
         out.append({
