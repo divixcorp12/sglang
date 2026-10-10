@@ -7,7 +7,7 @@
 //
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
 //              publish_piece: one synchronous read through the reader, with traces and injected faults;
-//              read_rows_drive_load: two readers over one DriveLoad
+//              read_rows_drive_load: two readers over one DriveLoad; read_rows_two_span: a read's first-span signal
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
 //              trace_clock_reads, spec_place, spec_pump, inject_spec
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
@@ -52,6 +52,23 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   static std::vector<int64_t> slots_of(TensorView slots) {
     const auto* data = static_cast<const int64_t*>(slots.data_ptr());
     return std::vector<int64_t>(data, data + slots.size(0));
+  }
+
+  // Fault word 19 (two_span_rows, a bit per row ordinal) as one flag per row of a `count`-row read (TwoSpanRows::rows).
+  static std::vector<uint8_t> two_span_of(const int64_t* f, size_t count) {
+    std::vector<uint8_t> rows(count, 0);
+    for (size_t o = 0; o < count && o < 64; ++o)
+      rows[o] = static_cast<uint8_t>(static_cast<uint64_t>(f[19]) >> o & 1u);
+    return rows;
+  }
+
+  // The layout's second-stage start in `t` (ReaderCore::second_stage_); 0 for a layout without one.
+  static int64_t second_stage_of(const Tables& t) {
+    if constexpr (requires { Layout::kSecondStageMask; }) {
+      return second_stage_start(t, Layout::kSecondStageMask);
+    } else {
+      return 0;
+    }
   }
 
   // Read `experts` of streamed row `row` into `slots` once, synchronously (tests, tools).
@@ -321,8 +338,20 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       std::vector<typename Source::SqeRecord> log;
       reader.set_sqe_log(&log);
       StageRecord stage;
-      const int result =
-          reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
+      const std::vector<int32_t> ids = ids_of(experts);
+      const std::vector<uint8_t> spans = two_span_of(f, ids.size());
+      const int result = reader.read(
+          row,
+          ids,
+          slots_of(slots),
+          static_cast<size_t>(step),
+          abandon_after(f[17]),
+          &stage,
+          nullptr,
+          SIZE_MAX,
+          NoProgress{},
+          nullptr,
+          TwoSpanRows{spans.data(), nullptr});
       stage.ok = result == 1 ? 1 : 0;
       stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
       std::memcpy(record.data_ptr(), &stage, sizeof(stage));
@@ -446,6 +475,118 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     load.snapshot(o + 4 + 2 * kDriveLoadWords, parts);
   }
 
+  // Test only (InstrBuild): one read with piece streaming of `experts` into `slots`, the rows of fault word 19 in two
+  // spans (TwoSpanRows), with `fault` injected. Each turn a progress callback looks for rows newly reported prefix-landed
+  // and checks, when it first sees one, that its first-stage bytes (every segment ending at or before the layout's
+  // second-stage start) in its destination slabs equal the reference's (`reference`: a slab pointer table shaped like
+  // `slabs`, row o at ref_slots[o]), and whether the row was already whole. `info` 6 int64: the result, the rows reported,
+  // the rows reported before they were whole, the rows whose first-stage bytes differed when reported, the reader's
+  // sub-reads still counted in flight after the read, and the second-stage start. `drive` (kDriveLoadWords int64): the
+  // reader's DriveLoad after the read.
+  static void read_rows_two_span(
+      TensorView extents,
+      TensorView starts,
+      TensorView file_sizes,
+      TensorView segments,
+      TensorView slabs,
+      TensorView row_bytes,
+      TensorView buffer_regions,
+      std::string paths,
+      std::string source_paths,
+      int64_t slot_bytes,
+      int64_t row_images,
+      int64_t direct,
+      int64_t row,
+      TensorView experts,
+      TensorView slots,
+      int64_t step,
+      TensorView fault,
+      TensorView reference,
+      TensorView ref_slots,
+      TensorView info,
+      TensorView drive) {
+    if constexpr (!Build::kFaults) {
+      test_only("read_rows_two_span");
+    } else {
+      using namespace host;
+      check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
+      auto cpu = SymbolicDevice{};
+      verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+      verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+      verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+      verify_named("reference", TensorMatcher({-1, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), reference);
+      verify_named("ref_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), ref_slots);
+      verify_named("info", TensorMatcher({6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
+      verify_named("drive", TensorMatcher({kDriveLoadWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), drive);
+      check_fault_words<Layout>(fault);
+      const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+      auto* out = static_cast<int64_t*>(info.data_ptr());
+      std::fill(out, out + 6, 0);
+      const Tables t = tables_from<Layout>(
+          extents,
+          starts,
+          file_sizes,
+          segments,
+          slabs,
+          row_bytes,
+          buffer_regions,
+          paths,
+          source_paths,
+          slot_bytes,
+          row_images);
+      const std::vector<int32_t> ids = ids_of(experts);
+      const std::vector<int64_t> dest = slots_of(slots);
+      const std::vector<uint8_t> spans = two_span_of(f, ids.size());
+      const int64_t split = second_stage_of(t);
+      const auto* ref_table = static_cast<const int64_t*>(reference.data_ptr());
+      const auto* ref_slot = static_cast<const int64_t*>(ref_slots.data_ptr());
+      Source reader(Tables(t), direct != 0);
+      reader.set_piece_stream(true);
+      reader.set_leg_cut_cap(f[31]);
+      if (!reader.open()) return;
+      reader.set_fault(fault_from(f));
+      std::vector<uint8_t> packed, prefix, seen(ids.size(), 0);
+      packed.reserve(ids.size());
+      prefix.reserve(ids.size());
+      const auto first_stage_same = [&](size_t o) {
+        bool same = true;
+        for (const Segment& s : t.segments) {
+          if (s.src + s.bytes > split) continue;
+          const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst;
+          const auto* ref_base = reinterpret_cast<const uint8_t*>(
+              static_cast<intptr_t>(ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
+          same = same && std::memcmp(got, ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst, static_cast<size_t>(s.bytes)) == 0;
+        }
+        return same;
+      };
+      auto progress = [&] {
+        for (size_t o = 0; o < prefix.size(); ++o) {
+          if (prefix[o] == 0 || seen[o] != 0) continue;
+          seen[o] = 1;
+          ++out[1];
+          if (packed[o] == 0) ++out[2];
+          if (!first_stage_same(o)) ++out[3];
+        }
+      };
+      out[0] = reader.read(
+          row,
+          ids,
+          dest,
+          static_cast<size_t>(step),
+          abandon_after(f[17]),
+          nullptr,
+          &packed,
+          SIZE_MAX,
+          progress,
+          nullptr,
+          TwoSpanRows{spans.data(), &prefix});
+      progress();
+      out[4] = reader.drive_share_reads();
+      out[5] = split;
+      reader.drive_load().snapshot(static_cast<int64_t*>(drive.data_ptr()), t.parts);
+    }
+  }
+
   // Test only: the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
   static int64_t publish_piece(TensorView word, int64_t generation, int64_t bit) {
     using namespace host;
@@ -547,7 +688,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     if (checking) {
       for (size_t o = 0; o < ids.size(); ++o) {
         RowGeometry g;
-        if (!row_geometry(t, static_cast<size_t>(row * t.experts + ids[o]), g, &runs[o * kPieces * count])) {
+        const size_t index = static_cast<size_t>(row * t.experts + ids[o]);
+        PieceRun* at = &runs[o * kPieces * count];
+        const int64_t split = second_stage_of(t);
+        if (!(f[19] >> o & 1 && split > 0 ? row_geometry_two_span(t, index, split, g, at) : row_geometry(t, index, g, at))) {
           throw std::runtime_error(error_prefix<Layout>() + "the checker cannot cut a row");
         }
       }
@@ -579,6 +723,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         seen[o] |= fresh;
       }
     };
+    const std::vector<uint8_t> spans = two_span_of(f, ids.size());
     std::atomic<bool> reading{true};
     std::thread checker;
     if (checking) {
@@ -600,7 +745,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           nullptr,
           SIZE_MAX,
           NoProgress{},
-          &publish);
+          &publish,
+          TwoSpanRows{spans.data(), nullptr});
     } catch (...) {
       reading.store(false, std::memory_order_release);
       if (checker.joinable()) checker.join();
@@ -620,9 +766,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   }
 
   // Test only: the sub-reads and pieces the reader computes when it admits expert `expert` of streamed row `row`
-  // (row_geometry). `subs`: kPieces rows of 6 int64 (file, offset, length, dest, part, k), in file order; `pieces`:
-  // kPieces rows of 1 + 2 * segments int64: the dependency mask, then (dst_lo, dst_hi) per segment in segment
-  // destination coordinates (dst + the run's bounds). Returns the sub-read count, or -1 when the row cannot be cut.
+  // (row_geometry, or with `two_span` row_geometry_two_span at the layout's second stage). `subs`: kPieces rows of 6
+  // int64 (file, offset, length, dest, part, k), in file order; `pieces`: kPieces rows of 1 + 2 * segments int64: the
+  // dependency mask, then (dst_lo, dst_hi) per segment in segment destination coordinates (dst + the run's bounds).
+  // Returns the sub-read count | the first span's sub-reads << 8, or -1 when the row cannot be cut.
   static int64_t piece_geometry(
       TensorView extents,
       TensorView starts,
@@ -638,7 +785,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       int64_t row,
       int64_t expert,
       TensorView subs,
-      TensorView pieces) {
+      TensorView pieces,
+      int64_t two_span) {
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
@@ -662,7 +810,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         pieces);
     RowGeometry g;
     std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
-    if (!row_geometry(t, static_cast<size_t>(row * t.experts + expert), g, runs.data())) return -1;
+    const size_t index = static_cast<size_t>(row * t.experts + expert);
+    const int64_t split = second_stage_of(t);
+    if (!(two_span != 0 && split > 0 ? row_geometry_two_span(t, index, split, g, runs.data())
+                                     : row_geometry(t, index, g, runs.data())))
+      return -1;
     auto* sub_out = static_cast<int64_t*>(subs.data_ptr());
     for (int s = 0; s < g.subs; ++s) {
       const int64_t words[6] = {g.sub[s].file, g.sub[s].offset, g.sub[s].length, g.sub[s].dest, g.part[s], g.k[s]};
@@ -679,7 +831,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         line[2 + 2 * i] = t.segments[i].dst + run.hi;
       }
     }
-    return g.subs;
+    return g.subs | static_cast<int64_t>(g.prefix) << 8;
   }
 
   // Serves one demand record per group on the calling thread: 1 if group 0 served one, 0 if nothing was posted (or it
@@ -756,7 +908,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // is held (test_kernel_hold), throws when made failing, else for each row t < max(rows, 1) writes out[t * hidden + j]
   // for j < max(hidden, 1) -- (accumulate ? out[..] : j) + sum_i weights[t * k + i] * (slots[t * k + i] + 1), or a zero
   // partial (accumulate ? out[..] : 0) when made zeroing -- and records one call per row. Its warm loop PAUSEs until
-  // its word moves or its deadline passes.
+  // its word moves or its deadline passes. Over a layer of the EXL3 row's six slabs, a call also records the byte sums
+  // of its live slots' first three slabs (w13) at its start and of the last three (w2) after ForwardCall::stage_two,
+  // which a forward calls between the two when set: what a two-stage forward's GateUp and Down would read.
   class FakeKernel final : public cpu_experts::CpuExpertKernel {
    public:
     struct Call {
@@ -764,6 +918,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       std::array<int32_t, Wire::kLanes> slots;
       std::array<float, Wire::kLanes> weights;
       int32_t capacity;  // the layer's: which layer the call ran
+      int32_t staged;    // ForwardCall::stage_two was set (and called)
+      double w13, w2;    // the slab byte sums (six-slab layers only, else 0)
     };
 
     void reset(int64_t ns_per_expert, int64_t fail, bool zero) {
@@ -798,9 +954,30 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       if (layer.kernel != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
     }
     using cpu_experts::CpuExpertKernel::forward;
+    // The bytes of the live slots of call row t in slabs [first, last) of a six-slab layer, summed; 0 otherwise.
+    static double slab_sum(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c, int32_t t,
+                           int first, int last) {
+      if (layer.slab_count != 6) return 0;
+      double sum = 0;
+      for (int32_t i = 0; i < c.k; ++i) {
+        const int32_t slot = c.slots[static_cast<int64_t>(t) * c.k + i];
+        if (slot < 0) continue;
+        const cpu_experts::ExpertRow row = layer[slot];
+        for (int name = first; name < last; ++name)
+          for (uint64_t b = 0; b < layer.slot_bytes[name]; ++b)
+            sum += row.slab[name][b];
+      }
+      return sum;
+    }
     void forward(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c,
                  cpu_experts::Team& team) const override {
       team.run([](int, int) {});  // one job through the team's dispatch and end barrier, as a real forward
+      std::vector<double> w13(static_cast<size_t>(std::max(c.rows, 1))), w2(w13.size());
+      for (size_t t = 0; t < w13.size(); ++t)
+        w13[t] = slab_sum(layer, c, static_cast<int32_t>(t), 0, 3);
+      if (c.stage_two) c.stage_two(c.stage_two_ctx);
+      for (size_t t = 0; t < w2.size(); ++t)
+        w2[t] = slab_sum(layer, c, static_cast<int32_t>(t), 3, 6);
       const int32_t core = c.cores.empty() ? -1 : c.cores.front();
       const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);
       while (now_ns() < until)
@@ -832,7 +1009,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       std::lock_guard<std::mutex> lock(mutex_);
       for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
         Call call{core, affinity, c.threads, c.accumulate ? 1 : 0, std::min<int32_t>(c.k, Wire::kLanes), {}, {},
-                  layer.capacity};
+                  layer.capacity, c.stage_two != nullptr ? 1 : 0, w13[t], w2[t]};
         for (int32_t i = 0; i < call.k; ++i) {
           call.slots[i] = c.slots[static_cast<int64_t>(t) * c.k + i];
           call.weights[i] = c.weights[static_cast<int64_t>(t) * c.k + i];
@@ -876,7 +1053,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
   // Test only: the fake's calls since test_kernel_address, one per row, as float64 rows {core, affinity, threads,
-  // accumulate, k, slots[kLanes], weights[kLanes], capacity} into `out` (as many as fit); returns how many there are.
+  // accumulate, k, slots[kLanes], weights[kLanes], capacity, staged, w13, w2} into `out` (as many as fit); returns how
+  // many there are.
   static int64_t test_kernel_calls(TensorView out) {
     if constexpr (!Build::kFaults) {
       test_only("test_kernel_calls");
@@ -884,10 +1062,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       using namespace host;
       auto cpu = SymbolicDevice{};
       expert_stream::verify_named(
-          "out", TensorMatcher({-1, 6 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
+          "out", TensorMatcher({-1, 9 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
       const std::vector<typename FakeKernel::Call> calls = fake_kernel().calls();
       auto* o = static_cast<double*>(out.data_ptr());
-      const int64_t width = 6 + 2 * Wire::kLanes;
+      const int64_t width = 9 + 2 * Wire::kLanes;
       for (int64_t r = 0; r < std::min<int64_t>(out.size(0), static_cast<int64_t>(calls.size())); ++r) {
         const typename FakeKernel::Call& c = calls[r];
         double* row = o + r * width;
@@ -901,6 +1079,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           row[5 + Wire::kLanes + i] = c.weights[i];
         }
         row[5 + 2 * Wire::kLanes] = c.capacity;
+        row[6 + 2 * Wire::kLanes] = c.staged;
+        row[7 + 2 * Wire::kLanes] = c.w13;
+        row[8 + 2 * Wire::kLanes] = c.w2;
       }
       return static_cast<int64_t>(calls.size());
     }
@@ -1027,6 +1208,64 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // message in kernel_error().
   static int64_t kernel_forward(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
                                 int64_t threads, TensorView cores, int64_t accumulate) {
+    return forward_layer(id, x, slots, weights, out, threads, cores, accumulate, nullptr, nullptr);
+  }
+
+  // Test only: kernel_forward as a two-stage CPU miss runs it, ForwardCall::stage_two set. A helper thread sleeps
+  // `delay_ns`, copies each of `restore`'s rows {dst, src, bytes} (int64 [n, 3]: second-stage bytes the caller held
+  // back) and then opens the gate the forward's stage_two spins on. `info` int64 [2]: stage_two's calls and the ns it
+  // waited. Returns as kernel_forward.
+  static int64_t kernel_forward_two_stage(int64_t id, TensorView x, TensorView slots, TensorView weights,
+                                          TensorView out, int64_t threads, TensorView cores, int64_t accumulate,
+                                          TensorView restore, int64_t delay_ns, TensorView info) {
+    if constexpr (!Build::kFaults) {
+      test_only("kernel_forward_two_stage");
+    } else {
+      using namespace host;
+      auto cpu = SymbolicDevice{};
+      expert_stream::verify_named("restore", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), restore);
+      expert_stream::verify_named("info", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
+      struct Gate {
+        std::atomic<int> open{0};
+        int64_t calls = 0, waited = 0;
+      } gate;
+      const auto wait = [](void* p) {
+        auto* g = static_cast<Gate*>(p);
+        ++g->calls;
+        const int64_t start = now_ns();
+        while (g->open.load(std::memory_order_acquire) == 0)
+          _mm_pause();
+        g->waited += now_ns() - start;
+      };
+      const auto* rows = static_cast<const int64_t*>(restore.data_ptr());
+      const int64_t count = restore.size(0);
+      std::thread opener([&] {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(delay_ns));
+        for (int64_t r = 0; r < count; ++r)
+          std::memcpy(reinterpret_cast<void*>(static_cast<intptr_t>(rows[3 * r])),
+                      reinterpret_cast<const void*>(static_cast<intptr_t>(rows[3 * r + 1])),
+                      static_cast<size_t>(rows[3 * r + 2]));
+        gate.open.store(1, std::memory_order_release);
+      });
+      int64_t status = 1;
+      try {
+        status = forward_layer(id, x, slots, weights, out, threads, cores, accumulate, +wait, &gate);
+      } catch (...) {
+        opener.join();
+        throw;
+      }
+      opener.join();
+      auto* o = static_cast<int64_t*>(info.data_ptr());
+      o[0] = gate.calls;
+      o[1] = gate.waited;
+      return status;
+    }
+  }
+
+  // kernel_forward's forward, with ForwardCall::stage_two set to `stage_two(ctx)` (null: one stage).
+  static int64_t forward_layer(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
+                               int64_t threads, TensorView cores, int64_t accumulate, void (*stage_two)(void*),
+                               void* ctx) {
     KernelLayer entry;
     {
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
@@ -1062,6 +1301,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     call.out = static_cast<float*>(out.data_ptr());
     call.accumulate = accumulate != 0;
     call.cores = on;
+    call.stage_two = stage_two;
+    call.stage_two_ctx = ctx;
     kernel_error_text().clear();
     try {
       layer.kernel->check(layer, call);
@@ -1409,6 +1650,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_poll_pause, Exports::draft_test_poll_pause); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_layer, Exports::kernel_layer);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_forward, Exports::kernel_forward);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_forward_two_stage, Exports::kernel_forward_two_stage); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_error, Exports::kernel_error);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_drop, Exports::kernel_drop);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
@@ -1419,6 +1661,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_publish_piece, Exports::publish_piece);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_pieces, Exports::read_rows_pieces);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_two_span, Exports::read_rows_two_span);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump_group, Exports::pump_group);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_info, Exports::slot_info);                       \

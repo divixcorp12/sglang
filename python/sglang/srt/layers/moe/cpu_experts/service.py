@@ -169,6 +169,7 @@ class CpuExpertService:
                 )
             self.layers: dict[int, object] = {}
         keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
+        self.two_stage = envs.SGLANG_DSV41_CPU_TWO_STAGE.get()
         host.enable_cpu_experts(
             trait.kernel_address(),
             self.split,
@@ -178,6 +179,7 @@ class CpuExpertService:
             threads=self.threads,
             group=self.group,
             keep_warm_us=max(keep_warm_us, 0),
+            two_stage=self.two_stage,
         )
         self._last_stats = host.cpu_stats(self.group)
         logger.info(
@@ -193,6 +195,11 @@ class CpuExpertService:
             self.group,
             envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
             envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
+        )
+        logger.info(
+            "CPU experts group %d two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): %s",
+            self.group,
+            "on" if self.two_stage else "off",
         )
 
     def _capacity(self, slabs: Mapping[str, torch.Tensor]) -> int:
@@ -253,7 +260,7 @@ class CpuExpertService:
         This is where per-expert CPU cost under load is read. Returns the counters.
         """
         stats = {
-            key: value - self._calibration_stats[key]
+            key: value - self._calibration_stats.get(key, 0)
             for key, value in self.host.cpu_stats(self.group).items()
         }
         lanes = stats["lanes"]
@@ -265,6 +272,14 @@ class CpuExpertService:
             stats["forward_ns"] / lanes / 1e6 if lanes else 0.0,
             self.split,
         )
+        if self.two_stage:
+            logger.info(
+                "CPU experts group %d two-stage: %d staged jobs, %d waited for w2 after gate/up, %.3f ms waiting",
+                self.group,
+                stats["staged_jobs"],
+                stats["stage_two_waits"],
+                stats["stage_two_wait_ns"] / 1e6,
+            )
         return stats
 
     def retune(self) -> Optional[list[int]]:

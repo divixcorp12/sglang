@@ -79,6 +79,11 @@ ARMS["dspark-both-misscut"] = (
     {**ARMS["dspark-both"][0], "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"},
     True,
 )
+# The cut arm with a two-stage CPU miss: w13 read first, the CPU's gate/up GEMVs overlapping the w2 read.
+ARMS["dspark-both-misscut-twostage"] = (
+    {**ARMS["dspark-both-misscut"][0], "SGLANG_DSV41_CPU_TWO_STAGE": "1"},
+    True,
+)
 # The cut arm with each row's parts sized by drive speed (fio QD1: 3.35 / 2.19 / 3.38 GB/s, DSV41_REFERENCE.md 33.16).
 ARMS["dspark-both-weights-misscut"] = (
     {**ARMS["dspark-both-misscut"][0], "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS": "16:10:16"},
@@ -119,6 +124,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-floors": "dspark-both",
     "dspark-both-misscut": "dspark-both",
     "dspark-both-weights-misscut": "dspark-both-misscut",
+    "dspark-both-misscut-twostage": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
@@ -135,10 +141,16 @@ RAM_KEYS = (
 )
 
 
+# Every arm but the two-stage one states it off, so a shell that exports it cannot carry it into an arm.
+TWO_STAGE_OFF = {"SGLANG_DSV41_CPU_TWO_STAGE": "0"}
+
+
 def _overrides(arm: str, out: str) -> dict:
     overrides, _ = ARMS[arm]
     passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
-    return {**overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")}
+    return {
+        **TWO_STAGE_OFF, **overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")
+    }
 
 
 def _probe_overrides(arm: str, out: str) -> dict:

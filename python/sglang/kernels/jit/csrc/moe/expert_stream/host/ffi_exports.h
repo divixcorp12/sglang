@@ -429,6 +429,7 @@ struct HostExports {
   // in host memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU
   // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. The idle engine keeps
   // its team in register work for `keep_warm_ns` after each job and in PAUSE after that, until the next submit.
+  // `two_stage` (SGLANG_DSV41_CPU_TWO_STAGE) sends each CPU miss once its first stage landed (CpuJob::staged).
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,
@@ -441,7 +442,8 @@ struct HostExports {
       int64_t parts,
       int64_t tokens,
       int64_t threads,
-      int64_t keep_warm_ns) {
+      int64_t keep_warm_ns,
+      int64_t two_stage) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     auto host_mem = SymbolicDevice{};
@@ -485,6 +487,7 @@ struct HostExports {
     config.threads = static_cast<int>(threads);
     if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
     config.keep_warm_ns = keep_warm_ns;
+    config.two_stage = two_stage != 0;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
     find(handle)->enable_cpu_experts(
         static_cast<int>(group), std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
@@ -844,11 +847,12 @@ struct HostExports {
     find(handle)->set_cpu_split(static_cast<int>(group), static_cast<const int64_t*>(split.data_ptr()), split.size(0));
   }
 
-  // Group `group`'s CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
+  // Group `group`'s CPU experts' metrics: out int64 [6] = {jobs, lanes, forward ns, staged jobs, stage-two waits,
+  // stage-two wait ns}.
   static void cpu_stats(int64_t handle, int64_t group, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("out", TensorMatcher({6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     find(handle)->cpu_stats(static_cast<int>(group), static_cast<int64_t*>(out.data_ptr()));
   }
 

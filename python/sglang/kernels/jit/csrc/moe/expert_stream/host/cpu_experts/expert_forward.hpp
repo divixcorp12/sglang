@@ -8,6 +8,7 @@
 //   validate(layer, params)              nullptr when the quant runs the layer, else why not; may normalize params
 //   usable(layer, params, slot)          whether a routed slot's contents can be run (check() only)
 //   dispatch(layer, params, call, isa, team)   the forward on the team: 0, 2 when the input refuses, else a failure status
+//   kStagedForward (optional)            true when dispatch itself calls ForwardCall::stage_two between its stages
 #pragma once
 #include "isa.hpp"
 #include "keep_warm.hpp"
@@ -107,6 +108,9 @@ public:
 
     void forward(const ExpertLayer& layer, const ForwardCall& c, Team& team) const override
     {
+        if constexpr (!kStagedForward) {
+            if (c.stage_two) c.stage_two(c.stage_two_ctx);
+        }
         const int status = Quant::dispatch(layer, layer.params_as<Params>(), c, isa(), team);
 
         if (status != 0) [[unlikely]]
@@ -120,6 +124,8 @@ public:
     }
 
 private:
+    static constexpr bool kStagedForward = requires { requires Quant::kStagedForward; };
+
     // Out of line and cold, so forward's failure path costs it one predicted branch.
     [[noreturn, gnu::noinline, gnu::cold]] static void failed(int status)
     {

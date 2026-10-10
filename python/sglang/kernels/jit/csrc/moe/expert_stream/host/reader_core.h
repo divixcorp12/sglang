@@ -34,6 +34,14 @@ struct NoProgress {
   void operator()() const {}
 };
 
+// SGLANG_DSV41_CPU_TWO_STAGE, for one read(): `rows[o]` nonzero reads row ordinal o in two spans
+// (row_geometry_two_span), and the read sets `(*prefix)[o]` to 1 once the first span's pieces are all published, before
+// the row is whole. Piece streaming only; null rows read every row in one span.
+struct TwoSpanRows {
+  const uint8_t* rows = nullptr;
+  std::vector<uint8_t>* prefix = nullptr;
+};
+
 // Test only: one prepared SQE, as ReaderCore::set_sqe_log records it.
 struct SqeRecord {
   int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
@@ -131,6 +139,11 @@ class ReaderCore {
 
   bool piece_stream() const {
     return piece_stream_;
+  }
+
+  // Where the layout's second stage begins in a row image: what a two-span read splits at; 0 when it cannot.
+  int64_t second_stage() const {
+    return second_stage_;
   }
 
   // Where this reader counts its reads in flight per root (drive_load.h): the tier points every reader at its one
@@ -413,6 +426,7 @@ class ReaderCore {
   //                     (retire_leases()) while a read is in flight, as `abandon` is how it decides when to stop
   //                     admitting. NoProgress compiles to nothing.
   //   publish           piece streaming only: where the owner publishes each piece (PiecePublish).
+  //   two_span          piece streaming only: the rows read in two spans and their prefix flags (TwoSpanRows).
   //
   // `abandon` and `progress` are template parameters, not std::function: a closure past std::function's local storage
   // would be heap-allocated per read. `experts` and `slots` are spans, so the service passes its fixed-size lists
@@ -431,7 +445,8 @@ class ReaderCore {
       std::vector<uint8_t>* packed = nullptr,
       size_t max_reading_rows = SIZE_MAX,
       Progress&& progress = Progress{},
-      const PiecePublish* publish = nullptr) {
+      const PiecePublish* publish = nullptr,
+      TwoSpanRows two_span = {}) {
     if (!io_.ready()) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
@@ -458,7 +473,10 @@ class ReaderCore {
       c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
     }
     c.publish = piece_stream_ ? publish : nullptr;
+    c.two_span = piece_stream_ && second_stage_ > 0 ? two_span.rows : nullptr;
+    c.prefix = two_span.prefix;
     if (packed) packed->assign(c.total, 0);
+    if (c.prefix) c.prefix->assign(c.total, 0);
     on_trace([&](StageRecord& t) {
       t.rows_asked = static_cast<int64_t>(c.total);
       t.pack_workers = derived().pack_workers();
@@ -538,6 +556,7 @@ class ReaderCore {
   // `direct` opens the files with O_DIRECT. Queue depth, read cuts and the read mode come from
   // UringOptions::from_env().
   ReaderCore(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {
+    if constexpr (requires { Layout::kSecondStageMask; }) second_stage_ = second_stage_start(t_, Layout::kSecondStageMask);
     configured_queue_depth_ = UringOptions::from_env().queue_depth;
     cuts_requested_ = UringOptions::from_env().read_cuts_on();
     fixed_requested_ = UringOptions::from_env().read_mode != UringReadMode::Normal;
@@ -632,6 +651,9 @@ class ReaderCore {
     // owner. The row is finished once every piece is published and every sub-read retired.
     uint8_t dispatched = 0;
     uint8_t published = 0;
+    // A row read in two spans (TwoSpanRows): its first span's pieces, and whether their publish was reported.
+    uint8_t prefix = 0;
+    bool prefix_told = false;
     int64_t pack_first = INT64_MAX;  // the earliest start and latest end of its pieces' jobs (traced reads only)
     int64_t pack_last = 0;
   };
@@ -662,7 +684,8 @@ class ReaderCore {
     bool stale_armed = false;    // ... and has been: deliver it with the next reap
     int64_t publishes = 0;       // pieces published over the reader's life (the publish_twice fault counts them)
     std::vector<SqeRecord>* sqe_log = nullptr;  // set_sqe_log
-    std::vector<Completion> held;               // completions withheld from the reader (hold_ordinal)
+    std::vector<Completion> held;               // completions withheld from the reader (hold_ordinal, suffix_delay_ns)
+    int64_t held_since = 0;                     // suffix_delay_ns: when the first was withheld
   };
   struct NoFaultState {};
 
@@ -695,6 +718,8 @@ class ReaderCore {
     bool stalled = false;  // a batch is waiting for its bank to retire
     size_t packing = 0;    // jobs handed to the packing workers and not yet collected by the owner (rows, or pieces)
     const PiecePublish* publish = nullptr;  // piece streaming: where the owner publishes (null: nowhere)
+    const uint8_t* two_span = nullptr;      // TwoSpanRows::rows (null: every row in one span)
+    std::vector<uint8_t>* prefix = nullptr;  // TwoSpanRows::prefix
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
     int64_t events = 0;    // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
@@ -1072,7 +1097,8 @@ class ReaderCore {
         if (e.length > 0 && t_.file_sizes[e.file] - e.offset <= 0) return false;
       }
       // The slot is Free (checked above), so its piece runs may be written before the batch is known good.
-      if (piece_stream_ && !plan_pieces(bank * kBounceRows + i, row_index, geometry_[i])) return false;
+      const bool two = c.two_span != nullptr && c.two_span[first + i] != 0;
+      if (piece_stream_ && !plan_pieces(bank * kBounceRows + i, row_index, geometry_[i], two)) return false;
     }
     const int64_t admitted = trace_stamp();
     on_trace([&](StageRecord& t) { ++t.batches; });
@@ -1132,12 +1158,14 @@ class ReaderCore {
     return true;
   }
 
-  // Piece streaming: cuts the row into sub-reads and pieces, into `g` and slot `slot`'s piece runs. Returns false to
-  // refuse the batch: the row cannot be cut, or a sub-read would start at or past end of file (the per-part check in
-  // admit_batch, per sub-read).
-  bool plan_pieces(size_t slot, size_t row_index, RowGeometry& g) {
+  // Piece streaming: cuts the row into sub-reads and pieces, into `g` and slot `slot`'s piece runs, in two spans when
+  // `two`. Returns false to refuse the batch: the row cannot be cut, or a sub-read would start at or past end of file
+  // (the per-part check in admit_batch, per sub-read).
+  bool plan_pieces(size_t slot, size_t row_index, RowGeometry& g, bool two) {
     const size_t segments = t_.segments.size();
-    if (!row_geometry(t_, row_index, g, &piece_runs_[slot * kPieces * segments])) return false;
+    PieceRun* runs = &piece_runs_[slot * kPieces * segments];
+    if (!(two ? row_geometry_two_span(t_, row_index, second_stage_, g, runs) : row_geometry(t_, row_index, g, runs)))
+      return false;
     for (int s = 0; s < g.subs; ++s) {
       if (t_.file_sizes[g.sub[s].file] - g.sub[s].offset <= 0) return false;
     }
@@ -1154,6 +1182,7 @@ class ReaderCore {
     BounceRow& r = rows_[slot];
     r.start = g.start;
     r.subs = static_cast<uint8_t>(g.subs);
+    r.prefix = static_cast<uint8_t>((1u << g.prefix) - 1u);
     std::copy(g.deps, g.deps + kPieces, r.deps);
     for (int s = 0; s < g.subs; ++s) {
       const uint32_t index =
@@ -1397,6 +1426,11 @@ class ReaderCore {
     requires(Build::kFaults)
   {
     Call& c = c_;
+    if (faults_.fault.suffix_delay_ns > 0) {
+      const int64_t until = faults_.held_since + faults_.fault.suffix_delay_ns;
+      for (int64_t now = now_ns(); now < until; now = now_ns())
+        std::this_thread::sleep_for(std::chrono::nanoseconds(until - now));
+    }
     completions_.assign(faults_.held.begin(), faults_.held.end());
     faults_.held.clear();
     again_.clear();
@@ -1432,6 +1466,21 @@ class ReaderCore {
                              : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault.hold_ordinal) &&
             (fault.sub < 0 || fault_matches_sub(index)) &&
             (fault.leg < 0 || static_cast<int64_t>(tag_leg(completions_[k].data)) == fault.leg)) {
+          faults_.held.push_back(completions_[k]);
+        } else {
+          completions_[kept++] = completions_[k];
+        }
+      }
+      completions_.resize(kept);
+    }
+    if (fault.suffix_delay_ns > 0) {
+      size_t kept = 0;
+      for (size_t k = 0; k < completions_.size(); ++k) {
+        const uint32_t index = tag_index(completions_[k].data);
+        const bool live = index < descs_.size() && descs_[index].generation != 0 &&
+                          descs_[index].generation == tag_generation(completions_[k].data);
+        if (live && rows_[descs_[index].slot].prefix != 0 && index % subs_ == 1) {  // k = 1: the second span
+          if (faults_.held.empty()) faults_.held_since = now_ns();
           faults_.held.push_back(completions_[k]);
         } else {
           completions_[kept++] = completions_[k];
@@ -1648,6 +1697,10 @@ class ReaderCore {
       if (r.ordinal < static_cast<size_t>(kTraceRows)) t.piece_publish[r.ordinal][j] = seq;
     });
     r.published |= bit;
+    if (r.prefix != 0 && !r.prefix_told && (r.published & r.prefix) == r.prefix) {
+      r.prefix_told = true;
+      if (c.prefix != nullptr) (*c.prefix)[r.ordinal] = 1;
+    }
   }
 
   // The row is packed whole: accounts it, flags it and frees its slot. Packing is the last reference the bank held on
@@ -1771,6 +1824,8 @@ class ReaderCore {
   // validation and admission. All are sized at open() or set_piece_stream(), and empty with the flag off.
   bool piece_stream_ = false;
   size_t subs_ = 1;
+  // Where the layout's second stage begins in a row image (second_stage_start); 0: rows cannot be read in two spans.
+  int64_t second_stage_ = 0;
   std::vector<Read> sub_reads_;
   std::vector<PieceRun> piece_runs_;
   std::vector<iovec> iovecs_;  // direct mode: segments.size() per descriptor (size_extents)

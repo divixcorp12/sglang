@@ -113,6 +113,7 @@ def host_variant() -> str:
 TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_faulted",
     "read_rows_sqes",
+    "read_rows_two_span",
     "inject",
     "inject_fault",
     "inject_group_stall",
@@ -134,6 +135,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "draft_test_tear",
     "draft_test_finish_close",
     "draft_test_poll_pause",
+    "kernel_forward_two_stage",
 )
 
 
@@ -385,11 +387,13 @@ def _fault_tensor(
     ring_reset_fail: bool = False,
     leg_cut_cap: int = 0,
     nop_flush_refused: bool = False,
+    two_span_rows: int = 0,
+    suffix_delay_ns: int = 0,
 ) -> torch.Tensor:
     """Pack fault keywords into the C++ fault tensor (``kFaultWords`` int64 words).
 
     The word order must stay in step with ``fault_from()`` in
-    ``exl3_ram_miss_host.cpp``; words 19, 20 and 26 are reserved. The keywords are
+    ``exl3_ram_miss_host.cpp``; word 26 is reserved. The keywords are
     documented at ``read_rows_with_fault``.
     """
     return torch.tensor(
@@ -413,8 +417,8 @@ def _fault_tensor(
             hold_ordinal,
             abandon_after,
             step,
-            0,  # word 19: reserved (was pack_workers; the packed path is gone)
-            0,  # word 20: reserved (was pack_split)
+            two_span_rows,
+            suffix_delay_ns,
             int(hold_rest),
             int(piece_stream),
             sub,
@@ -656,6 +660,14 @@ def read_rows_with_fault(
       ``READ_CUTS`` says (see ``analysis/dsv41-drive/iopoll-cuts/results.md``);
       ``leg`` then narrows the faults to a cut leg as well.
 
+    Two spans (``SGLANG_DSV41_CPU_TWO_STAGE``, piece streaming only):
+
+    - ``two_span_rows`` (a bit per row ordinal) reads those rows in two spans, the
+      layout's first stage over every root before its second (``piece_geometry``'s
+      ``two_span``). Not a fault.
+    - ``suffix_delay_ns`` withholds every second-span sub-read's completions until
+      nothing else is in flight and that long after the first was withheld.
+
     Returns both reads' results (1 ok, 0 failed, -1 abandoned). ``cqes``, if given,
     receives the completions reaped after each read. ``stats``, if given, receives
     the reader's ``stale_cqes``, ``generation_wraps``, ``unfinished_jobs`` and
@@ -863,6 +875,7 @@ def piece_geometry(
     row: int,
     expert: int,
     *,
+    two_span: bool = False,
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> Optional[tuple[list[dict], list[dict]]]:
@@ -873,18 +886,21 @@ def piece_geometry(
     ``{file, offset, length, dest, part, k}``. Pieces (``STAGE_PIECES``) are
     ``{deps, runs}``: ``deps`` is the bitmask of sub-reads the piece depends on and
     ``runs`` holds one ``(dst_lo, dst_hi)`` per segment, in segment destination
-    coordinates.
+    coordinates. ``two_span`` cuts it as a two-stage CPU miss
+    (``SGLANG_DSV41_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
+    second's ``k`` 1.
     """
     segments = int(tables.segments.shape[0])
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
         _host_module(layout, variant).expert_stream_piece_geometry(
-            *_table_args(tables)[:-1], row, expert, subs, pieces
+            *_table_args(tables)[:-1], row, expert, subs, pieces, int(bool(two_span))
         )
     )
     if count < 0:
         return None
+    count &= 0xFF
     keys = ("file", "offset", "length", "dest", "part", "k")
     sub_reads = [dict(zip(keys, line)) for line in subs[:count].tolist()]
     out = []
@@ -896,6 +912,52 @@ def piece_geometry(
             }
         )
     return sub_reads, out
+
+
+def read_rows_two_span(
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    reference,
+    ref_slots,
+    step: int = BOUNCE_ROWS,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    **faults,
+) -> dict:
+    """Test only: one piece-streamed read of ``experts`` into ``slots``, the rows of ``two_span_rows`` in two spans.
+
+    When the read first reports a row's first span landed, its first-stage bytes are compared with the ``reference``
+    slabs (a pointer table shaped like ``tables.slabs``, row o at ``ref_slots[o]``). Returns ``result``, ``reported``
+    (rows reported), ``early`` (reported before the row was whole), ``differed`` (rows whose first-stage bytes did not
+    match when reported), ``in_flight`` (the reader's sub-reads still counted in flight after the read), ``split`` (the
+    second stage's start) and ``drive_load`` (``decode_drive_load`` of the reader's own load). Faults as in
+    ``read_rows_with_fault``. Instrumented build only.
+    """
+    _refuse_test_only("read_rows_two_span", variant)
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    fault = _fault_tensor(**faults)
+    info = torch.zeros(6, dtype=torch.int64)
+    drive = torch.zeros(DRIVE_LOAD_WORDS, dtype=torch.int64)
+    _host_module(layout, variant).expert_stream_read_rows_two_span(
+        *_table_args(tables),
+        row,
+        expert_ids,
+        slot_ids,
+        int(step),
+        fault,
+        reference,
+        _ids(ref_slots),
+        info,
+        drive,
+    )
+    result, reported, early, differed, in_flight, split = info.tolist()
+    return dict(
+        result=result, reported=reported, early=early, differed=differed, in_flight=in_flight, split=split,
+        drive_load=decode_drive_load(drive.tolist()),
+    )
 
 
 # One request's stage record: the C++ ``StageRecord``'s int64 words, in order.
@@ -1422,6 +1484,49 @@ def kernel_forward(
     )
     # The message is this thread's (a thread-local in the module), read on the same thread.
     return status, (str(module.expert_stream_kernel_error()) if status else "")
+
+
+def kernel_forward_two_stage(
+    layer: int,
+    x: torch.Tensor,
+    slots: torch.Tensor,
+    weights: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    threads: int,
+    restore: Sequence[tuple[int, int, int]],
+    delay_s: float,
+    cores: Sequence[int] = (),
+    accumulate: bool = False,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+) -> tuple[int, str, dict]:
+    """Test only: :func:`kernel_forward` as a two-stage CPU miss runs it (``SGLANG_DSV41_CPU_TWO_STAGE``).
+
+    The forward's stage-two wait holds until a helper thread, ``delay_s`` after the call, has copied each ``restore``
+    row ``(dst, src, bytes)`` (the second-stage bytes the caller held back) and opened the gate. Returns the status, the
+    kernel's refusal and ``{"calls", "waited_ns"}`` of the wait. Instrumented build only.
+    """
+    _refuse_test_only("kernel_forward_two_stage", variant)
+    module = _host_module(layout, variant)
+    info = torch.zeros(2, dtype=torch.int64)
+    status = int(
+        module.expert_stream_kernel_forward_two_stage(
+            int(layer),
+            x.to(torch.float16).contiguous(),
+            slots.to(torch.int32).contiguous(),
+            weights.to(torch.float32).contiguous(),
+            out,
+            int(threads),
+            torch.tensor(list(cores), dtype=torch.int64),
+            int(bool(accumulate)),
+            torch.tensor([list(r) for r in restore], dtype=torch.int64).reshape(-1, 3),
+            int(delay_s * 1e9),
+            info,
+        )
+    )
+    calls, waited = info.tolist()
+    return status, (str(module.expert_stream_kernel_error()) if status else ""), {"calls": calls, "waited_ns": waited}
 
 
 def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
@@ -2107,6 +2212,7 @@ class ExpertStreamHost:
         threads: int,
         group: int = 0,
         keep_warm_us: int = 0,
+        two_stage: bool = False,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
@@ -2122,7 +2228,9 @@ class ExpertStreamHost:
         references to both. The thread's team never sleeps: its workers run the kernel's
         register work for ``keep_warm_us`` after each job and PAUSE after that, until the
         next submit. With ``[rows, 2 * nodes, tokens, hidden]`` rows a record's CPU job runs
-        one forward of its tokens from the row's token table.
+        one forward of its tokens from the row's token table. ``two_stage``
+        (``SGLANG_DSV41_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
+        its job once w13 has landed: the gate/up GEMVs run while w2 is still being read.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -2165,6 +2273,7 @@ class ExpertStreamHost:
             int(tokens),
             int(threads),
             int(keep_warm_us * 1e3),
+            int(bool(two_stage)),
         )
         self.cpu_rows = (x_rows, out_rows)
 
@@ -2201,11 +2310,18 @@ class ExpertStreamHost:
         )
 
     def cpu_stats(self, group: int = 0) -> dict[str, int]:
-        """Return the jobs and lanes group ``group``'s CPU expert thread computed, and its forward ns."""
-        out = torch.zeros(3, dtype=torch.int64)
+        """Return the jobs and lanes group ``group``'s CPU expert thread computed, and its forward ns.
+
+        With two-stage CPU misses, also its staged jobs, those whose w2 had not landed when their gate/up GEMVs were
+        done, and the ns they waited for it.
+        """
+        out = torch.zeros(6, dtype=torch.int64)
         self._module.expert_stream_cpu_stats(self.handle, int(group), out)
-        jobs, lanes, ns = out.tolist()
-        return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
+        jobs, lanes, ns, staged, waits, wait_ns = out.tolist()
+        return {
+            "jobs": jobs, "lanes": lanes, "forward_ns": ns, "staged_jobs": staged, "stage_two_waits": waits,
+            "stage_two_wait_ns": wait_ns,
+        }
 
     def copy_expert_bytes(self, row: int) -> int:
         """Return the bytes the DMA moves per expert of ``row``, for CPU calibration.
@@ -2262,10 +2378,14 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_test_kernel_address(int(ns_per_expert), int(fail), int(bool(zero))))
 
     def test_kernel_calls(self) -> list[dict]:
-        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, one per row, in order."""
+        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, one per row, in order.
+
+        ``staged`` says the forward was a two-stage one; over a six-slab layer ``w13`` and ``w2`` are the byte sums of
+        its live slots' w13 slabs at its start and w2 slabs after its stage-two wait (else 0).
+        """
         _refuse_test_only("test_kernel_calls", self.variant)
         lanes = self.wire.lanes
-        width = 6 + 2 * lanes
+        width = 9 + 2 * lanes
         count = int(self._module.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
         out = torch.zeros((count, width), dtype=torch.float64)
         self._module.expert_stream_test_kernel_calls(out)
@@ -2275,7 +2395,8 @@ class ExpertStreamHost:
             calls.append({
                 "core": int(row[0]), "affinity": int(row[1]), "threads": int(row[2]), "accumulate": bool(row[3]),
                 "slots": [int(s) for s in row[5 : 5 + k]], "weights": row[5 + lanes : 5 + lanes + k],
-                "capacity": int(row[5 + 2 * lanes]),
+                "capacity": int(row[5 + 2 * lanes]), "staged": bool(row[6 + 2 * lanes]),
+                "w13": row[7 + 2 * lanes], "w2": row[8 + 2 * lanes],
             })
         return calls
 
@@ -2542,6 +2663,10 @@ class ExpertStreamHost:
                 # Per root: reads in flight (0 here), bytes landed and busy/overlap time by kind
                 # (analysis/dsv41-drive/dspark/drive_busy.py drive-load reads it).
                 sys.stderr.write("exl3 RAM miss drive load " + json.dumps(self.drive_load()) + "\n")
+                if getattr(self, "cpu_rows", None) is not None:
+                    # Per group, the CPU expert thread's jobs, with the two-stage misses' waits for w2.
+                    stats = [self.cpu_stats(group) for group in range(self.nodes)]
+                    sys.stderr.write("exl3 RAM miss cpu stats " + json.dumps(stats) + "\n")
             finally:
                 close()
 

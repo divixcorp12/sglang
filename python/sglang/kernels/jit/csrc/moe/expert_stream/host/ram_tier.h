@@ -146,6 +146,8 @@ class RamTier {
       // The request path's buffers, sized once: nothing on it grows after construction.
       group.hot_scratch.assign(static_cast<size_t>((experts_ + 7) / 8), 0);
       group.packed.reserve(kWanted);
+      group.two_span.reserve(kWanted);
+      group.prefix.reserve(kWanted);
       group.piece_targets.reserve(kWanted);
     }
     int64_t widest = 0;
@@ -708,6 +710,9 @@ class RamTier {
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU experts are already enabled for group " + std::to_string(g));
     if (config.kernel == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the format's kernel");
+    if (config.two_stage && dist_.group(g).reader.second_stage() == 0)
+      throw std::runtime_error(
+          error_prefix<Layout>() + "two-stage CPU misses need row images whose second stage follows the first");
     if (cpu_kernel_ != nullptr && cpu_kernel_ != config.kernel)
       throw std::runtime_error(
           error_prefix<Layout>() + "every group's CPU experts run one kernel: group " + std::to_string(g) +
@@ -792,12 +797,16 @@ class RamTier {
     store_split(g, split, count);
   }
 
-  // Group g's CPU expert thread's metrics, {jobs, lanes, forward ns}; zeros when its CPU experts are off.
+  // Group g's CPU expert thread's metrics, {jobs, lanes, forward ns, staged jobs, stage-two waits, stage-two wait ns};
+  // zeros when its CPU experts are off.
   void cpu_stats(int g, int64_t* out) const {
     const CpuExpertEngine* cpu = cpu_engine(g);
     out[0] = cpu != nullptr ? cpu->jobs() : 0;
     out[1] = cpu != nullptr ? cpu->lanes() : 0;
     out[2] = cpu != nullptr ? cpu->compute_ns() : 0;
+    out[3] = cpu != nullptr ? cpu->staged_jobs() : 0;
+    out[4] = cpu != nullptr ? cpu->stage_two_waits() : 0;
+    out[5] = cpu != nullptr ? cpu->stage_two_wait_ns() : 0;
   }
 
   // Every group's CPU experts' cores, empty without CPU experts. For the caller, before the service thread starts.
@@ -1978,6 +1987,10 @@ class RamTier {
     Wire::LaneMask sent = 0;  // bit i: miss i went to the CPU
     int left = 0;
     uint32_t next = 0;  // the next CPU-miss job's sequence, short of the last (job.late_seq)
+    // Two-stage: the staged jobs whose second stage is not open yet, each one's sequence and the misses still landing.
+    uint32_t staged_seq[Wire::kLanes] = {};
+    Wire::LaneMask staged_rows[Wire::kLanes] = {};
+    int staged = 0;
   };
 
   // Fail-stops with the record's identity and `why`.
@@ -2599,20 +2612,53 @@ class RamTier {
     return at < group.packed.size() && group.packed[at] != 0;
   }
 
+  // True once miss i's first stage is in RAM (two-stage CPU misses): its whole row, or its read's first span.
+  static bool miss_first_stage_landed(const Group& group, const RecordPlan& plan, size_t i) {
+    if (miss_landed(group, plan, i)) return true;
+    const size_t at = plan.pooled != 0 ? static_cast<size_t>(plan.ordinal[i]) : i;
+    return at < group.prefix.size() && group.prefix[at] != 0;
+  }
+
+  // Opens the second stage of each staged job whose rows have all landed whole.
+  void open_landed_stage_two(Group& group, const RecordPlan& plan, CpuMissBatch* misses) {
+    for (int j = 0; j < misses->staged;) {
+      const Wire::LaneMask rows = misses->staged_rows[j];
+      bool whole = true;
+      for (size_t i = 0; i < plan.missing.size() && whole; ++i)
+        whole = (rows >> i & 1u) == 0 || miss_landed(group, plan, i);
+      if (!whole) {
+        ++j;
+        continue;
+      }
+      _mm_sfence();  // the rows' bytes before the CPU thread reads them
+      group.cpu->open_stage_two(misses->staged_seq[j]);
+      --misses->staged;
+      misses->staged_seq[j] = misses->staged_seq[misses->staged];
+      misses->staged_rows[j] = misses->staged_rows[misses->staged];
+    }
+  }
+
   // Submits the CPU misses whose rows landed since the last call as one part-1 job. Called from read()'s progress hook
-  // and after the read. Every job after the record's first adds into the part.
+  // and after the read. Every job after the record's first adds into the part. With two-stage CPU misses a miss goes
+  // once its first stage landed, and a job holding a row not yet whole is staged: its second stage opens once they are.
   void submit_landed_cpu_misses(Group& group, const Request& request, const RecordPlan& plan, CpuMissBatch* misses) {
+    if (misses->staged != 0) open_landed_stage_two(group, plan, misses);
     if (misses->left == 0) return;
     const CopyJob& job = plan.job;
+    const bool two_stage = group.cpu->config().two_stage;
     CpuJob cpu_job;
     cpu_job.row = request.row;
     cpu_job.part = 1;
     cpu_job.accumulate = misses->left < job.late_cpu;
     cpu_job.per_token = true;
+    Wire::LaneMask landing = 0;  // the job's misses not yet whole
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       const Lane& lane = request.lanes[plan.miss_lane[i]];
       if (lane.kind != Wire::kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
-      if (!miss_landed(group, plan, i)) continue;
+      if (!miss_landed(group, plan, i)) {
+        if (!two_stage || !miss_first_stage_landed(group, plan, i)) continue;
+        landing |= Wire::LaneMask{1} << i;
+      }
       cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
       cpu_job.weights[cpu_job.k] = lane.weight;
       cpu_job.lanes[cpu_job.k] = static_cast<int32_t>(plan.miss_lane[i]);
@@ -2622,6 +2668,12 @@ class RamTier {
     if (cpu_job.k == 0) return;
     misses->left -= cpu_job.k;
     cpu_job.seq = misses->left == 0 ? job.late_seq : misses->next++;
+    if (landing != 0) {
+      cpu_job.staged = true;
+      misses->staged_seq[misses->staged] = cpu_job.seq;
+      misses->staged_rows[misses->staged] = landing;
+      ++misses->staged;
+    }
     _mm_sfence();  // the rows' bytes before the CPU thread reads them
     submit_cpu_job(group, request, cpu_job);
   }
@@ -2631,6 +2683,7 @@ class RamTier {
   int64_t read_misses(
       Group& group, const Request& request, RecordPlan& plan, CpuMissBatch* misses, StageRecord* cur) {
     group.packed.clear();
+    group.prefix.clear();
     const bool pooled = plan.pooled != 0;
     if (pooled) {
       for (size_t i = 0; i < plan.missing.size(); ++i) {
@@ -2658,6 +2711,7 @@ class RamTier {
     }
     submit_landed_cpu_misses(group, request, plan, misses);
     if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
+    if (misses->staged != 0) fail_record(request, "a staged CPU miss's row never landed whole");
     return kStatusServed;
   }
 
@@ -2687,6 +2741,11 @@ class RamTier {
       }
     }
     const bool publishing = init_piece_words_locked(group, request, lanes, plan.idx);
+    // Two-stage CPU misses: each CPU miss's row in two spans, its first stage over every root before its second.
+    const bool two_stage = group.cpu != nullptr && group.cpu->config().two_stage;
+    group.two_span.clear();
+    for (size_t o = 0; two_stage && o < lanes.size(); ++o)
+      group.two_span.push_back(request.lanes[lanes[o]].kind == Wire::kKindMissCpu ? 1 : 0);
     bool fail_reads = false;
     if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
       apply_pending_fault(group);
@@ -2706,7 +2765,8 @@ class RamTier {
         SIZE_MAX,
         // read() runs this once per drain-loop turn and once per finished row.
         [&] { submit_landed_cpu_misses(group, request, plan, misses); },
-        publishing ? &group.piece_publish : nullptr);
+        publishing ? &group.piece_publish : nullptr,
+        TwoSpanRows{two_stage ? group.two_span.data() : nullptr, two_stage ? &group.prefix : nullptr});
     // The tier's count is the sum over the groups' readers: each adds what its own reader refused since it last did.
     const int64_t refused = group.reader.publish_refused();
     stats_.add(kPiecePublishRefused, refused - group.publish_refused_seen);

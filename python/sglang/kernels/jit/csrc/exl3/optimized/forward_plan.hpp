@@ -198,6 +198,8 @@ struct ForwardCtx
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
+    void (*stage_two)(void*);  // ForwardCall::stage_two: worker 0 calls it between GateUp and Middle (null: never)
+    void* stage_two_ctx;
     std::vector<Chunk> chunks;
 
     // workspace, per chunk (pointers into the persistent per-thread arena below: fresh
@@ -519,6 +521,10 @@ private:
                 std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
+            if (ctx.stage_two) {
+                if (worker == 0) ctx.stage_two(ctx.stage_two_ctx);
+                team.barrier();
+            }
             step<Phase::Middle>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             step<Phase::Down>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             step<Phase::Accumulate>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
@@ -690,6 +696,8 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     ctx.out = c.out;
     ctx.m_total = c.rows;
     ctx.zero_out = !c.accumulate;
+    ctx.stage_two = c.stage_two;
+    ctx.stage_two_ctx = c.stage_two_ctx;
 
     ForwardArena& ar = ForwardArena::get();
     ctx.chunks = std::move(ar.chunks);
@@ -720,6 +728,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         ctx.chunks.push_back(ch);
     }
     if (ctx.chunks.empty()) {
+        if (ctx.stage_two) ctx.stage_two(ctx.stage_two_ctx);
         if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * l.hidden * sizeof(float));
     } else {
         run_plan(ctx, p, ar, team, isa);

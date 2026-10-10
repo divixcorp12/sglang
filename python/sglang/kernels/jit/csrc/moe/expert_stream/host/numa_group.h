@@ -46,6 +46,9 @@ struct NumaGroup {
   int64_t demands_read = 0;
   int64_t publish_refused_seen = 0;  // the reader's refusals already added to the tier's kPiecePublishRefused
   std::vector<uint8_t> packed;
+  // Two-stage CPU misses (TwoSpanRows): which rows of a demand read go in two spans, and their first spans' landing.
+  std::vector<uint8_t> two_span;
+  std::vector<uint8_t> prefix;
   std::vector<PieceTarget> piece_targets;
   PiecePublish piece_publish;
   std::vector<uint8_t> hot_scratch;

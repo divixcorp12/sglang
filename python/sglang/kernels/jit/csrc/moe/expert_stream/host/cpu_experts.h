@@ -97,11 +97,15 @@ inline void check_cpu_expert_team(const std::string& prefix, const std::vector<i
 /// (part 1). Every miss job after the first adds into part 1 in landing order, so that part's fp32 sum order varies
 /// from run to run. A record's job is per_token: on a multi-token row (CpuExpertConfig::tokens > 1) the row's token
 /// table gives each token its own slots and weights, `lanes` naming each job lane's column there.
+///
+/// A staged job (CpuExpertConfig::two_stage) is a CPU miss job sent once its rows' first stage (w13) has landed: its
+/// forward runs the gate/up GEMVs, then waits until the tier calls open_stage_two(seq), once every row is whole.
 struct CpuJob {
   int64_t row = 0;
   int32_t part = 0;
   bool accumulate = false;  // add into the part rather than overwrite it
   bool per_token = false;   // a record's job: a multi-token row's table gives each token its weights
+  bool staged = false;      // its rows' second stage may still be landing: wait for open_stage_two(seq)
   uint32_t seq = 0;         // from claim()
   int32_t k = 0;
   int32_t slots[wire::Wire::kLanes] = {};
@@ -127,6 +131,7 @@ struct CpuExpertConfig {
   int64_t keep_warm_ns = 0;  // how long after each job the idle team runs register work instead of PAUSE
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
+  bool two_stage = false;    // SGLANG_DSV41_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job (CpuJob::staged)
 };
 
 /// The CPU expert thread, its job ring and its done word.
@@ -256,6 +261,12 @@ class BasicCpuExpertEngine {
     return static_cast<int32_t>(done_.load(std::memory_order_acquire) - seq) >= 0;
   }
 
+  /// Tier owner only: the staged job `seq` may read its rows' second stage. The release pairs with the forward's acquire
+  /// before it does, so the rows' bytes the caller fenced before this are seen.
+  void open_stage_two(uint32_t seq) {
+    stage_gates_[seq % kRing].store(seq, std::memory_order_release);
+  }
+
   /// Jobs finished, lanes computed and forward time in ns, for the service's counters.
   int64_t jobs() const {
     return jobs_done_.load(std::memory_order_relaxed);
@@ -265,6 +276,17 @@ class BasicCpuExpertEngine {
   }
   int64_t compute_ns() const {
     return compute_ns_.load(std::memory_order_relaxed);
+  }
+  /// Staged jobs run, those whose second stage had not landed when their gate/up GEMVs were done, and the ns they
+  /// waited for it: how much of the GEMVs' time the second stage's read hid.
+  int64_t staged_jobs() const {
+    return staged_jobs_.load(std::memory_order_relaxed);
+  }
+  int64_t stage_two_waits() const {
+    return stage_two_waits_.load(std::memory_order_relaxed);
+  }
+  int64_t stage_two_wait_ns() const {
+    return stage_two_wait_ns_.load(std::memory_order_relaxed);
   }
 
   static constexpr const char* kDraftPrefix = DraftExperts<Build>::kPrefix;
@@ -399,6 +421,12 @@ class BasicCpuExpertEngine {
         reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
     call.accumulate = job.accumulate;
     call.cores = config_.cores;
+    if (job.staged) {
+      call.stage_two = &BasicCpuExpertEngine::stage_two;
+      call.stage_two_ctx = this;
+      stage_job_ = &job;
+      stage_called_ = false;
+    }
     if (job.per_token && config_.tokens > 1) {
       call.rows = static_cast<int32_t>(expand_tokens(job, static_cast<const uint8_t*>(call.x)));
       call.slots = token_slots_.data();
@@ -423,6 +451,10 @@ class BasicCpuExpertEngine {
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
     }
+    // A kernel built before ForwardCall::stage_two would run Down on rows still landing: refuse its output.
+    if (job.staged && !stage_called_)
+      fail_stop(prefix_ + "kernel " + config_.kernel->name() + " never waited for row " + std::to_string(job.row) +
+                "'s second stage (rebuild it with SGLANG_DSV41_CPU_TWO_STAGE's ForwardCall)");
     const int64_t end = now_ns();
     add(compute_ns_, end - start);
     add(jobs_done_, 1);
@@ -454,6 +486,28 @@ class BasicCpuExpertEngine {
         token_weights_[t * job.k + i] = routed ? std::bit_cast<float>(bits) : 0.0f;
       }
     return tokens;
+  }
+
+  /// ForwardCall::stage_two of a staged job, on worker 0 between its stages: spins until the tier opens the job's gate.
+  /// The spin is the job's own time, so the watchdog still times it, and a read that never lands fails stop in the
+  /// tier; stop() alone ends it early, at shutdown.
+  static void stage_two(void* self) {
+    auto* engine = static_cast<BasicCpuExpertEngine*>(self);
+    const CpuJob& job = *engine->stage_job_;
+    engine->stage_called_ = true;
+    add(engine->staged_jobs_, 1);
+    const std::atomic<uint32_t>& gate = engine->stage_gates_[job.seq % kRing];
+    if (gate.load(std::memory_order_acquire) == job.seq) {
+      if constexpr (Build::kMetrics) engine->trace_.emit("cpu_stage_two", job.row, 0, job.seq, -1, 0, 0);
+      return;
+    }
+    const int64_t start = now_ns();
+    while (gate.load(std::memory_order_acquire) != job.seq && !engine->stop_.load(std::memory_order_relaxed))
+      _mm_pause();
+    const int64_t waited = now_ns() - start;
+    add(engine->stage_two_waits_, 1);
+    add(engine->stage_two_wait_ns_, waited);
+    if constexpr (Build::kMetrics) engine->trace_.emit("cpu_stage_two", job.row, 0, job.seq, -1, waited, 1);
   }
 
   static uint32_t load_u32(const uint8_t* p) {
@@ -528,6 +582,12 @@ class BasicCpuExpertEngine {
   std::atomic<int64_t> jobs_done_{0};
   std::atomic<int64_t> lanes_done_{0};
   std::atomic<int64_t> compute_ns_{0};
+  std::atomic<int64_t> staged_jobs_{0}, stage_two_waits_{0}, stage_two_wait_ns_{0};
+  // Staged jobs: each one's gate, at its sequence modulo the ring (the tier owner stores, the thread reads), and the job
+  // the thread runs now with whether its kernel called stage_two (this thread only).
+  std::array<std::atomic<uint32_t>, kRing> stage_gates_{};
+  const CpuJob* stage_job_ = nullptr;
+  bool stage_called_ = false;
   // A per-token job's expanded slots and weights, [tokens][k]; this thread only.
   std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_slots_{};
   std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_weights_{};

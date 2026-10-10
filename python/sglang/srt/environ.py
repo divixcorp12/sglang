@@ -1990,6 +1990,10 @@ class Envs:
     SGLANG_DSV41_CPU_SPLIT_MISS_CUT = EnvInt(1)
     # The most forced misses on a node for which the cut applies.
     SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX = EnvInt(3)
+    # Experiment: a two-stage CPU miss. The reader fetches a CPU-computed miss's w13 prefix across the mirror roots
+    # before its w2 suffix, and the CPU job starts once w13 has landed: it runs the gate/up GEMVs while w2 is still being
+    # read and waits for w2 before anything reads it. Needs SGLANG_DSV41_CPU_EXPERTS. Off until a served A/B decides.
+    SGLANG_DSV41_CPU_TWO_STAGE = EnvBool(False)
     # DSpark draft experts on the CPU (plan 2026-10-05-dsv41-dspark-port): each draft stage keeps the experts its
     # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
     # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.

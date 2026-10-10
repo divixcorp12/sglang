@@ -14,6 +14,9 @@ struct Exl3RowLayout {
       "w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh"};
   // suh/svh: 44.5 KB of a 13.3 MB DSV4.1 row, read by the copy wait's SMs rather than the DMA engine.
   static constexpr uint32_t kSmallMask = 0b110110;
+  // w2_*: what a CPU forward first reads after its gate/up GEMVs (the down input's suh, then the down GEMVs). A
+  // two-stage CPU miss (SGLANG_DSV41_CPU_TWO_STAGE) reads the image before them first.
+  static constexpr uint32_t kSecondStageMask = 0b111000;
 };
 
 }  // namespace sglang::exl3
