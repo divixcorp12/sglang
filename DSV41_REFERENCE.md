@@ -8296,8 +8296,8 @@ so an expert shared by 3-4 verify tokens decodes its weights once. Checked from 
 best-measured configuration (`0589e7fae4`): `SGLANG_DSV41_RAM_PREFETCH_SCORER` defaults to `gpu`, and
 `SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS` unset means the packaged table for the GPU scorer (`""` = no floors; a path =
 that file; the CPU scorer has none). With prefetch off nothing is read and launches pass as before; an explicit
-`SCORER=gpu` or floors path without prefetch is refused. `TOP_K_ONLY` stays off (never A/B'd); idle2 lives only on
-`codex/dsv41-spec-idle-drive`. The table covers target rows 1-39 (DSV4.1); another model needs floors `""`.
+`SCORER=gpu` or floors path without prefetch is refused. `TOP_K_ONLY` stays off (never A/B'd). idle2 is merged (§33.22) but is
+not part of what `RAM_PREFETCH=1` turns on: it needs its own three keys (see the prefetch scoreboard in §33.22). The table covers target rows 1-39 (DSV4.1); another model needs floors `""`.
 `SGLANG_EXL3_CPU_MAX_M`: see §33.22 (default 8 since 2026-10-11).
 
 ### 33.21 The SPCC stalls on its own: settings, writers and a fio span grid (2026-10-11)
@@ -8396,6 +8396,45 @@ Per-session ms/token, in session order 0-7:
 (§33.18). But the pooled figure turns on one drive-disturbed session, and one loss has no drive explanation. The flag
 showed what it was built for: a stalled session is now attributed to a drive by name. idle2 stays default off. A repeat
 should start from master (write-aware idle check) and drop or re-run any flagged session before pooling.
+
+**The NVMe-to-RAM prefetch variants so far (scoreboard, 2026-10-11).**
+
+All the variants share one mechanism. They predict the next layer's experts and read those rows from NVMe into RAM
+before decode demands them. They differ in who predicts, which predictions are admitted, and when the reads may use a
+drive. Each row below is measured against the same configuration without prefetch. Positive means the prefetch arm
+was faster.
+
+| # | Variant (arm) | What changes | Result vs no prefetch | § |
+|---|---|---|---|---|
+| 1 | CPU scorer (`dspark-both-prefetch`) | The speculative thread scores layer T+1's gate on the CPU, about 1.8 ms per record | Paired median −1.9%; 5 of 8 sessions slower | 33.14 |
+| 2 | GPU scorer (`dspark-both-prefetch-gpu`) | Gate scoring moves into the decode graph | First A/B 12.9% slower; reversed A/B a tie (paired −1.1%, 3 of 8 faster) | 33.15 |
+| 3 | GPU + margin floors (`...-gpu-floors`) | Per-layer minimum gate margin; precision 0.45 to 0.59, waste per token 6.9 to 2.8 | Tie: paired +0.6%, 5 of 8 faster | 33.15 addendum |
+| 4 | GPU + split cut (`...-gpu-misscut`), against the cut alone | Same as 2, on top of the miss-aware CPU split cut | About even once an outlier session is excluded | 33.17 |
+| 5 | GPU + per-drive in-flight cap (`...-gpu-cap`), against 2 | Moves sub-reads to the drive with the fewest bytes in flight | 4.5% slower; 6 of 8 slower; dropped | 33.17 |
+| 6 | GPU + cut + idle-drive reads (`...-gpu-misscut-idle`) | Speculative reads only to a drive with no demand read in flight, one 2.2 MB piece at a time, 4 ms deadline | About 7% slower; 6 of 8 slower (35% abandoned, 82% of promotions boosted) | 33.18 |
+| 7 | **GPU + cut + idle2** (`...-gpu-misscut-idle2`) | As 6, plus ties between idle drives spread across drives (`IDLE_SPREAD=1`) and 2 pieces in flight (`IDLE_PIECES=2`) | **Paired median +3.6%, 5 of 8 faster**; pooled −3.8% because of one Samsung-stalled session, +2.0% without it | 33.22 |
+
+**Best so far: idle2 (row 7).** It is the only variant whose paired median favours the prefetch. It fixed idle's two
+faults: abandoned reads fell from 35% to about 10%, and nvme0 no longer takes 72% of the speculative bytes (the split
+is now 59 / 51 / 55 GB). It is **not an established gain**:
+- the evidence is one same-window A/B, and the pooled result turns on one drive-disturbed session;
+- it was measured **without margin floors** (`MARGIN_FLOORS=""`), so idle2 with floors (rows 3 + 7) is untested.
+
+**What the flags turn on.** `SGLANG_DSV41_RAM_PREFETCH=1` alone gives row 3 (GPU scorer with the packaged floors),
+not idle2. To run idle2, set these as well:
+- `SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=1`
+- `SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=1`
+- `SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=2`
+
+To match the A/B exactly, also set `MARGIN_FLOORS=""`. Prefetch stays default off.
+
+**Why none wins clearly.** At this budget the prefetch is not on the decode critical path (§33.15 addendum, §33.16).
+Removing a quarter of the RAM misses does not clear a layer whose other misses still gate it, and every speculative
+read competes with the demand reads on the same three drives.
+
+**Next, if prefetch is pursued:**
+- repeat idle2 from master, with the write-aware idle check and flagged sessions re-run;
+- then idle2 with floors.
 
 ## Sources
 
