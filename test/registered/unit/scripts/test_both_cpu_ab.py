@@ -386,3 +386,66 @@ def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkey
             "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert {k: overrides[k] for k in want} == want, arm
+
+
+def _drive_rows(busy_ms_by_session):
+    def counters(sectors, busy):
+        return {"nvme4": {"device": "nvme2n1p1", "reads": sectors // 1000, "sectors_read": sectors, "writes": 0,
+                          "sectors_written": 0, "io_ticks_ms": busy, "time_in_queue_ms": 0}}  # fmt: skip
+
+    rows = [{"label": "before_server", "diskstats_sectors": {}}]
+    for t, (sid, busy) in enumerate(busy_ms_by_session):
+        rows.append({"label": "session_start", "session_id": sid, "monotonic": t, "drive_counters": counters(0, 0)})
+        rows.append({"label": "session_end", "session_id": sid, "monotonic": t + 1,
+                     "drive_counters": counters(10**9 // 512 * 2, busy)})  # fmt: skip
+        rows.append({"label": f"session_{sid}"})
+    return "".join(json.dumps(r) + "\n" for r in rows)
+
+
+def test_summarize_adds_per_session_drive_load_and_flags_across_both_arms_and_keeps_the_rest(tmp_path):
+    ab = _ab()
+    _arm_run(tmp_path, "dspark-both-misscut", rows_read=3000)
+    _arm_run(tmp_path, "dspark-both-misscut-maxm8", rows_read=2000)
+    # 2 GB per session; busy s per GB 0.31, 0.32 | 0.31, 0.45 -> median 0.315, and 0.45 is +43%.
+    for arm, sessions in (("dspark-both-misscut", [("s0", 620), ("s1", 640)]),
+                          ("dspark-both-misscut-maxm8", [("s0", 620), ("s1", 900)])):  # fmt: skip
+        (tmp_path / "servers" / arm / "run-1" / "boundary-samples.jsonl").write_text(_drive_rows(sessions))
+    summary = ab.summarize(str(tmp_path))
+    a, b = summary["dspark-both-misscut"], summary["dspark-both-misscut-maxm8"]
+    assert a["ram"]["rows_read"] == 3000 and b["text_vs_reference"]["pass"] is True  # the existing fields stay
+    assert [s["session_id"] for s in b["drives_per_session"]["sessions"]] == ["s0", "s1"]
+    assert b["drives_per_session"]["sessions"][1]["drives"]["nvme4"]["busy_s_per_gb"] == pytest.approx(0.45)
+    assert a["drive_flags"] == []
+    assert [(f["session_id"], f["drive"]) for f in b["drive_flags"]] == [("s1", "nvme4")]
+    assert json.loads((tmp_path / "summary.json").read_text())["dspark-both-misscut-maxm8"]["drive_flags"]
+
+
+def test_an_arm_without_per_session_drive_counters_gets_a_note_not_an_error(tmp_path):
+    ab = _ab()
+    _arm_run(tmp_path, "dspark-both")
+    summary = ab.summarize(str(tmp_path))["dspark-both"]
+    assert summary["drives_per_session"]["sessions"] == [] and summary["drives_per_session"]["notes"]
+    assert summary["drive_flags"] == [] and summary["ram"]["rows_read"] == 2000
+
+
+def test_main_prints_the_per_session_drive_table(tmp_path, monkeypatch, capsys):
+    ab = _ab()
+    _arm_run(tmp_path, "dspark-both")
+    (tmp_path / "servers" / "dspark-both" / "run-1" / "boundary-samples.jsonl").write_text(_drive_rows([("s0", 620)]))
+    monkeypatch.setattr(ab, "run_timed", lambda arm, out: 0)
+    monkeypatch.setattr(ab, "run_probe", lambda arm, out: 0)
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), "dspark-both"])
+    ab.main()
+    out = capsys.readouterr().out
+    assert "busy s per GB" in out and "0.31" in out
+
+
+def test_run_arm_brackets_the_warm_up_and_every_timed_session_with_drive_counters():
+    script = open(os.path.join(ROOT, "benchmarks", "dsv41_baseline", "run_arm.sh")).read()
+    loop = script[script.index('for session_id in "${timed_session_ids[@]}"'):]
+    loop = loop[: loop.index("\ndone\n")]
+    start, run, end = (loop.index(s) for s in ("'session_start'", "run_capture_sessions.py", "'session_end'"))
+    assert start < run < end  # the samples bracket the session's own requests
+    assert loop.count("provenance.drive_sample()") == 2
+    warm = script.index("for round in $(seq 1")
+    assert script.index("'warmup_start'") < warm < script.index("'warmup_end'") < script.index("label': 'server_ready'")
