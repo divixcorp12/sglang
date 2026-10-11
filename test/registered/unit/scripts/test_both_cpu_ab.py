@@ -444,8 +444,13 @@ def test_run_arm_brackets_the_warm_up_and_every_timed_session_with_drive_counter
     script = open(os.path.join(ROOT, "benchmarks", "dsv41_baseline", "run_arm.sh")).read()
     loop = script[script.index('for session_id in "${timed_session_ids[@]}"'):]
     loop = loop[: loop.index("\ndone\n")]
-    start, run, end = (loop.index(s) for s in ("'session_start'", "run_capture_sessions.py", "'session_end'"))
+    start, run, end = (loop.index(s) for s in (
+        "drive_sample 'session_start' \"$session_id\"", "run_capture_sessions.py",
+        "drive_sample 'session_end' \"$session_id\"",
+    ))  # fmt: skip
     assert start < run < end  # the samples bracket the session's own requests
-    assert loop.count("provenance.drive_sample()") == 2
+    body = script[script.index("drive_sample() {"):]
+    assert "provenance.drive_sample()" in body[: body.index("\n}\n")]
     warm = script.index("for round in $(seq 1")
-    assert script.index("'warmup_start'") < warm < script.index("'warmup_end'") < script.index("label': 'server_ready'")
+    assert script.index("drive_sample 'warmup_start'") < warm < script.index("drive_sample 'warmup_end'")
+    assert script.index("drive_sample 'warmup_end'") < script.index("label': 'server_ready'")

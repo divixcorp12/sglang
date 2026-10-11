@@ -433,6 +433,17 @@ print('env verified OK: all', len(expected), 'vars match /proc/$spid/environ')
 # round after the first a silent no-op (the session already "done", so the driver
 # returns without ever contacting the server) -- a real bug caught while adding the
 # tok/s check below, before any GPU time was spent on it. ---
+# The mirror drives' counters bracket the warm-up and each timed session (drive_sessions.py derives each one's
+# drive load; the server's own drive-load line covers its whole lifetime and cannot say which session a slow drive hit).
+drive_sample() {
+    pyrun -c "
+import json, sys, provenance
+row = {'label': '$1', **({'session_id': sys.argv[1]} if len(sys.argv) > 1 else {}), **provenance.drive_sample()}
+with open('$boundary_path', 'a') as f:
+    f.write(json.dumps(row) + chr(10))
+" "${@:2}"
+}
+drive_sample 'warmup_start'
 prev_compile_count=0
 ready=0
 clock=0
@@ -497,6 +508,7 @@ print(1 if cr.is_stable(clocks) else 0, 1 if cr.is_stable(tok_s_samples) else 0)
         break
     fi
 done
+drive_sample 'warmup_end'
 [ "$ready" = 1 ] || { stop_server; abort "$arm never reached a clock-stable, tok/s-stable, compile-quiet state after $max_warmup_rounds warm-up rounds (last: clock=${clock}MHz decode=${tok_s}tok/s compile_events=$prev_compile_count; see $log)"; }
 echo "$arm ready: clock=${clock}MHz decode=${tok_s}tok/s compile_events=$prev_compile_count"
 
@@ -573,11 +585,13 @@ do
     before_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
     clock_start=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
     cpu_start=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'None')")
+    drive_sample 'session_start' "$session_id"
     "${driver_pin[@]}" env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
         "$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py" \
         --port "$port" --sessions "$synthetic_sessions" --session-ids "$session_id" \
         --max-tokens "$max_tokens" --results "$run_dir/results.jsonl"
     rc=$?
+    drive_sample 'session_end' "$session_id"
     clock_end=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
     cpu_end=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'None')")
     after_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
