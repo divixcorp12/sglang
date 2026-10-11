@@ -38,11 +38,13 @@ def test_positions_past_the_live_count_are_padding_and_never_count():
         "misses": 1, "accept": 0, "reject_only": 1}
 
 
-def test_alignment_finds_the_offset_whose_routes_hold_the_misses():
+def test_a_job_forward_without_a_miss_joins_only_where_no_forward_was_dropped():
     m = _module()
-    routes = [[{1, 2}], [{3, 4}], [{5, 6}], [{7, 8}]]  # route forwards, one layer each
-    misses = [[{3}], [{5, 6}], [{8}]]  # job forwards: they start at route forward 1
-    assert m.align(misses, routes, max_offset=2) == (1, 1.0)
+    routes = [[{1, 2}], [{3, 4}], [{5, 6}], [{7, 8}], [{9, 10}], [{11, 12}], [{13, 14}]]
+    # Job forward 1 has no miss and sits between route lines 0 and 2: it is line 1. Job forward 3 has none either, but
+    # a forward was dropped between job forwards 2 and 4 (lines 2 and 5): it could be line 3 or 4, so it stays out.
+    misses = [[{1}], [set()], [{5}], [set()], [{11}], [{13}]]
+    assert m.layer_misses.match_forwards(misses, routes) == [(0, 0), (1, 1), (2, 2), (4, 5), (5, 6)]
 
 
 def test_each_verify_is_matched_to_its_requests_kth_accept_line():
