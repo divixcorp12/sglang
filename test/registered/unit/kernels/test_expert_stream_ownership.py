@@ -142,7 +142,8 @@ def test_the_tier_declares_only_the_callers_mutex():
     caller_mutex_ (Python callers against each other only) and the two InstrBuild-only guards, TraceState::mutex and
     TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; with the RAM prefetch on, each
     group's SpecGroup::turn, which its demand reader (try_to_lock, then lock) and its speculative thread (lock_guard) take
-    in turns, one read at a time. It locks nothing else, and no other
+    in turns, one read at a time, and the speculative pool's per-group mutex (SpecPool::mutex(g), ram_prefetch.h),
+    taken only where pool_ exists. It locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
     lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and no compare-exchange: the one
     the tier relies on is the lease channel's cas_gate, its open of the copy wait's gate (host/lease_channel.h,
@@ -152,7 +153,8 @@ def test_the_tier_declares_only_the_callers_mutex():
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
     assert "std::mutex mutex;" in _struct(code, "TraceState"), "the trace guard left TraceState"
     locked = set(re.findall(r"(?:lock_guard|unique_lock|scoped_lock)<[^>]*>\s*\w+\(([^)]*)\)", code))
-    assert locked == {"caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "spec.turn"}, locked
+    assert locked == {"caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "spec.turn",
+                      "pool_->mutex(g"}, locked
     assert "std::mutex turn;" in _struct(code, "SpecGroup"), "the reader turn left SpecGroup"
     assert "std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock)" in code
     assert "std::mutex mutex_" not in code and "guard(mutex_)" not in code and "self->mutex_" not in code
