@@ -8413,13 +8413,17 @@ was faster.
 | 5 | GPU + per-drive in-flight cap (`...-gpu-cap`), against 2 | Moves sub-reads to the drive with the fewest bytes in flight | 4.5% slower; 6 of 8 slower; dropped | 33.17 |
 | 6 | GPU + cut + idle-drive reads (`...-gpu-misscut-idle`) | Speculative reads only to a drive with no demand read in flight, one 2.2 MB piece at a time, 4 ms deadline | About 7% slower; 6 of 8 slower (35% abandoned, 82% of promotions boosted) | 33.18 |
 | 7 | **GPU + cut + idle2** (`...-gpu-misscut-idle2`) | As 6, plus ties between idle drives spread across drives (`IDLE_SPREAD=1`) and 2 pieces in flight (`IDLE_PIECES=2`) | First A/B: paired median +3.6%, 5 of 8 faster. **Repeat: −3.7%.** Step time per verify, flagged sessions excluded: 3.0% faster, then 2.6% slower. **A tie.** | 33.22 |
+| 8 | GPU + cut + idle2 + margin floors (`...-gpu-misscut-idle2-floors`) | 7 with the packaged floors | Paired median −3.0%, 3 of 8 faster; step time 2.2% slower; waste 2.4 rows/token. **A tie** | 33.22 |
 
 **Best so far: idle2 (row 7), but as a tie, not a gain.**
 - It fixed idle's two faults: abandoned reads fell from 35% to about 10%, and nvme0 no longer takes 72% of the
   speculative bytes (the split is now 59 / 51 / 55 GB).
 - It is the least harmful prefetch variant. Two same-window A/Bs put it within ±3% of no prefetch, in opposite
   directions (the repeat is below).
-- It was measured **without margin floors** (`MARGIN_FLOORS=""`). idle2 with floors (rows 3 + 7) is being re-run.
+- It was measured without margin floors. **idle2 with floors** (`...-idle2-floors`) also ties:
+  - paired median −3.0%;
+  - step time 2.2% slower;
+  - waste down to 2.4 rows per token (re-run below).
 
 **What the flags turn on.** `SGLANG_DSV41_RAM_PREFETCH=1` alone gives row 3 (GPU scorer with the packaged floors),
 not idle2. To run idle2, set these as well:
@@ -8472,7 +8476,34 @@ So idle2 is a tie with no prefetch. Its counters repeat the first A/B's closely:
 - 37% of used reads still in flight at use;
 - 29.7 NVMe rows per token against 20.3 without prefetch, 6.4 of them wasted.
 
-Both flagged sessions this time were on the SPCC, and both only in the prefetch arm. idle2 sends about 45% more
+**idle2 + floors, re-run (`ab-idle2-floors-rerun-20261011-174531`, floors arm first, same worktree).** Clean: drives
+idle at start in both arms, **no drive flags**, text matched, accept length 3.65 against 3.72.
+
+| Session | misscut ms/token | idle2 + floors | Paired | Step ms, misscut / floors |
+|---|---:|---:|---:|---|
+| CDW | 103.3 | 113.8 | −10.2% | 310 / 341 |
+| ETR | 61.3 | 67.1 | −9.4% | 261 / 285 |
+| TSCO | 56.4 | 55.5 | +1.5% | 275 / 271 |
+| BKR | 122.2 | 127.2 | −4.1% | 283 / 294 |
+| K | 70.6 | 68.8 | +2.5% | 256 / 257 |
+| DISCA | 86.8 | 81.2 | +6.4% | 318 / 298 |
+| WRK | 71.5 | 72.8 | −1.8% | 244 / 260 |
+| VLO | 94.2 | 115.7 | −22.8% | 269 / 260 (different text: 55 against 37 tokens) |
+
+- Medians 79.14 (misscut) and 77.02. Paired median **−3.0%**, 3 of 8 faster.
+- Step-time ratio median **1.022 (2.2% slower)**.
+- The floors did what they did in row 3:
+  - used / landed 0.63 (5,525 / 8,769), against 0.43 for idle2;
+  - 2.4 wasted rows per token, against 6.4;
+  - NVMe rows per token 25.7 against 23.3 without prefetch (+10%, against idle2's +46%);
+  - 39% of used reads still in flight at use.
+- **Verdict: a tie, slightly negative.** With the drive traffic down to +10% and no stall, the prefetch still does not
+  move decode time. That fits the layer-cover study's finding that the predictor, not the scheduling, bounds the gain
+  (`divix01:/data/models/slang/nvfp4-work/layer-cover/REPORT.md`; not yet a reference section).
+- **Prefetch stays off by default; Track B (a learned predictor, `RAM_PREFETCH_PREDICTOR_HANDOFF.md`) is the remaining
+  lever.**
+
+Both flagged sessions in the idle2 repeat were on the SPCC, and both only in the prefetch arm. idle2 sends about 45% more
 bytes through the drives, which plausibly makes an SPCC episode more likely. That is not shown.
 
 ### 33.23 What drive stalls cost: throughput little, A/B verdicts a lot (2026-10-11)

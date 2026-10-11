@@ -120,6 +120,7 @@ the native gate applied one layer early.
 | 5 | GPU + per-drive in-flight cap | −4.5%, dropped |
 | 6 | GPU + cut + idle-drive reads | about −7% |
 | 7 | **GPU + cut + idle2** | First A/B +3.6% paired median; **repeat −3.7%**. Step time per verify, flagged sessions out: −3.0%, then +2.6%. **A tie** |
+| 8 | GPU + cut + idle2 + floors | Paired median −3.0%; step time +2.2%; waste 2.4 rows/token. **A tie** |
 
 **Today's defaults.**
 - `SGLANG_DSV41_RAM_PREFETCH=1` alone gives row 3. Prefetch is **off by default**.
@@ -151,18 +152,14 @@ the native gate applied one layer early.
 
 ## Open state you inherit
 
-1. **The idle2 repeat is recorded; idle2 with floors is being re-run.**
-   - `ab-idle2-floors-20261011-164535` (recorded in §33.22) showed idle2 to be a tie.
-   - Its idle2 + floors arm was aborted at warm-up by the stability gate, with no fault.
-   - The re-run is `divix01:/data/models/slang/nvfp4-work/ram-prefetch/ab-idle2-floors-rerun-20261011-174531`.
-     Arms in order: `dspark-both-prefetch-gpu-misscut-idle2-floors`, then `dspark-both-misscut`.
-   - It runs from worktree `wt-idle2-floors` at `288fc15aa1`, registered in the generation gate as
-     "master 288fc15aa1".
-   - When it ends, read `summary.json`: per-arm `drive_flags` sit inside each arm's entry. Compare step time per
-     verify with flagged sessions excluded, as in §33.22. Ms/token alone mixes in accept-length changes from
-     diverging text.
-   - Record the result in §33.22, update the scoreboard, then remove `wt-idle2-floors`.
-   - If the floors arm again fails warm-up, run it with a longer warm-up rather than reading anything into it.
+1. **Track A is closed. Both idle2 variants tie with no prefetch** (§33.22):
+   - idle2: two A/Bs, step time −3.0% then +2.6%;
+   - idle2 + floors: `ab-idle2-floors-rerun-20261011-174531`, clean with no drive flags, paired median −3.0%, step
+     time +2.2%, waste 2.4 rows per token.
+
+   Prefetch stays off by default. When comparing arms, use step time per verify with flagged sessions excluded;
+   ms/token alone mixes in accept-length changes from diverging text. Per-arm `drive_flags` sit inside each arm's
+   entry in `summary.json`.
 2. **`codex/dsv41-layer-cover`** (`2c2f7044e0`, laptop worktree `/Users/dnikolaidis/.codex/worktrees/layer-cover`) is
    unmerged.
    - It adds `analysis/dsv41-drive/dspark/layer_cover.py`, `prefetch-replay/layer_cover_oracle.py` and
@@ -176,10 +173,10 @@ the native gate applied one layer early.
 
 ## Track A: close idle2
 
-idle2 alone is settled as a tie with no prefetch (two A/Bs, §33.22). Decide idle2 + floors from the re-run, with the
-drive flags applied.
-- **If idle2-floors beats `dspark-both-misscut`** on step time and the paired median, with flagged sessions re-run
-  or excluded:
+**Done (2026-10-11): both idle2 variants tie, so prefetch stays off.** What follows is kept for a future variant,
+for example one driven by a better predictor from Track B.
+- **If a variant beats `dspark-both-misscut`** on step time and the paired median, with flagged sessions re-run or
+  excluded:
   1. repeat it once, reversing the arm order;
   2. if it holds, make that configuration what `SGLANG_DSV41_RAM_PREFETCH=1` turns on. The precedent is commit
      `0589e7fae4`, which made the GPU scorer and floors the defaults with tests.
@@ -286,7 +283,6 @@ a learned L+1 head beat the native gate applied early? It must win on all three 
 | Base for all new work | `origin/master` at `288fc15aa1`. The old branch `codex/dsv41-ram-prefetch-margin` is identical to master. |
 | Laptop worktree on that branch | `/Users/dnikolaidis/.codex/worktrees/ram-prefetch-margin` (has an untracked `pyrightconfig.json`; leave it) |
 | Unmerged analysis branch | `codex/dsv41-layer-cover` (`2c2f7044e0`), laptop worktree `/Users/dnikolaidis/.codex/worktrees/layer-cover` |
-| Running A/B worktree (divix01) | `/data/models/slang/nvfp4-work/wt-idle2-floors` (`288fc15aa1`); remove it after the A/B is recorded |
 | divix01 clone | `/data/models/slang/sglang`; make private worktrees under `/data/models/slang/nvfp4-work/wt-<name>` |
 | Suggested new branch for Track B | `codex/dsv41-learned-predictor` from `origin/master`, laptop worktree `/Users/dnikolaidis/.codex/worktrees/learned-predictor` |
 | A/B driver | `analysis/dsv41-drive/dspark/both_cpu_ab.py` (arms, `REFERENCE`, `drive_flags`), via `benchmarks/dsv41_baseline/run_arm.sh` |
