@@ -84,6 +84,12 @@ ARMS["dspark-both-weights-misscut"] = (
     {**ARMS["dspark-both-misscut"][0], "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS": "16:10:16"},
     True,
 )
+# The cut arm with 4 tokens per CPU chunk (CHUNK_M 4, not 2): an expert shared by 3-4 verify tokens decodes its
+# weights once, not twice (bench: 4 tokens -25%, 6 tokens -10%, 1-2 unchanged; DSV41_REFERENCE.md 33.20).
+ARMS["dspark-both-misscut-maxm8"] = (
+    {**ARMS["dspark-both-misscut"][0], "SGLANG_EXL3_CPU_MAX_M": "8"},
+    True,
+)
 # The same, picking only among each token's predicted top_k (DSV41_REFERENCE.md 33.14's unused reads).
 ARMS["dspark-both-prefetch-topk"] = (
     {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
@@ -119,6 +125,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-floors": "dspark-both",
     "dspark-both-misscut": "dspark-both",
     "dspark-both-weights-misscut": "dspark-both-misscut",
+    "dspark-both-misscut-maxm8": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut": "dspark-both",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
