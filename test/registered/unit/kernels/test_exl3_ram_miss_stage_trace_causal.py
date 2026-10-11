@@ -244,7 +244,9 @@ NON_TRACE_CLOCK_READS = {
     # on the service or copy thread. The native test kernel's warm loop (test only) spins on its deadline there too.
     "team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);": 1,
     "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)": 1,
-    # busy() (cpu_experts.h): the start of each job, on the CPU expert thread, for the engine's watchdog.
+    # busy() (cpu_experts.h): the start of each job, on the CPU expert thread, for the engine's watchdog. And
+    # stall_state(), its age in the copy-wait abort's line, once, on the RAM thread's watchdog as it aborts.
+    "std::snprintf(ms, sizeof(ms), \"%.1f\", static_cast<double>(now_ns() - started) / 1e6);": 1,
     "job_started_ns_.store(now_ns(), std::memory_order_release);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread. The CPU expert engine's
     # watchdog (cpu_experts.h, with a draft source) times a running job or an unserved draft record the same way. And

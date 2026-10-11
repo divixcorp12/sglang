@@ -828,14 +828,18 @@ class RamTier {
   }
 
   // The copy thread's reason for withholding CopyDone, for the watchdog's abort: "; group G: its CPU job S is not
-  // done" or "; group G: sent no part". Empty at one group, whose abort line stays as it was, or when nothing waits.
+  // done (...)", with the engine's stall_state, or "; group G: sent no part". Empty at one group, whose abort line stays
+  // as it was, or when nothing waits.
   std::string copy_stall() const {
     if (Wire::kNodes == 1 || copy_engine_ == nullptr) return "";
     const uint64_t word = copy_engine_->stall();
     const std::string group = "; group " + std::to_string(word >> 8 & 0xFF);
     switch (word & 0xFF) {
-      case Engine::kStallCpu:
-        return group + ": its CPU job " + std::to_string(word >> 32) + " is not done";
+      case Engine::kStallCpu: {
+        const CpuExpertEngine* cpu = dist_.group(static_cast<int>(word >> 8 & 0xFF)).cpu.get();
+        const uint32_t seq = static_cast<uint32_t>(word >> 32);
+        return group + ": its CPU job " + std::to_string(seq) + " is not done" + (cpu ? cpu->stall_state(seq) : "");
+      }
       case Engine::kStallNoPart:
         return group + ": sent no part";
       default:

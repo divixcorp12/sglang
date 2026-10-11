@@ -19,6 +19,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <immintrin.h>
@@ -254,8 +255,29 @@ class BasicCpuExpertEngine {
   bool submit(const CpuJob& job) {
     if constexpr (Build::kMetrics) trace_.emit("cpu_submit", job.row, 0, job.seq, -1, job.part, job.k);
     if (!jobs_.push(job)) return false;
+    submitted_.store(job.seq, std::memory_order_relaxed);
     kick_.fetch_add(1, std::memory_order_release);
     return true;
+  }
+
+  /// For the copy-wait abort, on the watchdog's thread: why job `seq` is not done. Whether the tier owner submitted it
+  /// (an unsubmitted one is a CPU miss whose row has not landed, since a record's hit job is submitted before its copy
+  /// job), what the thread runs now and for how long, and the last job done. Reads the clock once.
+  std::string stall_state(uint32_t seq) const {
+    const bool submitted = static_cast<int32_t>(submitted_.load(std::memory_order_relaxed) - seq) >= 0;
+    std::string out = submitted ? " (submitted; the engine is "
+                                : " (not submitted: a CPU miss whose row has not landed; the engine is ";
+    const int64_t started = job_started_ns_.load(std::memory_order_acquire);
+    if (started == 0) {
+      out += "idle";
+    } else {
+      char ms[32];
+      std::snprintf(ms, sizeof(ms), "%.1f", static_cast<double>(now_ns() - started) / 1e6);
+      out += std::string("running ") +
+             (job_kind_.load(std::memory_order_relaxed) == kDraftJob ? "a draft job (record " : "a target job (row ") +
+             std::to_string(job_id_.load(std::memory_order_relaxed)) + ") for " + ms + " ms";
+    }
+    return out + ", done through job " + std::to_string(done_.load(std::memory_order_acquire)) + ")";
   }
 
   /// True once the job with sequence `seq`, or a later one, has finished. The acquire pairs with the release after the
@@ -581,6 +603,7 @@ class BasicCpuExpertEngine {
   alignas(64) std::atomic<uint32_t> kick_{0};  // moved by every submit; the thread's idle wait watches it
   std::optional<cpu_experts::Team> team_;      // the run thread's, from its start to its exit
   uint32_t claimed_ = 0;  // tier owner only
+  std::atomic<uint32_t> submitted_{0};  // the last job submitted (the tier owner writes), for stall_state()
   std::atomic<uint32_t> done_{0};
   std::atomic<int64_t> jobs_done_{0};
   std::atomic<int64_t> lanes_done_{0};
