@@ -43,7 +43,7 @@ def _done(areas, seq: int) -> int:
 
 def _calls() -> list[dict]:
     m = _module()
-    width = 6 + 2 * LANES
+    width = 9 + 2 * LANES
     count = int(m.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
     out = torch.zeros((count, width), dtype=torch.float64)
     m.expert_stream_test_kernel_calls(out)

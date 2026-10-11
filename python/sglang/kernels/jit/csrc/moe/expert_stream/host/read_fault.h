@@ -67,6 +67,10 @@ namespace expert_stream {
 //     another extent.
 //   - generation_start: seeds the generation counter (near 2^32 it wraps within a test).
 //
+// Two-span faults (TwoSpanRows):
+//   - suffix_delay_ns: every second-span sub-read's completions are withheld, as hold_ordinal's are, and released once
+//     nothing else is in flight and this long after the first was withheld: a slow second span after the first landed.
+//
 // Piece streaming faults:
 //   - publish_twice: the k-th piece published is published a second time, as a re-dispatch would; the readiness word
 //     must refuse it.
@@ -99,6 +103,7 @@ struct ReadFault {
   bool ring_reset_fail = false;
   bool nop_flush_refused = false;
   int64_t root = -1;
+  int64_t suffix_delay_ns = 0;
 };
 
 // The fault tensor of the test entry points: kFaultWords int64 words, in the order of _fault_tensor in
@@ -123,7 +128,9 @@ struct ReadFault {
 //   30     ring-reset bits: bit 0 nop_flush_refused, bit 1 ring_reset_fail
 //   31     leg_cut_cap (not a fault): cuts every read at that many bytes before the reader opens (0: READ_CUTS and the
 //          device limits)
-constexpr int64_t kFaultWords = 32;
+//   32     two_span_rows (not a fault): a bit per row ordinal the test entry points read in two spans (TwoSpanRows)
+//   33     suffix_delay_ns
+constexpr int64_t kFaultWords = 34;
 
 // Decodes the fault words of a tensor of kFaultWords entries.
 inline ReadFault fault_from(const int64_t* f) {
@@ -154,16 +161,17 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.nop_flush_refused = (f[30] & 1) != 0;
   fault.ring_reset_fail = (f[30] & 2) != 0;
   fault.root = f[19] - 1;
+  fault.suffix_delay_ns = f[33];
   return fault;
 }
 
 // Whether fault words `f` inject a fault, i.e. set a word that arms one. Words that only narrow a fault (the call
 // numbers, part, root, ordinal, sub, leg, submit_first, short_is_eof, hold_rest) arm nothing alone, and words 17-18,
-// 20, 22, 26, 28 and 31 are not faults. A production host has no fault state and refuses a tensor for which this is true
-// (HostTestExports::install_fault); it needs no ReadFault to decide.
+// 20, 22, 26, 28, 31 and 32 are not faults. A production host has no fault state and refuses a tensor for which this
+// is true (HostTestExports::install_fault); it needs no ReadFault to decide.
 inline bool injects_fault(const int64_t* f) {
   return f[0] != 0 || f[3] != 0 || f[6] != 0 || f[7] != 0 || f[8] != 0 || f[9] > 0 || f[10] > 0 || f[11] != 0 ||
-         f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[27] > 0 || f[30] != 0;
+         f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[27] > 0 || f[30] != 0 || f[33] > 0;
 }
 
 // Throws if `fault` is not kFaultWords long.

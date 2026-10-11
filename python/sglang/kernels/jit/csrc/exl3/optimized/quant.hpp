@@ -60,6 +60,8 @@ struct Exl3Quant
     static constexpr Isa kTopIsa = Isa::Vbmi;
     static constexpr const char* kIsaCapEnv = "EXL3_MOE_CPU_MAX_ISA";
     static constexpr const char* kIsaReportEnv = "EXL3_MOE_CPU_REPORT_ISA";
+    // dispatch calls ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh, so it waits there.
+    static constexpr bool kStagedForward = true;
     using Params = SglangExl3CpuParams;
 
     static std::array<uint64_t, kSlabs> row_bytes(const ExpertLayer& l, const Params& p)
