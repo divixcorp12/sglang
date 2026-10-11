@@ -8287,7 +8287,7 @@ best-measured configuration (`0589e7fae4`): `SGLANG_DSV41_RAM_PREFETCH_SCORER` d
 that file; the CPU scorer has none). With prefetch off nothing is read and launches pass as before; an explicit
 `SCORER=gpu` or floors path without prefetch is refused. `TOP_K_ONLY` stays off (never A/B'd); idle2 lives only on
 `codex/dsv41-spec-idle-drive`. The table covers target rows 1-39 (DSV4.1); another model needs floors `""`.
-`SGLANG_EXL3_CPU_MAX_M` stays unset (MAX_M 4): two A/Bs, +1.3% and -1.7%.
+`SGLANG_EXL3_CPU_MAX_M`: see §33.22 (default 8 since 2026-10-11).
 
 ### 33.21 The SPCC stalls on its own: settings, writers and a fio span grid (2026-10-11)
 
@@ -8340,6 +8340,14 @@ serially. `codex/dsv41-ram-prefetch-t7` and `-t9` were deleted: every commit on 
 - **Port-0 relief in the EXL3 CPU kernel** (moving integer multiplies and shifts toward p5, cutting register spills;
   §33.20). Same reason: a few percent of CPU kernel time does not reach decode time while the split is off the critical
   path. Revisit only if the CPU side becomes critical (for example a larger CPU share after a hardware change).
+
+**`SGLANG_EXL3_CPU_MAX_M` defaults to 8 (2026-10-11, owner's decision; `e00edbe0bf`).** Adopted against §33.20's
+"not adopted": no served A/B showed a gain (+1.3% and -1.7% paired), but none showed a loss beyond noise, the CPU output
+is bit-identical (bench), and the bench gains for experts shared by 3-6 tokens (4 tokens -25%, 6 tokens -10%) would
+matter if the CPU side becomes critical. 0 builds the kernel source's MAX_M 4 (`_resid_b128_cpu_v1`); the default
+builds `_resid_b128_m8_cpu_v1`, so the first launch after this change compiles once. The variable is refused without
+`SGLANG_DSV41_CPU_EXPERTS` only when set explicitly. A/B arms that do not pin it now run MAX_M 8, so
+`dspark-both-misscut` and `dspark-both-misscut-maxm8` are the same configuration from here on.
 
 ## Sources
 

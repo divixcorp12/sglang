@@ -8,7 +8,7 @@ There is no persistent weight repacking or increase in expert weight storage.
 Selection
 ---------
 For a call whose chunks each hold 1..CHUNK_M tokens (CHUNK_M = MAX_M / 2; MAX_M is
-EXL3_MOE_CPU_MAX_M, default 4), with H=5120, I=2304, residual activation rows,
+EXL3_MOE_CPU_MAX_M: 4 in the source, 8 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304, residual activation rows,
 128-element quantization blocks, 3-bit unswizzled matrices and AVX512BW:
   one expert, one token: range3_unroll (range-aware neighboring-band traversal);
   other one-token chunks: unroll_small (one-band traversal);
