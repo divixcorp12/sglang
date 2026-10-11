@@ -8584,6 +8584,80 @@ The rows affected are always the same sessions (VLO, K, ETR) in every A/B. So bo
 bias, and paired verdicts are unaffected. The metric is left as is: changing it would break comparison with every
 earlier result.
 
+### 33.24 Per-layer cover: no headroom for a layer-completing prefetch; prediction is the limit (2026-10-11)
+
+An offline study of whether reading a layer's predicted misses **as a set** (all or none) would beat today's per-row
+admission. Tools: `analysis/dsv41-drive/dspark/layer_cover.py` and
+`analysis/dsv41-drive/prefetch-replay/layer_cover_oracle.py`, with `test/registered/unit/scripts/test_layer_cover.py`
+(merged `ea3d18944a`). Report and outputs: `divix01:/data/models/slang/nvfp4-work/layer-cover/` (`REPORT.md`).
+
+Inputs:
+- the instrumented GPU-scorer captures and the cut capture, joined through `layer_misses.py`, for the live cover;
+- `verify_gate_rankings.py` / `verify_replay.py` over the margin captures, for the oracle (real gate rankings,
+  horizon 1, top-12 per token).
+
+**Misses per layer** (rows 1-39): about 3 in 4 layers have a forced miss, roughly 29 layers per forward, with
+87-93 misses per forward.
+
+| Misses in the layer | 0 | 1 | 2 | 3 | 4+ |
+|---|---:|---:|---:|---:|---:|
+| Share of layers | 25% | 24% | 18% | 12% | 20% |
+
+Layers with 4 or more misses hold over half of all misses.
+
+**Live cover by the pool, GPU scorer** (layers with at least one miss):
+- all misses covered: 13.6% (1.9 points of that with a read still in flight);
+- some covered: 47.5%;
+- none: 38.8%.
+
+Only 1-miss layers are ever cleared (41.5% of them); layers with 3 or more misses never are. With the margin floors
+the split is 11.6 / 45.7 / 42.7%.
+
+**Oracle with the real gate rankings.**
+- **23% of misses never appear as a candidate**, so 42% of miss layers cannot be cleared at any N. Layers with 4+
+  misses clear at most 33% of the time (19% at N = 8).
+- Reading the top 8 on every layer clears 53% of miss layers, but costs about 242 reads per verify against about 95
+  spare row reads per forward.
+- At today's ~39 reads per verify:
+  - the set rule (margin ≥ 0, at most 3 rows) clears 22% of miss layers, against 17% for top-1;
+  - both are worth about 0.21-0.24 ms per read;
+  - capping the set size never raised the value per read.
+- The best value per read, 0.36-0.47 ms, comes from a margin cut of 0.1-0.25. That is what the packaged floors do.
+
+**Timing.**
+- With the GPU scorer, 21% of used reads were still in flight at use (44% with the CPU scorer).
+- Read time p50 is 2.1 ms; issue to use p50 is 4.6 ms. That window holds about one extra 13.3 MB row next to the
+  layer's own demand reads.
+- So any rule that reads 2 or more rows per layer also runs into time.
+
+**What a covered read saves** (within (row, misses) cells):
+
+| The read removed | Saving |
+|---|---:|
+| A layer's last miss | 0.33-0.52 ms |
+| One read off a deeper queue, 2-3 misses | 0.75-1.5 ms |
+| One read off a deeper queue, 4 misses | 1.2-2.1 ms |
+
+A fully covered layer still waits about 0.6-1.0 ms more than a layer with no miss, because the covered row is still
+computed on the CPU. Partial cover is worth more than the "a layer stops gating only when fully cleared" model
+assumed.
+
+**In ms/token.** The best rules, at about one read per layer, save 8-15 ms per verify forward gross, roughly
+2-4 ms/token (3-5%), before the drive-contention cost. The live A/Bs (§33.22) show that cost roughly cancelling a
+saving of this size.
+
+**Verdict.** There is little headroom for a layer-completing prefetch. The limit is prediction: misses that are never
+candidates, and low precision past rank 1. Timing binds second, and only once a rule reads 2 or more rows per layer.
+The next lever is a better predictor (`RAM_PREFETCH_PREDICTOR_HANDOFF.md`, Track B).
+
+**Caveats.**
+- The oracle's misses come from `verify_replay`'s tier simulation, which runs 14.5% below the server's miss count.
+  The rankings are real.
+- The check on real misses (`verify_gate_rankings.py` over `cut-timeline-20261009-221958/cut`) needs ~160 MB of gate
+  tensors from `/mnt/nvme2` and has not been run.
+- The ms prices reuse §33.16's slopes from instrumented runs, with partial cover priced at half value.
+- The comparisons of fully covered 2+ miss layers rest on 16-34 layers each.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

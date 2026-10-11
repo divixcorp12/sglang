@@ -133,7 +133,7 @@ the native gate applied one layer early.
   - A speculative read on a drive that a demand read needs doubles that read's time.
   - So every wasted read has a cost.
 - **There is no headroom for a layer-completing rule.** The layer-cover study (`divix01:/data/models/slang/nvfp4-work/layer-cover/REPORT.md`,
-  branch `codex/dsv41-layer-cover`):
+  §33.24):
   - Misses per layer, rows 1-39: 25% have none, 24% one, 18% two, 12% three, 20% four or more.
   - Live coverage of miss layers: 13.6% fully covered, 47.5% partly, 38.8% not at all.
   - **23% of misses are never a candidate** (top-12), so 42% of miss layers can never be cleared.
@@ -160,12 +160,9 @@ the native gate applied one layer early.
    Prefetch stays off by default. When comparing arms, use step time per verify with flagged sessions excluded;
    ms/token alone mixes in accept-length changes from diverging text. Per-arm `drive_flags` sit inside each arm's
    entry in `summary.json`.
-2. **`codex/dsv41-layer-cover`** (`2c2f7044e0`, laptop worktree `/Users/dnikolaidis/.codex/worktrees/layer-cover`) is
-   unmerged.
-   - It adds `analysis/dsv41-drive/dspark/layer_cover.py`, `prefetch-replay/layer_cover_oracle.py` and
-     `test/registered/unit/scripts/test_layer_cover.py`.
-   - Its 5 tests were run only on the laptop with stubs. Run them on divix01, which needs a quiet box, then merge.
-   - Also record the layer-cover findings in the reference as §33.24; they are not there yet.
+2. **The layer-cover study is merged and recorded** (`ea3d18944a`, §33.24). It added `layer_cover.py`,
+   `layer_cover_oracle.py` and `test_layer_cover.py`; the tests passed on divix01 (7/7 with
+   `test_verify_gate_rankings.py`).
 3. **The real-miss check of the layer-cover numbers** has not been run. Item 3 used `verify_replay`'s tier simulation,
    which runs 14.5% below the server's miss count.
    - Run `analysis/dsv41-drive/prefetch-replay/verify_gate_rankings.py` on `cut-timeline-20261009-221958/cut`.
@@ -282,7 +279,6 @@ a learned L+1 head beat the native gate applied early? It must win on all three 
 |---|---|
 | Base for all new work | `origin/master` at `288fc15aa1`. The old branch `codex/dsv41-ram-prefetch-margin` is identical to master. |
 | Laptop worktree on that branch | `/Users/dnikolaidis/.codex/worktrees/ram-prefetch-margin` (has an untracked `pyrightconfig.json`; leave it) |
-| Unmerged analysis branch | `codex/dsv41-layer-cover` (`2c2f7044e0`), laptop worktree `/Users/dnikolaidis/.codex/worktrees/layer-cover` |
 | divix01 clone | `/data/models/slang/sglang`; make private worktrees under `/data/models/slang/nvfp4-work/wt-<name>` |
 | Suggested new branch for Track B | `codex/dsv41-learned-predictor` from `origin/master`, laptop worktree `/Users/dnikolaidis/.codex/worktrees/learned-predictor` |
 | A/B driver | `analysis/dsv41-drive/dspark/both_cpu_ab.py` (arms, `REFERENCE`, `drive_flags`), via `benchmarks/dsv41_baseline/run_arm.sh` |
@@ -317,6 +313,4 @@ Older A/B worktrees on divix01 (`wt-*`, ~140 of them) are earlier work. Leave th
   - a new reference section (§33.25 or next) with artifact paths;
   - if it advances, a written spec for serving the head.
 - **Housekeeping:**
-  - merge `codex/dsv41-layer-cover` after its tests pass on divix01;
-  - add §33.24 (layer cover);
   - remove the worktrees you created.
