@@ -8266,6 +8266,20 @@ so an expert shared by 3-4 verify tokens decodes its weights once. Checked from 
   off the decode critical path at this load. (An earlier version of this bullet said the split had been calibrated at
   the old cost; that was wrong.)
 
+**`MAX_M=8` repeats (2026-10-11).**
+- `ab-maxm8-rep-20261011-000201` (misscut first): **invalid**. The maxm8 arm's verdict failed "drives not idle at
+  start" (nvme4 at 2.1 MB/s): unit tests were run on divix01 during the A/B, against the run protocol. Its SPCC ran at
+  0.40 s/GB; CPU ms per lane 0.686 / 0.698 (misscut) -> 0.626 / 0.629 (maxm8).
+- `ab-maxm8-rep2-20261011-004004` (misscut first, box idle): paired median **maxm8 1.7% slower**, 3 of 8 sessions faster
+  (BKR +0.6, CDW -4.0, DISCA +1.3, ETR +6.7, TSCO -5.4, VLO -7.1, WRK +2.1, K -5.3). Medians 75.2 (misscut) / 75.5;
+  accept 3.49 / 3.66; text check passed. **CPU ms per lane 0.624 / 0.605 (misscut) against 0.648 / 0.652 (maxm8)**:
+  this time the m8 kernel was slower per lane, so the -10% of the first run does not reproduce. misscut's nvme4 ran at
+  0.363 s/GB here, maxm8's at 0.322.
+- Verdict: two valid runs, +1.3% and -1.7%; the per-lane CPU gain is not stable between runs either (served per-lane
+  cost moves ~5-10% run to run with the token mix). **Not adopted**; `SGLANG_EXL3_CPU_MAX_M` stays unset.
+- Two runs now show the SPCC alone slowing by 15-30% per GB in one arm (0.36-0.41 against ~0.31-0.32). Lifetime drive
+  totals cannot place it in time; per-session drive load in the A/B driver would.
+
 **Defaults as merged to master (2026-10-11).** The split cut is on (`SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1`,
 `_MAX=3`, since `69e1f7744d`). RAM prefetch stays off, but `SGLANG_DSV41_RAM_PREFETCH=1` alone now runs its
 best-measured configuration (`0589e7fae4`): `SGLANG_DSV41_RAM_PREFETCH_SCORER` defaults to `gpu`, and
@@ -8273,7 +8287,7 @@ best-measured configuration (`0589e7fae4`): `SGLANG_DSV41_RAM_PREFETCH_SCORER` d
 that file; the CPU scorer has none). With prefetch off nothing is read and launches pass as before; an explicit
 `SCORER=gpu` or floors path without prefetch is refused. `TOP_K_ONLY` stays off (never A/B'd); idle2 lives only on
 `codex/dsv41-spec-idle-drive`. The table covers target rows 1-39 (DSV4.1); another model needs floors `""`.
-`SGLANG_EXL3_CPU_MAX_M` stays unset (MAX_M 4) pending its repeat A/B.
+`SGLANG_EXL3_CPU_MAX_M` stays unset (MAX_M 4): two A/Bs, +1.3% and -1.7%.
 
 ## Sources
 
