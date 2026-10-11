@@ -198,12 +198,13 @@ if __name__ == "__main__":
 
 
 def test_cpu_experts_build_the_optimized_extension(tmp_path, monkeypatch):
-    """With CPU experts on, the build is the optimized flavor even with both accuracy flags left unset."""
+    """With CPU experts on, the build is the optimized flavor (MAX_M 8 by default) even with every flag left unset."""
     monkeypatch.delenv("SGLANG_EXL3_CPU_ACT_RESIDUAL", raising=False)
     monkeypatch.delenv("SGLANG_EXL3_CPU_ACT_BLOCK", raising=False)
+    monkeypatch.delenv("SGLANG_EXL3_CPU_MAX_M", raising=False)
     with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
         kw, _ = _load_args(tmp_path, monkeypatch, None, None)
-    assert kw["name"] == "sglang_exl3_ext_resid_b128_cpu_v1"
+    assert kw["name"] == "sglang_exl3_ext_resid_b128_m8_cpu_v1"
     assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL, exl3_ext.OPTIMIZED_TORCH_OPS]
 
 
