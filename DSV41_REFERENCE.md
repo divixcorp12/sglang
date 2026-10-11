@@ -8254,10 +8254,16 @@ so an expert shared by 3-4 verify tokens decodes its weights once. Checked from 
 - **The CPU side is clearly faster:** ms per lane at stop, group 0 / 1: 0.695 / 0.655 (misscut) -> 0.624 / 0.591
   (maxm8), **-10%**, as the bench predicted for the server's ~2-token lanes.
 - Drive busy s per GB unchanged (0.305 / 0.319 / 0.310 vs 0.306 / 0.321 / 0.310).
-- Reading: a real 10% cut in CPU expert time that does not show end to end within this A/B's resolution. The CPU split
-  table (`split [...]` in the stats line) is the same in both arms: it was calibrated at the old per-lane cost, so the
-  faster CPU only finishes earlier, it is not given more lanes. Recalibrating the split at MAX_M=8 is what could turn
-  the 10% into wall-clock.
+- Reading: a real 10% cut in CPU expert time that does not show end to end within this A/B's resolution.
+- **The split already follows the faster kernel; there is nothing to recalibrate.** The split is calibrated at every
+  launch (`CPU experts calibration` lines), and the arm's calibration priced the m8 kernel: CPU ms for k = 1..8 lanes,
+  group 0, `0.42 0.81 1.21 2.29 2.86 3.44 3.68 4.70` (maxm8) against `0.54 1.01 1.53 2.90 3.55 4.27 4.57 5.79`
+  (misscut), ~20% less from k = 2. The split barely moves (n = 0..8: `0 1 2 2 3 3 4 4 5` / `0 1 2 2 3 3 4 5 5` against
+  `0 1 1 2 3 3 4 4 5` / `0 1 2 2 3 3 4 4 5`) because the link costs 0.97 ms per expert and the best k is where the
+  CPU's k lanes and the link's n - k cross: at n = 8, k = 5 gives 2.86 against 2.90 either way. What the faster CPU
+  buys shows as the calibrated layer time (n = 8: 3.05 against 3.64 ms), and §33.11 addendum 2 found the target's split
+  off the decode critical path at this load. (An earlier version of this bullet said the split had been calibrated at
+  the old cost; that was wrong.)
 
 ## Sources
 
