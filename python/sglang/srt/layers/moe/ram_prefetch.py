@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
 import torch
+
+from sglang.srt.environ import envs
 
 # The host's bounds: host/gate_scorer.h GateScorer::kDepth and kMaxPerLayer, host/ram_prefetch.h SpecPool::kMaxShare.
 MAX_PER_TOKEN = 12
@@ -18,6 +21,8 @@ MAX_SPEC_SHARE = 4
 
 # SGLANG_DSV41_RAM_PREFETCH_SCORER's values.
 SCORERS = ("cpu", "gpu")
+# The GPU scorer's margin floors when SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS is unset (the file says what it was fit on).
+MARGIN_FLOORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ram_prefetch_margin_floors.json")
 
 
 @dataclass(frozen=True)
@@ -189,6 +194,15 @@ def read_margin_floors(path: str) -> dict[int, float]:
             raise ValueError(f"margin floors {path}: row {row!r} -> {value!r} is not a target row and a number")
         floors[int(row)] = float(value)
     return floors
+
+
+def margin_floors_path(scorer: str) -> Optional[str]:
+    """The floors file ``scorer`` runs with: ``SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS`` when set (empty: none), else
+    the packaged table for the GPU scorer and none for the CPU scorer."""
+    floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
+    if floors is None:
+        return MARGIN_FLOORS if scorer == "gpu" else None
+    return floors or None
 
 
 def load_margin_floors(path: str, rows: int) -> torch.Tensor:

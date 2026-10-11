@@ -1306,6 +1306,7 @@ class Exl3RamMissService:
             SCORERS,
             GpuScorer,
             load_margin_floors,
+            margin_floors_path,
             prefetch_tables,
             prefetch_targets,
             registered_gates,
@@ -1321,7 +1322,7 @@ class Exl3RamMissService:
         top_k_only = envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.get()
         hidden = cpu_experts.services[0].hidden
         cores = [list(plan.spec) for plan in numa.plans]
-        floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
+        floors = margin_floors_path(scorer)
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
             candidates = new_candidate_page(pin=pin)
@@ -1362,7 +1363,7 @@ class Exl3RamMissService:
             scorer.upper(),
             per_token,
             per_layer,
-            (", predicted top-k only" if top_k_only else "") + (f", margin floors {floors}" if floors else ""),
+            (", predicted top-k only" if top_k_only else "") + f", margin floors {floors or 'none'}",
             [plan.spec for plan in numa.plans],
         )
         return result

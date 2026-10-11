@@ -40,8 +40,8 @@ DRAFT_ONLY = {
 PREFETCH_OFF = {"SGLANG_DSV41_RAM_PREFETCH": "0", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": ""}
 # Every arm but the miss cut's states the CPU split's miss cut off, likewise.
 MISS_CUT_OFF = {"SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
-# The GPU scorer's margin floors fit by spec_margin.py's admission sweep (the file says on what).
-MARGIN_FLOORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ram_prefetch_margin_floors.json")
+# The GPU scorer's margin floors fit by spec_margin.py's admission sweep (the file says on what), packaged as its default.
+MARGIN_FLOORS = os.path.join(REPO, "python", "sglang", "srt", "layers", "moe", "ram_prefetch_margin_floors.json")
 # arm: (overrides on base_env, DSpark argv)
 ARMS = {
     "prod": ({**PREFETCH_OFF, **MISS_CUT_OFF}, False),

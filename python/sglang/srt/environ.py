@@ -2023,10 +2023,12 @@ class Envs:
     SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
     # Where the next layer's gate is scored: "cpu", each group's speculative thread on the record's staged input, or
     # "gpu", two kernels after the layer's post inside the decode graph (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer).
-    SGLANG_DSV41_RAM_PREFETCH_SCORER = EnvStr("cpu")
+    # gpu is the prefetch's best measured arm (DSV41_REFERENCE.md 33.14-33.18) and needs the RAM-miss copy engine.
+    SGLANG_DSV41_RAM_PREFETCH_SCORER = EnvStr("gpu")
     # The GPU scorer's margin floors: a JSON file {"min_margin": {"<target row>": floor}} from spec_margin.py's admission
     # sweep. A candidate whose margin is under its target row's floor is not read and does not count toward the layer's
-    # budget; a row the file omits keeps every candidate. Unset: no floors.
+    # budget; a row the file omits keeps every candidate. Unset: the GPU scorer's packaged table
+    # (layers/moe/ram_prefetch_margin_floors.json), the CPU scorer none. Empty: no floors.
     SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS = EnvStr(None)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is

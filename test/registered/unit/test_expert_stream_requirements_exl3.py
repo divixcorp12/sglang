@@ -769,14 +769,16 @@ def test_the_prefetch_off_with_nothing_set_passes_with_or_without_the_copy_engin
     _gate(args, SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=False)
 
 
-def test_the_default_gpu_scorer_without_the_copy_engine_names_the_cpu_scorer(model_dir):
-    """Refused rather than switched to the CPU scorer: the launch asked for the prefetch, and the CPU experts it needs
-    refuse a launch without the copy engine anyway."""
+def test_the_default_gpu_scorer_without_the_copy_engine_is_refused_as_the_cpu_scorer_would_be(model_dir):
+    """Refused rather than switched to the CPU scorer: the CPU experts the prefetch needs refuse a launch without the
+    copy engine whatever the scorer, so the message names the copy engine, not the CPU scorer."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
     no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": False}
-    with pytest.raises(ValueError, match="runs after the copy-engine post.*SGLANG_DSV41_RAM_PREFETCH_SCORER=cpu"):
+    with pytest.raises(ValueError, match="runs after the copy-engine post.*gpu is the default scorer"):
         _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1"):
+        _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
 
 
 def test_the_gpu_scorer_runs_on_the_prefetch_and_the_captured_copy_engine_post(model_dir):

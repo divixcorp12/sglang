@@ -357,27 +357,35 @@ def _check_ram_prefetch() -> None:
     scorer = envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get()
     if scorer not in ram_prefetch.SCORERS:
         raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of {ram_prefetch.SCORERS}, got {scorer!r}")
-    floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
-    if floors:
-        if scorer != "gpu":
-            # The floors filter the GPU scorer's candidate page; the CPU scorer would run without them, silently.
-            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu")
-        try:
-            ram_prefetch.read_margin_floors(floors)
-        except (OSError, ValueError) as error:
-            raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS: {error}") from error
+    # The gpu default and its packaged floors apply to a prefetching launch only; a value set explicitly is checked
+    # either way, so it cannot pass unused.
+    explicit_scorer = envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.is_set()
+    explicit_floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
+    if explicit_floors and scorer != "gpu":
+        # The floors filter the GPU scorer's candidate page; the CPU scorer would run without them, silently.
+        raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu")
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
-        if scorer == "gpu":
+        if explicit_scorer and scorer == "gpu":
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")
+        if explicit_floors:
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH=1")
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.
         raise ValueError("SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS=1")
     if scorer == "gpu" and not envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get():
+        # Refused, not switched to the CPU scorer: the CPU experts the prefetch needs refuse this launch either way.
         raise ValueError(
             "SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu runs after the copy-engine post captured in the decode graph; "
             "set SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1"
+            + ("" if explicit_scorer else " (gpu is the default scorer; SGLANG_DSV41_CPU_EXPERTS needs the copy engine too)")
         )
+    floors = ram_prefetch.margin_floors_path(scorer)
+    if floors:
+        try:
+            ram_prefetch.read_margin_floors(floors)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS: {error}") from error
     for name, high in (
         ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", ram_prefetch.MAX_PER_TOKEN),
         ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", ram_prefetch.MAX_PER_LAYER),
