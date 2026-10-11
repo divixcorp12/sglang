@@ -104,4 +104,4 @@ def test_set_rule_reads_all_or_nothing_and_clears_only_complete_layers():
     assert (top2["reads"], top2["useful"], top2["cleared"]) == (4, 2, 1)
     set2 = o.score_rule(rows, lambda c: (lambda s: s if len(s) <= 2 else [])([e for e, mg in c if mg >= 0.0]))
     assert (set2["reads"], set2["useful"], set2["cleared"]) == (2, 2, 1)  # layer 2's set of 3 is refused
-    assert set2["saved_ms"] == pytest.approx(2 * 0.67)
+    assert set2["saved_ms"] == pytest.approx(2 * 0.67, abs=0.05)  # rounded to 0.1 ms
