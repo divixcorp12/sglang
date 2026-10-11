@@ -62,3 +62,60 @@ def test_router_ids_are_read_from_the_side_files(tmp_path):
     ids.tofile(prefix + ".ids.bin")
     got = m.router_ids(prefix)
     assert got.shape == (2, 2, 3, 2) and int(got[1, 0, 2, 1]) == int(ids[1, 0, 2, 1])
+
+
+LAYERS, TOKENS, TOPK, FORWARDS = 2, 2, 2, 12
+
+
+def _capture(out_dir, job_routes, drop=(), base_gen=100):
+    """A capture of FORWARDS target-verify forwards, one request, one correct draft each: route forward i routes
+    position p of layer l to experts 1000 * l + 10 * i + 2 * p and + 1. Job forward k misses, on each layer, both
+    experts of position 0 (accepted) and the first of position 1 (rejected) of route forward ``job_routes[k]``. A
+    forward in ``drop`` is left incomplete (no gate on its last row), as the job trace leaves one it could not
+    finish."""
+    ids = np.zeros((FORWARDS, LAYERS, TOKENS, TOPK), dtype=np.int32)
+    for i in range(FORWARDS):
+        for layer in range(LAYERS):
+            for p in range(TOKENS):
+                ids[i, layer, p] = [1000 * layer + 10 * i + 2 * p, 1000 * layer + 10 * i + 2 * p + 1]
+    with open(os.path.join(out_dir, "router.json"), "w") as f:
+        json.dump({"layer_ids": list(range(LAYERS)), "tokens": TOKENS, "topk": TOPK}, f)
+    ids.tofile(os.path.join(out_dir, "router.ids.bin"))
+    with open(os.path.join(out_dir, "stages.jsonl"), "w") as f:
+        for i in range(FORWARDS):
+            f.write(json.dumps({"kind": "graph_routes", "phase": "target_verify", "rids": ["r"], "router": i, "seq": i,
+                                "forward_tokens": TOKENS,
+                                "routes": [sorted(int(e) for e in ids[i, layer].ravel()) for layer in range(LAYERS)]})
+                    + "\n")
+    with open(os.path.join(out_dir, "verify-accept.1.jsonl"), "w") as f:
+        for i in range(FORWARDS):
+            f.write(json.dumps({"rid": "r", "k": i, "num_correct_drafts": 0}) + "\n")
+    with open(os.path.join(out_dir, "events.1.tier.0.jsonl"), "w") as f:
+        for k, i in enumerate(job_routes):
+            for layer in range(LAYERS):
+                gen = base_gen + LAYERS * k + layer
+                misses = [int(ids[i, layer, 0, 0]), int(ids[i, layer, 0, 1]), int(ids[i, layer, 1, 0])]
+                f.write(json.dumps({"event": "copy_submit", "row": layer, "gen": gen, "ns": gen, "b": len(misses)})
+                        + "\n")
+                if not (k in drop and layer == LAYERS - 1):
+                    f.write(json.dumps({"event": "gate_open", "row": layer, "gen": gen, "ns": gen + 1}) + "\n")
+                for e in misses:
+                    f.write(json.dumps({"event": "miss_expert", "row": layer, "gen": gen, "a": e}) + "\n")
+
+
+def test_a_forward_the_job_trace_dropped_costs_only_that_forward(tmp_path):
+    m = _module()
+    # The job trace never completed route forward 5: one offset joins 0-4 or 6-11, never both (5 or 6 of 11).
+    _capture(str(tmp_path), job_routes=list(range(FORWARDS)), drop={5})
+    result = m.analyze(str(tmp_path))
+    assert result["verifies"] == FORWARDS - 1
+    assert result["alignment"]["joined"] == FORWARDS - 1 and result["alignment"]["job_forwards"] == FORWARDS - 1
+    assert result["per_verify"] == {"misses": 6, "accept": 4, "reject_only": 2}
+
+
+def test_a_job_trace_from_another_order_is_still_refused(tmp_path):
+    m = _module()
+    order = [3, 9, 0, 7, 11, 2, 5, 10, 1, 8, 4, 6]  # the job forwards in another order than the route log
+    _capture(str(tmp_path), job_routes=order)
+    with pytest.raises(ValueError, match="do not join"):
+        m.analyze(str(tmp_path))
