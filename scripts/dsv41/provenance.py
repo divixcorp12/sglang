@@ -36,6 +36,10 @@ REDACTED = "<redacted>"
 DRIVES = {"nvme0": "/mnt/nvme0", "nvme2": "/mnt/nvme2", "nvme4": "/mnt/nvme4"}
 # A drive another job is using reads well above this; the arms' own boot reads are not sampled here.
 IDLE_MAX_BYTES_PER_S = 1 << 20
+# Writes have their own limit: a writer (mimo-reap's GB-scale bursts to /mnt/nvme4, DSV41_REFERENCE 33.21) reads nothing.
+# At rest the SPCC takes ~32 KB/s (a Ray head node's logs, ext4's journal), so 1 MiB/s leaves ~30x for a journal
+# commit landing in the window and still trips on any bulk writer, which runs at hundreds of MB/s.
+IDLE_MAX_WRITTEN_BYTES_PER_S = 1 << 20
 SECTOR_BYTES = 512
 
 
@@ -223,9 +227,10 @@ def drive_sample(diskstats: str = "/proc/diskstats", devices: dict | None = None
 def drive_idle_check(
     seconds: float = 2.0, diskstats: str = "/proc/diskstats", sleep=None, devices: dict | None = None
 ) -> dict:
-    """Bytes/s read from each drive over ``seconds`` with the arm not yet started.
+    """Bytes/s read from and written to each drive over ``seconds`` with the arm not yet started, each against its
+    own limit; ``busy`` names the drives over each one.
 
-    A drive another job is reading makes an arm's timing and per-drive bytes meaningless, so the
+    A drive another job is reading or writing makes an arm's timing and per-drive bytes meaningless, so the
     verdict is stored with the result rather than printed to a log nobody joins to it."""
     import time
 
@@ -233,18 +238,29 @@ def drive_idle_check(
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         devices = resolve_devices() if devices is None else devices
-        before = read_sectors(diskstats, devices)
+        before = read_drive_counters(diskstats, devices)
         sleep(seconds)
-        after = read_sectors(diskstats, devices)
-        rates = {k: (after[k] - before[k]) * SECTOR_BYTES / seconds for k in devices}
+        after = read_drive_counters(diskstats, devices)
+
+        def rates(field):
+            return {k: (after[k][field] - before[k][field]) * SECTOR_BYTES / seconds for k in devices}
+
+        read, written = rates("sectors_read"), rates("sectors_written")
     except Exception as e:
         return {"idle": None, "unavailable": f"{type(e).__name__}: {e}", "measured_at_utc": started}
+    busy = {
+        "read": sorted(k for k, r in read.items() if r > IDLE_MAX_BYTES_PER_S),
+        "written": sorted(k for k, r in written.items() if r > IDLE_MAX_WRITTEN_BYTES_PER_S),
+    }
     return {
-        "idle": all(r <= IDLE_MAX_BYTES_PER_S for r in rates.values()),
-        "bytes_per_s": rates,
+        "idle": not busy["read"] and not busy["written"],
+        "busy": busy,
+        "bytes_per_s": read,
+        "written_bytes_per_s": written,
         "devices": devices,  # which kernel device each label resolved to
         "seconds": seconds,
         "max_idle_bytes_per_s": IDLE_MAX_BYTES_PER_S,
+        "max_idle_written_bytes_per_s": IDLE_MAX_WRITTEN_BYTES_PER_S,
         "measured_at_utc": started,
     }
 
