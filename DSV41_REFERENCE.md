@@ -7722,7 +7722,8 @@ better than rank (under 0: 0.14-0.18; 0.5 and up: 0.62-0.74). The per-layer mini
 (alpha 20 shrinkage toward the pooled rate), fit on one capture and scored on the other, kept 89.5% / 89.2% of the
 used reads and cut the wasted ones 40% / 45%. `SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS` (GPU scorer only) loads the
 table; `serve_gpu_job` skips a candidate under its target row's floor before it counts toward `per_layer`. The
-committed table (`analysis/dsv41-drive/dspark/ram_prefetch_margin_floors.json`, fit on all of
+committed table (`python/sglang/srt/layers/moe/ram_prefetch_margin_floors.json` since `0589e7fae4`; first
+`analysis/dsv41-drive/dspark/`), fit on all of
 `margin-gpu-20261009-035316`) is margin >= 0 on strong layers, >= 0.1 on weak ones, >= 0.25 on layer 14.
 
 A/B `ab-floors-20261009-125556` (commit `1970753936`, B first, 8 sessions): **rejected, a tie**.
@@ -8264,6 +8265,15 @@ so an expert shared by 3-4 verify tokens decodes its weights once. Checked from 
   buys shows as the calibrated layer time (n = 8: 3.05 against 3.64 ms), and §33.11 addendum 2 found the target's split
   off the decode critical path at this load. (An earlier version of this bullet said the split had been calibrated at
   the old cost; that was wrong.)
+
+**Defaults as merged to master (2026-10-11).** The split cut is on (`SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1`,
+`_MAX=3`, since `69e1f7744d`). RAM prefetch stays off, but `SGLANG_DSV41_RAM_PREFETCH=1` alone now runs its
+best-measured configuration (`0589e7fae4`): `SGLANG_DSV41_RAM_PREFETCH_SCORER` defaults to `gpu`, and
+`SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS` unset means the packaged table for the GPU scorer (`""` = no floors; a path =
+that file; the CPU scorer has none). With prefetch off nothing is read and launches pass as before; an explicit
+`SCORER=gpu` or floors path without prefetch is refused. `TOP_K_ONLY` stays off (never A/B'd); idle2 lives only on
+`codex/dsv41-spec-idle-drive`. The table covers target rows 1-39 (DSV4.1); another model needs floors `""`.
+`SGLANG_EXL3_CPU_MAX_M` stays unset (MAX_M 4) pending its repeat A/B.
 
 ## Sources
 
