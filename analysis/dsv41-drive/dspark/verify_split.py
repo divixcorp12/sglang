@@ -9,9 +9,10 @@ Inputs, all written by spec_margin_capture.py into OUT_DIR:
 * the router capture (``router.json`` / ``router.ids.bin``): every graph forward's top-k ids per layer and token row;
 * the accept log (``verify-accept.*.jsonl``): each request's k-th verify and its correct drafts.
 
-The job trace's forwards and the route log's are both every graph forward in order; ``align`` finds the offset at
-which every missed expert sits in its forward's routes for that layer (the check that the join is right), and a run
-below 99% is refused. A verify of a request's k-th line has its correct drafts c: positions 0..c are used (the bonus
+The route log has every graph forward in order; the job trace has those it completed, in order, so it can miss some.
+``layer_misses.match_forwards`` joins each job forward to the route line whose routes hold every expert it missed,
+and a capture where under 95% of the job forwards with a miss find theirs is refused (a dropped forward costs only
+itself; a job trace from another run or in another order joins almost none). A verify of a request's k-th line has its correct drafts c: positions 0..c are used (the bonus
 token's included), the rest ran on a rejected draft. A miss is ``accept`` when a used position routed to it and
 ``reject_only`` otherwise.
 
@@ -40,23 +41,6 @@ def split_layer(misses: set, ids_layer, num_correct_drafts: int, live: int) -> d
         used.update(int(e) for e in ids_layer[p] if e >= 0)
     accept = len(misses & used)
     return {"misses": len(misses), "accept": accept, "reject_only": len(misses) - accept}
-
-
-def align(job: list[list[set]], routes: list[list[set]], max_offset: int = 64) -> tuple[int, float]:
-    """The offset o (job forward i is route forward i + o) with the largest share of missed experts in the routes."""
-    best = (0, -1.0)
-    for o in range(-max_offset, max_offset + 1):
-        hit = total = 0
-        for i, fwd in enumerate(job):
-            j = i + o
-            if not 0 <= j < len(routes):
-                continue
-            for row, missed in enumerate(fwd):
-                total += len(missed)
-                hit += len(missed & routes[j][row])
-        if total and hit / total > best[1]:
-            best = (o, hit / total)
-    return best
 
 
 def verify_forwards(lines: list[dict], accepts: dict) -> list[dict]:
@@ -106,15 +90,18 @@ def analyze(out_dir: str) -> dict:
             for e in map(json.loads, f):
                 accepts[(e["rid"], e["k"])] = e["num_correct_drafts"]
     routes = [[set(r) for r in x["routes"]] for x in lines]
-    offset, share = align(job, routes)
-    if share < 0.99:
-        raise ValueError(f"the job trace and the route log do not align (best offset {offset}: {share:.3f})")
+    pairs = layer_misses.match_forwards(job, routes)
+    joined = {i for i, _ in pairs}
+    missing = [i for i, fwd in enumerate(job) if any(fwd)]
+    share = sum(i in joined for i in missing) / max(1, len(missing))
+    if share < 0.95:
+        raise ValueError(f"the job trace and the route log do not join ({share:.3f} of {len(missing)} job forwards "
+                         "with a miss found their route line)")
     verifies = {v["seq"]: v for v in verify_forwards(lines, accepts)}
     ids = router_ids(os.path.join(out_dir, "router"))
     per, by_c = [], collections.defaultdict(list)
-    for i, fwd in enumerate(job):
-        line = lines[i + offset] if 0 <= i + offset < len(lines) else None
-        v = verifies.get(line["seq"]) if line else None
+    for i, li in pairs:
+        fwd, v = job[i], verifies.get(lines[li]["seq"])
         if v is None or v["num_correct_drafts"] is None or v["router"] is None:
             continue
         tot = collections.Counter()
@@ -126,7 +113,8 @@ def analyze(out_dir: str) -> dict:
         raise ValueError("no verify forward joined its accept count")
     mean = lambda xs, k: round(statistics.mean(x.get(k, 0) for x in xs), 2)
     return {
-        "alignment": {"offset": offset, "missed_in_routes": round(share, 4)},
+        "alignment": {"joined": len(pairs), "job_forwards": len(job), "route_lines": len(lines),
+                      "joined_with_a_miss": round(share, 4)},
         "verifies": len(per),
         "per_verify": {k: mean(per, k) for k in ("misses", "accept", "reject_only")},
         "reject_only_share": round(sum(x.get("reject_only", 0) for x in per) / max(1, sum(x["misses"] for x in per)), 3),

@@ -72,6 +72,29 @@ def forwards(recs: list[dict], rows: int) -> list[list[dict]]:
     return out
 
 
+def match_forwards(job: list[list[set]], routes: list[list[set]], window: int = 40) -> list[tuple[int, int]]:
+    """(job forward, route line) pairs, in order, joining a job trace's forwards (each layer's missed experts) to the
+    route log's (each layer's routed experts). ``forwards`` drops a forward the job trace could not complete, so no
+    single offset joins the two logs. A forward with a miss joins its first route line at or after the previous join,
+    within ``window``, whose routes hold every expert it missed. A forward without one joins only between two joined
+    forwards with as many route lines as job forwards between them (no drop there); elsewhere it stays out."""
+    anchors, j = [], 0
+    for i, fwd in enumerate(job):
+        if not any(fwd):
+            continue
+        for jj in range(j, min(len(routes), j + window)):
+            if all(m <= routes[jj][row] for row, m in enumerate(fwd)):
+                anchors.append((i, jj))
+                j = jj + 1
+                break
+    out = []
+    for (i0, j0), (i1, j1) in zip(anchors, anchors[1:]):
+        out.append((i0, j0))
+        if j1 - j0 == i1 - i0:
+            out.extend((i, j0 + i - i0) for i in range(i0 + 1, i1))
+    return out + anchors[-1:]
+
+
 def within_slope(recs: list[dict], key, x: str, min_n: int = 5):
     """Least-squares slope of ``ms`` on ``x`` with a separate intercept per ``key`` stratum; None without spread."""
     strata = collections.defaultdict(list)

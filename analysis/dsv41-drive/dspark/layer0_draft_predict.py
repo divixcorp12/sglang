@@ -48,6 +48,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import layer_misses  # noqa: E402
+from layer_misses import match_forwards  # noqa: E402,F401  (its join of job forwards to route lines)
 
 LAYER, HIDDEN, N_EXPERTS, TOPK = 0, 5120, 384, 6
 EPS = 1e-20  # config rms_norm_eps
@@ -211,20 +212,6 @@ def leads(events: list) -> dict:
             ms = lambda t: None if t is None else round((e["ns"] - t) / 1e6, 6)
             out[e["gen"]] = {"draft_end_ms": ms(last["draft_end"]), "draft_observed_ms": ms(last["draft_observed"]),
                              "prev_verify_end_ms": ms(last["gate39"])}
-    return out
-
-
-def match_forwards(job: list, routes: list, window: int = 40) -> list:
-    """(job forward, route line) pairs, in order: each job forward's first route line at or after the previous
-    match whose per-layer routes hold every expert it missed. The job trace drops forwards it could not complete, so
-    no single offset joins the two logs (verify_split.align's assumption fails on cut-timeline: 0.689)."""
-    out, j = [], 0
-    for i, fwd in enumerate(job):
-        for jj in range(j, min(len(routes), j + window)):
-            if all(m <= routes[jj][row] for row, m in enumerate(fwd)):
-                out.append((i, jj))
-                j = jj + 1
-                break
     return out
 
 
