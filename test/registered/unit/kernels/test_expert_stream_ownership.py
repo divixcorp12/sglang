@@ -158,7 +158,9 @@ def test_the_tier_declares_only_the_callers_mutex():
     assert "std::mutex turn;" in _struct(code, "SpecGroup"), "the reader turn left SpecGroup"
     assert "std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock)" in code
     assert "std::mutex mutex_" not in code and "guard(mutex_)" not in code and "self->mutex_" not in code
-    for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_", "atomic_flag", "test_and_set",
+    # pthread_ by its lock families: the speculative thread names and pins itself (pthread_setname_np, _setaffinity_np).
+    for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_mutex", "pthread_rwlock", "pthread_spin",
+                  "pthread_cond", "pthread_barrier", "atomic_flag", "test_and_set",
                   ".exchange(", "futex", ".wait(", "notify_one", "notify_all", "condition_variable"):
         assert other not in code, other
     assert "compare_exchange" not in code
