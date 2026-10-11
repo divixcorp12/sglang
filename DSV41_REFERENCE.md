@@ -8202,6 +8202,27 @@ thirds). Other rows keep the thirds. Reference `dspark-both-misscut`.
 - Lifetime: misscut 1,081 tokens (4 warm-up rounds), spcc13 1,930 tokens (11). RAM rows per token 22.6 vs 20.0.
 - The repeat was skipped by decision (2026-10-10) to go straight to releasing the team during the w2 wait.
 
+**Repeat, arm first (A/B `ab-spcc13-rep-20261010-153324`, same build `e13fd80f25`): the gain did not hold.**
+
+| Session (driver order) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Median |
+|---|---|---|---|---|---|---|---|---|---|
+| spcc13 (ran first), ms/token | 111.3 | 62.0 | 51.6 | 132.1 | 131.9 | 84.8 | 114.2 | 114.1 | 112.7 |
+| misscut, ms/token | 120.4 | 62.8 | 58.9 | 123.4 | 72.3 | 84.6 | 54.9 | 102.9 | 78.5 |
+
+- Paired median: spcc13 **3.6% slower**. By session id: Double_BKR -7.1, Single_CDW +7.6, Single_DISCA -0.2,
+  Single_ETR +1.3, Single_TSCO +12.4, Single_VLO -10.9, **Single_WRK -108.2, val Single_K -82.4**. Without those two
+  sessions the median is +0.6%. Accept length 3.65 (spcc13) vs 3.71; text check passed; 3-4 warm-up rounds each.
+- **The SPCC was slow in the spcc13 arm**: demand busy s / GB read nvme0 97.3 / 316.8 (0.307), **nvme4 124.8 / 303.6
+  (0.411)**, nvme2 99.2 / 316.6 (0.313); misscut in the same A/B 0.304 / 0.318 / 0.308. In the first spcc13 run nvme4
+  was 0.318. The logs hold drive load only for each server's life, so whether the slow patch lines up with sessions 5
+  and 7 cannot be read back. Drive-state (SLC cache, garbage collection) and something about the arm's read shape on
+  that drive are both open; the first run argues against the arm.
+- Waits: 12.8 K staged jobs, 5.0 K waited (39%), 0.29 ms on average, the same as the first run.
+- Both runs pooled (16 session pairs): median +1.7%, within the noise of these A/Bs. **Verdict: no demonstrated gain;
+  not merged.** The branch stays as is (flags off by default).
+- Mapping checked: mirror root `/mnt/nvme4` is the SPCC (kernel `nvme2n1`); `/mnt/nvme0` and `/mnt/nvme2` are the
+  990 EVO Plus drives (`nvme0n1`, `nvme1n1`).
+
 **Releasing the team during the w2 wait: not built, nothing could use it** (investigation only, report
 `two-stage-yield-report.md`, no code change).
 - No draft job can arrive during a wait. The draft runs on the same CUDA stream as the verify and strictly before it
