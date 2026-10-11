@@ -1,7 +1,7 @@
 """The EXL3 CPU kernel's DSV4.1 plan on calls whose routes share an expert (csrc/exl3/optimized/forward_plan.hpp).
 
 Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_M tokens (sglang_exl3_cpu::chunk_m:
-MAX_M / 2, so 2 by default and 4 in a SGLANG_EXL3_CPU_MAX_M=8 build). Each case runs one call on a DeepSeek
+MAX_M / 2, so 4 by default (SGLANG_EXL3_CPU_MAX_M=8) and 2 in a SGLANG_EXL3_CPU_MAX_M=0 build). Each case runs one call on a DeepSeek
 V4.1-shaped layer:
   - unswizzled (native), which Dsv41Shape::accepts may take on AVX-512BW;
   - swizzled, which it always refuses, so it runs the generic plan;
@@ -152,7 +152,9 @@ def _check(layers, name, routes):
 
 def test_the_build_reports_its_chunk_size(layers):
     """CHUNK_M is half of MAX_M: SGLANG_EXL3_CPU_MAX_M's half when the build sets it, else the source default's."""
-    max_m = int(os.environ.get("SGLANG_EXL3_CPU_MAX_M") or 0)
+    from sglang.srt.environ import envs
+
+    max_m = envs.SGLANG_EXL3_CPU_MAX_M.get()
     assert _chunk_m() == (max_m // 2 if max_m else DEFAULT_CHUNK_M)
 
 

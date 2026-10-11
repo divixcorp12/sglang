@@ -73,8 +73,25 @@ def _cpu_experts_defines(**flags):
 )
 def test_cpu_experts_always_build_the_optimized_kernel(flags):
     defines = _cpu_experts_defines(**flags)
+    assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-DEXL3_MOE_CPU_MAX_M=8"]
+    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_m8_cpu_v1"
+
+
+def test_cpu_max_m_defaults_to_8_and_0_keeps_the_kernels_own():
+    """Default 8 (4 tokens per chunk, DSV41_REFERENCE.md 33.20); 0 builds the kernel source's default (MAX_M 4)."""
+    assert exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.default == 8
+    defines = _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=0)
     assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]
-    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_cpu_v1"
+    assert exl3_ext.build_flavor(defines) == "_resid_b128_cpu_v1"
+
+
+def test_the_max_m_default_does_not_refuse_a_launch_without_cpu_experts():
+    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(False), contextlib.ExitStack() as stack:
+        field = exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M
+        if field.is_set():
+            stack.callback(os.environ.__setitem__, "SGLANG_EXL3_CPU_MAX_M", os.environ["SGLANG_EXL3_CPU_MAX_M"])
+            field.clear()
+        assert "-DEXL3_MOE_CPU_MAX_M=8" not in exl3_ext.cpu_act_defines()
 
 
 @pytest.mark.parametrize(
