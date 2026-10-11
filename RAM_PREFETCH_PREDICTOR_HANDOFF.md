@@ -119,7 +119,7 @@ the native gate applied one layer early.
 | 4 | GPU + split cut | about even |
 | 5 | GPU + per-drive in-flight cap | −4.5%, dropped |
 | 6 | GPU + cut + idle-drive reads | about −7% |
-| 7 | **GPU + cut + idle2** | **+3.6% paired median, 5 of 8 faster**; pooled −3.8%, from one drive-stalled session |
+| 7 | **GPU + cut + idle2** | First A/B +3.6% paired median; **repeat −3.7%**. Step time per verify, flagged sessions out: −3.0%, then +2.6%. **A tie** |
 
 **Today's defaults.**
 - `SGLANG_DSV41_RAM_PREFETCH=1` alone gives row 3. Prefetch is **off by default**.
@@ -151,18 +151,18 @@ the native gate applied one layer early.
 
 ## Open state you inherit
 
-1. **Tonight's three-arm A/B is running or just finished.**
-   - Directory: `divix01:/data/models/slang/nvfp4-work/ram-prefetch/ab-idle2-floors-20261011-164535`.
-   - Arms, in order: `dspark-both-misscut`, `dspark-both-prefetch-gpu-misscut-idle2`,
-     `dspark-both-prefetch-gpu-misscut-idle2-floors`.
+1. **The idle2 repeat is recorded; idle2 with floors is being re-run.**
+   - `ab-idle2-floors-20261011-164535` (recorded in §33.22) showed idle2 to be a tie.
+   - Its idle2 + floors arm was aborted at warm-up by the stability gate, with no fault.
+   - The re-run is `divix01:/data/models/slang/nvfp4-work/ram-prefetch/ab-idle2-floors-rerun-20261011-174531`.
+     Arms in order: `dspark-both-prefetch-gpu-misscut-idle2-floors`, then `dspark-both-misscut`.
    - It runs from worktree `wt-idle2-floors` at `288fc15aa1`, registered in the generation gate as
      "master 288fc15aa1".
-   - Arms 1 and 2 finished. The idle2 arm's session 3 (`Double_BKR`) was again marked an outlier (TTFT 15.6 s
-     against 8.1 s); check its `drive_flags`.
-   - When it ends, read `summary.json`: the paired gains of each arm against `dspark-both-misscut`, the
-     per-session drive table, and `drive_flags`.
-   - Record the result in `DSV41_REFERENCE.md` §33.22 below the scoreboard, and update the scoreboard.
-   - Then remove `wt-idle2-floors`.
+   - When it ends, read `summary.json`: per-arm `drive_flags` sit inside each arm's entry. Compare step time per
+     verify with flagged sessions excluded, as in §33.22. Ms/token alone mixes in accept-length changes from
+     diverging text.
+   - Record the result in §33.22, update the scoreboard, then remove `wt-idle2-floors`.
+   - If the floors arm again fails warm-up, run it with a longer warm-up rather than reading anything into it.
 2. **`codex/dsv41-layer-cover`** (`2c2f7044e0`, laptop worktree `/Users/dnikolaidis/.codex/worktrees/layer-cover`) is
    unmerged.
    - It adds `analysis/dsv41-drive/dspark/layer_cover.py`, `prefetch-replay/layer_cover_oracle.py` and
@@ -176,9 +176,10 @@ the native gate applied one layer early.
 
 ## Track A: close idle2
 
-Decide from tonight's A/B, with the drive flags applied.
-- **If idle2-floors (or idle2) beats `dspark-both-misscut`** on the paired median, with flagged sessions re-run or
-  excluded:
+idle2 alone is settled as a tie with no prefetch (two A/Bs, §33.22). Decide idle2 + floors from the re-run, with the
+drive flags applied.
+- **If idle2-floors beats `dspark-both-misscut`** on step time and the paired median, with flagged sessions re-run
+  or excluded:
   1. repeat it once, reversing the arm order;
   2. if it holds, make that configuration what `SGLANG_DSV41_RAM_PREFETCH=1` turns on. The precedent is commit
      `0589e7fae4`, which made the GPU scorer and floors the defaults with tests.

@@ -8412,13 +8412,14 @@ was faster.
 | 4 | GPU + split cut (`...-gpu-misscut`), against the cut alone | Same as 2, on top of the miss-aware CPU split cut | About even once an outlier session is excluded | 33.17 |
 | 5 | GPU + per-drive in-flight cap (`...-gpu-cap`), against 2 | Moves sub-reads to the drive with the fewest bytes in flight | 4.5% slower; 6 of 8 slower; dropped | 33.17 |
 | 6 | GPU + cut + idle-drive reads (`...-gpu-misscut-idle`) | Speculative reads only to a drive with no demand read in flight, one 2.2 MB piece at a time, 4 ms deadline | About 7% slower; 6 of 8 slower (35% abandoned, 82% of promotions boosted) | 33.18 |
-| 7 | **GPU + cut + idle2** (`...-gpu-misscut-idle2`) | As 6, plus ties between idle drives spread across drives (`IDLE_SPREAD=1`) and 2 pieces in flight (`IDLE_PIECES=2`) | **Paired median +3.6%, 5 of 8 faster**; pooled −3.8% because of one Samsung-stalled session, +2.0% without it | 33.22 |
+| 7 | **GPU + cut + idle2** (`...-gpu-misscut-idle2`) | As 6, plus ties between idle drives spread across drives (`IDLE_SPREAD=1`) and 2 pieces in flight (`IDLE_PIECES=2`) | First A/B: paired median +3.6%, 5 of 8 faster. **Repeat: −3.7%.** Step time per verify, flagged sessions excluded: 3.0% faster, then 2.6% slower. **A tie.** | 33.22 |
 
-**Best so far: idle2 (row 7).** It is the only variant whose paired median favours the prefetch. It fixed idle's two
-faults: abandoned reads fell from 35% to about 10%, and nvme0 no longer takes 72% of the speculative bytes (the split
-is now 59 / 51 / 55 GB). It is **not an established gain**:
-- the evidence is one same-window A/B, and the pooled result turns on one drive-disturbed session;
-- it was measured **without margin floors** (`MARGIN_FLOORS=""`), so idle2 with floors (rows 3 + 7) is untested.
+**Best so far: idle2 (row 7), but as a tie, not a gain.**
+- It fixed idle's two faults: abandoned reads fell from 35% to about 10%, and nvme0 no longer takes 72% of the
+  speculative bytes (the split is now 59 / 51 / 55 GB).
+- It is the least harmful prefetch variant. Two same-window A/Bs put it within ±3% of no prefetch, in opposite
+  directions (the repeat is below).
+- It was measured **without margin floors** (`MARGIN_FLOORS=""`). idle2 with floors (rows 3 + 7) is being re-run.
 
 **What the flags turn on.** `SGLANG_DSV41_RAM_PREFETCH=1` alone gives row 3 (GPU scorer with the packaged floors),
 not idle2. To run idle2, set these as well:
@@ -8435,6 +8436,44 @@ read competes with the demand reads on the same three drives.
 **Next, if prefetch is pursued:**
 - repeat idle2 from master, with the write-aware idle check and flagged sessions re-run;
 - then idle2 with floors.
+
+**The idle2 repeat, with idle2 + floors (`ab-idle2-floors-20261011-164535`, master `288fc15aa1`, worktree
+`wt-idle2-floors`).** Three arms, back to back: `dspark-both-misscut`, idle2, then the new arm
+`dspark-both-prefetch-gpu-misscut-idle2-floors` (idle2 with the packaged floors; `both_cpu_ab.py`, `288fc15aa1`).
+Drives were idle at start, under the check that now counts writes too. idle2's text matched the reference.
+
+- **The floors arm did not run.** Its warm-up never met the stability gate in 12 rounds, so the driver aborted it and
+  wrote no summary. It ran at 12.6-14.4 tok/s with no fault; `summary.json` was written afterwards by `summarize()`.
+  - It is being re-run, floors arm first (`ab-idle2-floors-rerun-20261011-174531`).
+  - In warm-up, used / landed was 0.60 (5,752 / 9,562), against about 0.44 for idle2 without floors.
+- **idle2 against misscut:** medians 100.72 / 77.81; paired median **−3.7%**.
+
+| Session | misscut ms/token | idle2 ms/token | Paired | What happened |
+|---|---:|---:|---:|---|
+| CDW | 120.7 | 115.4 | +4.4% | |
+| ETR | 61.0 | 86.0 | −41.0% | Different text: 63 tokens at accept 3.15 against 103 at 4.29. Step time 267 against 259 ms, so not a stall |
+| TSCO | 55.7 | 119.7 | −114.9% | **SPCC stall, flagged**: nvme4 0.96 busy s per GB (+197%); step 585 against 262 ms |
+| BKR | 132.6 | 130.8 | +1.4% | **SPCC, flagged** (0.71 s/GB, +118%): TTFT 15.6 against 9.0 s, decode unaffected |
+| K | 66.0 | 70.3 | −6.6% | |
+| DISCA | 85.3 | 81.2 | +4.8% | |
+| WRK | 70.3 | 72.6 | −3.2% | Different text: 60 against 76 tokens |
+| VLO | 112.7 | 117.5 | −4.2% | |
+
+**Step time per verify** (`(total - ttft) / spec_verify_ct`, §33.23) is not moved by accept length. As an idle2 /
+misscut ratio, with flagged sessions excluded:
+
+| A/B | Median ratio | Sessions kept |
+|---|---:|---:|
+| `ab-idle2-rerun-20261011-150607` | 0.970 (3.0% faster) | 7 |
+| this one | 1.026 (2.6% slower) | 6 |
+
+So idle2 is a tie with no prefetch. Its counters repeat the first A/B's closely:
+- 18,936 issued, 7,471 used, 1,673 abandoned, 83,428 drive moves;
+- 37% of used reads still in flight at use;
+- 29.7 NVMe rows per token against 20.3 without prefetch, 6.4 of them wasted.
+
+Both flagged sessions this time were on the SPCC, and both only in the prefetch arm. idle2 sends about 45% more
+bytes through the drives, which plausibly makes an SPCC episode more likely. That is not shown.
 
 ### 33.23 What drive stalls cost: throughput little, A/B verdicts a lot (2026-10-11)
 
