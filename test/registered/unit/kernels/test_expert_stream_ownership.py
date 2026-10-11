@@ -140,17 +140,21 @@ def _struct(code, name, opener=None):
 def test_the_tier_declares_only_the_callers_mutex():
     """Task 15's source backstop to the shim's runtime zero (plan F11: names, not a count). The tier declares
     caller_mutex_ (Python callers against each other only) and the two InstrBuild-only guards, TraceState::mutex and
-    TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; it locks nothing else, and no other
+    TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; with the RAM prefetch on, each
+    group's SpecGroup::turn, which its demand reader (try_to_lock, then lock) and its speculative thread (lock_guard) take
+    in turns, one read at a time. It locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
     lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and no compare-exchange: the one
     the tier relies on is the lease channel's cas_gate, its open of the copy wait's gate (host/lease_channel.h,
     LEASE_PROTOCOL.md "The lease channel")."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
-    assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex"}
+    assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex", "turn"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
     assert "std::mutex mutex;" in _struct(code, "TraceState"), "the trace guard left TraceState"
     locked = set(re.findall(r"(?:lock_guard|unique_lock|scoped_lock)<[^>]*>\s*\w+\(([^)]*)\)", code))
-    assert locked == {"caller_mutex_", "trace_.mutex", "faults_.fault_mutex"}, locked
+    assert locked == {"caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "spec.turn"}, locked
+    assert "std::mutex turn;" in _struct(code, "SpecGroup"), "the reader turn left SpecGroup"
+    assert "std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock)" in code
     assert "std::mutex mutex_" not in code and "guard(mutex_)" not in code and "self->mutex_" not in code
     for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_", "atomic_flag", "test_and_set",
                   ".exchange(", "futex", ".wait(", "notify_one", "notify_all", "condition_variable"):
