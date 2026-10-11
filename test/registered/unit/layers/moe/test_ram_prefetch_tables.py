@@ -11,13 +11,16 @@ from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
 from sglang.kernels.ops.moe.expert_stream_transport import CAND_PAGE_BYTES, new_candidate_page
 from sglang.srt.layers.moe.ram_prefetch import (
+    MARGIN_FLOORS,
     GpuScorer,
     RouterGate,
     clear_router_gates,
     load_margin_floors,
+    margin_floors_path,
     prefetch_tables,
     prefetch_targets,
     register_moe_gates,
+    read_margin_floors,
     register_router_gate,
     registered_gates,
     spec_score_rows,
@@ -86,7 +89,8 @@ def test_a_layer_registered_again_with_another_gate_is_refused():
     assert registered_gates()[1].weight is gate.weight
 
 
-def test_the_service_enables_the_host_with_the_registered_gates_options_and_spare_cores():
+def test_the_service_enables_the_host_with_the_registered_gates_options_and_spare_cores(monkeypatch):
+    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH_SCORER", "cpu")
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
     calls = []
@@ -119,7 +123,7 @@ def test_the_gpu_scorer_enables_the_host_with_a_candidate_page_and_no_host_gate_
     calls = []
     host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
-    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("gpu"):
+    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("gpu"), envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""):
         scorer = module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
     (targets, gates, bias), kw = calls[0]
     assert targets.tolist() == [[1, 0], [-1, -1]] and gates is None and bias is None
@@ -135,7 +139,8 @@ def test_the_cpu_scorer_returns_no_gpu_scorer_and_an_unknown_one_is_refused():
     register_router_gate(1, gate.weight, gate.bias, 6)
     host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: None)
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
-    assert module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu) is None
+    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("cpu"):
+        assert module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu) is None
     with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("tpu"):
         with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER"):
             module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
@@ -227,3 +232,40 @@ def test_the_gpu_scorer_passes_the_margin_floors_file_to_the_host(tmp_path):
     ):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
     assert calls[0][1]["min_margin"].tolist() == [float("-inf"), 0.5]
+
+
+def test_the_prefetch_alone_runs_the_gpu_scorer_with_the_packaged_margin_floors(caplog):
+    """DSV41_REFERENCE.md 33.14-33.18's best arm is the default: SGLANG_DSV41_RAM_PREFETCH=1 needs nothing else."""
+    import os
+
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get() == "gpu"
+    assert not envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.is_set()
+    assert os.path.dirname(MARGIN_FLOORS) == os.path.dirname(module.__file__) and os.path.isfile(MARGIN_FLOORS)
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    calls = []
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+    rows = max(read_margin_floors(MARGIN_FLOORS)) + 1
+    with caplog.at_level("INFO", logger=module.logger.name):
+        scorer = module.Exl3RamMissService._enable_ram_prefetch(host, list(range(rows)), _numa(), cpu)
+    assert isinstance(scorer, GpuScorer)
+    assert torch.equal(calls[0][1]["min_margin"], load_margin_floors(MARGIN_FLOORS, rows))
+    assert "GPU scorer" in caplog.text and f"margin floors {MARGIN_FLOORS}" in caplog.text
+
+
+def test_empty_margin_floors_read_every_candidate_and_the_cpu_scorer_has_none(caplog):
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    calls = []
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+    with envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""):
+        assert margin_floors_path("gpu") is None
+        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    assert calls[0][1]["min_margin"] is None
+    assert margin_floors_path("gpu") == MARGIN_FLOORS and margin_floors_path("cpu") is None
+    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("cpu"), caplog.at_level("INFO", logger=module.logger.name):
+        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    assert "min_margin" not in calls[1][1]
+    assert "CPU scorer" in caplog.text and "margin floors none" in caplog.text

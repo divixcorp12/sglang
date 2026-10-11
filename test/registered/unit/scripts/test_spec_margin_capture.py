@@ -51,6 +51,11 @@ def test_the_capture_runs_any_ab_arm_and_leaves_its_scorer_alone_unless_asked():
     floors = cap.server_env("/out", False, arm="dspark-both-prefetch-gpu-floors")
     assert floors["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu"
     assert floors["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"].endswith("ram_prefetch_margin_floors.json")
+    from sglang.srt.layers.moe.ram_prefetch import MARGIN_FLOORS
+
+    assert floors["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"] == MARGIN_FLOORS
+    gpu = cap.server_env("/out", False, arm="dspark-both-prefetch-gpu")
+    assert gpu["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu" and gpu["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"] == ""
     assert off["SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"] == "/out/events"
 
 

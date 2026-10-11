@@ -752,9 +752,31 @@ def test_ram_prefetch_options_outside_the_hosts_bounds_are_refused(model_dir, na
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, **{name: value})
 
 
-def test_the_ram_prefetch_scorer_defaults_to_the_cpu():
-    """The GPU scorer is opt-in until its A/B is accepted (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer-design)."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get() == "cpu"
+def test_the_ram_prefetch_scorer_defaults_to_the_gpu():
+    """The prefetch's best measured arm (DSV41_REFERENCE.md 33.14-33.18); the prefetch itself stays off."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get() == "gpu"
+    assert envs.SGLANG_DSV41_RAM_PREFETCH.get() is False
+
+
+def test_the_prefetch_off_with_nothing_set_passes_with_or_without_the_copy_engine(model_dir):
+    """The GPU scorer default must not refuse a launch that does not prefetch."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    assert not envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.is_set()
+    assert not envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.is_set()
+    _gate(args, **CPU_EXPERTS_ENV)
+    _gate(args, SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True)
+    _gate(args, SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=False)
+
+
+def test_the_default_gpu_scorer_without_the_copy_engine_names_the_cpu_scorer(model_dir):
+    """Refused rather than switched to the CPU scorer: the launch asked for the prefetch, and the CPU experts it needs
+    refuse a launch without the copy engine anyway."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": False}
+    with pytest.raises(ValueError, match="runs after the copy-engine post.*SGLANG_DSV41_RAM_PREFETCH_SCORER=cpu"):
+        _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True)
 
 
 def test_the_gpu_scorer_runs_on_the_prefetch_and_the_captured_copy_engine_post(model_dir):
@@ -785,7 +807,14 @@ def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_pa
     path.write_text('{"min_margin": {"1": 0.25}}')
     gpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
     _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+    cpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+        _gate(args, **cpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+    # Unset, the floors are the GPU scorer's packaged table alone; empty, none.
+    _gate(args, **cpu)
+    _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="")
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"):
         _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(tmp_path / "missing.json"))

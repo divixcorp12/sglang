@@ -228,6 +228,25 @@ def test_the_floors_arm_differs_from_the_gpu_arm_in_the_committed_margin_floors_
     assert ab._overrides("dspark-both", "/out")[key] == ""
 
 
+def test_every_prefetch_arm_pins_its_scorer_and_floors_against_the_defaults_and_the_shell(monkeypatch):
+    """The scorer defaults to gpu with the packaged floors; each arm keeps the scorer and floors it was measured with."""
+    from sglang.srt.layers.moe.ram_prefetch import MARGIN_FLOORS
+
+    ab = _ab()
+    assert ab.MARGIN_FLOORS == MARGIN_FLOORS
+    scorer, floors = "SGLANG_DSV41_RAM_PREFETCH_SCORER", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"
+    monkeypatch.setenv(scorer, "tpu")
+    monkeypatch.setenv(floors, "/elsewhere.json")
+    for arm in ab.ARMS:
+        env = ab._overrides(arm, "/out")
+        if arm.startswith("dspark-both-prefetch"):
+            assert env[scorer] == ("gpu" if "-gpu" in arm else "cpu"), arm
+            assert env[floors] == (MARGIN_FLOORS if arm.endswith("-floors") else ""), arm
+        else:
+            # Prefetch off: the scorer is unused, and the gate refuses a leaked explicit gpu rather than ignore it.
+            assert env["SGLANG_DSV41_RAM_PREFETCH"] == "0" and env[floors] == "", arm
+
+
 def test_the_driver_runs_the_arms_in_the_order_given(monkeypatch, tmp_path):
     """The reversed A/B (B first) relies on it."""
     ab = _ab()
