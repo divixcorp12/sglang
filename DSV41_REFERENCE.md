@@ -8320,6 +8320,27 @@ against ~0.31-0.32), with single sessions 80-100% slower (§33.20).
 - Remedies, in order: replace the SPCC with a third 990 EVO Plus; or, in software, cut the tail, since every row is
   on all three drives (re-issue a late SPCC piece to a Samsung, or shift its share while its recent latency is high).
 
+### 33.22 Branches merged, and two CPU ideas closed without an A/B (2026-10-11)
+
+**Merged into `codex/dsv41-ram-prefetch-margin` and master** (all features default off; master at `4cf39eb877`):
+`codex/dsv41-run-locks`, `codex/dsv41-layer0-draft-predict`, `codex/dsv41-drive-sessions`,
+`codex/dsv41-spec-idle-drive` (idle-drive speculative reads, idle2, the per-drive in-flight cap) and
+`codex/dsv41-cpu-two-stage` (two-stage CPU misses, the spcc13 per-span weights). The two-stage merge moved its test
+fault words to 32 (`two_span_rows`) and 33 (`suffix_delay_ns`); the fault tensor is now 34 words. Tests at the merge:
+the 3 failures that also fail on master (`test_no_clock_read_bypasses_the_trace_gate`, two
+`test_expert_stream_sync_primitives` tests), plus 5 load-sensitive keep-warm/idle timing tests under `-n 8` that pass
+serially. `codex/dsv41-ram-prefetch-t7` and `-t9` were deleted: every commit on them was already on the branch
+(`git cherry`). Their worktrees and those of this work stream were removed on the laptop and divix01.
+
+**Closed without an A/B:**
+- **CPU expert workers on the SMT siblings.** The bench (§33.20) gains 0% for 1-token experts and 14% only for an
+  expert shared by 6 tokens; served lanes carry ~1.25 tokens (§33.11 addendum 2). And the CPU split is off the decode
+  critical path at this load: a 10% faster CPU kernel (`MAX_M=8`, §33.20) and two large split moves (§33.11) left
+  ms/token unchanged. Expected effect within noise.
+- **Port-0 relief in the EXL3 CPU kernel** (moving integer multiplies and shifts toward p5, cutting register spills;
+  §33.20). Same reason: a few percent of CPU kernel time does not reach decode time while the split is off the critical
+  path. Revisit only if the CPU side becomes critical (for example a larger CPU share after a hardware change).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
