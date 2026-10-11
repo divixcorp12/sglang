@@ -8024,8 +8024,8 @@ Before this change the overlap was 7.6 / 9.2 / 7.7 s (§33.17).
 - Speculative bytes per drive were even at 59 / 51 / 55 GB.
 - Demand and speculative reads overlapped for 1.8 / 2.8 / 2.2 s.
 
-**TODO: the idle2 same-window A/B** (`dspark-both-misscut` against `dspark-both-prefetch-gpu-misscut-idle2`) is
-still owed. The first attempt (`ab-idle2-20261010-012903`) has no result:
+**The idle2 same-window A/B** (`dspark-both-misscut` against `dspark-both-prefetch-gpu-misscut-idle2`) ran on
+2026-10-11; the result is in §33.22. The first attempt (`ab-idle2-20261010-012903`) has no result:
 - the cut-only arm finished normally;
 - the idle2 server then died at load with "no GPU memory for the KV cache";
 - the cause was a unit-kernel suite run alongside it without `cc-gpu.lock`. Several of those files use CUDA.
@@ -8361,6 +8361,41 @@ matter if the CPU side becomes critical. 0 builds the kernel source's MAX_M 4 (`
 builds `_resid_b128_m8_cpu_v1`, so the first launch after this change compiles once. The variable is refused without
 `SGLANG_DSV41_CPU_EXPERTS` only when set explicitly. A/B arms that do not pin it now run MAX_M 8, so
 `dspark-both-misscut` and `dspark-both-misscut-maxm8` are the same configuration from here on.
+
+**The idle2 A/B, with per-session drive load (`ab-idle2-rerun-20261011-150607`, from the merge at `4cf39eb877`).**
+`dspark-both-prefetch-gpu-misscut-idle2` against `dspark-both-misscut`, back to back with nothing else on the box. Both
+arms' drives were idle at start; that worktree's check counts reads only, as it predates the write-aware check. The
+text matched the reference.
+
+An earlier attempt, `ab-idle2-20261011-134703`, has no result. A probe filled the root volume's `/tmp` (OSError 28) and
+the misscut server never became healthy.
+
+Per-session ms/token, in session order 0-7:
+
+| Arm | Session 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | Median |
+|---|---|---|---|---|---|---|---|---|---|
+| misscut | 119.7 | 66.7 | 60.8 | 121.2 | 69.7 | 86.7 | 75.4 | 113.7 | 81.03 |
+| idle2 | 116.1 | 60.4 | 57.0 | **160.3** | 77.7 | 81.0 | 72.3 | 116.3 | 79.35 |
+
+- **Paired gain:** median +3.6%. idle2 is faster in 5 of 8 sessions (+3.0 to +9.4%) and slower in three (−2.2%,
+  −11.4% and −32.2%).
+- **Pooled:** idle2 is 3.8% slower, entirely because of session 3 (`Double_BKR`). Without that session it is 2.0%
+  faster.
+- **Session 3:** the first per-session drive flag fired here, and it named a **Samsung**, not the SPCC. nvme0 ran at
+  0.54 busy s per GB, 78% above its median of 0.31, while nvme2 and nvme4 stayed at 0.32-0.33. So a drive stall is
+  not only an SPCC behaviour, and this session's −32% is a drive event rather than the feature.
+- **Session 4 (−11.4%):** no drive flag (0.33 / 0.32 / 0.34), so that loss is unexplained.
+- **The prefetch itself:**
+  - 19,273 speculative reads issued, 7,631 used, 1,876 abandoned (9.7%);
+  - 37% of used reads were still in flight at use;
+  - 6.3 wasted rows per token over the server's life.
+- **Drive bytes per session:** idle2 read ~15-20% more per drive than misscut (for example 20.97 against 18.09 GB in
+  session 1). The misscut arm shows no flag.
+
+**Verdict:** a small gain at best, not established. The median favours idle2 by 3.6%, in line with the single-arm run
+(§33.18). But the pooled figure turns on one drive-disturbed session, and one loss has no drive explanation. The flag
+showed what it was built for: a stalled session is now attributed to a drive by name. idle2 stays default off. A repeat
+should start from master (write-aware idle check) and drop or re-run any flagged session before pooling.
 
 ## Sources
 
