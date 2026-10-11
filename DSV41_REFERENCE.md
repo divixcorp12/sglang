@@ -8289,6 +8289,37 @@ that file; the CPU scorer has none). With prefetch off nothing is read and launc
 `codex/dsv41-spec-idle-drive`. The table covers target rows 1-39 (DSV4.1); another model needs floors `""`.
 `SGLANG_EXL3_CPU_MAX_M` stays unset (MAX_M 4): two A/Bs, +1.3% and -1.7%.
 
+### 33.21 The SPCC stalls on its own: settings, writers and a fio span grid (2026-10-11)
+
+Three A/Bs had one arm whose SPCC (`/mnt/nvme4`, kernel `nvme2n1`, ext4) ran 15-30% slower per GB (0.36-0.41 busy s/GB
+against ~0.31-0.32), with single sessions 80-100% slower (§33.20).
+
+- **Settings match the Samsungs** (root `nvme id-ctrl` / `get-feature`, sysfs): PS0, no APST (SPCC: unsupported;
+  990 EVO Plus: disabled), write cache on, scheduler `none`, 512 B LBAs, PCIe Gen3 x4 on node 1, 64 MiB host memory
+  buffer each (both ask for 64 MiB). Hardware differences: max transfer 256 KB (`mdts` 6) against 512 KB, 4 W against
+  6 W in PS0. SMART: no thermal events ever (warning-temperature time 0), 33 °C idle, 362 TB read / 146 TB written,
+  20% wear, no media errors. Remounted `noatime` (it was `relatime`; `/etc/fstab` already had `noatime`).
+- **Writers on the SPCC** (`codex/dsv41-drive-sessions` report): a Ray head node (up since 2026-07-14) logs to
+  `/mnt/nvme4/ray_tmp`, ~5 KB/s, with the drive at ~32 KB/s of writes at rest (ext4 journal and inodes); the `mimo-reap`
+  project keeps its venv, HF cache and outputs there and writes GB-scale bursts (3.0 GB 2026-10-11 16:35 UTC; 2.14 GB
+  05:00-05:20 UTC, 12 min before a slow arm). The bursts do not line up with the slow arms.
+- **fio span grid** (`drive-fio-20261011-170021`; read-only, O_DIRECT io_uring randread, 2.2 MB requests, QD4, 45 s,
+  spans of 1-40 row-image files = 5-205 GB, SPCC against nvme0, two passes in opposite order, rowimg-disk.lock held,
+  box idle, Ray running, SPCC writes 27-35 KB/s in every run):
+  - When normal, the SPCC matches the 990 EVO Plus at every span: 3.46-3.48 against 3.35-3.57 GB/s, p50 ~2.5 ms,
+    p99 ~3.2 ms. The 64 MiB map does not hurt even at 205 GB.
+  - **In 4 of 20 runs, all on the SPCC, it fell to 0.35-0.60x of the Samsung** (span 1 and 2 in pass 1; span 40 and 2
+    in pass 2; the same spans were fast in the other pass). p50 barely moved (2.5-3.0 ms); p99 rose to 20-25 ms. The
+    Samsung's worst p99.9 was 3.8 ms.
+  - Verdict: not span or map-cache misses, not write-driven; stall episodes, most likely the drive's own background
+    work. Microbenchmark caveat: one request size at QD4, not serving's mix.
+- **Per-session drive load** is now in the A/B driver (`codex/dsv41-drive-sessions` at `365125f5cf`,
+  `analysis/dsv41-drive/dspark/drive_sessions.py`): per session and mirror drive, GB read, busy s, busy s per GB, reads,
+  bytes per read, MB written; a session is flagged when a drive's busy s per GB is over 15% above that drive's median.
+  The drive-idle check at an arm's start counts reads only, so it cannot see a writer.
+- Remedies, in order: replace the SPCC with a third 990 EVO Plus; or, in software, cut the tail, since every row is
+  on all three drives (re-issue a late SPCC piece to a Samsung, or shift its share while its recent latency is high).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
