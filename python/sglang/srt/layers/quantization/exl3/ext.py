@@ -87,7 +87,7 @@ def cpu_act_defines() -> list[str]:
                 "unset them or set those values"
             )
         return list(OPTIMIZED_CPU_DEFINES) + _max_m_defines()
-    if envs.SGLANG_EXL3_CPU_MAX_M.get():
+    if envs.SGLANG_EXL3_CPU_MAX_M.is_set() and envs.SGLANG_EXL3_CPU_MAX_M.get():
         raise ValueError(
             "SGLANG_EXL3_CPU_MAX_M sizes the optimized EXL3 CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds; "
             "the vendored kernel keeps its own"
