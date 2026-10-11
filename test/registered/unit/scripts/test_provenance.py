@@ -136,8 +136,10 @@ def test_git_state_refuses_a_directory_outside_any_worktree(tmp_path):
 DEVICES = {"nvme0": "nvme0n1", "nvme2": "nvme2n1", "nvme4": "nvme3n1"}
 
 
-def _write_diskstats(path, sectors):
-    rows = [f"   259       0 {dev} 1 0 {sectors[name]} 0 0 0 0 0 0 0 0" for name, dev in DEVICES.items()]
+def _write_diskstats(path, sectors, written=None):
+    written = written or {}
+    rows = [f"   259       0 {dev} 1 0 {sectors[name]} 0 0 0 {written.get(name, 0)} 0 0 0 0"
+            for name, dev in DEVICES.items()]
     path.write_text("\n".join(rows) + "\n")
 
 
@@ -154,6 +156,39 @@ def test_drive_idle_check_flags_a_busy_drive(tmp_path):
     assert result["idle"] is False
     assert result["bytes_per_s"]["nvme2"] == pytest.approx(8 * 1024 * 1024)
     assert result["bytes_per_s"]["nvme0"] == 0
+    assert result["busy"] == {"read": ["nvme2"], "written": []}
+
+
+def test_drive_idle_check_flags_a_drive_being_written(tmp_path):
+    # A writer (mimo-reap's GB-scale bursts to /mnt/nvme4) reads nothing: the read limit alone never saw it.
+    stats = tmp_path / "diskstats"
+    reads, written = {"nvme0": 0, "nvme2": 0, "nvme4": 0}, {"nvme4": 0}
+    _write_diskstats(stats, reads, written)
+
+    def sleep(seconds):
+        written["nvme4"] += 8 * 1024 * 1024 // 512 * 2  # 8 MiB/s over 2 s
+        _write_diskstats(stats, reads, written)
+
+    result = prov.drive_idle_check(seconds=2.0, diskstats=str(stats), sleep=sleep, devices=DEVICES)
+    assert result["idle"] is False
+    assert result["bytes_per_s"]["nvme4"] == 0
+    assert result["written_bytes_per_s"]["nvme4"] == pytest.approx(8 * 1024 * 1024)
+    assert result["busy"] == {"read": [], "written": ["nvme4"]}
+    assert result["max_idle_written_bytes_per_s"] == prov.IDLE_MAX_WRITTEN_BYTES_PER_S
+
+
+def test_drive_idle_check_passes_the_writes_of_a_drive_at_rest(tmp_path):
+    # At rest the SPCC takes ~32 KB/s of writes (a Ray head node's logs and ext4's journal).
+    stats = tmp_path / "diskstats"
+    reads, written = {"nvme0": 0, "nvme2": 0, "nvme4": 0}, {"nvme4": 0}
+    _write_diskstats(stats, reads, written)
+
+    def sleep(seconds):
+        written["nvme4"] += 32 * 1024 // 512 * 2
+        _write_diskstats(stats, reads, written)
+
+    result = prov.drive_idle_check(seconds=2.0, diskstats=str(stats), sleep=sleep, devices=DEVICES)
+    assert result["idle"] is True and result["busy"] == {"read": [], "written": []}
 
 
 def test_drive_idle_check_reports_an_idle_drive(tmp_path):
