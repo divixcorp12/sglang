@@ -394,7 +394,18 @@ def test_the_idle_drive_arm_is_the_prefetch_miss_cut_arm_with_idle_drive_reads_a
 
 IDLE_SPREAD = "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD"
 IDLE_PIECES = "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES"
-IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", "dspark-both-prefetch-gpu-misscut-idle2")
+IDLE2_ARMS = ("dspark-both-prefetch-gpu-misscut-idle2", "dspark-both-prefetch-gpu-misscut-idle2-floors")
+IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", *IDLE2_ARMS)
+
+
+def test_the_idle2_floors_arm_is_the_idle2_arm_with_the_packaged_margin_floors_alone():
+    ab = _ab()
+    floors = "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"
+    i, f = ab.ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut-idle2-floors"][0]
+    assert (i[floors], f[floors]) == ("", ab.MARGIN_FLOORS)
+    assert {k: v for k, v in f.items() if k != floors} == {k: v for k, v in i.items() if k != floors}
+    assert ab.ARMS["dspark-both-prefetch-gpu-misscut-idle2-floors"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut-idle2-floors"] == "dspark-both-misscut"
 
 
 def test_the_idle2_arm_is_the_idle_arm_with_spread_ties_and_two_pieces_against_the_miss_cut_arm():
@@ -416,7 +427,7 @@ def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(mon
     monkeypatch.setenv(IDLE_PIECES, "3")
     for arm in ab.ARMS:
         want = ("1" if arm in IDLE_ARMS else "0", "4000")
-        knobs = ("1", "2") if arm == "dspark-both-prefetch-gpu-misscut-idle2" else ("0", "1")
+        knobs = ("1", "2") if arm in IDLE2_ARMS else ("0", "1")
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert (overrides[IDLE], overrides[IDLE_DEADLINE]) == want, arm
             assert (overrides[IDLE_SPREAD], overrides[IDLE_PIECES]) == knobs, arm
