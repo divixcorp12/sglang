@@ -363,7 +363,7 @@ def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkey
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX", "5")
     for arm in ab.ARMS:
-        want = MISS_CUT if arm.endswith("-misscut") else {
+        want = MISS_CUT if "-misscut" in arm else {
             "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert {k: overrides[k] for k in want} == want, arm
