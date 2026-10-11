@@ -22,6 +22,7 @@
 #include "stream_wait.h"
 #include "tensor_checks.h"
 #include <algorithm>
+#include <cuda/ptx>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -51,10 +52,9 @@ struct PostParams {
   float* weights_dst;      // pinned: [kMaxRows, kMaxK], its weight, 0 for a -1 slot
 };
 
+// The device's global timer in nanoseconds, as lease_device.cuh's global_ns reads it (no inline PTX).
 SGL_DEVICE uint64_t global_ns() {
-  uint64_t ns;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
-  return ns;
+  return cuda::ptx::get_sreg_globaltimer();
 }
 
 __global__ void draft_clock_kernel(int64_t* out) {
