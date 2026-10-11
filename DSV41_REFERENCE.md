@@ -8436,6 +8436,84 @@ read competes with the demand reads on the same three drives.
 - repeat idle2 from master, with the write-aware idle check and flagged sessions re-run;
 - then idle2 with floors.
 
+### 33.23 What drive stalls cost: throughput little, A/B verdicts a lot (2026-10-11)
+
+This is a read-only pass over every completed DSpark A/B from 2026-10-08 to 10-11: 20 A/B directories, 34 arm runs
+after removing runs shared by several A/Bs, 272 timed sessions. Report, scripts and per-session tables:
+`divix01:/data/models/slang/nvfp4-work/stall-cost/` (`REPORT.md`).
+
+The question was whether replacing the SPCC, or re-sending a late row piece to another mirror drive, is worth doing.
+
+**Method.**
+- A session is judged by its **decode step time**, `(total - ttft) / spec_verify_ct`, not by ms/token. ms/token also
+  moves with accept length, which changes with the generated text.
+- Each session's own median step time over all 34 runs is tight: 1.4-3.7% median absolute deviation.
+- A session counts as **disturbed** when its step time is above 1.20x its own median.
+- The ratios have a gap between 1.14 and 1.26, so thresholds of 1.15, 1.20 and 1.25 all flag the same 9 sessions.
+
+**Frequency.** 9 of 272 sessions are disturbed (3.3%; Poisson 95% CI about 1.5-6.3%). They touch 6 of 34 arm runs.
+Another 4 sessions are slowed in prefill only.
+
+Stalls come in episodes: 4 of the 6 affected arm runs have 2-4 consecutive disturbed sessions.
+
+| Cause | Sessions | Evidence |
+|---|---:|---|
+| SPCC (`nvme4`) | 4 (3 firm, 1 probable) | Lifetime SPCC busy s per GB 1.16-1.33x the Samsungs' (normal 1.03-1.05) |
+| Samsung `nvme0` | 1 | idle2 rerun session 3, the mildest at 1.26x; per-session `io_ticks` (§33.22) |
+| Unattributed | 4 | All from 2026-10-08/09, before the drive-load log line existed; same signature as the SPCC episodes |
+| CPU contention | 0 | Loadavg, kcompactd and compilers show no association |
+
+**The SPCC stalls more often than it does damage.** It ran at 1.13x or more over the Samsungs in 10 of 26 logged
+arm lifetimes. Only 3-4 of those hurt a timed session; the rest fell in warm-up or the probe.
+
+**Cost.** Pooled mean is 89.58 and median 79.78 ms/token. The 9 sessions hold 40.5 s of excess decode out of 1,450 s.
+
+| Perfect fix | Mean ms/token saved | Median saved |
+|---|---:|---:|
+| Replace the SPCC (attributed SPCC stalls only) | 0.9% | 0.1% |
+| Replace the SPCC (if the 4 unattributed were also the SPCC) | 2.1% | 0.2% |
+| Re-send late pieces to another mirror (any single-drive stall) | 2.2% | 0.2% |
+
+Prefill pays a further 1.4% of TTFT. The re-send figure is an upper bound: a real re-send pays for extra reads and
+only reacts after a deadline.
+
+**The real cost is A/B noise.** In 4 of 34 arm runs (12%), stalls raised the arm's 8-session median by 10-30%:
+
+| Arm run | Median raised by | Cause |
+|---|---:|---|
+| `ab-20261008-223431` `dspark-both` | 28% | unattributed |
+| `ab-gpu-20261009-040647` `prefetch-gpu` | 11% | unattributed |
+| `ab-idle-drive` `misscut` | 18% | SPCC |
+| `ab-spcc13-rep` `twostage-spcc13` | 30% | SPCC |
+
+That is enough to flip a verdict. The idle-drive and spcc13-rep outliers were already set aside by hand in §33.18 and
+§33.20.
+
+**Limits.**
+- n is 9, so the bounds are good to about ±50-100% relative.
+- Only one session has per-session drive busy time. The rest rely on lifetime figures, which include warm-up.
+- Sectors read per session cannot name a stalled drive, because every row splits exactly into thirds.
+- Sessions are short (7-128 tokens), so one stall of a few seconds doubles a session. The gain would shrink for long
+  generations.
+
+**Decision.** Neither fix is worth it for throughput. For A/B reliability:
+- **First, free:** re-run or drop any session the per-session `drive_flags` (`both_cpu_ab.py`, §33.22) mark before
+  pooling.
+- **Then, if re-runs prove frequent:** replace the SPCC.
+- **Do not build the re-send** unless production tail latency comes to matter.
+
+**Side finding: two ms/token definitions.** `summary.json`'s `ms_per_token` is `1000 / decode_tokens_per_sec` from
+`results.jsonl`. The runner (`run_capture_sessions.py`) times decode from the first to the **last content chunk** of
+the stream.
+
+In 26 of 336 session rows the stream ends 350-430 ms after the last content chunk, about one verify step. That is
+presumably a final step that emits only the stop token. The runner therefore leaves that step out, by up to
+10 ms/token on 37-53-token sessions.
+
+The rows affected are always the same sessions (VLO, K, ETR) in every A/B. So both arms of a pair carry the same
+bias, and paired verdicts are unaffected. The metric is left as is: changing it would break comparison with every
+earlier result.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
