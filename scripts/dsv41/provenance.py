@@ -176,6 +176,50 @@ def read_sectors(path: str = "/proc/diskstats", devices: dict | None = None) -> 
     return out
 
 
+# /proc/diskstats columns after major, minor and name (Documentation/admin-guide/iostats.rst): what a session's
+# drive load is derived from. io_ticks is the time the device had any request in flight; time_in_queue integrates
+# the in-flight count over time.
+DRIVE_COUNTER_FIELDS = {
+    "reads": 0, "sectors_read": 2, "writes": 4, "sectors_written": 6, "io_ticks_ms": 9, "time_in_queue_ms": 10,
+}  # fmt: skip
+
+
+def read_drive_counters(path: str = "/proc/diskstats", devices: dict | None = None) -> dict:
+    """{label: {"device", reads, sectors_read, writes, sectors_written, io_ticks_ms, time_in_queue_ms}}, cumulative.
+
+    ``devices`` maps label -> block device name (the partition, from resolve_devices); the row is matched by its
+    exact name, so the whole disk's row never stands in for it."""
+    devices = resolve_devices() if devices is None else devices
+    wanted = {device: name for name, device in devices.items()}
+    out = {}
+    with open(path) as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) >= 14 and fields[2] in wanted:
+                values = fields[3:]
+                out[wanted[fields[2]]] = {
+                    "device": fields[2], **{k: int(values[i]) for k, i in DRIVE_COUNTER_FIELDS.items()}
+                }
+    missing = sorted(set(devices) - set(out))
+    if missing:
+        raise ValueError(f"no {path} row for {[devices[label] for label in missing]} (labels {missing})")
+    return out
+
+
+def drive_sample(diskstats: str = "/proc/diskstats", devices: dict | None = None) -> dict:
+    """The mirror drives' counters at one session or warm-up boundary, with no CPU sampling (it brackets a session
+    tightly). Never raises: counters that cannot be read are None with the reason, and the arm goes on."""
+    import time
+
+    out = {"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "monotonic": time.monotonic()}
+    try:
+        out["drive_counters"] = read_drive_counters(diskstats, devices)
+    except Exception as e:
+        out["drive_counters"] = None
+        out["drive_counters_unavailable"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def drive_idle_check(
     seconds: float = 2.0, diskstats: str = "/proc/diskstats", sleep=None, devices: dict | None = None
 ) -> dict:

@@ -25,7 +25,9 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
+sys.path.insert(0, HERE)
 import arm_env  # noqa: E402
+import drive_sessions  # noqa: E402
 import run_locks  # noqa: E402
 
 PORT = 30017
@@ -261,6 +263,16 @@ def _warmup_tokens(out: str, arm: str) -> list[int]:
     return tokens
 
 
+def _drive_load(out: str, arm: str) -> dict:
+    """The arm's per-session drive load from its timed run's boundary samples (drive_sessions.py)."""
+    runs = sorted(os.listdir(os.path.join(out, "servers", arm)))
+    path = os.path.join(out, "servers", arm, runs[-1], "boundary-samples.jsonl")
+    if not os.path.exists(path):
+        return {"warmup": None, "sessions": [], "notes": [f"no {path}"]}
+    with open(path) as f:
+        return drive_sessions.session_drive_load([json.loads(line) for line in f if line.strip()])
+
+
 def _compare(base_path: str, other_path: str):
     sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
     import dspark_text_band
@@ -331,7 +343,12 @@ def summarize(out: str) -> dict:
             if paired:
                 entry["paired_gain_pct_vs_reference"] = paired
                 entry["paired_gain_pct_median"] = statistics.median(paired.values())
+        entry["drives_per_session"] = _drive_load(out, arm)
         summary[arm] = entry
+    # Flagged against each drive's median over every arm's sessions, so a drive slow in one arm stands out.
+    flags = drive_sessions.flag_sessions({arm: entry["drives_per_session"] for arm, entry in summary.items()})
+    for arm, entry in summary.items():
+        entry["drive_flags"] = flags[arm]
     baseline = os.path.join(out, "baseline.json")
     if os.path.exists(baseline):
         with open(baseline) as f:
@@ -385,7 +402,10 @@ def main():
             print(f"{arm} {step.__name__}: rc={rc}", flush=True)
             if rc:
                 sys.exit(rc)
-    print(json.dumps(summarize(out), indent=2), flush=True)
+    summary = summarize(out)
+    loads = {arm: entry["drives_per_session"] for arm, entry in summary.items()}
+    print(drive_sessions.format_table(loads, {arm: entry["drive_flags"] for arm, entry in summary.items()}), flush=True)
+    print(json.dumps(summary, indent=2), flush=True)
 
 
 if __name__ == "__main__":

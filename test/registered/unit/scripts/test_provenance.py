@@ -207,6 +207,40 @@ def test_reading_sectors_for_a_device_missing_from_diskstats_raises(tmp_path):
         prov.read_sectors(str(stats), devices={**DEVICES, "nvme9": "nvme9n1"})
 
 
+def test_drive_counters_come_from_the_partition_row_the_mount_resolves_to(tmp_path):
+    drives, roots = _fake_trees(tmp_path, device_name="nvme7n1p1")
+    stats = tmp_path / "proc" / "diskstats"
+    # The whole-disk row carries different numbers; a name-prefix match would read it instead.
+    row = stats.read_text().split()
+    stats.write_text(
+        f"{row[0]} 999 nvme7n1 900 0 9000 0 90 0 900 0 0 9999 99999 0 0 0 0\n"
+        f"{row[0]} {row[1]} nvme7n1p1 10 1 2048 7 3 0 64 5 0 1500 4000 0 0 0 0\n"
+    )
+    devices = prov.resolve_devices(drives, **roots)
+    assert devices == {"nvme4": "nvme7n1p1"}
+    out = prov.read_drive_counters(str(stats), devices=devices)
+    assert out == {"nvme4": {"device": "nvme7n1p1", "reads": 10, "sectors_read": 2048, "writes": 3,
+                             "sectors_written": 64, "io_ticks_ms": 1500, "time_in_queue_ms": 4000}}  # fmt: skip
+
+
+def test_drive_counters_for_a_device_missing_from_diskstats_raise(tmp_path):
+    stats = tmp_path / "diskstats"
+    _write_diskstats(stats, {"nvme0": 1, "nvme2": 2, "nvme4": 3})
+    with pytest.raises(ValueError, match="nvme9n1"):
+        prov.read_drive_counters(str(stats), devices={**DEVICES, "nvme9": "nvme9n1"})
+
+
+def test_a_drive_sample_that_cannot_read_its_counters_says_why_and_does_not_raise(tmp_path):
+    out = prov.drive_sample(diskstats=str(tmp_path / "missing"), devices=DEVICES)
+    assert out["drive_counters"] is None and "FileNotFoundError" in out["drive_counters_unavailable"]
+    assert {"utc", "monotonic"} <= set(out)
+    stats = tmp_path / "diskstats"
+    _write_diskstats(stats, {"nvme0": 1, "nvme2": 2, "nvme4": 3})
+    out = prov.drive_sample(diskstats=str(stats), devices=DEVICES)
+    assert out["drive_counters"]["nvme4"]["sectors_read"] == 3 and "drive_counters_unavailable" not in out
+    json.dumps(out)
+
+
 def test_capture_records_the_imported_sglang_and_its_worktree():
     import sglang
 
