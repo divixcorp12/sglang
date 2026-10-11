@@ -348,6 +348,16 @@ def test_the_weights_arm_is_the_miss_cut_arm_with_the_mirror_weighted_by_drive_s
     assert ab.REFERENCE["dspark-both-weights-misscut"] == "dspark-both-misscut"
 
 
+def test_the_max_m8_arm_is_the_miss_cut_arm_with_four_tokens_per_cpu_chunk():
+    ab = _ab()
+    a, m = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-misscut-maxm8"][0]
+    assert m["SGLANG_EXL3_CPU_MAX_M"] == "8"  # CHUNK_M 4: an expert shared by up to 4 tokens decodes its weights once
+    assert {k: v for k, v in m.items() if k != "SGLANG_EXL3_CPU_MAX_M"} == {
+        k: v for k, v in a.items() if k != "SGLANG_EXL3_CPU_MAX_M"}
+    assert ab.ARMS["dspark-both-misscut-maxm8"][1] is True
+    assert ab.REFERENCE["dspark-both-misscut-maxm8"] == "dspark-both-misscut"
+
+
 def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
