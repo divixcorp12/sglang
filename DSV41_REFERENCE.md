@@ -8238,6 +8238,27 @@ thirds). Other rows keep the thirds. Reference `dspark-both-misscut`.
 - Caveat: rests mainly on the same-stream ordering; the traces are short and predate two-stage. Revisit if the draft
   moves to its own stream or overlaps the next verify.
 
+**`SGLANG_EXL3_CPU_MAX_M=8` in the server (A/B `ab-maxm8-20261010-215918`, `codex/dsv41-ram-prefetch-margin` at
+`8e4046693a`, arm `dspark-both-misscut-maxm8` run first, reference `dspark-both-misscut`).** CHUNK_M 4 in place of 2,
+so an expert shared by 3-4 verify tokens decodes its weights once. Checked from the server log: the arm loaded
+`exl3-build/resid_b128_m8_cpu_v1` (sha256 `bb4dcecbfd7c`), the reference `resid_b128_cpu_v1` (`be4c6818e708`).
+
+| Session (driver order) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Median |
+|---|---|---|---|---|---|---|---|---|---|
+| misscut, ms/token | 111.2 | 58.2 | 57.5 | 132.5 | 73.0 | 79.6 | 73.3 | 111.9 | 76.4 |
+| maxm8, ms/token | 121.8 | 60.8 | 52.8 | 125.7 | 66.1 | 79.2 | 73.2 | 109.5 | 76.2 |
+
+- Paired median: maxm8 **1.3% faster**, 6 of 8 sessions (BKR +5.2, CDW -9.5, DISCA +0.5, ETR -4.5, TSCO +8.2, VLO +2.2,
+  WRK +0.1, K +9.5). Text check passed.
+- **Confound, favouring the arm:** accept length 3.67 (maxm8) vs 3.54, worth ~3.5% per token, more than the gain.
+- **The CPU side is clearly faster:** ms per lane at stop, group 0 / 1: 0.695 / 0.655 (misscut) -> 0.624 / 0.591
+  (maxm8), **-10%**, as the bench predicted for the server's ~2-token lanes.
+- Drive busy s per GB unchanged (0.305 / 0.319 / 0.310 vs 0.306 / 0.321 / 0.310).
+- Reading: a real 10% cut in CPU expert time that does not show end to end within this A/B's resolution. The CPU split
+  table (`split [...]` in the stats line) is the same in both arms: it was calibrated at the old per-lane cost, so the
+  faster CPU only finishes earlier, it is not given more lanes. Recalibrating the split at MAX_M=8 is what could turn
+  the 10% into wall-clock.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
