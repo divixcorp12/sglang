@@ -32,9 +32,11 @@ namespace expert_stream {
 //     (nop_flush_refused, implied by ring_reset_fail), the failure-path drain's ring reset throws "io_uring ring reset
 //     failed" and read() must rethrow it, not abort.
 //
-// Per-extent faults hit the first completion of an extent of part `part` (-1: none), whichever row it is in and however
-// the kernel orders completions. part_error replaces its result with -errno; part_short makes it report at most that
-// many bytes (a block multiple). They are narrowed by:
+// Per-extent faults hit the first completion of an extent of part `part` (-1: any part), or of root `root` (-1: any
+// root), whichever row it is in and however the kernel orders completions; at least one of the two must be set. The
+// part is the descriptor's part slot; the root is the drive the sub-read actually reads (file % parts), which differs
+// from the part slot once SGLANG_MOE_EXPERT_MIRROR_DYNAMIC has moved it. part_error replaces its result with -errno;
+// part_short makes it report at most that many bytes (a block multiple). They are narrowed by:
 //   - ordinal: the row with that index in the request (-1: any);
 //   - sub: the sub-read with that index within its part, piece streaming only (-1: any; without piece streaming every
 //     extent is sub 0);
@@ -96,6 +98,7 @@ struct ReadFault {
   int64_t leg = -1;
   bool ring_reset_fail = false;
   bool nop_flush_refused = false;
+  int64_t root = -1;
 };
 
 // The fault tensor of the test entry points: kFaultWords int64 words, in the order of _fault_tensor in
@@ -107,7 +110,9 @@ struct ReadFault {
 //   17     abandon_after (not a reader fault): the entry point's abandon callback says stop once that many batches were
 //          admitted (0: never)
 //   18     step (not a fault): rows per batch of the faulted call (0: kBounceRows)
-//   19-20  reserved, ignored
+//   19     root + 1 (0: any root): narrows the per-extent faults to a drive
+//   20     mirror caps (not a fault): bits 0-7 the count n (0: dynamic root choice off), then cap q in bits 8(q+1)..
+//          8(q+1)+7 for q < n; the entry point passes them to ReaderCore::set_mirror_caps before reading
 //   21     hold_rest
 //   22     piece_stream (not a fault): turns piece streaming on before the reader opens
 //   23-25  sub, publish_twice, short_is_eof
@@ -148,12 +153,13 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.leg = f[29];
   fault.nop_flush_refused = (f[30] & 1) != 0;
   fault.ring_reset_fail = (f[30] & 2) != 0;
+  fault.root = f[19] - 1;
   return fault;
 }
 
 // Whether fault words `f` inject a fault, i.e. set a word that arms one. Words that only narrow a fault (the call
-// numbers, part, ordinal, sub, leg, submit_first, short_is_eof, hold_rest) arm nothing alone, and words 17-20, 22, 26,
-// 28 and 31 are not faults. A production host has no fault state and refuses a tensor for which this is true
+// numbers, part, root, ordinal, sub, leg, submit_first, short_is_eof, hold_rest) arm nothing alone, and words 17-18,
+// 20, 22, 26, 28 and 31 are not faults. A production host has no fault state and refuses a tensor for which this is true
 // (HostTestExports::install_fault); it needs no ReadFault to decide.
 inline bool injects_fault(const int64_t* f) {
   return f[0] != 0 || f[3] != 0 || f[6] != 0 || f[7] != 0 || f[8] != 0 || f[9] > 0 || f[10] > 0 || f[11] != 0 ||
@@ -165,6 +171,15 @@ template <ExpertRowLayout Layout>
 inline void check_fault_words(TensorView fault) {
   if (fault.size(0) != kFaultWords)
     throw std::runtime_error(error_prefix<Layout>() + "the fault tensor has the wrong length");
+}
+
+// The mirror caps of fault word 20 (see kFaultWords), empty when the word turns the dynamic root choice off.
+inline std::vector<int64_t> mirror_caps_of(const int64_t* f) {
+  const int64_t n = f[20] & 0xFF;
+  std::vector<int64_t> caps;
+  for (int64_t q = 0; q < n; ++q)
+    caps.push_back((f[20] >> (8 * (q + 1))) & 0xFF);
+  return caps;
 }
 
 // The entry points' abandon callback: stops once `after` batches were admitted (0: never).

@@ -45,16 +45,17 @@ def x_token_bytes() -> int:
 
 
 def prefetch_rig(
-    tmp_path, *, nodes=1, capacity=None, staging=None, share=2, pool=True, tokens=1, hot=False, rows=ROWS
+    tmp_path, *, nodes=1, capacity=None, staging=None, share=2, pool=True, tokens=1, hot=False, rows=ROWS,
+    mirror_weights=None,
 ) -> PrefetchRig:
     """One node: 7 slots a row, 3 staging, `share` pooled, 6 experts. Two nodes: 8 slots split by HALVES, 1 staging and
     `share` pooled per group, 8 experts. CPU experts on every group (one fake-kernel worker each), every row
     registered, split[n] = n so every eligible lane is the CPU's; rows of `tokens` staged inputs; with `hot`, a GPU hot
-    page; `rows` streamed rows."""
+    page; `rows` streamed rows; `mirror_weights` one weight per mirror root (one root when None)."""
     experts = 6 if nodes == 1 else 8
     capacity = (7 if nodes == 1 else 8) if capacity is None else capacity
     staging = (3 if nodes == 1 else 1) if staging is None else staging
-    s = ram_miss_setup(tmp_path, capacity=capacity, experts=experts, layers=rows)
+    s = ram_miss_setup(tmp_path, capacity=capacity, experts=experts, layers=rows, mirror_weights=mirror_weights)
     page = new_page(pin=False, wire=wire_layout(LANES, nodes))
     host = ExpertStreamHost(
         s.tables,
@@ -128,8 +129,21 @@ def gate(logits) -> tuple[torch.Tensor, torch.Tensor]:
     return w, torch.zeros((1, experts), dtype=torch.float32)
 
 
-def enable(rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores=None, top_k_only=False) -> None:
-    """Row 0 targets row 1 with `logits`' gate; every later row targets nothing."""
+def enable(
+    rig: PrefetchRig,
+    logits,
+    *,
+    top_k=2,
+    per_token=1,
+    per_layer=1,
+    cores=None,
+    top_k_only=False,
+    idle_deadline_s=None,
+    idle_spread=False,
+    idle_pieces=1,
+) -> None:
+    """Row 0 targets row 1 with `logits`' gate; every later row targets nothing. `idle_deadline_s`: idle-drive
+    speculative reads with that deadline, `idle_spread` and `idle_pieces` (None: the shared reader)."""
     w, bias = gate(logits)
     targets = torch.tensor([[1, 0]] + [[-1, -1]] * (rig.x_rows.shape[0] - 1), dtype=torch.int64)
     rig.host.enable_ram_prefetch(
@@ -141,6 +155,16 @@ def enable(rig: PrefetchRig, logits, *, top_k=2, per_token=1, per_layer=1, cores
         per_layer=per_layer,
         cores=cores if cores is not None else [[] for _ in range(rig.host.nodes)],
         top_k_only=top_k_only,
+        **(
+            {}
+            if idle_deadline_s is None
+            else {
+                "idle_drive": True,
+                "idle_deadline_s": idle_deadline_s,
+                "idle_spread": idle_spread,
+                "idle_pieces": idle_pieces,
+            }
+        ),
     )
 
 

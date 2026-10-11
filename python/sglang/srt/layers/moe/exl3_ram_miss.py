@@ -50,7 +50,7 @@ from sglang.srt.layers.moe.exl3_expert_format import (
     RowSegment,
 )
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
-from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
+from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy, mirror_caps
 from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
@@ -1107,6 +1107,20 @@ class Exl3RamMissService:
             sq_thread_cpus=[-1 if p.sq is None else p.sq for p in numa.plans],
         )
         try:
+            # SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (validated at launch): before the thread
+            # starts, every group's reader picks each sub-read's root under these caps.
+            caps = mirror_caps(
+                envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get(),
+                envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get(),
+                envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get(),
+            )
+            if caps is not None:
+                host.set_mirror_caps(caps)
+            logger.info(
+                "exl3 RAM miss mirror roots: %s",
+                "static split" if caps is None
+                else "dynamic, in-flight caps " + ",".join(str(c) for c in caps),
+            )
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
             host.reserve_staging(self.staging_width())
@@ -1323,6 +1337,12 @@ class Exl3RamMissService:
         hidden = cpu_experts.services[0].hidden
         cores = [list(plan.spec) for plan in numa.plans]
         floors = margin_floors_path(scorer)
+        idle = dict(
+            idle_drive=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get(),
+            idle_deadline_s=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() / 1e6,
+            idle_spread=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get(),
+            idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
+        )
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
             candidates = new_candidate_page(pin=pin)
@@ -1338,6 +1358,7 @@ class Exl3RamMissService:
                 top_k_only=top_k_only,
                 candidates=candidates,
                 min_margin=min_margin,
+                **idle,
             )
             targets, result = picked.targets, GpuScorer(picked, candidates, per_token, top_k_only)
         else:
@@ -1353,11 +1374,12 @@ class Exl3RamMissService:
                 per_layer=per_layer,
                 cores=cores,
                 top_k_only=top_k_only,
+                **idle,
             )
             targets, result = tables.targets, None
         logger.info(
             "exl3 RAM miss prefetch: %d of %d rows target the next layer, %s scorer, %d per token, %d per layer%s, "
-            "cores %s",
+            "cores %s, %s",
             int((targets[:, 0] >= 0).sum()),
             len(layer_ids),
             scorer.upper(),
@@ -1365,6 +1387,13 @@ class Exl3RamMissService:
             per_layer,
             (", predicted top-k only" if top_k_only else "") + f", margin floors {floors or 'none'}",
             [plan.spec for plan in numa.plans],
+            (
+                f"idle-drive reads (own reader per group, deadline {idle['idle_deadline_s'] * 1e3:g} ms, "
+                f"{'spread ties' if idle['idle_spread'] else 'row on one drive'}, "
+                f"{idle['idle_pieces']} piece{'s' if idle['idle_pieces'] > 1 else ''} in flight)"
+                if idle["idle_drive"]
+                else "shared reader (turns with demand)"
+            ),
         )
         return result
 

@@ -34,6 +34,42 @@ struct NoProgress {
   void operator()() const {}
 };
 
+// read()'s default root policy: every sub-read reads the root its table (or the dynamic choice, set_mirror_caps) gives
+// it, and as many go in flight as credit allows. A distinct type, so read() compiles the gated paths out.
+struct TableRoots {
+  static constexpr bool kGated = false;
+};
+
+// A speculative read's root policy (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE; design 2026-10-09-dsv41-drive-aware-reads,
+// change (2)), passed to read() by the speculative reader. The row reads one piece at a time, all from one root
+// with no demand sub-read in flight on any reader of the drive load: the first piece picks the demand-free root with
+// the fewest bytes in flight, and each later piece rechecks it and moves to another demand-free root when demand
+// arrived. With none demand-free the piece waits ("defers") without a ring wait; waiting past `deadline_ns`, or
+// `give_up` saying so, abandons the read (read() returns 0, `abandoned` set). `boost` set (a forced miss waits on
+// this row) drops all of that for the rest of the row: its pieces read their table roots, as many as credit allows.
+// Needs the mirror file map (set_mirror_map).
+//
+// `spread` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) drops the row's root: every piece takes the demand-free root with
+// the fewest bytes in flight, a tie going to the first root from the one after the row's previous piece (the row's
+// first piece: from the reader's rotating start, one root further per read), so idle drives share the rows rather
+// than the lowest-numbered one taking them all. `max_inflight` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES) lets that many
+// pieces be in flight at once, each gated as the first.
+struct IdleRoots {
+  static constexpr bool kGated = true;
+  const std::atomic<uint32_t>* boost = nullptr;  // nonzero: boosted (null: never)
+  int64_t deadline_ns = 0;                       // the longest wait for an idle root
+  bool spread = false;                           // spread ties over the idle roots, no root kept for the row
+  int max_inflight = 1;                          // the row's pieces in flight at once (unboosted)
+  bool (*give_up)(void*) = nullptr;              // true abandons the read before its next piece (null: never)
+  void (*on_piece)(void*, int root) = nullptr;   // after each piece is prepared (null: nothing)
+  void* context = nullptr;                       // give_up's and on_piece's argument
+  // What the read did, for the caller's counters.
+  int64_t deferrals = 0;  // waits for an idle root (one per wait, however long)
+  int64_t moves = 0;      // pieces sent to another root than the row's earlier pieces
+  bool boosted = false;
+  bool abandoned = false;
+};
+
 // Test only: one prepared SQE, as ReaderCore::set_sqe_log records it.
 struct SqeRecord {
   int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
@@ -146,6 +182,40 @@ class ReaderCore {
   // for its one read and clears it, on the thread that holds the reader. Call it on an idle reader.
   void set_read_kind(int kind) {
     kind_ = kind;
+  }
+
+  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (design 2026-10-09-dsv41-drive-aware-reads, change (3)): `caps`, one positive
+  // in-flight cap per mirror root, turns the dynamic root choice on (choose_root); empty turns it off, and the reader
+  // then reads every sub-read from its own root, as before. Piece streaming only (set it first). Builds the mirror file
+  // map (set_mirror_map). Call it on an idle reader.
+  void set_mirror_caps(std::span<const int64_t> caps) {
+    const std::string prefix = error_prefix<Layout>() + "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC: ";
+    if (caps.empty()) {
+      dynamic_ = false;
+      alt_file_.clear();
+      return;
+    }
+    const int64_t parts = t_.parts;
+    if (static_cast<int64_t>(caps.size()) != parts) {
+      throw std::runtime_error(
+          prefix + "needs one in-flight cap per mirror root: " + std::to_string(caps.size()) + " caps for " +
+          std::to_string(parts) + " mirror roots");
+    }
+    for (int64_t cap : caps)
+      if (cap < 1) throw std::runtime_error(prefix + "every in-flight cap must be positive, got " + std::to_string(cap));
+    build_mirror_map(prefix);
+    for (int64_t q = 0; q < parts; ++q)
+      caps_[q] = caps[static_cast<size_t>(q)];
+    dynamic_ = true;
+  }
+
+  // Builds the mirror file map a sub-read needs to read another root's copy: the dynamic choice (set_mirror_caps) and
+  // the speculative reader's IdleRoots. Every root holds every row's image at the same offsets, so a sub-read can read
+  // any root's file of its row; this refuses the tables when any row's files are not a full mirror set (the same source
+  // and size on every root, the root being file % parts). Piece streaming only (set it first). Call it on an idle
+  // reader.
+  void set_mirror_map() {
+    build_mirror_map(error_prefix<Layout>() + "the mirror file map: ");
   }
 
   // Test only: the sub-reads this reader counts in flight now, its share of the DriveLoad (0 between reads).
@@ -413,6 +483,9 @@ class ReaderCore {
   //                     (retire_leases()) while a read is in flight, as `abandon` is how it decides when to stop
   //                     admitting. NoProgress compiles to nothing.
   //   publish           piece streaming only: where the owner publishes each piece (PiecePublish).
+  //   roots             the root policy: TableRoots (the default, every demand read), or a speculative read's IdleRoots
+  //                     (piece streaming and set_mirror_map only), which reads one piece at a time from a root no
+  //                     demand reads, waits for one, and returns 0 with `roots.abandoned` set when it gives up.
   //
   // `abandon` and `progress` are template parameters, not std::function: a closure past std::function's local storage
   // would be heap-allocated per read. `experts` and `slots` are spans, so the service passes its fixed-size lists
@@ -420,7 +493,7 @@ class ReaderCore {
   //
   // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in range and
   // `experts.size() == slots.size()`. The service and read_rows_once (Python) validate at their boundaries.
-  template <class Abandon, class Progress = NoProgress>
+  template <class Abandon, class Progress = NoProgress, class RootPolicy = TableRoots>
   int read(
       int64_t layer,
       std::span<const int32_t> experts,
@@ -431,8 +504,13 @@ class ReaderCore {
       std::vector<uint8_t>* packed = nullptr,
       size_t max_reading_rows = SIZE_MAX,
       Progress&& progress = Progress{},
-      const PiecePublish* publish = nullptr) {
+      const PiecePublish* publish = nullptr,
+      RootPolicy&& roots = RootPolicy{}) {
     if (!io_.ready()) return 0;
+    if constexpr (std::decay_t<RootPolicy>::kGated) {
+      if (!piece_stream_ || alt_file_.empty())
+        throw std::logic_error(error_prefix<Layout>() + "a gated read needs piece streaming and the mirror file map");
+    }
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
     c = Call{};
@@ -443,6 +521,12 @@ class ReaderCore {
     c.total = experts.size();
     c.batches = (c.total + step - 1) / step;
     c.max_reading = std::max<size_t>(1, max_reading_rows);
+    if constexpr (std::decay_t<RootPolicy>::kGated) {
+      if (roots.spread) {
+        c.spread_start = spread_next_;
+        spread_next_ = (spread_next_ + 1) % static_cast<int>(t_.parts);
+      }
+    }
     // Credit is the ring's alone: banks and rows in flight do not enter it.
     c.capacity = queue_depth();
     if constexpr (Build::kFaults) {
@@ -495,10 +579,19 @@ class ReaderCore {
       if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) progress();
       derived().collect();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
-      if (!c.failed) refill();
+      if (!c.failed) refill(roots);
       if (c.failed) break;
       const bool ready = has_ready();
-      if (c.pending == 0 && !ready && held_empty() && c.packing == 0) break;
+      if (c.pending == 0 && !ready && held_empty() && c.packing == 0) {
+        if constexpr (std::decay_t<RootPolicy>::kGated) {
+          // A piece waits for an idle root (refill deferred it) with nothing in flight: no ring wait, poll again.
+          if (c.queue_count > 0) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(kDeferSleepNs));
+            continue;
+          }
+        }
+        break;
+      }
       // Submit what was prepared before packing, so storage stays busy while the CPU copies; block for a completion
       // only when there is no complete row to pack. With jobs packing on workers the owner cannot be woken from a
       // blocking wait when one finishes, so it polls instead. The slow-drive fault's withheld completions arrive only
@@ -571,6 +664,7 @@ class ReaderCore {
   static constexpr int kMaxRetries = 8;               // resubmissions of one descriptor before the read fails
   static constexpr uint8_t kPoisonFill = 0xA5;        // the `poison` fault's bounce-slot fill
   static constexpr int32_t kPoisonSlot = 0x7EADBEEF;  // the `poison` fault's scribble over a retired descriptor's slot
+  static constexpr int64_t kDeferSleepNs = 10'000;    // IdleRoots: a deferred read's poll interval
 
   // A bounce row's life: Free, then Reading until its last extent retires, then Ready to pack. Packing means handed to
   // a packing worker, which owns the copy until the owner sees its job done.
@@ -699,6 +793,10 @@ class ReaderCore {
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
     int64_t events = 0;    // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
     size_t published = 0;  // piece streaming: pieces published so far (the last_publish_delay_ns fault)
+    int reads_inflight = 0;      // sub-reads with a leg in flight (count_drive)
+    int gate_root = -1;          // IdleRoots: the root the row's last piece read (-1: none yet)
+    int spread_start = 0;        // IdleRoots::spread: where the row's first piece's tie-break starts
+    int64_t deferred_since = 0;  // IdleRoots: when the piece at the queue head began waiting for an idle root (0: not)
   };
 
   // Runs `f` on this read's stage record, if it has one. ProdBuild compiles every call to nothing.
@@ -1174,9 +1272,8 @@ class ReaderCore {
       ++bank_live_[bank];
       queue_push(index);
       on_trace([&](StageRecord& t) {
-        const size_t drive = file_drive_[extent->file];
-        t.drive_dev[drive] = drive_dev_[drive];
-        t.drive_extents[drive] += 1;
+        // With the dynamic root choice the file is decided later, at first preparation, and counted there.
+        if (!dynamic_) count_drive_extent(t, extent->file);
         const int64_t trace_slot = t.extents++;
         if (trace_slot < kTraceExtents) {
           t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
@@ -1254,24 +1351,47 @@ class ReaderCore {
   // fixed read issues one SQE per leg. A descriptor's Idle legs are reserved all-or-nothing: prepared together only if
   // they fit the credit (or nothing is pending, so a read wider than a lowered credit still progresses) and the SQ;
   // otherwise it stays at the queue head. Retries re-enter through the queue, so they take credit like any other read.
-  void refill() {
+  //
+  // A gated root policy (IdleRoots) also decides, before a sub-read's first preparation, whether it may go now and from
+  // which root (gate_root); a sub-read it holds back stays at the queue head unplanned and is decided again next turn.
+  template <class RootPolicy>
+  void refill(RootPolicy& roots) {
     Call& c = c_;
     int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
     clock_ = 0;            // and at most one for the drive load (DriveLoad::change)
     while (c.queue_count > 0) {
       const uint32_t index = queue_[c.queue_head];
       ExtentDesc& d = descs_[index];
-      if (d.legs == 0) plan_legs(index);
+      if constexpr (std::decay_t<RootPolicy>::kGated) {
+        if (d.legs == 0 && !gate_root(index, roots)) break;
+      }
+      if (d.legs == 0) {
+        // First preparation: with the dynamic root choice, the sub-read's root is picked now, from the load as it is
+        // when the read is issued, before its legs are cut by that root's device limits. A gated read's root is
+        // gate_root's.
+        if constexpr (!std::decay_t<RootPolicy>::kGated) {
+          if (dynamic_) choose_root(index);
+        }
+        plan_legs(index);
+      }
       // First attempt: nothing landed and nothing retried (a descriptor is re-queued only by a short or retried leg).
       const bool fresh = d.done == 0 && d.retries == 0;
       Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
       unsigned n = 0;
       for (unsigned l = 0; l < d.legs; ++l)
         n += legs[l].state == LegState::Idle ? 1u : 0u;
-      if (!(c.pending + n <= c.capacity || c.pending == 0)) break;
+      bool room = c.pending + n <= c.capacity || c.pending == 0;
       if constexpr (requires(const Reader& reader) { reader.sq_space(); }) {
-        if (n > 1 && io_.sq_space() < n) break;
+        room = room && !(n > 1 && io_.sq_space() < n);
       }
+      if (!room) {
+        // Not issued: a fresh sub-read under the dynamic choice chooses again when credit lets it go, so the choice
+        // sees the load at issue, not the load of the turn it first waited at the queue head.
+        if (dynamic_ && fresh) d.legs = 0;
+        break;
+      }
+      // Issued: the dynamic choice is final, so it is counted now (once: only a fresh sub-read is issued first).
+      if (dynamic_ && fresh) note_root(index);
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
       d.queued = false;
@@ -1330,6 +1450,10 @@ class ReaderCore {
             }
           }
         });
+      }
+      if constexpr (std::decay_t<RootPolicy>::kGated) {
+        if (fresh && roots.on_piece != nullptr)
+          roots.on_piece(roots.context, DriveLoad::root_of(d.read->file, t_.parts));
       }
     }
   }
@@ -1489,7 +1613,9 @@ class ReaderCore {
       const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
       const bool leg_matches = fault.leg < 0 || static_cast<int64_t>(l) == fault.leg;
       if (fault.cqe_error != 0 && metric(&ReaderMetrics::cqes) == fault.cqe_call && leg_matches) res = -fault.cqe_error;
-      if (fault.part >= 0 && !faults_.part_fired && static_cast<int64_t>(part) == fault.part && leg_matches &&
+      const bool part_matches = fault.part < 0 || static_cast<int64_t>(part) == fault.part;
+      const bool root_matches = fault.root < 0 || DriveLoad::root_of(d.read->file, t_.parts) == fault.root;
+      if ((fault.part >= 0 || fault.root >= 0) && !faults_.part_fired && part_matches && root_matches && leg_matches &&
           (fault.sub < 0 || static_cast<int64_t>(index % subs_) == fault.sub) &&
           (fault.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault.ordinal)) {
         if (fault.part_error != 0) {
@@ -1707,9 +1833,139 @@ class ReaderCore {
     io_.drain(pending);
   }
 
+  // set_mirror_map's map: alt_file_[file * parts + q] = root q's file of `file`'s row. Throws, naming `prefix`, unless
+  // piece streaming is on and every row's files are a full mirror set.
+  void build_mirror_map(const std::string& prefix) {
+    const int64_t parts = t_.parts;
+    if (!piece_stream_) throw std::runtime_error(prefix + "choosing a sub-read's root needs piece streaming");
+    if (parts > kMaxDrives)
+      throw std::runtime_error(prefix + "the drive load counts at most " + std::to_string(kMaxDrives) + " roots");
+    const int64_t files = static_cast<int64_t>(t_.paths.size());
+    auto refuse = [&](int64_t file, const std::string& why) {
+      throw std::runtime_error(
+          prefix + "file " + t_.paths[static_cast<size_t>(file)] + " is not a full mirror set: " + why);
+    };
+    if (files % parts != 0) refuse(files - 1, "the file count is not a multiple of the mirror roots");
+    for (size_t i = 0; i < t_.extents.size(); ++i) {
+      const Read& e = t_.extents[i];
+      if (e.length > 0 && e.file % parts != static_cast<int64_t>(i) % parts)
+        refuse(e.file, "part " + std::to_string(static_cast<int64_t>(i) % parts) + " reads another root's file");
+    }
+    std::vector<int64_t> alt(static_cast<size_t>(files * parts));
+    for (int64_t f = 0; f < files; ++f) {
+      for (int64_t q = 0; q < parts; ++q) {
+        const int64_t other = f - f % parts + q;
+        if (t_.source_paths[static_cast<size_t>(other)] != t_.source_paths[static_cast<size_t>(f)])
+          refuse(other, "it copies " + t_.source_paths[static_cast<size_t>(other)] + ", not " +
+                            t_.source_paths[static_cast<size_t>(f)]);
+        if (t_.file_sizes[static_cast<size_t>(other)] != t_.file_sizes[static_cast<size_t>(f)])
+          refuse(other, "its size differs from its mirror's");
+        alt[static_cast<size_t>(f * parts + q)] = other;
+      }
+    }
+    alt_file_ = std::move(alt);
+  }
+
+  // The dynamic root choice for piece-stream descriptor `index`, at its first preparation (set_mirror_caps), and again
+  // at each refill turn while it waits for credit (refill undoes an unissued plan). A root is
+  // open while its sub-reads in flight, demand and speculative, over every reader of the drive load, are below its
+  // cap. Among the open roots the one with the fewest bytes in flight wins; a tie goes to the sub-read's own root,
+  // then to the lowest root. With every root at its cap the sub-read keeps its own root: the choice never blocks or
+  // waits. Only the file changes: every root holds the row's image at the same offsets and size (set_mirror_caps
+  // checked), so the offset, length, destination, expectation and pieces stay the static geometry's.
+  void choose_root(uint32_t index) {
+    Read& read = sub_reads_[index];
+    const int64_t parts = t_.parts;
+    // The sub-read's own root is its descriptor's part (it may have chosen another before, while it waited for credit).
+    const int own = static_cast<int>((index / subs_) % static_cast<size_t>(parts));
+    read.file = alt_file_[static_cast<size_t>(read.file * parts + own)];
+    int best = -1;
+    int64_t best_bytes = 0;
+    for (int q = 0; q < static_cast<int>(parts); ++q) {
+      if (load_->reads_in_flight(q) >= caps_[q]) continue;
+      const int64_t bytes = load_->bytes_in_flight(q);
+      if (best < 0 || bytes < best_bytes || (bytes == best_bytes && q == own)) {
+        best = q;
+        best_bytes = bytes;
+      }
+    }
+    if (best >= 0 && best != own) read.file = alt_file_[static_cast<size_t>(read.file * parts + best)];
+  }
+
+  // IdleRoots, before sub-read `index`'s first preparation: true lets it go now, its file set to the root it reads;
+  // false holds it back this turn, at the queue head and unplanned. A boosted read takes its table root, as a demand
+  // would. Otherwise up to max_inflight pieces go in flight at a time, from the row's root while no demand reads it
+  // (not with spread), else from the demand-free root with the fewest bytes in flight; with none demand-free it waits,
+  // and past the deadline, or when give_up says so, the read is abandoned (c_.failed, roots.abandoned). Relaxed loads
+  // of every reader's load: a demand that lands between the check and the submit shares its drive with at most the
+  // pieces in flight.
+  bool gate_root(uint32_t index, IdleRoots& roots) {
+    Call& c = c_;
+    const int64_t parts = t_.parts;
+    Read& read = sub_reads_[index];
+    if (!roots.boosted && roots.boost != nullptr && roots.boost->load(std::memory_order_acquire) != 0)
+      roots.boosted = true;
+    if (roots.boosted) {
+      const int own = static_cast<int>((index / subs_) % static_cast<size_t>(parts));
+      read.file = alt_file_[static_cast<size_t>(read.file * parts + own)];
+      return true;
+    }
+    if (c.reads_inflight >= roots.max_inflight) return false;
+    if (roots.give_up != nullptr && roots.give_up(roots.context)) return abandon_gated(roots);
+    int root = !roots.spread && c.gate_root >= 0 && load_->demand_reads(c.gate_root) == 0 ? c.gate_root : -1;
+    if (root < 0) {
+      const int n = static_cast<int>(parts);
+      const int start = !roots.spread ? 0 : c.gate_root >= 0 ? (c.gate_root + 1) % n : c.spread_start;
+      for (int i = 0; i < n; ++i) {
+        const int q = (start + i) % n;
+        if (load_->demand_reads(q) == 0 && (root < 0 || load_->bytes_in_flight(q) < load_->bytes_in_flight(root)))
+          root = q;
+      }
+    }
+    if (root < 0) {
+      const int64_t now = now_ns();
+      if (c.deferred_since == 0) {
+        c.deferred_since = now;
+        ++roots.deferrals;
+      } else if (now - c.deferred_since > roots.deadline_ns) {
+        return abandon_gated(roots);
+      }
+      return false;
+    }
+    c.deferred_since = 0;
+    if (c.gate_root >= 0 && root != c.gate_root) ++roots.moves;
+    c.gate_root = root;
+    read.file = alt_file_[static_cast<size_t>(read.file * parts + root)];
+    return true;
+  }
+
+  // IdleRoots gives up: no further piece is issued, and read() drains what is in flight and returns 0.
+  bool abandon_gated(IdleRoots& roots) {
+    roots.abandoned = true;
+    c_.failed = true;
+    return false;
+  }
+
+  // The dynamic choice of descriptor `index` is final (its first issue): counts a redirect and the trace's extent.
+  void note_root(uint32_t index) {
+    const int64_t file = sub_reads_[index].file;
+    const int own = static_cast<int>((index / subs_) % static_cast<size_t>(t_.parts));
+    const int root = DriveLoad::root_of(file, t_.parts);
+    if (root != own) load_->redirected(own, root);
+    on_trace([&](StageRecord& t) { count_drive_extent(t, file); });
+  }
+
+  // The trace's per-drive extent count: one more extent reads `file`.
+  void count_drive_extent(StageRecord& t, int64_t file) {
+    const size_t drive = file_drive_[file];
+    t.drive_dev[drive] = drive_dev_[drive];
+    t.drive_extents[drive] += 1;
+  }
+
   // Adds `reads` sub-reads and `bytes` bytes of descriptor `d`'s root to the shared drive load, and to this reader's
   // share of it.
   void count_drive(const ExtentDesc& d, int reads, int64_t bytes) {
+    c_.reads_inflight += reads;
     const int root = DriveLoad::root_of(d.read->file, t_.parts);
     mine_[root][kind_].reads += reads;
     mine_[root][kind_].bytes += bytes;
@@ -1790,6 +2046,12 @@ class ReaderCore {
   int kind_ = kDemandRead;
   int64_t clock_ = 0;
   Share mine_[kMaxDrives][2] = {};
+  // The dynamic root choice (set_mirror_caps): on or off, each root's in-flight cap, and the mirror file map,
+  // alt_file_[file * parts + q] = root q's file of `file`'s row.
+  bool dynamic_ = false;
+  int64_t caps_[kMaxDrives] = {};
+  std::vector<int64_t> alt_file_;
+  int spread_next_ = 0;  // IdleRoots::spread: the next read's spread_start
   // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
   [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
   [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;

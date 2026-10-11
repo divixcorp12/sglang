@@ -377,6 +377,56 @@ def test_the_max_m8_arm_is_the_miss_cut_arm_with_four_tokens_per_cpu_chunk():
     assert ab.REFERENCE["dspark-both-misscut-maxm8"] == "dspark-both-misscut"
 
 
+IDLE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE"
+IDLE_DEADLINE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US"
+
+
+def test_the_idle_drive_arm_is_the_prefetch_miss_cut_arm_with_idle_drive_reads_against_the_miss_cut_arm():
+    """Design 2026-10-09-dsv41-drive-aware-reads change (2): compared with dspark-both-misscut, the same arm without
+    the prefetch, so the prefetch's net effect with idle-drive reads is what the A/B reads."""
+    ab = _ab()
+    a, c = ab.ARMS["dspark-both-prefetch-gpu-misscut"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut-idle"][0]
+    assert (c[IDLE], c[IDLE_DEADLINE]) == ("1", "4000")
+    assert {k: v for k, v in c.items() if k != IDLE} == {k: v for k, v in a.items() if k != IDLE}
+    assert ab.ARMS["dspark-both-prefetch-gpu-misscut-idle"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut-idle"] == "dspark-both-misscut"
+
+
+IDLE_SPREAD = "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD"
+IDLE_PIECES = "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES"
+IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", "dspark-both-prefetch-gpu-misscut-idle2")
+
+
+def test_the_idle2_arm_is_the_idle_arm_with_spread_ties_and_two_pieces_against_the_miss_cut_arm():
+    ab = _ab()
+    a, c = ab.ARMS["dspark-both-prefetch-gpu-misscut-idle"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0]
+    assert (a[IDLE_SPREAD], a[IDLE_PIECES]) == ("0", "1")
+    assert (c[IDLE], c[IDLE_SPREAD], c[IDLE_PIECES]) == ("1", "1", "2")
+    knobs = (IDLE_SPREAD, IDLE_PIECES)
+    assert {k: v for k, v in c.items() if k not in knobs} == {k: v for k, v in a.items() if k not in knobs}
+    assert ab.ARMS["dspark-both-prefetch-gpu-misscut-idle2"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut-idle2"] == "dspark-both-misscut"
+
+
+def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv(IDLE, "1")
+    monkeypatch.setenv(IDLE_DEADLINE, "9")
+    monkeypatch.setenv(IDLE_SPREAD, "1")
+    monkeypatch.setenv(IDLE_PIECES, "3")
+    for arm in ab.ARMS:
+        want = ("1" if arm in IDLE_ARMS else "0", "4000")
+        knobs = ("1", "2") if arm == "dspark-both-prefetch-gpu-misscut-idle2" else ("0", "1")
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert (overrides[IDLE], overrides[IDLE_DEADLINE]) == want, arm
+            assert (overrides[IDLE_SPREAD], overrides[IDLE_PIECES]) == knobs, arm
+
+
+def test_the_summary_keeps_the_idle_drive_counters():
+    ab = _ab()
+    assert {"spec_deferred", "spec_abandoned", "spec_boosted", "spec_moved_root"} <= set(ab.RAM_KEYS)
+
+
 def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
@@ -454,3 +504,38 @@ def test_run_arm_brackets_the_warm_up_and_every_timed_session_with_drive_counter
     warm = script.index("for round in $(seq 1")
     assert script.index("drive_sample 'warmup_start'") < warm < script.index("drive_sample 'warmup_end'")
     assert script.index("drive_sample 'warmup_end'") < script.index("label': 'server_ready'")
+
+
+DYNAMIC = "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC"
+CAPS = "SGLANG_MOE_EXPERT_MIRROR_CAPS"
+
+
+def test_the_cap_arm_is_the_gpu_arm_with_the_per_drive_in_flight_cap(monkeypatch):
+    """Design 2026-10-09-dsv41-drive-aware-reads change (3): roots nvme0, nvme4 (the SPCC), nvme2 capped at 4, 2, 4
+    sub-reads in flight; compared with dspark-both like the other prefetch arms."""
+    ab = _ab()
+    g, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-cap"][0]
+    assert (c[DYNAMIC], c[CAPS]) == ("1", "4,2,4")
+    assert {k: v for k, v in c.items() if k not in (DYNAMIC, CAPS)} == {
+        k: v for k, v in g.items() if k not in (DYNAMIC, CAPS)
+    }
+    # The caps follow the roots' order in the recipe the arms run on.
+    assert ab.arm_env.EXPERT_MIRROR_DIRS.split(":") == [
+        "/mnt/nvme0/dsv41_flash", "/mnt/nvme4/dsv41_flash", "/mnt/nvme2/dsv41_flash"]
+    assert ab.ARMS["dspark-both-prefetch-gpu-cap"][1] is True
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-cap"] == "dspark-both"
+    monkeypatch.setenv(DYNAMIC, "0")
+    monkeypatch.setenv(CAPS, "9,9,9")
+    assert (ab._overrides("dspark-both-prefetch-gpu-cap", "/out")[DYNAMIC],
+            ab._overrides("dspark-both-prefetch-gpu-cap", "/out")[CAPS]) == ("1", "4,2,4")
+
+
+def test_every_other_arm_pins_the_dynamic_root_choice_off_against_an_exported_shell(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv(DYNAMIC, "1")
+    monkeypatch.setenv(CAPS, "4,2,4")
+    for arm in ab.ARMS:
+        if arm == "dspark-both-prefetch-gpu-cap":
+            continue
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert (overrides[DYNAMIC], overrides[CAPS]) == ("0", ""), arm

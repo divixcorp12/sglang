@@ -741,7 +741,8 @@ struct HostExports {
   // `candidates` uint8 [SpecCandidates::kCandPageBytes], pinned memory the caller keeps alive, `gates` and `bias`
   // [0, 0], `hidden` unused. `cores` int64 [groups, width]: each group's speculative thread's cores, -1 padding (none:
   // the caller's affinity). Cores 64-71 are refused. `min_margin` float32 [rows] (GPU scorer only), per target row the
-  // least margin a candidate needs, or [0]: no floors.
+  // least margin a candidate needs, or [0]: no floors. `idle_deadline_ns` > 0: idle-drive speculative reads
+  // (RamPrefetchConfig::idle_deadline_ns), 0: the shared reader; `idle_spread` and `idle_pieces` shape them.
   static void enable_ram_prefetch(
       int64_t handle,
       TensorView targets,
@@ -754,7 +755,10 @@ struct HostExports {
       int64_t per_layer,
       int64_t top_k_only,
       TensorView candidates,
-      TensorView min_margin) {
+      TensorView min_margin,
+      int64_t idle_deadline_ns,
+      int64_t idle_spread,
+      int64_t idle_pieces) {
     using namespace host;
     using Cand = expert_stream::wire::SpecCandidates;
     auto cpu = SymbolicDevice{};
@@ -806,6 +810,10 @@ struct HostExports {
     config.candidates = gpu ? static_cast<const uint8_t*>(candidates.data_ptr()) : nullptr;
     const auto* floors = static_cast<const float*>(min_margin.data_ptr());
     config.min_margin.assign(floors, floors + min_margin.size(0));
+    config.idle_deadline_ns = idle_deadline_ns;
+    config.idle_spread = idle_spread != 0;
+    // Clamped into one past the bound, so a value beyond int's range is refused rather than wrapped into it.
+    config.idle_pieces = static_cast<int>(std::clamp<int64_t>(idle_pieces, 0, RamPrefetchConfig::kMaxIdlePieces + 1));
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int g = 0; g < Wire::kNodes; ++g) {
       std::vector<int> own;
@@ -950,6 +958,16 @@ struct HostExports {
     expert_stream::verify_named(
         "out", TensorMatcher({expert_stream::kCounterCount}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
+  }
+
+  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC's caps, one int64 per mirror root (empty: off), on every group's reader
+  // (RamTier::set_mirror_caps). Paused or before the thread starts.
+  static void set_mirror_caps(int64_t handle, TensorView caps) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("caps", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), caps);
+    const auto* data = static_cast<const int64_t*>(caps.data_ptr());
+    find(handle)->set_mirror_caps(std::span<const int64_t>(data, static_cast<size_t>(caps.size(0))));
   }
 
   // The tier's drive load (DriveLoad::snapshot, kDriveLoadWords words): relaxed reads, callable while the service runs.
@@ -1160,6 +1178,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_group_counters, Exports::group_counters);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_drive_load, Exports::drive_load);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_mirror_caps, Exports::set_mirror_caps);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                 \

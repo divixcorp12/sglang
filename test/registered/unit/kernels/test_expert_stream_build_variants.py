@@ -134,6 +134,7 @@ RAW_EXPORTS = {
     "spec_place": lambda m, h: m.expert_stream_spec_place(h, 0, 0),
     "spec_pump": lambda m, h: m.expert_stream_spec_pump(h, 0),
     "inject_spec": lambda m, h: m.expert_stream_inject_spec(h, 0, 0),
+    "inject_demand_load": lambda m, h: m.expert_stream_inject_demand_load(h, torch.zeros(ops.DRIVE_SLOTS, dtype=torch.int64)),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),
     "copy_engine_ballast": lambda m, h: m.expert_stream_copy_engine_ballast(h, 0, 0, 0),
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
@@ -154,7 +155,7 @@ RAW_EXPORTS = {
 
 
 def test_every_test_only_export_is_listed_and_exported_by_both_builds():
-    assert sorted(RAW_EXPORTS) == sorted(set(ops.TEST_ONLY_EXPORTS) - {"read_rows_faulted", "read_rows_sqes"})
+    assert sorted(RAW_EXPORTS) == sorted(set(ops.TEST_ONLY_EXPORTS) - {"read_rows_faulted", "read_rows_sqes", "read_rows_idle"})
     for variant in ops.VARIANTS:
         module = ops._host_module("exl3", variant)
         for name in ops.TEST_ONLY_EXPORTS:
@@ -176,7 +177,7 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
 @pytest.mark.parametrize(
     "helper",
     (
-        "read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields",
+        "read_rows_with_fault", "read_rows_sqes", "read_rows_idle", "seqlock_stress", "pause_ns", "read_record_fields",
     ),
 )
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
@@ -184,6 +185,7 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
     calls = {
         "read_rows_with_fault": lambda: ops.read_rows_with_fault(s.tables, 0, [1], [0], [], [], variant="prod"),
         "read_rows_sqes": lambda: ops.read_rows_sqes(s.tables, 0, [1], [0], variant="prod"),
+        "read_rows_idle": lambda: ops.read_rows_idle(s.tables, 0, [1], [0], variant="prod"),
         "seqlock_stress": lambda: ops.seqlock_stress(0.001, variant="prod"),
         "pause_ns": lambda: ops.pause_ns(variant="prod"),
         "read_record_fields": lambda: ops.read_record_fields(

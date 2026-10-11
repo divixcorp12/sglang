@@ -113,12 +113,14 @@ def host_variant() -> str:
 TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_faulted",
     "read_rows_sqes",
+    "read_rows_idle",
     "inject",
     "inject_fault",
     "inject_group_stall",
     "spec_place",
     "spec_pump",
     "inject_spec",
+    "inject_demand_load",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
@@ -385,13 +387,23 @@ def _fault_tensor(
     ring_reset_fail: bool = False,
     leg_cut_cap: int = 0,
     nop_flush_refused: bool = False,
+    root: int = -1,
+    mirror_caps: Sequence[int] = (),
 ) -> torch.Tensor:
     """Pack fault keywords into the C++ fault tensor (``kFaultWords`` int64 words).
 
     The word order must stay in step with ``fault_from()`` in
-    ``exl3_ram_miss_host.cpp``; words 19, 20 and 26 are reserved. The keywords are
-    documented at ``read_rows_with_fault``.
+    ``host/read_fault.h``; word 26 is reserved. The keywords are
+    documented at ``read_rows_with_fault``; ``root`` narrows the per-extent faults to
+    the drive a sub-read reads (``file % parts``), and ``mirror_caps`` (one cap per
+    mirror root, at most 4 roots and 255 each; empty: off) turns the dynamic root
+    choice of ``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC`` on in the entry points that take it
+    (``read_rows_sqes``, ``read_rows_drive_load``).
     """
+    caps = [int(c) for c in mirror_caps]
+    if len(caps) > DRIVE_SLOTS or any(not 0 <= c <= 255 for c in caps):
+        raise ValueError(f"mirror_caps {caps}: at most {DRIVE_SLOTS} caps of 0..255 fit the fault word")
+    caps_word = len(caps) | sum(c << (8 * (q + 1)) for q, c in enumerate(caps))
     return torch.tensor(
         [
             submit_error,
@@ -413,8 +425,8 @@ def _fault_tensor(
             hold_ordinal,
             abandon_after,
             step,
-            0,  # word 19: reserved (was pack_workers; the packed path is gone)
-            0,  # word 20: reserved (was pack_split)
+            root + 1,  # word 19: 0 any root (was pack_workers; the packed path is gone)
+            caps_word,  # word 20: the mirror caps (was pack_split)
             int(hold_rest),
             int(piece_stream),
             sub,
@@ -487,7 +499,9 @@ def read_rows_traced(
 # ``elapsed_ns`` (since the load's origin), ``clock_reads`` and ``roots``, then these
 # fields per root for ``DRIVE_SLOTS`` roots. Reads and bytes "in flight" are
 # instantaneous; ``*_bytes`` landed and ``*_busy_ns`` accumulate over the load's life.
-# ``overlap_ns`` is the time a root had demand and speculative reads in flight at once.
+# ``overlap_ns`` is the time a root had demand and speculative reads in flight at once;
+# ``moved_from``/``moved_to`` count the sub-reads the dynamic root choice
+# (``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``) sent away from and to the root.
 DRIVE_SLOTS = 4  # kMaxDrives
 DRIVE_FIELDS = (
     "demand_reads",
@@ -499,6 +513,8 @@ DRIVE_FIELDS = (
     "demand_busy_ns",
     "spec_busy_ns",
     "overlap_ns",
+    "moved_from",
+    "moved_to",
 )
 DRIVE_LOAD_WORDS = 3 + DRIVE_SLOTS * len(DRIVE_FIELDS)
 
@@ -531,6 +547,7 @@ def read_rows_drive_load(
     b_spec: bool = False,
     nested: bool = False,
     step: int = BOUNCE_ROWS,
+    preload: Sequence[tuple[int, int]] = (),
     layout: str = "exl3",
     variant: Optional[str] = None,
     **faults,
@@ -542,7 +559,10 @@ def read_rows_drive_load(
     ``read_rows_with_fault`` (``piece_stream`` applies to both readers); reader B then
     reads ``then_experts`` into ``then_slots`` with none. ``a_spec``/``b_spec`` make
     that reader's read speculative. ``nested`` runs B's read inside A's, at the first
-    turn that finds A with sub-reads in flight.
+    turn that finds A with sub-reads in flight. ``mirror_caps`` (a fault keyword) turns
+    the dynamic root choice on for both readers; ``preload`` (``(reads, bytes)`` per
+    root) is counted as another reader's demand reads in flight while A reads, and
+    taken back before ``"after_a"``.
 
     Returns ``{"a", "b"}`` (the results: 1, 0, -1; A's is -2 when it raised, B's -9
     when it did not run), ``"a_raised"``, ``"a_in_flight"`` (A's sub-reads in flight
@@ -552,6 +572,11 @@ def read_rows_drive_load(
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     then_ids, then_at = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
+    if len(preload) > DRIVE_SLOTS:
+        raise ValueError(f"preload names {len(preload)} roots, the drive load has {DRIVE_SLOTS}")
+    pre = torch.zeros(2 * DRIVE_SLOTS, dtype=torch.int64)
+    for q, (reads, nbytes) in enumerate(preload):
+        pre[q], pre[DRIVE_SLOTS + q] = int(reads), int(nbytes)
     out = torch.zeros(4 + 3 * DRIVE_LOAD_WORDS, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_read_rows_drive_load(
         *_table_args(tables),
@@ -563,6 +588,7 @@ def read_rows_drive_load(
         int(step),
         fault,
         int(a_spec) | int(b_spec) << 1 | int(nested) << 2,
+        pre,
         out,
     )
     words = out.tolist()
@@ -578,6 +604,85 @@ def read_rows_drive_load(
         "nested": decode_drive_load(snaps[0]) if nested else None,
         "after_a": decode_drive_load(snaps[1]),
         "after_b": decode_drive_load(snaps[2]),
+    }
+
+
+def read_rows_idle(
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    preload: Sequence[int] = (),
+    follow: bool = False,
+    boost: bool = False,
+    give_up_after: int = 0,
+    deadline_s: float = 1.0,
+    spread: bool = False,
+    pieces: int = 1,
+    reads: int = 1,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    **faults,
+) -> dict:
+    """Test only: one speculative C++ read of ``experts`` into ``slots`` under the idle-drive root policy
+    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, ``IdleRoots``), with the fault keywords of ``read_rows_with_fault`` (piece
+    streaming always on).
+
+    ``preload`` (demand reads per root) stands for other readers' demand in flight for the whole read. ``follow``: a
+    demand read arrives on the first piece's root once it is in flight, and stays. ``boost`` boosts the read from its
+    start. ``give_up_after`` > 0 gives up once that many pieces were issued. ``deadline_s``: the longest wait for an
+    idle root. ``spread`` and ``pieces``: SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD and _IDLE_PIECES. ``reads`` repeats the
+    read on the one reader, as its speculative reader reads row after row (stopping at the first that does not return
+    1); the counts and SQEs add up over them.
+
+    Returns ``{"result"`` (1, 0; -2 when it raised), ``"abandoned"``, ``"boosted"``, ``"deferrals"``, ``"moves"``,
+    ``"pieces"``, ``"widest"`` (the most of its sub-reads in flight when one was issued), ``"share_after"`` (its
+    sub-reads still counted after it returned), ``"sqes"`` (``(root, offset, length)`` per SQE, in order) and
+    ``"load"`` (the decoded drive load after the read, the preload and the follower taken back)``}``. Instrumented
+    build only.
+    """
+    _refuse_test_only("read_rows_idle", variant)
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    fault = _fault_tensor(piece_stream=True, **faults)
+    if len(preload) > DRIVE_SLOTS:
+        raise ValueError(f"preload names {len(preload)} roots, the drive load has {DRIVE_SLOTS}")
+    pre = torch.zeros(2 * DRIVE_SLOTS, dtype=torch.int64)
+    for q, reads in enumerate(preload):
+        pre[q] = int(reads)
+    sqes = torch.zeros((4096, 4), dtype=torch.int64)
+    out = torch.zeros(10 + DRIVE_LOAD_WORDS, dtype=torch.int64)
+    _host_module(layout, variant).expert_stream_read_rows_idle(
+        *_table_args(tables),
+        row,
+        expert_ids,
+        slot_ids,
+        fault,
+        pre,
+        int(bool(follow)),
+        int(bool(boost)),
+        int(give_up_after),
+        int(deadline_s * 1e9),
+        int(bool(spread)),
+        int(pieces),
+        int(reads),
+        sqes,
+        out,
+    )
+    words = out.tolist()
+    parts = int(tables.extents.shape[2])
+    count = min(words[8], sqes.shape[0])
+    return {
+        "result": words[0],
+        "abandoned": bool(words[1]),
+        "boosted": bool(words[2]),
+        "deferrals": words[3],
+        "moves": words[4],
+        "pieces": words[5],
+        "widest": words[6],
+        "share_after": words[7],
+        "sqes": [(int(f) % parts, int(o), int(n)) for f, o, n, _ in sqes[:count].tolist()],
+        "load": decode_drive_load(words[10:]),
     }
 
 
@@ -1176,6 +1281,10 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
     )
 
 
+# The most of a row's pieces an idle-drive read may have in flight (RamPrefetchConfig::kMaxIdlePieces).
+MAX_IDLE_PIECES = 4
+
+
 # The GPU scorer's candidate page (csrc/moe/expert_stream/spec_candidates.h): CAND_RECORDS slots of CAND_STRIDE bytes,
 # slot (seq - 1) % CAND_RECORDS; u32 seq, u16 count, u16 flags, then CAND_MAX entries (u16 expert, u8 rank, pad, f32).
 CAND_MAX = 8
@@ -1256,6 +1365,10 @@ COUNTERS = (
     "spec_failed",
     "spec_delayed",
     "spec_late",
+    "spec_deferred",
+    "spec_abandoned",
+    "spec_boosted",
+    "spec_moved_root",
     "spec_scored",
     "spec_score_ns",
 )
@@ -1286,6 +1399,10 @@ CORE_COUNTERS = (
     "spec_failed",
     "spec_delayed",
     "spec_late",
+    "spec_deferred",
+    "spec_abandoned",
+    "spec_boosted",
+    "spec_moved_root",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -1910,13 +2027,24 @@ class ExpertStreamHost:
         top_k_only: bool = False,
         candidates: Optional[torch.Tensor] = None,
         min_margin: Optional[torch.Tensor] = None,
+        idle_drive: bool = False,
+        idle_deadline_s: float = 0.004,
+        idle_spread: bool = False,
+        idle_pieces: int = 1,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
         ``cores`` is each NUMA group's speculative-thread core list (empty: the caller's affinity). CPU scorer:
         ``gates`` bf16 ``[n, experts, hidden]`` and ``bias`` fp32 ``[n, experts]``, host tensors this host keeps alive.
         GPU scorer: ``candidates`` (``new_candidate_page``), which the select kernel writes, and no gates; optional
-        ``min_margin`` fp32 ``[layers]``, per target row the least margin a candidate needs to be read."""
+        ``min_margin`` fp32 ``[layers]``, per target row the least margin a candidate needs to be read.
+
+        ``idle_drive`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE): each group reads its pool rows through a reader of its
+        own, one piece at a time from a drive no demand reads, abandoning a read that waited ``idle_deadline_s`` for
+        one; off, the speculative reads take turns with the demand reads on the group's reader. With it,
+        ``idle_spread`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
+        rotating from row to row, and ``idle_pieces`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
+        row's pieces may be in flight at once."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:
@@ -1967,6 +2095,11 @@ class ExpertStreamHost:
             min_margin = min_margin.contiguous()
         if len(cores) != self.nodes:
             raise ValueError(f"one core list per NUMA group ({self.nodes}), got {len(cores)}")
+        idle_deadline_ns = int(idle_deadline_s * 1e9) if idle_drive else 0
+        if idle_drive and idle_deadline_ns < 1:
+            raise ValueError(f"idle_deadline_s must be positive, got {idle_deadline_s}")
+        if not 1 <= idle_pieces <= MAX_IDLE_PIECES:
+            raise ValueError(f"idle_pieces must be in [1, {MAX_IDLE_PIECES}], got {idle_pieces}")
         table = torch.full((self.nodes, max(1, max(len(own) for own in cores))), -1, dtype=torch.int64)
         for g, own in enumerate(cores):
             for j, core in enumerate(own):
@@ -1985,6 +2118,9 @@ class ExpertStreamHost:
             int(bool(top_k_only)),
             candidates if candidates is not None else torch.empty(0, dtype=torch.uint8),
             min_margin if min_margin is not None else torch.empty(0, dtype=torch.float32),
+            idle_deadline_ns,
+            int(bool(idle_spread)),
+            int(idle_pieces),
         )
         self.ram_prefetch_tensors = (gates, bias, candidates, min_margin)
 
@@ -1994,10 +2130,22 @@ class ExpertStreamHost:
         return bool(self._module.expert_stream_spec_pump(self.handle, int(group)))
 
     def inject_spec(self, delay_s: float = 0.0, fail: bool = False) -> None:
-        """Test only: each speculative read sleeps ``delay_s`` first, holding the reader's turn; with ``fail`` it is
-        reported failed without reading."""
+        """Test only: each speculative read sleeps ``delay_s``: first, holding the reader's turn, on the shared reader;
+        once its first piece is in flight on an idle-drive reader. With ``fail`` it is reported failed without
+        reading."""
         _refuse_test_only("inject_spec", self.variant)
         self._module.expert_stream_inject_spec(self.handle, int(delay_s * 1e9), int(fail))
+
+    def inject_demand_load(self, reads: Sequence[int]) -> None:
+        """Test only: adds ``reads[q]`` demand sub-reads to mirror root q's drive load (negative takes them back), as
+        another reader's demand in flight an idle-drive read must avoid."""
+        _refuse_test_only("inject_demand_load", self.variant)
+        if len(reads) > DRIVE_SLOTS:
+            raise ValueError(f"reads names {len(reads)} roots, the drive load has {DRIVE_SLOTS}")
+        words = torch.zeros(DRIVE_SLOTS, dtype=torch.int64)
+        for q, n in enumerate(reads):
+            words[q] = int(n)
+        self._module.expert_stream_inject_demand_load(self.handle, words)
 
     def take_bulk_delta(self) -> torch.Tensor:
         """Return the eager paths' map changes since the last call.
@@ -2502,6 +2650,13 @@ class ExpertStreamHost:
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)
         self._module.expert_stream_group_counters(self.handle, int(group), out)
         return dict(zip(COUNTERS, out.tolist()))
+
+    def set_mirror_caps(self, caps: Sequence[int]) -> None:
+        """``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``: every NUMA group's reader picks each sub-read's mirror root, skipping
+        roots with ``caps[q]`` sub-reads in flight (demand and speculative, every group) and preferring the fewest bytes
+        in flight; with every root at its cap a sub-read keeps its own root. One positive cap per mirror root; empty
+        turns it off. Refused when the tables' files are not a full mirror set. Paused, or before the thread starts."""
+        self._module.expert_stream_set_mirror_caps(self.handle, torch.tensor([int(c) for c in caps], dtype=torch.int64))
 
     def drive_load(self) -> dict:
         """The tier's per-root drive load (``decode_drive_load``), shared by every NUMA

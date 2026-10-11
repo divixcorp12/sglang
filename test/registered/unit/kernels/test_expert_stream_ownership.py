@@ -140,25 +140,29 @@ def _struct(code, name, opener=None):
 def test_the_tier_declares_only_the_callers_mutex():
     """Task 15's source backstop to the shim's runtime zero (plan F11: names, not a count). The tier declares
     caller_mutex_ (Python callers against each other only) and the two InstrBuild-only guards, TraceState::mutex and
-    TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; with the RAM prefetch on, each
-    group's SpecGroup::turn, which its demand reader (try_to_lock, then lock) and its speculative thread (lock_guard) take
-    in turns, one read at a time, and the speculative pool's per-group mutex (SpecPool::mutex(g), ram_prefetch.h),
-    taken only where pool_ exists. It locks nothing else, and no other
+    TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; it locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
     lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and no compare-exchange: the one
     the tier relies on is the lease channel's cas_gate, its open of the copy wait's gate (host/lease_channel.h,
-    LEASE_PROTOCOL.md "The lease channel")."""
+    LEASE_PROTOCOL.md "The lease channel").
+
+    The RAM prefetch (ram_prefetch.h) adds two, off the request path's own state: the pool's per-group mutex
+    (SpecPool::mutex, taken as pool_->mutex(g)) over its entries' transitions, and SpecGroup::turn, the shared
+    reader's turn between a demand read and a speculative one, which an idle-drive group
+    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex", "turn"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
     assert "std::mutex mutex;" in _struct(code, "TraceState"), "the trace guard left TraceState"
+    assert "std::mutex turn;" in _struct(code, "SpecGroup"), "the shared reader's turn left SpecGroup"
     locked = set(re.findall(r"(?:lock_guard|unique_lock|scoped_lock)<[^>]*>\s*\w+\(([^)]*)\)", code))
-    assert locked == {"caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "spec.turn",
-                      "pool_->mutex(g"}, locked
-    assert "std::mutex turn;" in _struct(code, "SpecGroup"), "the reader turn left SpecGroup"
+    # The regex stops at the first ")": the pool's mutex reads as "pool_->mutex(g".
+    assert locked == {
+        "caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "pool_->mutex(g", "spec.turn, std::defer_lock"
+    }, locked
     assert "std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock)" in code
     assert "std::mutex mutex_" not in code and "guard(mutex_)" not in code and "self->mutex_" not in code
-    # pthread_ by its lock families: the speculative thread names and pins itself (pthread_setname_np, _setaffinity_np).
+    # pthread_ names and pins threads (pthread_setname_np, pthread_setaffinity_np); none of its locks may appear.
     for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_mutex", "pthread_rwlock", "pthread_spin",
                   "pthread_cond", "pthread_barrier", "atomic_flag", "test_and_set",
                   ".exchange(", "futex", ".wait(", "notify_one", "notify_all", "condition_variable"):

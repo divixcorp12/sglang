@@ -820,3 +820,90 @@ def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_pa
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"):
         _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(tmp_path / "missing.json"))
+
+
+def test_idle_drive_speculative_reads_default_off_with_a_4_ms_deadline():
+    """Off until its served A/B is accepted (design 2026-10-09-dsv41-drive-aware-reads, change (2))."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get() is False
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() == 4000
+
+
+def test_idle_drive_reads_need_the_prefetch_and_a_bounded_deadline(model_dir):
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    _gate(args, **on)
+    _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=100_000)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    for deadline in (0, 100_001):
+        with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US must be in"):
+            _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=deadline)
+
+
+def test_idle_drive_spread_and_pieces_default_to_todays_reads():
+    """Off until their served A/B is accepted: ties to the lowest root, the row on its root, one piece in flight."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get() is False
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get() == 1
+
+
+def test_idle_drive_pieces_must_be_1_to_4_like_the_deadline_whatever_the_drive_flag(model_dir):
+    """Bounded on every launch, as the deadline is; like the deadline, neither knob is refused with the drive flag off
+    (they do nothing there)."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    for pieces in (1, 4):
+        _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=2)
+    for env in (on, CPU_EXPERTS_ENV):
+        for pieces in (0, 5):
+            with pytest.raises(ValueError, match=r"SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES must be in \[1, 4\]"):
+                _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
+
+
+THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
+
+
+def test_the_dynamic_mirror_root_choice_defaults_off():
+    """Off until its served A/B is accepted (design 2026-10-09-dsv41-drive-aware-reads, change (3))."""
+    assert envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get() is False
+    assert envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get() == ""
+
+
+def test_dynamic_mirror_caps_pass_with_one_positive_cap_per_root(model_dir):
+    args = _exl3_launch(model_dir)
+    _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS, SGLANG_MOE_EXPERT_MIRROR_DYNAMIC=True,
+          SGLANG_MOE_EXPERT_MIRROR_CAPS="4,2,4")
+    _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS)  # static: no caps needed
+
+
+@pytest.mark.parametrize(
+    "env, match",
+    [
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True}, "needs SGLANG_MOE_EXPERT_MIRROR_CAPS"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2"}, "lists 2 caps but"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,0,4"}, "positive integer"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,x,4"}, "positive integer"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,-1,4"}, "positive integer"),
+        ({"SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2,4"}, "silently ignored"),
+    ],
+)
+def test_bad_dynamic_mirror_caps_are_refused_at_launch(model_dir, env, match):
+    args = _exl3_launch(model_dir)
+    with pytest.raises(ValueError, match=match):
+        _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS, **env)
+
+
+def test_dynamic_mirror_caps_need_mirror_roots(model_dir):
+    args = _exl3_launch(model_dir)
+    with pytest.raises(ValueError, match="needs SGLANG_MOE_EXPERT_MIRROR_DIRS"):
+        _gate(args, SGLANG_MOE_EXPERT_MIRROR_DYNAMIC=True, SGLANG_MOE_EXPERT_MIRROR_CAPS="4")
+
+
+def test_the_mirror_caps_parser():
+    from sglang.srt.layers.moe.exl3_read_split import mirror_caps
+
+    assert mirror_caps(False, "", THREE_ROOTS) is None
+    assert mirror_caps(True, " 4, 2 ,4 ", THREE_ROOTS) == (4, 2, 4)
+    with pytest.raises(ValueError, match="at most 4 mirror roots"):
+        mirror_caps(True, "1,1,1,1,1", ":".join(f"/r{i}" for i in range(5)))

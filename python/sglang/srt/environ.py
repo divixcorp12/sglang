@@ -502,6 +502,14 @@ class Envs:
     # Colon-separated relative read shares, one per root of
     # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
     SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
+    # Pick each RAM-miss sub-read's mirror root when it is issued instead of by the
+    # static split: a root whose sub-reads in flight reach its cap in
+    # SGLANG_MOE_EXPERT_MIRROR_CAPS is skipped, the fewest bytes in flight wins, and
+    # with every root capped a sub-read keeps its own root.
+    SGLANG_MOE_EXPERT_MIRROR_DYNAMIC = EnvBool(False)
+    # Comma-separated in-flight sub-read caps, one positive integer per root of
+    # SGLANG_MOE_EXPERT_MIRROR_DIRS in its order (e.g. 4,2,4); required with DYNAMIC.
+    SGLANG_MOE_EXPERT_MIRROR_CAPS = EnvStr("")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
     # Copy all host expert rows into registered memory (replaces the pinned LRU).
     SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
@@ -2030,6 +2038,19 @@ class Envs:
     # budget; a row the file omits keeps every candidate. Unset: the GPU scorer's packaged table
     # (layers/moe/ram_prefetch_margin_floors.json), the CPU scorer none. Empty: no floors.
     SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS = EnvStr(None)
+    # Speculative reads only to an idle drive (design 2026-10-09-dsv41-drive-aware-reads, change (2)): each NUMA group
+    # reads its pool rows through a reader of its own, one piece at a time, from a mirror root no demand read is on,
+    # instead of taking turns with the demand reads on the group's reader. A forced miss waiting on a row lifts that.
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
+    # How long such a read waits for an idle drive before it is abandoned (its pool entry stays empty).
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
+    # With idle-drive reads: spread each row's pieces over the idle drives, ties rotating from row to row, instead of
+    # keeping the row on one drive with ties to the lowest-numbered (which took 179 of 249 GB in the A/B of
+    # DSV41_REFERENCE.md 33.18).
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD = EnvBool(False)
+    # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4), each on a drive no demand
+    # reads. One read rows too slowly in that A/B: 35% abandoned, 82% of promotions boosted.
+    SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

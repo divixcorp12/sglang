@@ -247,8 +247,10 @@ NON_TRACE_CLOCK_READS = {
     # busy() (cpu_experts.h): the start of each job, on the CPU expert thread, for the engine's watchdog.
     "job_started_ns_.store(now_ns(), std::memory_order_release);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread. The CPU expert engine's
-    # watchdog (cpu_experts.h, with a draft source) times a running job or an unserved draft record the same way.
-    "const int64_t now = now_ns();": 2,
+    # watchdog (cpu_experts.h, with a draft source) times a running job or an unserved draft record the same way. And
+    # an idle-drive speculative read's wait for an idle drive (ReaderCore::gate_root, IdleRoots only), on the
+    # speculative thread: a demand read's root policy (TableRoots) compiles it out.
+    "const int64_t now = now_ns();": 3,
     # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
     # through it) and stop()'s drain deadline, which the copy thread reads only once a stop was asked for.
     "if (now_ns() > deadline_ns) return false;": 1,

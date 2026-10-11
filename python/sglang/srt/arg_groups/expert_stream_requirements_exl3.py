@@ -255,6 +255,7 @@ def _check(cfg, budgets) -> None:
         _check_dspark_cpu_experts(cfg)
     _check_row_weighted_assignment()
     _check_ram_prefetch()
+    _check_mirror_caps()
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     speculative = getattr(cfg, "speculative_algorithm", None) is not None
     if cpu_experts and graph.decode.backend != Backend.BREAKABLE:
@@ -364,11 +365,24 @@ def _check_ram_prefetch() -> None:
     if explicit_floors and scorer != "gpu":
         # The floors filter the GPU scorer's candidate page; the CPU scorer would run without them, silently.
         raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu")
+    deadline = envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get()
+    if not 1 <= deadline <= ram_prefetch.MAX_IDLE_DEADLINE_US:
+        raise ValueError(
+            f"SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US must be in [1, {ram_prefetch.MAX_IDLE_DEADLINE_US}], "
+            f"got {deadline}"
+        )
+    pieces = envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get()
+    if not 1 <= pieces <= ram_prefetch.MAX_IDLE_PIECES:
+        raise ValueError(
+            f"SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES must be in [1, {ram_prefetch.MAX_IDLE_PIECES}], got {pieces}"
+        )
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
         if explicit_scorer and scorer == "gpu":
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")
         if explicit_floors:
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH=1")
+        if envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get():
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_DSV41_RAM_PREFETCH=1")
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.
@@ -394,6 +408,18 @@ def _check_ram_prefetch() -> None:
         value = getattr(envs, name).get()
         if not 1 <= value <= high:
             raise ValueError(f"{name} must be in [1, {high}], got {value}")
+
+
+def _check_mirror_caps() -> None:
+    """``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``'s caps, one positive in-flight cap per mirror root, refused here rather
+    than when the RAM-miss service starts (exl3_read_split.mirror_caps, which the service calls too)."""
+    from sglang.srt.layers.moe.exl3_read_split import mirror_caps
+
+    mirror_caps(
+        envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get(),
+        envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get(),
+        envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get(),
+    )
 
 
 def _check_direct_residency(budgets) -> None:
