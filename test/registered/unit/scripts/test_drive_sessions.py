@@ -161,3 +161,9 @@ def test_the_table_lists_every_arms_sessions_and_marks_the_flagged_cells():
     assert any(line.startswith("A") and "0.30" in line and "1.00 GB" in line for line in lines)
     assert any(line.startswith("B") and "0.60*" in line for line in lines)
     assert not any("0.31*" in line for line in lines)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
