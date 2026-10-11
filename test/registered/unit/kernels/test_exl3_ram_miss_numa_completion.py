@@ -243,6 +243,43 @@ def test_a_group_whose_cpu_job_stalls_is_named_by_the_copy_wait_abort(tmp_path):
     assert "group 1: its CPU job" in result.stderr, result.stderr[-2000:]
 
 
+def test_the_copy_wait_abort_says_the_stalled_cpu_job_was_submitted_and_is_running(tmp_path):
+    """The abort that named a group's CPU job could not say why it was not done (DSV41_REFERENCE 33.19's warm-up abort,
+    "group 1: its CPU job 7360 is not done"): here the job was submitted and its forward runs, held."""
+    result = _run(tmp_path, """
+        host.test_kernel_hold(cores[2])
+        req = sim.post(ROW, [0, 1, 2, 3], captured=True, cpu_on=True, dst=[0, 1, 2, 3])
+        assert host.pump() == 1
+        host.start_thread(fatal_wait_s=60.0)
+        sim.close_copy_gate(req)
+        time.sleep(3.0)
+        print("reached")
+    """)
+    assert_aborted(result, "a copy wait held the decode stream")
+    assert "is not done (submitted; the engine is running a target job (row 1) for " in result.stderr, (
+        result.stderr[-2000:])
+
+
+def test_the_copy_wait_abort_says_a_cpu_miss_whose_row_has_not_landed_was_never_submitted(tmp_path):
+    """Group 1's only host lane is a CPU miss whose row is still packing (pack_delay_ns 3 s, past the 200 ms copy
+    wait), so its job was never submitted: the abort says so and that the engine is idle, which a slow forward would
+    not show."""
+    result = _run(tmp_path, """
+        host.set_cpu_split([0] * 9, group=0)
+        host.set_cpu_split([0, 1] + [0] * 7, group=1)
+        host.start_thread(fatal_wait_s=60.0)
+        host.inject_fault(pack_delay_ns=3_000_000_000)
+        req = sim.post(ROW, [0, 5], captured=True, cpu_on=True, cpu_misses=True, dst=[0, 1], weights=[1.0, 0.5])
+        assert [int(k) for k in req.kinds] == [1, 5], req.kinds  # HIT_COPY, MISS_CPU
+        sim.close_copy_gate(req)
+        time.sleep(3.0)
+        print("reached")
+    """)
+    assert_aborted(result, "a copy wait held the decode stream")
+    assert "is not done (not submitted: a CPU miss whose row has not landed; the engine is idle" in result.stderr, (
+        result.stderr[-2000:])
+
+
 def test_a_group_that_never_sends_its_part_is_named_by_the_copy_wait_abort(tmp_path):
     """Review Focus 2: both nodes have a copy-engine lane; group 1's thread stalls before it reads the record, so its
     part never reaches the copy thread. Group 0's part alone must not store CopyDone."""
