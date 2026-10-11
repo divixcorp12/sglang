@@ -174,6 +174,12 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2"] = (
     },
     True,
 )
+# idle2 with the packaged margin floors (DSV41_REFERENCE.md 33.22): the floors halved the wasted reads but saved nothing
+# while their reads fought demand reads; idle2 keeps speculative reads off a busy drive.
+ARMS["dspark-both-prefetch-gpu-misscut-idle2-floors"] = (
+    {**ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0], "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": MARGIN_FLOORS},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -192,6 +198,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-cap": "dspark-both",
     "dspark-both-prefetch-gpu-misscut-idle": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2": "dspark-both-misscut",
+    "dspark-both-prefetch-gpu-misscut-idle2-floors": "dspark-both-misscut",
 }
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
