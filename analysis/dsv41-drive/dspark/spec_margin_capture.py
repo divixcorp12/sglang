@@ -6,7 +6,8 @@ alone so every engine flushes its event file. Then breaks the layer records down
 prefetches, bins the speculative reads by gate rank and margin. The instrumented build's timings are not a throughput
 number.
 
-Locks: rowimg-disk.lock, then cc-gpu.lock (the protocol's order); the server runs under taskset on SERVER_CORES.
+Locks: rowimg-disk.lock, then cc-gpu.lock (the protocol's order), taken here through run_locks.take, which also accepts
+them held by an outer `flock`; the server runs under taskset on SERVER_CORES.
 
 Usage: spec_margin_capture.py OUT_DIR [--arm ARM] [--no-verify-split] [--prompts 8] [--max-tokens 128] [--top-k-only] [--scorer cpu|gpu]
 """
@@ -14,7 +15,6 @@ Usage: spec_margin_capture.py OUT_DIR [--arm ARM] [--no-verify-split] [--prompts
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import signal
@@ -28,6 +28,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
 import arm_env  # noqa: E402
+import run_locks  # noqa: E402
 import both_cpu_ab  # noqa: E402
 
 PORT = 30032
@@ -120,9 +121,7 @@ def main() -> int:
     os.makedirs(a.out_dir, exist_ok=True)
     env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
-    with open(DISK_LOCK, "w") as disk, open(arm_env.GPU_LOCK, "w") as gpu:
-        fcntl.flock(disk, fcntl.LOCK_EX)
-        fcntl.flock(gpu, fcntl.LOCK_EX)
+    with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(a.out_dir, "server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
                                       stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)

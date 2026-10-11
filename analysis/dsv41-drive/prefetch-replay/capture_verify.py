@@ -6,7 +6,8 @@ through logprob_probe.py, and shuts the server down normally so the route log's 
 capture: no forward lost, every verify forward with a router record. A diagnostic run: its timings are not a
 throughput number.
 
-Locks: rowimg-disk.lock, then cc-gpu.lock (the protocol's order); the server runs under taskset on SERVER_CORES.
+Locks: rowimg-disk.lock, then cc-gpu.lock (the protocol's order), taken here through run_locks.take, which also accepts
+them held by an outer `flock`; the server runs under taskset on SERVER_CORES.
 
 Usage: capture_verify.py OUT_DIR [--sessions-skip 0|9] [--prompts 8] [--max-tokens 128]
 """
@@ -14,7 +15,6 @@ Usage: capture_verify.py OUT_DIR [--sessions-skip 0|9] [--prompts 8] [--max-toke
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import signal
@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
 sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
 sys.path.insert(0, os.path.join(REPO, "analysis", "dsv41-drive", "router-capture"))
 import arm_env  # noqa: E402
+import run_locks  # noqa: E402
 import session_subset  # noqa: E402
 
 PORT = 30031
@@ -125,9 +126,7 @@ def main() -> int:
     sessions = write_sessions(session_subset.CORPUS_PATH, os.path.join(a.out_dir, "sessions.jsonl"), skip=a.sessions_skip, n=a.prompts)
     env = os.environ | server_env(a.out_dir) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
-    with open(DISK_LOCK, "w") as disk, open(arm_env.GPU_LOCK, "w") as gpu:
-        fcntl.flock(disk, fcntl.LOCK_EX)
-        fcntl.flock(gpu, fcntl.LOCK_EX)
+    with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(a.out_dir, "server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
                                       stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
