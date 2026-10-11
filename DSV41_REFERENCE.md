@@ -8070,6 +8070,14 @@ the SPCC (nvme4) reads 10/42 of each row instead of 1/3. The reference arm is `d
   `FATAL exl3 RAM miss: a copy wait held the decode stream for 2.0 s; group 1: its CPU job 7360 is not done`.
   The retry passed the same point cleanly. This is the only such abort under `ram-prefetch/`. Cause unknown; if it
   recurs (with or without weights), reproduce it offline with a CPU-experts miss over a weighted split.
+  Follow-up (2026-10-11, branch `codex/dsv41-loose-ends`): not reproduced offline. 6,480 CPU-only records with
+  6,110 CPU-miss lanes over 3-root splits `16:10:16`, `16:1:16` and `1:1:1`, three row sizes, misscut on and off, and the
+  read faults reverse_cqes, max_outstanding 1 and 2, pack_delay and a held sub-read: every CopyDone arrived, the
+  slowest in 0.25 s. The 2 s copy wait fires long before the 30 s request watchdog, so a CPU miss whose row has not
+  landed (its job is not submitted until then), a job queued behind a long draft forward, and a 2 s forward all print
+  the same line. The abort now tells them apart: `... is not done (submitted; the engine is running a target job
+  (row R) for N ms, done through job D)` or `(not submitted: a CPU miss whose row has not landed; the engine is
+  idle, ...)`.
 
 **Layer 0's experts predicted from the draft tokens (offline; branch `codex/dsv41-layer0-draft-predict` at
 `54144b065a`, script `analysis/dsv41-drive/dspark/layer0_draft_predict.py`, outputs
@@ -8096,7 +8104,10 @@ labels; 126 labelled verifies, 6.38 layer-0 NVMe rows per verify).
   on plain decode; rejected drafts have no ground truth); unrouted experts' tiers come from a recency model (0.71
   balanced accuracy); one capture of 8 convfinqa sessions; read queueing and evictions not simulated.
 - Found on the way: `verify_split.py` refuses this capture. Its single-offset join reaches 0.689 because the job trace
-  drops incomplete forwards; the layer-0 script joins forwards by their misses instead. `verify_split.py` is unfixed.
+  drops incomplete forwards; the layer-0 script joins forwards by their misses instead. Fixed 2026-10-11
+  (`codex/dsv41-loose-ends`): both scripts use `layer_misses.match_forwards`. On this capture all 126 job forwards join,
+  against 142 route lines (16 forwards dropped), and 38.1% of the misses are needed only by a rejected draft position
+  (88.7 misses per verify, 33.8 reject-only).
 - What would make it worth revisiting: a longer lead. Measure the ~60 ms between one verify's last layer and the next
   verify's layer 0 (drive idle time there; whether the draft tokens could be published earlier).
 
@@ -8316,7 +8327,9 @@ against ~0.31-0.32), with single sessions 80-100% slower (§33.20).
 - **Per-session drive load** is now in the A/B driver (`codex/dsv41-drive-sessions` at `365125f5cf`,
   `analysis/dsv41-drive/dspark/drive_sessions.py`): per session and mirror drive, GB read, busy s, busy s per GB, reads,
   bytes per read, MB written; a session is flagged when a drive's busy s per GB is over 15% above that drive's median.
-  The drive-idle check at an arm's start counts reads only, so it cannot see a writer.
+  The drive-idle check at an arm's start counted reads only, so it could not see a writer. From 2026-10-11
+  (`codex/dsv41-loose-ends`) it also limits sectors written (1 MiB/s, its own limit) and names the drives over each
+  limit in `busy`.
 - Remedies, in order: replace the SPCC with a third 990 EVO Plus; or, in software, cut the tail, since every row is
   on all three drives (re-issue a late SPCC piece to a Samsung, or shift its share while its recent latency is high).
 
