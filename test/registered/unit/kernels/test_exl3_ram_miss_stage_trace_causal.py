@@ -223,12 +223,12 @@ def test_an_enabled_trace_reads_the_clock_at_every_stamp(tmp_path):
         host.stop()
 
 
-# Every clock read in the file that is not a trace stamp: now_ns(), and any direct libc or std::chrono clock read
-# (CLOCK_READ below). A new one fails this test until it is either routed through stamp() (so the disabled trace
+# Every clock read in the file that is not a trace stamp: now_ns(), the job trace's clock_ns(), and any direct libc or
+# std::chrono clock read (CLOCK_READ below). A new one fails this test until it is either routed through stamp() (so the disabled trace
 # skips it) or added here as a deliberate non-trace read.
 NON_TRACE_CLOCK_READS = {
     "inline int64_t now_ns() {": 1,  # the clock itself
-    "clock_gettime(CLOCK_MONOTONIC, &ts);": 1,  # now_ns()'s body
+    "clock_gettime(CLOCK_MONOTONIC, &ts);": 2,  # now_ns()'s body, and the job trace's clock_ns() (below)
     "return now_ns();": 1,  # stamp() itself
     # Deadlines of callers that wait, never the service or copy thread serving a request: RamThread::pause() (and its
     # copy-idle wait), and fill_wait (the second "deadline" line and the "return -1" line).
@@ -262,18 +262,41 @@ NON_TRACE_CLOCK_READS = {
     "while (now_ns() < deadline) {": 1,
     # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, and the copy
     # latency's submit and completion reads.
-    "if constexpr (Build::kMetrics) start = now_ns();": 2,  # copy_issue_ns, and the RAM prefetch scorer's time
-    "stats_.add(kSpecScoreNs, now_ns() - start);": 1,  # the scorer's time, a metric on the speculative thread
+    # copy_issue_ns, and the RAM prefetch scorer's time: the CPU scorer's and the GPU scorer's candidate wait
+    # (serve_gpu_job, 2258a586b8), metrics on the speculative thread.
+    "if constexpr (Build::kMetrics) start = now_ns();": 3,
+    "stats_.add(kSpecScoreNs, now_ns() - start);": 2,
     "count<kCopyIssueNs>(now_ns() - start);": 1,
     "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
+    # The CPU job trace (job_trace.h, 636208496a): JobTrace<true> exists only in InstrBuild (JobTrace<Build::kMetrics>;
+    # JobTrace<false> is empty) and records only once SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX is set and its gate opens.
+    # Its own clock_ns() (definition, the CLOCK_MONOTONIC/REALTIME anchors once at construction, a pending draft's
+    # observation, each event), the copy thread's DMA-observation stamp (CopyEngine::observe_jobs, inside
+    # `if constexpr (Build::kMetrics)`), and the draft forward's selected/payload-ready stamps (DraftExperts::serve,
+    # 1cf2697ff8, both `if constexpr (Build::kMetrics)`).
+    "static int64_t clock_ns() {": 1,
+    "monotonic_ns_ = clock_ns();": 1,
+    "clock_gettime(CLOCK_REALTIME, &wall);": 1,
+    "observed_ns_ = active() ? clock_ns() : 0;": 1,
+    "emit_at(kind, clock_ns(), row, gen, seq, group, a, b, c);": 1,
+    "const int64_t before = now_ns();": 1,
+    "if constexpr (Build::kMetrics) selected = now_ns();": 1,
+    "if constexpr (Build::kMetrics) trace_.draft_prepared(now_ns(), stage, epoch, seq);": 1,
     # CpuExpertEngine (cpu_experts.h): one pair per CPU forward, a job of 0.5 ms or more on the CPU expert thread, off
     # the service thread; ProdBuild keeps it because the split's re-tune (cpu_stats' forward ns) reads it in serving.
     # ... and pause_ns, test only (refused on ProdBuild): one PAUSE probe on the caller's thread.
     # ... and the startup split calibration (split_calibration.h): once, on the calibrating caller's thread with the
     # service paused and the copy engine not armed, each run's start, its two completion stamps and its timeout.
     # ... and the engine's pair per draft forward (draft_forward_ns), on the CPU expert thread.
-    "const int64_t start = now_ns();": 4,
+    # ... and two waits that already spin, each the start and the "waited" line (17e4287be8, 2258a586b8): a two-stage CPU
+    # miss's stage_two (cpu_experts.h), only when its second-stage gate is still closed, on the CPU expert thread (its
+    # stage_two_wait_ns stat); and the GPU scorer's candidate-slot poll (RamTier::await_candidates, kCandWaitNs), on the
+    # speculative thread or spec_pump's caller, never the service or copy thread.
+    # ... and the two-stage test forward's gate (kernel_forward_two_stage, test only, refused on ProdBuild).
+    "const int64_t start = now_ns();": 7,
+    "const int64_t waited = now_ns() - start;": 2,
+    "g->waited += now_ns() - start;": 1,
     "const int64_t end = now_ns();": 2,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     "end = std::max(end, now_ns());": 2,
@@ -281,6 +304,9 @@ NON_TRACE_CLOCK_READS = {
     # The native test forward (ffi_test_exports.h, test only, refused on ProdBuild): its spin, on the CPU expert thread.
     "const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);": 1,
     "while (now_ns() < until)": 1,
+    # The read faults (reader_core.h, `requires(Build::kFaults)`, 17e4287be8): suffix_delay_ns's hold and release.
+    "if (faults_.held.empty()) faults_.held_since = now_ns();": 1,
+    "for (int64_t now = now_ns(); now < until; now = now_ns())": 1,
     # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
     # open and at a ring reset, never per read.
     "const auto t0 = std::chrono::steady_clock::now();": 1,
@@ -296,7 +322,7 @@ NON_TRACE_CLOCK_READS = {
     "now = std::max<int64_t>(1, now_ns() - origin_);": 1,
     "const int64_t now = std::max<int64_t>(1, now_ns() - origin_);": 1,
 }
-CLOCK_READ = re.compile(r"\bnow_ns\(\)|\b(?:steady|system|high_resolution)_clock::now\b|\bclock_gettime\s*\(")
+CLOCK_READ = re.compile(r"\b(?:now|clock)_ns\(\)|\b(?:steady|system|high_resolution)_clock::now\b|\bclock_gettime\s*\(")
 
 
 def test_no_ungated_clock_read_remains_on_the_request_path():
