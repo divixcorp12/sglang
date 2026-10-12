@@ -117,6 +117,32 @@ def test_eligible_denominators_match_across_scorers():
     assert tables["no_gate"].cells["reads=3"]["pooled"].read == 0
 
 
+class _Batched(_Fixed):
+    """Per-group scores keyed by seq, offered both one at a time and through score_many."""
+
+    def __init__(self, name, by_seq, rule):
+        self.name, self.by_seq, self.rule, self.calls = name, by_seq, rule, []
+
+    def __call__(self, g):
+        return b1_rows.TokenScores(scores=self.by_seq[g.seq], rule=self.rule)
+
+    def score_many(self, groups):
+        self.calls.append(len(groups))
+        return [self(g) for g in groups]
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 64])
+def test_score_many_gives_the_same_tables_as_one_group_at_a_time(chunk):
+    groups = [_group(seq=i, session=f"s{i % 2}", flagged=bool(i % 3), target_layer=LAYERS[i % 2]) for i in range(5)]
+    by_seq = {i: _scores([{7: 0.9 - 0.1 * i, 1: 0.5, 2: 0.05 * i}, {5: 0.3, 2: 0.6}]) for i in range(5)}
+    batched = _Batched("b", by_seq, "noisy_or")
+    single = type("Single", (), {"name": "b", "__call__": lambda self, g: batched(g)})()
+    want = b1_score.evaluate_many(iter(groups), [single], cuts=(0.5, 0.9))["b"]
+    got = b1_score.evaluate_many(iter(groups), [batched], cuts=(0.5, 0.9), chunk=chunk)["b"]
+    assert b1_score.table_to_json(got) == b1_score.table_to_json(want)
+    assert sum(batched.calls) == len(groups) and max(batched.calls) <= chunk
+
+
 def test_evaluate_matches_evaluate_many_and_reports_split_and_horizon():
     s = _Fixed("m", MARGIN_SCORES, "margin")
     one = b1_score.evaluate([_group()], s, cuts=(2.0,))

@@ -84,15 +84,15 @@ class _Ctx(msgspec.Struct, frozen=True):
     device: str
 
 
-def _full_config(*, device: str) -> RunConfig:
+def _full_config(*, device: str, compile: bool = False) -> RunConfig:
     return RunConfig(horizons=b1_rows.TRAINED_HORIZONS, grids={v: b1_select.grid(variant=v) for v in VARIANTS},
-                     train=b1_train.TrainConfig(device=device))
+                     train=b1_train.TrainConfig(device=device, compile=compile))
 
 
-def _smoke_config(*, device: str) -> RunConfig:
+def _smoke_config(*, device: str, compile: bool = False) -> RunConfig:
     return RunConfig(horizons=(1, 2), grids={v: b1_select.grid(variant=v)[:1] for v in VARIANTS},
-                     train=b1_train.TrainConfig(epochs=2, patience=1, device=device), bootstrap_n=200,
-                     cost_runs=50, cost_warmup=5)
+                     train=b1_train.TrainConfig(epochs=2, patience=1, device=device, compile=compile),
+                     bootstrap_n=200, cost_runs=50, cost_warmup=5)
 
 
 def _sha256_file(path: str) -> str:
@@ -186,8 +186,8 @@ def _load_pop(ctx: _Ctx, *, horizon: int) -> b1_baselines.PopScorer:
     return b1_baselines.PopScorer.from_json(json.dumps(doc[str(horizon)]))
 
 
-def _load_pca(ctx: _Ctx, *, horizon: int, rank: int) -> PCAStats:
-    path = os.path.join(_stage_dir(ctx, "fit"), f"pca_h{horizon}_r{rank}.pt")
+def _load_pca(ctx: _Ctx, *, rank: int) -> PCAStats:
+    path = os.path.join(_stage_dir(ctx, "fit"), f"pca_r{rank}.pt")
     t = torch.load(path, map_location="cpu", weights_only=True)
     return PCAStats(mean=t["mean"], components=t["components"], explained_variance=t["explained_variance"])
 
@@ -269,19 +269,21 @@ def _stage_dataset(ctx: _Ctx) -> dict:
 
 
 def _stage_fit(ctx: _Ctx) -> dict:
-    """Popularity and PCA from train-split groups only (R2), per horizon."""
+    """Popularity per horizon and one PCA per rank, from train-split rows only (R2).
+
+    x is stored once per session, so the horizons share one input distribution and one PCA per rank.
+    """
     out = _stage_dir(ctx, "fit")
     ranks = sorted({g["pca_rank"] for grid in ctx.cfg.grids.values() for g in grid})
-    x_of = _x_of(ctx)
     pops = {}
     for h in ctx.cfg.horizons:
         pop = b1_baselines.PopScorer.fit(_groups(ctx, split="train", horizon=h), num_experts=ctx.cfg.num_experts)
         pops[str(h)] = json.loads(pop.to_json())
-        for rank in ranks:
-            pca = b1_head.fit_train_pca(_groups(ctx, split="train", horizon=h), x_of=x_of, rank=rank,
-                                        max_rows=b1_train.PCA_MAX_ROWS, seed=ctx.cfg.train.seed)
-            torch.save({"mean": pca.mean.cpu(), "components": pca.components.cpu(),
-                        "explained_variance": pca.explained_variance.cpu()}, os.path.join(out, f"pca_h{h}_r{rank}.pt"))
+    for rank in ranks:
+        pca = b1_head.fit_train_pca_from_shards(ctx.dataset_dir, sessions=_train_sessions(ctx), rank=rank,
+                                                max_rows=b1_train.PCA_MAX_ROWS, seed=ctx.cfg.train.seed)
+        torch.save({"mean": pca.mean.cpu(), "components": pca.components.cpu(),
+                    "explained_variance": pca.explained_variance.cpu()}, os.path.join(out, f"pca_r{rank}.pt"))
     _write_json(os.path.join(out, "pop.json"), pops)
     return {"horizons": list(ctx.cfg.horizons), "ranks": ranks}
 
@@ -312,7 +314,7 @@ def _head_key(kwargs: dict) -> str:
 
 def _train_one(ctx: _Ctx, *, horizon: int, kwargs: dict, out: str) -> tuple[dict, b1_score.Table]:
     cfg = b1_head.HeadConfig(**{**kwargs, "num_experts": ctx.cfg.num_experts})
-    pca = _load_pca(ctx, horizon=horizon, rank=cfg.pca_rank)
+    pca = _load_pca(ctx, rank=cfg.pca_rank)
     x_of = _x_of(ctx)
     model, history = b1_train.train_head(
         cfg, ctx.cfg.train, train_groups=lambda: _groups(ctx, split="train", horizon=horizon),
@@ -367,9 +369,12 @@ def _stage_curve(ctx: _Ctx) -> dict:
             if len(subset) == len(sessions):
                 values.append(entry["dev_precision_r1"])
                 continue
+            # The subset's own PCA: no statistic of the sessions it leaves out reaches it.
+            pca = b1_head.fit_train_pca_from_shards(ctx.dataset_dir, sessions=subset, rank=cfg.pca_rank,
+                                                    max_rows=b1_train.PCA_MAX_ROWS, seed=ctx.cfg.train.seed)
             _, hist = b1_train.train_head(
                 cfg, ctx.cfg.train, train_groups=lambda s=subset: _groups(ctx, split="train", horizon=h, sessions=s),
-                dev_groups=lambda: _groups(ctx, split="dev", horizon=h), x_of=x_of)
+                dev_groups=lambda: _groups(ctx, split="dev", horizon=h), x_of=x_of, pca=pca)
             values.append(hist["best_dev_table"]["cells"]["reads=1"]["pooled"]["precision"])
         curve[variant] = dict(zip(LEARNING_LABELS, values, strict=True))
         improving[variant] = b1_select.still_improving(*values)
@@ -583,7 +588,7 @@ def _run_stages(*, ctx, fns: dict[str, Callable], selected: list[str]) -> dict[s
 def run(args: argparse.Namespace, *, cfg: RunConfig | None = None) -> dict:
     """Run the selected stages (resuming) and return results.json when the report stage has been done."""
     if cfg is None:
-        cfg = (_smoke_config if args.smoke else _full_config)(device=args.device)
+        cfg = (_smoke_config if args.smoke else _full_config)(device=args.device, compile=args.compile)
     dataset_dir = args.dataset or os.path.join(args.out, "dataset")
     ctx = _Ctx(model_path=args.model_path, corpus=args.corpus, integrity=args.integrity, out=args.out,
                dataset_dir=dataset_dir, cfg=cfg, smoke=args.smoke, device=args.device)
@@ -602,6 +607,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--stages", nargs="+", choices=STAGES, help="default: all, in order")
     p.add_argument("--device", default="cuda")
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--compile", action="store_true", help="torch.compile the head's MLP for training")
     p.add_argument("--allow-any-out", action="store_true", help="tests only: accept an --out off /mnt/nvme1")
     args = p.parse_args(argv)
     if args.smoke and args.dataset:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterable
+from typing import Protocol, runtime_checkable
 
 import msgspec
 import numpy as np
@@ -113,11 +114,7 @@ def _aggregate(ts: TokenScores, *, skip: np.ndarray, k: int) -> np.ndarray:
     return np.where(finite.any(axis=0) & ~skip, value, -np.inf)
 
 
-def candidates(g: Group, ts: TokenScores, *, k: int = b1_rows.GATE_DEPTH) -> list[tuple[int, float]]:
-    """(expert, value) the forward could read at the target, by (-value, id); hot and RAM rows removed, floor applied.
-
-    'margin' keeps up to k per token by margin to the token's 6th score; 'noisy_or' is 1 - prod(1 - p); 'count' sums.
-    """
+def _candidate_arrays(g: Group, ts: TokenScores, *, k: int) -> tuple[np.ndarray, np.ndarray]:
     num_experts = int(np.asarray(ts.scores).shape[1])
     value = _aggregate(ts, skip=_skip_mask(g, num_experts=num_experts), k=k)
     ok = np.isfinite(value)
@@ -126,7 +123,16 @@ def candidates(g: Group, ts: TokenScores, *, k: int = b1_rows.GATE_DEPTH) -> lis
     ids = np.nonzero(ok)[0]
     vals = value[ids]
     order = np.lexsort((ids, -vals))
-    return [(int(ids[i]), float(vals[i])) for i in order]
+    return ids[order], vals[order]
+
+
+def candidates(g: Group, ts: TokenScores, *, k: int = b1_rows.GATE_DEPTH) -> list[tuple[int, float]]:
+    """(expert, value) the forward could read at the target, by (-value, id); hot and RAM rows removed, floor applied.
+
+    'margin' keeps up to k per token by margin to the token's 6th score; 'noisy_or' is 1 - prod(1 - p); 'count' sums.
+    """
+    ids, vals = _candidate_arrays(g, ts, k=k)
+    return [(int(e), float(v)) for e, v in zip(ids, vals)]
 
 
 def _labels(g: Group) -> _Labels:
@@ -143,9 +149,9 @@ def _cut_key(cut: float) -> str:
     return f"cut={float(cut)!r}"
 
 
-def _budgets(cand: list[tuple[int, float]], *, reads, cuts) -> dict[str, list[int]]:
-    out = {f"reads={r}": [e for e, _ in cand[:r]] for r in reads}
-    out.update({_cut_key(c): [e for e, v in cand if v >= c] for c in cuts})
+def _budgets(ids: np.ndarray, vals: np.ndarray, *, reads, cuts) -> dict[str, list[int]]:
+    out = {f"reads={r}": ids[:r].tolist() for r in reads}
+    out.update({_cut_key(c): ids[vals >= c].tolist() for c in cuts})
     return out
 
 
@@ -165,11 +171,12 @@ def _add(cells: dict[str, Cell], *, labels: _Labels, read: list[int]) -> None:
         c.saved_ms_hi += hi * useful
 
 
-def _calibrate(counts: np.ndarray, *, cand: list[tuple[int, float]], labels: _Labels) -> None:
-    for e, v in cand:
-        b = min(int(v * CALIBRATION_BINS), CALIBRATION_BINS - 1)
-        counts[b, 0] += 1
-        counts[b, 1] += e in labels.eligible
+def _calibrate(counts: np.ndarray, *, ids: np.ndarray, vals: np.ndarray, labels: _Labels) -> None:
+    # Truncation toward zero, as int(v * bins) does; noisy-or values are in [0, 1].
+    bins = np.minimum((vals * CALIBRATION_BINS).astype(np.int64), CALIBRATION_BINS - 1)
+    hit = np.isin(ids, np.fromiter(labels.eligible, dtype=np.int64, count=len(labels.eligible)))
+    counts[:, 0] += np.bincount(bins, minlength=CALIBRATION_BINS)
+    counts[:, 1] += np.bincount(bins[hit], minlength=CALIBRATION_BINS)
 
 
 def _calibration_bins(counts: np.ndarray) -> list[tuple[float, float, int, int]]:
@@ -177,31 +184,59 @@ def _calibration_bins(counts: np.ndarray) -> list[tuple[float, float, int, int]]
     return [(i * width, (i + 1) * width, int(counts[i, 0]), int(counts[i, 1])) for i in range(CALIBRATION_BINS)]
 
 
+@runtime_checkable
+class BatchScorer(Protocol):
+    """A scorer that can score many groups in one call (one forward for a learned head)."""
+
+    name: str
+
+    def score_many(self, groups: list[Group]) -> list[TokenScores]: ...
+
+
+def _chunks(groups: Iterable[Group], *, size: int) -> Iterable[list[Group]]:
+    chunk: list[Group] = []
+    for g in groups:
+        chunk.append(g)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _score_chunk(s: Scorer, chunk: list[Group]) -> list[TokenScores]:
+    return s.score_many(chunk) if isinstance(s, BatchScorer) else [s(g) for g in chunk]
+
+
 def evaluate_many(groups: Iterable[Group], scorers: list[Scorer], *, reads=READS, cuts=(),
-                  k: int = b1_rows.GATE_DEPTH) -> dict[str, Table]:
-    """One streaming pass over ``groups``: every scorer sees the same groups, labels and denominators."""
+                  k: int = b1_rows.GATE_DEPTH, chunk: int = 512) -> dict[str, Table]:
+    """One streaming pass over ``groups``: every scorer sees the same groups, labels and denominators.
+
+    Groups are scored ``chunk`` at a time, through ``score_many`` when a scorer has it; results do not depend on it.
+    """
     cells = {s.name: {} for s in scorers}
     calib = {s.name: np.zeros((CALIBRATION_BINS, 2), np.int64) for s in scorers}
     probabilistic: dict[str, bool] = {}
     split, horizon = "", 0
-    for g in groups:
-        split, horizon = g.split, g.horizon
-        labels = _labels(g)
+    for part in _chunks(groups, size=chunk):
+        split, horizon = part[-1].split, part[-1].horizon
+        labels = [_labels(g) for g in part]
         for s in scorers:
-            ts = s(g)
-            cand = candidates(g, ts, k=k)
-            for budget, read in _budgets(cand, reads=reads, cuts=cuts).items():
-                _add(cells[s.name].setdefault(budget, {}), labels=labels, read=read)
-            probabilistic[s.name] = ts.rule == "noisy_or"
-            if probabilistic[s.name]:
-                _calibrate(calib[s.name], cand=cand, labels=labels)
+            for g, lab, ts in zip(part, labels, _score_chunk(s, part), strict=True):
+                ids, vals = _candidate_arrays(g, ts, k=k)
+                for budget, read in _budgets(ids, vals, reads=reads, cuts=cuts).items():
+                    _add(cells[s.name].setdefault(budget, {}), labels=lab, read=read)
+                probabilistic[s.name] = ts.rule == "noisy_or"
+                if probabilistic[s.name]:
+                    _calibrate(calib[s.name], ids=ids, vals=vals, labels=lab)
     return {s.name: Table(scorer=s.name, split=split, horizon=horizon, cells=cells[s.name],
                           calibration=_calibration_bins(calib[s.name]) if probabilistic.get(s.name) else [])
             for s in scorers}
 
 
-def evaluate(groups: Iterable[Group], scorer: Scorer, *, reads=READS, cuts=(), k: int = b1_rows.GATE_DEPTH) -> Table:
-    return evaluate_many(groups, [scorer], reads=reads, cuts=cuts, k=k)[scorer.name]
+def evaluate(groups: Iterable[Group], scorer: Scorer, *, reads=READS, cuts=(), k: int = b1_rows.GATE_DEPTH,
+             chunk: int = 512) -> Table:
+    return evaluate_many(groups, [scorer], reads=reads, cuts=cuts, k=k, chunk=chunk)[scorer.name]
 
 
 def _cut_sweep(table: Table) -> list[tuple[float, Cell]]:

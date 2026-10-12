@@ -66,6 +66,83 @@ def test_batch_shapes_and_labels(variant, dense):
     assert not (batch.y * batch.hard_neg).any()
 
 
+def _reference_batch(groups, *, model):
+    """The original per-group make_batch, kept as the oracle for the vectorised one."""
+    from sglang.srt.layers.moe.expert_prediction.training import llapor
+    from sglang.srt.layers.moe.residency_capture_ref import KIND_VRAM_HOT
+
+    cfg, pca, vocab, e = model.cfg, model.pca, model.vocab, model.cfg.num_experts
+    us, ys, negs = [], [], []
+    for g in groups:
+        feats = llapor.encode_features(torch.from_numpy(_x_of(g)), torch.from_numpy(g.source_ids.astype(np.int64)),
+                                       torch.from_numpy(g.source_weights.astype(np.float32)), pca=pca, num_experts=e)
+        ids = torch.from_numpy(g.gate_ids.astype(np.int64))
+        scores = torch.from_numpy(g.gate_scores.astype(np.float32))
+        valid = (ids >= 0) & torch.isfinite(scores)
+        scores = torch.where(valid, scores, torch.zeros_like(scores))
+        margin = torch.where(valid, scores - scores[:, 5:6], torch.zeros_like(scores))
+        dense = []
+        for src in (scores, margin, valid.float()):
+            d = torch.zeros((len(ids), e))
+            d.scatter_add_(1, ids.clamp_min(0), src * valid.float())
+            dense.append(d)
+        tids = torch.from_numpy(g.target_ids.astype(np.int64))
+        y = torch.zeros((len(tids), e))
+        y.scatter_add_(1, tids.clamp_min(0), torch.from_numpy((g.target_ids >= 0) & (g.target_kinds != KIND_VRAM_HOT)).float())
+        routed = torch.zeros((len(tids), e))
+        routed.scatter_add_(1, tids.clamp_min(0), torch.from_numpy(g.target_ids >= 0).float())
+        us.append(torch.cat([feats, dense[0], dense[1]], -1) if cfg.variant == "E5" else feats)
+        ys.append(y.clamp(max=1.0))
+        negs.append(dense[2] * (1.0 - routed.clamp(max=1.0)))
+    layer_ix = {layer: i for i, layer in enumerate(vocab.layers)}
+    counts = [len(g.tokens) for g in groups]
+    rep = lambda vals: torch.tensor(np.repeat(np.array(vals, dtype=np.int64), counts))  # noqa: E731
+    return dict(u=torch.cat(us), y=torch.cat(ys), hard_neg=torch.cat(negs),
+                source_layer=rep([layer_ix[g.source_layer] for g in groups]),
+                target_layer=rep([layer_ix[g.target_layer] for g in groups]),
+                stratum=rep([vocab.strata.index(g.target_stratum) for g in groups]))
+
+
+@pytest.mark.parametrize("variant", ["E2", "E5"])
+def test_vectorised_batch_matches_the_per_group_reference(variant):
+    model, groups = _model(variant)
+    mixed = groups + [_group(seq=20, source_row=1, split="train", n=1, has_bias=False),
+                      _group(seq=21, source_row=2, split="train", n=2, has_bias=False)]
+    vocab = b1_head.Vocab.from_rows(mixed)
+    model = b1_head.B1Head(model.cfg, pca=model.pca, vocab=vocab)
+    got = b1_head.make_batch(mixed, x_of=_x_of, pca=model.pca, cfg=model.cfg, vocab=model.vocab)
+    want = _reference_batch(mixed, model=model)
+    for name, tensor in want.items():
+        assert torch.allclose(getattr(got, name).float(), tensor.float(), atol=1e-5), name
+
+
+def test_score_many_matches_one_group_at_a_time():
+    model, groups = _model("E5")
+    scorer = b1_head.HeadScorer(model, x_of=_x_of, name="e5")
+    many = scorer.score_many(groups)
+    assert len(many) == len(groups)
+    for g, ts in zip(groups, many, strict=True):
+        np.testing.assert_allclose(ts.scores, scorer(g).scores, atol=1e-6)
+
+
+def test_pca_from_shards_reads_only_train_and_is_seeded(tmp_path):
+    rng = np.random.default_rng(0)
+    for split, session, rows in (("train", "a/1", 7), ("train", "b", 9), ("dev", "c", 5)):
+        x = (rng.standard_normal((rows, DIM)).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+        b1_rows.write_x(tmp_path, split=split, session=session, x=x)
+    a = b1_head.fit_train_pca_from_shards(tmp_path, sessions=["a/1", "b"], rank=RANK, max_rows=12, seed=1)
+    b = b1_head.fit_train_pca_from_shards(tmp_path, sessions=["a/1", "b"], rank=RANK, max_rows=12, seed=1)
+    assert a.components.shape == (RANK, DIM) and torch.equal(a.components, b.components)
+    with pytest.raises(FileNotFoundError):
+        b1_head.fit_train_pca_from_shards(tmp_path, sessions=["c"], rank=RANK, max_rows=12, seed=1)
+    # With max_rows above the 16 train rows every row is used: the mean is the mean of the train x shards only.
+    every = b1_head.fit_train_pca_from_shards(tmp_path, sessions=["a/1", "b"], rank=RANK, max_rows=100, seed=1)
+    import router_score
+    rows = np.concatenate([router_score.bf16_to_f32(np.asarray(b1_rows.read_x(tmp_path, split="train", session=s)))
+                           for s in ("a/1", "b")])
+    assert torch.allclose(every.mean, torch.from_numpy(rows).mean(0), atol=1e-5)
+
+
 def test_embeddings_follow_the_vocab_and_logits_shape():
     model, groups = _model()
     assert model.source_emb.num_embeddings == len(model.vocab.layers)

@@ -44,6 +44,8 @@ class TrainConfig(msgspec.Struct, frozen=True):
     patience: int = 3
     seed: int = 0
     device: str = "cpu"
+    compile: bool = False  # torch.compile the MLP for training; the embeddings and batching stay eager
+    compile_backend: str = "inductor"
 
 
 def nested_subsets(sessions: list[str], *, fractions=(0.25, 0.5, 1.0), seed: int) -> list[list[str]]:
@@ -91,13 +93,21 @@ def _cosine(total_steps: int) -> Callable[[int], float]:
     return lambda step: 0.5 * (1.0 + math.cos(math.pi * min(1.0, step / max(1, total_steps))))
 
 
+def _predictor(model: b1_head.B1Head, tcfg: TrainConfig) -> Callable[[torch.Tensor], torch.Tensor]:
+    # Compiling the submodule leaves model.state_dict() keys unchanged; batch sizes vary, hence dynamic.
+    if not tcfg.compile:
+        return model.predictor
+    return torch.compile(model.predictor, dynamic=True, backend=tcfg.compile_backend)
+
+
 def _train_epoch(model: b1_head.B1Head, opt: torch.optim.Optimizer, sched, *, groups: Iterable[b1_rows.Group],
-                 x_of, tcfg: TrainConfig, rng: np.random.Generator) -> float:
+                 x_of, tcfg: TrainConfig, rng: np.random.Generator,
+                 predict: Callable[[torch.Tensor], torch.Tensor]) -> float:
     model.train()
     total, count = 0.0, 0
     for batch_groups in _batches(groups, batch_rows=tcfg.batch_rows, rng=rng):
         batch = b1_head.make_batch(batch_groups, x_of=x_of, pca=model.pca, cfg=model.cfg, vocab=model.vocab)
-        loss = b1_head.head_loss(model(batch), batch, cfg=model.cfg)
+        loss = b1_head.head_loss(predict(model.inputs(batch)), batch, cfg=model.cfg)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -126,11 +136,13 @@ def train_head(cfg: b1_head.HeadConfig, tcfg: TrainConfig, *, train_groups: Call
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     total = tcfg.epochs * _steps_per_epoch(train_groups(), batch_rows=tcfg.batch_rows)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, _cosine(total))
+    predict = _predictor(model, tcfg)
 
     history: list[dict] = []
     best_recall, best_epoch, best_state, best_table = -1.0, -1, None, None
     for epoch in range(tcfg.epochs):
-        loss = _train_epoch(model, opt, sched, groups=train_groups(), x_of=x_of, tcfg=tcfg, rng=rng)
+        loss = _train_epoch(model, opt, sched, groups=train_groups(), x_of=x_of, tcfg=tcfg, rng=rng,
+                            predict=predict)
         table = _dev_table(model, groups=dev_groups(), x_of=x_of)
         recall = table.cells["reads=1"]["pooled"].recall
         history.append({"epoch": epoch, "loss": loss, "dev_recall_at_1": recall})

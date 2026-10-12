@@ -36,12 +36,21 @@ def _planted(seq, *, split):
     return msgspec.structs.replace(g, target_ids=ids, target_kinds=kinds)
 
 
-def _run(seed=0):
+def _run(seed=0, **train_kwargs):
     train = [_planted(i, split="train") for i in range(400)]
     dev = [_planted(1000 + i, split="dev") for i in range(100)]
     cfg = b1_head.HeadConfig(pca_rank=RANK, hidden=32, emb_dim=4, dropout=0.0)
-    tcfg = b1_train.TrainConfig(epochs=25, lr=1e-2, batch_rows=32, patience=5, seed=seed)
+    tcfg = b1_train.TrainConfig(epochs=25, lr=1e-2, batch_rows=32, patience=5, seed=seed, **train_kwargs)
     return b1_train.train_head(cfg, tcfg, train_groups=lambda: train, dev_groups=lambda: dev, x_of=_x_of)
+
+
+def test_compiled_training_matches_eager_and_keeps_state_dict_keys():
+    # The eager backend runs dynamo's graph capture on the real path without CPU codegen.
+    a, ha = _run(seed=3)
+    b, hb = _run(seed=3, compile=True, compile_backend="eager")
+    assert [h["dev_recall_at_1"] for h in ha["history"]] == [h["dev_recall_at_1"] for h in hb["history"]]
+    np.testing.assert_allclose([h["loss"] for h in ha["history"]], [h["loss"] for h in hb["history"]], rtol=1e-5)
+    assert list(a.state_dict()) == list(b.state_dict())
 
 
 def test_planted_rule_is_learned_to_high_recall():
