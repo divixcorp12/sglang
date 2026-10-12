@@ -1153,7 +1153,7 @@ git commit -m "feat(cpu-experts): CpuExpertKernel interface; ExpertForward is a 
 Claude-Session: https://claude.ai/code/session_01FVzWUFXT8SqY4pbyJn21Ft"
 ```
 
-`SYNC`, then `RUN_CPU test/registered/unit/kernels/test_cpu_experts_common.py test/registered/unit/kernels/test_cpu_experts_abi.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py test/registered/unit/kernels/test_cpu_experts_layout.py`. Expected: all pass (the plain and asan-ubsan harness runs report every `CHECKS` name). Then `NVFP4_AB t1` (both PASS) and `CPU_CHECKS t1` (`ALL GREEN (check)`). A red harness check is fixed with a follow-up commit, never an amend.
+`SYNC`, then `RUN_CPU test/registered/unit/kernels/test_cpu_experts_common.py test/registered/unit/kernels/test_cpu_experts_abi.py test/manual/dsv41/test_nvfp4_cpu_build.py test/manual/dsv41/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py test/registered/unit/kernels/test_cpu_experts_layout.py`. Expected: all pass (the plain and asan-ubsan harness runs report every `CHECKS` name). Then `NVFP4_AB t1` (both PASS) and `CPU_CHECKS t1` (`ALL GREEN (check)`). A red harness check is fixed with a follow-up commit, never an amend.
 
 ---
 
@@ -1297,7 +1297,7 @@ Also update the module docstring: "... and ``cpu_experts_cross_library_check.cpp
 - Modify: `python/sglang/srt/layers/quantization/nvfp4/build.py`, `python/sglang/srt/layers/quantization/nvfp4/ext.py`
 - Modify: `python/sglang/srt/layers/quantization/exl3/schemes/exl3_cpu_experts.py`, `python/sglang/srt/layers/quantization/nvfp4/schemes/nvfp4_cpu_experts.py`
 - Modify: `python/sglang/srt/layers/moe/cpu_experts/pool.py` (Protocol gains two methods)
-- Test: `test/registered/unit/kernels/test_nvfp4_cpu_build.py`, `test/registered/unit/kernels/test_nvfp4_cpu_experts.py`, `test/registered/unit/kernels/test_cpu_expert_pool.py`, `test/manual/dsv41/test_cpu_expert_engines_exl3.py`
+- Test: `test/manual/dsv41/test_nvfp4_cpu_build.py`, `test/manual/dsv41/test_nvfp4_cpu_experts.py`, `test/registered/unit/kernels/test_cpu_expert_pool.py`, `test/manual/dsv41/test_cpu_expert_engines_exl3.py`
 
 **Interfaces:**
 - Consumes: `exl3_cpu_kernel()`, `nvfp4_cpu_kernel()` (Task 1).
@@ -1395,7 +1395,7 @@ def test_the_extension_hands_out_one_kernel_address():
     assert address != 0 and trait.kernel_address() == address
 ```
 
-- [ ] **Step 2: Run to verify they fail.** Commit the tests (`test(cpu-experts): kernel addresses and layer specs`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py`. Expected: the four new tests fail (`has no attribute 'nvfp4_cpu_kernel_address'`, `nvfp4_cpu_module`, `unexpected keyword argument 'module'`, `has no attribute 'layer_spec'`).
+- [ ] **Step 2: Run to verify they fail.** Commit the tests (`test(cpu-experts): kernel addresses and layer specs`), `SYNC`, `RUN_CPU test/manual/dsv41/test_nvfp4_cpu_build.py test/manual/dsv41/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py`. Expected: the four new tests fail (`has no attribute 'nvfp4_cpu_kernel_address'`, `nvfp4_cpu_module`, `unexpected keyword argument 'module'`, `has no attribute 'layer_spec'`).
 
 - [ ] **Step 3: The bindings.** Create `exl3/optimized/torch_ops.cpp`:
 
@@ -2382,7 +2382,7 @@ struct BareLayers {
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h` (three exports)
 - Modify: `python/sglang/kernels/ops/moe/expert_stream_transport.py` (`TEST_ONLY_EXPORTS`, module functions `kernel_layer`, `kernel_forward`, `kernel_drop`)
-- Modify: `test/registered/unit/kernels/test_nvfp4_cpu_experts.py`, `test/registered/unit/kernels/test_expert_stream_build_variants.py`
+- Modify: `test/manual/dsv41/test_nvfp4_cpu_experts.py`, `test/registered/unit/kernels/test_expert_stream_build_variants.py`
 - Modify: `test/manual/dsv41/exl3_cpu_forward_ab.py`, `test/manual/dsv41/test_cpu_expert_engines_exl3.py`
 
 **Interfaces:**
@@ -2539,7 +2539,7 @@ and `calls` gains (with `from sglang.test.dsv41_ram_miss_fixtures import fake_cp
 
 `test/manual/dsv41/exl3_cpu_forward_ab.py`: `register_slabs(ext, s, limit)` returns `(es.kernel_layer(trait.kernel_address(), trait.layer_spec(s, CAP)), trait)` (exit on `RuntimeError` as today); the `slabs` registration's forward is `status, why = es.kernel_forward(handle, x, sel, w.float(), out, threads=THREADS)` (exit naming the case unless `status == 0`); `engines` mode splits `--cores` into two halves and runs each half's cases on its own thread through `kernel_forward(..., cores=half)` (rename it `--registration cores`, keeping `engines` as an accepted alias so the check script's history reads); cleanup is `es.kernel_drop(handle)` for slab layers, `ext.exl3_moe_cpu_free_layer(handle)` for table layers. Fp16 weights widen exactly to fp32 and the kernel narrows them back, so the dumps stay bit-exact. Update its docstring to name `kernel_forward` instead of "the C ABI's forward". `test/manual/dsv41/test_cpu_expert_engines_exl3.py`: `_forward(trait, layer, x, slots, weights, cores, threads)` returns `(status, out)` from `es.kernel_forward(..., cores=cores)`; the test creates the layer with `kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(...), CAP))` and runs on `cores[:2]` and `cores[2:4]`; its docstring's "engines" become "core groups".
 
-- [ ] **Step 2: Run to verify they fail.** Commit, `SYNC`, `RUN_CPU test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_expert_stream_build_variants.py` -- expected FAIL (`module ... has no attribute 'kernel_layer'`).
+- [ ] **Step 2: Run to verify they fail.** Commit, `SYNC`, `RUN_CPU test/manual/dsv41/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_expert_stream_build_variants.py` -- expected FAIL (`module ... has no attribute 'kernel_layer'`).
 
 - [ ] **Step 3: Implement the exports** in `HostTestExports` (instr only; prod refuses through `test_only`):
 
@@ -2693,7 +2693,7 @@ def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = No
 
 (`_host_module(layout, variant)` resolves `variant=None` to the environment's build; the tests pass `variant="instr"` where the default would be prod. The error string is read on the same thread, so the thread-local holds it.)
 
-- [ ] **Step 4: Run.** Commit (`test(cpu-experts): kernel correctness through the host's kernel test exports`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_expert_stream_build_variants.py` -- all pass. `SUITE_EXT` -- pass. `CPU_CHECKS t6` -- `ALL GREEN (check)` (its `slabs` dumps now run through `kernel_forward`, compared with the make_layer baseline).
+- [ ] **Step 4: Run.** Commit (`test(cpu-experts): kernel correctness through the host's kernel test exports`), `SYNC`, `RUN_CPU test/manual/dsv41/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_expert_stream_build_variants.py` -- all pass. `SUITE_EXT` -- pass. `CPU_CHECKS t6` -- `ALL GREEN (check)` (its `slabs` dumps now run through `kernel_forward`, compared with the make_layer baseline).
 
 ---
 
@@ -2704,7 +2704,7 @@ def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = No
 - Create: `test/registered/unit/kernels/test_cpu_expert_service.py`
 - Modify: `python/sglang/srt/layers/moe/cpu_experts/trait.py` (gains the Protocol), `service.py` (imports)
 - Modify: `python/sglang/srt/layers/quantization/exl3/schemes/exl3_cpu_experts.py`, `python/sglang/srt/layers/quantization/nvfp4/schemes/nvfp4_cpu_experts.py`, `python/sglang/srt/layers/quantization/nvfp4/ext.py`
-- Modify: `test/registered/unit/kernels/test_nvfp4_cpu_build.py` (`test_the_loader_builds_once_per_content_and_reuses_the_library`), `test/manual/dsv41/test_cpu_expert_engines_exl3.py` (helpers move in), `test/manual/dsv41/run_exl3_cpu_forward_checks.sh` (pytest step)
+- Modify: `test/manual/dsv41/test_nvfp4_cpu_build.py` (`test_the_loader_builds_once_per_content_and_reuses_the_library`), `test/manual/dsv41/test_cpu_expert_engines_exl3.py` (helpers move in), `test/manual/dsv41/run_exl3_cpu_forward_checks.sh` (pytest step)
 
 **Interfaces:**
 - Consumes: everything above.
@@ -2727,7 +2727,7 @@ def test_the_pool_and_the_c_abi_mirrors_are_gone():
 
 - [ ] **Step 2: Run to verify it fails.** `git rm test/registered/unit/kernels/test_cpu_expert_pool.py test/registered/unit/kernels/test_cpu_experts_abi.py test/manual/dsv41/test_cpu_expert_pool_exl3.py`, `git add` the new file and the moved helpers, commit (`test(cpu-experts): service, policy and trait tests leave the pool's file`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_expert_service.py`. Expected: `test_the_pool_and_the_c_abi_mirrors_are_gone` FAILS (`cannot import name 'CpuExpertQuantTrait'`); every moved test passes.
 - [ ] **Step 3: Implement.** Move the `CpuExpertQuantTrait` Protocol into `trait.py` with only the members listed under Produces (its docstring: "One expert format's CPU kernel. ``slab_names`` are the pinned-tier tensors it reads; ``kernel_address`` and ``layer_spec`` are what the RAM-miss service gives the host (``expert_stream/host/cpu_experts/kernel.hpp``); its CPU expert threads run the kernel without Python.") and `git rm python/sglang/srt/layers/moe/cpu_experts/pool.py`. In both scheme files delete the removed methods and ctypes structs (the params are `struct.pack` already) and rewrite the module docstrings: EXL3 "The kernel is the optimized build of exllamav3's CPU MoE kernel, ``csrc/exl3/optimized/kernel.cpp`` (built by SGLANG_DSV41_CPU_EXPERTS=1). ``Exl3CpuQuantTrait`` describes each streamed layer's pinned slabs for the kernel's ``make_layer`` (``layer_spec``) and hands out the kernel's address (the extension's torch op ``sglang_exl3_cpu::kernel_address``)."; NVFP4 likewise with "loaded by ``nvfp4.ext.nvfp4_cpu_module``" and "its tvm-ffi export ``nvfp4_cpu_kernel_address``". `Nvfp4CpuQuantTrait` loses `library` (keeps `module`). In `nvfp4/ext.py` delete `nvfp4_cpu_library` and the `ctypes` import, and update the docstring. `test_the_loader_builds_once_per_content_and_reuses_the_library` uses `nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()` / `nvfp4_cpu_library_path(str(tmp_path))`. In `run_exl3_cpu_forward_checks.sh`, the pytest step runs `test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py`, and its header comment's "(4) the CPU expert pool tests" becomes "(4) the CPU expert engine and service tests".
-- [ ] **Step 4: Run.** `git grep -nE '\b(CpuExpertPool|CpuExpertForward|CpuExpertsForwardCall|CpuExpertsLayer)\b|\b(native_forward|native_keep_warm|native_create_engine|native_free_engine|register_layer|free_layer)\s*\(' -- '*.py'` -- expected: no output (C++ keeps the C ABI until Task 9; the deletion test names the methods only as strings). Commit (`refactor(cpu-experts): delete CpuExpertPool and the traits' ctypes halves`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_expert_service.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py`, then `POOL=test/registered/unit/kernels/test_cpu_expert_service.py KIFACE_CPU` -- `EXIT=0`. `SUITE_EXT` (now without the deleted file) -- pass. `CPU_CHECKS t7` -- `ALL GREEN (check)`.
+- [ ] **Step 4: Run.** `git grep -nE '\b(CpuExpertPool|CpuExpertForward|CpuExpertsForwardCall|CpuExpertsLayer)\b|\b(native_forward|native_keep_warm|native_create_engine|native_free_engine|register_layer|free_layer)\s*\(' -- '*.py'` -- expected: no output (C++ keeps the C ABI until Task 9; the deletion test names the methods only as strings). Commit (`refactor(cpu-experts): delete CpuExpertPool and the traits' ctypes halves`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_expert_service.py test/manual/dsv41/test_nvfp4_cpu_build.py test/manual/dsv41/test_nvfp4_cpu_experts.py`, then `POOL=test/registered/unit/kernels/test_cpu_expert_service.py KIFACE_CPU` -- `EXIT=0`. `SUITE_EXT` (now without the deleted file) -- pass. `CPU_CHECKS t7` -- `ALL GREEN (check)`.
 
 ---
 
@@ -2738,7 +2738,7 @@ def test_the_pool_and_the_c_abi_mirrors_are_gone():
 - Modify: `python/sglang/kernels/jit/csrc/exl3/moe_mul1.cpp:20-22,2665-2704`
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/cpu_forward.cpp`, `bench/CMakeLists.txt:76-77` (comment)
 - Modify: `python/sglang/kernels/jit/csrc/nvfp4/bench/src/cpu_forward.cpp`
-- Modify: `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp`, `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`
+- Modify: `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp`, `test/manual/dsv41/nvfp4_cpu_sanitizer.cpp`
 
 **Interfaces:**
 - Consumes: the accessors (Task 1).
@@ -2832,7 +2832,7 @@ void exl3_moe_cpu_baseline_set_cores(std::span<const int> cores)
 ```
 
 and in `main`, `g_cores = cores;` then `#ifdef EXL3_BENCH_BASELINE exl3_moe_cpu_baseline_set_cores(cores); #endif` (the optimized backend needs no setup: the cores ride on each call). Update the file comment ("one full forward through the kernel interface, per backend ... timed from the forward call alone") and the CMake comment at `CMakeLists.txt:76` ("the baseline copy includes the vendored kernel's own headers beside the source").
-- [ ] **Step 5: NVFP4 bench and harnesses.** In each of `nvfp4/bench/src/cpu_forward.cpp`, `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp` and `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`: include `"kernel.h"` and `"quant.hpp"` (for `SglangNvfp4CpuParams`; the latter replaces `"cpu_experts_cabi.h"`), make layers with `::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)))` from a `LayerSlabs d` filled with today's descriptor values, and run forwards through `kernel.forward(*layer, call)` with `call.cores` = the harness's core list (where it created an engine). Statuses the harnesses write or assert come from one helper, so the A/B dump stays byte-identical:
+- [ ] **Step 5: NVFP4 bench and harnesses.** In each of `nvfp4/bench/src/cpu_forward.cpp`, `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp` and `test/manual/dsv41/nvfp4_cpu_sanitizer.cpp`: include `"kernel.h"` and `"quant.hpp"` (for `SglangNvfp4CpuParams`; the latter replaces `"cpu_experts_cabi.h"`), make layers with `::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)))` from a `LayerSlabs d` filled with today's descriptor values, and run forwards through `kernel.forward(*layer, call)` with `call.cores` = the harness's core list (where it created an engine). Statuses the harnesses write or assert come from one helper, so the A/B dump stays byte-identical:
 
 ```cpp
 // The C ABI's status for what a kernel call threw: 0 none, 2 std::invalid_argument, 1 any other exception.
@@ -2851,7 +2851,7 @@ int status_of(F&& f)
 ```
 
 In the sanitizer, `register_layer(...) == 2` asserts become `status_of([&] { kernel.make_layer(d, params); }) == 2`; `forward(nullptr) == 2` is deleted (no null call exists); the keep-warm asserts become `status_of([&] { kernel.keep_warm({}, 2, &word, 0, INT64_MAX); }) == 0`, `... keep_warm({}, 0, ...) == 2`, and the never-created-engine case becomes a repeated core: `const int twice[2] = {0, 0}; assert(status_of([&] { kernel.keep_warm(twice, 1, &word, 0, INT64_MAX); }) == 2);`; `free_layer` calls go (the `unique_ptr` frees). In the A/B harness, `engine_create` failing printed "engine_create refused" -- replace it with a `check_cores`-equivalent `status_of` around the first forward, keeping the dump's format and order unchanged (read the harness's write order before editing; only the means of calling changes).
-- [ ] **Step 6: Run.** Commit (`refactor(cpu-experts): benches and harnesses call the kernel interface; upstream's handle API keeps its own table`), `SYNC`. `NVFP4_AB t8` -- both PASS (the harness at this revision against Task 0's dump). `RUN_CPU test/registered/unit/kernels/test_nvfp4_cpu_build.py` -- pass (it builds and runs the sanitizer, plain and asan-ubsan, scalar and avx2). `CPU_CHECKS t8` -- `ALL GREEN (check)` (`bare-validate` now runs the interface; 24 frozen outputs). `BENCH kiface-bench 1` -- `BUILD=0` (it builds `exl3_cpu_baseline` too) and `EXIT=0`. `SUITE_EXT` -- pass (the table path through `exl3_moe_cpu_forward` changed).
+- [ ] **Step 6: Run.** Commit (`refactor(cpu-experts): benches and harnesses call the kernel interface; upstream's handle API keeps its own table`), `SYNC`. `NVFP4_AB t8` -- both PASS (the harness at this revision against Task 0's dump). `RUN_CPU test/manual/dsv41/test_nvfp4_cpu_build.py` -- pass (it builds and runs the sanitizer, plain and asan-ubsan, scalar and avx2). `CPU_CHECKS t8` -- `ALL GREEN (check)` (`bare-validate` now runs the interface; 24 frozen outputs). `BENCH kiface-bench 1` -- `BUILD=0` (it builds `exl3_cpu_baseline` too) and `EXIT=0`. `SUITE_EXT` -- pass (the table path through `exl3_moe_cpu_forward` changed).
 
 ---
 
@@ -2862,7 +2862,7 @@ In the sanitizer, `register_layer(...) == 2` asserts become `status_of([&] { ker
 - Modify: `exl3/optimized/quant.hpp`, `exl3/optimized/kernel.cpp`, `exl3/optimized/moe_mul1.h:116`, `nvfp4/optimized/quant.hpp`, `nvfp4/optimized/kernel.cpp`
 - Modify: `python/sglang/srt/layers/quantization/nvfp4/ext.py:22-24,40`
 - Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/README.txt`, `python/sglang/kernels/jit/csrc/nvfp4/optimized/README.md`, `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/README.txt` (where it names the C ABI), `python/sglang/kernels/jit/csrc/nvfp4/bench/README.md` (same)
-- Test: `test/registered/unit/kernels/test_cpu_experts_layout.py`, `test/registered/unit/kernels/test_nvfp4_cpu_build.py`
+- Test: `test/registered/unit/kernels/test_cpu_experts_layout.py`, `test/manual/dsv41/test_nvfp4_cpu_build.py`
 
 **Interfaces:**
 - Produces: `SglangExl3CpuParams` defined in `exl3/optimized/quant.hpp`, `SglangNvfp4CpuParams` in `nvfp4/optimized/quant.hpp` (global namespace, plain structs, the same fields and comments as today).
@@ -2907,7 +2907,7 @@ def test_build_py_makes_a_library_exporting_no_c_abi(tmp_path):
 ```
 
 (Read the export's actual symbol name from `nm -D` on a Task 3 build first; tvm-ffi prefixes it.)
-- [ ] **Step 2: Run to verify they fail.** Commit the tests (`test(cpu-experts): no C ABI remains`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_experts_layout.py test/registered/unit/kernels/test_nvfp4_cpu_build.py` -- expected FAIL (`cpu_experts_cabi.h` holds `extern "C"`; the library exports `sglang_nvfp4_cpu_experts_*`).
+- [ ] **Step 2: Run to verify they fail.** Commit the tests (`test(cpu-experts): no C ABI remains`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_experts_layout.py test/manual/dsv41/test_nvfp4_cpu_build.py` -- expected FAIL (`cpu_experts_cabi.h` holds `extern "C"`; the library exports `sglang_nvfp4_cpu_experts_*`).
 - [ ] **Step 3: Delete.** Move `SglangExl3CpuParams` (with its comment block, minus the sentence about `SglangCpuExpertsLayer`: "A layer's params: make_layer's `params` bytes are this struct.") into `exl3/optimized/quant.hpp` before the `sglang::exl3_cpu` namespace, and `SglangNvfp4CpuParams` likewise into `nvfp4/optimized/quant.hpp`; drop both quant headers' `#include "cpu_experts_cabi.h"` and `moe_mul1.h`'s last line; drop the macro lines and the `cabi.hpp` includes from both `kernel.cpp`s; fix the NVFP4 `static_assert` message to "SlabName indexes LayerSlabs::slabs in the quant's slab order" and quant.hpp's "The descriptor's slabs, in cpu_experts_cabi.h order" to "in the slab order of SglangNvfp4CpuParams' comment"; update `kernel.cpp`'s EXL3 file comment ("This file holds the kernel's accessor and the torch wrappers."). `git rm` the four files. In `nvfp4/ext.py`, drop `_FORWARD_ABI` and its comment and remove it from `_sources()` (the framework glob already covers `kernel.hpp`). Rewrite the README sections that describe the C ABI: each kernel README states that the library's kernel is `CpuExpertKernel` (`host/cpu_experts/kernel.hpp`) behind its accessor, reached from Python through the torch op / tvm-ffi export, layers made by the host's `set_cpu_layer` from `CpuExpertLayerSpec`; keep every measured-provenance section unchanged.
 - [ ] **Step 4: The success-criteria greps.** On the laptop:
 
@@ -2919,7 +2919,7 @@ git grep -n 'extern "C"' -- python/sglang/kernels/jit/csrc/exl3 python/sglang/ke
 ```
 
 Expected: no output from any of the four. The patterns match code (an include, a declaration or call, a type), not prose; `\b` keeps upstream's `exl3_moe_cpu_free_layer(` and the unrelated `register_layer_transfer_counter(` out. If a comment or docstring still matches, reword it (it describes the deleted ABI) rather than widening the pattern; docs/ and analysis/ are history and are not searched.
-- [ ] **Step 5: Run.** Commit (`refactor(cpu-experts): delete the C ABI`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_experts_layout.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_experts_common.py` -- all pass. `NVFP4_AB t9`, `CPU_CHECKS t9`, `BENCH kiface-bench 1`, `SUITE_EXT` -- green.
+- [ ] **Step 5: Run.** Commit (`refactor(cpu-experts): delete the C ABI`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_experts_layout.py test/manual/dsv41/test_nvfp4_cpu_build.py test/manual/dsv41/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_experts_common.py` -- all pass. `NVFP4_AB t9`, `CPU_CHECKS t9`, `BENCH kiface-bench 1`, `SUITE_EXT` -- green.
 
 ---
 

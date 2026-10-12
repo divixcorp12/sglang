@@ -1942,7 +1942,7 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > which raises on the **first** file that has no CI registry, or is registered but
 > lacks an `if __name__ == "__main__":` block. Over all 2,122 files: **30 with no
 > registry, 27 registered with no `__main__`**, and it raises at
-> `test/registered/unit/test_file_row_reader.py`. **So no registered test runs
+> `test/registered/unit/model_loader/test_file_row_reader.py`. **So no registered test runs
 > through `run_suite` at all**, and the offenders concentrate in `layers/moe` (27)
 > and `kernels` (15) -- this plan's own area.
 >
@@ -1957,7 +1957,7 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > | registered, no `__main__` | **19** | `layers/moe` 7, `kernels` 4, `models` 4 |
 > | **malformed registration** | **1** | `unit/eplb` |
 >
-> `run_suite` still raises first at `test/registered/unit/test_file_row_reader.py`,
+> `run_suite` still raises first at `test/registered/unit/model_loader/test_file_row_reader.py`,
 > so the headline finding is unchanged: **no registered test runs through
 > `run_suite` at all.**
 >

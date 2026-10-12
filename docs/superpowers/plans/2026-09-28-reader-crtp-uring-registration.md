@@ -141,7 +141,7 @@ ssh divix01 'git -C /data/models/slang/sglang fetch origin \
 
 - [ ] **Step 4: Record the baseline of the reader suites** (the files the refactor must keep green):
 
-CPU-TEST `test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py test/registered/unit/kernels/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py`
+CPU-TEST `test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py test/manual/dsv41/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py test/manual/dsv41/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py`
 
 Expected: EXIT=0. Record the counts. (`test_exl3_ram_miss_tier.py` runs inside SUITE, which holds the GPU lock.)
 
@@ -419,7 +419,7 @@ Expected: matches only inside `pack_*`/`row_*` bodies, the dispatchers, the cons
 
 - [ ] **Step 5: Commit, SYNC, then run the golden plus the reader suites**
 
-CPU-TEST `test/registered/unit/kernels/test_expert_stream_reader_golden.py test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py test/registered/unit/kernels/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py test/registered/unit/kernels/test_expert_stream_uring_integration.py`
+CPU-TEST `test/registered/unit/kernels/test_expert_stream_reader_golden.py test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py test/manual/dsv41/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py test/manual/dsv41/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py test/registered/unit/kernels/test_expert_stream_uring_integration.py`
 
 Expected: EXIT=0, with counts equal to Task 0 Step 4 plus the Task 1 and Task 2 additions.
 
@@ -665,7 +665,7 @@ If the compiler finds a `reader.`/`reader_.` use in `ffi_exports.h`, `ram_tier.h
 
 - [ ] **Step 6: Commit, SYNC, run the structural test, the golden and the reader suites, then SUITE**
 
-CPU-TEST `test/registered/unit/kernels/test_expert_stream_reader_split.py test/registered/unit/kernels/test_expert_stream_reader_golden.py test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py test/registered/unit/kernels/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py test/registered/unit/kernels/test_expert_stream_uring_integration.py`
+CPU-TEST `test/registered/unit/kernels/test_expert_stream_reader_split.py test/registered/unit/kernels/test_expert_stream_reader_golden.py test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py test/manual/dsv41/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py test/manual/dsv41/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py test/registered/unit/kernels/test_expert_stream_uring_integration.py`
 
 Expected: EXIT=0. Then SUITE: counts equal Task 2's plus the 4 structural tests, with no new failures or errors. Record the command and the counts.
 
@@ -1363,7 +1363,7 @@ def _table_buffer_regions(tables) -> torch.Tensor:
 
 - [ ] **Step 6: Commit, SYNC, run**
 
-CPU-TEST `test/registered/unit/kernels/test_expert_stream_fixed_buffers.py test/registered/unit/kernels/test_registered_buffer_table.py test/registered/unit/kernels/test_expert_stream_reader_golden.py test/registered/unit/kernels/test_expert_stream_reader_split.py test/registered/unit/kernels/test_exl3_ram_miss_split.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_expert_stream_uring_options.py test/registered/unit/kernels/test_expert_stream_buffer_regions.py test/registered/unit/kernels/test_uring_file_reader.py`
+CPU-TEST `test/registered/unit/kernels/test_expert_stream_fixed_buffers.py test/registered/unit/kernels/test_registered_buffer_table.py test/registered/unit/kernels/test_expert_stream_reader_golden.py test/registered/unit/kernels/test_expert_stream_reader_split.py test/registered/unit/kernels/test_exl3_ram_miss_split.py test/manual/dsv41/test_exl3_ram_miss_piece_stream.py test/manual/dsv41/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_expert_stream_uring_options.py test/registered/unit/kernels/test_expert_stream_buffer_regions.py test/registered/unit/kernels/test_uring_file_reader.py`
 
 Expected: EXIT=0, with no skips on divix01 (6.12 EL10 advertises `READV_FIXED`). The golden and the reader suites passing here show that the one-leg default path is unchanged. Then run the native/integration matrix (Task 2 Step 3's command); expected EXIT=0, 0 skips.
 

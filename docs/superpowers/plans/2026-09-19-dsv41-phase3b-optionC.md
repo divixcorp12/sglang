@@ -103,7 +103,7 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41 && g
 `<FW-GPU> <cmd>` is the same in `DFWT` on `cc/moe-expert-plugins` (`cd .../wt-moe-plugins && git pull --ff-only shared cc/moe-expert-plugins`).
 
 **Suites.**
-- `DSV41_SUITE`: `test/registered/unit/layers/moe/test_exl3_expert_layout.py test/registered/unit/layers/moe/test_exl3_row_reader.py test/registered/unit/layers/moe/test_exl3_slot_layout.py test/registered/unit/layers/moe/test_exl3_expert_format.py test/registered/unit/layers/moe/test_exl3_shard_row_source.py test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/layers/quantization/test_exl3_method.py test/registered/unit/layers/quantization/test_exl3_moe_method.py test/registered/unit/layers/quantization/test_exl3_moe_stream_mode.py test/registered/unit/layers/quantization/test_exl3_ops_cpu.py test/registered/unit/layers/quantization/test_exl3_ext.py test/registered/unit/layers/test_engram_file_table.py test/registered/unit/layers/test_engram_row_cache.py test/registered/unit/layers/attention/test_dsv4_candidate_indexer.py test/registered/unit/models/test_deepseek_v4_exl3_weights.py test/registered/unit/model_loader/test_weight_iterator_skip.py test/registered/unit/test_file_row_reader.py test/registered/unit/test_dsv41_expert_knobs.py test/registered/unit/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_ref_oracle_helpers.py test/manual/dsv41/test_trace_corpus.py test/manual/dsv41/test_tier_sim.py test/manual/dsv41/test_read_benches.py test/manual/dsv41/test_ref_oracle_lazy_experts.py` plus this plan's new dsv41 CPU files as they land.
+- `DSV41_SUITE`: `test/registered/unit/layers/moe/test_exl3_expert_layout.py test/registered/unit/layers/moe/test_exl3_row_reader.py test/registered/unit/layers/moe/test_exl3_slot_layout.py test/registered/unit/layers/moe/test_exl3_expert_format.py test/registered/unit/layers/moe/test_exl3_shard_row_source.py test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/layers/quantization/test_exl3_method.py test/registered/unit/layers/quantization/test_exl3_moe_method.py test/registered/unit/layers/quantization/test_exl3_moe_stream_mode.py test/registered/unit/layers/quantization/test_exl3_ops_cpu.py test/registered/unit/layers/quantization/test_exl3_ext.py test/registered/unit/layers/test_engram_file_table.py test/registered/unit/layers/test_engram_row_cache.py test/registered/unit/layers/attention/test_dsv4_candidate_indexer.py test/registered/unit/models/test_deepseek_v4_exl3_weights.py test/registered/unit/model_loader/test_weight_iterator_skip.py test/registered/unit/model_loader/test_file_row_reader.py test/registered/unit/configs/test_dsv41_expert_knobs.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_ref_oracle_helpers.py test/manual/dsv41/test_trace_corpus.py test/manual/dsv41/test_tier_sim.py test/manual/dsv41/test_read_benches.py test/manual/dsv41/test_ref_oracle_lazy_experts.py` plus this plan's new dsv41 CPU files as they land.
 - `FRAMEWORK_SUITE`: the list in `docs/superpowers/plans/2026-09-18-dsv41-phase3a-r2.md` ("Test suites named in steps") plus this plan's new framework CPU files. Known pre-existing failure: `test_expert_transfer.py::TestExpertRowCopySubmission::test_gpu_submission_uses_fallback_for_nonpinned_sources`.
 - Task 2 records both suites' summary lines before any change (`$ANA/baseline-{dsv41,framework}-suite.txt`); later "suite unchanged" steps compare against those lines plus the new tests.
 
@@ -748,7 +748,7 @@ Expected: `2`; no diff output. Run `<DSV41-CPU> <DSV41_SUITE> test/registered/un
 **Files:**
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (module body and docstring)
 - Modify: `python/sglang/srt/layers/engram.py:746-756` (`EngramEmbedding.forward`) and module level (one helper)
-- Modify: `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- Modify: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
 - Create: `test/registered/unit/layers/test_engram_lookup_break.py`
 
 **Interfaces:**
@@ -759,7 +759,7 @@ Expected: `2`; no diff output. Run `<DSV41-CPU> <DSV41_SUITE> test/registered/un
 
 First check `PhaseConfig`'s batch-size field names: `grep -n "class PhaseConfig" -A 25 python/sglang/srt/model_executor/cuda_graph_config.py`. The code below uses `bs` and `max_bs`; if the class names them differently, use its names everywhere below.
 
-In `test/registered/unit/test_expert_stream_requirements_exl3.py`, add after the imports:
+In `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`, add after the imports:
 ```python
 BREAKABLE_BS1 = CudaGraphConfig(
     decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1),
@@ -853,7 +853,7 @@ Before writing the last test, read `EngramEmbedding.forward` (`engram.py:746-760
 
 - [ ] **Step 2: Commit red, push, run red**
 
-`git add test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/test_engram_lookup_break.py`; commit `test(dsv41): red tests for breakable decode at bs 1 and the Engram lookup break`. Run `<DSV41-CPU> test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/test_engram_lookup_break.py`. Expected: the four new gate cases fail (`runs eagerly` raised, or `DID NOT RAISE` for `full`); the three Engram tests fail with `AttributeError: module 'sglang.srt.layers.engram' has no attribute '_engram_file_table_lookup'`; the old cases pass.
+`git add test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/test_engram_lookup_break.py`; commit `test(dsv41): red tests for breakable decode at bs 1 and the Engram lookup break`. Run `<DSV41-CPU> test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/test_engram_lookup_break.py`. Expected: the four new gate cases fail (`runs eagerly` raised, or `DID NOT RAISE` for `full`); the three Engram tests fail with `AttributeError: module 'sglang.srt.layers.engram' has no attribute '_engram_file_table_lookup'`; the old cases pass.
 
 - [ ] **Step 3: Implement the gate**
 
@@ -2261,7 +2261,7 @@ Expected: `2`; `git log` lists only the framework commits of Tasks 6–7 (and no
 - Modify: `python/sglang/srt/layers/quantization/exl3.py` (`apply`; new `_apply_graph`)
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check`, registration)
 - Create: `test/registered/unit/layers/quantization/test_exl3_fused_moe.py` (CPU), `test/manual/dsv41/test_exl3_graph_apply_gpu.py` (GPU; the task's GPU step, rerun in Task 16)
-- Modify: `test/registered/unit/test_expert_stream_requirements_exl3.py`, `test/registered/unit/layers/moe/test_exl3_expert_format.py`
+- Modify: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`, `test/registered/unit/layers/moe/test_exl3_expert_format.py`
 
 **Interfaces:**
 - Consumes: `PinnedTierRowBackend.keep`, `ExpertStreamer.serves_graph_gather`, `ExpertStreamer.gather`, `hot_cache.tensors`, `hot_cache.capacity`, `hot_cache.scratch_rows`, `exl3_ext()`.
@@ -2330,7 +2330,7 @@ def test_the_exl3_format_serves_graph_gathers_from_its_pinned_tier():
 
     assert graph_source_kind_of(Exl3ExpertFormat) == "pinned_tier"
 ```
-In `test/registered/unit/test_expert_stream_requirements_exl3.py` add:
+In `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py` add:
 ```python
 def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
@@ -2414,7 +2414,7 @@ def test_captured_in_graph_moe_matches_the_eager_streamed_apply(tmp_path):
 
 - [ ] **Step 2: Commit red, push, run red**
 
-`git add test/registered/unit/layers/quantization/test_exl3_fused_moe.py test/registered/unit/layers/moe/test_exl3_expert_format.py test/registered/unit/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_graph_apply_gpu.py`; commit `test(dsv41): red tests for the in-graph EXL3 MoE over the pinned tier`. Run `<DSV41-CPU> test/registered/unit/layers/quantization/test_exl3_fused_moe.py test/registered/unit/layers/moe/test_exl3_expert_format.py test/registered/unit/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_graph_apply_gpu.py`. Expected: import error for `exl3_fused_moe`; the format test fails (`"dense" == "pinned_tier"`); the two gate tests fail; the GPU file skips.
+`git add test/registered/unit/layers/quantization/test_exl3_fused_moe.py test/registered/unit/layers/moe/test_exl3_expert_format.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_graph_apply_gpu.py`; commit `test(dsv41): red tests for the in-graph EXL3 MoE over the pinned tier`. Run `<DSV41-CPU> test/registered/unit/layers/quantization/test_exl3_fused_moe.py test/registered/unit/layers/moe/test_exl3_expert_format.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_graph_apply_gpu.py`. Expected: import error for `exl3_fused_moe`; the format test fails (`"dense" == "pinned_tier"`); the two gate tests fail; the GPU file skips.
 
 - [ ] **Step 3: Implement the fused MoE module**
 
@@ -6025,7 +6025,7 @@ The device side already posts advisories when `advise` is set (Task 13) and the 
 **Files:**
 - Modify: `python/sglang/srt/environ.py`, `python/sglang/srt/layers/moe/exl3_expert_format.py` (`prefetch_enabled`), `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check`)
 - Create: `test/registered/unit/kernels/test_exl3_ram_miss_advisory.py` (CPU)
-- Modify: `test/manual/dsv41/test_exl3_ram_miss_cuda.py` (GPU case), `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- Modify: `test/manual/dsv41/test_exl3_ram_miss_cuda.py` (GPU case), `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
 
 **Interfaces:**
 - Produces: `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH = EnvBool(False)`; `prefetch_enabled() -> bool` reads it; the gate refuses it without breakable decode and graph gather.
@@ -6129,7 +6129,7 @@ def test_layer_posts_advise_the_next_layer(tmp_path):
     finally:
         host.stop()
 ```
-Append to `test/registered/unit/test_expert_stream_requirements_exl3.py`:
+Append to `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`:
 ```python
 def test_prefetch_needs_graph_gather_under_breakable_decode(model_dir):
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
@@ -6139,7 +6139,7 @@ def test_prefetch_needs_graph_gather_under_breakable_decode(model_dir):
 
 - [ ] **Step 2: Commit red, push, run red**
 
-`git add` the three test files; commit `test(dsv41): red tests for next-layer advisory prefetch`. Run `<DSV41-CPU> test/registered/unit/kernels/test_exl3_ram_miss_advisory.py test/registered/unit/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_ram_miss_cuda.py`. Expected: the three advisory tests pass already (Tasks 11–12 built the thread side; this is their first run, a characterization — if any fails, it is a Task 11 or 12 bug: fix it in `exl3_ram_miss_host.cpp` with its own red/green commit pair before going on); the gate test fails (`envs` has no `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`); the GPU file skips.
+`git add` the three test files; commit `test(dsv41): red tests for next-layer advisory prefetch`. Run `<DSV41-CPU> test/registered/unit/kernels/test_exl3_ram_miss_advisory.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_ram_miss_cuda.py`. Expected: the three advisory tests pass already (Tasks 11–12 built the thread side; this is their first run, a characterization — if any fails, it is a Task 11 or 12 bug: fix it in `exl3_ram_miss_host.cpp` with its own red/green commit pair before going on); the gate test fails (`envs` has no `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`); the GPU file skips.
 
 - [ ] **Step 3: Implement**
 

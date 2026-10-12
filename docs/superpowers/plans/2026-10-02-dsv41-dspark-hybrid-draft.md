@@ -545,7 +545,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py`: add a rule directly before
   `cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()`, which comes after the `isinstance(graph, CudaGraphConfig)`
   early return.
-- Test: `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- Test: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
 
 **Interfaces:**
 - Consumes: `load_resident_set` (Task 2); `parse_core_list` (`cpu_experts/policy.py`).
@@ -555,7 +555,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS` (`EnvInt(0)`);
   - `envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH` (`EnvStr("")`).
 
-- [ ] **Step 1: Write the failing tests.** Append to `test/registered/unit/test_expert_stream_requirements_exl3.py`:
+- [ ] **Step 1: Write the failing tests.** Append to `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`:
 
 ```python
 DSPARK_CPU_ENV = dict(
@@ -596,7 +596,7 @@ def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path):
 
 ```bash
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-  test/registered/unit/test_expert_stream_requirements_exl3.py -q -p no:randomly -k "dspark_cpu or resident_file" 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+  test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py -q -p no:randomly -k "dspark_cpu or resident_file" 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: `EXIT=1`, with `AttributeError` on `envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS`.
 
@@ -651,7 +651,7 @@ from sglang.srt.layers.moe.cpu_experts.policy import parse_core_list
 
 ```bash
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-  test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_resident.py \
+  test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_resident.py \
   -q -p no:randomly 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: `EXIT=0`.
@@ -660,7 +660,7 @@ Expected: `EXIT=0`.
 
 ```bash
 git add python/sglang/srt/environ.py python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py \
-  test/registered/unit/test_expert_stream_requirements_exl3.py
+  test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py
 git commit -m "env(dspark): draft CPU experts, cores, threads and resident set, and their launch rule
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"

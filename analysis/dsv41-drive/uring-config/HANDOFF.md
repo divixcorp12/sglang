@@ -241,7 +241,7 @@ interpreter and `PYTHONPATH`. These are correctness results, not latency results
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
   taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
   test/registered/unit/kernels/test_exl3_ram_miss_tier.py \
-  test/registered/unit/kernels/test_exl3_ram_miss_row_images.py \
+  test/manual/dsv41/test_exl3_ram_miss_row_images.py \
   test/registered/unit/kernels/test_expert_stream_second_layout.py \
   test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py \
   -q -p no:randomly

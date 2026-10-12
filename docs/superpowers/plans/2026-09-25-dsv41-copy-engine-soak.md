@@ -112,7 +112,7 @@ probe line is in `d3-probe/server.log` ("exl3 copy probe"). Hazard probe JSON: `
   `CUDA_VISIBLE_DEVICES= PYTHONPATH=$WT/python OMP_NUM_THREADS=8 taskset -c 0-31 python -m pytest
   test/registered/unit/kernels test/registered/unit/layers/moe/test_exl3_ram_miss_{service,shutdown,tables}.py
   test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/layers/moe/test_exl3_native_prefetch.py
-  test/registered/unit/test_dsv41_config.py test/registered/unit/managers/test_prompt_logprob_refusal.py
+  test/registered/unit/configs/test_dsv41_config.py test/registered/unit/managers/test_prompt_logprob_refusal.py
   test/registered/unit/managers/test_logprob_style_without_logprobs.py -q -p no:randomly -rfE --basetemp=...`
   (log `divix01:/mnt/nvme1/ce-soak/cpu-head.log`). Not yet run: the same at the merge-base, mutants of the EAGER
   refusal and the tvm-ffi guard.

@@ -815,7 +815,7 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$P
   OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
   && taskset -c 0-63 /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
   && taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-     test/registered/unit/kernels/test_expert_stream_hotpath_shim.py -q -rs -s -p no:randomly 2>&1 | tail -25; \
+     test/manual/dsv41/test_expert_stream_hotpath_shim.py -q -rs -s -p no:randomly 2>&1 | tail -25; \
   echo "EXIT=${PIPESTATUS[0]}"'
 ```
 
@@ -858,7 +858,7 @@ Reading:
 
 Mutants in the private worktree `/data/models/slang/nvfp4-work/wt-hotpath-mut` at `e3a66073b4`, reverted with
 `git checkout --`, worktree removed afterwards. Command: `taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest
-test/registered/unit/kernels/test_expert_stream_hotpath_shim.py -q -p no:randomly`.
+test/manual/dsv41/test_expert_stream_hotpath_shim.py -q -p no:randomly`.
 
 | mutant | change | result |
 |---|---|---|

@@ -172,10 +172,10 @@ Also read `.claude/rules/modify-component-must-read.md` and `.claude/rules/divix
   test/registered/unit/layers/moe/test_expert_format.py
   test/registered/unit/layers/moe/test_expert_stream.py
   test/registered/unit/layers/moe/test_exl3_*.py
-  test/registered/unit/test_expert_stream_requirements.py
-  test/registered/unit/test_expert_stream_requirements_exl3.py
+  test/registered/unit/arg_groups/test_expert_stream_requirements.py
+  test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py
   test/registered/unit/test_environ.py
-  test/registered/unit/test_ci_registration_ratchet.py
+  test/registered/unit/ci/test_ci_registration_ratchet.py
   benchmarks/dsv41_flash/test_harness.py
   benchmarks/dsv41_baseline/test_dsv41_baseline.py
   ```
@@ -303,7 +303,7 @@ base are pre-existing, not this plan's to fix.
 - Modify: `python/sglang/srt/managers/scheduler.py:1872-1878,4790,4806-4819`
 - Modify: `python/sglang/srt/layers/moe/expert_format.py:279-281,300`
 - Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py:1057` (docstring only)
-- Modify: `test/registered/unit/test_ci_registration_ratchet.py:58`
+- Modify: `test/registered/unit/ci/test_ci_registration_ratchet.py:58`
 - Test: `test/registered/unit/layers/moe/test_expert_fail_stop_checks.py`,
   `test/registered/unit/layers/moe/test_expert_graph_gather.py`,
   `test/registered/unit/layers/moe/test_expert_residency_gpu.py`,
@@ -552,7 +552,7 @@ git rm python/sglang/kernels/jit/csrc/moe/expert_doorbell.cuh \
        benchmark/expert_doorbell/bench_doorbell.py benchmark/expert_doorbell/probe_hold.py
 ```
 Then delete the line `"unit/kernels/test_expert_doorbell_copier.py",` (58) from `KNOWN_NO_REGISTRY` in
-`test/registered/unit/test_ci_registration_ratchet.py`. `test_the_known_lists_carry_no_fixed_files` fails on a
+`test/registered/unit/ci/test_ci_registration_ratchet.py`. `test_the_known_lists_carry_no_fixed_files` fails on a
 listed file that no longer exists.
 
 - [ ] **Step 7: Adapt the tests that built a doorbell**
@@ -741,7 +741,7 @@ Expected:
 
 Run R1 and R2. Then run the command below, where `$MOE` is `test/registered/unit/layers/moe`:
 ```
-R3-gpu t1 $MOE/test_expert_fail_stop_checks.py $MOE/test_expert_graph_gather.py $MOE/test_expert_residency_gpu.py $MOE/test_exl3_ram_miss_shutdown.py $MOE/test_exl3_ram_miss_service.py $MOE/test_expert_pinned_graph_gather.py $MOE/test_expert_format.py test/registered/unit/test_ci_registration_ratchet.py test/registered/unit/kernels
+R3-gpu t1 $MOE/test_expert_fail_stop_checks.py $MOE/test_expert_graph_gather.py $MOE/test_expert_residency_gpu.py $MOE/test_exl3_ram_miss_shutdown.py $MOE/test_exl3_ram_miss_service.py $MOE/test_expert_pinned_graph_gather.py $MOE/test_expert_format.py test/registered/unit/ci/test_ci_registration_ratchet.py test/registered/unit/kernels
 ```
 Expected:
 - `EXIT=0`, except for any `FAILED` line that also appears in Task 0's `base-failures.txt`.
@@ -762,8 +762,8 @@ If one of those fails, the NVFP4 or EXL3 path changed. Stop and debug; do not ad
 - Modify: `python/sglang/srt/arg_groups/moe_offload_hook.py:87`
 - Modify: `python/sglang/srt/arg_groups/fields/exec_.py:944-951`
 - Modify: `benchmarks/dsv41_baseline/arm_env.py:154`, `benchmarks/dsv41_flash/arm_config.py:114`
-- Test: `test/registered/unit/test_environ.py`, `test/registered/unit/test_expert_stream_requirements.py`,
-  `test/registered/unit/test_expert_stream_requirements_exl3.py`,
+- Test: `test/registered/unit/test_environ.py`, `test/registered/unit/arg_groups/test_expert_stream_requirements.py`,
+  `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`,
   `test/registered/unit/layers/moe/test_offload_presets.py`, `benchmarks/dsv41_flash/test_harness.py`
 
 **Interfaces:**
@@ -818,7 +818,7 @@ and add to `TestDeprecatedEnvRegistry`:
         )
 ```
 
-`test/registered/unit/test_expert_stream_requirements.py`: replace `test_doorbell_is_refused` and
+`test/registered/unit/arg_groups/test_expert_stream_requirements.py`: replace `test_doorbell_is_refused` and
 `test_it_accepts_a_launch_with_all_three_settings_off` with:
 ```python
     def test_the_removed_doorbell_variable_is_not_a_gate_setting(self):
@@ -834,7 +834,7 @@ and add to `TestDeprecatedEnvRegistry`:
         memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 ```
 
-`test/registered/unit/test_expert_stream_requirements_exl3.py`: delete `"SGLANG_MOE_EXPERT_DOORBELL": False,` from
+`test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`: delete `"SGLANG_MOE_EXPERT_DOORBELL": False,` from
 `WINDOW_C_ENV`, because `_under_window_c_env` calls `getattr(envs, name)`. Then add:
 ```python
 def test_the_removed_doorbell_variable_does_not_gate_an_exl3_launch(model_dir, monkeypatch):
@@ -935,14 +935,14 @@ removes the descriptors but leaves the pin.
 
 ```bash
 cd /home/dimitri/data/divix/sglang-nvfp4-worktrees/doorbell-removal
-git add test/registered/unit/test_environ.py test/registered/unit/test_expert_stream_requirements.py \
-  test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_offload_presets.py \
+git add test/registered/unit/test_environ.py test/registered/unit/arg_groups/test_expert_stream_requirements.py \
+  test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_offload_presets.py \
   benchmarks/dsv41_flash/test_harness.py
 git commit -m "test(moe): removed doorbell variables warn, the preset is refused, gates ignore it (red)"
 ```
 Run R1 and R2. Then run:
 ```
-R3-cpu t2-red test/registered/unit/test_environ.py test/registered/unit/test_expert_stream_requirements.py test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_offload_presets.py benchmarks/dsv41_flash/test_harness.py
+R3-cpu t2-red test/registered/unit/test_environ.py test/registered/unit/arg_groups/test_expert_stream_requirements.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_offload_presets.py benchmarks/dsv41_flash/test_harness.py
 ```
 Expected: `EXIT=1`, with these failures:
 - `test_the_doorbell_envs_warn_that_the_copier_was_removed` (`KeyError` on `_DEPRECATED_ENVS`);
@@ -1032,7 +1032,7 @@ ValueError(... "SGLANG_MOE_EXPERT_DOORBELL; set it to 0")`).
 ```bash
 cd /home/dimitri/data/divix/sglang-nvfp4-worktrees/doorbell-removal
 git grep -n "SGLANG_MOE_EXPERT_DOORBELL\|DOORBELL_PRESET\|expert_doorbell" -- python benchmarks benchmark scripts test \
-  | grep -v "^python/sglang/srt/environ.py:\|^python/sglang/srt/layers/moe/expert_residency_gpu.py:404:\|^test/registered/unit/test_environ.py:\|^test/registered/unit/test_expert_stream_requirements.py:\|^test/registered/unit/test_expert_stream_requirements_exl3.py:"
+  | grep -v "^python/sglang/srt/environ.py:\|^python/sglang/srt/layers/moe/expert_residency_gpu.py:404:\|^test/registered/unit/test_environ.py:\|^test/registered/unit/arg_groups/test_expert_stream_requirements.py:\|^test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py:"
 pyflakes python/sglang/srt/layers/moe/offload_presets.py python/sglang/srt/arg_groups/moe_offload_hook.py \
   test/registered/unit/layers/moe/test_offload_presets.py test/registered/unit/test_environ.py
 git add -A python benchmarks test
@@ -1046,7 +1046,7 @@ Expected:
 
 Run R1 and R2. Then run:
 ```
-R3-cpu t2 test/registered/unit/test_environ.py test/registered/unit/test_expert_stream_requirements.py test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_offload_presets.py benchmarks/dsv41_flash/test_harness.py benchmarks/dsv41_baseline/test_dsv41_baseline.py
+R3-cpu t2 test/registered/unit/test_environ.py test/registered/unit/arg_groups/test_expert_stream_requirements.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_offload_presets.py benchmarks/dsv41_flash/test_harness.py benchmarks/dsv41_baseline/test_dsv41_baseline.py
 ```
 Expected: `EXIT=0`, apart from failures that `base-failures.txt` already lists, and the `wt-doorbell-removal`
 path printed first.
@@ -1167,8 +1167,8 @@ test/registered/unit/layers/moe/test_expert_graph_gather.py    # test_flag_off_g
 test/registered/unit/layers/moe/test_expert_prefetch_pricing.py      # offline pricing model's test (kept)
 test/registered/unit/layers/moe/test_expert_residency_gpu.py   # *_pre_doorbell_path names + deferred assertion
 test/registered/unit/test_environ.py                           # removed-variable tests
-test/registered/unit/test_expert_stream_requirements.py        # removed-variable gate test
-test/registered/unit/test_expert_stream_requirements_exl3.py   # removed-variable gate test
+test/registered/unit/arg_groups/test_expert_stream_requirements.py        # removed-variable gate test
+test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py   # removed-variable gate test
 test/registered/unit/layers/moe/test_offload_presets.py        # removed-preset tests
 ```
 Any other file is a missed removal: fix it in its owning task's file set, as a new commit. For `*.md`, run

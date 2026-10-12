@@ -67,7 +67,7 @@ Dropping the per-expert `torch.where` also shrinks C, removing ~5 of the ~25 ker
 - Create: `analysis/dsv41-drive/pcie-trace/chunk_host_time.py`: per chunk, host blocked on the gather and host time to the next gather launch.
 - Modify: `python/sglang/srt/environ.py`: the flag.
 - Modify: `python/sglang/srt/dsv41_config.py`: the field.
-- Modify: `test/registered/unit/test_dsv41_config.py`: the defaults test.
+- Modify: `test/registered/unit/configs/test_dsv41_config.py`: the defaults test.
 - Modify: `python/sglang/srt/layers/quantization/exl3_ops.py`:
   - `Exl3RoutePlan`;
   - `_accumulate_expert`, the shared per-expert body;
@@ -215,7 +215,7 @@ Expected:
 **Files:**
 - Modify: `python/sglang/srt/environ.py`, after `SGLANG_DSV41_ENABLE_PREFILL_SHARE` (~line 1923)
 - Modify: `python/sglang/srt/dsv41_config.py` (the struct and `from_envs`)
-- Modify: `test/registered/unit/test_dsv41_config.py` (`test_defaults_match_the_env_declarations`)
+- Modify: `test/registered/unit/configs/test_dsv41_config.py` (`test_defaults_match_the_env_declarations`)
 
 **Interfaces:**
 - Produces: `envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN` (`EnvBool`, default `False`) and `Dsv41Config.enable_prefill_route_plan: bool`.
@@ -231,7 +231,7 @@ In `test_defaults_match_the_env_declarations`, next to `enable_prefill_fills=Fal
 
 - [ ] **Step 2: Run it and see it fail**
 
-Run: `PYTHONPATH=$PWD/python python -m pytest test/registered/unit/test_dsv41_config.py -q -p no:randomly`
+Run: `PYTHONPATH=$PWD/python python -m pytest test/registered/unit/configs/test_dsv41_config.py -q -p no:randomly`
 Expected: FAIL (`Dsv41Config` has no `enable_prefill_route_plan`).
 
 - [ ] **Step 3: Declare the env var and the field**
@@ -251,13 +251,13 @@ Expected: FAIL (`Dsv41Config` has no `enable_prefill_route_plan`).
 
 - [ ] **Step 4: Run it and see it pass**
 
-Run: `PYTHONPATH=$PWD/python python -m pytest test/registered/unit/test_dsv41_config.py -q -p no:randomly`
+Run: `PYTHONPATH=$PWD/python python -m pytest test/registered/unit/configs/test_dsv41_config.py -q -p no:randomly`
 Expected: PASS, including `test_one_field_per_knob`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add python/sglang/srt/environ.py python/sglang/srt/dsv41_config.py test/registered/unit/test_dsv41_config.py
+git add python/sglang/srt/environ.py python/sglang/srt/dsv41_config.py test/registered/unit/configs/test_dsv41_config.py
 git commit -m "feat(dsv41): SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN, default off"
 ```
 
@@ -796,7 +796,7 @@ Record which test caught each. After reverting, re-run Step 3's command and reco
 ```bash
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly 2>&1 | tail -3; echo EXIT=${PIPESTATUS[0]}
 ```
-Run it here and at the merge base (a second private worktree at `git merge-base HEAD 4831d251bc`), then diff the counts. Also run `test/registered/unit/layers/quantization test/registered/unit/layers/moe test/registered/unit/test_dsv41_config.py` at both commits. Record every command next to its counts.
+Run it here and at the merge base (a second private worktree at `git merge-base HEAD 4831d251bc`), then diff the counts. Also run `test/registered/unit/layers/quantization test/registered/unit/layers/moe test/registered/unit/configs/test_dsv41_config.py` at both commits. Record every command next to its counts.
 
 - [ ] **Step 6: Commit the GPU test changes**
 

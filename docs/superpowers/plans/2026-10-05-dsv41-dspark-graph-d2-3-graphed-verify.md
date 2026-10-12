@@ -878,7 +878,7 @@ git commit -m "feat(exl3-ram-miss): the copy-engine barrier counts graphed verif
 
 **Files:**
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check`, a new `_check_graphed_verify`)
-- Test: `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- Test: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
 
 **Interfaces:**
 - Consumes: the env vars `SGLANG_MOE_EXPERT_GRAPH_GATHER`, `SGLANG_MOE_GPU_RESIDENCY_UPDATE`,
@@ -926,7 +926,7 @@ In `test_dspark_speculation_passes_with_decode_disabled`, replace the comment wi
 - [ ] **Step 2: Run them and watch them fail**
 
 Commit `test(exl3-gate): a DSpark verify in the breakable decode graph, and what it needs (failing)`. Run the CPU
-command with `<FILES>` = `test/registered/unit/test_expert_stream_requirements_exl3.py` and `<K>` =
+command with `<FILES>` = `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py` and `<K>` =
 `graphed_dspark or breakable_decode_graph_passes`.
 Expected: FAIL.
 - The passing test raises "EXL3 expert caching runs DSpark verify eagerly only".
@@ -1003,14 +1003,14 @@ and "--cuda-graph-backend-decode disabled".
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run the CPU command with `<FILES>` = `test/registered/unit/test_expert_stream_requirements_exl3.py` and `<K>` =
+Run the CPU command with `<FILES>` = `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py` and `<K>` =
 `not nothing_matches_this`.
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py test/registered/unit/test_expert_stream_requirements_exl3.py
+git add python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py
 git commit -m "feat(exl3-gate): admit a DSpark static verify in the breakable decode graph on DIRECT residency at W miss lanes" -m "<trailers>"
 ```
 

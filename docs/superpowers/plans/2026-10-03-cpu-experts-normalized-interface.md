@@ -560,7 +560,7 @@ command with the image's `python3`.
   `run_team` from `team.hpp`)
 - Modify: `nvfp4_cpu/optimized/cpu_experts_cabi.h` (`SglangNvfp4CpuParams`, the five declarations)
 - Delete: `nvfp4_cpu/optimized/experts.hpp`, `nvfp4_cpu/optimized/moe_mul1.h`
-- Modify callers: `test/registered/unit/kernels/{nvfp4_cpu_sanitizer.cpp,test_nvfp4_cpu_build.py,test_nvfp4_cpu_experts.py}`,
+- Modify callers: `test/manual/dsv41/{nvfp4_cpu_sanitizer.cpp,test_nvfp4_cpu_build.py,test_nvfp4_cpu_experts.py}`,
   `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp`, `nvfp4_cpu/bench/src/cpu_forward.cpp`, `nvfp4_cpu/optimized/README.md`
 
 **Interfaces:**
@@ -610,7 +610,7 @@ git -C $R fetch -q origin && git -C $R worktree add -q --detach $W/wt-normalize 
 bash $W/wt-normalize/test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh $W/wt-normalize $W/normalize-t4 $D/nvfp4
 cd $W/wt-normalize && PYTHONPATH=$PWD/python CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ OMP_NUM_THREADS=8 \
   taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly \
-  test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py \
+  test/manual/dsv41/test_nvfp4_cpu_build.py test/manual/dsv41/test_nvfp4_cpu_experts.py \
   test/registered/unit/kernels/test_cpu_experts_common.py test/registered/unit/kernels/test_cpu_experts_abi.py
 echo "PYTEST_EXIT=$?"'
 ```

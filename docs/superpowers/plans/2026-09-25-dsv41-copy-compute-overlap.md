@@ -364,7 +364,7 @@ cure the hang), and a graph's first replay (harness tests with 0 and 3,000 fille
 - CPU (`cpu_suite.sh`: `CUDA_VISIBLE_DEVICES= PYTHONPATH=$WT/python OMP_NUM_THREADS=8 taskset -c 0-31 python -m pytest
   test/registered/unit/kernels test/registered/unit/layers/moe/test_exl3_ram_miss_service.py
   test/registered/unit/layers/moe/test_exl3_ram_miss_shutdown.py test/registered/unit/layers/moe/test_exl3_ram_miss_tables.py
-  test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/test_dsv41_config.py -q -p no:randomly -rfE`):
+  test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/configs/test_dsv41_config.py -q -p no:randomly -rfE`):
   head `423d516028` **1372 passed, 414 skipped, 2 failed**; base `4f8dd84069` 1357 passed, 414 skipped, 2 failed.
   The same two fail at the base (`test_apply_graph_adds_nothing_unless_router_capture_is_on`,
   `test_one_field_per_knob`): pre-existing. The known flake `test_a_hit_lanes_slot_is_never_its_own_requests_victim`

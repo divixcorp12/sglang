@@ -81,7 +81,7 @@ Test: `test/registered/unit/kernels/test_expert_stream_kernel_exports.py` (new);
 
 **Files:** Modify `environ.py` (the source's two hunks); Create `python/sglang/srt/layers/moe/cpu_experts/draft_resident.py`
 (verbatim from source); Modify `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check`);
-Tests: `test/registered/unit/kernels/test_dspark_draft_resident.py` (verbatim), `test/registered/unit/test_expert_stream_requirements_exl3.py` (source hunk).
+Tests: `test/registered/unit/kernels/test_dspark_draft_resident.py` (verbatim), `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py` (source hunk).
 
 - [ ] Step 1: port both tests; add one: cores `"62-65"` are refused naming core 64.
 - [ ] Step 2: run them. Expected: FAIL (import errors / missing env vars).
@@ -139,7 +139,7 @@ no longer defines (check each `COMMON` key with `grep -n KEY python/sglang/srt/e
 ### Task 7: divix01 runs and docs
 
 - [ ] Step 1: push; pull into `wt-dsv41-dspark`; warm host modules serially; run
-  `test/registered/unit/kernels/test_dspark_draft_*.py test/registered/unit/kernels/test_expert_stream_kernel_exports.py test/registered/unit/layers/moe/test_host_numa.py test/registered/unit/layers/quantization/test_exl3_moe_method.py test/registered/unit/layers/quantization/test_exl3_stream_scope.py test/registered/unit/test_expert_stream_requirements_exl3.py`. Expected: all pass.
+  `test/registered/unit/kernels/test_dspark_draft_*.py test/registered/unit/kernels/test_expert_stream_kernel_exports.py test/registered/unit/layers/moe/test_host_numa.py test/registered/unit/layers/quantization/test_exl3_moe_method.py test/registered/unit/layers/quantization/test_exl3_stream_scope.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`. Expected: all pass.
 - [ ] Step 2: with `SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_EXL3_SRC=...`: `test/manual/dsv41/test_cpu_expert_engines_exl3.py`, then under `cc-gpu.lock` `test/manual/dsv41/test_dspark_hybrid_draft_gpu.py`. Expected: pass.
 - [ ] Step 3: smoke both arms, 1 session, 32 tokens (`AB_SESSIONS=1 AB_NEW_TOKENS=32`). Expected: rc 0, `spec_verify_ct > 0`, the "DSpark CPU experts: 3 draft stages" log line in hybrid.
 - [ ] Step 4: the A/B as §33.4 ran it (16 sessions incl. held-out `AB_SKIP`); paired median decode tok/s ratio.

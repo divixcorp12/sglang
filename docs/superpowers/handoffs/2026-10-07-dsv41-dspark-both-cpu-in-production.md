@@ -153,7 +153,7 @@ doesn't help, because the freed VRAM goes to the KV pool, which then overflows H
 
 ## Suite baselines (for comparison)
 
-- `test/registered/unit/kernels` + `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- `test/registered/unit/kernels` + `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
   - Command: `OMP_NUM_THREADS=8 taskset -c 0-63 python -m pytest ... -q -p no:randomly`, no EXL3 env.
   - At `31b385b1de` (= master's tree): 1967 passed, 25 skipped, EXIT=0, 16.5 min.
 - `benchmarks/dsv41_baseline`: 166 passed.
