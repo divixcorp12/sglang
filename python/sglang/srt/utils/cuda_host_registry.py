@@ -1,30 +1,68 @@
-"""Host memory ranges registered with ``cudaHostRegister`` by this process."""
+"""Host memory ranges registered with ``cudaHostRegister`` by this process.
+
+Unregistration often runs from a garbage-collection finalizer (a tier's slabs
+released by ``weakref.finalize``), and a collection can start inside any locked
+lookup here. ``forget_cuda_host_registration`` called by the thread that already
+holds the lock therefore queues the forget instead of waiting for itself, and
+every locked function applies the queued forgets first, so a lookup in progress
+never sees the tables change under it.
+"""
 
 from __future__ import annotations
 
 import bisect
+import collections
+import contextlib
 import threading
+from collections.abc import Iterator
 
 import torch
 
 _LOCK = threading.Lock()
+_OWNER: int | None = None  # the thread holding _LOCK; only that thread reads its own id
 _BASES: list[int] = []
 _SIZES: dict[int, int] = {}
+_DEFERRED_FORGETS: collections.deque[int] = collections.deque()
+
+
+@contextlib.contextmanager
+def _locked() -> Iterator[None]:
+    """Holds the lock, with every queued forget applied."""
+    global _OWNER
+    with _LOCK:
+        _OWNER = threading.get_ident()
+        try:
+            while _DEFERRED_FORGETS:
+                _forget_locked(_DEFERRED_FORGETS.popleft())
+            yield
+        finally:
+            _OWNER = None
+
+
+def _forget_locked(base: int) -> None:
+    if _SIZES.pop(base, None) is not None:
+        del _BASES[bisect.bisect_left(_BASES, base)]
 
 
 def record_cuda_host_registration(base: int, size: int) -> None:
     """Record one successful ``cudaHostRegister(base, size)`` call."""
-    with _LOCK:
+    with _locked():
         if base not in _SIZES:
             bisect.insort(_BASES, base)
         _SIZES[base] = size
 
 
 def forget_cuda_host_registration(base: int) -> None:
-    """Forget a range after its successful ``cudaHostUnregister(base)``."""
-    with _LOCK:
-        if _SIZES.pop(base, None) is not None:
-            del _BASES[bisect.bisect_left(_BASES, base)]
+    """Forget a range after its successful ``cudaHostUnregister(base)``.
+
+    Called from inside a locked lookup on the same thread (a finalizer run by a
+    collection), it is queued and applied by the next locked call.
+    """
+    if _OWNER == threading.get_ident():
+        _DEFERRED_FORGETS.append(base)
+        return
+    with _locked():
+        _forget_locked(base)
 
 
 def is_cuda_host_registered(tensor: torch.Tensor) -> bool:
@@ -37,7 +75,7 @@ def is_cuda_host_registered(tensor: torch.Tensor) -> bool:
         return False
     start = tensor.data_ptr()
     end = start + tensor.numel() * tensor.element_size()
-    with _LOCK:
+    with _locked():
         position = bisect.bisect_right(_BASES, start) - 1
         if position < 0:
             return False
@@ -54,7 +92,7 @@ def is_cuda_host_registered(tensor: torch.Tensor) -> bool:
 
 def cuda_host_registration_end(address: int) -> int | None:
     """End address of the recorded registration holding ``address``, or None."""
-    with _LOCK:
+    with _locked():
         position = bisect.bisect_right(_BASES, address) - 1
         if position < 0:
             return None
