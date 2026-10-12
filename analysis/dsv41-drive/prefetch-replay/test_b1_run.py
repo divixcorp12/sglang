@@ -154,6 +154,11 @@ def test_smoke_takes_only_train_split_sessions_and_scratch_rids_name_only_them(t
     assert not b1_run._scratch_block(str(src), str(tmp_path / "none"), sessions={"zz"})
 
 
+def test_block_dirs_sit_under_the_corpus_blocks_dir():
+    """b0_capture writes OUT_DIR/blocks/<block-id>/; manifest session_block holds the bare block id."""
+    assert b1_run._block_dir(corpus="/c", name="b000") == os.path.join("/c", "blocks", "b000")
+
+
 def test_smoke_needs_five_train_sessions():
     with pytest.raises(ValueError, match="needs 5"):
         b1_run._pick_smoke_sessions({"split": {"train": ["a", "b"]}, "session_block": {"a": "b", "b": "b"}})

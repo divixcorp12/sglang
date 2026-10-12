@@ -208,6 +208,11 @@ def _pick_smoke_sessions(manifest: dict) -> dict[str, list[str]]:
     return picked
 
 
+def _block_dir(*, corpus: str, name: str) -> str:
+    # b0_capture writes OUT_DIR/blocks/<block-id>/; manifest session_block holds the bare id.
+    return os.path.join(corpus, "blocks", name)
+
+
 def _scratch_block(src: str, dst: str, *, sessions: set[str]) -> bool:
     """Symlink the block's capture files and write a rids.json naming only ``sessions``; False when none match."""
     rids = {rid: v for rid, v in _load_json(os.path.join(src, "rids.json")).items() if v["session_id"] in sessions}
@@ -231,7 +236,7 @@ def _smoke_inputs(ctx: _Ctx) -> tuple[str, str, list[str]]:
     root = os.path.join(ctx.out, "smoke")
     blocks, rewritten = [], []
     for name in sorted({manifest["session_block"][s] for s in chosen}):
-        src, dst = os.path.join(ctx.corpus, name), os.path.join(root, "blocks", name)
+        src, dst = _block_dir(corpus=ctx.corpus, name=name), _block_dir(corpus=root, name=name)
         if not _scratch_block(src, dst, sessions=chosen):
             continue
         blocks.append(dst)
@@ -255,7 +260,7 @@ def _stage_dataset(ctx: _Ctx) -> dict:
         else:
             manifest, integrity = os.path.join(ctx.corpus, "manifest.json"), ctx.integrity
             names = sorted(set(_load_json(manifest)["session_block"].values()))
-            blocks = [os.path.join(ctx.corpus, n) for n in names]
+            blocks = [_block_dir(corpus=ctx.corpus, name=n) for n in names]
         b1_dataset.build_dataset(model_path=ctx.model_path, block_dirs=blocks, manifest_path=manifest,
                                  integrity_path=integrity, out_dir=ctx.dataset_dir)
     info = _dataset_info(ctx)
