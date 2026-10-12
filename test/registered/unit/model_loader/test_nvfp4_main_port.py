@@ -13,6 +13,9 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecision
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.models.qwen3_5_mtp import _mtp_quant_config
 from sglang.srt.models.qwen4_exp import _ple_table_is_fp8
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=13, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 class TestNvfp4MainPort(unittest.TestCase):

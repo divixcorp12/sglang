@@ -34,6 +34,9 @@ from sglang.srt.layers.quantization.online_fp8 import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _ENV_KEYS = (GROUPS_ENV, SCHEME_ENV, LAYERS_ENV)
 _SUBNORMAL_HALF_STEP = 2.0**-10
