@@ -72,6 +72,10 @@ def _join(loaded: dict, capture, res) -> tuple[Joined, Counter]:
     for f in loaded["forwards"]:
         if f["kind"] != "graph" or not f["verify"]:
             continue
+        # A verify with no request is the server's warm-up: its captured input and ids are zero.
+        if not f["rids"]:
+            counts["no_request_forwards"] += 1
+            continue
         counts["verify_forwards"] += 1
         router, q = f["router"], record_of_seq.get(int(f["seq"]))
         has_router = router is not None and router < len(capture.x)
