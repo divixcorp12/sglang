@@ -9370,6 +9370,149 @@ replay prices each forward-layer independently (no cross-layer drive queueing be
 not model the pool holding a row for one more layer, and covers 1,173 fewer forward-layers at L+2 (one fewer valid
 source row per forward); it is a model, not a measured speedup.
 
+### 33.28 R2: supervised projection (T5) and full-score gate correction (G0), offline (2026-10-12)
+
+Track B round 3, after §33.27. R1 could not run its last two arms (raw x did not fit its 8 GiB guard). On the same
+reused B0 corpus, splits, exclusion manifest, policy and timing model, do T5 (trainable x projection, from T3's
+seed-0 checkpoint) or G0 (a learned low-rank correction to the native gate's full 384 scores, from scratch) beat R1's
+T3 and the native gate at L+1, and the better one at L+2, with a scorer cost measured the way serving would pay it?
+Offline only: no serving code, capture or A/B. Every number is **exploratory on reused data; independent confirmation
+pending**. Locked_test shards are never loaded; R1's and B1's run directories, selection files and verdicts are
+untouched. No real-data result exists yet: every result below is `pending`.
+
+**Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_r2_<module>.py`; R1 modules change
+only additively):
+
+| Tool | Role |
+|---|---|
+| `r2_plan.py` | `r2_plan.json` / `r2_plan.sha256`: names the R1 run read, arms, seeds 0/1/2, epoch limits, selection, calibration, x budget and the R2 continuation gate |
+| `r2_arms.py` | Raw-x budget check, T5 (parent T3 seed 0, `projection=True`, lr x0.1) and G0 training over three seeds through `r1_train.train_arm` |
+| `r2_cost.py` | T5 / G0 scorer cost under a CUDA graph at 6 live tokens: head-only, complete, and G0's correction given native scores |
+| `r2_eval.py` | Dev / calib scoring of T5, G0, T3, F0 and the gate on identical groups, skip masks and denominators; timing replay |
+| `r2_report.py` | `REPORT.md` / `results.json` renderer |
+| `r2_run.py` | Resumable driver: plan, train, select, calib, cost, replay, l2, report |
+| `r1_cache.py` (additive) | `build_cache` / `collate` take keyword-only `x_dtype` and `x_budget_bytes`; defaults keep fp32 x and 8 GiB, so R1 is unchanged |
+
+**Frozen constants** (set in `r2_plan`; R1's are reused by value).
+- x: raw train and dev x device-resident bf16, cast to fp32 per batch; budget 16 GiB checked against free GPU memory at
+  start. Past it the driver exits 3 with a message. `s_native` stays fp32.
+- Timing (D8, as R1): row read 2.2 ms; contention 1.0 / 2.0 / 3.0; gate delay = gate-only median; learned arms their
+  own measured delay.
+- Cost (D9): the serving-relevant increment, pre-registered. G0: the correction path given native scores (block
+  aggregation, filtering and selection included); T5 and T3: head only; each <= 0.1 ms per layer at bf16. The complete
+  figure with the offline gate is reported beside it, not gated.
+- Policy (D7, as R1): cap 2 at mean reads <= 1 per forward-layer, best dev recall on an exact threshold sweep, calib
+  threshold lowest within budget. Seeds 0 / 1 / 2 for both arms; the arm compared is the median dev recall across
+  seeds, the seed-0 checkpoint is the candidate.
+
+**Inputs and paths.**
+- Corpus `divix01:/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012`, dataset `/mnt/nvme1/nvfp4-work/b1-dataset-20261012/`,
+  both reused; B1 head F0 from §33.26.
+- R1 run `/mnt/nvme1/nvfp4-work/b1-r1-20261012/`, read-only: `run_plan.json`, `selection.json`,
+  `stages/audit/exclusions.json`, `stages/{seeds,l2,calib,cost}/result.json` and the T3 / F0 / L+2 T3 checkpoints, each
+  verified against its recorded sha256 (parents are copied into the R2 run and re-verified).
+- Out: `/mnt/nvme1/nvfp4-work/b1-r2-<date>/` with `r2_plan.json`, `stages/<name>/DONE.json`, `results.json`,
+  `REPORT.md`, `invocations.jsonl`. The driver refuses `--out` outside the work root, `b1-run-20261012`,
+  `b1-r1-20261012` and anything inside `--r1-run`.
+
+**Stage order and gate.** plan (freezes `r2_plan.json` before any training), train (T5, G0 at L+1, seeds 0-2, curves,
+checkpoint and parent hashes), select (better arm by median dev recall), calib (threshold on calib), cost, replay
+(zero / nominal / adverse beside T3 and the gate), l2 (the winner at L+2, seed 0, against the L+2 native gate and R1's
+L+2 T3), report. Continuation gate (D10): the candidate's dev recall at cap 2 is >= 10% relative above the native gate
+and above T3's median; calib precision not lower than the gate's at no more than +5% reads; incremental cost <= 0.1 ms
+per layer; the advantage holds across seeds, without flagged sessions and in the nominal timing case. If both arms
+fail or tie T3, the report says the remaining representation changes add nothing at this data size; no further arms in
+this feature (D12).
+
+**Rerun.** On divix01, from a private worktree at the pushed commit, production stopped. Stages resume from their
+`DONE.json`; a stage whose recorded inputs changed reruns; `plan` refuses a different plan. Lock order is disk then GPU.
+
+```bash
+OUT=/mnt/nvme1/nvfp4-work/b1-r2-<date>
+R1=/mnt/nvme1/nvfp4-work/b1-r1-20261012
+DATA=/mnt/nvme1/nvfp4-work/b1-dataset-20261012
+CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
+HEAD=<b1-run-20261012 checkpoint dir>/h1_E5_r128_h512_w2.0.pt
+PY=/data/models/slang/.venv/bin/python
+RUN="$PY analysis/dsv41-drive/prefetch-replay/r2_run.py <MODEL_PATH> --r1-run $R1 --dataset $DATA \
+  --corpus $CORPUS --b1-head $HEAD --out $OUT"
+CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
+export OMP_NUM_THREADS=8
+export PYTHONPATH=$PWD/python  # without it the venv imports sglang from another tree
+GPU="flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63"
+
+# (a) plan: CPU, cores 0-63
+$CAP taskset -c 0-63 $RUN --stages plan --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+
+# (b) train, select, calib: GPU, cc-gpu.lock, cores 32-63 (exit 3 = raw-x budget refusal)
+$GPU $RUN --stages train select calib --device cuda; echo "EXIT=${PIPESTATUS[0]}"
+
+# (c) scorer cost under a CUDA graph, 6 live tokens: GPU, cc-gpu.lock, cores 32-63
+$GPU $RUN --stages cost --device cuda; echo "EXIT=${PIPESTATUS[0]}"
+
+# (d) L+2 for the winner: GPU, cc-gpu.lock, cores 32-63
+$GPU $RUN --stages l2 --device cuda; echo "EXIT=${PIPESTATUS[0]}"
+
+# (e) timing replay and report: CPU, cores 0-63
+$CAP taskset -c 0-63 $RUN --stages replay report --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+
+# opt-in smoke, every stage (needs the GPU)
+$GPU $RUN --smoke --out $OUT-smoke; echo "EXIT=${PIPESTATUS[0]}"
+```
+
+Tests: `divix01-pytest analysis/dsv41-drive/prefetch-replay/test_r2_<module>.py ... -q -p no:randomly`, naming only
+the affected files; `--gpu -s` for the CUDA cost tests. The real-data smoke needs `SGLANG_R2_R1_RUN`,
+`SGLANG_R2_DATASET`, `SGLANG_R2_MODEL`, `SGLANG_R2_CORPUS` and `SGLANG_R2_B1_HEAD`. Read pytest's own status via
+`PIPESTATUS`.
+
+**Checks at the feature's final gate**, synthetic groups only:
+
+| Check | Files | Result | Exit |
+|---|---|---|---|
+| `py_compile` | `r2_*.py`, `r1_cache.py` | pending | pending |
+| `divix01-pytest` (CPU) | `test_r2_plan.py`, `test_r2_arms.py`, `test_r2_eval.py`, `test_r2_report.py`, `test_r2_run.py` | pending | pending |
+| `divix01-pytest` (CPU, R1 regression) | `test_r1_cache.py`, `test_r1_train.py`, `test_r1_run.py`, ... | pending | pending |
+| `divix01-pytest --gpu` | `test_r2_cost.py`, `test_r1_cost.py` | pending | pending |
+
+**Results** (exploratory on reused data; independent confirmation pending). Run directory
+`divix01:/mnt/nvme1/nvfp4-work/b1-r2-<date>/`; worktree and commit pending.
+
+L+1, cap 2 at mean reads <= 1 per forward-layer, same groups, skip masks and denominators as §33.27:
+
+| Scorer | Dev recall seeds 0 / 1 / 2 | Median | Dev precision | Calib recall | Calib precision |
+|---|---|---|---|---|---|
+| T5 | pending | pending | pending | pending | pending |
+| G0 | pending | pending | pending | pending | pending |
+| T3 (R1) | 0.332 / 0.331 / 0.331 | 0.331 | pending | 0.348 | 0.609 |
+| F0 | 0.317 | - | 0.528 | 0.330 | 0.578 |
+| gate | 0.288 | - | 0.479 | 0.284 | 0.498 |
+
+Scorer cost (CUDA graph, 6 live tokens, median ms; bf16 / fp32):
+
+| Path | T5 | G0 |
+|---|---|---|
+| head only | pending | pending |
+| complete (offline gate included) | pending | pending |
+| correction given native scores | - | pending |
+
+Timing replay (cap 2, dev, on-time useful rows; winner pending):
+
+| Contention | Winner | T3 | gate |
+|---|---|---|---|
+| zero (1.0x) | pending | 24,067 | 21,165 |
+| nominal (2.0x) | pending | 16,282 | 14,834 |
+| adverse (3.0x) | pending | 8,257 | 7,626 |
+
+L+2 (winner, seed 0, dev cap 2):
+
+| Scorer | Dev recall | Dev precision | Nominal on-time useful rows |
+|---|---|---|---|
+| winner (L+2) | pending | pending | pending |
+| T3 ladder (L+2, R1) | 0.319 | 0.509 | 22,166 |
+| gate (L+2) | 0.251 | 0.401 | 17,566 |
+
+**Continuation gate (D10):** pending. Whether T5 or G0 adds anything over T3: pending.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
