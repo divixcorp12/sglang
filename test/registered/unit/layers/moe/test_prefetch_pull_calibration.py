@@ -3,6 +3,7 @@
 import os
 import importlib.util
 import json
+import sys
 import tempfile
 import subprocess
 from unittest import mock
@@ -15,6 +16,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prediction.serving.calibration import (
     PullCalibrationHistogram,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _histogram() -> PullCalibrationHistogram:
@@ -321,3 +325,7 @@ def test_runtime_close_writes_empty_profiling_artifact_without_metrics():
     runtime.prefetch = mock.Mock()
     runtime.close()
     runtime.prefetch.write_calibration.assert_called_once_with(complete=True)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

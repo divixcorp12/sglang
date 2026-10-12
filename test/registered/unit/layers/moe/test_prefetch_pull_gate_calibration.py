@@ -5,10 +5,14 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import sys
 from pathlib import Path
 
 import pytest
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 SCRIPT = Path(__file__).parents[5] / "scripts/expert_prediction/prefetch/calibrate_pull_gate.py"
 
@@ -262,3 +266,7 @@ def test_cli_writes_only_a_complete_provenance_locked_gate(tmp_path):
     costs.write_text(json.dumps(_costs()))
     module.main(["--train", str(train), "--heldout", str(heldout), "--costs", str(costs), "--out", str(out)])
     assert json.loads(out.read_text())["complete"] is True
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
