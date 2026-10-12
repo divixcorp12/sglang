@@ -15,7 +15,16 @@ residency files (``router.res.*``, record layout in residency_capture_ref). Per 
    that hit are counted as admitted. Tie and eviction rates are reported overall, per horizon and per stratum
    (routes by the demanding layer, no-target horizons by the predicting row), and nothing is filtered on stratum.
 
-Usage: b0_integrity.py MODEL_PATH SESSION_DIR... [--out report.json]; exits 1 when any session fails.
+Layouts. A capture dir is either a block dir (``OUT/blocks/<block-id>/``, the files of many sessions served by one
+server start) or an F100 one-session dir; both are positional arguments and hold the same files. A dir with a
+``rids.json`` (rid -> session_id, turn, split) also gets ``by_session``: each joined forward goes to the session of
+its route-log ``rids``, with that session's counts, rates and split. A route-log rid missing from rids.json is
+listed under ``unmapped_rids``; it is not an error. ``by_stratum`` and ``by_horizon`` stay dir-wide.
+
+Verify forwards whose route-log ``rids`` is empty (the server's no-request warm-up forwards) are skipped by the
+checks above and counted as ``no_request_forwards``, which is not a failure.
+
+Usage: b0_integrity.py MODEL_PATH CAPTURE_DIR... [--out report.json]; exits 1 when any dir fails.
 """
 
 from __future__ import annotations
@@ -188,9 +197,64 @@ def _with_rates(counts: Counter) -> dict:
     return out
 
 
+def _load_rids(out_dir: str) -> dict | None:
+    """The dir's rid -> {session_id, turn, split} map, or None for a dir without rids.json."""
+    path = os.path.join(out_dir, "rids.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _by_session_groups(joined: Joined, *, loaded: dict, rids: dict) -> dict:
+    """The joined forwards split by session; a forward with no mapped rid goes to the None group."""
+    session_of_seq = {}
+    for f in loaded["forwards"]:
+        if f["kind"] == "graph":
+            mapped = [rids[r]["session_id"] for r in f["rids"] if r in rids]
+            session_of_seq[int(f["seq"])] = mapped[0] if mapped else None
+    owners = [session_of_seq.get(int(s)) for s in joined.seqs]
+    groups = {}
+    for owner in dict.fromkeys(owners):
+        keep = np.fromiter((o == owner for o in owners), dtype=bool, count=len(owners))
+        groups[owner] = Joined(seqs=joined.seqs[keep], router=joined.router[keep],
+                               residency=joined.residency[keep], live=joined.live[keep])
+    return groups
+
+
+def _unmapped_rids(loaded: dict, *, rids: dict) -> list[str]:
+    """Route-log rids that rids.json does not name."""
+    seen = {r for f in loaded["forwards"] for r in f["rids"]}
+    return sorted(seen - set(rids))
+
+
+def _by_session(sessions: dict, *, rids: dict) -> dict:
+    """Per session counts and rates with the session's B0 split."""
+    split_of = {v["session_id"]: v["split"] for v in rids.values()}
+    return {sid: {**_with_rates(c), "split": split_of.get(sid)} for sid, c in sorted(sessions.items())}
+
+
+def _check_part(capture, res, joined: Joined, *, W, bias) -> tuple[Counter, dict, dict, list]:
+    """Route and snapshot checks of some joined forwards: totals, per-stratum, per-horizon, mismatches."""
+    route_counts, route_strata, mismatches = _route_check(capture, joined, rows=res.rows, W=W, bias=bias)
+    snap_counts, snap_strata, horizons = _snapshot_check(res, capture, joined, rows=res.rows)
+    # The route totals live only in their strata; the snapshot totals are counted apart from theirs.
+    counts: Counter = Counter()
+    counts.update(route_counts)
+    counts.update(snap_counts)
+    strata: dict = defaultdict(Counter)
+    for name, part_counts in route_strata.items():
+        counts.update(part_counts)
+        strata[name].update(part_counts)
+    for name, part_counts in snap_strata.items():
+        strata[name].update(part_counts)
+    return counts, strata, horizons, mismatches
+
+
 def check_session(out_dir: str, *, W, bias, residency_prefix: str = RESIDENCY_PREFIX) -> dict:
-    """One session's integrity report; ``W`` [rows, experts, hidden] and ``bias`` [rows, experts] fp32, in the
-    residency header's row order. Raises ValueError on a residency header without per-row entries."""
+    """One capture dir's integrity report (a block dir or a one-session dir); ``W`` [rows, experts, hidden] and
+    ``bias`` [rows, experts] fp32, in the residency header's row order. With a rids.json in the dir the report
+    adds by_session and unmapped_rids. Raises ValueError on a residency header without per-row entries."""
     res = load_residency(os.path.join(out_dir, residency_prefix))
     capture = router_score.load_capture(os.path.join(out_dir, "router"))
     loaded = tier_sim.load_forwards(os.path.join(out_dir, "trace.jsonl"), allow_dropped=True)
@@ -200,22 +264,28 @@ def check_session(out_dir: str, *, W, bias, residency_prefix: str = RESIDENCY_PR
     if len(W) != len(res.rows) or len(bias) != len(res.rows):
         raise ValueError(f"{out_dir}: {len(W)} gates for {len(res.rows)} rows")
     joined, counts = _join(loaded, capture, res)
-    route_counts, route_strata, mismatches = _route_check(capture, joined, rows=res.rows, W=W, bias=bias)
-    snap_counts, snap_strata, horizons = _snapshot_check(res, capture, joined, rows=res.rows)
-    # The route totals live only in their strata; the snapshot totals are counted apart from theirs.
-    counts.update(route_counts)
-    counts.update(snap_counts)
+    rids = _load_rids(out_dir)
+    groups = {None: joined} if rids is None else _by_session_groups(joined, loaded=loaded, rids=rids)
     strata: dict = defaultdict(Counter)
-    for name, part_counts in route_strata.items():
+    horizons: dict = defaultdict(Counter)
+    mismatches: list = []
+    sessions: dict = {}
+    for session_id, part in groups.items():
+        part_counts, part_strata, part_horizons, part_mismatches = _check_part(
+            capture, res, part, W=W, bias=bias)
         counts.update(part_counts)
-        strata[name].update(part_counts)
-    for name, part_counts in snap_strata.items():
-        strata[name].update(part_counts)
+        mismatches.extend(part_mismatches)
+        for name, c in part_strata.items():
+            strata[name].update(c)
+        for h, c in part_horizons.items():
+            horizons[h].update(c)
+        if session_id is not None:
+            sessions[session_id] = Counter(part_counts, joined_forwards=len(part.seqs))
     counts["seq_gaps"] = _seq_gaps(loaded)
     counts["missing_records"] = counts["missing_router"] + counts["missing_label"]
     counts["joined_forwards"] = len(joined.seqs)
     report = _with_rates(counts)
-    for key in _FAILING + ("tie_count",):
+    for key in _FAILING + ("tie_count", "no_request_forwards"):
         report.setdefault(key, 0)
     report.update(
         out_dir=out_dir,
@@ -225,6 +295,9 @@ def check_session(out_dir: str, *, W, bias, residency_prefix: str = RESIDENCY_PR
         by_horizon={h: _with_rates(c) for h, c in sorted(horizons.items())},
         mismatches=mismatches,
     )
+    if rids is not None:
+        report["by_session"] = _by_session(sessions, rids=rids)
+        report["unmapped_rids"] = _unmapped_rids(loaded, rids=rids)
     report["ok"] = all(report[key] == 0 for key in _FAILING)
     return report
 
@@ -244,15 +317,21 @@ def _gates(model_path: str, rows: list[ResidencyRow]) -> tuple[torch.Tensor, tor
 def _summarize(sessions: list[dict]) -> dict:
     total: Counter = Counter()
     strata: dict = defaultdict(Counter)
+    by_session: dict = defaultdict(Counter)
+    splits: dict = {}
     for report in sessions:
         total.update({k: v for k, v in report.items() if isinstance(v, int) and not isinstance(v, bool)})
         for name, counts in report.get("by_stratum", {}).items():
             strata[name].update({k: v for k, v in counts.items() if isinstance(v, int)})
+        for sid, counts in report.get("by_session", {}).items():
+            by_session[sid].update({k: v for k, v in counts.items() if isinstance(v, int)})
+            splits[sid] = counts.get("split")
     return {
         "sessions": len(sessions),
         "failed_sessions": [r["out_dir"] for r in sessions if not r["ok"]],
         "overall": _with_rates(total),
         "by_stratum": {name: _with_rates(c) for name, c in sorted(strata.items())},
+        "by_session": {sid: {**_with_rates(c), "split": splits[sid]} for sid, c in sorted(by_session.items())},
         "per_session": sessions,
     }
 
