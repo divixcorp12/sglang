@@ -1,19 +1,25 @@
-"""B0 capture driver: a session-split residency-capture corpus on /mnt/nvme1, one served session at a time.
+"""B0 capture driver: a session-split residency-capture corpus on /mnt/nvme1, blocks of sessions per server start.
 
-Per sampled session (b0_split.sample_sessions over the corpus) it starts a dspark-both-misscut server with the stage
-trace, router capture, the residency switch and the accept log pointed at ``OUT_DIR/<session_id>/``, serves the
-session's turns through run_capture_sessions.py, and stops the launcher alone so the final ring reads land. The
-session is then checked for completeness (capture_verify.check_capture, residency record per verify forward, every
-turn answered). A session that fails is wiped and served once more; one that fails again moves to
-``OUT_DIR/failed/<session_id>`` and is listed. A passing session gets ``DONE.json``, so a rerun resumes.
+The sampled sessions (b0_split.sample_sessions over the corpus) are served in blocks of ``--block`` (default 25).
+Each block starts one dspark-both-misscut server whose stage trace, router capture, residency switch, accept log
+and metrics point at ``OUT_DIR/blocks/<block-id>/``. The block's sessions go to that server one after another, each
+through its own run_capture_sessions.py call, and the launcher is stopped alone after the last one so the final
+ring reads land. The first session served after each server start is ``warm_start`` and is kept.
 
-Each session dir also holds ``rids.json`` (rid -> session, turn, B0 split) and ``drive-samples.jsonl`` (mirror drive
-counters around the serve, for drive_sessions.flag_sessions). At the end ``OUT_DIR/manifest.json`` is written by
-b0_manifest. ``--pilot K`` serves only the first K sampled sessions and writes no manifest.
+Per session ``OUT_DIR/<session_id>/`` holds results.jsonl, rids.json (rid -> session, turn, B0 split),
+drive-samples.jsonl (mirror drive counters around the session, for drive_sessions.flag_sessions) and DONE.json
+(block, warm_start). The block is checked for completeness (capture_verify.check_capture, a residency record per
+verify forward) and each session for answered turns. Sessions without DONE are re-served once in a new block;
+the ones still without DONE move to ``OUT_DIR/failed/<session_id>`` and are listed. A rerun skips sessions with
+DONE.json or FAILED.json and regroups the rest into new blocks.
 
-Locks: rowimg-disk.lock, then cc-gpu.lock, through run_locks.take; the server runs under taskset on SERVER_CORES.
+At the end ``OUT_DIR/manifest.json`` is written by b0_manifest. ``--pilot K`` serves the first K sampled sessions
+as one block and writes no manifest.
 
-Usage: b0_capture.py OUT_DIR [--sessions 300] [--seed 0] [--pilot 2] [--max-tokens 1024]
+Locks: rowimg-disk.lock, then cc-gpu.lock, through run_locks.take, held across all blocks; the server runs under
+taskset on SERVER_CORES.
+
+Usage: b0_capture.py OUT_DIR [--sessions 300] [--seed 0] [--block 25] [--pilot 2] [--max-tokens 1024]
 """
 
 from __future__ import annotations
@@ -65,15 +71,15 @@ def recipe_env() -> dict:
     return {**overrides, "SGLANG_DSV41_RESIDENCY_CAPTURE": "1"}
 
 
-def server_env(session_dir: str) -> dict:
-    """The recipe with the trace, router capture and accept log written under ``session_dir``."""
+def server_env(block_dir: str) -> dict:
+    """The recipe with the trace, router capture, accept log and metrics written under ``block_dir``."""
     return arm_env.arm_env({
         **recipe_env(),
-        "SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(session_dir, "trace.jsonl"),
+        "SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(block_dir, "trace.jsonl"),
         # The residency side files take ROUTER_CAPTURE_PATH + ".res", which is RESIDENCY_PREFIX.
-        "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(session_dir, "router"),
-        "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH": os.path.join(session_dir, "verify-accept"),
-        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(session_dir, "metrics.jsonl"),
+        "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(block_dir, "router"),
+        "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH": os.path.join(block_dir, "verify-accept"),
+        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(block_dir, "metrics.jsonl"),
     })
 
 
@@ -109,25 +115,29 @@ def results_complete(session_dir: str, *, session: dict) -> None:
         )
 
 
-def residency_complete(session_dir: str) -> None:
+def residency_complete(block_dir: str) -> None:
     """Raise RuntimeError when a verify forward in the route log has no residency record."""
     import tier_sim
     from sglang.srt.layers.moe.residency_capture import load_residency
 
-    res = load_residency(os.path.join(session_dir, RESIDENCY_PREFIX))
+    res = load_residency(os.path.join(block_dir, RESIDENCY_PREFIX))
     have = {int(seq) for seq in res.keys[:, 0]}
-    loaded = tier_sim.load_forwards(os.path.join(session_dir, "trace.jsonl"), allow_dropped=True)
+    loaded = tier_sim.load_forwards(os.path.join(block_dir, "trace.jsonl"), allow_dropped=True)
     missing = [f["seq"] for f in loaded["forwards"] if f["kind"] == "graph" and f["verify"] and f["seq"] not in have]
     if missing:
         raise RuntimeError(f"{len(missing)} verify forwards have no residency record (first seq {missing[0]})")
 
 
-def check_complete(session_dir: str, *, session: dict) -> dict:
-    """The session's completeness: every turn answered, no lost forward, router and residency records for each verify."""
-    results_complete(session_dir, session=session)
-    summary = capture_verify.check_capture(session_dir)
-    residency_complete(session_dir)
+def check_block(block_dir: str) -> dict:
+    """The block's completeness: no lost forward, router and residency records for each verify. Returns the summary."""
+    summary = capture_verify.check_capture(block_dir)
+    residency_complete(block_dir)
     return summary
+
+
+def check_session(session: dict, session_dir: str) -> None:
+    """Raise RuntimeError unless every turn of ``session`` was answered."""
+    results_complete(session_dir, session=session)
 
 
 def _write_json(path: str, obj) -> None:
@@ -326,35 +336,39 @@ def _drive_sample(label: str, sid: str) -> dict:
     return {"label": label, "session_id": sid, **provenance.drive_sample()}
 
 
-def _serve_session(session: dict, session_dir: str, *, max_tokens: int) -> None:
-    """One attempt: server up, the session's turns served, launcher stopped so the rings' last read lands."""
+def _start_server(block_dir: str) -> subprocess.Popen:
+    """Launch the server with its capture files in ``block_dir`` and wait for health; stops it before raising."""
+    env = os.environ | server_env(block_dir) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
+    with open(os.path.join(block_dir, "server.log"), "w") as log:
+        server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
+                                  stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
+    if not capture_verify._healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
+        capture_verify.stop_server(server)
+        raise RuntimeError(f"block {os.path.basename(block_dir)}: the server never became healthy")
+    return server
+
+
+def _serve_one(server: subprocess.Popen, session: dict, session_dir: str, block_dir: str, *, max_tokens: int) -> None:
+    """Serve one session's turns on the running server; the drive samples and results land in ``session_dir``."""
     sid = session["session_id"]
+    if server.poll() is not None:
+        raise RuntimeError(f"session {sid}: the server exited {server.returncode} before the session")
     sessions_file = os.path.join(session_dir, "session.jsonl")
     with open(sessions_file, "w") as f:
         f.write(json.dumps(session) + "\n")
-    env = os.environ | server_env(session_dir) | {"PYTHONPATH": os.path.join(REPO, "python")}
-    argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
-    with open(os.path.join(session_dir, "server.log"), "w") as log:
-        server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
-                                  stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
-    samples = []
-    try:
-        if not capture_verify._healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
-            raise RuntimeError(f"session {sid}: the server never became healthy")
-        samples.append(_drive_sample("session_start", sid))
-        rc = subprocess.run(
-            ["taskset", "-c", arm_env.DRIVER_CORES, arm_env.PYTHON, RUNNER, "--port", str(PORT),
-             "--sessions", sessions_file, "--session-ids", sid, "--max-tokens", str(max_tokens),
-             "--results", os.path.join(session_dir, "results.jsonl")],
-            cwd=REPO,
-        ).returncode
-        samples.append(_drive_sample("session_end", sid))
-    finally:
-        capture_verify.stop_server(server)
+    samples = [_drive_sample("session_start", sid)]
+    rc = subprocess.run(
+        ["taskset", "-c", arm_env.DRIVER_CORES, arm_env.PYTHON, RUNNER, "--port", str(PORT),
+         "--sessions", sessions_file, "--session-ids", sid, "--max-tokens", str(max_tokens),
+         "--results", os.path.join(session_dir, "results.jsonl")],
+        cwd=REPO,
+    ).returncode
+    samples.append(_drive_sample("session_end", sid))
     with open(os.path.join(session_dir, "drive-samples.jsonl"), "w") as f:
         f.write("".join(json.dumps(s) + "\n" for s in samples))
     if rc != 0:
-        raise RuntimeError(f"session {sid}: the session runner exited {rc}")
+        raise RuntimeError(f"session {sid}: the session runner exited {rc} (block {os.path.basename(block_dir)})")
 
 
 def _ps_lines() -> list[str]:
@@ -372,7 +386,8 @@ def _finish(*, out_dir: str, sessions: list[dict], split: dict, outcome: dict, r
         with open(os.path.join(out_dir, sid, "rids.json")) as f:
             rids.update(json.load(f))
     _write_json(os.path.join(out_dir, "rids.json"), rids)
-    write_manifest(out_dir, commit=_commit(), recipe=recipe, split=split, failed=outcome["failed"], flagged=flagged)
+    write_manifest(out_dir, commit=_commit(), recipe=recipe, split=split, failed=outcome["failed"], flagged=flagged,
+                   session_block=outcome["blocks"], warm_start=outcome["warm_start"])
     print(json.dumps({"sampled": len(sessions), "done": len(outcome["done"]), "failed": outcome["failed"],
                       "flagged": [f["session_id"] for f in flagged]}, indent=1))
     return 0 if len(outcome["done"]) >= MIN_COMPLETE_FRACTION * len(sessions) else 1
@@ -383,7 +398,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("out_dir")
     p.add_argument("--sessions", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--pilot", type=int, default=0, help="serve only the first K sampled sessions, no manifest")
+    p.add_argument("--block", type=int, default=DEFAULT_BLOCK, help="sessions served per server start")
+    p.add_argument("--pilot", type=int, default=0,
+                   help="serve only the first K sampled sessions as one block, no manifest")
     p.add_argument("--max-tokens", type=int, default=1024)
     a = p.parse_args(argv)
     out_dir = os.path.abspath(a.out_dir)
@@ -395,12 +412,13 @@ def main(argv: list[str] | None = None) -> int:
     split = split_sessions([s["session_id"] for s in sampled], seed=a.seed)
     _write_json(os.path.join(out_dir, "split.json"), split)
     sessions = sampled[: a.pilot] if a.pilot else sampled
-    by_id = {s["session_id"]: s for s in sessions}
+    block_size = a.pilot if a.pilot else a.block
     with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
-        outcome = capture_all(
-            out_dir=out_dir, sessions=sessions, split=split,
-            serve=lambda s, d: _serve_session(s, d, max_tokens=a.max_tokens),
-            check=lambda s, d: check_complete(d, session=by_id[s["session_id"]]),
+        outcome = capture_blocks(
+            out_dir=out_dir, sessions=sessions, split=split, block_size=block_size,
+            start=_start_server,
+            serve_session=functools.partial(_serve_one, max_tokens=a.max_tokens),
+            stop=capture_verify.stop_server, check_block=check_block, check_session=check_session,
         )
     if a.pilot:
         print(json.dumps(outcome, indent=1))
