@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import bisect
 import glob
+import importlib.util
 import json
 import struct
 import sys
+from pathlib import Path
 
 MARGIN_EDGES = (-1.0, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5)
 
@@ -98,20 +100,16 @@ def bins(picks: list[dict], top_k: int) -> dict:
 FLOORS = (0.3, 0.4, 0.5, 0.6)
 
 
-def stratum(layer: int) -> str:
-    """The handoff's architecture strata, by target layer: Engram sits at 1 and 14, the encoder ends at 19, the
-    bounded prefill replay starts at 21, DSpark taps 37-39."""
-    if layer in (1, 14):
-        return "enters engram"
-    if layer in (2, 15):
-        return "leaves engram"
-    if layer == 20:
-        return "19->20"
-    if layer == 21:
-        return "replay start"
-    if layer >= 37:
-        return "late"
-    return "interior"
+def _load_stratum():
+    # By file path: the moe package __init__ imports torch, which this script must not need.
+    path = Path(__file__).resolve().parents[3] / "python/sglang/srt/layers/moe/dsv41_strata.py"
+    spec = importlib.util.spec_from_file_location("sglang_dsv41_strata", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.stratum
+
+
+stratum = _load_stratum()
 
 
 def margin_bin(p: dict) -> int:
