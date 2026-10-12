@@ -8828,6 +8828,96 @@ The next lever is a better predictor (`RAM_PREFETCH_PREDICTOR_HANDOFF.md`, Track
 - The ms prices reuse §33.16's slopes from instrumented runs, with partial cover priced at half value.
 - The comparisons of fully covered 2+ miss layers rest on 16-34 layers each.
 
+### 33.25 B0: gate-training corpus with in-graph residency labels (2026-10-11)
+
+Track B0 of `RAM_PREFETCH_PREDICTOR_HANDOFF.md`: a session-split capture for a learned L+1..L+4 predictor. Per
+(verify forward, layer, token) it holds the gate input, the native routes and weights, the RAM map of the next four
+layers at the prediction point, and each routed lane's true demand kind, with GPU timestamps. B1 (baselines, E2/E5,
+L+1 and L+2/L+4 evaluation) trains and tests on it. The feature's final gate ran the CPU and GPU tests only; the
+pilot and the full run were not run by the gate, so every corpus number below reads "not run by the gate".
+
+**Corpus path.** `/mnt/nvme1/` (never the root volume or nvme0/2/4), one directory per session plus `manifest.json`
+and `rids.json` at the top. A session directory holds `session.jsonl`, `results.jsonl`, `rids.json`,
+`drive-samples.jsonl`, `DONE.json`, the router capture files and the residency side files `router.res.*`. Sessions
+that failed twice sit under `failed/<id>/FAILED.json` and are not in the manifest. Path: not run by the gate.
+
+**Recipe.**
+- Env: `both_cpu_ab.ARMS['dspark-both-misscut'][0]` through `arm_env.arm_env`, EXL3 fused path, RAM prefetch off
+  (`SGLANG_DSV41_RAM_PREFETCH=0`, so speculative reads do not change the miss pattern).
+- Capture switches: the job trace, `SGLANG_DSV41_ROUTER_CAPTURE_PATH`, `SGLANG_DSV41_RESIDENCY_CAPTURE=1` and
+  `SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH`.
+- `SGLANG_DSV41_RESIDENCY_CAPTURE` is refused without the router capture path. With it unset nothing is allocated and
+  nothing is launched in the graph.
+- One session per server start (ring files are complete only after the launcher's SIGTERM), `--max-tokens` 1024,
+  port 30033, disk lock then GPU lock.
+
+**Record layout** (stated once in `residency_capture_ref.py`; the CUDA kernel, the host reference and the readers
+share it). Files are `<prefix>.snap.bin`, `<prefix>.label.bin`, `<prefix>.seq.bin` and a `.json` header
+(`residency_capture.py`).
+- Snapshot per (forward, layer row T): 4 horizons x 384-bit mask (6 x uint64; bit e set iff the target row's
+  `ram_slot[e] >= 0`; all zero when the target is -1), a per-horizon valid flag and a uint64 `%globaltimer` stamp.
+- Label per (forward, layer): each route's kind as uint8 in route order, plus a `%globaltimer` stamp. Kinds 1..5 are
+  `ram_slot_map.LaneKind`; 0 is VRAM hot (a route outside the planned lanes).
+- `seq.bin` keys each record to the forward's `seq`, pass id and live token count.
+
+**Horizon validity.** A horizon T+h is invalid only when no streamed row has model layer id `layer_ids[T] + h`
+(target -1, `valid` false, mask all zero). Nothing else invalidates one: crossing Engram, 19->20, 21 or the layers
+from 37 up stays valid. The header states it as `validity_rule`: "invalid: no target row".
+
+**Per-row header fields, one entry per map row.** B1 filters on these; the integrity tool reports per stratum and
+never drops a horizon on stratum.
+- `layer_id`: the model layer.
+- `stratum`: the label from `dsv41_strata.stratum()`, shared with `spec_margin.stratum`.
+- `gate_has_bias`: whether the layer's router gate has an `e_score_correction_bias`, the property
+  `ram_prefetch.prefetch_targets` selects on; false for hash-routed or gateless layers. It comes from
+  `ram_prefetch.registered_gates()`, which `deepseek_v4.py` fills when the residency switch is on.
+
+**Integrity.** `b0_integrity.py MODEL_PATH SESSION_DIR... [--out REPORT]` recomputes the gate
+(`sqrt(softplus(x @ W.T))` in fp32 plus bias, top-6 compared as sets). A rank-6/7 swap within one bf16 step counts
+as a tie; any other mismatch is kept in the report and exits 1, as do seq gaps, missing records and live-count
+disagreement. It also reports no-target horizons, snapshots stamped after their demand, and the eviction rate
+between snapshot and demand (non-hot routes the snapshot showed in RAM that were then served as an NVMe miss),
+overall, per horizon and per stratum.
+
+**Rerun.** On divix01, from a private worktree at the pushed commit (`.claude/rules/divix01-run-protocol.md`), with
+production stopped and no `launch_server`, `both_cpu_ab` or `run_arm.sh` running:
+
+```bash
+# pilot: two sessions, no manifest
+taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_capture.py /mnt/nvme1/<corpus> --pilot 2
+taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_integrity.py <MODEL_PATH> /mnt/nvme1/<corpus>/<session>...
+# full run: resumes from the pilot's directory, writes manifest.json
+taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_capture.py /mnt/nvme1/<corpus> --sessions 300 --seed 0
+```
+
+The full run starts only after the pilot passes the integrity tool. A rerun skips sessions with `DONE.json` or
+`FAILED.json`; delete the marker to serve one again. The run stops after 5 failed sessions in a row and exits 0 only
+when at least 90% of sampled sessions are done. The manifest holds the commit, the recipe env, the session list, the
+seeded whole-session split 180/45/30/45, the per-row metadata, the validity rule, and file sizes and sha256s.
+
+**Results.**
+
+| Item | Value |
+|---|---|
+| Corpus path | not run by the gate |
+| Sessions captured complete / sampled | not run by the gate |
+| Failed sessions | not run by the gate |
+| Drive-flagged sessions | not run by the gate |
+| Non-tie route mismatches | not run by the gate |
+| Tie rate (rank 6/7 within bf16) | not run by the gate |
+| Eviction between snapshot and demand | not run by the gate |
+| No-target horizons | not run by the gate |
+| Capture overhead per verify forward | not run by the gate |
+
+The gate's checks on the merged feature, on divix01 (`divix01-pytest`, GPU lane with `--gpu`):
+
+| Check | Result | Exit |
+|---|---|---|
+| CPU: `test_exl3_stream_trace.py`, `test_ram_slot_map.py`, `test_dsv41_config.py` (`test_one_field_per_knob` deselected) and the scripts tests | 386 passed, 1 deselected, 14 warnings in 22.03 s | 0 |
+| `scripts/lint/check_registered_tests.py` | failed | 1 |
+| `scripts/lint/check_no_bare_pytest_main.py` | passed | 0 |
+| GPU: `test_residency_capture_cuda.py`, `test_exl3_ram_miss_graph_gpu.py` | 10 passed, 15 warnings in 23.78 s | 0 |
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

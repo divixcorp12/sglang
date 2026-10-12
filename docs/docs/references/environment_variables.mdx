@@ -1380,6 +1380,11 @@ These variables configure DeepSeek V4.1: streaming EXL3 routed experts from disk
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>empty</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_RESIDENCY_CAPTURE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With the router capture on, also record per layer the RAM residency of the next four layers' experts and each routed lane's demand kind into side files at the same prefix. Refused without <code>SGLANG_DSV41_ROUTER_CAPTURE_PATH</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TEST_DSV41_RAM_MISS_FAULT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Test only: <code>&lt;demands&gt;:&lt;seconds&gt;</code> makes the RAM-miss thread sleep before every demand read once that many demands have read rows, forcing a timeout after capture.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>empty</code></td>

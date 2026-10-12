@@ -33,6 +33,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     expert_dir: str
     expert_trace_path: str
     router_capture_path: str
+    residency_capture: bool
     verify_accept_log_path: str
     ram_miss_timeout_ms: int
     ram_miss_idle_spin_us: int
@@ -103,6 +104,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             expert_dir=envs.SGLANG_DSV41_EXPERT_DIR.get(),
             expert_trace_path=envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get(),
             router_capture_path=envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get(),
+            residency_capture=envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get(),
             verify_accept_log_path=envs.SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH.get(),
             ram_miss_timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
             ram_miss_idle_spin_us=envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.get(),

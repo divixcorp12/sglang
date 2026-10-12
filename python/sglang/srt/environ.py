@@ -1870,6 +1870,9 @@ class Envs:
     # input and top-k weights into binary side files at this path prefix (exl3_stream_trace.RouterCapture,
     # ~410 KB per token). Setting it without the trace is refused.
     SGLANG_DSV41_ROUTER_CAPTURE_PATH = EnvStr("")
+    # With the router capture above on: also record, per layer, the RAM residency of the next four layers'
+    # experts and each routed lane's demand kind into side files at the same prefix. Refused without it.
+    SGLANG_DSV41_RESIDENCY_CAPTURE = EnvBool(False)
     # Trace runs: a path prefix for one JSON line per request per verify step (its ordinal and correct drafts,
     # speculative/verify_accept_log.py), which joins the route log's verify forwards to split misses by verified
     # position (analysis/dsv41-drive/dspark/verify_split.py). Empty: nothing is written.

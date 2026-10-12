@@ -4,6 +4,12 @@ import pytest
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.srt.layers.moe.ram_slot_map import LaneKind, LaneOverflow, MapReplica, split_miss_cut, type_lanes
+from sglang.srt.layers.moe.residency_capture_ref import (
+    KIND_VRAM_HOT,
+    horizon_targets,
+    route_labels,
+    snapshot_masks,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -256,3 +262,45 @@ def test_a_zero_cut_is_todays_typing():
 def test_the_split_miss_cut_applies_only_with_cpu_experts():
     assert split_miss_cut(1, 3, cpu_experts=True) == (1, 3)
     assert split_miss_cut(1, 3, cpu_experts=False) == (0, 3)
+
+
+# Streamed model layers with gaps at 0, 3..13, 16 and 23..35.
+_LAYERS = [1, 2, 14, 15, 17, 18, 19, 20, 21, 22, 36, 37, 38]
+
+
+def test_horizons_cross_engram_19_20_21_and_the_tail_but_stay_valid():
+    targets, valid = horizon_targets(_LAYERS)
+    row = {layer: i for i, layer in enumerate(_LAYERS)}
+    assert targets[row[1]] == [row[2], -1, -1, -1]  # 1 -> 2 is an Engram boundary; 3..5 are not streamed
+    assert targets[row[19]] == [row[20], row[21], row[22], -1]  # crosses 19 -> 20 and 21
+    assert targets[row[36]] == [row[37], row[38], -1, -1]
+    assert valid[row[19]] == [True, True, True, False]
+    assert all(v == (t != -1) for ts, vs in zip(targets, valid) for t, v in zip(ts, vs))
+
+
+def test_a_horizon_past_the_last_row_has_an_all_zero_mask():
+    targets, valid = horizon_targets([5, 6])
+    assert targets[1] == [-1, -1, -1, -1] and valid[1] == [False] * 4
+    ram = [[0] * 384, [-1] * 384]
+    assert snapshot_masks(ram, targets=targets[1]) == [[0] * 6] * 4
+
+
+def test_snapshot_masks_set_bit_e_of_word_e_div_64_for_resident_experts():
+    ram = [[-1] * 384 for _ in range(3)]
+    ram[1][0] = ram[1][63] = ram[1][64] = ram[1][383] = 7
+    ram[2][130] = 0
+    masks = snapshot_masks(ram, targets=[1, 2, -1, 0])
+    assert masks[0] == [1 | (1 << 63), 1, 0, 0, 0, 1 << 63]
+    assert masks[1] == [0, 0, 1 << 2, 0, 0, 0]
+    assert masks[2] == masks[3] == [0] * 6
+
+
+def test_route_labels_agree_with_type_lanes_and_mark_unplanned_routes_hot():
+    ram = [-1] * 10
+    ram[1], ram[3] = 21, 23
+    staging = [50, 51, 52] + [-1] * 5
+    planned = [1, 2, 3, 4]
+    kinds, _ = _type(planned, ram, staging, cpu_on=True)
+    labels = route_labels(routes=[4, 9, 1, 7, 3], planned=planned, count=4, lane_kind=kinds)
+    assert labels == [kinds[3], KIND_VRAM_HOT, kinds[0], KIND_VRAM_HOT, kinds[2]]
+    assert route_labels(routes=[4, 1], planned=planned, count=1, lane_kind=kinds) == [KIND_VRAM_HOT, kinds[0]]

@@ -624,6 +624,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         # once the target row attached.
         self.spec_expected = False
         self.spec_score = None
+        # SGLANG_DSV41_RESIDENCY_CAPTURE: a ResidencyHook set by Exl3RamMissService.attach; None is the uncaptured post.
+        self.residency_hook = None
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -691,6 +693,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             cpu_input=self.cpu_input if captured and self.cpu_experts else None,
             spill=self.spill,
         )
+        if self.residency_hook is not None:
+            self.residency_hook.launch(
+                side=side, routes=self.routes, planned=self.planned, count=plan.count, route_log=self.route_log
+            )
         if self.spec_expected:
             # Layer T+1's gate on this layer's input, forked off this stream so C1 does not wait for it; joined below.
             side.spec_score(entry=self.spec_score, x=self.cpu_input[0] if self.cpu_input is not None else None)
@@ -1025,6 +1031,14 @@ class Exl3RamMissService:
             raise RuntimeError(
                 "exl3 RAM miss: SGLANG_DSV41_ROUTER_CAPTURE_PATH needs SGLANG_DSV41_EXPERT_TRACE_PATH: the "
                 "router capture is written by the stage trace's graph route log"
+            )
+        if (
+            envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get()
+            and not envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get()
+        ):
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_DSV41_RESIDENCY_CAPTURE needs SGLANG_DSV41_ROUTER_CAPTURE_PATH: the "
+                "residency capture is written beside the router capture"
             )
         cfg = Dsv41Config.from_envs()
         streamers = {
@@ -1598,6 +1612,16 @@ class Exl3RamMissService:
             cpu_experts=self.cpu_experts is not None,
             streamer_of=self.tables[streamer.layer_id].streamer_of,
         )
+        if self.route_log is not None and self.route_log.residency is not None:
+            from sglang.srt.layers.moe.residency_hook import residency_hook_for
+
+            streamer.row_backend.residency_hook = residency_hook_for(
+                row,
+                layer_ids=sorted(self._rows, key=self._rows.__getitem__),
+                width=streamer.graph_gather_rows,
+                topk=streamer.layer.top_k,
+                device=cache.device,
+            )
         if self._spec_gpu is not None:
             self._note_spec_row(row, streamer.row_backend)
         updater = manager.gpu_residency
@@ -1653,6 +1677,15 @@ class Exl3RamMissService:
         )
         if router_prefix:
             log.enable_router(router_prefix)
+        if envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get():
+            from sglang.srt.layers.moe.ram_prefetch import registered_gates
+            from sglang.srt.layers.moe.residency_capture import residency_rows
+
+            # ensure_started refused the switch without a router prefix.
+            layer_ids = sorted(self._rows, key=self._rows.__getitem__)
+            log.enable_residency(
+                router_prefix + ".res", rows=residency_rows(layer_ids, gates=registered_gates())
+            )
         if self._gpu_hot_updater is not None:
             log.bind_hot(
                 self._gpu_hot_updater.slot_to_expert, self._gpu_hot_updater.layer_ids

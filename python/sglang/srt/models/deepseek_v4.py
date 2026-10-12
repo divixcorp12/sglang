@@ -5307,7 +5307,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
-        if envs.SGLANG_DSV41_RAM_PREFETCH.get():
+        if (
+            envs.SGLANG_DSV41_RAM_PREFETCH.get()
+            or envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get()
+        ):
             from sglang.srt.layers.moe.ram_prefetch import register_moe_gates
 
             register_moe_gates(
