@@ -11,6 +11,9 @@ from sglang.srt.layers.moe.expert_prediction.training.dataset import (
     load_session_splits,
 )
 from sglang.srt.layers.moe.expert_prediction.training.pca import encode, fit_pca, reconstruct
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestLLaPorLossWeights(unittest.TestCase):

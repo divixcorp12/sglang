@@ -8,6 +8,9 @@ from sglang.srt.layers.moe.expert_prediction.base import ExpertPredictor, pad_ca
 from sglang.srt.layers.moe.expert_prediction.contracts import MoeLayerSpec, RouteFeature
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
 from sglang.srt.layers.moe.expert_prediction.popularity import PopularityPredictor
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
 

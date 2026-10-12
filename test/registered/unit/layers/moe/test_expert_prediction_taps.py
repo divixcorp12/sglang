@@ -14,6 +14,9 @@ from sglang.srt.layers.moe.expert_prediction.contracts import (
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
 from sglang.srt.layers.moe.expert_prediction.taps import RouteTaps, discover_moe_layers
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class FakeTopK(nn.Module):

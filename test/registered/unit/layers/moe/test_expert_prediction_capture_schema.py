@@ -2,6 +2,9 @@ import unittest
 
 from sglang.srt.layers.moe.expert_prediction.capture_schema import rows_per_request
 from sglang.srt.layers.moe.expert_prediction.prefix_hash import PrefixHasher, SeenPrefixes
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPrefixHasher(unittest.TestCase):
