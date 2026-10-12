@@ -9039,9 +9039,9 @@ flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages c
 # (e) report (needs every earlier stage's DONE marker)
 $CAP taskset -c 0-63 $RUN --stages report --device cpu
 
-# opt-in smoke on 5 train-split sessions (no locked-test session is extracted)
-$CAP taskset -c 0-63 $PY analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
-  --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke --device cpu
+# opt-in smoke on 5 train-split sessions (no locked-test session is extracted); every stage, cost needs the GPU
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $PY analysis/dsv41-drive/prefetch-replay/b1_run.py \
+  <MODEL_PATH> --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke
 ```
 
 Tests (`divix01-pytest <named test_b1_*.py files> -q -p no:randomly`; `--gpu` for `test_b1_cost.py`; the real-corpus

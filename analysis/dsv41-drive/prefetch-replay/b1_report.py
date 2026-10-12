@@ -133,8 +133,6 @@ def _cost(c: dict) -> list[str]:
     c = c or {}
     keys = ("bytes_bf16", "median_ms", "p90_ms", "runs", "tokens", "within_0_1ms")
     out = ["## Scorer cost (chosen L+1 head, RTX 5090, 6 tokens, one layer)", ""]
-    if c.get("skipped"):
-        out += [f"Skipped: {c['skipped']}", ""]
     return out + _table(["metric", "value"], [[k, _num(c.get(k))] for k in keys])
 
 
