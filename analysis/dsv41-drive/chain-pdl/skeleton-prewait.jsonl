@@ -1,0 +1,9 @@
+{"kind": "skeleton", "mode": 0, "work_ns": 2000, "pre_ns": 0, "layers": 40, "replay_us_p50": 966.74, "per_layer_us_p50": 24.168}
+{"kind": "skeleton", "mode": 1, "work_ns": 2000, "pre_ns": 0, "layers": 40, "replay_us_p50": 935.47, "per_layer_us_p50": 23.387}
+{"kind": "skeleton", "mode": 2, "work_ns": 2000, "pre_ns": 0, "layers": 40, "replay_us_p50": 898.43, "per_layer_us_p50": 22.461}
+{"kind": "skeleton", "mode": 0, "work_ns": 2000, "pre_ns": 200, "layers": 40, "replay_us_p50": 1036.48, "per_layer_us_p50": 25.912}
+{"kind": "skeleton", "mode": 1, "work_ns": 2000, "pre_ns": 200, "layers": 40, "replay_us_p50": 1005.44, "per_layer_us_p50": 25.136}
+{"kind": "skeleton", "mode": 2, "work_ns": 2000, "pre_ns": 200, "layers": 40, "replay_us_p50": 905.95, "per_layer_us_p50": 22.649}
+{"kind": "skeleton", "mode": 0, "work_ns": 2000, "pre_ns": 500, "layers": 40, "replay_us_p50": 1128.5, "per_layer_us_p50": 28.212}
+{"kind": "skeleton", "mode": 1, "work_ns": 2000, "pre_ns": 500, "layers": 40, "replay_us_p50": 1097.86, "per_layer_us_p50": 27.446}
+{"kind": "skeleton", "mode": 2, "work_ns": 2000, "pre_ns": 500, "layers": 40, "replay_us_p50": 918.5, "per_layer_us_p50": 22.962}

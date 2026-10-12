@@ -1,0 +1,46 @@
+{
+ "host": "divix01",
+ "gpu": "NVIDIA GeForce RTX 5090",
+ "cuda": "13.0",
+ "probes": {
+  "v8_weak": {
+   "build": true,
+   "ok": true,
+   "load_opcodes": [
+    "LDG.E.ENL2.256"
+   ],
+   "error": null
+  },
+  "v8_cv": {
+   "build": true,
+   "ok": true,
+   "load_opcodes": [
+    "LDG.E.ENL2.256.STRONG.SYS"
+   ],
+   "error": null
+  },
+  "ldgsts": {
+   "build": true,
+   "ok": true,
+   "load_opcodes": [
+    "LDGDEPBAR",
+    "LDGSTS.E.BYPASS.128"
+   ],
+   "error": null
+  },
+  "bulk": {
+   "build": true,
+   "ok": true,
+   "load_opcodes": [
+    "UBLKCP.S.G"
+   ],
+   "error": null
+  },
+  "batch": {
+   "build": true,
+   "ok": true,
+   "load_opcodes": [],
+   "error": null
+  }
+ }
+}
