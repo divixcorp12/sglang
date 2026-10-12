@@ -87,7 +87,7 @@ def _typed_case(rng):
     for e in planned:
         if ram[e] >= 0:
             ram[e] = rng.randrange(LANES)
-    staging = rng.sample(range(8, 14), 6)
+    staging = rng.sample(range(8, 16), LANES)
     kinds, _ = type_lanes(
         planned, ram, staging, SPLIT, lanes=LANES, captured=True, copy_armed=False, hit_copy="sm",
         cpu_on=False, cpu_misses=False,
