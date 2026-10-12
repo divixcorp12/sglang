@@ -238,3 +238,9 @@ def test_aligned_rows_reject_wrong_width_and_mismatched_slots():
                 torch.zeros(2, PAGE, dtype=torch.uint8),
                 torch.tensor([0]),
             )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

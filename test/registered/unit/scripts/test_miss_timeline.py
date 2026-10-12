@@ -5,6 +5,10 @@ import sys
 
 import pytest
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
 _PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "..", "..", "analysis", "dsv41-drive", "dspark", "miss_timeline.py"
 )
@@ -85,3 +89,7 @@ def test_summary_counts_together_landings(trace):
 def test_busy_union_merges_overlaps():
     assert mt.busy_within([(0, 2), (1, 3), (5, 6)], 0, 10) == 4
     assert mt.busy_within([(0, 2), (5, 6)], 1, 5.5) == pytest.approx(1.5)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

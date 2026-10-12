@@ -2,6 +2,9 @@ import json
 import torch
 from safetensors.torch import save_file, load_file
 from scripts.dsv41.make_dspark_draft_dir import make_draft_dir
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _write(tmp_path):
@@ -27,3 +30,11 @@ def test_copies_only_mtp_tensors_and_restores_nextn(tmp_path):
     assert cfg["num_nextn_predict_layers"] == 3 and cfg["dspark_block_size"] == 5
     idx = json.load(open(out / "model.safetensors.index.json"))["weight_map"]
     assert idx == {"mtp.0.a": "model.safetensors", "mtp.1.b": "model.safetensors"}
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))
