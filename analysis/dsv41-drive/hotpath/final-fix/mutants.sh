@@ -9,7 +9,7 @@ wt=${1:?private worktree}; out=${2:?out dir}
 here=$(cd "$(dirname "$0")" && pwd)
 H=python/sglang/kernels/jit/csrc/moe/expert_stream/host
 PREFIX=test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py::test_fill_wait_returns_as_a_prefix_lands
-FIRST=test/registered/unit/kernels/test_expert_stream_hotpath_shim.py::test_the_service_thread_allocates_nothing_from_its_first_request
+FIRST=test/manual/dsv41/test_expert_stream_hotpath_shim.py::test_the_service_thread_allocates_nothing_from_its_first_request
 cd "$wt" || exit 1
 [ -z "$(git status --porcelain)" ] || { echo "$wt is dirty"; exit 1; }
 run() {  # <tag> <runs> <node> [LOAD]

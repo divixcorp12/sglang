@@ -9,11 +9,8 @@ import time
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, spawn_child, warm_host_modules
 from sglang.test.dsv41_ram_prefetch_fixtures import LANES, LOGITS, enable, forced, prefetch_rig, trigger
-
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)

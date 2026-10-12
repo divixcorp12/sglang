@@ -12,13 +12,16 @@ lane at reservation, a miss lane under tag LOADING, and a read that fails aborts
 
 import faulthandler
 import random
+import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "registered/unit/kernels"))
 import test_exl3_ram_miss_split as split
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
@@ -35,11 +38,8 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     read_rows_sqes,
     read_rows_traced,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, assert_aborted, ram_miss_setup, run_host_script
-
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)

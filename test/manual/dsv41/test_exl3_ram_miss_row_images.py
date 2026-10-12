@@ -8,11 +8,14 @@ open, and the service's wiring of the images.
 
 import errno
 import resource
+import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "registered/unit/kernels"))
 import test_exl3_ram_miss_split as split
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_pieces, read_rows_sqes, read_rows_traced
@@ -20,10 +23,7 @@ from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables, open_service_row_images
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
-
-register_cpu_ci(est_time=240, suite="base-a-test-cpu")
 
 
 _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
