@@ -1,3 +1,4 @@
+import sys
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
@@ -11,6 +12,9 @@ from sglang.srt.model_executor.runner_backend import (
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_logits_processor_output_buffers_tensor_fields_and_preserves_metadata():
@@ -169,3 +173,7 @@ def test_capture_one_stores_every_verify_row_of_a_request_keyed_graph(monkeypatc
     stored = backend._outputs[key]
     assert torch.equal(stored.next_token_logits, verify.next_token_logits)
     assert torch.equal(stored.hidden_states, verify.hidden_states)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
