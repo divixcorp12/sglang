@@ -8929,15 +8929,20 @@ The full run starts only after the pilot passes the integrity tool.
 
 | Item | Value |
 |---|---|
-| Corpus path | not run by the gate |
-| Sessions captured complete / sampled | not run by the gate |
-| Failed sessions | not run by the gate |
-| Drive-flagged sessions | not run by the gate |
-| Non-tie route mismatches | not run by the gate |
-| Tie rate (rank 6/7 within bf16) | not run by the gate |
-| Eviction between snapshot and demand | not run by the gate |
-| No-target horizons | not run by the gate |
-| Capture overhead per verify forward | not run by the gate |
+| Corpus path | `divix01:/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012` (16 GB; commit `37ed17437f`; blocks b000-b003; 4 warm-start sessions) |
+| Sessions captured complete / sampled | 100 / 100 (owner reduced the target from 300 to 100); split train 60 / dev 15 / calib 10 / locked_test 15 |
+| Failed sessions | 0 |
+| Drive-flagged sessions | 19 (listed in `manifest.json` `flagged`) |
+| Non-tie route mismatches | 1 of 1,540,800 route cells: b000 seq 1283, layer 39, token 1, three of six experts differ with computed rank 6 = rank 7; read as one bad token record. The tool exits 1 and lists b000 as failed for it. |
+| Tie rate (rank 6/7 within bf16) | 3.05e-5 (47 ties) |
+| Eviction between snapshot and demand | 0.0056 (75,152 of 13,428,020 snapshot routes) |
+| No-target horizons | 64,200 |
+| Request / warm-up verify forwards | 6,412 joined / 8 `no_request_forwards`; no seq gaps, missing records, live-count mismatches or stamp inversions |
+| Capture overhead per verify forward | not measured end to end; the snapshot kernel costs 8.2 µs per layer (F100 GPU test), about 0.33 ms per 40-layer forward |
+
+The capture took about 70 minutes for four server starts (2026-10-12). Integrity report:
+`divix01:/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012/integrity.json` (`b0_integrity.py` at `37ed17437f` over
+`blocks/b000`..`b003`).
 
 The gate's checks on the merged feature, on divix01 (`divix01-pytest`, GPU lane with `--gpu`):
 
