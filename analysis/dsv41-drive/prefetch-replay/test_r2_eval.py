@@ -101,6 +101,13 @@ def test_select_uses_best_epoch_and_breaks_ties_by_params():
     assert out["candidate"]["sha"] == "sha10"
 
 
+def test_select_accepts_int_seed_keys():
+    t5 = {s: _arm([0.5], params=10) for s in (0, 1, 2)}
+    g0 = {s: _arm([0.6], params=20) for s in (0, 1, 2)}
+    out = r2_eval.select(_train(t5, g0), r1_seeds=_seeds(0.45))
+    assert out["winner"] == "G0" and out["candidate"]["sha"] == "sha20"
+
+
 def test_delay_per_scorer():
     r1_cost = {"gate_only_ms": 0.01, "gate_ms": 0.2}
     delays = r2_eval.scorer_delays(r1_cost=r1_cost, arm_costs={"T5": {"complete_ms": 0.3}, "G0": {"complete_ms": 0.4}})

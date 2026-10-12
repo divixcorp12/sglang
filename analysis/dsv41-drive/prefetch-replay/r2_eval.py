@@ -151,8 +151,8 @@ def _dev_recall(arm: dict) -> float:
 
 def select(train_result: dict, *, r1_seeds: dict) -> dict:
     """Median dev recall per arm across seeds, the winner (ties to fewer parameters) and its seed-0 checkpoint."""
-    arms = train_result["arms"]
-    by_seed = {n: {str(s): _dev_recall(a) for s, a in seeds.items()} for n, seeds in arms.items()}
+    arms = {n: {str(s): a for s, a in seeds.items()} for n, seeds in train_result["arms"].items()}
+    by_seed = {n: {s: _dev_recall(a) for s, a in seeds.items()} for n, seeds in arms.items()}
     medians = {n: statistics.median(v.values()) for n, v in by_seed.items()}
     params = {n: seeds[_SEED0]["params"] for n, seeds in arms.items()}
     winner = max(sorted(medians), key=lambda n: (medians[n], -params[n]))
