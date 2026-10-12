@@ -2875,6 +2875,10 @@ _SPEC_METHODS = {
     "expert_stream_spec_score": "score",
     "expert_stream_spec_select": "select",
 }
+_RESIDENCY_METHODS = {
+    "expert_stream_residency_snapshot": "snapshot",
+    "expert_stream_route_labels": "labels",
+}
 # The select kernel's bounds (spec_score.cuh kSpecDepth, kSelectMaxExperts).
 SPEC_DEPTH = 12
 SPEC_SELECT_MAX_EXPERTS = 1024
@@ -2892,6 +2896,9 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ] + [
         (name, f"SpecScoreKernel::{method}")
         for name, method in _SPEC_METHODS.items()
+    ] + [
+        (name, f"ResidencySnapshotKernel::{method}")
+        for name, method in _RESIDENCY_METHODS.items()
     ]
 
 
@@ -2967,6 +2974,68 @@ def run_spec_select(
         state,
         int(candidates.data_ptr()),
     )
+
+
+def run_residency_snapshot(ram_slot, targets, valid, out_masks, out_valid, out_stamp, *, module=None) -> None:
+    """The residency capture's snapshot kernel (residency_snapshot.cuh; record layout in residency_capture_ref):
+    ``ram_slot`` int32 [layers, experts <= 384], the horizons' precomputed ``targets`` int32 [4] and ``valid`` uint8
+    [4], into ``out_masks`` int64 [4, 6], ``out_valid`` uint8 [4] and a %globaltimer ``out_stamp`` int64 [1], one CUDA
+    device. ``module``: the device module (default: the 8-lane, one-node build)."""
+    device = ram_slot.device
+    for name, (tensor, dtype, shape) in {
+        "ram_slot": (ram_slot, torch.int32, None),
+        "targets": (targets, torch.int32, (4,)),
+        "valid": (valid, torch.uint8, (4,)),
+        "out_masks": (out_masks, torch.int64, (4, 6)),
+        "out_valid": (out_valid, torch.uint8, (4,)),
+        "out_stamp": (out_stamp, torch.int64, (1,)),
+    }.items():
+        if (
+            tensor.dtype != dtype
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+            or (shape is not None and tuple(tensor.shape) != shape)
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous {dtype} tensor of shape {shape or '[layers, experts]'} on {device}"
+            )
+    if ram_slot.dim() != 2 or not 1 <= ram_slot.shape[1] <= 384:
+        raise ValueError(f"ram_slot must be [layers, 1..384 experts], got {tuple(ram_slot.shape)}")
+    (module or _device_module()).expert_stream_residency_snapshot(
+        ram_slot, targets, valid, out_masks, out_valid, out_stamp
+    )
+
+
+def run_route_labels(routes, planned, count, lane_kind, out_kinds, out_stamp, *, module=None) -> None:
+    """The residency capture's label kernel (residency_snapshot.cuh; record layout in residency_capture_ref): each of
+    ``routes`` int64 [width] gets the ``lane_kind`` int32 [lanes] of its lane among the first ``count`` int32 [1] of
+    ``planned`` int64 [lanes], else KIND_VRAM_HOT, into ``out_kinds`` uint8 [width], with a %globaltimer ``out_stamp``
+    int64 [1], one CUDA device. ``module``: the device module (default: the 8-lane, one-node build)."""
+    device = routes.device
+    width, lanes = routes.numel(), planned.numel()
+    for name, (tensor, dtype, numel) in {
+        "routes": (routes, torch.int64, width),
+        "planned": (planned, torch.int64, lanes),
+        "count": (count, torch.int32, 1),
+        "lane_kind": (lane_kind, torch.int32, lanes),
+        "out_kinds": (out_kinds, torch.uint8, width),
+        "out_stamp": (out_stamp, torch.int64, 1),
+    }.items():
+        if (
+            tensor.dtype != dtype
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+            or tensor.dim() != 1
+            or tensor.numel() != numel
+            or numel < 1
+        ):
+            raise ValueError(f"{name} must be a non-empty contiguous 1-D {dtype} tensor of {numel} on {device}")
+    (module or _device_module()).expert_stream_route_labels(
+        routes, planned, count, lane_kind, out_kinds, out_stamp
+    )
+
 
 
 def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
