@@ -6,7 +6,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
+import pytest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).parents[5]
 LAUNCHER = ROOT / "scripts/expert_prediction/run-shadow-server.sh"
@@ -211,3 +217,7 @@ def test_trace_mode_refuses_calibration_even_for_provenance_only(tmp_path):
     assert result.returncode == 2
     assert "trace" in result.stderr.lower()
     assert "calibration" in result.stderr.lower()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
