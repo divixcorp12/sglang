@@ -6,7 +6,7 @@ report, with each train/dev/calib group whose source or target layer is the cell
 r1_groups.load_exclusions reads the result. The input manifest records the sha256 of every input file, the commit,
 split membership, layer ids and the dev/calib recall denominators. locked_test shards are never listed or read (R4).
 
-Inputs: a B1 dataset dir (b1_rows layout plus dataset.json), the B0 corpus dir (manifest.json, <block>/rids.json),
+Inputs: a B1 dataset dir (b1_rows layout plus dataset.json), the B0 corpus dir (manifest.json, blocks/<block>/rids.json),
 the B0 integrity report, the frozen B1 head and the model path (target gates).
 Usage: ex = r1_audit.build_exclusions(integrity=json.load(f), dataset_dir=D, corpus_dir=C); run by r1_run.py's audit.
 """
@@ -32,6 +32,7 @@ import b1_rows  # noqa: E402
 import r1_gate  # noqa: E402
 import r1_groups  # noqa: E402
 import r1_stage  # noqa: E402
+import r1_stamps  # noqa: E402
 
 DATASET_JSON = "dataset.json"
 CORPUS_MANIFEST = "manifest.json"
@@ -62,9 +63,10 @@ def _load_json(path) -> dict:
 
 
 def _block_sessions(corpus_dir, *, block: str) -> set[str]:
-    rids = b0_integrity._load_rids(os.path.join(os.fspath(corpus_dir), block))
+    block_dir = os.path.join(os.fspath(corpus_dir), r1_stamps.BLOCKS_DIR, block)
+    rids = b0_integrity._load_rids(block_dir)
     if rids is None:
-        raise ValueError(f"{corpus_dir}/{block}: no rids.json, so the block's sessions are unknown")
+        raise ValueError(f"{block_dir}: no rids.json, so the block's sessions are unknown")
     return {v["session_id"] for v in rids.values()}
 
 

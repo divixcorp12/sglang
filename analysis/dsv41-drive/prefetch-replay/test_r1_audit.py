@@ -53,8 +53,8 @@ def _rows():
 def _integrity(corpus, cells):
     mismatches = [{"seq": s, "router_record": 0, "layer_id": layer, "token": t, "computed": [1, 2],
                    "captured": [1, 3], "rank6_minus_rank7": 0.5} for s, layer, t in cells]
-    return {"per_session": [{"out_dir": str(corpus / "b000"), "rows": _rows(), "mismatches": mismatches},
-                            {"out_dir": str(corpus / "b001"), "rows": _rows(), "mismatches": []}]}
+    return {"per_session": [{"out_dir": str(corpus / "blocks" / "b000"), "rows": _rows(), "mismatches": mismatches},
+                            {"out_dir": str(corpus / "blocks" / "b001"), "rows": _rows(), "mismatches": []}]}
 
 
 def _layout(tmp_path):
@@ -78,9 +78,10 @@ def _layout(tmp_path):
     (data / "dataset.json").write_text(json.dumps({"sessions_by_split": by_split,
                                                    "built_sessions": sorted(blocks)}))
     for block in ("b000", "b001"):
-        (corpus / block).mkdir(parents=True)
+        block_dir = corpus / "blocks" / block
+        block_dir.mkdir(parents=True)
         rids = {f"rid-{s}": {"session_id": s, "turn": 0, "split": "x"} for s, b in blocks.items() if b == block}
-        (corpus / block / "rids.json").write_text(json.dumps(rids))
+        (block_dir / "rids.json").write_text(json.dumps(rids))
     (corpus / "manifest.json").write_text(json.dumps({"split": by_split}))
     return data, corpus
 
