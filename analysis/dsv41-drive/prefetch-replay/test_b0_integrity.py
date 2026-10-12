@@ -102,6 +102,54 @@ def test_a_clean_session_passes_and_counts_only_live_tokens(tmp_path):
     assert report["stamp_inversions"] == 0
 
 
+def _warmup_session(tmp_path):
+    """Two rids=[] verifies (seq 0, 1; zero x and ids) ahead of the two real forwards (seq 2, 3)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lives, real = [1, 1, *LIVE], [False, False, True, True]
+    lines = [{"kind": "graph_routes_header", "schema": 3, "run": "r", "layer_ids": LAYERS, "hot_capacity": [1, 1]}]
+    lines += [{"kind": "graph_routes", "schema": 3, "seq": s, "forward_pass_id": s + 1, "phase": "target_verify",
+               "rids": ["a"] if real[s] else [], "forward_tokens": live, "routes": [ROUTE, ROUTE],
+               "misses": [0, 0], "router": s} for s, live in enumerate(lives)]
+    (tmp_path / "trace.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+    prefix = str(tmp_path / "router")
+    header = {"schema": 3, "layer_ids": LAYERS, "tokens": WIDTH, "hidden": HIDDEN, "topk": TOPK}
+    (tmp_path / "router.json").write_text(json.dumps(header))
+    x = np.zeros((len(lives), len(LAYERS), WIDTH, HIDDEN), dtype=np.uint16)
+    ids = np.zeros((len(lives), len(LAYERS), WIDTH, TOPK), dtype=np.int32)
+    for s, live in enumerate(lives):
+        if real[s]:
+            x[s, :, :live, 0] = 0x3F80
+            ids[s] = ROUTE
+    x.tofile(prefix + ".x.bin")
+    ids.tofile(prefix + ".ids.bin")
+    np.zeros(ids.shape, dtype=np.float32).tofile(prefix + ".w.bin")
+    np.asarray([[s, s + 1, live] for s, live in enumerate(lives)], dtype=np.int64).tofile(prefix + ".seq.bin")
+    rows = [ResidencyRow(layer_id=layer, stratum=stratum(layer), gate_has_bias=True) for layer in LAYERS]
+    capture = ResidencyCapture(str(tmp_path / b0.RESIDENCY_PREFIX), rows=rows, schema=3)
+    for s, live in enumerate(lives):
+        masks = torch.zeros((len(LAYERS), 4, 6), dtype=torch.int64)
+        valid = torch.zeros((len(LAYERS), 4), dtype=torch.uint8)
+        kinds = torch.full((len(LAYERS), WIDTH, TOPK), LaneKind.MISS_GPU, dtype=torch.uint8)
+        if real[s]:
+            masks[0, 0, 0] = MAPPED
+            valid[0, 0] = 1
+            kinds[1, :live] = torch.tensor([int(k) for k in KINDS], dtype=torch.uint8)
+        capture.write(run="r", depth=8, keys=(s, s + 1, live), masks=masks, valid=valid,
+                      snap_stamp=torch.tensor([100, 100]), kinds=kinds, label_stamp=torch.tensor([200, 200]))
+    capture.flush()
+    return str(tmp_path)
+
+
+def test_warmup_verify_forwards_without_rids_are_counted_not_checked(tmp_path):
+    W, bias = _gates()
+    report = b0.check_session(_warmup_session(tmp_path), W=W, bias=bias)
+    assert report["ok"] and report["no_request_forwards"] == 2
+    assert report["joined_forwards"] == len(LIVE) and report["missing_records"] == 0
+    assert report["route_cells"] == 2 * sum(LIVE) and report["non_tie_mismatches"] == 0
+    assert (report["snapshot_routes"], report["evicted"]) == (3 * sum(LIVE), sum(LIVE))
+    assert "no_request_forwards" not in b0._FAILING
+
+
 def test_a_rank6_rank7_swap_within_bf16_rounding_is_a_counted_tie(tmp_path):
     W, bias = _gates(rank7_logit=2.999)
     report = b0.check_session(_session(tmp_path, captured=[0, 1, 2, 3, 4, 6]), W=W, bias=bias)
