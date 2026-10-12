@@ -14,8 +14,9 @@ layer). A failure in environment setup is not a code bug:
   `python/uv.lock`, something rewrote it: restore it (`git checkout HEAD -- python/uv.lock`); never commit it.
 - **`SGLANG_EXL3_SRC must point at an exllamav3 checkout`** or a missing CUDA toolkit is the runner's environment,
   not code. The runner sets the EXL3 env the GPU suites use; report it if it reappears.
-- **A test that also fails at the merge-base** is not yours: check the base before changing code for it, and say so
-  in your summary. On 2026-10-12, `test_dsv41_config.py::test_one_field_per_knob` failed on master (65 DSV41 env vars,
+- **A test that also fails at the merge-base** is not yours. When tests fail, the runner re-runs the failing ones at
+  the merge-base with master and labels each: `ALSO FAILS AT BASE` (not this branch's bug: say so, change nothing for
+  it), `passes at base ... <- introduced by this branch` (yours to fix), or `new in this branch`. On 2026-10-12, `test_dsv41_config.py::test_one_field_per_knob` failed on master (65 DSV41 env vars,
   26 config fields).
 - **`push failed` / ssh errors** are infrastructure: report them, do not change code.
 - **`TimeoutExpired` in a child process** right after a C++ change is a cold JIT build, not a hang
