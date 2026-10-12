@@ -66,7 +66,8 @@ def test_excluded_middle_token_keeps_features_aligned():
                            vocab=model.vocab, device="cpu")
     ref = r1_cache.collate([full], x_of=_x, pca=model.pca, cfg=model.cfg, vocab=model.vocab, device="cpu")
     assert inp.batch.live[0].tolist() == [True, False, False, False, False, False]
-    assert torch.equal(inp.u[0, 0], ref.u[0, 1])
+    # A 1-row and a 2-row PCA matmul may differ in the last bits.
+    assert torch.allclose(inp.u[0, 0], ref.u[0, 1], rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(inp.batch.position[0, :1], [1])
 
 
