@@ -19,7 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=180, suite="base-a-test-cpu")
 
-REPO = Path(__file__).resolve().parents[4]
+REPO = Path(__file__).resolve().parents[3]
 BUILD = REPO / "python/sglang/srt/layers/quantization/nvfp4/build.py"
 CXX = os.environ.get("CXX") or shutil.which("g++")
 
@@ -183,7 +183,7 @@ def test_the_native_harness_passes(tmp_path, harness, flags, cap):
     if flags and not _links_sanitizers(tmp_path):
         pytest.skip(f"{CXX} cannot link ASan/UBSan (its sanitizer runtimes are not installed)")
     exe = _build_module().build(
-        tmp_path / Path(harness).stem, cxx=CXX, main=REPO / "test/registered/unit/kernels" / harness, extra_flags=flags
+        tmp_path / Path(harness).stem, cxx=CXX, main=REPO / "test/manual/dsv41" / harness, extra_flags=flags
     )
     env = {k: v for k, v in os.environ.items() if k != "NVFP4_CPU_MAX_ISA"}
     if cap:

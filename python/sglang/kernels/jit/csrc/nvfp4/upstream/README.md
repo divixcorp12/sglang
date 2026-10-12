@@ -46,7 +46,7 @@ quantizer, avoiding reciprocal overflow on tiny FP32 inputs. Nonfinite inputs
 or deltas above finite FP16 range return status 2 without publishing output.
 The kernel reads the GPU layout directly; the unchanged upstream dot product
 remains only as the reference in the GGML differential check
-(`test/registered/unit/kernels/nvfp4_cpu_ggml_check.cpp`).
+(`test/manual/dsv41/nvfp4_cpu_ggml_check.cpp`).
 
 ## Reproduce the import
 
