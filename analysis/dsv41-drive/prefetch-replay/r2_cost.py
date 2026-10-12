@@ -1,7 +1,7 @@
 """R2 scorer cost of T5 and G0 under one CUDA graph at 6 live tokens (D9): what serving would pay for each.
 
-T5 (trainable projection) is timed head-only (precomputed gate features and x, then head, sigmoid, select) and
-complete (fp32 gate features from x, then the same). G0 (low-rank correction of the native 384 scores) is timed on
+T5 (trainable projection) is timed head-only (precomputed gate features and x, then head and sigmoid, no selection,
+as r1_cost's head-only) and complete (fp32 gate features from x, then the same plus select). G0 (low-rank correction of the native 384 scores) is timed on
 the correction path given precomputed native scores (what serving adds on top of its score kernel), head-only (the
 same without selection) and complete (scores computed in-graph in fp32). Each path runs on the plan's low dtype
 (model cast; gate and features stay fp32) and on the all-fp32 reference. read_set_diff compares the two read sets.
@@ -48,7 +48,7 @@ def _t5_steps(model, *, ref, W: torch.Tensor, bias: torch.Tensor, st: r1_cost._S
         return r1_cost.select_torch(scores(u), skip=st.skip, threshold=st.threshold, cap=cap)
 
     def head_only() -> torch.Tensor:
-        return r1_cost.select_torch(scores(u_fixed), skip=st.skip, threshold=st.threshold, cap=cap)
+        return scores(u_fixed)
 
     return {"head_only": head_only, "complete": complete}
 
