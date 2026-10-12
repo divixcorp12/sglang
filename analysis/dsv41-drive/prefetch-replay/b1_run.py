@@ -243,7 +243,7 @@ def _smoke_inputs(ctx: _Ctx) -> tuple[str, str, list[str]]:
         rewritten += [{**r, "out_dir": dst} for r in integrity["per_session"]
                       if os.path.realpath(r["out_dir"]) == os.path.realpath(src)]
     small = {"split": picked, "warm_start": sorted(chosen & set(manifest["warm_start"])),
-             "flagged": sorted(chosen & set(manifest["flagged"]))}
+             "flagged": [f for f in manifest["flagged"] if f["session_id"] in chosen]}
     _write_json(os.path.join(root, "manifest.json"), small)
     _write_json(os.path.join(root, "integrity.json"), {"per_session": rewritten})
     return os.path.join(root, "manifest.json"), os.path.join(root, "integrity.json"), blocks

@@ -18,7 +18,8 @@ from b1_rows import read_groups, read_x  # noqa: E402
 def _setup(tmp_path, monkeypatch):
     block = t0._block(tmp_path / "b000")
     manifest = {"split": {"train": ["s1"], "dev": ["s2"], "calib": [], "locked_test": []},
-                "warm_start": ["s2"], "flagged": ["s2"]}
+                # b0_manifest schema 2: flagged entries are drive_flags records, not bare ids.
+                "warm_start": ["s2"], "flagged": [{"session_id": "s2", "drive": "nvme4", "excess_pct": 22.2}]}
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest))
     cell = {"seq": 0, "router_record": 0, "layer_id": 19, "token": 0, "computed": [], "captured": []}

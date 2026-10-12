@@ -40,9 +40,14 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def flagged_sessions(manifest: dict) -> set[str]:
+    # b0_manifest schema 2: each flagged entry is a drive_flags record keyed by session_id.
+    return {f["session_id"] for f in manifest["flagged"]}
+
+
 def _session_meta(manifest: dict) -> dict[str, dict]:
     """session -> {split, warm_start, flagged} for every session the manifest splits."""
-    warm, flagged = set(manifest["warm_start"]), set(manifest["flagged"])
+    warm, flagged = set(manifest["warm_start"]), flagged_sessions(manifest)
     return {sid: {"split": name, "warm_start": sid in warm, "flagged": sid in flagged}
             for name, sids in manifest["split"].items() for sid in sids}
 
@@ -97,7 +102,7 @@ def build_dataset(*, model_path, block_dirs, manifest_path, integrity_path, out_
         "dropped_cells": extracted.dropped_cells,
         "sessions_by_split": {s: sorted(manifest["split"].get(s, [])) for s in SPLITS},
         "built_sessions": sorted(seen),
-        "flagged": sorted(manifest["flagged"]),
+        "flagged": sorted(flagged_sessions(manifest)),
         "manifest_sha256": _sha256(manifest_path),
     }
     os.makedirs(out_dir, exist_ok=True)
