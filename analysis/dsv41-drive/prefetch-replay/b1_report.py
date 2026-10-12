@@ -62,10 +62,14 @@ def _metric_cells(table: dict, *, budget: str, key: str) -> list[str]:
     return [_num(None if c is None else c.get(m)) for m in METRICS]
 
 
+def _own_budgets(table: dict) -> list[str]:
+    return sorted(table.get("cells", {}), key=_budget_sort_key)
+
+
 def _pooled_table(tables: dict, *, key: str) -> list[str]:
     header = ["scorer", "budget", "recall", "precision", "never-candidate recovery"]
     rows = [[s, b] + _metric_cells(tables[s], budget=b, key=key)
-            for s in _scorer_names(tables) for b in _budgets(tables)]
+            for s in _scorer_names(tables) for b in _own_budgets(tables[s])]
     return _table(header, rows)
 
 
@@ -76,14 +80,14 @@ def _keys_with(tables: dict, prefix: str) -> list[str]:
 
 
 def _split_table(tables: dict, *, prefix: str, budget: str) -> list[str]:
-    scorers = _scorer_names(tables)
-    header = [prefix.rstrip(":")] + [f"{s} {m}" for s in scorers for m in ("recall", "precision")]
+    # Only scorers evaluated at this budget; calibrated cuts differ per scorer.
+    scorers = [s for s in _scorer_names(tables) if budget in tables[s].get("cells", {})]
+    header = [prefix.rstrip(":")] + [f"{s} {m}" for s in scorers for m in ("recall", "precision", "never-cand.")]
     rows = []
     for key in _keys_with(tables, prefix):
         row = [key.split(":", 1)[1]]
         for s in scorers:
-            c = _cell(tables[s], budget=budget, key=key)
-            row += [_num(None if c is None else c.get(m)) for m in ("recall", "precision")]
+            row += _metric_cells(tables[s], budget=budget, key=key)
         rows.append(row)
     return _table(header, rows)
 
