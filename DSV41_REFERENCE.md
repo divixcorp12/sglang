@@ -5644,7 +5644,8 @@ ms/token on the 85-token session (+0.1, noise). `arm_env.py` summarizes it as "a
 **In the recipe:** on (`SGLANG_DSV41_ENABLE_LEASE_PDL=1`).
 
 **Evidence:** merge message. The results file `analysis/dsv41-drive/chain-pdl/results.md` is on branch
-`expert-stream-transfer-measurement` (`6bba593810`) and **is not on `master`**; `arm_env.py` cites it there.
+`expert-stream-transfer-measurement` (`6bba593810`), merged into `master` by the 2026-10-11 branch catch-up
+(§33.22); `arm_env.py` cites it there.
 
 ### 29.3 Three mirror roots via a per-row piece cut (`9428a6812a`, 2026-09-28)
 
@@ -5958,7 +5959,7 @@ byte-identical. Treat it as an estimate against the weight pairs' ±0.3 spread.
    (`mirror-scaling/weight-pair.md`).
 8. **The copy thread's submission floor:** `cuMemcpyAsync` takes 8 libcuda mutexes per call; fewer calls per job
    (`cuMemcpyBatchAsync`) is not measured (`hotpath/results.md` §9d).
-9. **The chain-PDL results file** is not on `master` (§29.2).
+9. **The chain-PDL results file**: on `master` since the 2026-10-11 branch catch-up (§29.2, §33.22).
 10. **Validate the stream-ordered copy wait** (§29.14): run its tests, a decode A/B against the spinning wait, and a
     node-mode trace re-run. Also check the head-of-queue risk.
 11. **Measure the hot cache at 16080** against 15080 (decode ms/token), and the prefill headroom (0.16 GiB minimum in
@@ -8496,6 +8497,23 @@ the 3 failures that also fail on master (`test_no_clock_read_bypasses_the_trace_
 `test_expert_stream_sync_primitives` tests), plus 5 load-sensitive keep-warm/idle timing tests under `-n 8` that pass
 serially. `codex/dsv41-ram-prefetch-t7` and `-t9` were deleted: every commit on them was already on the branch
 (`git cherry`). Their worktrees and those of this work stream were removed on the laptop and divix01.
+
+**Branch catch-up (2026-10-11, `codex/dsv41-branch-catchup`).** Every branch with commits not on `master` was
+triaged; the merged work is default off or additive.
+- Merged: `fix-host-registry-deadlock` (a host-registration forget from a weakref finalizer inside a locked lookup is
+  queued instead of deadlocking), `dsv41-dspark` (§33.4 above, and the draft CPU-expert launch rules now run when no
+  expert cache is set), `cc/engram-partial-accept-test` (CPU test only), and three analysis-only branches:
+  `expert-stream-transfer-measurement` (`analysis/dsv41-drive/copy-mechanism/`, `chain-pdl/`), `cc/mirror-scaling-bench`
+  (`mirror-scaling/` bench, io_uring sweep and gzipped data) and `dsv41-compute-gap` (`analysis/dsv41-compute-gap/`,
+  plus a one-time log line when the MoE side stream is on).
+- Picked, records only: `sleep-free-wait/results.md` and `uring-config/results.md` (`arm/sleepfree-cand`), the wake
+  probe (`probe/stream-wait-wake`), `numa/results.md` and its read probe (`expert-stream-service-cpu`),
+  `mirror3/results.md` (`arm/mirror3`), and the hybrid draft plan (`dsv41-dspark-cpu-draft`).
+- Not merged, for the owner: `dsv41-retire-flags` (removes six flags production sets), `cc/sm120-sparse-dispatch-fallback`
+  (changes FlashInfer/Triton dispatch in the default decode path), and the compute-gap verdict that
+  `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1` should join the recipe (−1.16 ms/token, 8/8 sessions, 2026-09-27; never
+  re-measured on today's recipe).
+- Everything else was superseded, rejected with a recorded result, or probe/arm scaffolding. Nothing was deleted.
 
 **Closed without an A/B:**
 - **CPU expert workers on the SMT siblings.** The bench (§33.20) gains 0% for 1-token experts and 14% only for an
