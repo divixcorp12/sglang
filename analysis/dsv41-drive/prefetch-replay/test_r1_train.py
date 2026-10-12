@@ -52,7 +52,7 @@ def _split(n: int, *, seed: int):
     available = rng.random((n, E)) < 0.8
     route = rng.random((n, W, E)) < 0.2
     u = rng.standard_normal((n, W, F_DIM)).astype(np.float32) * live[..., None]
-    u[..., 0] += miss[:, None, :1] * 2.0  # a learnable signal
+    u[..., 0] += miss[:, :1] * 2.0  # a learnable signal
     batch = GroupBatch(
         live=live, position=np.tile(np.arange(W, dtype=np.int64), (n, 1)), width=widths.astype(np.float32),
         source_layer=np.zeros(n, np.int64), target_layer=rng.integers(0, 3, n).astype(np.int64),

@@ -110,3 +110,8 @@ def test_measure_complete_reports_both_paths(aggregator):
     assert out["param_bytes"] * 2 == out["fp32"]["param_bytes"]
     assert out["buffer_bytes"] * 2 == out["fp32"]["buffer_bytes"]
     assert out["selection_matches_policy"] is True
+    assert out["read_set_diff_fraction"] is None
+    inp, skips = _inputs(4)
+    diff = {"inputs": [inp], "skips": [skips], "threshold": 0.0}
+    out = r1_cost.measure_complete(model, W=W, bias=bias, cost=r1_plan.CostSpec(), runs=5, warmup=1, diff=diff)
+    assert 0.0 <= out["read_set_diff_fraction"] <= 1.0
