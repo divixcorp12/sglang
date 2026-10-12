@@ -9017,10 +9017,12 @@ resume from their `DONE.json`.
 OUT=/mnt/nvme1/nvfp4-work/b1-run-<date>
 DATA=/mnt/nvme1/nvfp4-work/b1-dataset-<date>
 CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
-RUN="python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
+PY=/data/models/slang/.venv/bin/python
+RUN="$PY analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
   --integrity $CORPUS/integrity.json --out $OUT --dataset $DATA"
 CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
 export OMP_NUM_THREADS=8
+export PYTHONPATH=$PWD/python  # without it the venv imports sglang from another tree
 
 # (a) dataset, fit, baselines: CPU, cores 0-63 under the analysis cap
 $CAP taskset -c 0-63 $RUN --stages dataset fit baselines
@@ -9038,7 +9040,7 @@ flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages c
 $CAP taskset -c 0-63 $RUN --stages report --device cpu
 
 # opt-in smoke on 5 train-split sessions (no locked-test session is extracted)
-$CAP taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
+$CAP taskset -c 0-63 $PY analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
   --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke --device cpu
 ```
 
