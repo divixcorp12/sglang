@@ -8836,10 +8836,18 @@ layers at the prediction point, and each routed lane's true demand kind, with GP
 L+1 and L+2/L+4 evaluation) trains and tests on it. The feature's final gate ran the CPU and GPU tests only; the
 pilot and the full run were not run by the gate, so every corpus number below reads "not run by the gate".
 
-**Corpus path.** `/mnt/nvme1/` (never the root volume or nvme0/2/4), one directory per session plus `manifest.json`
-and `rids.json` at the top. A session directory holds `session.jsonl`, `results.jsonl`, `rids.json`,
-`drive-samples.jsonl`, `DONE.json`, the router capture files and the residency side files `router.res.*`. Sessions
-that failed twice sit under `failed/<id>/FAILED.json` and are not in the manifest. Path: not run by the gate.
+**Corpus path.** `/mnt/nvme1/` (never the root volume or nvme0/2/4), with `manifest.json` and `rids.json` at the top,
+one directory per session and one per server start under `blocks/<block-id>/`.
+- A block directory (`blocks/b000/`, ...) holds what the server writes: `trace.jsonl`, the router capture files and
+  residency side files `router.*` / `router.res.*`, the verify-accept log, `metrics.jsonl`, `server.log`, and a
+  `rids.json` for its own sessions.
+- A session directory holds `session.jsonl`, `results.jsonl`, `rids.json`, `drive-samples.jsonl` (samples around that
+  session's runner call) and `DONE.json`. `DONE.json` names the session's `block` and carries `warm_start`.
+- Sessions that failed the retry sit under `failed/<id>/FAILED.json` and are not in the manifest. A first-attempt
+  block directory with no done session moves to `failed/blocks/<block-id>/`; one with any done session stays in place.
+  Nothing is deleted.
+
+Path: not run by the gate.
 
 **Recipe.**
 - Env: `both_cpu_ab.ARMS['dspark-both-misscut'][0]` through `arm_env.arm_env`, EXL3 fused path, RAM prefetch off
@@ -8848,8 +8856,14 @@ that failed twice sit under `failed/<id>/FAILED.json` and are not in the manifes
   `SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH`.
 - `SGLANG_DSV41_RESIDENCY_CAPTURE` is refused without the router capture path. With it unset nothing is allocated and
   nothing is launched in the graph.
-- One session per server start (ring files are complete only after the launcher's SIGTERM), `--max-tokens` 1024,
-  port 30033, disk lock then GPU lock.
+- Blocks of `--block` sessions per server start (default 25, so 12 starts for 300 sessions). Each session in a block
+  goes to the same server one after another through its own `run_capture_sessions.py --session-ids <sid>` call, with
+  max-running-requests 1 and no `--rid-suffix` (rids `<sid>-t<turn>` are distinct). The server is stopped after the
+  block's last session, because ring files are complete only after the launcher's SIGTERM; the block checks run then.
+  `--max-tokens` 1024, port 30033, disk lock then GPU lock, held across all blocks.
+- `warm_start`: the first session served after each server start (including the first session of a re-served block)
+  has `warm_start=true` in its `DONE.json` and in the manifest. It is kept, not dropped; the server's verify forwards
+  with no request are separate (see Integrity).
 
 **Record layout** (stated once in `residency_capture_ref.py`; the CUDA kernel, the host reference and the readers
 share it). Files are `<prefix>.snap.bin`, `<prefix>.label.bin`, `<prefix>.seq.bin` and a `.json` header
@@ -8872,28 +8886,44 @@ never drops a horizon on stratum.
   `ram_prefetch.prefetch_targets` selects on; false for hash-routed or gateless layers. It comes from
   `ram_prefetch.registered_gates()`, which `deepseek_v4.py` fills when the residency switch is on.
 
-**Integrity.** `b0_integrity.py MODEL_PATH SESSION_DIR... [--out REPORT]` recomputes the gate
+**Integrity.** `b0_integrity.py MODEL_PATH DIR... [--out REPORT]` takes block directories and F100's
+one-session-per-dir directories alike. It recomputes the gate
 (`sqrt(softplus(x @ W.T))` in fp32 plus bias, top-6 compared as sets). A rank-6/7 swap within one bf16 step counts
 as a tie; any other mismatch is kept in the report and exits 1, as do seq gaps, missing records and live-count
 disagreement. It also reports no-target horizons, snapshots stamped after their demand, and the eviction rate
 between snapshot and demand (non-hot routes the snapshot showed in RAM that were then served as an NVMe miss),
 overall, per horizon and per stratum.
+- Verify forwards whose route-log `rids` is empty (the server's warm-up forwards) are left out of the route,
+  snapshot and label checks and of missing-record counting. They are reported as `no_request_forwards`, a plain
+  count that never fails the run.
+- With a `rids.json` in the directory (`<sid>-t<turn>` -> session_id, turn, split), the report adds `by_session`
+  (counts and rates per session, with its split) next to `by_stratum` and `by_horizon`. A rid missing from
+  `rids.json` is reported as unmapped, not raised on.
 
 **Rerun.** On divix01, from a private worktree at the pushed commit (`.claude/rules/divix01-run-protocol.md`), with
 production stopped and no `launch_server`, `both_cpu_ab` or `run_arm.sh` running:
 
 ```bash
-# pilot: two sessions, no manifest
+# pilot: the first two sampled sessions as one block, no manifest
 taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_capture.py /mnt/nvme1/<corpus> --pilot 2
-taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_integrity.py <MODEL_PATH> /mnt/nvme1/<corpus>/<session>...
+taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_integrity.py <MODEL_PATH> /mnt/nvme1/<corpus>/blocks/<block-id>
 # full run: resumes from the pilot's directory, writes manifest.json
-taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_capture.py /mnt/nvme1/<corpus> --sessions 300 --seed 0
+taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b0_capture.py /mnt/nvme1/<corpus> --sessions 300 --seed 0 --block 25
 ```
 
-The full run starts only after the pilot passes the integrity tool. A rerun skips sessions with `DONE.json` or
-`FAILED.json`; delete the marker to serve one again. The run stops after 5 failed sessions in a row and exits 0 only
-when at least 90% of sampled sessions are done. The manifest holds the commit, the recipe env, the session list, the
-seeded whole-session split 180/45/30/45, the per-row metadata, the validity rule, and file sizes and sha256s.
+The full run starts only after the pilot passes the integrity tool.
+- Resume: a rerun skips sessions with `DONE.json` or `FAILED.json` (delete the marker to serve one again), regroups
+  the rest into blocks of `--block` under fresh block ids, and never overwrites an existing block directory.
+- Block retry: a block whose server never becomes healthy, dies, or fails the block checks (`check_capture`,
+  residency completeness) is re-served once under a new block id, covering only its sessions without `DONE.json`. A
+  session whose `results_complete` fails gets no `DONE.json` but does not fail the rest of its block. Sessions still
+  without `DONE.json` after the retry go to `failed/<id>/FAILED.json`.
+- The run stops early only after 2 blocks in a row whose retry also left every session without `DONE.json`, and
+  exits 0 only when at least 90% of sampled sessions are done.
+- The manifest (schema 2) holds the commit, the recipe env, the done sessions, a session -> block mapping, the
+  `warm_start` sessions, the blocks with their residency header identity check and file sizes and sha256s, the
+  seeded whole-session split 180/45/30/45, failed and flagged sessions, the per-row metadata and the validity rule.
+  `rids.json` at the top is the merge of the per-session files.
 
 **Results.**
 

@@ -48,65 +48,169 @@ def test_a_session_with_an_unanswered_turn_or_an_error_record_is_incomplete(tmp_
         b0.results_complete(str(tmp_path), session=session)
 
 
-def _serve_ok(session, sdir):
+def _serve_ok(handle, session, sdir, block_dir):
+    assert os.listdir(sdir) == []  # every attempt serves into a clean session dir
     Path(sdir, "payload").write_text(session["session_id"])
+    with open(Path(block_dir, "trace.jsonl"), "a") as f:
+        f.write(session["session_id"] + "\n")
+    handle["served"].append(session["session_id"])
+
+
+def _raise(exc):
+    raise exc
+
+
+def _blocks(tmp_path, sessions, *, block_size=b0.DEFAULT_BLOCK, split=None, start=None, serve_session=_serve_ok,
+            check_block=None, check_session=None, log=None):
+    """capture_blocks with fakes; ``log`` collects ("start", block), ("stop", served sids) events."""
+    log = [] if log is None else log
+
+    def default_start(block_dir):
+        log.append(("start", os.path.basename(block_dir)))
+        return {"served": []}
+
+    def stop(handle):
+        log.append(("stop", handle["served"]))
+
+    ids = [s["session_id"] for s in sessions]
+    return b0.capture_blocks(
+        out_dir=str(tmp_path), sessions=sessions, split=split or {"train": ids}, block_size=block_size,
+        start=start or default_start, serve_session=serve_session, stop=stop,
+        check_block=check_block or (lambda d: {"verify_forwards": 3}),
+        check_session=check_session or (lambda s, d: None),
+    )
+
+
+def _done(tmp_path, sid):
+    return json.loads((tmp_path / sid / b0.DONE_NAME).read_text())
 
 
 def test_a_failed_session_is_reserved_once_and_then_passes(tmp_path):
-    calls = []
+    seen = []
 
-    def serve(session, sdir):
-        calls.append(os.listdir(sdir))  # a retry starts from a wiped dir
-        _serve_ok(session, sdir)
-
-    def check(session, sdir):
-        if len(calls) == 1:
+    def check_session(session, sdir):
+        seen.append(session["session_id"])
+        if seen.count("a") == 1 and session["session_id"] == "a":
             raise RuntimeError("seq gap")
-        return {"verify_forwards": 3}
 
-    out = b0.capture_all(out_dir=str(tmp_path), sessions=[_session("a")], split={"train": ["a"]}, serve=serve,
-                         check=check)
-    assert out == {"done": ["a"], "failed": []} and calls == [[], []]
-    done = json.loads((tmp_path / "a" / b0.DONE_NAME).read_text())
-    assert done["attempts"] == 2 and done["summary"] == {"verify_forwards": 3}
+    out = _blocks(tmp_path, [_session("a"), _session("b")], check_session=check_session)
+    assert out == {"done": ["a", "b"], "failed": [], "blocks": {"a": "b001", "b": "b000"}, "warm_start": ["a"]}
+    done = _done(tmp_path, "a")
+    assert done == {"session_id": "a", "block": "b001", "warm_start": True, "attempts": 2,
+                    "summary": {"verify_forwards": 3}}
+    assert _done(tmp_path, "b")["warm_start"] is False
     assert json.loads((tmp_path / "a" / "rids.json").read_text())["a-t0"]["split"] == "train"
+    # b000 holds b's capture, so it stays in place.
+    assert (tmp_path / b0.BLOCKS_DIR / "b000" / "trace.jsonl").read_text() == "a\nb\n"
 
 
 def test_a_session_failing_twice_is_listed_and_leaves_the_corpus_root(tmp_path):
-    def check(session, sdir):
-        raise RuntimeError("missing router record")
-
-    out = b0.capture_all(out_dir=str(tmp_path), sessions=[_session("a")], split={"train": ["a"]}, serve=_serve_ok,
-                         check=check)
-    assert out == {"done": [], "failed": ["a"]}
+    out = _blocks(tmp_path, [_session("a")], check_block=lambda d: _raise(RuntimeError("missing router record")))
+    assert out == {"done": [], "failed": ["a"], "blocks": {}, "warm_start": []}
     assert not (tmp_path / "a").exists()
     failed = json.loads((tmp_path / b0.FAILED_DIR / "a" / b0.FAILED_NAME).read_text())
     assert failed["attempts"] == b0.ATTEMPTS and len(failed["reasons"]) == b0.ATTEMPTS
+    assert "missing router record" in failed["reasons"][0]
+    assert sorted(os.listdir(tmp_path / b0.FAILED_DIR / b0.BLOCKS_DIR)) == ["b000", "b001"]
+    assert os.listdir(tmp_path / b0.BLOCKS_DIR) == []
 
 
 def test_a_rerun_skips_done_and_failed_sessions_and_serves_the_rest(tmp_path):
     split = {"train": ["a", "b", "c"]}
     sessions = [_session(s) for s in "abc"]
-    first = b0.capture_all(
-        out_dir=str(tmp_path), sessions=sessions[:2], split=split, serve=_serve_ok,
-        check=lambda s, d: {} if s["session_id"] == "a" else (_ for _ in ()).throw(RuntimeError("bad")),
-    )
-    assert first == {"done": ["a"], "failed": ["b"]}
-    served = []
-    second = b0.capture_all(
-        out_dir=str(tmp_path), sessions=sessions, split=split,
-        serve=lambda s, d: (served.append(s["session_id"]), _serve_ok(s, d)), check=lambda s, d: {},
-    )
-    assert served == ["c"] and second == {"done": ["a", "c"], "failed": ["b"]}
+    first = _blocks(tmp_path, sessions[:2], split=split,
+                    check_session=lambda s, d: None if s["session_id"] == "a" else _raise(RuntimeError("bad")))
+    assert first["done"] == ["a"] and first["failed"] == ["b"]
+    log = []
+    second = _blocks(tmp_path, sessions, split=split, log=log)
+    assert log == [("start", "b002"), ("stop", ["c"])]
+    assert second == {"done": ["a", "c"], "failed": ["b"], "blocks": {"a": "b000", "c": "b002"},
+                      "warm_start": ["a", "c"]}
 
 
 def test_the_run_stops_after_consecutive_failures(tmp_path):
-    ids = [f"s{i}" for i in range(b0.MAX_CONSECUTIVE_FAILURES + 3)]
-    out = b0.capture_all(
-        out_dir=str(tmp_path), sessions=[_session(i) for i in ids], split={"train": ids}, serve=_serve_ok,
-        check=lambda s, d: (_ for _ in ()).throw(RuntimeError("bad")),
-    )
-    assert len(out["failed"]) == b0.MAX_CONSECUTIVE_FAILURES
+    ids = [f"s{i}" for i in range(6)]
+    log = []
+    out = _blocks(tmp_path, [_session(i) for i in ids], block_size=2, log=log,
+                  check_block=lambda d: _raise(RuntimeError("bad")))
+    assert out["failed"] == ids[: 2 * b0.MAX_CONSECUTIVE_FAILED_BLOCKS]
+    assert [e for e in log if e[0] == "start"] == [("start", f"b{i:03d}") for i in range(4)]
+
+
+def test_block_sessions_share_one_server_start_and_the_first_is_warm(tmp_path):
+    ids = [f"s{i}" for i in range(5)]
+    log = []
+    out = _blocks(tmp_path, [_session(i) for i in ids], block_size=2, log=log)
+    assert log == [("start", "b000"), ("stop", ["s0", "s1"]), ("start", "b001"), ("stop", ["s2", "s3"]),
+                   ("start", "b002"), ("stop", ["s4"])]
+    assert out["done"] == ids and out["warm_start"] == ["s0", "s2", "s4"]
+    assert out["blocks"] == {"s0": "b000", "s1": "b000", "s2": "b001", "s3": "b001", "s4": "b002"}
+    rids = json.loads((tmp_path / b0.BLOCKS_DIR / "b001" / "rids.json").read_text())
+    assert sorted(rids) == ["s2-t0", "s2-t1", "s3-t0", "s3-t1"]
+
+
+def test_block_server_death_reserves_the_block_and_retires_its_dir(tmp_path):
+    starts = []
+
+    def serve_session(handle, session, sdir, block_dir):
+        if len(starts) == 1 and session["session_id"] != "a":
+            raise RuntimeError("runner exited 1")  # the server died after a
+        _serve_ok(handle, session, sdir, block_dir)
+
+    def start(block_dir):
+        starts.append(block_dir)
+        return {"served": []}
+
+    out = _blocks(tmp_path, [_session(s) for s in "abc"], start=start, serve_session=serve_session,
+                  check_block=lambda d: _raise(OSError("router ring short")) if len(starts) == 1 else {})
+    assert out["done"] == ["a", "b", "c"] and out["warm_start"] == ["a"]
+    assert set(out["blocks"].values()) == {"b001"}
+    assert os.listdir(tmp_path / b0.FAILED_DIR / b0.BLOCKS_DIR) == ["b000"]
+    assert _done(tmp_path, "a")["attempts"] == 2
+
+
+def test_block_unhealthy_start_is_reserved_and_never_stopped(tmp_path):
+    log = []
+
+    def start(block_dir):
+        if not log:
+            log.append(("start-failed", os.path.basename(block_dir)))
+            raise RuntimeError("the server never became healthy")
+        log.append(("start", os.path.basename(block_dir)))
+        return {"served": []}
+
+    out = _blocks(tmp_path, [_session("a")], start=start, log=log)
+    assert log == [("start-failed", "b000"), ("start", "b001"), ("stop", ["a"])]
+    assert out["blocks"] == {"a": "b001"} and out["warm_start"] == ["a"]
+
+
+def test_block_a_failing_session_does_not_fail_the_rest_of_its_block(tmp_path):
+    out = _blocks(tmp_path, [_session(s) for s in "abc"],
+                  check_session=lambda s, d: _raise(RuntimeError("turn 1 unanswered")) if s["session_id"] == "b"
+                  else None)
+    assert out["done"] == ["a", "c"] and out["failed"] == ["b"]
+    assert out["blocks"] == {"a": "b000", "c": "b000"}
+    failed = json.loads((tmp_path / b0.FAILED_DIR / "b" / b0.FAILED_NAME).read_text())
+    assert [r.split(":")[0] for r in failed["reasons"]] == ["attempt 1 (block b000)", "attempt 2 (block b001)"]
+    # b000 keeps a and c's capture; b001 served only b and got no DONE.
+    assert os.listdir(tmp_path / b0.BLOCKS_DIR) == ["b000"]
+    assert os.listdir(tmp_path / b0.FAILED_DIR / b0.BLOCKS_DIR) == ["b001"]
+
+
+def test_block_ids_skip_existing_dirs_in_blocks_and_failed_blocks(tmp_path):
+    (tmp_path / b0.BLOCKS_DIR / "b000").mkdir(parents=True)
+    (tmp_path / b0.FAILED_DIR / b0.BLOCKS_DIR / "b003").mkdir(parents=True)
+    assert b0._next_block_id(str(tmp_path)) == "b004"
+    assert b0._next_block_id(str(tmp_path)) == "b005"
+
+
+def test_block_plan_groups_in_order_up_to_the_block_size():
+    sessions = [_session(f"s{i}") for i in range(5)]
+    plan = b0.plan_blocks(sessions=sessions, block_size=2)
+    assert [[s["session_id"] for s in block] for block in plan] == [["s0", "s1"], ["s2", "s3"], ["s4"]]
+    assert b0.plan_blocks(sessions=[], block_size=2) == []
+    with pytest.raises(ValueError):
+        b0.plan_blocks(sessions=sessions, block_size=0)
 
 
 def _sample(label, sid, mono, *, sectors, ticks):
@@ -125,3 +229,35 @@ def test_a_session_with_a_slow_drive_is_flagged(tmp_path):
         (d / "drive-samples.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     flags = b0.drive_flags(out_dir=str(tmp_path), ids=["a", "b", "c"])
     assert [f["session_id"] for f in flags] == ["c"]
+
+
+def _finish_fixture(tmp_path, monkeypatch):
+    """Two done sessions with rids.json; write_manifest is captured."""
+    seen = {}
+    monkeypatch.setattr(b0, "_commit", lambda: "abc")
+    monkeypatch.setattr(b0, "write_manifest", lambda out_dir, **kw: seen.update(kw))
+    sessions = [_session("a", 1), _session("b", 1)]
+    for s in sessions:
+        d = tmp_path / s["session_id"]
+        d.mkdir()
+        (d / "rids.json").write_text(json.dumps(b0.rid_map(s, split_name="train")))
+    outcome = {"done": ["a", "b"], "failed": [], "blocks": {"a": "b000", "b": "b000"}, "warm_start": ["a"]}
+    return seen, sessions, outcome
+
+
+def test_finish_passes_the_blocks_and_warm_start_to_the_manifest(tmp_path, monkeypatch):
+    seen, sessions, outcome = _finish_fixture(tmp_path, monkeypatch)
+    rc = b0._finish(out_dir=str(tmp_path), sessions=sessions, split={"train": ["a", "b"]}, outcome=outcome,
+                    recipe={})
+    assert rc == 0
+    assert seen["session_block"] == {"a": "b000", "b": "b000"}
+    assert seen["warm_start"] == ["a"]
+    assert seen["failed"] == []
+
+
+def test_finish_merges_the_session_rids_and_fails_below_the_complete_fraction(tmp_path, monkeypatch):
+    seen, sessions, outcome = _finish_fixture(tmp_path, monkeypatch)
+    rc = b0._finish(out_dir=str(tmp_path), sessions=sessions + [_session(f"x{i}", 1) for i in range(8)],
+                    split={"train": ["a", "b"]}, outcome=outcome, recipe={})
+    assert rc == 1
+    assert set(json.loads((tmp_path / "rids.json").read_text())) == {"a-t0", "b-t0"}
