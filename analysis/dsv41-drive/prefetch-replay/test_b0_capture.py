@@ -229,3 +229,35 @@ def test_a_session_with_a_slow_drive_is_flagged(tmp_path):
         (d / "drive-samples.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     flags = b0.drive_flags(out_dir=str(tmp_path), ids=["a", "b", "c"])
     assert [f["session_id"] for f in flags] == ["c"]
+
+
+def _finish_fixture(tmp_path, monkeypatch):
+    """Two done sessions with rids.json; write_manifest is captured."""
+    seen = {}
+    monkeypatch.setattr(b0, "_commit", lambda: "abc")
+    monkeypatch.setattr(b0, "write_manifest", lambda out_dir, **kw: seen.update(kw))
+    sessions = [_session("a", 1), _session("b", 1)]
+    for s in sessions:
+        d = tmp_path / s["session_id"]
+        d.mkdir()
+        (d / "rids.json").write_text(json.dumps(b0.rid_map(s, split_name="train")))
+    outcome = {"done": ["a", "b"], "failed": [], "blocks": {"a": "b000", "b": "b000"}, "warm_start": ["a"]}
+    return seen, sessions, outcome
+
+
+def test_finish_passes_the_blocks_and_warm_start_to_the_manifest(tmp_path, monkeypatch):
+    seen, sessions, outcome = _finish_fixture(tmp_path, monkeypatch)
+    rc = b0._finish(out_dir=str(tmp_path), sessions=sessions, split={"train": ["a", "b"]}, outcome=outcome,
+                    recipe={})
+    assert rc == 0
+    assert seen["session_block"] == {"a": "b000", "b": "b000"}
+    assert seen["warm_start"] == ["a"]
+    assert seen["failed"] == []
+
+
+def test_finish_merges_the_session_rids_and_fails_below_the_complete_fraction(tmp_path, monkeypatch):
+    seen, sessions, outcome = _finish_fixture(tmp_path, monkeypatch)
+    rc = b0._finish(out_dir=str(tmp_path), sessions=sessions + [_session(f"x{i}", 1) for i in range(8)],
+                    split={"train": ["a", "b"]}, outcome=outcome, recipe={})
+    assert rc == 1
+    assert set(json.loads((tmp_path / "rids.json").read_text())) == {"a-t0", "b-t0"}
