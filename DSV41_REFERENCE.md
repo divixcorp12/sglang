@@ -9014,26 +9014,32 @@ second, disjoint capture is warranted only if the head is near the bar and still
 resume from their `DONE.json`.
 
 ```bash
-# dataset, fit, baselines, curve, cuts, freeze, locked, report: cores 0-63 under the analysis cap
 OUT=/mnt/nvme1/nvfp4-work/b1-run-<date>
+DATA=/mnt/nvme1/nvfp4-work/b1-dataset-<date>
 CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
-OMP_NUM_THREADS=8 systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
-  taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> \
-  --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT \
-  --stages dataset fit baselines
+RUN="python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
+  --integrity $CORPUS/integrity.json --out $OUT --dataset $DATA"
+CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
+export OMP_NUM_THREADS=8
 
-# train and cost need the GPU: cc-gpu.lock, cores 32-63
-OMP_NUM_THREADS=8 flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
-  python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> \
-  --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT --stages train curve cost
+# (a) dataset, fit, baselines: CPU, cores 0-63 under the analysis cap
+$CAP taskset -c 0-63 $RUN --stages dataset fit baselines
 
-# select, freeze, then the locked test (refused without the frozen selection file) and the report
-OMP_NUM_THREADS=8 systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
-  taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> \
-  --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT --stages cuts freeze locked report
+# (b) train and curve need the GPU: cc-gpu.lock, cores 32-63
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages train curve
+
+# (c) cuts, freeze, then the locked test (refused without the frozen selection file): CPU
+$CAP taskset -c 0-63 $RUN --stages cuts freeze locked --device cpu
+
+# (d) scorer cost: GPU, cc-gpu.lock, cores 32-63
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages cost
+
+# (e) report (needs every earlier stage's DONE marker)
+$CAP taskset -c 0-63 $RUN --stages report --device cpu
 
 # opt-in smoke on 5 train-split sessions (no locked-test session is extracted)
-... b1_run.py <MODEL_PATH> --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke
+$CAP taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
+  --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke --device cpu
 ```
 
 Tests (`divix01-pytest <named test_b1_*.py files> -q -p no:randomly`; `--gpu` for `test_b1_cost.py`; the real-corpus

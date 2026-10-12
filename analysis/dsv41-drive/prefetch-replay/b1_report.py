@@ -96,16 +96,26 @@ def _horizon_section(h: str, block: dict) -> list[str]:
     out += ["Pooled over all locked-test sessions.", ""] + _pooled_table(tables, key="pooled")
     out += ["Pooled without the drive-flagged sessions.", ""] + _pooled_table(tables, key="pooled_noflag")
     for prefix, title in (("layer:", "Per target layer"), ("stratum:", "Per stratum")):
-        if _keys_with(tables, prefix):
-            out += [f"{title} (reads=1).", ""] + _split_table(tables, prefix=prefix, budget="reads=1")
+        if not _keys_with(tables, prefix):
+            continue
+        for budget in _budgets(tables):
+            out += [f"{title} ({budget}).", ""] + _split_table(tables, prefix=prefix, budget=budget)
     return out
 
 
-def _learning_curve(curve: dict) -> list[str]:
+def _learning_curve(curve: dict, improving: dict) -> list[str]:
     out = ["## Learning curve (dev, precision at reads=1)", ""]
     variants = sorted(curve) if curve else ["E2", "E5"]
-    rows = [[v] + [_num(curve.get(v, {}).get(n)) for n in LEARNING_SIZES] for v in variants]
-    return out + _table(["variant"] + [f"{n} sessions" for n in LEARNING_SIZES], rows)
+    rows = [[v] + [_num(curve.get(v, {}).get(n)) for n in LEARNING_SIZES] + [_num(improving.get(v))]
+            for v in variants]
+    header = ["variant"] + [f"{n} sessions" for n in LEARNING_SIZES] + ["still improving"]
+    return out + _table(header, rows)
+
+
+def _second_capture(sc: dict) -> list[str]:
+    sc = sc or {}
+    rows = [[k, _num(sc.get(k))] for k in ("near_bar", "still_improving", "warranted")]
+    return ["Second capture (D5: near the bar and still improving):", ""] + _table(["item", "value"], rows)
 
 
 def _bootstrap(b: dict) -> list[str]:
@@ -151,10 +161,11 @@ def render(results: dict) -> str:
         out += _horizon_section(str(h), horizons[h])
     if not horizons:
         out += [f"Horizon tables: {PENDING}", ""]
-    out += _learning_curve(results.get("learning_curve") or {})
+    out += _learning_curve(results.get("learning_curve") or {}, results.get("still_improving") or {})
     out += _bootstrap(results.get("bootstrap"))
     out += _cost(results.get("cost"))
     out += _verdict(results.get("verdict"))
+    out += _second_capture(results.get("second_capture"))
     out += _provenance(results)
     return "\n".join(out).rstrip("\n") + "\n"
 
