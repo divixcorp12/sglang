@@ -132,6 +132,17 @@ def test_budget_refuses_one_group_past_and_accepts_at_budget():
     assert r2_arms.check_x_budget(n_groups=n, plan=margin, free_bytes=need + 5) == need
 
 
+def test_budget_counts_the_join_peak_of_the_largest_split():
+    train, dev = 5, 2
+    need = r1_cache.x_cache_bytes(train + dev, x_dtype=torch.bfloat16)
+    peak = need + r1_cache.x_cache_bytes(train, x_dtype=torch.bfloat16)
+    plan = SimpleNamespace(x_dtype="bfloat16", x_budget_bytes=need, x_margin_bytes=3)
+    # Free memory that holds the caches but not the transient torch.cat copy is refused, not left to a CUDA OOM.
+    with pytest.raises(MemoryError, match="peak"):
+        r2_arms.check_x_budget(n_groups=train + dev, plan=plan, free_bytes=peak + 2, peak_groups=train)
+    assert r2_arms.check_x_budget(n_groups=train + dev, plan=plan, free_bytes=peak + 3, peak_groups=train) == need
+
+
 def test_three_seeds_per_arm_with_parent_hashes(env):
     res = _train(env)
     assert set(res) == {"T5", "G0"}
