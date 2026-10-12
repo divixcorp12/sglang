@@ -117,7 +117,7 @@ def _write_json(path: str, obj) -> None:
 def _save_tables(path: str, tables: dict[str, b1_score.Table]) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "wb") as f:
-        f.write(msgspec.json.encode(tables))
+        f.write(msgspec.json.format(msgspec.json.encode(tables), indent=1))
 
 
 def _load_tables(path: str) -> dict[str, b1_score.Table]:
@@ -384,16 +384,20 @@ def _stage_cuts(ctx: _Ctx) -> dict:
         reference = base["gate_floors" if "gate_floors" in base else "gate"]
         gate_precision = reference.cells["reads=1"]["pooled"].precision
         per_h = train[str(h)]
+        calib_tables: dict[str, b1_score.Table] = {}
         for variant in VARIANTS:
             entry = per_h["configs"][per_h["best_by_variant"][variant]]
             model, _ = b1_head.load_head(entry["path"])
             model = model.to(ctx.cfg.train.device)
             scorer = b1_head.HeadScorer(model, x_of=_x_of(ctx), name=variant)
             table = _evaluate(ctx, [scorer], split="calib", horizon=h, cuts=HEAD_CUTS)[variant]
+            calib_tables[variant] = table
             cuts[variant] = b1_select.calibrate_cuts(table)
             at_p = b1_score.cut_for_precision(table, gate_precision)
             cuts[variant]["at_gate_precision"] = at_p
-        summary[str(h)] = {"cuts": cuts, "gate_precision_calib_r1": gate_precision}
+        _save_tables(os.path.join(out, f"calib_h{h}.json"), calib_tables)
+        summary[str(h)] = {"cuts": cuts, "gate_precision_calib_r1": gate_precision,
+                           "calibration": {v: [list(r) for r in t.calibration] for v, t in calib_tables.items()}}
     _write_json(os.path.join(out, "cuts.json"), summary)
     return summary
 
@@ -425,7 +429,10 @@ def _stage_freeze(ctx: _Ctx) -> dict:
                                     created=datetime.date.today().isoformat())
     if not os.path.exists(path):
         b1_select.freeze_selection(path, selection)
-    return {"selection": path, "sha256": b1_select.load_frozen(path)[1], "chosen": chosen}
+    frozen, sha = b1_select.load_frozen(path)
+    if frozen.horizons != selection.horizons:
+        raise ValueError(f"{path} was frozen from a different training or cuts run; remove it to refreeze")
+    return {"selection": path, "sha256": sha, "chosen": chosen}
 
 
 def _locked_scorers(ctx: _Ctx, sel: b1_select.Selection, *, horizon: int, x_of) -> list[tuple[list, tuple]]:
@@ -519,6 +526,7 @@ def _stage_report(ctx: _Ctx) -> dict:
         "horizons": {}, "learning_curve": curve["curve"], "bootstrap": locked["bootstrap"], "cost": cost,
         "verdict": {}, "frozen_sha256": locked["frozen_sha256"], "smoke": ctx.smoke,
         "dataset": _done(ctx, "dataset")["counts"], "still_improving": curve["still_improving"],
+        "calibration": {h: per_h["calibration"] for h, per_h in cuts.items()},
         "paths": {"dataset": ctx.dataset_dir, "selection": os.path.join(ctx.out, SELECTION_NAME),
                   "out": ctx.out, "model_path": ctx.model_path},
     }

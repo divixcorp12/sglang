@@ -116,6 +116,15 @@ def _learning_curve(curve: dict, improving: dict) -> list[str]:
     return out + _table(header, rows)
 
 
+def _calibration(calibration: dict) -> list[str]:
+    out = ["## Head calibration (calib split)", ""]
+    rows = [[f"L+{h}", v, f"{_num(b[0])}-{_num(b[1])}", _num(b[2]), _num(b[3]),
+             _num(None if not b[2] else b[3] / b[2])]
+            for h in sorted(calibration, key=int) for v in sorted(calibration[h]) for b in calibration[h][v]]
+    header = ["horizon", "head", "p bin", "candidates", "eligible", "observed rate"]
+    return out + _table(header, rows)
+
+
 def _second_capture(sc: dict) -> list[str]:
     sc = sc or {}
     rows = [[k, _num(sc.get(k))] for k in ("near_bar", "still_improving", "warranted")]
@@ -166,6 +175,7 @@ def render(results: dict) -> str:
     if not horizons:
         out += [f"Horizon tables: {PENDING}", ""]
     out += _learning_curve(results.get("learning_curve") or {}, results.get("still_improving") or {})
+    out += _calibration(results.get("calibration") or {})
     out += _bootstrap(results.get("bootstrap"))
     out += _cost(results.get("cost"))
     out += _verdict(results.get("verdict"))

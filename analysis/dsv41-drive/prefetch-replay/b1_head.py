@@ -24,6 +24,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
+sys.path.insert(0, os.path.join(REPO, "analysis", "dsv41-drive", "router-capture"))
 sys.path.insert(0, HERE)
 import b1_rows  # noqa: E402
 
