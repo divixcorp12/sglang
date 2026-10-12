@@ -20,6 +20,7 @@ import os
 import sys
 from collections.abc import Iterator
 from typing import Literal, Protocol
+from urllib.parse import quote, unquote
 
 import msgspec
 import numpy as np
@@ -121,24 +122,29 @@ def _split_dir(root, *, split: str, frozen_sha256: str | None) -> str:
     return os.path.join(os.fspath(root), split)
 
 
+def _stem(session: str) -> str:
+    # B0 session ids contain '/' (e.g. 'cfq-train-Double_AAL/2014/page_89.pdf'); one flat, reversible file name each.
+    return quote(session, safe="")
+
+
 def write_x(out_dir, *, split: str, session: str, x: np.ndarray) -> str:
     """Write the session's x rows (uint16 bf16 words [N, hidden]) and their shape sidecar; returns the .bin path."""
     if x.dtype != np.uint16 or x.ndim != 2:
         raise ValueError(f"x must be uint16 [N, hidden], got {x.dtype} {x.shape}")
     d = os.path.join(os.fspath(out_dir), split, "x")
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"{session}.bin")
+    path = os.path.join(d, f"{_stem(session)}.bin")
     np.ascontiguousarray(x).tofile(path)
-    with open(os.path.join(d, f"{session}.json"), "w") as f:
+    with open(os.path.join(d, f"{_stem(session)}.json"), "w") as f:
         json.dump({"rows": int(x.shape[0]), "hidden": int(x.shape[1])}, f, indent=1)
     return path
 
 
 def read_x(dataset_dir, *, split: str, session: str, frozen_sha256: str | None = None) -> np.memmap:
     d = os.path.join(_split_dir(dataset_dir, split=split, frozen_sha256=frozen_sha256), "x")
-    with open(os.path.join(d, f"{session}.json")) as f:
+    with open(os.path.join(d, f"{_stem(session)}.json")) as f:
         shape = json.load(f)
-    return np.memmap(os.path.join(d, f"{session}.bin"), dtype=np.uint16, mode="r",
+    return np.memmap(os.path.join(d, f"{_stem(session)}.bin"), dtype=np.uint16, mode="r",
                      shape=(shape["rows"], shape["hidden"]))
 
 
@@ -172,7 +178,7 @@ def write_groups(out_dir, *, split: str, horizon: int, session: str, groups: lis
             raise ValueError(f"group ({g.session}, {g.split}, h{g.horizon}) in shard ({session}, {split}, h{horizon})")
     d = os.path.join(os.fspath(out_dir), split, f"h{horizon}")
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"{session}.npz")
+    path = os.path.join(d, f"{_stem(session)}.npz")
     np.savez(path, **_pack(groups))
     return path
 
@@ -203,12 +209,12 @@ def read_groups(dataset_dir, *, split: str, horizon: int, sessions: list[str] | 
     """Stream groups session by session (sorted names unless ``sessions`` gives the order), then by seq."""
     d = os.path.join(_split_dir(dataset_dir, split=split, frozen_sha256=frozen_sha256), f"h{horizon}")
     if sessions is None:
-        sessions = sorted(name[:-len(".npz")] for name in os.listdir(d) if name.endswith(".npz"))
+        sessions = sorted(unquote(name[:-len(".npz")]) for name in os.listdir(d) if name.endswith(".npz"))
     # Not a generator itself, so the locked-test refusal raises at the call, not at the first next().
     return _stream(d, sessions=list(sessions))
 
 
 def _stream(d: str, *, sessions: list[str]) -> Iterator[Group]:
     for session in sessions:
-        with np.load(os.path.join(d, f"{session}.npz"), allow_pickle=False) as z:
+        with np.load(os.path.join(d, f"{_stem(session)}.npz"), allow_pickle=False) as z:
             yield from _unpack(z)

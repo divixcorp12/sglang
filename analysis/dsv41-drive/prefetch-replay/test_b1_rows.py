@@ -59,6 +59,16 @@ def test_groups_round_trip_in_session_then_seq_order(tmp_path):
     assert [g.session for g in only] == ["s1"] * 3
 
 
+def test_session_ids_with_slashes_round_trip_as_one_flat_shard_each(tmp_path):
+    """Real B0 session ids look like 'cfq-train-Double_AAL/2014/page_89.pdf'."""
+    sid = "cfq-train-Double_AAL/2014/page_89.pdf-1"
+    b1_rows.write_groups(tmp_path, split="dev", horizon=1, session=sid, groups=[_group(session=sid)])
+    b1_rows.write_x(tmp_path, split="dev", session=sid, x=np.zeros((2, HIDDEN), np.uint16))
+    assert [g.session for g in b1_rows.read_groups(tmp_path, split="dev", horizon=1)] == [sid]
+    assert b1_rows.read_x(tmp_path, split="dev", session=sid).shape == (2, HIDDEN)
+    assert all(p.parent.name in ("x", "h1") for p in tmp_path.rglob("*") if p.is_file())
+
+
 def test_an_empty_session_shard_round_trips(tmp_path):
     b1_rows.write_groups(tmp_path, split="train", horizon=4, session="s9", groups=[])
     assert list(b1_rows.read_groups(tmp_path, split="train", horizon=4)) == []
