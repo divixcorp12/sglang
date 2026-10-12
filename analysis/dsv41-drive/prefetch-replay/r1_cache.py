@@ -98,8 +98,12 @@ def _native_scores(groups: list[R1Group], *, x: torch.Tensor, live: torch.Tensor
 
 def collate(groups: list[R1Group], *, x_of: Callable[[R1Group], np.ndarray], pca: PCAStats, cfg: b1_head.HeadConfig,
             vocab: b1_head.Vocab, device, with_x: bool = False,
-            gates: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None) -> ModelInput:
-    """Groups to one padded [G, 6, ...] ModelInput on ``device``; s_native needs ``gates`` and implies x."""
+            gates: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+            x_dtype: torch.dtype = torch.float32) -> ModelInput:
+    """Groups to one padded [G, 6, ...] ModelInput on ``device``; s_native needs ``gates`` and implies x.
+
+    x is stored in ``x_dtype``; s_native is always computed from fp32 x and stays fp32.
+    """
     counts = np.array([len(r.g.tokens) for r in groups], dtype=np.int64)
     if len(groups) == 0 or counts.max() > MAX_WIDTH:
         raise ValueError(f"need 1..{MAX_WIDTH} tokens per group and at least one group")
@@ -117,7 +121,7 @@ def collate(groups: list[R1Group], *, x_of: Callable[[R1Group], np.ndarray], pca
         x = _pad(flat, gi=gi_t.to(dev), slot=slot_t.to(dev), groups=len(groups))
     if gates is not None:
         s_native = _native_scores(groups, x=x, live=torch.from_numpy(batch.live).float(), gates=gates)
-    return ModelInput(batch=batch, u=u, x=x if with_x else None, s_native=s_native)
+    return ModelInput(batch=batch, u=u, x=x.to(x_dtype) if with_x else None, s_native=s_native)
 
 
 def _cat(parts: list[ModelInput]) -> ModelInput:
@@ -131,10 +135,15 @@ def _cat(parts: list[ModelInput]) -> ModelInput:
     return ModelInput(batch=batch, u=joined("u"), x=joined("x"), s_native=joined("s_native"))
 
 
+def x_cache_bytes(n_groups: int, *, x_dtype: torch.dtype) -> int:
+    """Device bytes of raw x for ``n_groups`` padded groups held in ``x_dtype``."""
+    return n_groups * MAX_WIDTH * _HIDDEN * torch.empty((), dtype=x_dtype).element_size()
+
+
 def build_cache(groups, *, x_of: Callable[[R1Group], np.ndarray], pca: PCAStats, cfg: b1_head.HeadConfig,
                 vocab: b1_head.Vocab, device, with_x: bool = False,
                 gates: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None, chunk: int = 4096,
-                x_budget_bytes: int = _X_BUDGET_BYTES) -> GroupCache:
+                x_budget_bytes: int = _X_BUDGET_BYTES, x_dtype: torch.dtype = torch.float32) -> GroupCache:
     """Collate a group stream ``chunk`` groups at a time into one cache; x is refused past ``x_budget_bytes``."""
     parts: list[ModelInput] = []
     keys: list[GroupKey] = []
@@ -144,10 +153,10 @@ def build_cache(groups, *, x_of: Callable[[R1Group], np.ndarray], pca: PCAStats,
     def flush() -> None:
         nonlocal held_x
         parts.append(collate(pending, x_of=x_of, pca=pca, cfg=cfg, vocab=vocab, device=device, with_x=with_x,
-                             gates=gates))
+                             gates=gates, x_dtype=x_dtype))
         keys.extend(r.key for r in pending)
         if with_x:
-            held_x += len(pending) * MAX_WIDTH * _HIDDEN * 4
+            held_x += x_cache_bytes(len(pending), x_dtype=x_dtype)
             if held_x > x_budget_bytes:
                 raise MemoryError(f"raw x cache needs more than {x_budget_bytes} bytes; stream it instead")
         pending.clear()
@@ -164,13 +173,14 @@ def build_cache(groups, *, x_of: Callable[[R1Group], np.ndarray], pca: PCAStats,
 
 
 def take(cache: GroupCache, idx: torch.Tensor) -> ModelInput:
-    """Groups ``idx`` (int64 tensor of group indices) as one ModelInput."""
+    """Groups ``idx`` (int64 tensor of group indices) as one ModelInput; x always comes out fp32."""
     sel = idx.cpu().numpy()
     inp = cache.inp
     batch = GroupBatch(**{n: getattr(inp.batch, n)[sel] for n in GroupBatch.__struct_fields__})
     dev = inp.u.device
     idx = idx.to(dev)
-    return ModelInput(batch=batch, u=inp.u[idx], x=None if inp.x is None else inp.x[idx],
+    # .float() is a no-op on fp32 storage, so R1 caches return the indexed tensor unchanged.
+    return ModelInput(batch=batch, u=inp.u[idx], x=None if inp.x is None else inp.x[idx].float(),
                       s_native=None if inp.s_native is None else inp.s_native[idx])
 
 
