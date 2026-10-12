@@ -7,8 +7,8 @@
         "cpp:clangd",
         "rust:rust-analyzer",
         "python:pyright-langserver,--stdio",
-        "yaml:yaml-language-server",
-        "json:vscode-json-language-server"
+        "yaml:yaml-language-server,--stdio",
+        "json:vscode-json-language-server,--stdio"
       ]
     }
   }
