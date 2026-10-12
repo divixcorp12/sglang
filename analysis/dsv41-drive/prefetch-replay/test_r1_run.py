@@ -194,7 +194,7 @@ def _gate_parts(*, cand_recall: float, cost_ms: float) -> dict:
     nominal = {"gate": {"on_time_useful": 3}, "gate_floors": {"on_time_useful": 4}, "T2": {"on_time_useful": 9}}
     replay = {"candidate": "T2", "dev": dev, "noflag": {"gate": 0.3, "gate_floors": 0.32, "T2": cand_recall},
               "timing": {"cases": {"nominal": nominal}}}
-    seeds = {"selection": {"candidate": "T2", "dev_by_seed": {"0": cand_recall, "1": cand_recall, "2": cand_recall}}}
+    seeds = {"selection": {"candidate": "T2", "dev_by_seed": {"T2": {"0": cand_recall, "1": cand_recall, "2": cand_recall}}}}
     return {"seeds": seeds, "calib": calib, "cost": {"gate_ms": cost_ms}, "replay": replay}
 
 
