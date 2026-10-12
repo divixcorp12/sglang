@@ -28,6 +28,10 @@ a 13k-line `python/uv.lock` rewrite and a `python/.python-version`.
 - **Laptop-only checks** are limited to `python3 -m py_compile <files>` and the stdlib lint scripts
   (`python3 scripts/lint/check_registered_tests.py`, `python3 scripts/lint/check_no_bare_pytest_main.py`).
 - Never write `uv run`, `uv sync` or `pip install` into a check.
+- Some test files cannot even be collected on divix01: anything importing `sglang.test.test_utils` pulls in
+  `datasets`, which fails under pyarrow 25.0.1 (`module 'pyarrow' has no attribute 'PyExtensionType'`). This is
+  environmental and fails at master too. Do not put such a file in a divix01 check (collect or run); list the files a
+  batch actually changed rather than a directory glob, and say in the task which files were left out and why.
 - Name test files narrowly (run protocol, "Run only the tests your change affects"); never a whole directory.
   `test/registered` and `test/registered/unit` fail collection on divix01 (pyarrow); target files or
   `test/registered/unit/kernels`.
