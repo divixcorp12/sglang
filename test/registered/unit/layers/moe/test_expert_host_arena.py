@@ -16,7 +16,7 @@ from sglang.srt.model_loader.file_tensor_cache import (
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 PAGE = 4096
 _FILE_TAGS = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
