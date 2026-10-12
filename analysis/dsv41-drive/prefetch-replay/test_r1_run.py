@@ -177,6 +177,25 @@ def test_owned_stage_is_reused_while_inputs_match_and_reruns_when_they_change(tm
     assert done["outputs"]["result.json"] == r1_stage.sha256_file(str(tmp_path / "stages" / "x" / "result.json"))
 
 
+def test_stage_calib_passes_the_stage1_sha_to_r1_arms(tmp_path, monkeypatch):
+    ctx = r1_stage.StageCtx(out=str(tmp_path), dataset="d", corpus="c", model_path="m", b1_head="h", device="cpu",
+                            smoke=False, plan_sha="p")
+    seen = {}
+
+    def fake_calib(ctx, *, plan, selection, stage1_scorers, stage1_sha):
+        seen["sha"] = stage1_sha
+
+    def fake_load(ctx, name):
+        return {"selection": {"candidate": "T0"}} if name == "seeds" else {"ok": 1}
+
+    monkeypatch.setattr(r1_run.r1_arms, "stage_calib", fake_calib)
+    monkeypatch.setattr(r1_run, "_native_scorers", lambda ctx: {})
+    monkeypatch.setattr(r1_run, "_load_result", fake_load)
+    monkeypatch.setattr(r1_run, "_result_sha", lambda ctx, name: f"sha-{name}")
+    r1_run._stage_calib(SimpleNamespace(ctx=ctx, plan=None))
+    assert seen["sha"] == "sha-stage1"
+
+
 def test_noflag_recall_leaves_out_flagged_sessions():
     def group(session, eligible):
         return SimpleNamespace(key=SimpleNamespace(session=session),

@@ -326,7 +326,8 @@ def _native_scorers(ctx: StageCtx) -> dict:
 
 def _stage_calib(run: _Run) -> dict:
     selection = _load_result(run.ctx, "seeds")["selection"]
-    r1_arms.stage_calib(run.ctx, plan=run.plan, selection=selection, stage1_scorers=_native_scorers(run.ctx))
+    r1_arms.stage_calib(run.ctx, plan=run.plan, selection=selection, stage1_scorers=_native_scorers(run.ctx),
+                        stage1_sha=_result_sha(run.ctx, "stage1"))
     return _load_result(run.ctx, "calib")
 
 

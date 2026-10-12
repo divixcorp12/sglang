@@ -128,7 +128,7 @@ def _cost_section(cost: dict) -> list[str]:
     out += _table(["gate path", "scope", "median ms", "p90 ms", "runs"], rows)
     extra = {k: cost.get(k) for k in ("param_bytes", "buffer_bytes", "read_set_diff_fraction")}
     return out + ["Read-set difference is the fraction of groups whose capped read set differs "
-                  "between the bf16 and fp32 gate paths (D17).", ""] + _kv_table(extra)
+                  "between the bf16 and fp32 head paths (D17).", ""] + _kv_table(extra)
 
 
 def _gate_section(title: str, outcome: dict | None) -> list[str]:
@@ -164,11 +164,15 @@ def _recall(results: dict, name: str) -> float | None:
     return cell.get("recall")
 
 
-def _judge(candidate: float | None, baseline: float | None) -> dict:
+def _dev_recall(results: dict, name: str) -> float | None:
+    return ((results.get("selection") or {}).get(name) or {}).get("dev_recall_cap2")
+
+
+def _judge(candidate: float | None, baseline: float | None, *, split: str = "calib") -> dict:
     if candidate is None or baseline is None:
         return {"status": "unresolved", "evidence": "missing data"}
     delta = candidate - baseline
-    text = f"calib recall cap 2 {candidate:.3f} vs {baseline:.3f} (delta {delta:+.3f})"
+    text = f"{split} recall cap 2 {candidate:.3f} vs {baseline:.3f} (delta {delta:+.3f})"
     if delta >= RELATIVE_BAR * baseline and delta > 0:
         return {"status": "supported", "evidence": text}
     if delta <= 0:
@@ -188,7 +192,12 @@ def _lead(results: dict) -> dict:
 def attribution(results: dict) -> dict:
     out = {}
     for name, (cand, base) in EXPLANATION_PAIRS.items():
-        out[name] = _judge(_recall(results, cand), _recall(results, base))
+        cal = (_recall(results, cand), _recall(results, base))
+        if None in cal and name in ("block_aggregation", "capacity"):
+            # Ladder arms are only calibrated when candidate or T0; fall back to the same-split dev D8 points.
+            out[name] = _judge(_dev_recall(results, cand), _dev_recall(results, base), split="dev")
+        else:
+            out[name] = _judge(*cal)
     out["lead"] = _lead(results)
     return out
 
@@ -202,6 +211,16 @@ def _attribution_section(results: dict) -> list[str]:
     return out + ["Unresolved: " + (", ".join(open_) if open_ else "none"), ""]
 
 
+def _delay_note(results: dict) -> list[str]:
+    out = ["The Stage-2 gate's timing check uses zero scorer delay (cost runs after training).", ""]
+    gate = (results.get("stage2_gate") or {}).get("passed")
+    with_delay = (results.get("stage2_gate_with_delay") or {}).get("passed")
+    if gate is not None and with_delay is not None and gate != with_delay:
+        out += [f"WARNING: with the measured scorer delay the Stage-2 gate outcome differs: "
+                f"{'PASS' if with_delay else 'FAIL'}.", ""]
+    return out
+
+
 def render(results: dict) -> str:
     label = results.get("label") or LABEL
     out = ["# R1 block-level miss predictor and capped read policy", "", f"Status: {label}", "",
@@ -213,6 +232,7 @@ def render(results: dict) -> str:
     out += _histogram_section(stage1.get("histograms") or {})
     out += _timing_section(results.get("timing") or {})
     out += _gate_section("Stage-2 gate", results.get("stage2_gate"))
+    out += _delay_note(results)
     out += _arms_section(results)
     out += _cost_section(results.get("cost") or {})
     out += _l2_section(results.get("l2") or {})

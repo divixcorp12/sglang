@@ -9208,7 +9208,7 @@ affected source and eligible rows. §33.26 recorded 0 dropped cells for this row
 **Stage order and gate (D3).** plan (freezes `run_plan.json` from the sha256s of the four inputs), audit, stage1 (F0,
 bare gate, gate + floors and the gate-rank/learned-admission hybrid, caps 1 and 2 at mean reads <= 1, per-forward-layer
 read histograms, timing replay), then train (T0-T4 at seed 0, selected on dev, thresholded on calib), seeds, l2, calib,
-cost, replay, report. If Stage 1's continuation gate fails, train, seeds, l2 and calib are skipped; cost and replay
+cost, replay, report. If the Stage-2 gate (D3) fails, train, seeds, l2 and calib are skipped; cost and replay
 still run on F0. The gate (D10) does not rewrite B2.
 
 **Rerun.** On divix01, from a private worktree at the pushed commit, `PYTHONPATH=$PWD/python`, production stopped.

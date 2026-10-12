@@ -78,7 +78,8 @@ class SelectionMetric(msgspec.Struct, frozen=True, kw_only=True):
     metric: str = "best eligible-row recall along an exact sorted-threshold sweep"
     cap: int = 2
     mean_reads: float = 1.0
-    ties: tuple[str, ...] = ("lower scorer cost", "fewer parameters")
+    # D8 v2: scorer cost is reported but not used as a tie-break.
+    ties: tuple[str, ...] = ("fewer parameters",)
     cap1: str = "reported as its own lane; never vetoes or rescues cap 2"
     seeds: str = "median dev score across seeds; the seed-0 checkpoint is the candidate"
     early_stop: str = "this metric on dev, patience epochs without improvement"
