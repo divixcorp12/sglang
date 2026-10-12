@@ -8833,13 +8833,13 @@ The next lever is a better predictor (`RAM_PREFETCH_PREDICTOR_HANDOFF.md`, Track
 Track B0 of `RAM_PREFETCH_PREDICTOR_HANDOFF.md`: a session-split capture for a learned L+1..L+4 predictor. Per
 (verify forward, layer, token) it holds the gate input, the native routes and weights, the RAM map of the next four
 layers at the prediction point, and each routed lane's true demand kind, with GPU timestamps. B1 (baselines, E2/E5,
-L+1 and L+2/L+4 evaluation) trains and tests on it. Every number below is `pending`; hx fills them in from the pilot
-and the full run.
+L+1 and L+2/L+4 evaluation) trains and tests on it. The feature's final gate ran the CPU and GPU tests only; the
+pilot and the full run were not run by the gate, so every corpus number below reads "not run by the gate".
 
 **Corpus path.** `/mnt/nvme1/` (never the root volume or nvme0/2/4), one directory per session plus `manifest.json`
 and `rids.json` at the top. A session directory holds `session.jsonl`, `results.jsonl`, `rids.json`,
 `drive-samples.jsonl`, `DONE.json`, the router capture files and the residency side files `router.res.*`. Sessions
-that failed twice sit under `failed/<id>/FAILED.json` and are not in the manifest. Path: `pending`.
+that failed twice sit under `failed/<id>/FAILED.json` and are not in the manifest. Path: not run by the gate.
 
 **Recipe.**
 - Env: `both_cpu_ab.ARMS['dspark-both-misscut'][0]` through `arm_env.arm_env`, EXL3 fused path, RAM prefetch off
@@ -8899,15 +8899,24 @@ seeded whole-session split 180/45/30/45, the per-row metadata, the validity rule
 
 | Item | Value |
 |---|---|
-| Corpus path | `pending` |
-| Sessions captured complete / sampled | `pending` |
-| Failed sessions | `pending` |
-| Drive-flagged sessions | `pending` |
-| Non-tie route mismatches | `pending` |
-| Tie rate (rank 6/7 within bf16) | `pending` |
-| Eviction between snapshot and demand | `pending` |
-| No-target horizons | `pending` |
-| Capture overhead per verify forward | `pending` |
+| Corpus path | not run by the gate |
+| Sessions captured complete / sampled | not run by the gate |
+| Failed sessions | not run by the gate |
+| Drive-flagged sessions | not run by the gate |
+| Non-tie route mismatches | not run by the gate |
+| Tie rate (rank 6/7 within bf16) | not run by the gate |
+| Eviction between snapshot and demand | not run by the gate |
+| No-target horizons | not run by the gate |
+| Capture overhead per verify forward | not run by the gate |
+
+The gate's checks on the merged feature, on divix01 (`divix01-pytest`, GPU lane with `--gpu`):
+
+| Check | Result | Exit |
+|---|---|---|
+| CPU: `test_exl3_stream_trace.py`, `test_ram_slot_map.py`, `test_dsv41_config.py` (`test_one_field_per_knob` deselected) and the scripts tests | 386 passed, 1 deselected, 14 warnings in 22.03 s | 0 |
+| `scripts/lint/check_registered_tests.py` | failed | 1 |
+| `scripts/lint/check_no_bare_pytest_main.py` | passed | 0 |
+| GPU: `test_residency_capture_cuda.py`, `test_exl3_ram_miss_graph_gpu.py` | 10 passed, 15 warnings in 23.78 s | 0 |
 
 ## Sources
 
