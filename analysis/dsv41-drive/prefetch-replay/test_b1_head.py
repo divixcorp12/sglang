@@ -15,7 +15,7 @@ import b1_head  # noqa: E402
 import b1_rows  # noqa: E402
 from test_b1_rows import _group  # noqa: E402
 
-DIM = 16
+DIM = 8  # fit_pca oversamples to min(rank + 10, DIM), which must not exceed the fitted row count
 RANK = 4
 E = b1_rows.NUM_EXPERTS
 
