@@ -15,7 +15,7 @@ import b1_head  # noqa: E402
 import b1_rows  # noqa: E402
 from test_b1_rows import _group  # noqa: E402
 
-DIM = 16
+DIM = 8  # fit_pca oversamples to min(rank + 10, DIM), which must not exceed the fitted row count
 RANK = 4
 E = b1_rows.NUM_EXPERTS
 
@@ -61,8 +61,8 @@ def test_batch_shapes_and_labels(variant, dense):
     assert batch.y.shape == batch.hard_neg.shape == (4, E)
     # Token 0 routes 7,3,9,1,2,0 with kinds MISS_GPU,HIT,0,0,0,0: kind 0 (VRAM hot) is never a label.
     assert set(torch.nonzero(batch.y[0]).flatten().tolist()) == {7, 3}
-    # Gate top-12 is experts 0..11; the routed non-hot 7 and 3 are not hard negatives, the rest are.
-    assert set(torch.nonzero(batch.hard_neg[0]).flatten().tolist()) == set(range(12)) - {7, 3}
+    # Gate top-12 is experts 0..11; every routed id (hot or not) is excluded from the hard negatives.
+    assert set(torch.nonzero(batch.hard_neg[0]).flatten().tolist()) == set(range(12)) - {7, 3, 9, 1, 2, 0}
     assert not (batch.y * batch.hard_neg).any()
 
 

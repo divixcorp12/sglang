@@ -156,7 +156,11 @@ def _group_arrays(g: b1_rows.Group, *, x: np.ndarray, pca: PCAStats, cfg: HeadCo
     y = _labels(g, num_experts=cfg.num_experts)
     if cfg.variant == "E5":
         feats = torch.cat([feats, score, margin], dim=-1)
-    return {"u": feats, "y": y, "hard_neg": in_top * (1.0 - y), "n": torch.tensor(n)}
+    # Hard negatives are gate top-12 entries the target did not route at all (hot-routed ones are not).
+    ids = torch.from_numpy(g.target_ids.astype(np.int64))
+    routed = torch.zeros((n, cfg.num_experts), dtype=torch.float32)
+    routed.scatter_add_(1, ids.clamp_min(0), torch.from_numpy(g.target_ids >= 0).float())
+    return {"u": feats, "y": y, "hard_neg": in_top * (1.0 - routed.clamp_(max=1.0)), "n": torch.tensor(n)}
 
 
 def make_batch(groups: list[b1_rows.Group], *, x_of: Callable[[b1_rows.Group], np.ndarray], pca: PCAStats,
