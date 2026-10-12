@@ -9160,6 +9160,118 @@ shards (~5 s each), and train from device-resident split caches (`b1_cache.py`: 
 MLP, `dynamic=True`; compiling before caching was slower, 99.5 s vs 90.2 s). The rerun (dataset reused): fit and
 baselines 41 s, train and curve 27 min (GPU), cuts/freeze/locked 6 min, cost 15 s, report 8 s.
 
+### 33.27 R1: block-level miss predictor and capped read policy, offline (2026-10-12)
+
+Track B round 2, after §33.26. On the reused B0 corpus, does a learned block-level predictor give a better *feasible*
+speculative read policy at L+1 than the native gate (bare, and with the packaged floors) under a per-layer read cap and
+a mean read budget, with the complete offline scorer cost and a timing-sensitivity replay measured? Offline only: no
+serving code, capture or A/B. Every number is **exploratory on reused data; independent confirmation pending**. The
+locked test of §33.26 counts as observed: its shards are never loaded (a reader asked for that split raises), and the
+B1 run directory, selection file and verdict are untouched. The feature's checks build and test the code on synthetic
+groups (all green at the final gate, see the check table below); no real-data result exists yet (the study results
+below are `pending`).
+
+**Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_r1_<module>.py`; no `b1_*` module is
+edited except additively):
+
+| Tool | Role |
+|---|---|
+| `r1_plan.py` | `run_plan.json`: arms, parents, seeds, epoch limits, objective, selection and calibration rules, continuation gate, frozen constants |
+| `r1_stage.py` | Atomic `stages/<name>/DONE.json` with input/output sha256s, out-root guard, `invocations.jsonl` |
+| `r1_audit.py` | Exclusion manifest (`stages/audit/exclusions.json`) from the integrity report and the dataset |
+| `r1_groups.py`, `r1_cache.py` | R1 group reader (applies the manifest, refuses locked_test) and device-resident collation |
+| `r1_gate.py`, `r1_controls.py` | Full gate scores; bare-gate, gate + floors and hybrid group scorers |
+| `r1_policy.py`, `r1_metrics.py` | Pooling (max, noisy-or, once), capped policy and threshold sweep; useful / wasted / eligible, histograms |
+| `r1_models.py`, `r1_aggregator.py`, `r1_challengers.py` | T0 block head, learned block aggregator, projection / capacity challengers |
+| `r1_train.py`, `r1_arms.py` | Training loop (seeded, group batches) and the arm ladder T0-T4, seeds, L+2, calibration |
+| `r1_stamps.py`, `r1_timing.py` | Residency-stamp windows; zero / nominal / adverse timing replay with scorer delay |
+| `r1_cost.py` | Complete scorer under a CUDA graph at 6 live tokens, beside head-only |
+| `r1_stage1.py`, `r1_report.py`, `r1_run.py` | Stage 1 evaluation, `REPORT.md` / `results.json` renderer, the driver |
+
+**Frozen constants** (set only in `r1_plan.default_plan`; `r1_timing` and `r1_cost` read them from the plan).
+- D16 contention multipliers on the row-read time: zero 1.0, nominal 2.0, adverse 3.0 (source §33.16; the row read is
+  §33.19's 2.2-2.4 ms). Timing prices on-time useful rows, not every useful row.
+- D17 cost dtypes: bf16 head and aggregator over an fp32 gate, with an all-fp32 path timed beside it. The bf16 median
+  is what the continuation gate and the replay's scorer delay use.
+
+**Inputs and paths.**
+- Corpus: `divix01:/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012` (100 sessions, 60 / 15 / 10 / 15 split, reused).
+- Dataset: `divix01:/mnt/nvme1/nvfp4-work/b1-dataset-20261012/` (reused, not rebuilt).
+- B1 head F0: `h1_E5_r128_h512_w2.0.pt` from the §33.26 run, hashed in `run_plan.json`, never rewritten.
+- Run: `divix01:/mnt/nvme1/nvfp4-work/b1-r1-<date>/` with `run_plan.json`, `stages/<name>/DONE.json`,
+  `selection.json`, `results.json`, `REPORT.md`, `invocations.jsonl`. The driver refuses any `--out` outside
+  `/mnt/nvme1/nvfp4-work/` or equal to `b1-run-20261012`.
+
+**Exclusion manifest.** The integrity report's one non-tie capture mismatch (b000 seq 1283, layer 39, token 1) is
+excluded through `stages/audit/exclusions.json`, which the R1 reader applies to every arm and control, listing its
+affected source and eligible rows. §33.26 recorded 0 dropped cells for this row; R1 counts it explicitly.
+
+**Stage order and gate (D3).** plan (freezes `run_plan.json` from the sha256s of the four inputs), audit, stage1 (F0,
+bare gate, gate + floors and the gate-rank/learned-admission hybrid, caps 1 and 2 at mean reads <= 1, per-forward-layer
+read histograms, timing replay), then train (T0-T4 at seed 0, selected on dev, thresholded on calib), seeds, l2, calib,
+cost, replay, report. If the Stage-2 gate (D3) fails, train, seeds, l2 and calib are skipped; cost and replay
+still run on F0. The gate (D10) does not rewrite B2.
+
+**Rerun.** On divix01, from a private worktree at the pushed commit, `PYTHONPATH=$PWD/python`, production stopped.
+Stages resume from their `DONE.json`; a stage whose recorded inputs changed reruns, and `plan` refuses a different
+plan. Lock order is disk then GPU.
+
+```bash
+OUT=/mnt/nvme1/nvfp4-work/b1-r1-<date>
+DATA=/mnt/nvme1/nvfp4-work/b1-dataset-20261012
+CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
+HEAD=<b1-run-20261012 checkpoint dir>/h1_E5_r128_h512_w2.0.pt
+PY=/data/models/slang/.venv/bin/python
+RUN="$PY analysis/dsv41-drive/prefetch-replay/r1_run.py <MODEL_PATH> --dataset $DATA --corpus $CORPUS \
+  --integrity $CORPUS/integrity.json --b1-head $HEAD --out $OUT"
+CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
+export OMP_NUM_THREADS=8
+export PYTHONPATH=$PWD/python  # without it the venv imports sglang from another tree
+GPU="flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63"
+
+# (a) plan and audit: CPU, cores 0-63
+$CAP taskset -c 0-63 $RUN --stages plan audit --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+
+# (b) stage 1 (F0, native controls, caps, histograms, timing, D3 gate): GPU, cc-gpu.lock, cores 32-63;
+#     it times F0's complete scorer under a CUDA graph first, so the D3 timing check includes that delay
+$GPU $RUN --stages stage1 --device cuda; echo "EXIT=${PIPESTATUS[0]}"
+
+# (c) training arms, seeds, L+2, calibration: GPU, cc-gpu.lock, cores 32-63 (skipped by the driver if Stage 1 stops)
+$GPU $RUN --stages train seeds l2 calib; echo "EXIT=${PIPESTATUS[0]}"
+
+# (d) complete scorer cost under a CUDA graph, 6 live tokens: GPU, cc-gpu.lock, cores 32-63
+$GPU $RUN --stages cost; echo "EXIT=${PIPESTATUS[0]}"
+
+# (e) timing replay and report: CPU, cores 0-63 (report needs every earlier DONE.json)
+$CAP taskset -c 0-63 $RUN --stages replay report --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+
+# opt-in smoke, every stage whatever the gate says (cost needs the GPU)
+$GPU $RUN --smoke --out $OUT-smoke
+```
+
+Tests (`divix01-pytest analysis/dsv41-drive/prefetch-replay/test_r1_<module>.py ... -q -p no:randomly`, naming only
+the affected files; `--gpu -s` for the CUDA tests such as `test_r1_cost.py`; the real-data smoke needs
+`SGLANG_R1_DATASET`, `SGLANG_R1_MODEL` and `SGLANG_R1_CORPUS`). Read pytest's own status via `PIPESTATUS`.
+
+**Checks at the feature's final gate (2026-10-12)**, synthetic groups only (the real-data smoke is opt-in and was not
+run by the gate). Laptop `python3 -m py_compile` on the `r1_*.py` modules; the rest through `divix01-pytest` on the
+named files with `-q -p no:randomly` (`--gpu -s` for the cost files):
+
+| Check | Files | Result | Exit |
+|---|---|---|---|
+| `py_compile` | `r1_groups.py`, `r1_gate.py`, `r1_audit.py`, `r1_stamps.py`, `r1_policy.py`, ... | compiled | 0 |
+| `divix01-pytest` (CPU) | `test_r1_groups.py`, `test_r1_gate.py`, `test_r1_audit.py`, `test_r1_stamps.py`, ... | 149 passed, 1 skipped, 14 warnings in 8.44 s | 0 |
+| `divix01-pytest` (CPU, B1 regression) | `test_b1_rows.py`, `test_b1_extract.py`, `test_b1_dataset.py`, `test_b1_score.py`, ... | 101 passed, 1 skipped, 14 warnings in 14.69 s | 0 |
+| `divix01-pytest --gpu` | `test_r1_cost.py`, `test_b1_cost.py` | 9 passed, 14 warnings in 28.52 s | 0 |
+
+The 14 warnings come from `torch/jit/_script.py:365`. Lint and typecheck were not run by the gate.
+
+**Results.** Pending: the full run is started by the owner. Stage 1 (useful / wasted / eligible, precision, recall,
+reads under caps 1 and 2), the T0-T4 arm curves and checkpoint hashes, the timing replay, the complete-scorer cost and
+the continuation-gate outcome are all `pending`; `REPORT.md` and `results.json` in the run directory will state which
+of ranking, abstention, block aggregation, capacity, training length or lead explains any gain, and which remain
+unresolved.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
