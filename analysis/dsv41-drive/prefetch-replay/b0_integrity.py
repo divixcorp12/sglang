@@ -108,13 +108,15 @@ def _seq_gaps(loaded: dict) -> int:
     return max(int(loaded["dropped"]), inner)
 
 
-def _is_tie(order: np.ndarray, scores: np.ndarray, captured: np.ndarray) -> bool:
-    """Only the computed rank-6 expert is swapped for the rank-7 one, and their biased scores are within TIE_RTOL."""
+def _is_tie(order: np.ndarray, biased: np.ndarray, captured: np.ndarray) -> bool:
+    """One computed expert is swapped for one other, and their biased scores are within TIE_RTOL. The swapped-in one
+    may rank below 7: several experts can share the rank-6 score exactly."""
     computed, cap = {int(e) for e in order[:TOPK]}, {int(e) for e in captured}
-    if computed - cap != {int(order[TOPK - 1])} or cap - computed != {int(order[TOPK])}:
+    dropped, added = computed - cap, cap - computed
+    if len(dropped) != 1 or len(added) != 1:
         return False
-    a, b = float(scores[TOPK - 1]), float(scores[TOPK])
-    return a - b <= TIE_RTOL * max(abs(a), abs(b))
+    a, b = float(biased[dropped.pop()]), float(biased[added.pop()])
+    return abs(a - b) <= TIE_RTOL * max(abs(a), abs(b))
 
 
 def _route_check(capture, joined: Joined, *, rows: list[ResidencyRow], W, bias) -> tuple[Counter, dict, list]:
@@ -138,7 +140,7 @@ def _route_check(capture, joined: Joined, *, rows: list[ResidencyRow], W, bias) 
         differ = (np.sort(order[:, :TOPK], axis=1) != np.sort(captured, axis=1)).any(axis=1)
         strata[meta.stratum]["route_cells"] += len(rec)
         for i in np.nonzero(differ)[0]:
-            if _is_tie(order[i], scores[i], captured[i]):
+            if _is_tie(order[i], biased[i].numpy(), captured[i]):
                 strata[meta.stratum]["tie_count"] += 1
                 continue
             strata[meta.stratum]["non_tie_mismatches"] += 1

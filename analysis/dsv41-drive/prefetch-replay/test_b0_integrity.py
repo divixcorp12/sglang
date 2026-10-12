@@ -27,9 +27,9 @@ KINDS = [LaneKind.MISS_CPU, LaneKind.MISS_GPU, LaneKind.HIT_COPY, LaneKind.HIT_C
 MAPPED = (1 << 2) | (1 << 3) | (1 << 4)
 
 
-def _gates(rank7_logit=-5.6):
-    """x is one-hot on dim 0, so expert e's logit is W[:, e, 0]: experts 0..5 lead, expert 6 is rank 7."""
-    logits = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, rank7_logit] + [-6.0 - 0.1 * e for e in range(7, EXPERTS)]
+def _gates(rank7_logit=-5.6, rank8_logit=-6.7):
+    """x is one-hot on dim 0, so expert e's logit is W[:, e, 0]: experts 0..5 lead, 6 is rank 7, 7 is rank 8."""
+    logits = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, rank7_logit, rank8_logit] + [-6.0 - 0.1 * e for e in range(8, EXPERTS)]
     W = torch.zeros(len(LAYERS), EXPERTS, HIDDEN)
     W[:, :, 0] = torch.tensor(logits)
     return W, torch.zeros(len(LAYERS), EXPERTS)
@@ -158,8 +158,16 @@ def test_a_rank6_rank7_swap_within_bf16_rounding_is_a_counted_tie(tmp_path):
     assert report["tie_rate"] == pytest.approx(1 / (2 * sum(LIVE)))
 
 
+def test_a_swap_with_an_expert_below_rank_7_that_scores_the_same_is_a_counted_tie(tmp_path):
+    """Three or more experts can share the rank-6 score exactly (pilot 2026-10-12: four at 32.75005, layer 36); the
+    router may then keep one that topk ranks 8th, which is still a tie, not a capture fault."""
+    W, bias = _gates(rank7_logit=3.0, rank8_logit=2.9999)
+    report = b0.check_session(_session(tmp_path, captured=[0, 1, 2, 3, 4, 7]), W=W, bias=bias)
+    assert report["ok"] and report["tie_count"] == 1 and report["non_tie_mismatches"] == 0
+
+
 def test_a_non_tie_mismatch_is_kept_and_fails_the_run(tmp_path, monkeypatch):
-    """The same rank-6/7 swap is not a tie when the scores are far apart, and an expert from below rank 7 never is."""
+    """The same rank-6/7 swap is not a tie when the scores are far apart, nor is one with a far lower-scoring expert."""
     W, bias = _gates()
     far = b0.check_session(_session(tmp_path / "far", captured=[0, 1, 2, 3, 4, 6]), W=W, bias=bias)
     assert not far["ok"] and far["tie_count"] == 0 and far["non_tie_mismatches"] == 1
