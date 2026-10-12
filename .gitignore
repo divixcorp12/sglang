@@ -290,3 +290,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# hx spec drafts (moved out of the repo on finalize)
+docs/hx/*.draft.md
