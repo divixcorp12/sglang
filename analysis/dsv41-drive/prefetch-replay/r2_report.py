@@ -5,7 +5,7 @@ dev_recall_cap2, checkpoint_sha256, parent_sha256}}}), selection ({winner, media
 {arm: v}, t3_median}), comparison ({cap1|cap2: {scorer: {recall, precision, reads}}}), calib
 ({scorer: {threshold, recall_cap2, precision, reads}}), timing ({assumptions, cases}), cost
 ({arm: {dtype: {path: {median_ms, p90_ms, p99_ms, runs, param_bytes, buffer_bytes}}}}), l2,
-continuation_gate ({passed, reasons, values}), adds_over_t3. A missing value renders as `pending`.
+l2_timing ({assumptions, cases}, horizon 2), continuation_gate ({passed, reasons, values}), adds_over_t3. A missing value renders as `pending`.
 Usage: python3 r2_report.py RESULTS.json --out REPORT.md
 """
 from __future__ import annotations
@@ -103,6 +103,11 @@ def _cost_section(cost: dict) -> list[str]:
                   "T5's head. The complete path includes the offline gate.", ""]
 
 
+def _l2_timing_section(timing: dict) -> list[str]:
+    out = r1_report._timing_section(timing)
+    return ["## L+2 timing replay (horizon 2)"] + out[1:]
+
+
 def _criteria_rows(values: dict) -> list[list[str]]:
     rows = []
     for arm, crit in sorted((values.get("arms") or {}).items()):
@@ -160,6 +165,7 @@ def render(results: dict) -> str:
     out += r1_report._timing_section(results.get("timing") or {})
     out += _cost_section(results.get("cost") or {})
     out += r1_report._l2_section(results.get("l2") or {})
+    out += _l2_timing_section(results.get("l2_timing") or {})
     out += _gate_section(results.get("continuation_gate") or {})
     out += _reading(results)
     return "\n".join(out).rstrip("\n") + "\n"

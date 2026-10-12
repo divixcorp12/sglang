@@ -459,7 +459,8 @@ def _l2(table: dict | None) -> dict:
 
 
 def _not_evaluated(reason: str) -> dict:
-    return {"passed": False, "reasons": [f"not evaluated: {reason}"], "values": {}}
+    # passed None means the gate was never evaluated, not that it failed.
+    return {"passed": None, "reasons": [f"not evaluated: {reason}"], "values": {}}
 
 
 def _continuation(plan: r2_plan.R2Plan, *, select: dict, calib: dict, cost: dict, replay: dict) -> dict:
@@ -496,7 +497,6 @@ def _results(run: _Run) -> dict:
     ctx, plan = run.ctx, run.plan
     parts = {n: _maybe(ctx, n) for n in ("train", "select", "calib", "cost", "replay", L2_TABLE)}
     gate = _gate_result(plan, parts=parts)
-    evaluated = not gate["reasons"][0].startswith("not evaluated")
     return {
         "label": plan.label, "plan_sha": ctx.plan_sha, "smoke": ctx.smoke, "r1_run": run.r1_run,
         "r1_plan_sha": plan.r1_plan_sha, "arms": _arms(parts["train"]), "selection": _selection(parts["select"]),
@@ -505,7 +505,7 @@ def _results(run: _Run) -> dict:
         "timing": (parts["replay"] or {}).get("timing", {}), "cost": _cost(parts["cost"]),
         "cost_increment": _increments(parts["cost"]),
         "l2": _l2(parts[L2_TABLE]), "l2_timing": (parts[L2_TABLE] or {}).get("timing", {}),
-        "continuation_gate": gate, "adds_over_t3": bool(gate["passed"]) if evaluated else None,
+        "continuation_gate": gate, "adds_over_t3": None if gate["passed"] is None else bool(gate["passed"]),
         "paths": {"out": ctx.out, "dataset": ctx.dataset, "corpus": ctx.corpus, "model_path": ctx.model_path,
                   "b1_head": ctx.b1_head},
     }
