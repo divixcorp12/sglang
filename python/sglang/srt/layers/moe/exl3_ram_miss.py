@@ -1026,6 +1026,14 @@ class Exl3RamMissService:
                 "exl3 RAM miss: SGLANG_DSV41_ROUTER_CAPTURE_PATH needs SGLANG_DSV41_EXPERT_TRACE_PATH: the "
                 "router capture is written by the stage trace's graph route log"
             )
+        if (
+            envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get()
+            and not envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get()
+        ):
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_DSV41_RESIDENCY_CAPTURE needs SGLANG_DSV41_ROUTER_CAPTURE_PATH: the "
+                "residency capture is written beside the router capture"
+            )
         cfg = Dsv41Config.from_envs()
         streamers = {
             layer_id: table.streamer_of()
