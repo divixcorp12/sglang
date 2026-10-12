@@ -8959,8 +8959,8 @@ Track B1 and B2 of `RAM_PREFETCH_PREDICTOR_HANDOFF.md`. On the locked-test sessi
 learned head beat the native gate (with and without the packaged margin floors) at predicting the rows that will be NVMe
 misses at demand, at equal reads per layer? The verdict is on L+1 only; L+2 and L+4 are evidence for the lead-time lever
 with no bar. The feature's checks build and test the code on synthetic blocks (gate run: `py_compile` exit 0; CPU suite
-96 passed, 1 skipped, exit 0; `--gpu` `test_b1_cost.py` 2 passed, exit 0; `check_no_bare_pytest_main.py` exit 0);
-**every number below is `pending`**, filled by the orchestrating session after the merge.
+96 passed, 1 skipped, exit 0; `--gpu` `test_b1_cost.py` 2 passed, exit 0; `check_no_bare_pytest_main.py` exit 0).
+Results are from the full run of 2026-10-12 at `401e7f26e8` (see **Results** below).
 
 **Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_b1_<module>.py`):
 
@@ -9020,7 +9020,7 @@ DATA=/mnt/nvme1/nvfp4-work/b1-dataset-<date>
 CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
 PY=/data/models/slang/.venv/bin/python
 RUN="$PY analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
-  --integrity $CORPUS/integrity.json --out $OUT --dataset $DATA"
+  --integrity $CORPUS/integrity.json --out $OUT --dataset $DATA --compile"
 CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
 export OMP_NUM_THREADS=8
 export PYTHONPATH=$PWD/python  # without it the venv imports sglang from another tree
@@ -9048,53 +9048,117 @@ flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $PY analysis/ds
 Tests (`divix01-pytest <named test_b1_*.py files> -q -p no:randomly`; `--gpu` for `test_b1_cost.py`; the real-corpus
 smoke needs `SGLANG_B1_CORPUS`, `SGLANG_B1_MODEL` and `SGLANG_B1_INTEGRITY`).
 
-**Results** (all pending; locked-test sessions, 15; sha256 of the frozen selection file: pending).
+**Results** (full run 2026-10-12, worktree at `401e7f26e8`, `--compile` on; locked test = 15 sessions, read once;
+sha256 of the frozen selection file `0018b38b0636161fae61422cf2a93e0e028f3287c53f7ae6f82e3e7d9a898df5`).
+Run directory `divix01:/mnt/nvme1/nvfp4-work/b1-run-20261012/` (`stages/report/REPORT.md` has the per-layer, per-stratum
+and per-session tables; `stages/report/results.json` the numbers); dataset `b1-dataset-20261012/`. The first full run's
+fit, train and log are kept under `superseded/` (stopped for speed, see **Run time**).
 
-Dataset (rows / eligible rows / dropped cells):
+Dataset (rows / eligible rows / dropped cells, L+1 / L+2 / L+4):
 
-| Split | Horizon | Rows | Eligible rows | Dropped cells |
-|---|---|---|---|---|
-| train | L+1 / L+2 / L+4 | pending | pending | pending |
-| dev | L+1 / L+2 / L+4 | pending | pending | pending |
-| calib | L+1 / L+2 / L+4 | pending | pending | pending |
-| locked_test | L+1 / L+2 / L+4 | pending | pending | pending |
+| Split | Rows | Eligible rows | Dropped cells |
+|---|---|---|---|
+| train | 902,772 / 879,624 / 833,328 | 250,535 / 233,238 / 217,441 | 0 / 0 / 0 |
+| dev | 274,248 / 267,216 / 253,152 | 76,073 / 71,076 / 66,128 | 0 / 0 / 0 |
+| calib | 124,722 / 121,524 / 115,128 | 36,379 / 33,769 / 31,457 | 0 / 0 / 0 |
+| locked_test | 185,328 / 180,576 / 171,072 | 53,619 / 49,786 / 46,388 | 0 / 0 / 0 |
 
-L+1, locked test, pooled (and without the 19 flagged sessions):
+Dropped cells are 0 in every split, although the integrity report's one non-tie mismatch (b000 seq 1283, layer 39) was
+meant to be dropped and counted; not chased (one cell in 13.4M routes cannot move a table).
 
-| Scorer | Recall @1 | Prec @1 | Recall @2 | Prec @2 | Recall @3 | Prec @3 | Never-cand. recovered | At cut (R / P) |
+Selection (dev, L+1 precision at 1 read): E5 `r128_h512_w2.0` 0.393, E2 `r256_h512_w1.0` 0.264; E5 chosen at every
+horizon. Most E5 grid configs reached their best dev epoch at 18-19 of the 20-epoch cap, so the heads are not fully
+converged: a longer cap would likely add a little, not 0.12.
+
+L+1, locked test, pooled. 30,888 forward-layers, 53,619 eligible rows. "Never-cand." is never-candidate recovery at 3
+reads; "at cut" is the calib-chosen threshold (variable reads per layer), recall / precision:
+
+| Scorer | Recall @1 | Prec @1 | Recall @2 | Prec @2 | Recall @3 | Prec @3 | Never-cand. | At cut (R / P) |
 |---|---|---|---|---|---|---|---|---|
-| gate | pending | pending | pending | pending | pending | pending | pending | pending |
-| gate + floors | pending | pending | pending | pending | pending | pending | pending | pending |
-| prev | pending | pending | pending | pending | pending | pending | pending | pending |
-| pop | pending | pending | pending | pending | pending | pending | pending | pending |
-| E2 | pending | pending | pending | pending | pending | pending | pending | pending |
-| E5 | pending | pending | pending | pending | pending | pending | pending | pending |
+| gate | 0.215 | 0.375 | 0.347 | 0.307 | 0.436 | 0.262 | 0.000 | 0.284 / 0.570 (cut 0.1) |
+| gate + floors | 0.188 | 0.520 | 0.284 | 0.488 | 0.336 | 0.468 | 0.000 | 0.317 / 0.532 (cut 0.05) |
+| prev | 0.001 | 0.001 | 0.001 | 0.002 | 0.001 | 0.002 | 0.001 | - |
+| pop | 0.033 | 0.058 | 0.064 | 0.055 | 0.093 | 0.054 | 0.055 | - |
+| E2 | 0.174 | 0.303 | 0.284 | 0.247 | 0.363 | 0.210 | 0.191 | 0.339 / 0.534 (cut 0.27) |
+| E5 | 0.232 | 0.403 | 0.381 | 0.331 | 0.486 | 0.281 | 0.126 | 0.507 / 0.534 (cut 0.18); 0.371 / 0.674 (cut 0.36) |
 
-L+2 and L+4, locked test, pooled (no bar; E3 evidence):
+Without the drive-flagged sessions nothing moves by more than 0.006 (gate 0.217 / 0.378, gate + floors 0.189 / 0.523,
+E5 0.232 / 0.402 at 1 read).
 
-| Horizon | Scorer | Recall @1 | Prec @1 | Recall @3 | Prec @3 | Never-cand. recovered |
-|---|---|---|---|---|---|---|
-| L+2 | gate / E2 / E5 | pending | pending | pending | pending | pending |
-| L+4 | gate / E2 / E5 | pending | pending | pending | pending | pending |
+Reads spent on the locked test, L+1 (the arms compare policies with different read counts, so this is the fair view):
 
-Per layer and per stratum tables: pending (`REPORT.md` in the run directory).
+| Policy | Rows read | Useful | Precision | Recall |
+|---|---|---|---|---|
+| gate, 1 read | 30,681 | 11,516 | 0.375 | 0.215 |
+| gate + floors, 1 read | 19,355 | 10,059 | 0.520 | 0.188 |
+| gate + floors, cut 0.05 | 31,981 | 17,016 | 0.532 | 0.317 |
+| E5, 1 read | 30,888 | 12,438 | 0.403 | 0.232 |
+| E5, cut 0.36 | 29,517 | 19,903 | 0.674 | 0.371 |
+| E5, cut 0.18 | 50,903 | 27,174 | 0.534 | 0.507 |
 
-Dev learning curve (L+1 precision at 1 read):
+At about the same total reads (~30k), E5 thresholded at 0.36 finds 1.73x the gate's useful rows and 1.17x the
+floored gate's at its cut, at higher precision than either. The head's advantage is in *which forward-layers* it reads
+from, not in its top-1 choice within a forward-layer: forced to exactly one read everywhere it barely beats the bare
+gate (0.403 vs 0.375).
+
+L+2 and L+4, locked test, pooled (no bar; evidence for the lead-time lever):
+
+| Horizon | Scorer | Recall @1 | Prec @1 | Recall @3 | Prec @3 | Never-cand. @3 | At cut (R / P) |
+|---|---|---|---|---|---|---|---|
+| L+2 | gate | 0.190 | 0.315 | 0.377 | 0.213 | 0.000 | 0.265 / 0.476 (cut 0.1) |
+| L+2 | E2 | 0.176 | 0.290 | 0.365 | 0.201 | 0.211 | 0.316 / 0.560 (cut 0.3) |
+| L+2 | E5 | 0.225 | 0.373 | 0.456 | 0.251 | 0.163 | 0.370 / 0.645 (cut 0.32) |
+| L+4 | gate | 0.158 | 0.257 | 0.313 | 0.172 | 0.000 | 0.253 / 0.378 (cut 0.1) |
+| L+4 | E2 | 0.174 | 0.284 | 0.361 | 0.196 | 0.224 | 0.314 / 0.557 (cut 0.3) |
+| L+4 | E5 | 0.207 | 0.337 | 0.423 | 0.229 | 0.172 | 0.353 / 0.615 (cut 0.38) |
+
+The gate decays with distance (precision at 1 read 0.375 -> 0.315 -> 0.257); E5 decays more slowly (0.403 -> 0.373 ->
+0.337) and E2, which sees only x and the source routing, is flat (0.303 -> 0.290 -> 0.284) and passes the gate at L+4.
+
+Dev learning curve (L+1 precision at 1 read; each subset uses its own PCA):
 
 | Variant | 15 sessions | 30 sessions | 60 sessions | Still improving |
 |---|---|---|---|---|
-| E2 | pending | pending | pending | pending |
-| E5 | pending | pending | pending | pending |
+| E2 | 0.138 | 0.202 | 0.264 | true |
+| E5 | 0.349 | 0.373 | 0.393 | true |
 
-Scorer cost of the chosen L+1 head on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA graph, against 0.1 ms):
+Scorer cost of the chosen L+1 head (E5 `r128_h512_w2.0`) on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA
+graph, 1,000 runs, against 0.1 ms):
 
-| Chosen head | bf16 bytes | Median time (ms) |
-|---|---|---|
-| pending | pending | pending |
+| Chosen head | bf16 bytes | Median time (ms) | p90 (ms) |
+|---|---|---|---|
+| E5 r128 h512, sha256 `2a282600...f22ef67f` | 4,654,784 | 0.059 | 0.060 |
 
-Paired per-session median and 95% bootstrap interval, head minus gate-with-floors: pending.
+Session bootstrap (15 sessions), head minus gate-with-floors precision at 1 read: median -0.105, 95% CI
+[-0.122, -0.093].
 
-**Verdict (L+1):** pending. Second capture warranted per the learning-curve rule: pending.
+**Verdict (L+1): DO NOT ADVANCE**, by the rule as written. Arms: precision **not met** (0.403 vs 0.520, needs +0.15);
+recall **met** (0.507 at the floored gate's precision vs 0.188, 2.70x, needs 1.25x); bootstrap **not met** (the
+implemented bootstrap is of the precision arm, lower bound -0.122); cost **met** (0.059 ms). Second capture warranted:
+no (not near the precision bar, though still improving).
+
+**The verdict turns on an ambiguity in the bar.** The rule is "(precision arm or recall arm) and bootstrap lower bound
+above zero and cost", and the bootstrap was implemented on the precision arm only. A post-hoc session bootstrap of
+the recall arm on the same locked tables (10,000 resamples, seed 0, computed after the locked read; the cuts were frozen
+on calib before it):
+
+| Recall ratio, E5 cut 0.18 against | Point | 95% CI | Sessions where E5 is higher |
+|---|---|---|---|
+| gate + floors, 1 read (the arm as written) | 2.70 | [2.47, 2.90] | 15 / 15 |
+| gate + floors, cut 0.05 (matched precision 0.532) | 1.60 | [1.47, 1.72] | 15 / 15 |
+
+Read with a recall-arm bootstrap, the head would advance: at the floored gate's precision it finds 1.6x the useful rows
+even against the floored gate's own best threshold, in every locked session. The cost is reads: 50.9k rows vs 32.0k.
+Whether a thresholded, variable-read-per-layer prefetcher is the policy the bar meant is the owner's call; "the native
+gate is the ceiling" holds only for a fixed one-read-per-layer budget.
+
+**Run time.** The first full run was stopped: its fit stage took 47 min (six PCA fits through a re-sorting reservoir)
+and training was Python-bound at ~45 s/epoch (~7 h projected). `0b2d8e45dd` and `401e7f26e8` vectorise `make_batch`,
+score heads in chunks (`b1_score.evaluate_many(chunk=512)`, `HeadScorer.score_many`), fit one PCA per rank from the x
+shards (~5 s each), and train from device-resident split caches (`b1_cache.py`: train 902,772 + dev 274,248 rows,
+9.6 GB GPU, built in 44 s). An epoch then takes ~2.5 s eager and ~1.2 s with `--compile` (compiles only the predictor
+MLP, `dynamic=True`; compiling before caching was slower, 99.5 s vs 90.2 s). The rerun (dataset reused): fit and
+baselines 41 s, train and curve 27 min (GPU), cuts/freeze/locked 6 min, cost 15 s, report 8 s.
 
 ## Sources
 
