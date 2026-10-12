@@ -16,7 +16,11 @@ import unittest
 import torch
 
 from sglang.srt.layers.moe.expert_residency import decide_residency_on_device
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from test_expert_residency_batched import _ReferencePolicy
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _reference(scores, resident, capacity, margin, sigmas):
