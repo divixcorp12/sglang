@@ -8958,8 +8958,9 @@ The gate's checks on the merged feature, on divix01 (`divix01-pytest`, GPU lane 
 Track B1 and B2 of `RAM_PREFETCH_PREDICTOR_HANDOFF.md`. On the locked-test sessions of the §33.25 corpus, does a
 learned head beat the native gate (with and without the packaged margin floors) at predicting the rows that will be NVMe
 misses at demand, at equal reads per layer? The verdict is on L+1 only; L+2 and L+4 are evidence for the lead-time lever
-with no bar. The feature's checks build and test the code on synthetic blocks; **every number below is `pending`**,
-filled by the orchestrating session after the merge.
+with no bar. The feature's checks build and test the code on synthetic blocks (gate run: `py_compile` exit 0; CPU suite
+96 passed, 1 skipped, exit 0; `--gpu` `test_b1_cost.py` 2 passed, exit 0; `check_no_bare_pytest_main.py` exit 0);
+**every number below is `pending`**, filled by the orchestrating session after the merge.
 
 **Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_b1_<module>.py`):
 
