@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, ut_parse_one_file
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-REGISTERED = Path(__file__).resolve().parents[1]  # test/registered
+REGISTERED = Path(__file__).resolve().parents[2]  # test/registered
 SKIPPED_BASENAMES = ("conftest.py", "__init__.py")  # run_suite skips these
 
 # Registered and enabled, but no `if __name__ == "__main__":` block.
@@ -34,57 +34,12 @@ KNOWN_NO_MAIN = frozenset(
     "unit/models/test_qwen4_exp_route_trace.py",
     "unit/scripts/test_task1_arm_verdict.py",
     "unit/spec/test_verify_trace.py",
-    "unit/test_file_row_reader.py",
     }
 )
 
-# No register_*_ci call at all: collect_tests raises "No CI registry found". Whether each should be registered
-# is undecided; the list records that it is not.
-#
-# This is the blocker, not KNOWN_NO_MAIN: collect_tests raises on the first offender of either class, so clearing
-# every file in KNOWN_NO_MAIN still leaves run_suite unable to collect while any of these remain. The decision
-# has three answers with different consequences (20 of the files are in layers/moe, one body of work whose tests
-# were written and never registered):
-#   - register them: CI grows by their runtime and whatever environment they need, and some may fail on a runner
-#     for environment reasons (32 of 307 multi-class files failed identically in every order in the class-order
-#     sweep, analysis/dsv41-drive/order_sweep/order_sweep_result.txt);
-#   - move them out of test/registered: they keep working under manual pytest and stop breaking collection;
-#     right if they are development instruments, not acceptance tests;
-#   - an explicit opt-out marker in the registry: honest about intent, but a new mechanism for files nobody
-#     wants run.
-KNOWN_NO_REGISTRY = frozenset(
-    {
-    "unit/kernels/test_expert_cache_transfer_warp_geometry.py",
-    "unit/kernels/test_sgl_kernel_load_utils.py",
-    "unit/layers/moe/test_async_telemetry.py",
-    "unit/layers/moe/test_expert_prediction_adapters.py",
-    "unit/layers/moe/test_expert_prediction_capture.py",
-    "unit/layers/moe/test_expert_prediction_capture_schema.py",
-    "unit/layers/moe/test_expert_prediction_capture_writer.py",
-    "unit/layers/moe/test_expert_prediction_metrics.py",
-    "unit/layers/moe/test_expert_prediction_predictors.py",
-    "unit/layers/moe/test_expert_prediction_runtime.py",
-    "unit/layers/moe/test_expert_prediction_taps.py",
-    "unit/layers/moe/test_expert_prediction_training.py",
-    "unit/layers/moe/test_expert_prefetch.py",
-    "unit/layers/moe/test_expert_prefetch_checkpoints.py",
-    "unit/layers/moe/test_expert_prefetch_pricing.py",
-    "unit/layers/moe/test_expert_residency.py",
-    "unit/layers/moe/test_expert_residency_batched.py",
-    "unit/layers/moe/test_expert_residency_device.py",
-    "unit/layers/moe/test_expert_transfer.py",
-    "unit/layers/moe/test_prefetch_pull_calibration.py",
-    "unit/layers/moe/test_prefetch_pull_gate_calibration.py",
-    "unit/layers/moe/test_prefetch_shadow_launcher_provenance.py",
-    "unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py",
-    "unit/layers/quantization/test_nvfp4_swizzle.py",
-    "unit/layers/quantization/test_online_fp8.py",
-    "unit/model_executor/runner_backend/test_breakable_cuda_graph_backend.py",
-    "unit/model_loader/test_nvfp4_main_port.py",
-    "unit/test_make_dspark_draft_dir.py",
-    "unit/test_nvfp4_expert_offload.py",
-    }
-)
+# No register_*_ci call at all: collect_tests raises "No CI registry found" on the first such file,
+# so a single one stops every suite from collecting. Register the file or move it to test/manual.
+KNOWN_NO_REGISTRY = frozenset()
 
 # A registration that is present but malformed: the parser itself raises.
 KNOWN_MALFORMED = frozenset(
