@@ -179,6 +179,42 @@ def test_a_verify_without_its_residency_record_fails(tmp_path):
     assert not report["ok"] and report["missing_records"] == 1
 
 
+def _block(tmp_path, *, mapped=("s1-t0", "s2-t0")):
+    """Two sessions, one verify forward each, in one dir; rids.json names only the rids in ``mapped``."""
+    session = _session(tmp_path)
+    lines = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
+    for line, rid in zip(lines[1:], ("s1-t0", "s2-t0")):
+        line["rids"] = [rid]
+    (tmp_path / "trace.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+    rids = {r: {"session_id": r.split("-")[0], "turn": 0, "split": "train" if r[1] == "1" else "eval"} for r in mapped}
+    (tmp_path / "rids.json").write_text(json.dumps(rids))
+    return session
+
+
+def test_a_block_dir_reports_each_session_through_rids_json(tmp_path):
+    W, bias = _gates()
+    report = b0.check_session(_block(tmp_path), W=W, bias=bias)
+    assert report["ok"] and report["unmapped_rids"] == []
+    s1, s2 = report["by_session"]["s1"], report["by_session"]["s2"]
+    assert (s1["split"], s2["split"]) == ("train", "eval")
+    assert (s1["joined_forwards"], s2["joined_forwards"]) == (1, 1)
+    assert (s1["route_cells"], s2["route_cells"]) == (2 * LIVE[0], 2 * LIVE[1])
+    assert (s1["evicted"], s2["evicted"]) == (LIVE[0], LIVE[1])
+    assert report["route_cells"] == 2 * sum(LIVE)
+    assert report["by_horizon"][1]["evicted"] == sum(LIVE)
+    summary = b0._summarize([report])
+    assert summary["by_session"]["s1"]["split"] == "train"
+    assert summary["by_session"]["s2"]["evicted"] == LIVE[1]
+
+
+def test_an_unmapped_rid_is_reported_not_raised(tmp_path):
+    W, bias = _gates()
+    report = b0.check_session(_block(tmp_path, mapped=("s1-t0",)), W=W, bias=bias)
+    assert report["ok"] and report["unmapped_rids"] == ["s2-t0"]
+    assert list(report["by_session"]) == ["s1"]
+    assert report["route_cells"] == 2 * sum(LIVE)
+
+
 def test_a_residency_header_without_per_row_entries_is_refused(tmp_path):
     session = _session(tmp_path)
     header_path = tmp_path / f"{b0.RESIDENCY_PREFIX}.json"
