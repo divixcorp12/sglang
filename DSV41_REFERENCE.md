@@ -9266,11 +9266,82 @@ named files with `-q -p no:randomly` (`--gpu -s` for the cost files):
 
 The 14 warnings come from `torch/jit/_script.py:365`. Lint and typecheck were not run by the gate.
 
-**Results.** Pending: the full run is started by the owner. Stage 1 (useful / wasted / eligible, precision, recall,
-reads under caps 1 and 2), the T0-T4 arm curves and checkpoint hashes, the timing replay, the complete-scorer cost and
-the continuation-gate outcome are all `pending`; `REPORT.md` and `results.json` in the run directory will state which
-of ranking, abstention, block aggregation, capacity, training length or lead explains any gain, and which remain
-unresolved.
+**Results** (full run 2026-10-12, worktree `wt-r1-run` at `18e937f060`; exploratory on reused data, independent
+confirmation pending). Run directory `divix01:/mnt/nvme1/nvfp4-work/b1-r1-20261012/` (`REPORT.md`, `results.json`,
+`selection.json`, `run_plan.json` sha256 in `run_plan.sha256`); script and log `r1-run-20261012.{sh,log}`. A real-data
+smoke (`b1-r1-20261012-smoke/`, every stage, 4 min) ran first and was clean. Timings: plan + audit 1 min, stage1 8 min,
+train/seeds/l2/calib 41 min, cost 1 min, replay + report 9 min. The audit excluded the one mismatch cell (dev L+1
+eligible 76,073 -> 76,072); the stamp join matched 251,316 windows (6,444 missing, 0 inversions).
+
+Stage 1 (no training), L+1, cap 2 at mean reads <= 1 per forward-layer (45,708 dev / 20,787 calib forward-layers):
+
+| Scorer | Dev recall | Dev precision | Dev reads | Calib recall | Calib precision |
+|---|---|---|---|---|---|
+| F0 (B1 head, noisy-or) | 0.317 | 0.528 | 45,704 | 0.330 | 0.578 |
+| gate | 0.288 | 0.479 | 45,695 | 0.284 | 0.498 |
+| gate + floors | 0.279 | 0.508 | 41,790 | 0.276 | 0.526 |
+| pop / prev | 0.033 / 0.001 | | | | |
+
+Stage-2 gate (D3): **passed**, narrowly: dev recall 0.3175 vs gate 0.2877 (+10.3% relative, bar +10%); on-time useful
+rows at nominal contention 15,652 vs 14,821 (+5.6%). The cap shrinks B1's uncapped equal-read advantage (~17%, §33.26):
+part of it came from concentrating reads on bursty layers (per-layer, per-stratum and per-session read histograms are
+in `REPORT.md`). Cap 1 and the hybrid are degenerate under the frozen "lowest threshold within budget"
+rule (cap 1 never binds the mean, so both read on every forward-layer); read cap 2.
+
+Arm ladder (seed 0, dev recall at cap 2; candidate chosen by dev, thresholded on calib):
+
+| Arm | Change | Epochs | Dev recall | Seeds 0/1/2 |
+|---|---|---|---|---|
+| F0 | frozen B1 head | 0 | 0.317 | - |
+| T0 | B1 architecture and loss, retrained | 60 | 0.324 | 0.324 / 0.323 / 0.323 |
+| T1 | + learned block aggregator (frozen encoder) | 20 | 0.326 | 0.326 / 0.325 / 0.324 |
+| T2 | + block BCE, 0.25 route BCE, encoder unfrozen | 16 | 0.331 | 0.331 / 0.330 / 0.331 |
+| **T3** | + position embedding, live width | 9 | **0.332** | 0.332 / 0.331 / 0.331 |
+| T4 | + rank-16 layer adapters | 9 | 0.331 | - |
+| T5, G0 | trainable projection; full-score challenger | - | **not run** | - |
+
+T5 and G0 were skipped by the driver with `MemoryError: raw x cache needs more than 8589934592 bytes; stream it
+instead` (its own 8 GiB guard; streaming is not implemented). They are untested, not negative. T0 matching F0 rules out
+a broken training path; retraining longer adds +0.007.
+
+Candidate **T3** (ancestry T0 -> T1 -> T2 -> T3), calib threshold 0.323, at 1 read per forward-layer on calib: recall
+0.348, precision 0.609, against the gate's 0.284 / 0.498 at the same 20,787 reads.
+
+Timing-sensitivity replay (cap 2, dev; row read 2.2 ms; scorer delay: T3 and F0 their complete bf16 median 0.193 ms,
+native controls gate-only 0.064 ms), on-time useful rows:
+
+| Contention | T3 | F0 | gate | gate + floors |
+|---|---|---|---|---|
+| zero (1.0x) | 24,067 | 23,056 | 21,165 | 20,496 |
+| nominal (2.0x) | 16,282 | 15,497 | 14,834 | 14,214 |
+| adverse (3.0x) | 8,257 | 7,857 | 7,626 | 7,245 |
+
+T3 leads the gate by +13.7% / +9.8% / +8.3%, charged its full offline scorer delay.
+
+Complete offline scorer cost of T3 (CUDA graph, 6 live tokens, 1,000 runs): complete 0.193 ms median (bf16 and fp32
+alike), head only 0.101 ms; F0 0.142 / 0.049 ms; gate only 0.064-0.070 ms. Parameters 3.35 MB bf16, buffers 1.3 MB;
+the bf16 path changes the capped read set in 0.9% of groups. The offline gate (a plain PyTorch fp32 matmul +
+softplus) costs ~10x the serving score kernel (~6 us, `RAM_PREFETCH_PREDICTOR_HANDOFF.md`), so the complete figure overstates a serving
+implementation; the head alone is still ~0.1 ms.
+
+L+2 (T3's ladder retrained at L+2 vs T0 at L+2, dev cap 2): 0.319 / 0.509 precision vs 0.309 / 0.493. No native-gate
+L+2 control was computed in R1; both L+2 heads exceed the L+1 gate's 0.288 with one more layer of lead (different
+eligible sets, 71,075 vs 76,072).
+
+**Continuation gate (D10): FAIL, on cost alone.** Recall at cap 2 0.3317 vs gate 0.2877 (+15.3%, met); calib
+precision 0.609 vs 0.498 (met); calib reads 20,787 vs 20,787 (met); seed median 0.3308, min 0.3307 (met); without
+flagged sessions 0.3260 vs 0.2856 (met); on-time useful rows at nominal 16,282 vs 14,834 (met); **bf16 complete scorer
+0.193 ms per layer (needs <= 0.1, not met)**.
+
+Attribution (`REPORT.md`): ranking supported (F0 vs gate, calib +0.054); abstention not supported (the degenerate cap-1
+lane); block aggregation (+0.002), capacity (+0.006), training length (+0.007) and lead (+0.010) below the relative bar,
+unresolved. Most of the gain is the B1 head's ranking; the R1 additions add ~+0.015 recall together.
+
+**Reading.** The learned predictor is a real, seed-stable improvement over the gate at equal reads (~15% recall,
+~10% on-time useful rows), and the old locked test is not involved. In absolute terms it is small: it adds about 10%
+to the gate's on-time useful rows, and the gate's own served prefetch measured as a tie (§33.22). A serving A/B would
+likely not resolve it from noise. The cost miss is mostly the unfused offline implementation, but the head alone sits at
+the 0.1 ms bound.
 
 ## Sources
 
