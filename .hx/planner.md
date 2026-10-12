@@ -16,7 +16,12 @@ a 13k-line `python/uv.lock` rewrite and a `python/.python-version`.
   `/Users/dnikolaidis/.hx/checks/divix01-pytest <test files> -q -p no:randomly`
   It pushes the checkout's branch to origin, runs pytest in a private divix01 worktree
   (`/data/models/slang/nvfp4-work/wt-<branch>`) with `PYTHONPATH`, `OMP_NUM_THREADS=8` and `taskset -c 0-63`, and
-  exits with pytest's own status (`.claude/rules/divix01-run-protocol.md`).
+  exits with pytest's own status (`.claude/rules/divix01-run-protocol.md`). It sets the EXL3 env
+  (`SGLANG_EXL3_SRC`, `SGLANG_EXL3_BUILD_DIR`, `CUDA_HOME`) and tests uncommitted work through a scratch ref, so a
+  fixer can rerun a lane before it commits.
+- Before putting an existing test file in a check, consider whether it passes on master: a check that fails at the
+  base sends fixers after a bug the feature did not cause. Deselect a known base failure with `--deselect` and say
+  why in the task.
 - **GPU tests** (`test/manual/dsv41/*_cuda.py`, `*_gpu.py`, anything needing CUDA) add `--gpu`:
   `/Users/dnikolaidis/.hx/checks/divix01-pytest --gpu <files> -q -s -p no:randomly`. It waits on `cc-gpu.lock` and
   runs on cores 32-63. Run them for real in the batch that owns the kernel; a `py_compile` is not a GPU test.
