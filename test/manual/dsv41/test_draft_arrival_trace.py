@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[3]
 
 def test_decode_admission_excludes_prefill_and_requires_all_burnin_bounds(monkeypatch):
     import importlib.util

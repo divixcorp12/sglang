@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux/OpenMP di
 
 @pytest.fixture(scope="module")
 def probes(tmp_path_factory):
-    root = Path(__file__).resolve().parents[4]
+    root = Path(__file__).resolve().parents[3]
     work = tmp_path_factory.mktemp("worker-trace")
     source = work / "probe.cpp"
     source.write_text(r'''

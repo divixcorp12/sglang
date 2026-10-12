@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[3]
 BOOTSTRAP = ROOT / "test/manual/dsv41/omp_bootstrap"
 LIBRARY = os.environ.get("DSV41_OMP_TEST_LIBRARY")
 pytestmark = pytest.mark.skipif(sys.platform != "linux" or not LIBRARY,
