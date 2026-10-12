@@ -217,7 +217,7 @@ def _groups(ctx: r1_stage.StageCtx, *, split: str, exclusions: Exclusions) -> li
                                          sessions=_sessions(ctx, split=split)))
 
 
-def _f0_token_scorer(ctx: r1_stage.StageCtx, *, groups: list[R1Group], split: str) -> _ChunkedHead:
+def f0_token_scorer(ctx: r1_stage.StageCtx, *, groups: list[R1Group], split: str) -> _ChunkedHead:
     """The frozen B1 head reading x through r1_groups.x_rows, so dropped tokens stay aligned with r.g."""
     model, _ = b1_head.load_head(ctx.b1_head)
     x_of_group = r1_cache.make_x_of(ctx.dataset, split=split)
@@ -250,7 +250,7 @@ def run_stage1(ctx: r1_stage.StageCtx, *, plan: r1_plan.RunPlan, exclusions: Exc
     for split in SPLITS:
         groups[split] = _groups(ctx, split=split, exclusions=exclusions)
         scorers = r1_controls.control_scorers(
-            floors=floors, pop=pop, f0_token_scorer=_f0_token_scorer(ctx, groups=groups[split], split=split),
+            floors=floors, pop=pop, f0_token_scorer=f0_token_scorer(ctx, groups=groups[split], split=split),
             learned=None)
         rule = "select" if split == plan.selection_metric.split else "calibrate"
         evals[split] = evaluate_split(groups[split], scorers, caps=(plan.cap_secondary, plan.cap_primary),
