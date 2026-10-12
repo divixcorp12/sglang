@@ -9343,6 +9343,33 @@ to the gate's on-time useful rows, and the gate's own served prefetch measured a
 likely not resolve it from noise. The cost miss is mostly the unfused offline implementation, but the head alone sits at
 the 0.1 ms bound.
 
+**L+2 spike (2026-10-12, `r1_l2_spike.py` at `7175bd5405`, output `b1-r1-20261012/spike-l2/result.json`, log
+`r1-l2-spike-20261012.log`).** The native gate applied two layers early (target gate weights on x[T]) against R1's L+2
+heads, through the same scoring path, cap-2 rule and per-scorer delays (gate 0.064 ms, heads 0.193 ms), dev 44,535 /
+calib 20,254 forward-layers. Stamp join at h=2: 244,872 windows, 12,888 missing, 0 inversions.
+
+| L+2 scorer | Dev recall | Dev precision | Calib recall | Calib precision |
+|---|---|---|---|---|
+| gate | 0.251 | 0.401 | 0.251 | 0.418 |
+| T0 (L+2) | 0.309 | 0.493 | 0.329 | 0.549 |
+| T3 ladder (L+2) | 0.319 | 0.509 | 0.343 | 0.572 |
+
+The head's lead over the gate grows with distance (+27% recall at L+2 vs +15% at L+1): the gate decays (0.288 -> 0.251),
+the head barely does (0.332 -> 0.319). On-time useful rows (dev, same timing model as above):
+
+| Contention | gate L+1 (served today) | T3 L+1 | gate L+2 | T3 L+2 |
+|---|---|---|---|---|
+| zero | 21,165 | 24,067 | 17,863 | 22,658 |
+| nominal | 14,834 | 16,282 | 17,566 | 22,166 |
+| adverse | 7,626 | 8,257 | 15,510 | 19,167 |
+
+At L+1 under contention a third (nominal) to two thirds (adverse) of the gate's useful reads land late; at L+2 almost
+none do. In this model the lead is worth more than the learned predictor: the bare gate at L+2 beats the L+1 gate by
++18% at nominal and 2x at adverse, and T3 at L+2 adds +26% over it (+49% / 2.5x over today's L+1 gate). Caveats: the
+replay prices each forward-layer independently (no cross-layer drive queueing beyond the contention multiplier), does
+not model the pool holding a row for one more layer, and covers 1,173 fewer forward-layers at L+2 (one fewer valid
+source row per forward); it is a model, not a measured speedup.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

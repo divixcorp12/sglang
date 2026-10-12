@@ -5,6 +5,15 @@ evaluation, B2 verdict) of `RAM_PREFETCH_PREDICTOR_HANDOFF.md`. The record of ev
 `DSV41_REFERENCE.md` §33.25 (capture) and §33.26 (results). When this file and the reference disagree, the reference
 wins.
 
+> **Update 2026-10-12 (later the same day), `master` after `7175bd5405`.** The design critique below (round 1) was
+> accepted with five amendments and run as hx feature F106 ("R1"), followed by an L+2 spike. Their results are in
+> **"ROUND 2 RESULTS: R1 and the L+2 spike"** at the end of this file and in `DSV41_REFERENCE.md` §33.27. Short
+> version: the learned head is a real, seed-stable gain at equal reads (+15% recall at L+1, +27% at L+2), the R1
+> continuation gate fails on scorer cost alone, and the timing replay says **lead time (L+2) is worth more than the
+> learned predictor**: the bare native gate moved to L+2 beats today's L+1 gate on on-time useful rows by +18% at
+> nominal contention and 2x at adverse. The questions in "What we want from you" below were round 1's; round 2's
+> open questions are at the end of the new section.
+
 ## What we want from you
 
 A second opinion, not more code. Read this file, then §33.26, and tell the owner:
@@ -853,5 +862,124 @@ Repository evidence to recheck if HEAD moves:
 **First experiment to prioritize:** the block-level missing-expert objective with learned pooling, followed by
 small target-layer adapters, using the existing corpus. Its success criterion is a better feasible read policy,
 with a measured complete scorer cost, not simply a larger token-route accuracy number.
+
+## ROUND 2 RESULTS: R1 and the L+2 spike
+
+**Date and code:** 2026-10-12. hx feature F106 (story ST8), merged as `18e937f060`; results `222fcba5e5`; L+2 spike
+`7175bd5405`. Record: `DSV41_REFERENCE.md` §33.27. Run directory `divix01:/mnt/nvme1/nvfp4-work/b1-r1-20261012/`
+(`REPORT.md`, `results.json`, `selection.json`, `run_plan.json` + `.sha256`, `spike-l2/result.json`); smoke
+`b1-r1-20261012-smoke/`; worktree `divix01:/data/models/slang/nvfp4-work/wt-r1-run`. Every number is **exploratory on
+reused data (dev/calib of the B0 corpus); independent confirmation pending**. The old locked test was never loaded.
+
+### What R1 changed relative to the critique (owner-approved amendments)
+
+1. **Stage 1 first, with a stop.** The frozen B1 head (F0) and the native controls were scored under caps before
+   any training; training ran only because F0 cleared +10% recall over the best native control under cap 2 and kept
+   more on-time useful rows at nominal contention.
+2. The label point was reframed: on available experts a route *is* a miss up to the 0.56% eviction rate, so the
+   block objective's expected gain is union labels and abstention, not a label fix.
+3. Scorer cost is offline only (gate scores through candidate selection); reader publication belongs to a serving spec.
+4. The timing replay is a bounded sensitivity model from B0's own stamps: row read 2.2 ms (§33.19) times contention
+   1.0 / 2.0 / 3.0 (zero / nominal / adverse; nominal from §33.16's "a speculative read doubles a demand read").
+5. Run through hx, not a `codex/` branch.
+
+Frozen dtype for cost: bf16 head and aggregator over an fp32 gate, an fp32 path timed beside it.
+
+### Stage 1 (no training), L+1, cap 2, mean reads <= 1 per forward-layer
+
+| Scorer | Dev recall | Dev precision | Calib recall | Calib precision |
+|---|---|---|---|---|
+| F0 (B1 head) | 0.317 | 0.528 | 0.330 | 0.578 |
+| gate | 0.288 | 0.479 | 0.284 | 0.498 |
+| gate + floors | 0.279 | 0.508 | 0.276 | 0.526 |
+
+Stage-2 gate passed narrowly: +10.3% dev recall (bar +10%), on-time useful rows at nominal 15,652 vs 14,821. The cap
+shrinks B1's ~17% uncapped equal-read advantage: part of it came from piling reads onto bursty layers. **The cap-1
+lane and the hybrid are degenerate** under the frozen "lowest threshold within budget" rule (cap 1 never binds the
+mean, so both read on every forward-layer); read cap 2.
+
+### The arm ladder (L+1, seed 0; dev recall at cap 2)
+
+| Arm | Change | Dev recall | Seeds 0/1/2 |
+|---|---|---|---|
+| F0 | frozen B1 head | 0.317 | - |
+| T0 | B1 architecture and loss, retrained (60 epochs) | 0.324 | 0.324 / 0.323 / 0.323 |
+| T1 | + learned block aggregator, frozen encoder | 0.326 | 0.326 / 0.325 / 0.324 |
+| T2 | + block BCE + 0.25 route BCE, encoder unfrozen | 0.331 | 0.331 / 0.330 / 0.331 |
+| **T3** | + position embedding and live width (candidate) | **0.332** | 0.332 / 0.331 / 0.331 |
+| T4 | + rank-16 target-layer adapters | 0.331 | - |
+| T5, G0 | trainable projection; full-score challenger | **not run** | - |
+
+- T5 and G0 were skipped by the driver's own 8 GiB raw-x cache guard ("stream it instead"; streaming is not
+  implemented). Untested, not negative.
+- T0 matching F0 rules out a broken training path. All R1 additions together add ~+0.015 recall; the gain is mostly
+  the B1 head's ranking (attribution: ranking supported; aggregation, capacity, training length below the bar).
+- T3 on calib, at the same 20,787 reads as the gate: recall 0.348 vs 0.284, precision 0.609 vs 0.498.
+
+### Continuation gate: FAIL on cost alone
+
+Met: recall +15.3% (0.3317 vs 0.2877); calib precision not lower; calib reads equal; seed median 0.3308 (min 0.3307);
+without flagged sessions 0.3260 vs 0.2856; on-time useful at nominal 16,282 vs 14,834. **Not met: complete bf16 scorer
+0.193 ms per layer (bar 0.1).** Head only 0.101 ms; the offline gate alone 0.064 ms, about 10x the serving score
+kernel (~6 us), so the complete figure overstates a serving implementation, but the head alone sits at the bound.
+bf16 vs fp32 changes the capped read set in 0.9% of groups.
+
+### The L+2 spike: lead time is the bigger lever
+
+Native gate applied two layers early vs R1's L+2 heads, same scoring path, cap rule and per-scorer delays.
+
+| L+2 scorer | Dev recall | Dev precision | Calib recall |
+|---|---|---|---|
+| gate | 0.251 | 0.401 | 0.251 |
+| T0 (L+2) | 0.309 | 0.493 | 0.329 |
+| T3 ladder (L+2) | 0.319 | 0.509 | 0.343 |
+
+On-time useful rows (dev; timing model; the gate charged 0.064 ms, heads 0.193 ms):
+
+| Contention | gate L+1 (served today) | T3 L+1 | gate L+2 | T3 L+2 |
+|---|---|---|---|---|
+| zero | 21,165 | 24,067 | 17,863 | 22,658 |
+| nominal | 14,834 | 16,282 | 17,566 | 22,166 |
+| adverse | 7,626 | 8,257 | 15,510 | 19,167 |
+
+- At L+1 under contention, a third (nominal) to two thirds (adverse) of the gate's useful reads land **late**. At L+2
+  almost none do (nominal: 297 late of 17,863). This matches §33.24's "21% of used reads still in flight at use".
+- The bare gate at L+2 is less accurate (recall 0.251 vs 0.288) but beats today's L+1 gate on on-time rows by +18%
+  at nominal and 2.0x at adverse. It needs no learned model and no new scorer cost.
+- The head's advantage grows with distance (+27% recall at L+2 vs +15% at L+1); T3 at L+2 is +49% / 2.5x over
+  today's L+1 gate at nominal / adverse.
+
+**Caveats on the timing model.** It prices each forward-layer independently with a contention multiplier and
+does not model cross-layer drive queueing; it ignores the pool holding a row one layer longer (capacity, eviction);
+L+2 covers 1,173 fewer forward-layers (one fewer valid source row per forward). It is a model, not a measured
+speedup. The served gate+floors prefetch at L+1 measured as a tie (§33.22). That is consistent with this model,
+in which much of L+1's useful work arrives late, but it does not prove an L+2 variant will win.
+
+### How this session reads it (an opinion; argue with it)
+
+1. **The learned predictor alone will not move serving.** About +10% on-time useful rows over a served baseline
+   that ties is likely below A/B noise, and it costs ~0.1-0.2 ms per layer.
+2. **Moving the native gate to L+2 is the cheapest experiment with a plausible serving effect.** The GPU scorer's slot,
+   the candidate page and the speculative threads exist; the change is which target gate the score kernel applies
+   (W[T+2] on x[T]) and how long the pool keeps a row. B0 already captured horizons up to 4, so an offline check of
+   L+4 costs one more spike run.
+3. If the L+2 gate wins in serving, the learned head is a second step on top of it (+26% on-time rows over the L+2
+   gate in this model), and its cost problem becomes worth solving with a fused kernel.
+
+### Open questions for the next reader
+
+1. Do you trust the timing model's L+1 -> L+2 shift, given that it ignores cross-layer queueing and pool capacity? What
+   is the cheapest way to check it before a served A/B (for example, replaying the B0 drive traces, or a short
+   instrumented served run with the gate retargeted to L+2)?
+2. Should the next served experiment be the native gate at L+2 (no model), with floors re-fitted for L+2, before any
+   learned-predictor serving work?
+3. Is L+4 worth the same spike? (B1's L+4 gate precision fell to 0.257 at 1 read; more lead may not pay.)
+4. Is it worth implementing raw-x streaming to run T5 and G0, given that the ladder adds only ~+0.015 over F0?
+
+### Still open from round 1
+
+- Independent confirmation capture: not taken; none of the above has a fresh locked test.
+- Housekeeping as listed under "Housekeeping still open" (plus `wt-r1-run`, `b1-r1-20261012-smoke`).
+- F105 Q1 in hx stays open on purpose as evidence for an hx display/replan bug investigation.
 
 Production on divix01 is still stopped; only you can restart it.
