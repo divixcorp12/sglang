@@ -16,7 +16,7 @@ BASETEMP=/mnt/nvme1/pytest-tmp/np-gpu-suite-$(git rev-parse --short HEAD)
 rm -rf $BASETEMP && mkdir -p $BASETEMP
 CPU_TARGETS="test/registered/unit/kernels test/registered/unit/layers/moe/test_exl3_ram_miss_service.py
   test/registered/unit/layers/moe/test_exl3_ram_miss_shutdown.py test/registered/unit/layers/moe/test_exl3_ram_miss_tables.py
-  test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/test_dsv41_config.py"
+  test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/configs/test_dsv41_config.py"
 [ -f test/registered/unit/layers/moe/test_exl3_native_prefetch.py ] && CPU_TARGETS="$CPU_TARGETS test/registered/unit/layers/moe/test_exl3_native_prefetch.py"
 FILES="test_exl3_ram_miss_cuda.py test_exl3_lease_kernels_cuda.py test_exl3_two_phase_parity_cuda.py
   test_exl3_two_phase_timing_cuda.py test_exl3_two_phase_failure_cuda.py test_exl3_piece_stream_cuda.py
