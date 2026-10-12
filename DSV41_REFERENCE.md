@@ -9083,12 +9083,11 @@ Dev learning curve (L+1 precision at 1 read):
 | E2 | pending | pending | pending | pending |
 | E5 | pending | pending | pending | pending |
 
-Scorer cost on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA graph, against 0.1 ms):
+Scorer cost of the chosen L+1 head on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA graph, against 0.1 ms):
 
-| Variant | bf16 bytes | Median time (ms) |
+| Chosen head | bf16 bytes | Median time (ms) |
 |---|---|---|
-| E2 | pending | pending |
-| E5 | pending | pending |
+| pending | pending | pending |
 
 Paired per-session median and 95% bootstrap interval, head minus gate-with-floors: pending.
 
