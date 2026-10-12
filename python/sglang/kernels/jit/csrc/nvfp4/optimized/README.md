@@ -20,8 +20,8 @@ scalar loop. `NVFP4_CPU_MAX_ISA=scalar` caps the tier (it never raises it) and `
 tier chosen (`nvfp4 isa avx2`) to stderr. The arithmetic needs `-ffp-contract=off` and must never be built with
 `-Ofast`.
 
-The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
-`test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
+The native harnesses (`test/manual/dsv41/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
+`test/manual/dsv41/test_nvfp4_cpu_build.py`.
 
 See [the benchmark guide](../bench/README.md) for the native benchmark
 executable, fixed-team process rounds, fixture format and timing protocol.
@@ -164,7 +164,7 @@ reports error against a separate FP64 W4A16 reference. The differential GGML
 test covers every finite signed scale, varying nibbles, GPU scale row
 boundaries, and all partial 64-value block lengths, for both tiers (AVX2 where the host has it). The
 standalone sanitizer harness is in
-`test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`; compile it together with
+`test/manual/dsv41/nvfp4_cpu_sanitizer.cpp`; compile it together with
 `kernel.cpp` and the vendored C source; `test_nvfp4_cpu_build.py` also runs it under ASan/UBSan where the
 compiler can link them.
 

@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
-REPO = Path(__file__).resolve().parents[4]
+REPO = Path(__file__).resolve().parents[3]
 CXX = os.environ.get("CXX") or shutil.which("g++")
 
 pytestmark = pytest.mark.skipif(

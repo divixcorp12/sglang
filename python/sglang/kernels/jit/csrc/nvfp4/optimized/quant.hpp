@@ -47,7 +47,7 @@ constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediat
     const uint64_t h = uint64_t(hidden), n = uint64_t(intermediate);
     return {n * h, h * n / 2, rounded(2 * n, 128) * rounded(h / 16, 4), rounded(h, 128) * rounded(n / 16, 4), 4, 4, 4};
 }
-// The sanitizer harness's 80 x 80 layer (test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp) registers exactly these.
+// The sanitizer harness's 80 x 80 layer (test/manual/dsv41/nvfp4_cpu_sanitizer.cpp) registers exactly these.
 static_assert(row_bytes(80, 80)[kW13] == 80 * 80 && row_bytes(80, 80)[kW2] == 80 * 80 / 2);
 static_assert(row_bytes(80, 80)[kSf13] == 256 * 8 && row_bytes(80, 80)[kSf2] == 128 * 8);
 
