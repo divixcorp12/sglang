@@ -23,6 +23,10 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     _checkpoint_cache_identity,
 )
 from sglang.srt.utils import offloader as offloader_module
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 OFFLOAD_NAMES = (
     "w13_weight",
