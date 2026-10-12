@@ -3,13 +3,14 @@
 Each stage writes ``stages/<name>/result.json`` and an atomic DONE.json holding its input and output sha256s; a stage
 is reused only while its recorded inputs match and reruns when they do not (the plan stage refuses instead, through
 r1_plan.freeze_plan). run_plan.json is frozen by the plan stage before any training stage can run (C1). When the
-Stage-2 gate (D3) fails, train, seeds, l2 and calib are skipped and the run reports after Stage 1; cost and replay
-still time F0, so Stage 1's timing replay carries a measured scorer delay. ``--smoke`` (a few sessions, 1 epoch) runs
-every stage whatever the gate says. --out must lie under /mnt/nvme1/nvfp4-work/ and outside b1-run-20261012; every
+Stage-2 gate (D3) fails, train, seeds, l2 and calib are skipped and the run reports after Stage 1; stage1 times F0's
+complete scorer before the gate, so its timing replay carries a measured scorer delay. ``--smoke`` (a few sessions,
+1 epoch) runs every stage whatever the gate says. --out must lie under /mnt/nvme1/nvfp4-work/ and outside b1-run-20261012; every
 invocation is appended with its exit code to <out>/invocations.jsonl. REPORT.md and results.json land in --out.
 
 Inputs: MODEL_PATH (gates), the B1 dataset dir, the B0 corpus dir, its integrity report and the frozen B1 head.
-The train, cost and replay stages need the GPU: run the driver under cc-gpu.lock on cores 32-63.
+The stage1, train and cost stages need the GPU (replay only when its scorers are placed on cuda): run them under
+cc-gpu.lock on cores 32-63.
 Usage: flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 python3 r1_run.py MODEL_PATH --dataset D
        --corpus C --integrity R --b1-head H --out /mnt/nvme1/nvfp4-work/b1-r1-<date> [--stages ...] [--device cuda]
        [--smoke]

@@ -9231,8 +9231,9 @@ GPU="flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63"
 # (a) plan and audit: CPU, cores 0-63
 $CAP taskset -c 0-63 $RUN --stages plan audit --device cpu; echo "EXIT=${PIPESTATUS[0]}"
 
-# (b) stage 1 (F0, native controls, caps, histograms): CPU, cores 0-63
-$CAP taskset -c 0-63 $RUN --stages stage1 --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+# (b) stage 1 (F0, native controls, caps, histograms, timing, D3 gate): GPU, cc-gpu.lock, cores 32-63;
+#     it times F0's complete scorer under a CUDA graph first, so the D3 timing check includes that delay
+$GPU $RUN --stages stage1 --device cuda; echo "EXIT=${PIPESTATUS[0]}"
 
 # (c) training arms, seeds, L+2, calibration: GPU, cc-gpu.lock, cores 32-63 (skipped by the driver if Stage 1 stops)
 $GPU $RUN --stages train seeds l2 calib; echo "EXIT=${PIPESTATUS[0]}"
