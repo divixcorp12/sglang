@@ -69,7 +69,7 @@ class _EagerGraphView:
         return getattr(self._cfg, name)
 
 
-def _check_dspark_cpu_experts(cfg) -> None:
+def check_dspark_cpu_experts(cfg) -> None:
     """The draft CPU experts' launch rules, so a bad core list or resident file fails here, not at the first draft
     call."""
     if getattr(cfg, "speculative_algorithm", None) != "DSPARK":
@@ -252,7 +252,7 @@ def _check(cfg, budgets) -> None:
         # backend is not known yet, and the pass after parsing runs every check below.
         return
     if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
-        _check_dspark_cpu_experts(cfg)
+        check_dspark_cpu_experts(cfg)
     _check_row_weighted_assignment()
     _check_ram_prefetch()
     _check_mirror_caps()

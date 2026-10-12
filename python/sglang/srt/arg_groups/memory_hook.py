@@ -222,6 +222,13 @@ def handle_offload_compatibility(server_args: Any) -> None:
     if pinned_budget_mb < 0:
         raise ValueError("SGLANG_MOE_PINNED_HOST_MB must be nonnegative")
     if hot_budget_mb == 0 and pinned_budget_mb == 0 and prefetch_candidates == 0:
+        if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
+            # The draft's CPU experts need no expert cache; their launch rules hold all the same.
+            from sglang.srt.arg_groups.expert_stream_requirements_exl3 import (
+                check_dspark_cpu_experts,
+            )
+
+            check_dspark_cpu_experts(cfg)
         return
     if hot_budget_mb < 0:
         raise ValueError("SGLANG_MOE_HOT_GPU_MB must be nonnegative")
