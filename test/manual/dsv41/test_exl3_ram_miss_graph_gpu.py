@@ -428,5 +428,116 @@ def test_many_layers_in_one_replay_are_served(tmp_path, layers):
         service.shutdown()
 
 
+def _graph_kernel_names(graph):
+    """Every node of ``graph`` in the driver's order: kernel nodes by function name, others by node type."""
+    from cuda.bindings import driver as cuda_drv
+
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import checkCudaErrors
+
+    raw = graph.raw_cuda_graph()
+    _, count = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw, 0))
+    nodes, _ = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw, count))
+    names = []
+    for node in nodes:
+        node_type = checkCudaErrors(cuda_drv.cuGraphNodeGetType(node))
+        if node_type != cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            names.append(f"node_type_{int(node_type)}")
+            continue
+        func = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node)).func
+        names.append(checkCudaErrors(cuda_drv.cuFuncGetName(func)).decode())
+    return names
+
+
+def _capture_nodes(fn):
+    """One eager call (the warmup that sizes any ring), then the node names of ``fn`` captured into a graph."""
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        fn()
+    return graph, _graph_kernel_names(graph)
+
+
+def test_residency_capture_adds_exactly_its_nodes_to_the_graph_and_fills_its_rings(tmp_path):
+    """With no hook the captured graph holds no residency kernel and the route log alone adds none; the hook adds
+    one snapshot kernel, one label kernel and the ring copies of ``record_residency``, nothing else, and a replay
+    fills the rings with the hook's staging records (a switch-off regression would add nodes to every decode graph)."""
+    from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
+    from sglang.srt.layers.moe.residency_capture import ResidencyRow
+    from sglang.srt.layers.moe.residency_capture_ref import HORIZONS, MASK_WORDS, snapshot_masks
+    from sglang.srt.layers.moe.residency_hook import ResidencyHook
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    layer, streamer, service, _ = _layers(tmp_path)
+    snapshot_kernel, label_kernel = "exl3_residency_snapshot_kernel", "exl3_route_labels_kernel"
+    try:
+        backend = streamer.row_backend
+        assert backend.residency_hook is None and backend.route_log is None
+        gen = torch.Generator(device="cpu").manual_seed(7)
+        x = (torch.randn((1, HIDDEN), generator=gen) * 0.5).to("cuda", torch.bfloat16)
+        weights = torch.softmax(torch.randn((1, TOP_K), generator=gen), -1).cuda()
+        route = [9, 10, 11, 0, 1, 12]
+        ids = torch.tensor([route], device="cuda", dtype=torch.int32)
+
+        def forward():
+            return Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)
+
+        _, off_names = _capture_nodes(forward)
+        assert not [n for n in off_names if snapshot_kernel in n or label_kernel in n]
+
+        log = GraphRouteLog(1, service.lanes, x.device, depth=8)
+        log.bind(backend.row, 0, 3)
+        log.enable_residency(
+            str(tmp_path / "res"), rows=[ResidencyRow(layer_id=0, stratum="early", gate_has_bias=False)]
+        )
+        backend.route_log = log
+        _, log_names = _capture_nodes(forward)
+        assert not [n for n in log_names if snapshot_kernel in n or label_kernel in n]
+
+        # The row's own map as every horizon's target, so the snapshot is not all zero once misses are served.
+        hook = ResidencyHook(
+            backend.row, targets=[0] * HORIZONS, valid=[True] * HORIZONS, width=TOP_K, topk=TOP_K, device=x.device
+        )
+        backend.residency_hook = hook
+        graph, on_names = _capture_nodes(forward)
+        assert sum(snapshot_kernel in n for n in on_names) == 1, on_names
+        assert sum(label_kernel in n for n in on_names) == 1, on_names
+
+        def record():
+            log.record_residency(
+                backend.row,
+                masks=hook.masks,
+                valid=hook.out_valid,
+                snap_stamp=hook.snap_stamp,
+                kinds=hook.kinds.view(1, TOP_K),
+                label_stamp=hook.label_stamp,
+            )
+
+        _, record_names = _capture_nodes(record)
+        # Nothing else of the route log's chain moved: the delta is the two kernels plus the ring copies.
+        assert len(on_names) - len(log_names) == 2 + len(record_names), (len(on_names), len(log_names), record_names)
+
+        ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        service.fail_stop_check()
+        rings = log.residency_rings
+        slot = (int(log.seq.item()) - 1) % log.depth
+        assert torch.equal(rings.masks[slot, backend.row], hook.masks)
+        assert rings.valid[slot, backend.row].tolist() == [1] * HORIZONS
+        assert int(rings.snap_stamp[slot, backend.row]) > 0 and int(rings.label_stamp[slot, backend.row]) > 0
+        # The ring's snapshot is the host reference over the device map as the replay's post left it.
+        want = snapshot_masks(service.device_side.map_bank["ram_slot"].tolist(), targets=[0] * HORIZONS)
+        got = [[w & (2**64 - 1) for w in words] for words in rings.masks[slot, backend.row].tolist()]
+        assert got == want
+        assert len(got[0]) == MASK_WORDS
+        kinds = rings.kinds[slot, backend.row, 0].tolist()
+        assert torch.equal(rings.kinds[slot, backend.row, 0], hook.kinds)
+        # Experts 0 and 1 are the VRAM hot rows, outside the planned lanes; the four others are typed lanes.
+        assert [k == 0 for k in kinds] == [False, False, False, True, True, False], kinds
+    finally:
+        service.shutdown()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
