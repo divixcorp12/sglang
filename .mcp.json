@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "agent-lsp": {
+      "type": "stdio",
+      "command": "agent-lsp",
+      "args": [
+        "cpp:clangd",
+        "rust:rust-analyzer",
+        "python:pyright-langserver,--stdio",
+        "yaml:yaml-language-server",
+        "json:vscode-json-language-server"
+      ]
+    }
+  }
+}
