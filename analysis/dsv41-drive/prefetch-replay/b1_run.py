@@ -477,10 +477,11 @@ def _stage_locked(ctx: _Ctx) -> dict:
 def _stage_cost(ctx: _Ctx) -> dict:
     """Scorer cost of the chosen L+1 head on the RTX 5090: bf16 bytes and CUDA-graph median ms for 6 tokens.
 
-    Runs under cc-gpu.lock (cores 32-63); without CUDA it records why it was skipped.
+    Runs under cc-gpu.lock (cores 32-63). Without CUDA it raises, so no DONE marker hides an unmeasured cost.
     """
     if not (ctx.device.startswith("cuda") and torch.cuda.is_available()):
-        return {"skipped": f"no CUDA for device {ctx.device!r}"}
+        raise RuntimeError(f"the cost stage needs CUDA (got device {ctx.device!r}): "
+                           "run it with --device cuda under cc-gpu.lock on cores 32-63")
     sel, _ = b1_select.load_frozen(os.path.join(ctx.out, SELECTION_NAME))
     chosen = _done(ctx, "freeze")["chosen"]
     entry = sel.horizons[_sel_key(1, chosen["1"])]

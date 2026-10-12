@@ -9014,26 +9014,34 @@ second, disjoint capture is warranted only if the head is near the bar and still
 resume from their `DONE.json`.
 
 ```bash
-# dataset, fit, baselines, curve, cuts, freeze, locked, report: cores 0-63 under the analysis cap
 OUT=/mnt/nvme1/nvfp4-work/b1-run-<date>
+DATA=/mnt/nvme1/nvfp4-work/b1-dataset-<date>
 CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
-OMP_NUM_THREADS=8 systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
-  taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> \
-  --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT \
-  --stages dataset fit baselines
+PY=/data/models/slang/.venv/bin/python
+RUN="$PY analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
+  --integrity $CORPUS/integrity.json --out $OUT --dataset $DATA"
+CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
+export OMP_NUM_THREADS=8
+export PYTHONPATH=$PWD/python  # without it the venv imports sglang from another tree
 
-# train and cost need the GPU: cc-gpu.lock, cores 32-63
-OMP_NUM_THREADS=8 flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
-  python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> \
-  --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT --stages train curve cost
+# (a) dataset, fit, baselines: CPU, cores 0-63 under the analysis cap
+$CAP taskset -c 0-63 $RUN --stages dataset fit baselines
 
-# select, freeze, then the locked test (refused without the frozen selection file) and the report
-OMP_NUM_THREADS=8 systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
-  taskset -c 0-63 python analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> \
-  --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT --stages cuts freeze locked report
+# (b) train and curve need the GPU: cc-gpu.lock, cores 32-63
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages train curve
 
-# opt-in smoke on 5 train-split sessions (no locked-test session is extracted)
-... b1_run.py <MODEL_PATH> --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke
+# (c) cuts, freeze, then the locked test (refused without the frozen selection file): CPU
+$CAP taskset -c 0-63 $RUN --stages cuts freeze locked --device cpu
+
+# (d) scorer cost: GPU, cc-gpu.lock, cores 32-63
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages cost
+
+# (e) report (needs every earlier stage's DONE marker)
+$CAP taskset -c 0-63 $RUN --stages report --device cpu
+
+# opt-in smoke on 5 train-split sessions (no locked-test session is extracted); every stage, cost needs the GPU
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $PY analysis/dsv41-drive/prefetch-replay/b1_run.py \
+  <MODEL_PATH> --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke
 ```
 
 Tests (`divix01-pytest <named test_b1_*.py files> -q -p no:randomly`; `--gpu` for `test_b1_cost.py`; the real-corpus
@@ -9077,12 +9085,11 @@ Dev learning curve (L+1 precision at 1 read):
 | E2 | pending | pending | pending | pending |
 | E5 | pending | pending | pending | pending |
 
-Scorer cost on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA graph, against 0.1 ms):
+Scorer cost of the chosen L+1 head on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA graph, against 0.1 ms):
 
-| Variant | bf16 bytes | Median time (ms) |
+| Chosen head | bf16 bytes | Median time (ms) |
 |---|---|---|
-| E2 | pending | pending |
-| E5 | pending | pending |
+| pending | pending | pending |
 
 Paired per-session median and 95% bootstrap interval, head minus gate-with-floors: pending.
 

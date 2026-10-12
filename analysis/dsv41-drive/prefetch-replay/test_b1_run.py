@@ -88,9 +88,18 @@ def test_a_stage_is_refused_when_an_earlier_one_has_no_marker(tmp_path):
 def test_end_to_end_on_a_synthetic_dataset_resumes_and_records_the_frozen_sha(tmp_path):
     dataset = _write_dataset(tmp_path / "dataset")
     args, cfg = _args(tmp_path, dataset), _small_config()
-    results = b1_run.run(args, cfg=cfg)
-
     out = tmp_path / "out"
+    upto_locked = list(b1_run.STAGES[:b1_run.STAGES.index("cost")])
+    b1_run.run(_args(tmp_path, dataset, "--stages", *upto_locked), cfg=cfg)
+    with pytest.raises(RuntimeError, match="cc-gpu.lock"):
+        b1_run.run(_args(tmp_path, dataset, "--stages", "cost"), cfg=cfg)
+    assert not (out / "stages" / "cost" / "DONE.json").exists()
+    # Stand-in for a GPU cost run; the CPU check has no CUDA.
+    fake_cost = {"bytes_bf16": 1000, "median_ms": 0.05}
+    (out / "stages" / "cost").mkdir(parents=True, exist_ok=True)
+    (out / "stages" / "cost" / "DONE.json").write_text(json.dumps(fake_cost))
+    results = b1_run.run(_args(tmp_path, dataset, "--stages", "report"), cfg=cfg)
+
     sha = hashlib.sha256((out / "selection.json").read_bytes()).hexdigest()
     assert results["frozen_sha256"] == sha
     assert set(results["horizons"]) == {"1", "2"}
@@ -101,7 +110,7 @@ def test_end_to_end_on_a_synthetic_dataset_resumes_and_records_the_frozen_sha(tm
     assert len({(c["forwards"], c["eligible"], c["never_candidates"]) for c in pooled.values()}) == 1
     assert pooled["gate"]["eligible"] == SPLIT_SESSIONS["locked_test"] * ROWS
     assert set(results["learning_curve"]["E2"]) == {"15", "30", "60"}
-    assert results["cost"] == {"skipped": "no CUDA for device 'cpu'"}
+    assert results["cost"] == fake_cost
     assert isinstance(results["verdict"]["advance"], bool)
     assert (out / "stages" / "report" / "REPORT.md").read_text().startswith("# B1 learned predictor")
 
@@ -154,10 +163,11 @@ def test_smoke_needs_five_train_sessions():
 def test_smoke_runs_every_stage_on_real_training_sessions(tmp_path):
     import torch
 
+    if not torch.cuda.is_available():
+        pytest.skip("the smoke runs the cost stage, which needs CUDA")
     corpus = os.environ["SGLANG_B1_CORPUS"]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     argv = [os.environ["SGLANG_B1_MODEL"], "--corpus", corpus, "--integrity", os.environ["SGLANG_B1_INTEGRITY"],
-            "--out", str(tmp_path / "out"), "--smoke", "--device", device, "--allow-any-out"]
+            "--out", str(tmp_path / "out"), "--smoke", "--device", "cuda", "--allow-any-out"]
     assert b1_run.main(argv) == 0
     results = json.loads((tmp_path / "out" / "stages" / "report" / "results.json").read_text())
     assert results["smoke"] and results["frozen_sha256"]

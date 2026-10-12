@@ -62,10 +62,14 @@ def _metric_cells(table: dict, *, budget: str, key: str) -> list[str]:
     return [_num(None if c is None else c.get(m)) for m in METRICS]
 
 
+def _own_budgets(table: dict) -> list[str]:
+    return sorted(table.get("cells", {}), key=_budget_sort_key)
+
+
 def _pooled_table(tables: dict, *, key: str) -> list[str]:
     header = ["scorer", "budget", "recall", "precision", "never-candidate recovery"]
     rows = [[s, b] + _metric_cells(tables[s], budget=b, key=key)
-            for s in _scorer_names(tables) for b in _budgets(tables)]
+            for s in _scorer_names(tables) for b in _own_budgets(tables[s])]
     return _table(header, rows)
 
 
@@ -76,14 +80,14 @@ def _keys_with(tables: dict, prefix: str) -> list[str]:
 
 
 def _split_table(tables: dict, *, prefix: str, budget: str) -> list[str]:
-    scorers = _scorer_names(tables)
-    header = [prefix.rstrip(":")] + [f"{s} {m}" for s in scorers for m in ("recall", "precision")]
+    # Only scorers evaluated at this budget; calibrated cuts differ per scorer.
+    scorers = [s for s in _scorer_names(tables) if budget in tables[s].get("cells", {})]
+    header = [prefix.rstrip(":")] + [f"{s} {m}" for s in scorers for m in ("recall", "precision", "never-cand.")]
     rows = []
     for key in _keys_with(tables, prefix):
         row = [key.split(":", 1)[1]]
         for s in scorers:
-            c = _cell(tables[s], budget=budget, key=key)
-            row += [_num(None if c is None else c.get(m)) for m in ("recall", "precision")]
+            row += _metric_cells(tables[s], budget=budget, key=key)
         rows.append(row)
     return _table(header, rows)
 
@@ -96,16 +100,26 @@ def _horizon_section(h: str, block: dict) -> list[str]:
     out += ["Pooled over all locked-test sessions.", ""] + _pooled_table(tables, key="pooled")
     out += ["Pooled without the drive-flagged sessions.", ""] + _pooled_table(tables, key="pooled_noflag")
     for prefix, title in (("layer:", "Per target layer"), ("stratum:", "Per stratum")):
-        if _keys_with(tables, prefix):
-            out += [f"{title} (reads=1).", ""] + _split_table(tables, prefix=prefix, budget="reads=1")
+        if not _keys_with(tables, prefix):
+            continue
+        for budget in _budgets(tables):
+            out += [f"{title} ({budget}).", ""] + _split_table(tables, prefix=prefix, budget=budget)
     return out
 
 
-def _learning_curve(curve: dict) -> list[str]:
+def _learning_curve(curve: dict, improving: dict) -> list[str]:
     out = ["## Learning curve (dev, precision at reads=1)", ""]
     variants = sorted(curve) if curve else ["E2", "E5"]
-    rows = [[v] + [_num(curve.get(v, {}).get(n)) for n in LEARNING_SIZES] for v in variants]
-    return out + _table(["variant"] + [f"{n} sessions" for n in LEARNING_SIZES], rows)
+    rows = [[v] + [_num(curve.get(v, {}).get(n)) for n in LEARNING_SIZES] + [_num(improving.get(v))]
+            for v in variants]
+    header = ["variant"] + [f"{n} sessions" for n in LEARNING_SIZES] + ["still improving"]
+    return out + _table(header, rows)
+
+
+def _second_capture(sc: dict) -> list[str]:
+    sc = sc or {}
+    rows = [[k, _num(sc.get(k))] for k in ("near_bar", "still_improving", "warranted")]
+    return ["Second capture (D5: near the bar and still improving):", ""] + _table(["item", "value"], rows)
 
 
 def _bootstrap(b: dict) -> list[str]:
@@ -118,8 +132,8 @@ def _bootstrap(b: dict) -> list[str]:
 def _cost(c: dict) -> list[str]:
     c = c or {}
     keys = ("bytes_bf16", "median_ms", "p90_ms", "runs", "tokens", "within_0_1ms")
-    return ["## Scorer cost (RTX 5090, 6 tokens, one layer)", ""] + _table(
-        ["metric", "value"], [[k, _num(c.get(k))] for k in keys])
+    out = ["## Scorer cost (chosen L+1 head, RTX 5090, 6 tokens, one layer)", ""]
+    return out + _table(["metric", "value"], [[k, _num(c.get(k))] for k in keys])
 
 
 def _verdict(v: dict) -> list[str]:
@@ -151,10 +165,11 @@ def render(results: dict) -> str:
         out += _horizon_section(str(h), horizons[h])
     if not horizons:
         out += [f"Horizon tables: {PENDING}", ""]
-    out += _learning_curve(results.get("learning_curve") or {})
+    out += _learning_curve(results.get("learning_curve") or {}, results.get("still_improving") or {})
     out += _bootstrap(results.get("bootstrap"))
     out += _cost(results.get("cost"))
     out += _verdict(results.get("verdict"))
+    out += _second_capture(results.get("second_capture"))
     out += _provenance(results)
     return "\n".join(out).rstrip("\n") + "\n"
 
