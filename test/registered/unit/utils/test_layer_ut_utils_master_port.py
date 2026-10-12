@@ -17,7 +17,8 @@ import unittest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+# unit/ caps est_time at 60; the earlier estimate was 90, so re-check against a CI timing.
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 # Initialises the world-1 group, reports the port it used, and stays alive until the parent says to exit, so two of
 # these are alive at once.
