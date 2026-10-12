@@ -10,7 +10,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 ROWS = 8
 HIDDEN = 32
