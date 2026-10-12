@@ -16,6 +16,9 @@ from sglang.srt.layers.moe.expert_prediction.capture_reader import (
 from sglang.srt.layers.moe.expert_prediction.runtime import ExpertPredictionRuntime
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class FakeTopK(nn.Module):

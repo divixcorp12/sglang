@@ -7,6 +7,9 @@ from sglang.srt.layers.moe.expert_prefetch import (
     SparseNextLayerPolicy,
 )
 from sglang.srt.layers.moe.expert_transfer import FixedRowTransferPlan
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Executor:

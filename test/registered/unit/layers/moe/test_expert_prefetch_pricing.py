@@ -24,6 +24,9 @@ from sglang.srt.layers.moe.expert_prediction.training.dataset import (
     SessionSplits,
     load_layer_rows,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _load_single_layer_capture(root: Path, *, residency: torch.Tensor) -> LayerRows:
