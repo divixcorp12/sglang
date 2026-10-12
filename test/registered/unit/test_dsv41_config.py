@@ -24,6 +24,7 @@ def test_defaults_match_the_env_declarations():
         expert_dir="",
         expert_trace_path="",
         router_capture_path="",
+        residency_capture=False,
         ram_miss_timeout_ms=2000,
         ram_miss_fault="",
         enable_ram_miss_copy_engine=False,
