@@ -75,7 +75,7 @@ Estimated: most of the 1.3 s, and part of the 0.64 s, for TTFT ~9.9 s to ~8.5 s.
 ## File Structure
 
 - Modify `python/sglang/srt/environ.py`, `python/sglang/srt/dsv41_config.py` and
-  `test/registered/unit/test_dsv41_config.py`: the flag.
+  `test/registered/unit/configs/test_dsv41_config.py`: the flag.
 - Modify `python/sglang/srt/layers/moe/expert_stream.py`:
   - add `_gather_host_rows_to_kernel` next to `_gather_host_rows_kernel` (~line 695);
   - `ExpertPinnedHostCache.__init__` reads the flag;
@@ -110,7 +110,7 @@ Estimated: most of the 1.3 s, and part of the 0.64 s, for TTFT ~9.9 s to ~8.5 s.
 **Files:**
 - Modify: `python/sglang/srt/environ.py` (after `SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN`, ~line 1929)
 - Modify: `python/sglang/srt/dsv41_config.py`
-- Modify: `test/registered/unit/test_dsv41_config.py` (`test_defaults_match_the_env_declarations`)
+- Modify: `test/registered/unit/configs/test_dsv41_config.py` (`test_defaults_match_the_env_declarations`)
 
 **Interfaces:**
 - Produces: `envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER` and `Dsv41Config.enable_prefill_split_gather: bool`.
@@ -120,7 +120,7 @@ Estimated: most of the 1.3 s, and part of the 0.64 s, for TTFT ~9.9 s to ~8.5 s.
 
 - [ ] **Step 2: Run it on divix01 at that commit and see it fail**
 
-Run: `bash /mnt/nvme1/prefill-opt/rpt.sh <sha> test/registered/unit/test_dsv41_config.py`
+Run: `bash /mnt/nvme1/prefill-opt/rpt.sh <sha> test/registered/unit/configs/test_dsv41_config.py`
 Expected: FAIL, `TypeError: Unexpected keyword argument 'enable_prefill_split_gather'`.
 
 - [ ] **Step 3: Declare it**

@@ -4135,7 +4135,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check_dspark_cpu_experts`)
 - Modify: `python/sglang/srt/layers/moe/cpu_experts/draft.py` (`DraftCpuExperts`, `DraftCpuExpertsRegistry.runtime`)
 - Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py` (`ensure_started`, `draft_host`)
-- Test: `test/registered/unit/layers/moe/test_threading_config.py`, `test/registered/unit/test_expert_stream_requirements_exl3.py`, `test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`
+- Test: `test/registered/unit/layers/moe/test_threading_config.py`, `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`, `test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`
 
 **Interfaces:**
 - Consumes: Task 11's `ExpertStreamHost.draft_source`, `SharedDraftHost`, the draft-only `DraftCpuHost`.
@@ -4280,7 +4280,7 @@ def _ram_miss_service():
 
 - [ ] **Step 4: Run and pass**
 
-CPU: `test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`.
+CPU: `test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`.
 GPU lock, optimized build env: `test/manual/dsv41/test_dspark_hybrid_draft_gpu.py` (the draft-only shape).
 Expected: `EXIT=0`. The existing test `test_named_draft_cores_are_left_out_of_every_derived_role` resolves without CPU
 experts, so it still passes.
@@ -4291,7 +4291,7 @@ experts, so it still passes.
 git add python/sglang/srt/layers/moe/cpu_experts/threading_config.py \
   python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py python/sglang/srt/layers/moe/cpu_experts/draft.py \
   python/sglang/srt/layers/moe/exl3_ram_miss.py test/registered/unit/layers/moe/test_threading_config.py \
-  test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py
+  test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py
 git commit -m "feat(dspark): under CPU experts the draft runs on node 0's CPU expert team; named draft cores are refused
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -4543,7 +4543,7 @@ could run in the breakable graph. The narrowest change:
 
 **Files:**
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py`
-- Test: `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- Test: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
 
 **Interfaces:**
 - Produces: `_check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY)`, `_CPU_EXPERTS_VERIFY_REMEDY`,
@@ -4620,7 +4620,7 @@ def test_victim_lanes_need_cpu_experts_and_a_lane_per_route(model_dir, env, matc
         _gate(_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **SPILL, **env})
 ```
 
-- [ ] **Step 2: Run and see them fail** — `test/registered/unit/test_expert_stream_requirements_exl3.py`, CPU.
+- [ ] **Step 2: Run and see them fail** — `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`, CPU.
 Expected: failures in the new tests, still refused "without speculative decoding".
 
 - [ ] **Step 3: Implement**
@@ -4691,7 +4691,7 @@ launch has it off, so these two defines are the way in. The recipe sets them in 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py test/registered/unit/test_expert_stream_requirements_exl3.py
+git add python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py
 git commit -m "feat(exl3-gate): the target's CPU experts serve a graphed DSpark verify; VICTIM_LANES needs them
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -902,7 +902,7 @@ For each, run the tests that exercise those seqlocks under the GPU lock:
 ```bash
 flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
   /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_miss_two_phase.py \
-  test/registered/unit/kernels/test_exl3_ram_miss_lease_service.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py \
+  test/registered/unit/kernels/test_exl3_ram_miss_lease_service.py test/manual/dsv41/test_exl3_ram_miss_piece_stream.py \
   -q -p no:randomly 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 ```
 

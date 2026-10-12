@@ -172,7 +172,7 @@ Rows are built in the `RamTier` constructor (`ram_tier.h:68-79`), and there is n
     - `scripts/dsv41/exl3_stage_trace_overhead.py`
     - `test/registered/unit/kernels/golden/hotpath_golden.json`
   - **`test/registered/unit/kernels/` tests:**
-    - `test_exl3_ram_miss_{copy_engine,cpu_experts,piece_stream,prefill_share,stage_trace,stage_trace_causal,stage_trace_lanes,thread,tier,trace_export,wrap}.py`
+    - `test_exl3_ram_miss_{copy_engine,cpu_experts,prefill_share,stage_trace,stage_trace_causal,stage_trace_lanes,thread,tier,trace_export,wrap}.py`, `test/manual/dsv41/test_exl3_ram_miss_piece_stream.py`
     - `test_expert_stream_{build_variants,hotpath_stress,ownership,second_layout}.py`
   - **Elsewhere:** `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`.
 - **Regenerating the golden file.** Use the command `hotpath_script.py`'s docstring gives. Record why each counter changed.
@@ -1179,7 +1179,7 @@ git commit -m "device(dsv41-slot-map): post applies the row's map delta and type
 
 **Files:**
 - Modify: `host/ram_tier.h` (the `LateCpu` send), `host/copy_engine.h`, `python/sglang/srt/layers/moe/cpu_experts/service.py` (the pinned split table, read by the device), `python/sglang/srt/environ.py`, `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py`
-- Test: `test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py`, `test/registered/unit/test_expert_stream_requirements_exl3.py`, `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py`
+- Test: `test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py`, `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`, `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py`
 
 **Interfaces:**
 - Produces:
@@ -1230,7 +1230,7 @@ In the GPU file `test_exl3_cpu_lane_order_cuda.py`, add `test_cpu_tail_includes_
 - [ ] **Step 3: Run them and confirm they fail**
 
 ```
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES= taskset -c 0-17,30-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/test_expert_stream_requirements_exl3.py -q -p no:randomly; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES= taskset -c 0-17,30-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py -q -p no:randomly; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: FAIL.
 
@@ -1255,7 +1255,7 @@ Use the same command, plus the GPU file under `cc-gpu.lock`. Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h python/sglang/kernels/jit/csrc/moe/expert_stream/host/copy_engine.h python/sglang/srt/layers/moe/cpu_experts/service.py python/sglang/srt/environ.py python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py
+git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h python/sglang/kernels/jit/csrc/moe/expert_stream/host/copy_engine.h python/sglang/srt/layers/moe/cpu_experts/service.py python/sglang/srt/environ.py python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py
 git commit -m "cpu-experts(dsv41-slot-map): CPU-computed NVMe misses, a device-read split table, switchable hit copy; HIT_WAIT_US ignored"
 ```
 

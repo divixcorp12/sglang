@@ -6384,7 +6384,7 @@ EXIT read from pytest):
 | Run | Commit | Result |
 |---|---|---|
 | `test/registered/unit/kernels test/registered/unit/scripts/test_cpu_experts_quality.py` | `1ff55fb37b` | 775 passed / 456 skipped |
-| `test/registered/unit/test_expert_stream_requirements_exl3.py` | `02d343733c` | 39 passed |
+| `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py` | `02d343733c` | 39 passed |
 | `test_exl3_ram_miss_attach_lanes.py` | `02d343733c` | 12 passed |
 | GPU: `test_expert_route_plan_fused.py`, `test_expert_residency_gpu.py`, `test_exl3_cpu_lane_order_cuda.py` | `fad844b678` | 382 passed / 1 failed |
 | GPU manual: split parity, lease kernels, copy engine, lease ordering (`SGLANG_EXL3_SRC` set) | `fad844b678` | 37 passed |

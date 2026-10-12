@@ -53,7 +53,7 @@
 | `python/sglang/test/dsv41_chain_sim.py` | `forced_from` on `post` |
 | `python/sglang/test/dsv41_ram_prefetch_fixtures.py` (new) | the prefetch test rig |
 | `analysis/dsv41-drive/dspark/both_cpu_ab.py`, `benchmarks/dsv41_baseline/arm_env.py` | the `dspark-both-prefetch` arm and its summary |
-| Tests (new) | `test/registered/unit/kernels/test_exl3_ram_prefetch_{pool,swap,scorer,step,thread,events}.py`, `test/registered/unit/layers/moe/test_ram_prefetch_tables.py` |
+| Tests (new) | `test/registered/unit/kernels/test_exl3_ram_prefetch_{pool,swap,scorer,step,events}.py`, `test/manual/dsv41/test_exl3_ram_prefetch_thread.py`, `test/registered/unit/layers/moe/test_ram_prefetch_tables.py` |
 
 ## Task list
 
@@ -79,7 +79,7 @@ The guidance's task 5 is split into Tasks 5 and 6: the pump-mode step (determini
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check`, new `_check_ram_prefetch`)
 - Modify: `python/sglang/srt/layers/moe/cpu_experts/threading_config.py` (`CoreSettings`, `NodePlan`, `ThreadingConfig.from_env`/`resolve`, new `_spec_cores`)
 - Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py` (`spill_room_shortfall`, `_check_spill_room`, `Exl3RamMissService.__init__`)
-- Test: `test/registered/unit/test_expert_stream_requirements_exl3.py`, `test/registered/unit/layers/moe/test_threading_config.py`, `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`
+- Test: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`, `test/registered/unit/layers/moe/test_threading_config.py`, `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -105,7 +105,7 @@ Expected: the branch head's one-line log, then `/data/models/slang/nvfp4-work/wt
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `test/registered/unit/test_expert_stream_requirements_exl3.py`:
+Append to `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`:
 
 ```python
 def test_ram_prefetch_options_default_off_at_the_replays_budget():
@@ -178,14 +178,14 @@ def test_the_speculative_pool_adds_its_share_to_the_spill_room():
 
 ```bash
 cd /Users/dnikolaidis/.codex/worktrees/ram-prefetch/sglang-nvfp4
-git add test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py
+git add test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py
 git commit -m "Test the RAM prefetch options, launch gate, spare cores and spill room
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git push origin codex/dsv41-ram-prefetch
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch && git log -1 --oneline
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -q -p no:randomly -k "ram_prefetch or spec_cores or speculative_pool" 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -q -p no:randomly -k "ram_prefetch or spec_cores or speculative_pool" 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=1`; failures with `AttributeError: ... SGLANG_DSV41_RAM_PREFETCH`, `TypeError: CoreSettings.__init__() got an unexpected keyword argument 'ram_prefetch'`, and `TypeError: spill_room_shortfall() got an unexpected keyword argument 'pool'`.
@@ -356,7 +356,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git push origin codex/dsv41-ram-prefetch
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch && git log -1 --oneline
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=0`, every test of the three files passed (the whole files, since `NodePlan.log_line`, `resolve` and the spill check changed for every caller).
@@ -374,9 +374,9 @@ old = "    _check_row_weighted_assignment()\n    _check_ram_prefetch()\n"
 assert t.count(old) == 1
 p.write_text(t.replace(old, "    _check_row_weighted_assignment()\n"))
 PY
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/test_expert_stream_requirements_exl3.py -q -p no:randomly -k ram_prefetch 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py -q -p no:randomly -k ram_prefetch 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 git checkout -- python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py && git status --short
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/test_expert_stream_requirements_exl3.py -q -p no:randomly -k ram_prefetch 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py -q -p no:randomly -k ram_prefetch 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: first `EXIT=1` (the refusals are not raised), empty `git status --short`, then `EXIT=0`.
@@ -2827,7 +2827,7 @@ Expected: `EXIT=1` after each mutant (red on `test_a_cpu_record_reads_...`, `tes
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h` (`~RamTier` :151; `take_pooled_locked`; `read_rows`; new `start_spec`, `stop_spec`, `quiesce_spec`, `resume_spec`, `spec_busy_episode`, `pin_spec`, `run_spec`)
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_thread.h` (`start` :62, `stop` :104, `pause` :123, `resume_locked` :168, `watch` :246, `stuck_group` :257, `abort_hung` :283)
-- Test: `test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py`
+- Test: `test/manual/dsv41/test_exl3_ram_prefetch_thread.py`
 
 **Interfaces:**
 - Consumes: `SpecState`, `SpecGroup`, `serve_spec_job`, `spec_read`, `spec_count`, `inject_spec`, `enable_ram_prefetch` (Task 5); `kSpecPromoted`, `kSpecDelayed` (Task 3); fixtures `prefetch_rig`, `enable`, `trigger`, `forced`, `load`, `LOGITS`.
@@ -2835,7 +2835,7 @@ Expected: `EXIT=1` after each mutant (red on `test_a_cpu_record_reads_...`, `tes
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py`:
+Create `test/manual/dsv41/test_exl3_ram_prefetch_thread.py`:
 
 ```python
 """The speculative threads (spec 2026-10-08-dsv41-ram-prefetch-design, Phase 1, "Demand priority", "Threads and
@@ -3014,14 +3014,14 @@ def test_the_watchdog_aborts_a_hung_speculative_read(tmp_path):
 
 ```bash
 cd /Users/dnikolaidis/.codex/worktrees/ram-prefetch/sglang-nvfp4
-git add test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py
+git add test/manual/dsv41/test_exl3_ram_prefetch_thread.py
 git commit -m "Test the RAM prefetch's speculative threads
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git push origin codex/dsv41-ram-prefetch
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch && git log -1 --oneline
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py -q -p no:randomly 2>&1 | tail -10; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/manual/dsv41/test_exl3_ram_prefetch_thread.py -q -p no:randomly 2>&1 | tail -10; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=1`: the thread, turn, promotion, pause and watchdog tests fail (no thread serves the ring; `_until` times out, the child does not abort); `test_without_the_prefetch_no_speculative_thread_starts` passes.
@@ -3280,7 +3280,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git push origin codex/dsv41-ram-prefetch
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch && git log -1 --oneline
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/registered/unit/kernels/test_exl3_ram_prefetch_swap.py test/registered/unit/kernels/test_exl3_ram_miss_thread.py test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py test/registered/unit/kernels/test_exl3_ram_miss_numa_completion.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/manual/dsv41/test_exl3_ram_prefetch_thread.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/registered/unit/kernels/test_exl3_ram_prefetch_swap.py test/registered/unit/kernels/test_exl3_ram_miss_thread.py test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py test/registered/unit/kernels/test_exl3_ram_miss_numa_completion.py test/registered/unit/kernels/test_exl3_ram_miss_stage_trace_causal.py test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=0`. `test_exl3_ram_miss_stage_trace_causal.py` (if the file is named differently, `ls test/registered/unit/kernels | grep stage_trace` names it) shows the trace's clock-read count is unchanged with the prefetch off.
@@ -3291,7 +3291,7 @@ Expected: `EXIT=0`. `test_exl3_ram_miss_stage_trace_causal.py` (if the file is n
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch
 T=python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h
-run() { PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py -q -p no:randomly -k "demand_read_waits" 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"; }
+run() { PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/manual/dsv41/test_exl3_ram_prefetch_thread.py -q -p no:randomly -k "demand_read_waits" 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"; }
 /data/models/slang/.venv/bin/python - "$T" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1]); old = "    std::lock_guard<std::mutex> turn(spec.turn);\n"
@@ -3734,7 +3734,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git push origin codex/dsv41-ram-prefetch
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch && git log -1 --oneline
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_events.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/registered/unit/kernels/test_expert_job_trace.py test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_events.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/manual/dsv41/test_expert_job_trace.py test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=0`.
@@ -3908,7 +3908,7 @@ Expected: `EXIT=0`.
 ```bash
 ssh divix01 bash -s <<'REMOTE'
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch && git log -1 --oneline
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_pool.py test/registered/unit/kernels/test_exl3_ram_prefetch_swap.py test/registered/unit/kernels/test_exl3_ram_prefetch_scorer.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py test/registered/unit/kernels/test_exl3_ram_prefetch_events.py test/registered/unit/layers/moe/test_ram_prefetch_tables.py test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_exl3_ram_miss_thread.py test/registered/unit/kernels/test_exl3_ram_miss_slot_map.py test/registered/unit/kernels/test_exl3_ram_miss_numa_groups.py test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py test/registered/unit/scripts/test_both_cpu_ab.py -q -p no:randomly 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels/test_exl3_ram_prefetch_pool.py test/registered/unit/kernels/test_exl3_ram_prefetch_swap.py test/registered/unit/kernels/test_exl3_ram_prefetch_scorer.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/manual/dsv41/test_exl3_ram_prefetch_thread.py test/registered/unit/kernels/test_exl3_ram_prefetch_events.py test/registered/unit/layers/moe/test_ram_prefetch_tables.py test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_exl3_ram_miss_thread.py test/registered/unit/kernels/test_exl3_ram_miss_slot_map.py test/registered/unit/kernels/test_exl3_ram_miss_numa_groups.py test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py test/registered/unit/scripts/test_both_cpu_ab.py -q -p no:randomly 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=0`. Record the pass count with this exact selection in the §33.14 write-up.

@@ -214,7 +214,7 @@ cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python OMP
   CUDA_HOME=/usr/local/cuda-13.4 \
   && taskset -c 0-63 /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
   && taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-     test/registered/unit/kernels/test_expert_stream_hotpath_shim.py -q -rs -s -p no:randomly
+     test/manual/dsv41/test_expert_stream_hotpath_shim.py -q -rs -s -p no:randomly
 ```
 
 `sglang.__file__` = `/data/models/slang/nvfp4-work/wt-hotpath/python/sglang/__init__.py`. **`10 passed`**, EXIT=0,

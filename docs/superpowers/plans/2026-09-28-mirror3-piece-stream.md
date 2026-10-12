@@ -77,7 +77,7 @@ piece table (`ffi_exports.h:554`) has no reader to ask. Open question 1 asks the
 | device `kRowPieces = 8`, `kAllPieces = 255u` | `row_copy_kernels.cuh:19-20` | unchanged |
 | Python `STAGE_PIECES = 8` | `ops/moe/expert_stream_transport.py:423-424` | unchanged. Its comment ("the most sub-reads a row issues") stays true |
 | Python `ALL_PIECES = 0xFF` | `python/sglang/test/dsv41_lease_sim.py:21` | unchanged |
-| test `SUB_READS = 4` and its model `_expected_sub_reads` | `test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py:48,59-65` | `SUB_READS` stays the max. The model gains `per_part` (Task 2) |
+| test `SUB_READS = 4` and its model `_expected_sub_reads` | `test/manual/dsv41/test_exl3_ram_miss_piece_stream.py:48,59-65` | `SUB_READS` stays the max. The model gains `per_part` (Task 2) |
 
 ## Global Constraints
 
@@ -112,9 +112,9 @@ piece table (`ffi_exports.h:554`) has no reader to ask. Open question 1 asks the
 | `test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py` (create) | goldens pinning 1/2-part geometry and SQEs to `1732aff4ba` | 1 |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/reader_base.h` (modify `:55-68`) | `sub_reads_per_part`, its static_asserts, updated comment | 2 |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/piece_geometry.h` (modify `:9-21`, `:42-62`) | per-row cut | 2 |
-| `test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py` (modify) | model gains `per_part`, N-part geometry tests (T2), 3-part reader and tier tests (T3), new refusal (T3) | 2, 3 |
+| `test/manual/dsv41/test_exl3_ram_miss_piece_stream.py` (modify) | model gains `per_part`, N-part geometry tests (T2), 3-part reader and tier tests (T3), new refusal (T3) | 2, 3 |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/row_reader.h` (modify `:96-122`, `:725-727`, `:1505-1508`) | refusal `parts > kPieces`, comments | 3 |
-| `test/registered/unit/kernels/test_exl3_ram_miss_row_images.py` (modify `:161`, `:226-228`) | NOT_REUSED reason, 3-root direct-mode byte equality | 3 |
+| `test/manual/dsv41/test_exl3_ram_miss_row_images.py` (modify `:161`, `:226-228`) | NOT_REUSED reason, 3-root direct-mode byte equality | 3 |
 | `test/manual/dsv41/test_exl3_piece_stream_cuda.py` (modify) | `StreamService(mirror_weights=…)`, G12, G2/G3 over three roots | 4 |
 | `test/manual/dsv41/test_exl3_piece_stream_row_images_cuda.py` (modify `:30-56`) | image fixture builds one image root per mirror | 4 |
 | `analysis/dsv41-drive/nvme-load/nvme_sampler.py` (modify) | devices from argv | 6 |
@@ -278,7 +278,7 @@ Expected: `7 passed`, `EXIT=0`. The C++ is still `1732aff4ba`'s, so this is the 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/reader_base.h:55-68`
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/piece_geometry.h:9-21,42-62`
-- Test: `test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py` (model at `:48-65`, `_assert_geometry` at `:81-84`, `_synthetic_tables` at `:131-172`, U1 tests at `:175-197`)
+- Test: `test/manual/dsv41/test_exl3_ram_miss_piece_stream.py` (model at `:48-65`, `_assert_geometry` at `:81-84`, `_synthetic_tables` at `:131-172`, U1 tests at `:175-197`)
 
 **Interfaces:**
 - Consumes: `Tables` (`host/row_tables.h`: `parts`, `extents[row*parts + p]` as `Read{file, offset, length, dest}`).
@@ -482,7 +482,7 @@ git add -u && git commit -m "test(expert-stream): N-part piece geometry, sub-rea
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" && git push origin cc/mirror3-piece-stream
 ssh divix01 'cd /data/models/slang/nvfp4-work/wt-mirror3 && git fetch origin && git checkout --detach origin/cc/mirror3-piece-stream \
   && PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-     test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py -q -p no:randomly \
+     test/manual/dsv41/test_exl3_ram_miss_piece_stream.py -q -p no:randomly \
      -k "u1_geometry or share_of_the_pieces or zero_part or nine_parts" 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"'
 ```
 
@@ -591,7 +591,7 @@ git add -u && git commit -m "feat(expert-stream): cut each reading part into its
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" && git push origin cc/mirror3-piece-stream
 ssh divix01 'cd /data/models/slang/nvfp4-work/wt-mirror3 && git fetch origin && git checkout --detach origin/cc/mirror3-piece-stream \
   && PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-     test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py \
+     test/manual/dsv41/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py \
      -q -p no:randomly 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"'
 ```
 
@@ -607,8 +607,8 @@ geometry asserts.
 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/row_reader.h:96-122,725-727,1505-1508`
-- Modify: `test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py` (`:200-212` U1 reader test, `:534-537` refusal test, `_host` at `:563`, new tests)
-- Modify: `test/registered/unit/kernels/test_exl3_ram_miss_row_images.py:161,226-228`
+- Modify: `test/manual/dsv41/test_exl3_ram_miss_piece_stream.py` (`:200-212` U1 reader test, `:534-537` refusal test, `_host` at `:563`, new tests)
+- Modify: `test/manual/dsv41/test_exl3_ram_miss_row_images.py:161,226-228`
 
 **Interfaces:**
 - Consumes: Task 2's `_per_part`, `_row_sub_reads`, and `_sub_read(s, row, expert, part, k)` (already at `:487`). Also `read_rows_pieces(tables, row, experts, slots, *, direct, generation, **faults) -> (result, record, masks, info)`, `read_rows_sqes`, `read_rows_traced`, `piece_word`, `split._sentinel`, `split._assert_rows`, and `LeaseSim`.
@@ -812,7 +812,7 @@ git add -u && git commit -m "test(expert-stream): piece streaming over three to 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" && git push origin cc/mirror3-piece-stream
 ssh divix01 'cd /data/models/slang/nvfp4-work/wt-mirror3 && git fetch origin && git checkout --detach origin/cc/mirror3-piece-stream \
   && PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-     test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py -q -p no:randomly \
+     test/manual/dsv41/test_exl3_ram_miss_piece_stream.py -q -p no:randomly \
      -k "mirror_parts or three or reader_reads" 2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"'
 ```
 
@@ -871,8 +871,8 @@ git add -u && git commit -m "feat(expert-stream): piece streaming refuses only m
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" && git push origin cc/mirror3-piece-stream
 ssh divix01 'cd /data/models/slang/nvfp4-work/wt-mirror3 && git fetch origin && git checkout --detach origin/cc/mirror3-piece-stream \
   && PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
-     test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py \
-     test/registered/unit/kernels/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_split.py \
+     test/manual/dsv41/test_exl3_ram_miss_piece_stream.py test/registered/unit/kernels/test_exl3_ram_miss_piece_stream_parts.py \
+     test/manual/dsv41/test_exl3_ram_miss_row_images.py test/registered/unit/kernels/test_exl3_ram_miss_split.py \
      test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py -q -p no:randomly 2>&1 | tail -8; echo "EXIT=${PIPESTATUS[0]}"'
 ```
 

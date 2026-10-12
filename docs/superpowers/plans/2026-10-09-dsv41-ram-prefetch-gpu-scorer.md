@@ -91,7 +91,7 @@
 - Modify: `python/sglang/srt/environ.py` (directly after `SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)`, ~line 2013)
 - Modify: `python/sglang/srt/layers/moe/ram_prefetch.py` (the bounds block at the top)
 - Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check_ram_prefetch`, ~lines 340-360)
-- Test: `test/registered/unit/test_expert_stream_requirements_exl3.py`
+- Test: `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -116,7 +116,7 @@ Expected: the branch head's one-line log, then `/data/models/slang/nvfp4-work/wt
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `test/registered/unit/test_expert_stream_requirements_exl3.py`:
+Append to `test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py`:
 
 ```python
 def test_the_ram_prefetch_scorer_defaults_to_the_cpu():
@@ -148,7 +148,7 @@ def test_an_unknown_ram_prefetch_scorer_is_refused_whether_or_not_the_prefetch_i
 
 ```bash
 cd /Users/dnikolaidis/.codex/worktrees/ram-prefetch-margin
-git add test/registered/unit/test_expert_stream_requirements_exl3.py
+git add test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py
 git commit -m "Test the RAM prefetch scorer option and its launch rules
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -157,7 +157,7 @@ git push origin codex/dsv41-ram-prefetch-margin
 ssh divix01 bash -s <<'REMOTE'
 set -u
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch-margin && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch-margin && git log -1 --oneline
-env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/test_expert_stream_requirements_exl3.py -k "scorer" 2>&1 | tail -12; echo "EXIT=${PIPESTATUS[0]}"
+env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py -k "scorer" 2>&1 | tail -12; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=1`, failures with `AttributeError: ... SGLANG_DSV41_RAM_PREFETCH_SCORER`.
@@ -222,7 +222,7 @@ git push origin codex/dsv41-ram-prefetch-margin
 ssh divix01 bash -s <<'REMOTE'
 set -u
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch-margin && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch-margin && git log -1 --oneline
-env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/test_expert_stream_requirements_exl3.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=0`; the whole file passes (the Phase 1 prefetch tests included).
@@ -1118,7 +1118,7 @@ git push origin codex/dsv41-ram-prefetch-margin
 ssh divix01 bash -s <<'REMOTE'
 set -u
 cd /data/models/slang/nvfp4-work/wt-ram-prefetch-margin && git fetch -q origin && git checkout -q --detach origin/codex/dsv41-ram-prefetch-margin && git log -1 --oneline
-env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/kernels/test_exl3_ram_prefetch_gpu_host.py test/registered/unit/kernels/test_exl3_ram_miss_device_args.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/registered/unit/kernels/test_exl3_ram_prefetch_thread.py test/registered/unit/kernels/test_exl3_ram_prefetch_events.py test/registered/unit/kernels/test_exl3_ram_prefetch_pool.py test/registered/unit/kernels/test_exl3_ram_prefetch_swap.py test/registered/unit/kernels/test_exl3_ram_prefetch_scorer.py test/registered/unit/kernels/test_expert_stream_build_variants.py test/registered/unit/kernels/test_expert_stream_hotpath_golden.py 2>&1 | tail -4; echo "EXIT=${PIPESTATUS[0]}"
+env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/registered/unit/kernels/test_exl3_ram_prefetch_gpu_host.py test/registered/unit/kernels/test_exl3_ram_miss_device_args.py test/registered/unit/kernels/test_exl3_ram_prefetch_step.py test/manual/dsv41/test_exl3_ram_prefetch_thread.py test/registered/unit/kernels/test_exl3_ram_prefetch_events.py test/registered/unit/kernels/test_exl3_ram_prefetch_pool.py test/registered/unit/kernels/test_exl3_ram_prefetch_swap.py test/registered/unit/kernels/test_exl3_ram_prefetch_scorer.py test/registered/unit/kernels/test_expert_stream_build_variants.py test/registered/unit/kernels/test_expert_stream_hotpath_golden.py 2>&1 | tail -4; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE
 ```
 Expected: `EXIT=0` (the first run rebuilds the host modules; a `TimeoutExpired` there is the compiler, re-run once warm). Record the pass count with this selection.
@@ -2823,7 +2823,7 @@ cd /data/models/slang/nvfp4-work/wt-ram-prefetch-margin && git fetch -q origin &
 PY="env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly"
 $PY test/registered/unit/kernels/test_*exl3*.py test/registered/unit/kernels/test_*expert*.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 $PY test/registered/unit/layers/moe/test_ram_prefetch_tables.py test/registered/unit/layers/moe/test_exl3_ram_miss_service.py test/registered/unit/layers/moe/test_threading_config.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
-$PY test/registered/unit/test_expert_stream_requirements_exl3.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+$PY test/registered/unit/arg_groups/test_expert_stream_requirements_exl3.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 $PY test/registered/unit/scripts/test_both_cpu_ab.py test/registered/unit/scripts/test_spec_margin.py test/registered/unit/scripts/test_spec_margin_capture.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 env PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 /data/models/slang/.venv/bin/python -m pytest -q -p no:randomly test/manual/dsv41/test_exl3_ram_prefetch_gpu_scorer_cuda.py test/manual/dsv41/test_exl3_lease_kernels_cuda.py test/manual/dsv41/test_exl3_lease_ordering_cuda.py test/manual/dsv41/test_exl3_copy_engine_cuda.py 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 REMOTE

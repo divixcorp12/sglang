@@ -60,8 +60,9 @@ there is no sleep predicate.
 Bit-exactness: phase order and accumulation are unchanged; the frozen references and routed cross-arm references of
 the bench, and the engine tests on the instr build's fake kernel, must pass. On divix01, in a private worktree:
 `test/registered/unit/kernels/test_cpu_expert*.py test_dspark_*cpu*.py test_cpu_experts_common.py
-test_nvfp4_cpu_build.py test_exl3_worker_trace.py test_exl3_ram_miss_stage_trace_causal.py
-test_exl3_ram_miss_numa_groups.py test_expert_stream_build_variants.py test_expert_stream_hotpath_golden.py`, then
+test_exl3_ram_miss_stage_trace_causal.py
+test_exl3_ram_miss_numa_groups.py test_expert_stream_build_variants.py test_expert_stream_hotpath_golden.py`,
+`test/manual/dsv41/test_nvfp4_cpu_build.py test_exl3_worker_trace.py`, then
 the CPU-expert files of `test/manual/dsv41` under `cc-gpu.lock`. The production proof is a serving capture with
 `stall_sampler.py` under the server mask and no libgomp bootstrap, showing worker voluntary switches near 0 during
 decode.

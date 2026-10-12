@@ -257,7 +257,7 @@ against today's 10/9. Register the kernel name (D8 pattern).
 
 ## 6. Tests
 
-New host tests, CPU, `test/registered/unit/kernels/test_exl3_ram_miss_piece_stream.py`:
+New host tests, CPU, `test/manual/dsv41/test_exl3_ram_miss_piece_stream.py`:
 - **U1 geometry**, over every row of a synthetic layout with random `starts`, small last parts and `0:1` weights:
   - sub-reads are page aligned, nonzero, and tile each part;
   - pieces partition the needed bytes, with boundaries 128 B aligned;

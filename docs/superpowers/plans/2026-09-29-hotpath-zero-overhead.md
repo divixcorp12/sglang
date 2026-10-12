@@ -564,7 +564,7 @@ Calls from the host module go through its PLT, so the preload sees them, and `st
 **Files:**
 - Create: `python/sglang/test/hotpath_shim.c`
 - Create: `python/sglang/test/hotpath_shim.py`
-- Create: `T/test_expert_stream_hotpath_shim.py`
+- Create: `test/manual/dsv41/test_expert_stream_hotpath_shim.py`
 - Modify: `analysis/dsv41-drive/hotpath/baseline.md` (master's per-request counts)
 
 **Interfaces:**
@@ -763,7 +763,7 @@ def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warm
   The `variant` keyword is accepted as `"default"` until Task 8 adds `ExpertStreamHost(variant=...)`. From Task 8 on,
   the tests pass `"prod"`.
 
-- [ ] **Step 3: Write `T/test_expert_stream_hotpath_shim.py`.** For now it holds only the shim's self-test and a
+- [ ] **Step 3: Write `test/manual/dsv41/test_expert_stream_hotpath_shim.py`.** For now it holds only the shim's self-test and a
   characterization test that prints master's numbers. The zero-count assertions are added by Tasks 9, 11, 12 and 15.
 
 ```python
@@ -841,7 +841,7 @@ def test_characterize_the_hot_path(shim, tmp_path):
 
   ```bash
   git add python/sglang/test/hotpath_shim.c python/sglang/test/hotpath_shim.py \
-          test/registered/unit/kernels/test_expert_stream_hotpath_shim.py analysis/dsv41-drive/hotpath/baseline.md
+          test/manual/dsv41/test_expert_stream_hotpath_shim.py analysis/dsv41-drive/hotpath/baseline.md
   git commit -m "test(expert-stream): LD_PRELOAD counting shim for the service and copy threads; master's per-request counts
 
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1039,7 +1039,7 @@ something.
   - `require_o_direct(path: str) -> None`, which raises `RuntimeError("... needs a filesystem that takes O_DIRECT
     ...")`.
 
-- [ ] **Step 1: Write the failing fixture test** in `T/test_exl3_ram_miss_row_images.py`, next to
+- [ ] **Step 1: Write the failing fixture test** in `test/manual/dsv41/test_exl3_ram_miss_row_images.py`, next to
   `test_the_fixture_puts_a_reused_test_on_row_images_read_with_o_direct`:
 
 ```python
@@ -1100,7 +1100,7 @@ def require_o_direct(path: str) -> None:
   direct=False)` and `Exl3ShardRowSource` are the eager Python reader, which keeps its buffered default.
 
 - [ ] **Step 5: Pin the bounce-only tests to shard tables.** These are the tests `NOT_REUSED` and `ONE_READ_PER_PART`
-  name in `T/test_exl3_ram_miss_row_images.py`, plus every test in `T/test_exl3_ram_miss_pack_workers.py`. In each,
+  name in `test/manual/dsv41/test_exl3_ram_miss_row_images.py`, plus every test in `T/test_exl3_ram_miss_pack_workers.py`. In each,
   change its `ram_miss_setup(...)` call to pass `row_images=False` and its `direct=True` back to `direct=False`. The
   point is that they keep testing what they tested until Task 6 deletes them.
 
@@ -1109,7 +1109,7 @@ def require_o_direct(path: str) -> None:
   ```bash
   python - <<'PY'
   import ast, pathlib
-  src = pathlib.Path("test/registered/unit/kernels/test_exl3_ram_miss_row_images.py").read_text()
+  src = pathlib.Path("test/manual/dsv41/test_exl3_ram_miss_row_images.py").read_text()
   tree = ast.parse(src)
   for node in tree.body:
       if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in ("NOT_REUSED", "ONE_READ_PER_PART"):
@@ -1159,7 +1159,7 @@ lock-free changes this plan's review has to read.
   `test/manual/dsv41/test_exl3_piece_stream_cuda.py`
 - Modify: `H/ram_tier.h`, `H/ram_thread.h`, `H/ffi_exports.h`, `H/row_reader.h`, `H/reader_core.h` (comments only),
   `H/read_fault.h`, `H/reader_base.h` (comments only), `H/row_tables.h`
-- Modify: `OPS`, `SVC`, `python/sglang/test/dsv41_ram_miss_fixtures.py`, `T/test_exl3_ram_miss_row_images.py`, and the
+- Modify: `OPS`, `SVC`, `python/sglang/test/dsv41_ram_miss_fixtures.py`, `test/manual/dsv41/test_exl3_ram_miss_row_images.py`, and the
   test modules that hold the pinned bounce-only tests (Task 5 Step 5)
 
 **Interfaces:**
@@ -1172,7 +1172,7 @@ lock-free changes this plan's review has to read.
     `read_rows_traced`, `read_rows_with_fault`, `read_rows_sqes` and `read_rows_pieces`;
   - `_table_args(tables, direct=True)`, which keeps its internal `direct` so a test can hand C++ `direct=0`.
 
-- [ ] **Step 1: Write the failing refusal tests** in `T/test_exl3_ram_miss_row_images.py`:
+- [ ] **Step 1: Write the failing refusal tests** in `test/manual/dsv41/test_exl3_ram_miss_row_images.py`:
 
 ```python
 def test_the_reader_refuses_shard_tables(tmp_path):
@@ -1277,7 +1277,7 @@ def test_the_reader_refuses_buffered_reads_of_row_images(tmp_path):
 
 - [ ] **Step 5: Delete the bounce-only tests** that Task 5 Step 5 pinned, and the `BOUNCE_ONLY_PINNED` list.
   - Delete `T/test_exl3_ram_miss_pack_workers.py` and `test/manual/dsv41/test_exl3_piece_stream_cuda.py`.
-  - In `T/test_exl3_ram_miss_row_images.py`, delete the reuse machinery, since every suite now runs on images
+  - In `test/manual/dsv41/test_exl3_ram_miss_row_images.py`, delete the reuse machinery, since every suite now runs on images
     directly: `SETUP_USERS`, the three fixtures, `_row_images`, `_clone`, `NOT_REUSED`, `ONE_READ_PER_PART`, `_reuse`
     and its three calls, and `test_the_fixture_puts_a_reused_test_on_row_images_read_with_o_direct`.
   - Keep every test below the `# ---- The direct mode lands the same bytes as the bounce path ----` banner whose body
@@ -1315,8 +1315,8 @@ names the converter.
 **Files:**
 - Modify: `python/sglang/srt/environ.py`, `python/sglang/srt/dsv41_config.py`, `SVC`,
   `benchmarks/dsv41_baseline/arm_env.py`, `benchmarks/dsv41_baseline/test_dsv41_baseline.py` (if it pins these keys),
-  `test/registered/unit/test_dsv41_config.py`, `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`
-- Test: `test/registered/unit/test_dsv41_config.py`, `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`
+  `test/registered/unit/configs/test_dsv41_config.py`, `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`
+- Test: `test/registered/unit/configs/test_dsv41_config.py`, `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`
 
 **Interfaces:**
 - Consumes: `open_row_images`, whose error must name `scripts/dsv41/build_row_images.py`. Check it; if it does not,
@@ -1325,7 +1325,7 @@ names the converter.
 
 - [ ] **Step 1: Write the failing tests.**
 
-  In `test/registered/unit/test_dsv41_config.py`:
+  In `test/registered/unit/configs/test_dsv41_config.py`:
 
 ```python
 def test_removed_ram_miss_knobs_warn(monkeypatch):
@@ -1417,7 +1417,7 @@ def test_the_service_refuses_to_start_without_leases(tmp_path, monkeypatch):
   (`_start_service_with` is the module's existing builder with its lease flag exposed. Add the keyword if it has
   none.)
 
-- [ ] **Step 5: Run the tests.** Use LOCAL-TEST on `test/registered/unit/test_dsv41_config.py`,
+- [ ] **Step 5: Run the tests.** Use LOCAL-TEST on `test/registered/unit/configs/test_dsv41_config.py`,
   `test/registered/unit/layers/moe` and `benchmarks/dsv41_baseline/test_dsv41_baseline.py`. Expected: PASS. Then run
   SUITE on divix01.
 
@@ -1712,7 +1712,7 @@ def host_sources() -> tuple[Path, ...]:
 - Modify: `T/test_exl3_ram_miss_stage_trace_causal.py` (`NON_TRACE_CLOCK_READS`), and the five `busy_since_ns()`
   callers (`T/test_exl3_ram_miss_lease_defer.py:79`, `T/test_exl3_ram_miss_lease_thread.py:199`,
   `test/manual/dsv41/test_exl3_two_phase_timing_cuda.py:333,363`, `test/manual/dsv41/test_exl3_task5_item4_gpu.py:152`)
-- Test: `T/test_expert_stream_build_variants.py`, `T/test_expert_stream_hotpath_shim.py`
+- Test: `T/test_expert_stream_build_variants.py`, `test/manual/dsv41/test_expert_stream_hotpath_shim.py`
 
 **Interfaces:**
 - Consumes: `Build::kMetrics`.
@@ -1762,7 +1762,7 @@ def test_the_instrumented_host_still_reports_every_counter(tmp_path):
         host.stop()
 ```
 
-  Add to `T/test_expert_stream_hotpath_shim.py`:
+  Add to `test/manual/dsv41/test_expert_stream_hotpath_shim.py`:
 
 ```python
 def test_the_prod_service_thread_reads_no_clock_per_request(shim, tmp_path):
@@ -2411,7 +2411,7 @@ def test_prod_has_no_trace_or_fault_symbols_and_instr_has_them():
 - Create: `H/fixed_vec.h`
 - Modify: `H/tier_protocol.h` (`Request`, `read_record`, `listed`), `H/ram_tier.h`, `H/reader_core.h`,
   `H/row_reader.h`, `H/ffi_exports.h` (the read entry points' callbacks), `H/read_fault.h` (`abandon_after`)
-- Test: `T/test_expert_stream_hotpath_shim.py`, `T/test_expert_stream_fixed_vec.py` (new)
+- Test: `test/manual/dsv41/test_expert_stream_hotpath_shim.py`, `T/test_expert_stream_fixed_vec.py` (new)
 
 **Interfaces:**
 - Produces:
@@ -2465,7 +2465,7 @@ def test_fixed_vec_pushes_assigns_clears_and_throws_on_overflow(tmp_path):
     subprocess.run([str(exe)], check=True)
 ```
 
-  Add to `T/test_expert_stream_hotpath_shim.py`:
+  Add to `test/manual/dsv41/test_expert_stream_hotpath_shim.py`:
 
 ```python
 @pytest.mark.parametrize("variant", ["prod", "instr"])
@@ -2707,7 +2707,7 @@ inline auto abandon_after(int64_t after) {
 **Files:**
 - Create: `H/spsc_ring.h`
 - Modify: `H/copy_engine.h`, `H/ram_tier.h` (construction, `submit` call)
-- Test: `T/test_expert_stream_hotpath_shim.py`, `T/test_expert_stream_spsc_ring.py` (new),
+- Test: `test/manual/dsv41/test_expert_stream_hotpath_shim.py`, `T/test_expert_stream_spsc_ring.py` (new),
   `T/test_exl3_ram_miss_copy_engine.py` (unchanged; must stay green)
 
 **Interfaces:**
@@ -3716,7 +3716,7 @@ def test_a_pause_retires_a_copy_that_completed_while_parked(tmp_path):
 
 **Files:**
 - Modify: `H/ram_tier.h`
-- Test: `T/test_expert_stream_hotpath_shim.py`, `T/test_expert_stream_ownership.py`
+- Test: `test/manual/dsv41/test_expert_stream_hotpath_shim.py`, `T/test_expert_stream_ownership.py`
 
 **Interfaces:**
 - `RamTier` has no `mutex_`.
@@ -3726,7 +3726,7 @@ def test_a_pause_retires_a_copy_that_completed_while_parked(tmp_path):
 - `rows_demand`/`rows_advisory` become `LineCounters`-style relaxed words.
 - `fill_join()` runs `finish_fill_owned()` once, after the join.
 
-- [ ] **Step 1: Write the failing tests.** Add to `T/test_expert_stream_hotpath_shim.py`:
+- [ ] **Step 1: Write the failing tests.** Add to `test/manual/dsv41/test_expert_stream_hotpath_shim.py`:
 
 ```python
 @pytest.mark.parametrize("variant", ["prod", "instr"])
@@ -3951,7 +3951,7 @@ called_from_lib:libgomp.so
   Compare them with the same command at `wt-hotpath-base`.
 
 - [ ] **Step 4: Run the shim and the stress test on divix01** under `taskset -c 0-63`: CPU-TEST on
-  `T/test_expert_stream_hotpath_shim.py -s` and on `T/test_expert_stream_hotpath_stress.py` (ten runs). Record the final
+  `test/manual/dsv41/test_expert_stream_hotpath_shim.py -s` and on `T/test_expert_stream_hotpath_stress.py` (ten runs). Record the final
   per-request table, which must be zero for the service thread's malloc, free, mutex, cond, clock and sleep, and for
   the copy thread's malloc, free, mutex and cond. Put master's and the branch's tables side by side in `results.md`.
 
@@ -4004,7 +4004,7 @@ rather than run mismatched arms.
 
 - [ ] **Step 1: Arm C's hook in the shim.** Add an exit dump to `hotpath_shim.c`: a constructor reads
   `HOTPATH_SHIM_OUT` (test code, raw `getenv`) and, when it is set, arms at load. A destructor writes
-  `{"service": {...}, "copy": {...}}` to that path. Add a self-test in `T/test_expert_stream_hotpath_shim.py`: run the
+  `{"service": {...}, "copy": {...}}` to that path. Add a self-test in `test/manual/dsv41/test_expert_stream_hotpath_shim.py`: run the
   probe program with `HOTPATH_SHIM_OUT` set, and read the JSON. Commit it on the branch, with the trailers.
 
 - [ ] **Step 2: Register both trees.** In the branch's `benchmarks/dsv41_baseline/generations.json`, register

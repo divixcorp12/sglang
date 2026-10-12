@@ -165,7 +165,7 @@ build like every test-only export.
 
 - C++ benches link the kernel library and use the interface directly: `expert_stream/bench/src/{cpu_forward,
   full_stack,self_test,stack_fixture}.{cpp,h}` and `CMakeLists.txt`, `nvfp4/bench/src/cpu_forward.cpp`,
-  `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp`, `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`.
+  `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp`, `test/manual/dsv41/nvfp4_cpu_sanitizer.cpp`.
 - The shared-framework toy (`cpu_experts_common_toy.hpp`, `cpu_experts_common_toy_lib.cpp`,
   `cpu_experts_common_check.cpp`, `test_cpu_experts_common.py`) ports to the interface: it is the framework's test.
 - Deleted with the ABI: `test_cpu_experts_abi.py`, `test_cpu_expert_pool.py`, `test/manual/dsv41/

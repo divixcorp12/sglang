@@ -60,7 +60,7 @@ The EXL3 reference implementation for every shape here: `python/sglang/srt/layer
 | `python/sglang/srt/layers/quantization/nvfp4_cpu/CMakeLists.txt` | **deleted** | 1 |
 | `.../nvfp4_cpu/optimized/build.py` (new) | compile the library or a harness executable; CLI like EXL3's `build.py` | 1 |
 | `python/sglang/srt/layers/quantization/nvfp4_cpu_ext.py` (new) | build-on-first-use loader, cached by content hash, returns `ctypes.CDLL` | 1 |
-| `test/registered/unit/kernels/test_nvfp4_cpu_build.py` (new) | build.py / loader tests; runs the two native harnesses CTest used to run | 1 |
+| `test/manual/dsv41/test_nvfp4_cpu_build.py` (new) | build.py / loader tests; runs the two native harnesses CTest used to run | 1 |
 | `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp` (new) | A/B harness: fixed forwards through the C ABI, every output and status dumped | 2 |
 | `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (new) | divix01 driver: build each variant, dump, compare bitwise | 2 |
 | `.../nvfp4_cpu/optimized/layout.h` | `rounded` becomes `constexpr` | 3 |
@@ -68,7 +68,7 @@ The EXL3 reference implementation for every shape here: `python/sglang/srt/layer
 | `.../nvfp4_cpu/optimized/shapes.hpp` (new) | `GenericShape` (3), `Dsv41Shape` (5) | 3, 5 |
 | `.../nvfp4_cpu/optimized/forward_plan.hpp` (new) | `Phase`, `PlanTraits`, `share`, `ForwardPlan` | 4, 5 |
 | `.../nvfp4_cpu/optimized/moe_mul1.cpp` | registry, cores, arithmetic helpers, ctx/arena, dispatch, C ABI; `Workers`/`Work`/`calculate` removed | 3, 4, 5 |
-| `test/registered/unit/kernels/test_nvfp4_cpu_experts.py` (new) | C ABI behavior under the OpenMP team (subprocess per case) | 4 |
+| `test/manual/dsv41/test_nvfp4_cpu_experts.py` (new) | C ABI behavior under the OpenMP team (subprocess per case) | 4 |
 | `.../nvfp4_cpu/bench/CMakeLists.txt` | standalone; OpenMP; C++20 | 4 |
 | `.../nvfp4_cpu/bench/run.sh` | exports the OpenMP wait policy; records it | 6 |
 | `.../nvfp4_cpu/optimized/README.md`, `bench/README.md`, `upstream/README.md` | build, threading, code layout | 1, 6 |
@@ -104,7 +104,7 @@ The `.hpp` files follow EXL3's pattern: included mid-file inside `moe_mul1.cpp`'
 **Files:**
 - Create: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py`
 - Create: `python/sglang/srt/layers/quantization/nvfp4_cpu_ext.py`
-- Create: `test/registered/unit/kernels/test_nvfp4_cpu_build.py`
+- Create: `test/manual/dsv41/test_nvfp4_cpu_build.py`
 - Delete: `python/sglang/srt/layers/quantization/nvfp4_cpu/CMakeLists.txt`
 - Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/README.md` (Build section), `.../nvfp4_cpu/bench/README.md` (Build section)
 
@@ -119,7 +119,7 @@ git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4 fetch origin
 git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4 worktree add -b nvfp4-cpu-forward-plan ../sglang-nvfp4-nvfp4-plan origin/master
 ```
 
-`test/registered/unit/kernels/test_nvfp4_cpu_build.py`:
+`test/manual/dsv41/test_nvfp4_cpu_build.py`:
 
 ```python
 """The NVFP4 CPU expert library builds from Python and passes its native harnesses (Linux, GCC with OpenMP).
@@ -205,7 +205,7 @@ def test_the_native_harness_passes(tmp_path, harness, flags):
 
 ```bash
 cd /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-nvfp4-plan
-git add test/registered/unit/kernels/test_nvfp4_cpu_build.py
+git add test/manual/dsv41/test_nvfp4_cpu_build.py
 git commit -m "$(cat <<'EOF'
 test(nvfp4-cpu): the kernel builds from Python and passes its native harnesses (failing)
 
@@ -217,7 +217,7 @@ git push -u origin nvfp4-cpu-forward-plan
 ssh divix01 'git -C /data/models/slang/sglang fetch origin && git -C /data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-nvfp4-plan origin/nvfp4-cpu-forward-plan && mkdir -p /mnt/nvme1/nvfp4-plan'
 ```
 
-Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_build.py`
+Run: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_build.py`
 Expected: 4 failed: `FileNotFoundError` for `optimized/build.py`; `ImportError` for `nvfp4_cpu_ext`. `EXIT=1`.
 
 - [ ] **Step 3: Write `build.py`**
@@ -390,8 +390,8 @@ baseline; `--main HARNESS.cpp` links a native harness into an executable instead
 and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags, compiler and host CPU. A native build
 targets the build machine's ISA. The arithmetic needs `-ffp-contract=off` and must never be built with `-Ofast`.
 
-The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
-`test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
+The native harnesses (`test/manual/dsv41/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
+`test/manual/dsv41/test_nvfp4_cpu_build.py`.
 ````
 
 In `nvfp4_cpu/bench/README.md`, replace the `## Build` section's code block and the paragraph after it (through `benchmark executables.`) with:
@@ -428,7 +428,7 @@ git push
 ssh divix01 'git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan fetch -q origin && git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan checkout -q --detach origin/nvfp4-cpu-forward-plan'
 ```
 
-Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_build.py`
+Run: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_build.py`
 Expected: `4 passed`, `EXIT=0`. If the sanitizer case fails only on LeakSanitizer reports whose every frame is inside `libgomp`, ledger a ruling and add `env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"}` for that case alone; any report with a frame in `moe_mul1.cpp`, `dot_nvfp4.h` or `nvfp4.c` is a real failure.
 
 ---
@@ -756,7 +756,7 @@ struct SlabRowBytes
                  4, 4, 4}};
     }
 };
-// The sanitizer harness's 80 x 80 layer (test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp) registers exactly these.
+// The sanitizer harness's 80 x 80 layer (test/manual/dsv41/nvfp4_cpu_sanitizer.cpp) registers exactly these.
 static_assert(SlabRowBytes::of(80, 80).bytes[kW13] == 80 * 80 && SlabRowBytes::of(80, 80).bytes[kW2] == 80 * 80 / 2);
 static_assert(SlabRowBytes::of(80, 80).bytes[kSf13] == 256 * 8 && SlabRowBytes::of(80, 80).bytes[kSf2] == 128 * 8);
 
@@ -961,14 +961,14 @@ ssh divix01 'git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan fetch -q origin 
 ```
 
 Run: `ab_check` with `<N>`=`3`. Expected: three `PASS ... bit-exact`, `EXIT=0`.
-Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_build.py`. Expected: `4 passed`, `EXIT=0`.
+Run: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_build.py`. Expected: `4 passed`, `EXIT=0`.
 
 ---
 
 ### Task 4: `ForwardPlan<GenericShape, kBuildIsa>` on an OpenMP team; the `Workers` pool removed
 
 **Files:**
-- Create: `test/registered/unit/kernels/test_nvfp4_cpu_experts.py`
+- Create: `test/manual/dsv41/test_nvfp4_cpu_experts.py`
 - Create: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/forward_plan.hpp`
 - Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/moe_mul1.cpp` (rewritten around the plan; full text below)
 - Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/bench/CMakeLists.txt`
@@ -979,7 +979,7 @@ Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_build.py`. Expect
 
 - [ ] **Step 1: Write the failing tests**
 
-`test/registered/unit/kernels/test_nvfp4_cpu_experts.py`:
+`test/manual/dsv41/test_nvfp4_cpu_experts.py`:
 
 ```python
 """The NVFP4 CPU expert C ABI under its OpenMP team (Linux, GCC with OpenMP).
@@ -1115,7 +1115,7 @@ def test_an_intermediate_q8_cannot_represent_returns_2_and_leaves_out_untouched(
 - [ ] **Step 2: Commit, push, run them to see the two new behaviors fail**
 
 ```bash
-git add test/registered/unit/kernels/test_nvfp4_cpu_experts.py
+git add test/manual/dsv41/test_nvfp4_cpu_experts.py
 git commit -m "$(cat <<'EOF'
 test(nvfp4-cpu): the C ABI under an OpenMP team: any team size up to the cores, a short team fails (failing)
 
@@ -1127,7 +1127,7 @@ git push
 ssh divix01 'git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan fetch -q origin && git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan checkout -q --detach origin/nvfp4-cpu-forward-plan'
 ```
 
-Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_experts.py`
+Run: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_experts.py`
 Expected: `2 failed, 3 passed`, `EXIT=1`. The failures: `test_a_later_forward_may_use_more_workers_than_the_first` (old pool: `forward 3 1 untouched`) and `test_a_team_smaller_than_requested_fails_the_forward_and_leaves_out_untouched` (old pool ignores OpenMP: `forward 4 0 written`). The three passing tests are characterization: they pin today's behavior that the rewrite must keep.
 
 - [ ] **Step 3: Write `forward_plan.hpp`**
@@ -1677,7 +1677,7 @@ git push
 ssh divix01 'git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan fetch -q origin && git -C /data/models/slang/nvfp4-work/wt-nvfp4-plan checkout -q --detach origin/nvfp4-cpu-forward-plan'
 ```
 
-Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_nvfp4_cpu_build.py`
+Run: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_experts.py test/manual/dsv41/test_nvfp4_cpu_build.py`
 Expected: `9 passed`, `EXIT=0`.
 Run: `ab_check` with `<N>`=`4`. Expected: three `PASS ... bit-exact`, `EXIT=0`.
 Run (the bench still configures, builds and validates):
@@ -1790,7 +1790,7 @@ ssh divix01 'nm -C /mnt/nvme1/nvfp4-plan/task5/ab-native | grep -c "Dsv41Shape";
 ```
 
 Expected: the first count is ≥ 1 and the second is `0`. If the first is also 0 because GCC inlined every instantiation, look instead for `$0x900` (2304) or `$0x1400` (5120) immediates in `objdump -d --no-show-raw-insn /mnt/nvme1/nvfp4-plan/task5/ab-native`, compared with `ab-portable`, and ledger which check you used.
-Run: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_nvfp4_cpu_build.py`. Expected: `9 passed`, `EXIT=0`.
+Run: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_experts.py test/manual/dsv41/test_nvfp4_cpu_build.py`. Expected: `9 passed`, `EXIT=0`.
 
 ---
 
@@ -1854,7 +1854,7 @@ through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerInfo`, `
 slab bases and strides; `SlabRowBytes` is each slab's minimum stride.
 
 Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (native, upstream-baseline
-and portable builds against a baseline worktree's dumps), and `test/registered/unit/kernels/test_nvfp4_cpu_{build,experts}.py`.
+and portable builds against a baseline worktree's dumps), and `test/manual/dsv41/test_nvfp4_cpu_{build,experts}.py`.
 ```
 
 In `bench/README.md`: change `records. No Python, PyTorch, CUDA or OpenMP is required.` to `records. No Python, PyTorch or CUDA is required; the kernel needs OpenMP, and \`run.sh\` sets its wait policy (\`OMP_WAIT_POLICY=ACTIVE\`, \`GOMP_SPINCOUNT=INFINITE\`, \`OMP_DYNAMIC=FALSE\`) unless the caller already did.` and change `use identical Q8_0 activation quantization, FP32 projections, SiLU, routing, thread pool and` to `use identical Q8_0 activation quantization, FP32 projections, SiLU, routing, OpenMP team and`.
@@ -1923,4 +1923,4 @@ EOF
 git push
 ```
 
-Final gates on the pushed head: `divix_pytest test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_nvfp4_cpu_build.py` gives `9 passed`, `EXIT=0`. `ab_check` with `<N>`=`final` gives three `PASS`, `EXIT=0`. Record both commands and their output in the ledger next to the A/B table.
+Final gates on the pushed head: `divix_pytest test/manual/dsv41/test_nvfp4_cpu_experts.py test/manual/dsv41/test_nvfp4_cpu_build.py` gives `9 passed`, `EXIT=0`. `ab_check` with `<N>`=`final` gives three `PASS`, `EXIT=0`. Record both commands and their output in the ledger next to the A/B table.

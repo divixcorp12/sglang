@@ -210,7 +210,7 @@ git commit -m "refactor: share verified file cache with PLE"
 - Modify: `python/sglang/srt/model_executor/model_runner.py`
 - Modify: `python/sglang/srt/utils/offloader.py`
 - Modify: `test/registered/unit/models/test_qwen4_exp_ple_cache_integration.py`
-- Modify: `test/registered/unit/test_nvfp4_expert_offload.py`
+- Modify: `test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 
 - [ ] **Step 1: Write failing identity-plumbing tests**
 
@@ -239,7 +239,7 @@ Expected: identical identity inputs produce stable cache keys; path, revision, o
 - [ ] **Step 5: Commit Task 3**
 
 ```bash
-git add python/sglang/srt/model_executor/model_runner_components/load_model_utils.py python/sglang/srt/model_executor/model_runner.py python/sglang/srt/utils/offloader.py test/registered/unit/models/test_qwen4_exp_ple_cache_integration.py test/registered/unit/test_nvfp4_expert_offload.py
+git add python/sglang/srt/model_executor/model_runner_components/load_model_utils.py python/sglang/srt/model_executor/model_runner.py python/sglang/srt/utils/offloader.py test/registered/unit/models/test_qwen4_exp_ple_cache_integration.py test/registered/unit/layers/moe/test_nvfp4_expert_offload.py
 git commit -m "refactor: share checkpoint cache identity"
 ```
 
@@ -252,7 +252,7 @@ git commit -m "refactor: share checkpoint cache identity"
 - Modify: `python/sglang/srt/utils/offloader.py`
 - Modify: `python/sglang/srt/layers/moe/fused_moe_triton/layer.py`
 - Modify: `python/sglang/srt/model_executor/model_runner_components/load_model_utils.py`
-- Modify: `test/registered/unit/test_nvfp4_expert_offload.py`
+- Modify: `test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 
 - [ ] **Step 1: Write failing file-backed offloader tests**
 
@@ -301,7 +301,7 @@ Expected: all prior anonymous-offload tests and new file-backed lifecycle tests 
 - [ ] **Step 8: Commit Task 4**
 
 ```bash
-git add python/sglang/srt/environ.py python/sglang/srt/utils/offloader.py python/sglang/srt/layers/moe/fused_moe_triton/layer.py python/sglang/srt/model_executor/model_runner_components/load_model_utils.py test/registered/unit/test_nvfp4_expert_offload.py
+git add python/sglang/srt/environ.py python/sglang/srt/utils/offloader.py python/sglang/srt/layers/moe/fused_moe_triton/layer.py python/sglang/srt/model_executor/model_runner_components/load_model_utils.py test/registered/unit/layers/moe/test_nvfp4_expert_offload.py
 git commit -m "feat: file-back ModelOpt NVFP4 experts"
 ```
 
@@ -313,7 +313,7 @@ git commit -m "feat: file-back ModelOpt NVFP4 experts"
 - Modify: `python/sglang/srt/layers/quantization/modelopt_quant.py`
 - Modify: `python/sglang/srt/utils/offloader.py`
 - Modify: `test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py`
-- Modify: `test/registered/unit/test_nvfp4_expert_offload.py`
+- Modify: `test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 
 - [ ] **Step 1: Write RED tests for final-layout correctness**
 
@@ -359,7 +359,7 @@ Expected: cold, warm, and anonymous gathered payloads are identical; no double t
 - [ ] **Step 6: Commit Task 5**
 
 ```bash
-git add python/sglang/srt/layers/quantization/modelopt_quant.py python/sglang/srt/utils/offloader.py test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py test/registered/unit/test_nvfp4_expert_offload.py
+git add python/sglang/srt/layers/quantization/modelopt_quant.py python/sglang/srt/utils/offloader.py test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py test/registered/unit/layers/moe/test_nvfp4_expert_offload.py
 git commit -m "feat: reuse final NVFP4 expert layout"
 ```
 
@@ -513,7 +513,7 @@ git commit -m "feat: drive expert cache from routing stats"
 - Modify: `python/sglang/srt/server_args.py`
 - Modify: `python/sglang/srt/model_executor/model_runner.py`
 - Modify: `python/sglang/srt/layers/quantization/modelopt_quant.py`
-- Modify: `test/registered/unit/test_nvfp4_expert_offload.py`
+- Modify: `test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 - Modify: `test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py`
 
 - [ ] **Step 1: Write failing configuration and startup tests**
@@ -550,7 +550,7 @@ Expected: valid prototype configuration constructs the manager before memory-poo
 - [ ] **Step 6: Commit Task 8**
 
 ```bash
-git add python/sglang/srt/environ.py python/sglang/srt/server_args.py python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/quantization/modelopt_quant.py test/registered/unit/test_nvfp4_expert_offload.py test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py
+git add python/sglang/srt/environ.py python/sglang/srt/server_args.py python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/quantization/modelopt_quant.py test/registered/unit/layers/moe/test_nvfp4_expert_offload.py test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py
 git commit -m "feat: wire NVFP4 hot expert residency"
 ```
 
@@ -581,7 +581,7 @@ Expected: no whitespace errors or implementation placeholders; `qwen4_exp.py` re
   test/registered/unit/model_loader/test_file_tensor_cache.py \
   test/registered/unit/models/test_qwen4_exp_ple_table.py \
   test/registered/unit/models/test_qwen4_exp_ple_cache_integration.py \
-  test/registered/unit/test_nvfp4_expert_offload.py \
+  test/registered/unit/layers/moe/test_nvfp4_expert_offload.py \
   test/registered/unit/layers/moe/test_expert_stream.py \
   test/registered/unit/layers/moe/test_expert_hot_cache.py \
   test/registered/unit/layers/quantization/test_modelopt_nvfp4_expert_stream.py \

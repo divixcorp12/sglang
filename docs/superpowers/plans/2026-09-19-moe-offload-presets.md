@@ -79,7 +79,7 @@ The preset must set this variable through the same `envs` path as every other va
 - Modify: `python/sglang/srt/environ.py` (the `SGLANG_MOE_*` block, next to `SGLANG_MOE_EXPERT_FILE_DIR`)
 - Modify: `python/sglang/srt/layers/moe/expert_stream.py:366`
 - Modify: `python/sglang/srt/arg_groups/memory_hook.py:103`
-- Test: existing `test/registered/unit/test_nvfp4_expert_offload.py`
+- Test: existing `test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 
 **Interfaces:**
 - Produces: `envs.SGLANG_MOE_EXPERT_STREAM` (an `EnvBool`, default `False`).
@@ -109,7 +109,7 @@ with
 
 - [ ] **Step 3: Run the existing offload tests**
 
-Sync (see "Running tests on divix01"), then RUN_CPU `test/registered/unit/test_nvfp4_expert_offload.py`
+Sync (see "Running tests on divix01"), then RUN_CPU `test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 Expected: the same pass count as before the change (61 selected, all pass). `patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"})` in those tests still works, because `EnvBool.get()` reads `os.environ`.
 
 - [ ] **Step 4: Commit**
@@ -841,7 +841,7 @@ Sync, then:
 RUN_CPU `test/registered/unit/layers/moe/test_offload_presets.py`
 Expected: all pass (17 tests).
 
-RUN_CPU `test/registered/unit/server_args test/registered/unit/test_nvfp4_expert_offload.py`
+RUN_CPU `test/registered/unit/server_args test/registered/unit/layers/moe/test_nvfp4_expert_offload.py`
 Expected: the same result as on the parent commit. Record the parent's result first: stash nothing; run it on a sync of `HEAD~1` if unsure. A new failure that names `moe_offload_preset` means a field registry or ratchet needs the new field. Follow that test's message (for example add the field to the list it enumerates); do not change the test's intent.
 
 - [ ] **Step 7: Check the CLI end to end without starting a server**
