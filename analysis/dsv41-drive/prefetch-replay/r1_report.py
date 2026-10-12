@@ -212,7 +212,8 @@ def _attribution_section(results: dict) -> list[str]:
 
 
 def _delay_note(results: dict) -> list[str]:
-    out = ["The Stage-2 gate's timing check uses zero scorer delay (cost runs after training).", ""]
+    out = ["The Stage-2 gate's timing check uses F0's measured scorer delay (timed before the gate); "
+           "native gate controls use the gate-only delay.", ""]
     gate = (results.get("stage2_gate") or {}).get("passed")
     with_delay = (results.get("stage2_gate_with_delay") or {}).get("passed")
     if gate is not None and with_delay is not None and gate != with_delay:

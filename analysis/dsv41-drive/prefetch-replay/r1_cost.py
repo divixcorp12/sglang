@@ -158,6 +158,16 @@ def _path_cost(model: r1_models.R1Model, *, ref: r1_models.R1Model, W: torch.Ten
             **_bytes(model, itemsize=torch.finfo(dtype).bits // 8)}
 
 
+def _gate_only_cost(*, W: torch.Tensor, bias: torch.Tensor, st: _Static, cap: int, runs: int, warmup: int) -> dict:
+    """Native gate controls: fp32 gate scores, max over tokens, then the same skip, threshold and cap selection."""
+
+    def step() -> torch.Tensor:
+        scores = r1_gate.full_gate_scores(st.x, W=W, bias=bias).max(dim=0).values
+        return select_torch(scores, skip=st.skip, threshold=st.threshold, cap=cap)
+
+    return _time_graph(step, runs=runs, warmup=warmup)
+
+
 def _check_cost_spec(cost: r1_plan.CostSpec) -> None:
     if cost.head_dtype != cost.aggregator_dtype:
         raise ValueError("head and aggregator share one module, so their dtypes must match")
@@ -188,6 +198,8 @@ def measure_complete(model: r1_models.R1Model, *, W: torch.Tensor, bias: torch.T
     low = out[_SHORT[cost.head_dtype]]
     out["param_bytes"], out["buffer_bytes"] = low["param_bytes"], low["buffer_bytes"]
     out["gate_ms"] = low["complete"]["median_ms"]
+    out["gate_only"] = _gate_only_cost(W=W, bias=bias, st=st, cap=2, runs=runs, warmup=warmup)
+    out["gate_only_ms"] = out["gate_only"]["median_ms"]
     out["selection_matches_policy"] = _selection_matches_static(ref, W=W, bias=bias, st=st, device=device)
     out["read_set_diff_fraction"] = None if diff is None else read_set_diff(
         model, inputs=diff["inputs"], skips=diff["skips"], threshold=float(diff["threshold"]), cap=2)

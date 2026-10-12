@@ -133,7 +133,7 @@ def test_summary_layout_timing_cases_and_gate_pass(tmp_path):
                               scorer_delay_ms=0.1)
     cell = out["stage1"]["dev"]["F0_noisy_or"]["cap2"]
     assert {"useful", "wasted", "eligible", "precision", "recall", "reads"} <= set(cell)
-    hist = out["stage1"]["histograms"]["gate"]["dev/pooled"]
+    hist = out["stage1"]["histograms"]["gate"]["cap2/dev/pooled"]
     assert {"0", "1", "2", "3", "4+", "p50", "p99", "max"} <= set(hist)
     assert set(out["timing"]["cases"]) == {"zero", "nominal", "adverse"}
     assert out["timing"]["assumptions"]["contention"] == {"zero": 1.0, "nominal": 2.0, "adverse": 3.0}

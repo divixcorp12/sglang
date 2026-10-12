@@ -145,14 +145,16 @@ _HIST_STATS = ("p50", "p90", "p95", "p99", "max", "max_burst")
 
 
 def _stage1_tables(evals: dict[str, dict]) -> dict:
-    """r1_report layout: stage1[split][scorer]['capN'] cells, and the widest cap's pre-cap histograms per key."""
+    """r1_report layout: stage1[split][scorer]['capN'] cells, and pre-cap histograms keyed capN/split/key."""
     out: dict = {split: {name: {f"cap{cap}": dict(v["point"]) for cap, v in caps.items()}
                          for name, caps in ev.items()} for split, ev in evals.items()}
     hists: dict[str, dict] = {}
     for split, ev in evals.items():
         for name, caps in ev.items():
-            for key, h in caps[max(caps)]["report_json"]["hist"].items():
-                hists.setdefault(name, {})[f"{split}/{key}"] = {**h["bins"], **{q: h[q] for q in _HIST_STATS}}
+            for cap, v in caps.items():
+                for key, h in v["report_json"]["hist"].items():
+                    hists.setdefault(name, {})[f"cap{cap}/{split}/{key}"] = {
+                        **h["bins"], **{q: h[q] for q in _HIST_STATS}}
     out["histograms"] = hists
     return out
 
@@ -165,25 +167,35 @@ def _timing_cell(res: r1_timing.TimingResult, *, eligible: int) -> dict:
             "partial_saved_ms": res.partial_saved_ms, "missing_windows": res.missing_windows}
 
 
+def _delay_for(scorer_delay_ms: float | dict[str, float], *, name: str) -> float:
+    if isinstance(scorer_delay_ms, dict):
+        return scorer_delay_ms.get(name, scorer_delay_ms["*"])  # "*" is the default for scorers not listed
+    return scorer_delay_ms
+
+
 def _timing(evals: dict[str, dict], *, groups: dict[str, list[R1Group]], plan: r1_plan.RunPlan, windows: dict,
-            scorer_delay_ms: float) -> dict:
+            scorer_delay_ms: float | dict[str, float]) -> dict:
     """Cap-2 reads replayed per contention case; 'cases' is dev (the Stage-2 split), 'calib' holds the same for calib.
 
-    One scorer delay applies to every scorer, so native controls carry the learned scorer's delay too.
+    A float is one delay for every scorer; a dict maps scorer name -> delay with "*" as the default.
     """
-    cases = r1_timing.cases_from_plan(plan.timing, scorer_delay_ms=scorer_delay_ms)
     cap = plan.stage2_gate.cap
     by_split: dict[str, dict] = {}
     for split, ev in evals.items():
         eligible = sum(len(r.labels.eligible_all) for r in groups[split])
-        by_split[split] = {c.name: {name: _timing_cell(r1_timing.replay(groups[split], caps[cap]["reads"],
-                                                                         windows=windows, case=c), eligible=eligible)
-                                    for name, caps in ev.items()} for c in cases}
+        by_split[split] = {c: {} for c in plan.timing.contention}
+        for name, caps in ev.items():
+            delay = _delay_for(scorer_delay_ms, name=name)
+            for case in r1_timing.cases_from_plan(plan.timing, scorer_delay_ms=delay):
+                res = r1_timing.replay(groups[split], caps[cap]["reads"], windows=windows, case=case)
+                by_split[split][case.name][name] = _timing_cell(res, eligible=eligible)
     assumptions = {"model": r1_timing.MODEL_TEXT, "label": r1_timing.LABEL, "cap": cap,
                    "row_read_ms": plan.timing.row_read_ms, "row_read_source": plan.timing.row_read_source,
                    "contention": dict(plan.timing.contention), "contention_source": plan.timing.contention_source,
                    "scorer_delay_ms": scorer_delay_ms, "scorer_delay_source": plan.timing.scorer_delay_source,
-                   "scorer_delay_scope": "the same delay for every scorer"}
+                   "scorer_delay_scope": ("per scorer: gate-only for the native gate controls, complete otherwise"
+                                          if isinstance(scorer_delay_ms, dict)
+                                          else "the same delay for every scorer")}
     return {"assumptions": assumptions, "cases": by_split.get(plan.stage2_gate.split, {}),
             "calib": by_split.get("calib", {})}
 
@@ -194,7 +206,7 @@ def _gate_inputs(evals: dict[str, dict], timing: dict, *, name: str, spec: r1_pl
 
 
 def summarize(evals: dict[str, dict], *, groups: dict[str, list[R1Group]], plan: r1_plan.RunPlan, windows: dict,
-              scorer_delay_ms: float) -> dict:
+              scorer_delay_ms: float | dict[str, float]) -> dict:
     """Stage-1 tables, timing cases and the D3 gate (F0 vs the best native control on dev) from evaluate_split runs."""
     timing = _timing(evals, groups=groups, plan=plan, windows=windows, scorer_delay_ms=scorer_delay_ms)
     spec = plan.stage2_gate
@@ -203,7 +215,7 @@ def summarize(evals: dict[str, dict], *, groups: dict[str, list[R1Group]], plan:
     return {"stage1": _stage1_tables(evals), "timing": timing, "stage2_gate": msgspec.to_builtins(gate)}
 
 
-def _sessions(ctx: r1_stage.StageCtx, *, split: str) -> list[str] | None:
+def smoke_sessions(ctx: r1_stage.StageCtx, *, split: str) -> list[str] | None:
     if not ctx.smoke:
         return None
     with open(os.path.join(ctx.dataset, b1_dataset.DATASET_NAME)) as f:
@@ -214,7 +226,7 @@ def _sessions(ctx: r1_stage.StageCtx, *, split: str) -> list[str] | None:
 
 def _groups(ctx: r1_stage.StageCtx, *, split: str, exclusions: Exclusions) -> list[R1Group]:
     return list(r1_groups.read_r1_groups(ctx.dataset, split=split, horizon=HORIZON, exclusions=exclusions,
-                                         sessions=_sessions(ctx, split=split)))
+                                         sessions=smoke_sessions(ctx, split=split)))
 
 
 def f0_token_scorer(ctx: r1_stage.StageCtx, *, groups: list[R1Group], split: str) -> _ChunkedHead:
@@ -240,7 +252,7 @@ def _write_policy_files(ctx: r1_stage.StageCtx, *, split: str, groups: list[R1Gr
 
 
 def run_stage1(ctx: r1_stage.StageCtx, *, plan: r1_plan.RunPlan, exclusions: Exclusions, windows: dict,
-               scorer_delay_ms: float = 0.0) -> dict:
+               scorer_delay_ms: float | dict[str, float] = 0.0) -> dict:
     """Stage 1 on dev and calib; pop is fit on train only (R5), F0 is the frozen B1 head."""
     pop = b1_baselines.PopScorer.fit(r.g for r in _groups(ctx, split="train", exclusions=exclusions))
     floors = b1_baselines.load_floors()

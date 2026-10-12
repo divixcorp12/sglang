@@ -214,7 +214,8 @@ def _gate_parts(*, cand_recall: float, cost_ms: float) -> dict:
     replay = {"candidate": "T2", "dev": dev, "noflag": {"gate": 0.3, "gate_floors": 0.32, "T2": cand_recall},
               "timing": {"cases": {"nominal": nominal}}}
     seeds = {"selection": {"candidate": "T2", "dev_by_seed": {"T2": {"0": cand_recall, "1": cand_recall, "2": cand_recall}}}}
-    return {"seeds": seeds, "calib": calib, "cost": {"gate_ms": cost_ms}, "replay": replay}
+    return {"seeds": seeds, "calib": calib, "cost": {"gate_ms": cost_ms, "subject": "T2"},
+            "replay": replay}
 
 
 def test_continuation_gate_compares_the_candidate_with_the_best_native_control():
@@ -225,6 +226,14 @@ def test_continuation_gate_compares_the_candidate_with_the_best_native_control()
     assert not slow["passed"] and not slow["values"]["arms"]["cost"]
     weak = r1_run._continuation(plan, **_gate_parts(cand_recall=0.33, cost_ms=0.05))
     assert not weak["passed"] and not weak["values"]["arms"]["recall"]
+
+
+def test_continuation_gate_is_not_evaluated_when_the_cost_subject_is_not_the_candidate():
+    plan = r1_plan.default_plan(dataset="d", corpus="c", b1_head="h", out_dir="o", inputs={})
+    parts = _gate_parts(cand_recall=0.40, cost_ms=0.05)
+    parts["cost"]["subject"] = "F0"
+    out = r1_run._continuation(plan, **parts)
+    assert not out["passed"] and "not evaluated" in out["reasons"][0]
 
 
 _SMOKE_ENV = ("SGLANG_R1_DATASET", "SGLANG_R1_MODEL", "SGLANG_R1_CORPUS", "SGLANG_R1_INTEGRITY", "SGLANG_R1_B1_HEAD")

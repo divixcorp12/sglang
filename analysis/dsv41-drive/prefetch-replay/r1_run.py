@@ -281,16 +281,18 @@ def _stage_audit(run: _Run) -> dict:
 
 
 def _stage_stage1(run: _Run) -> dict:
-    """F0 and the native controls under caps on dev and calib, histograms, timing (no delay) and the D3 gate."""
+    """F0 and the native controls under caps on dev and calib, histograms, timing with F0's measured delay, D3 gate."""
     ctx, plan = run.ctx, run.plan
     inputs = {**_common_inputs(run), "exclusions": r1_stage.sha256_file(_exclusions_path(ctx)),
               "b1_head": r1_stage.sha256_file(ctx.b1_head), "audit": _result_sha(ctx, "audit")}
 
     def compute() -> dict:
         windows, stamp_audit = _windows(ctx)
+        f0 = _Subject(name=r1_stage1.F0_HEAD, path=None, threshold=math.inf, note="F0 timed before the D3 gate")
+        f0_cost = _measure_cost(ctx, plan=plan, model=_subject_model(ctx, f0))
         out = r1_stage1.run_stage1(ctx, plan=plan, exclusions=r1_groups.load_exclusions(_exclusions_path(ctx)),
-                                   windows=windows)
-        return {**out, "stamp_audit": msgspec.to_builtins(stamp_audit), "label": plan.label}
+                                   windows=windows, scorer_delay_ms=_scorer_delays(f0_cost))
+        return {**out, "f0_cost": f0_cost, "stamp_audit": msgspec.to_builtins(stamp_audit), "label": plan.label}
 
     return _owned(ctx, "stage1", inputs=inputs, compute=compute)
 
@@ -387,6 +389,24 @@ def _read_set_diff(ctx: StageCtx, model: r1_models.R1Model, *, threshold: float,
     return r1_cost.read_set_diff(model, inputs=inputs, skips=skips, threshold=threshold, cap=cap)
 
 
+def _measure_cost(ctx: StageCtx, *, plan: RunPlan, model: r1_models.R1Model) -> dict:
+    """r1_cost.measure_complete on the intended gate layer; needs CUDA (used before the D3 gate and by the cost stage)."""
+    if not (ctx.device.startswith("cuda") and torch.cuda.is_available()):
+        raise RuntimeError(f"the cost measurement needs CUDA (got device {ctx.device!r}): "
+                           "run it with --device cuda under cc-gpu.lock on cores 32-63")
+    layer = _cost_layer(ctx)
+    W, bias = r1_gate.load_target_gates(ctx.model_path, layer_ids=[layer])[layer]
+    runs, warmup = (SMOKE_COST_RUNS, SMOKE_COST_WARMUP) if ctx.smoke else (COST_RUNS, COST_WARMUP)
+    result = r1_cost.measure_complete(model.to(ctx.device), W=W, bias=bias, cost=plan.cost,
+                                      tokens=plan.cost.live_tokens, runs=runs, warmup=warmup, device=ctx.device)
+    return {**result, "layer": layer}
+
+
+def _scorer_delays(cost: dict) -> dict[str, float]:
+    """Per-scorer replay delay: gate-only for the native gate controls, the complete scorer for everything else."""
+    return {**{n: float(cost["gate_only_ms"]) for n in r1_stage1.NATIVE_CONTROLS}, "*": float(cost["gate_ms"])}
+
+
 def _stage_cost(run: _Run) -> dict:
     """Complete offline scorer cost under a CUDA graph at the plan's live tokens, bf16 beside fp32 (D13, D17)."""
     ctx, plan = run.ctx, run.plan
@@ -396,19 +416,12 @@ def _stage_cost(run: _Run) -> dict:
               "threshold": repr(subject.threshold), "audit": _result_sha(ctx, "audit")}
 
     def compute() -> dict:
-        if not (ctx.device.startswith("cuda") and torch.cuda.is_available()):
-            raise RuntimeError(f"the cost stage needs CUDA (got device {ctx.device!r}): "
-                               "run it with --device cuda under cc-gpu.lock on cores 32-63")
-        layer = _cost_layer(ctx)
-        W, bias = r1_gate.load_target_gates(ctx.model_path, layer_ids=[layer])[layer]
         model = _subject_model(ctx, subject).to(ctx.device)
-        runs, warmup = (SMOKE_COST_RUNS, SMOKE_COST_WARMUP) if ctx.smoke else (COST_RUNS, COST_WARMUP)
-        result = r1_cost.measure_complete(model, W=W, bias=bias, cost=plan.cost, tokens=plan.cost.live_tokens,
-                                          runs=runs, warmup=warmup, device=ctx.device)
+        result = _measure_cost(ctx, plan=plan, model=model)
         diff = _read_set_diff(ctx, model, threshold=subject.threshold, cap=plan.cap_primary)
         threshold = None if math.isinf(subject.threshold) else subject.threshold
         return {**result, "read_set_diff_fraction": diff, "subject": subject.name, "subject_note": subject.note,
-                "checkpoint_sha256": inputs["checkpoint"], "threshold": threshold, "layer": layer,
+                "checkpoint_sha256": inputs["checkpoint"], "threshold": threshold,
                 "gpu": torch.cuda.get_device_name(), "label": plan.label}
 
     return _owned(ctx, "cost", inputs=inputs, compute=compute)
@@ -458,7 +471,7 @@ def _stage_replay(run: _Run) -> dict:
               "candidate_ckpt": r1_stage.sha256_file(candidate[1]) if candidate else "none"}
 
     def compute() -> dict:
-        delay = float(_load_result(ctx, "cost")["gate_ms"])
+        delay = _scorer_delays(_load_result(ctx, "cost"))
         windows, _ = _windows(ctx)
         pop = _pop(ctx)
         groups = {s: _groups(ctx, split=s) for s in r1_stage1.SPLITS}
@@ -533,6 +546,10 @@ def _continuation(plan: RunPlan, *, seeds: dict, calib: dict, cost: dict, replay
     candidate = seeds["selection"]["candidate"]
     if replay["candidate"] != candidate:
         raise RuntimeError(f"replay scored {replay['candidate']!r}, the selection is {candidate!r}: rerun replay")
+    if cost["subject"] != candidate:
+        # r1_cost times plain R1 heads only; a raw-x candidate (T5, G0) has no complete-scorer cost here.
+        return _not_evaluated(f"complete scorer cost not measured for candidate {candidate!r} "
+                              f"(cost subject {cost['subject']!r}); cost and nominal-timing arms are not evaluated")
     cap = str(plan.continuation_gate.cap)
 
     def arm(name: str) -> dict:

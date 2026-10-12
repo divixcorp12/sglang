@@ -39,6 +39,7 @@ import r1_groups  # noqa: E402
 import r1_models  # noqa: E402
 import r1_policy  # noqa: E402
 import r1_stage  # noqa: E402
+import r1_stage1  # noqa: E402
 import r1_train  # noqa: E402
 from r1_groups import R1Group  # noqa: E402
 from r1_plan import ArmSpec, RunPlan  # noqa: E402
@@ -47,7 +48,6 @@ from r1_stage import StageCtx  # noqa: E402
 # Written by the audit stage; the driver and this module must agree on the name.
 EXCLUSIONS_REL = os.path.join("stages", "audit", "exclusions.json")
 RESULT_NAME = "result.json"
-_SMOKE_GROUPS = 256  # arbitrary; keeps --smoke runs to seconds
 _SMOKE_EPOCHS = 1
 _CALIB_CHUNK = 1024  # groups per scoring forward; arbitrary, only bounds memory
 _CHAIN_ROOT = "T0"
@@ -132,10 +132,9 @@ def _ckpt_hashes(results: dict[str, r1_train.ArmResult]) -> dict[str, str]:
 
 def _read_groups(ctx: StageCtx, *, split: str, horizon: int) -> list[R1Group]:
     exclusions = r1_groups.load_exclusions(_exclusions_path(ctx))
-    stream = r1_groups.read_r1_groups(ctx.dataset, split=split, horizon=horizon, exclusions=exclusions)
-    if ctx.smoke:
-        stream = itertools.islice(stream, _SMOKE_GROUPS)
-    return list(stream)
+    # Same smoke subset as Stage 1 and the driver: the first SMOKE_SESSIONS sessions of the split.
+    return list(r1_groups.read_r1_groups(ctx.dataset, split=split, horizon=horizon, exclusions=exclusions,
+                                         sessions=r1_stage1.smoke_sessions(ctx, split=split)))
 
 
 def _target_gates(ctx: StageCtx, *, groups: list[R1Group]) -> dict:
