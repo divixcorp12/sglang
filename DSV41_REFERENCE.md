@@ -9378,7 +9378,7 @@ seed-0 checkpoint) or G0 (a learned low-rank correction to the native gate's ful
 T3 and the native gate at L+1, and the better one at L+2, with a scorer cost measured the way serving would pay it?
 Offline only: no serving code, capture or A/B. Every number is **exploratory on reused data; independent confirmation
 pending**. Locked_test shards are never loaded; R1's and B1's run directories, selection files and verdicts are
-untouched. No real-data result exists yet: every result below is `pending`.
+untouched. No real-data result exists yet (the full study is started after merge): every study result below is `pending`.
 
 **Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_r2_<module>.py`; R1 modules change
 only additively):
@@ -9472,10 +9472,10 @@ the affected files; `--gpu -s` for the CUDA cost tests. The real-data smoke need
 
 | Check | Files | Result | Exit |
 |---|---|---|---|
-| `py_compile` | `r2_*.py`, `r1_cache.py` | pending | pending |
-| `divix01-pytest` (CPU) | `test_r2_plan.py`, `test_r2_arms.py`, `test_r2_eval.py`, `test_r2_report.py`, `test_r2_run.py` | pending | pending |
-| `divix01-pytest` (CPU, R1 regression) | `test_r1_cache.py`, `test_r1_train.py`, `test_r1_run.py`, ... | pending | pending |
-| `divix01-pytest --gpu` | `test_r2_cost.py`, `test_r1_cost.py` | pending | pending |
+| `py_compile` | `r2_*.py`, `r1_cache.py` | clean | 0 |
+| `divix01-pytest` (CPU) | `test_r2_cache.py`, `test_r2_plan.py`, `test_r2_arms.py`, `test_r2_eval.py`, `test_r2_report.py`, `test_r2_run.py` (one run with the R1 regression files below) | 306 passed, 3 skipped (combined run) | 0 |
+| `divix01-pytest` (CPU, R1 regression) | `test_r1_cache.py`, `test_r1_train.py`, `test_r1_run.py`, ... | included in the combined run above | 0 |
+| `divix01-pytest --gpu` | `test_r2_cost.py`, `test_r1_cost.py`, `test_b1_cost.py` | 14 passed | 0 |
 
 **Results** (exploratory on reused data; independent confirmation pending). Run directory
 `divix01:/mnt/nvme1/nvfp4-work/b1-r2-<date>/`; worktree and commit pending.
