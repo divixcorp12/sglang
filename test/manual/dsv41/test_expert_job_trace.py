@@ -10,7 +10,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def trace_probe(tmp_path_factory):
-    root = Path(__file__).resolve().parents[4]
+    root = Path(__file__).resolve().parents[3]
     work = tmp_path_factory.mktemp("job-trace-build")
     source = work / "probe.cpp"
     source.write_text(r'''
@@ -110,7 +110,7 @@ def test_thread_resource_snapshots_observe_faults_and_sleep(trace_probe, tmp_pat
 
 def test_classifier_respects_dma_completion_interval(tmp_path):
     import importlib.util
-    script = Path(__file__).resolve().parents[4] / "benchmarks/dsv41_baseline/expert_job_trace.py"
+    script = Path(__file__).resolve().parents[3] / "benchmarks/dsv41_baseline/expert_job_trace.py"
     spec = importlib.util.spec_from_file_location("expert_job_trace", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
