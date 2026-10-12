@@ -7,6 +7,9 @@ from sglang.srt.layers.moe.expert_residency import (
     TransferPriority,
     decide_residency_policies_from_host_scores,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestExpertResidencyPolicy(unittest.TestCase):
