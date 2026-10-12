@@ -280,7 +280,11 @@ def _ancestry(state: _Ladder, name: str) -> list[str]:
 
 
 def _choose_candidate(state: _Ladder, *, plan: RunPlan) -> str:
-    """D8 over the ladder's final arm and G0: best dev recall, ties to fewer parameters."""
+    """D8 over the ladder's final arm and G0 at the screen seed: best dev recall, ties to fewer parameters.
+
+    Scorer cost is not measured before r1_cost runs, so it is not a tie-break here. The pick is fixed at the
+    screen seed; stage_seeds repeats only the picked ancestry and T0, and records this rule in its selection.
+    """
     chain = [s.name for s in plan.arms if s.name != _REFERENCE and not s.g0 and s.name in state.kept]
     finals = {state.kept[chain[-1]]} if chain else set()
     if _CHALLENGER_LINE in state.kept:
@@ -350,6 +354,8 @@ def _selection(train: dict, *, repeats: dict[str, dict[str, dict]]) -> dict:
             by_seed[n][seed] = _dev_recall(msgspec.convert(results[n], r1_train.ArmResult))
     names = sorted({*arms, _REFERENCE})
     return {"candidate": candidate, "ancestry": ancestry,
+            "rule": "candidate fixed at the screen seed (best dev recall, ties to fewer parameters); "
+                    "repeat seeds measure its stability and T0's, not the G0-vs-ladder choice",
             "median_dev": statistics.median(by_seed[candidate].values()), "dev_by_seed": by_seed,
             "median_by_arm": {n: statistics.median(v.values()) for n, v in by_seed.items()},
             "ckpts": {n: _ckpt_record(train["arms"][n]) for n in names}, "horizon": 1, "seed": train["seed"]}
@@ -479,10 +485,13 @@ def calibrate(cands: dict[str, list[r1_policy.Candidates]], *, labels: list, cap
     return out
 
 
-def stage_calib(ctx: StageCtx, *, plan: RunPlan, selection: dict, stage1_scorers: dict) -> dict:
-    """{scorer: {cap: {threshold, point}}} on calib at L+1; stage1_scorers maps name -> GroupScorer (native controls)."""
+def stage_calib(ctx: StageCtx, *, plan: RunPlan, selection: dict, stage1_scorers: dict, stage1_sha: str) -> dict:
+    """{scorer: {cap: {threshold, point}}} on calib at L+1; stage1_scorers maps name -> GroupScorer (native controls).
+
+    stage1_sha is the stage-1 DONE sha256 (floors and controls included), so a changed control reruns calib.
+    """
     inputs = {**_base_inputs(ctx, plan=plan), "selection": r1_stage.sha256_json(selection),
-              "scorers": r1_stage.sha256_json(sorted(stage1_scorers))}
+              "scorers": r1_stage.sha256_json(sorted(stage1_scorers)), "stage1": stage1_sha}
     hit = _cached(ctx, "calib", inputs=inputs)
     if hit is not None:
         return {name: {int(c): v for c, v in caps.items()} for name, caps in hit["scorers"].items()}
