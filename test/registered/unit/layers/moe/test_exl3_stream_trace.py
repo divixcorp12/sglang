@@ -572,7 +572,7 @@ def test_router_capture_holds_every_token_of_a_verify_forward(tmp_path, monkeypa
     log.poll(trace, final=True)
     trace.close()
     header, x, ids, w, keys = _load_router(prefix)
-    assert header["schema"] == 2 and header["tokens"] == tokens
+    assert header["schema"] == module.ROUTER_CAPTURE_SCHEMA and header["tokens"] == tokens
     assert x.shape == (5, layers, tokens, 16) and ids.shape == w.shape == (5, layers, tokens, 6)
     assert keys[:, 2].tolist() == live
     lines = [json.loads(line) for line in path.read_text().splitlines()]
@@ -623,3 +623,115 @@ def test_load_forwards_marks_verify_forwards_and_keeps_their_router_record(tmp_p
     assert [f["verify"] for f in forwards] == [True, False]
     assert [f["router"] for f in forwards] == [0, None]
     assert forwards[0]["tokens"] == 6
+
+
+def _residency_input(step, row, tokens=2, topk=6):
+    """Step- and layer-dependent records, as the snapshot and label kernels write them; mask word 0 is -1 so the
+    loader must read the int64 ring as uint64 words, not values."""
+    masks = (torch.arange(24, dtype=torch.int64) + 1000 * step + 100 * row).reshape(4, 6)
+    masks[0, 0] = -1
+    valid = torch.tensor([(step + row + h) % 2 for h in range(4)], dtype=torch.uint8)
+    snap_stamp = torch.tensor([10**15 + 10 * step + row], dtype=torch.int64)
+    kinds = ((torch.arange(tokens * topk) + step + row) % 6).to(torch.uint8).reshape(tokens, topk)
+    label_stamp = snap_stamp + 5
+    return dict(masks=masks, valid=valid, snap_stamp=snap_stamp, kinds=kinds, label_stamp=label_stamp)
+
+
+def _assert_residency_record(loaded, record, step, row):
+    want = _residency_input(step, row)
+    assert loaded.masks[record, row].tolist() == want["masks"].numpy().view("uint64").tolist()
+    assert loaded.valid[record, row].tolist() == [bool(v) for v in want["valid"].tolist()]
+    assert int(loaded.snap_stamp[record, row]) == int(want["snap_stamp"])
+    assert loaded.kinds[record, row].tolist() == want["kinds"].tolist()
+    assert int(loaded.label_stamp[record, row]) == int(want["label_stamp"])
+
+
+def _residency_log(tmp_path, *, layer_ids, depth=8, margin=2, router=False):
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.layers.moe.residency_capture import residency_rows
+
+    log = module.GraphRouteLog(layers=len(layer_ids), width=8, device="cpu", depth=depth, margin=margin)
+    if router:
+        log.enable_router(str(tmp_path / "router"))
+    gates = {layer_ids[0]: SimpleNamespace(bias=torch.zeros(4)), layer_ids[1]: SimpleNamespace(bias=None)}
+    log.enable_residency(str(tmp_path / "router.res"), rows=residency_rows(layer_ids, gates=gates))
+    for row, layer in enumerate(layer_ids):
+        log.bind(row, layer, 28)
+    return log
+
+
+def _residency_forward(log, step, router=False):
+    for row in range(log.layers):
+        log.record(row, torch.tensor(_forward_routes(step, log.layers)[row]), torch.tensor([1], dtype=torch.int32))
+        if router:
+            log.record_router(row, *_router_input(step, row))
+        log.record_residency(row, **_residency_input(step, row))
+
+
+def test_residency_capture_round_trips_with_its_row_header_joined_to_router_and_route_lines(tmp_path, monkeypatch):
+    """Record i of the residency files is the forward of router record i and of the i-th route line (same seq and
+    pass id), past the warmup and through a wrapping ring; the header names each row's layer, stratum and gate."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.layers.moe.residency_capture import load_residency
+
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = _residency_log(tmp_path, layer_ids=[14, 20, 37], router=True)
+    monkeypatch.setattr(module, "capturing_graphs", lambda: True)
+    _residency_forward(log, 99, router=True)  # warmup: sizes the rings, never written
+    monkeypatch.setattr(module, "capturing_graphs", lambda: False)
+    for step in range(12):
+        log.on_pre_forward(300 + step, _decode_batch("r"))
+        _residency_forward(log, step, router=True)
+        if step % 3 == 2:
+            log.poll(trace)
+    log.poll(trace, final=True)
+    trace.close()
+    loaded = load_residency(str(tmp_path / "router.res"))
+    assert [(r.layer_id, r.stratum, r.gate_has_bias) for r in loaded.rows] == [
+        (14, "enters engram", True), (20, "19->20", False), (37, "late", False)
+    ]
+    assert loaded.validity_rule == "invalid: no target row"
+    assert loaded.header["schema"] == module.ROUTER_CAPTURE_SCHEMA == 3
+    steps = [json.loads(line) for line in path.read_text().splitlines()][1:]
+    _, _, _, _, router_keys = _load_router(str(tmp_path / "router"))
+    assert loaded.keys.tolist() == router_keys.tolist()
+    assert loaded.keys[:, 0].tolist() == [line["seq"] for line in steps]
+    assert loaded.keys[:, 1].tolist() == [300 + step for step in range(12)]
+    for step in range(12):
+        for row in range(3):
+            _assert_residency_record(loaded, step, step, row)
+
+
+def test_residency_capture_skips_a_lost_forward_and_counts_it_dropped(tmp_path):
+    """Forwards overwritten before a read leave a seq gap in the residency keys, counted in ``dropped``; every
+    surviving record is its own forward's, never a neighbour's."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.layers.moe.residency_capture import load_residency
+
+    trace = module.Exl3StreamTrace(str(tmp_path / "trace.jsonl"))
+    log = _residency_log(tmp_path, layer_ids=[3, 4], depth=4, margin=1)
+    _residency_forward(log, 0)
+    log.poll(trace)
+    for step in range(1, 7):  # six forwards between reads: the ring holds four
+        _residency_forward(log, step)
+    log.poll(trace)
+    trace.close()
+    loaded = load_residency(str(tmp_path / "router.res"))
+    assert loaded.keys[:, 0].tolist() == [0, 3, 4, 5, 6] and log.dropped == 2
+    for record, step in enumerate([0, 3, 4, 5, 6]):
+        for row in range(2):
+            _assert_residency_record(loaded, record, step, row)
+
+
+def test_residency_capture_off_adds_no_ring_and_a_header_without_rows_is_refused(tmp_path):
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.layers.moe.residency_capture import load_residency
+
+    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=8, margin=2)
+    _log_forward(log, 0, 1)
+    assert log.residency is None and log.residency_rings is None and len(log._ring()) == 4
+    prefix = str(tmp_path / "old.res")
+    (tmp_path / "old.res.json").write_text(json.dumps({"schema": 2, "layer_ids": [3], "tokens": 1, "topk": 6}))
+    with pytest.raises(ValueError, match="per-row"):
+        load_residency(prefix)

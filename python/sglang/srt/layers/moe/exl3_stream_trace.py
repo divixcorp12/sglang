@@ -32,6 +32,11 @@ from typing import Any, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.residency_capture import (
+    ResidencyCapture,
+    ResidencyRings,
+    ResidencyRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +87,9 @@ RAM_MISS_TRACE_SCHEMA = 7
 #    keeps its meaning.
 ROUTE_LOG_SCHEMA = 2
 # The RouterCapture side files' own layout; <prefix>.json states it.
-ROUTER_CAPTURE_SCHEMA = 2
+# 3: adds the residency side files (residency_capture), with their own .json header;
+#    the router files are unchanged.
+ROUTER_CAPTURE_SCHEMA = 3
 
 
 def _stream_capturing() -> bool:
@@ -216,6 +223,10 @@ class GraphRouteLog:
     also written to the RouterCapture side files. Without it no router tensor exists
     and nothing calls ``record_router``.
 
+    ``enable_residency`` likewise adds the residency rings (``residency_capture``):
+    ``record_residency`` copies each layer's snapshot and label records into the slot,
+    and every emitted forward is appended to the residency side files.
+
     Warmup forwards before capture execute these copies too. ``warmup`` counts them,
     from the Python calls made in capture mode outside a stream capture (a capture
     records the copies but runs none), and no entry below it is written.
@@ -254,6 +265,8 @@ class GraphRouteLog:
         self.router_x: Optional[torch.Tensor] = None
         self.router_ids: Optional[torch.Tensor] = None
         self.router_w: Optional[torch.Tensor] = None
+        self.residency: Optional[ResidencyCapture] = None
+        self.residency_rings: Optional[ResidencyRings] = None
 
     def bind(self, row: int, layer_id: int, capacity: int) -> None:
         """Name ring row ``row``: its layer id and hot-slot capacity."""
@@ -277,6 +290,16 @@ class GraphRouteLog:
         The rings are sized by the first ``record_router`` call, a warmup forward's.
         """
         self.router = RouterCapture(prefix)
+
+    def enable_residency(self, prefix: str, *, rows: list[ResidencyRow]) -> None:
+        """Also capture each layer's residency snapshot and route labels into ``prefix`` files.
+
+        ``rows`` is one header entry per ring row. The rings are sized by the first
+        ``record_residency`` call, a warmup forward's.
+        """
+        if len(rows) != self.layers:
+            raise ValueError(f"residency capture needs {self.layers} rows, got {len(rows)}")
+        self.residency = ResidencyCapture(prefix, rows=rows, schema=ROUTER_CAPTURE_SCHEMA)
 
     def ring_bytes(self) -> int:
         """Device bytes held by the rings."""
@@ -371,6 +394,46 @@ class GraphRouteLog:
             0, self.slot, topk_weights.reshape(1, tokens, topk).float()
         )
 
+    def record_residency(
+        self,
+        row: int,
+        *,
+        masks: torch.Tensor,
+        valid: torch.Tensor,
+        snap_stamp: torch.Tensor,
+        kinds: torch.Tensor,
+        label_stamp: torch.Tensor,
+    ) -> None:
+        """Log one layer's residency snapshot and route labels into the slot (layout in ``residency_capture``).
+
+        Captured in the graph. Must follow the layer's ``record``: row 0's takes the
+        slot. ``masks`` int64 [4, 6], ``valid`` uint8 [4], the stamps int64 [1] and
+        ``kinds`` uint8 [tokens, topk]; the first call sizes the rings like ``record_router``.
+        """
+        if self.residency_rings is None:
+            if self.residency is None:
+                raise RuntimeError("record_residency needs enable_residency first")
+            if _stream_capturing() or self._host is not None:
+                raise RuntimeError(
+                    "the residency rings must be allocated by a warmup forward, before capture and reads"
+                )
+            self.residency_rings = ResidencyRings(
+                depth=self.depth,
+                layers=self.layers,
+                tokens=int(kinds.shape[0]),
+                topk=int(kinds.shape[-1]),
+                device=self.routes.device,
+            )
+        self.residency_rings.record(
+            row,
+            self.slot,
+            masks=masks,
+            valid=valid,
+            snap_stamp=snap_stamp,
+            kinds=kinds,
+            label_stamp=label_stamp,
+        )
+
     def read_seq(self) -> int:
         """Graph forwards run so far.
 
@@ -387,6 +450,7 @@ class GraphRouteLog:
             if self.router_x is not None
             else []
         )
+        ring += self.residency_rings.tensors() if self.residency_rings is not None else []
         return ring
 
     def tensors(self) -> list[torch.Tensor]:
@@ -439,9 +503,11 @@ class GraphRouteLog:
             self._header_written = True
         seq_tensor, routes, misses, pass_ids = ring[:4]
         hot = ring[4] if self.hot is not None else None
+        rest = ring[4 + (hot is not None) :]
         router_x, router_ids, router_w = (
-            ring[-3:] if self.router_x is not None else (None, None, None)
+            rest[:3] if self.router_x is not None else (None, None, None)
         )
+        residency = rest[3:] if self.router_x is not None else rest
         seq = int(seq_tensor[0])
         end = seq if complete else seq - 1
         start = max(self.next_seq, self.warmup)
@@ -466,6 +532,17 @@ class GraphRouteLog:
                     router_ids[slot],
                     router_w[slot],
                 )
+            if residency:
+                self.residency.write(
+                    run=self.run,
+                    depth=self.depth,
+                    keys=(s, pass_id, int((meta or {}).get("tokens", 0))),
+                    masks=residency[0][slot],
+                    valid=residency[1][slot],
+                    snap_stamp=residency[2][slot],
+                    kinds=residency[3][slot],
+                    label_stamp=residency[4][slot],
+                )
             trace.record_graph_route_step(
                 s,
                 [[int(e) for e in row if e >= 0] for row in routes[slot].tolist()],
@@ -486,6 +563,8 @@ class GraphRouteLog:
         if self.router is not None:
             # The scheduler may be SIGKILLed at shutdown, like the stage trace's lines.
             self.router.flush()
+        if self.residency is not None:
+            self.residency.flush()
 
 
 class Exl3StreamTrace:
