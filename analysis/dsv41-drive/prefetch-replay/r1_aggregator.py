@@ -50,8 +50,11 @@ def block_features(token_logits: torch.Tensor, *, live: torch.Tensor, position: 
     # noisy-or of sigmoid(l) in logit space: 1 - prod(1 - p) = 1 - exp(-sum softplus(l))
     soft = torch.where(liv, F.softplus(token_logits), zero).sum(dim=1)
     noisy = -torch.expm1(-soft)
-    feats = [anchor, anchor_present, draft, draft_present.to(token_logits.dtype), peak, mean,
-             var.clamp_min(0.0).sqrt(), total, noisy, count.expand_as(anchor)]
+    # Safe sqrt: sqrt(0) has an infinite gradient that turns into NaN for single-token groups.
+    pos_var = var > 0
+    std = torch.where(pos_var, torch.where(pos_var, var, torch.ones_like(var)).sqrt(), torch.zeros_like(var))
+    feats = [anchor, anchor_present, draft, draft_present.to(token_logits.dtype).expand_as(anchor), peak, mean,
+             std, total, noisy, count.expand_as(anchor)]
     return torch.stack(feats, dim=-1)
 
 
