@@ -28,6 +28,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
 sys.path.insert(0, os.path.join(REPO, "analysis", "dsv41-drive", "router-capture"))
 sys.path.insert(0, HERE)
+import b1_cache  # noqa: E402
 import b1_head  # noqa: E402
 import b1_rows  # noqa: E402
 import b1_score  # noqa: E402
@@ -155,6 +156,57 @@ def train_head(cfg: b1_head.HeadConfig, tcfg: TrainConfig, *, train_groups: Call
     model.eval()
     return model, {"history": history, "best_epoch": best_epoch, "best_dev_recall_at_1": best_recall,
                    "best_dev_table": b1_score.table_to_json(best_table)}
+
+
+def train_head_cached(cfg: b1_head.HeadConfig, tcfg: TrainConfig, *, train_cache: b1_cache.SplitCache,
+                      dev_cache: b1_cache.SplitCache, pca, vocab: b1_head.Vocab) -> tuple[b1_head.B1Head, dict]:
+    """train_head over device-resident split caches: rows shuffled per epoch, early stop on the device recall@1.
+
+    The caches must be built with this ``pca`` and ``vocab``. Callers score the restored model with b1_score
+    (dev_table) for selection.
+    """
+    torch.manual_seed(tcfg.seed)
+    device = train_cache.row_group.device
+    gen = torch.Generator(device=device).manual_seed(tcfg.seed)
+    model = b1_head.B1Head(cfg, pca=pca, vocab=vocab).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
+    steps = math.ceil(train_cache.rows / tcfg.batch_rows)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, _cosine(tcfg.epochs * steps))
+    predict = _predictor(model, tcfg)
+
+    history: list[dict] = []
+    best_recall, best_epoch, best_state = -1.0, -1, None
+    for epoch in range(tcfg.epochs):
+        model.train()
+        perm = torch.randperm(train_cache.rows, generator=gen, device=device)
+        total = torch.zeros((), device=device)
+        for a in range(0, train_cache.rows, tcfg.batch_rows):
+            idx = perm[a:a + tcfg.batch_rows]
+            batch = b1_cache.take(train_cache, idx, variant=cfg.variant)
+            loss = b1_head.head_loss(predict(model.inputs(batch)), batch, cfg=cfg)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            sched.step()
+            total += loss.detach() * len(idx)
+        model.eval()
+        recall = b1_cache.recall_at_1(dev_cache, b1_cache.predict(model, dev_cache))
+        history.append({"epoch": epoch, "loss": float(total) / train_cache.rows, "dev_recall_at_1": recall})
+        if recall > best_recall:
+            best_recall, best_epoch = recall, epoch
+            best_state = copy.deepcopy(model.state_dict())
+        elif epoch - best_epoch >= tcfg.patience:
+            break
+    model.load_state_dict(best_state)
+    model.eval()
+    return model, {"history": history, "best_epoch": best_epoch, "best_dev_recall_at_1": best_recall}
+
+
+def dev_table(model: b1_head.B1Head, *, dev_cache: b1_cache.SplitCache, dev_groups: Iterable[b1_rows.Group],
+              name: str) -> b1_score.Table:
+    """b1_score's exact table for the cached dev split, every read budget."""
+    scorer = b1_cache.CachedHeadScorer(model, cache=dev_cache, name=name)
+    return b1_score.evaluate(dev_groups, scorer, reads=b1_score.READS)
 
 
 def make_x_of(dataset_dir: str) -> Callable[[b1_rows.Group], np.ndarray]:

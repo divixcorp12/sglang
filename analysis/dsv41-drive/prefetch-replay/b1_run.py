@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -36,6 +37,7 @@ sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
 sys.path.insert(0, os.path.join(REPO, "analysis", "dsv41-drive", "router-capture"))
 sys.path.insert(0, HERE)
 import b1_baselines  # noqa: E402
+import b1_cache  # noqa: E402
 import b1_cost  # noqa: E402
 import b1_dataset  # noqa: E402
 import b1_head  # noqa: E402
@@ -312,38 +314,74 @@ def _head_key(kwargs: dict) -> str:
     return f"{kwargs['variant']}_r{kwargs['pca_rank']}_h{kwargs['hidden']}_w{kwargs['hard_neg_weight']}"
 
 
-def _train_one(ctx: _Ctx, *, horizon: int, kwargs: dict, out: str) -> tuple[dict, b1_score.Table]:
+class _Caches(msgspec.Struct):
+    train: b1_cache.SplitCache
+    dev: b1_cache.SplitCache
+    pca: PCAStats
+    vocab: b1_head.Vocab
+
+
+def _caches(ctx: _Ctx, *, horizon: int, pca: PCAStats, vocab: b1_head.Vocab,
+            sessions: list[str] | None = None) -> _Caches:
+    """Device-resident train (optionally a session subset) and dev caches built with ``pca``."""
+    device = ctx.cfg.train.device
+    pca = PCAStats(mean=pca.mean.to(device), components=pca.components.to(device),
+                   explained_variance=pca.explained_variance.to(device))
+
+    def build(split: str, subset: list[str] | None) -> b1_cache.SplitCache:
+        return b1_cache.build(_groups(ctx, split=split, horizon=horizon, sessions=subset), x_of=_x_of(ctx), pca=pca,
+                              vocab=vocab, num_experts=ctx.cfg.num_experts)
+
+    return _Caches(train=build("train", sessions), dev=build("dev", None), pca=pca, vocab=vocab)
+
+
+def _vocab(ctx: _Ctx, *, horizon: int) -> b1_head.Vocab:
+    return b1_head.Vocab.from_rows(itertools.chain(_groups(ctx, split="train", horizon=horizon),
+                                                   _groups(ctx, split="dev", horizon=horizon)))
+
+
+def _train_one(ctx: _Ctx, *, horizon: int, kwargs: dict, out: str, caches: _Caches) -> tuple[dict, b1_score.Table]:
     cfg = b1_head.HeadConfig(**{**kwargs, "num_experts": ctx.cfg.num_experts})
-    pca = _load_pca(ctx, rank=cfg.pca_rank)
-    x_of = _x_of(ctx)
-    model, history = b1_train.train_head(
-        cfg, ctx.cfg.train, train_groups=lambda: _groups(ctx, split="train", horizon=horizon),
-        dev_groups=lambda: _groups(ctx, split="dev", horizon=horizon), x_of=x_of, pca=pca)
+    model, history = b1_train.train_head_cached(cfg, ctx.cfg.train, train_cache=caches.train, dev_cache=caches.dev,
+                                                pca=caches.pca, vocab=caches.vocab)
     key = _head_key(kwargs)
-    scorer = b1_head.HeadScorer(model, x_of=x_of, name=key)
-    table = b1_score.evaluate(_groups(ctx, split="dev", horizon=horizon), scorer, reads=b1_score.READS)
+    table = b1_train.dev_table(model, dev_cache=caches.dev, dev_groups=_groups(ctx, split="dev", horizon=horizon),
+                               name=key)
     path = os.path.join(out, "heads", f"h{horizon}_{key}.pt")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     sha = b1_head.save_head(path, model.cpu())
     entry = {"variant": cfg.variant, "config": msgspec.to_builtins(cfg), "path": path, "sha256": sha,
-             "best_epoch": history["best_epoch"], "dev_precision_r1": table.cells["reads=1"]["pooled"].precision}
+             "best_epoch": history["best_epoch"], "history": history["history"],
+             "dev_precision_r1": table.cells["reads=1"]["pooled"].precision}
     return entry, table
+
+
+def _release_device_memory() -> None:
+    # Callers drop their cache reference first; a rank-256 E5 train cache is several GB.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _stage_train(ctx: _Ctx) -> dict:
     """Grid and train each head per horizon on train, early-stopped on dev; pick by dev precision at 1 read.
 
-    Needs the GPU when --device cuda: run under cc-gpu.lock.
+    Caches are built once per (horizon, PCA rank) and shared by that rank's configs. Needs the GPU when --device
+    cuda: run under cc-gpu.lock.
     """
     out = _stage_dir(ctx, "train")
     summary = {}
     for h in ctx.cfg.horizons:
-        entries, tables = {}, {}
-        for variant in VARIANTS:
-            for kwargs in ctx.cfg.grids[variant]:
-                entry, table = _train_one(ctx, horizon=h, kwargs=kwargs, out=out)
-                entries[table.scorer] = entry
-                tables[table.scorer] = table
+        vocab = _vocab(ctx, horizon=h)
+        configs = [kwargs for variant in VARIANTS for kwargs in ctx.cfg.grids[variant]]
+        done: dict[str, tuple[dict, b1_score.Table]] = {}
+        for rank in sorted({kw["pca_rank"] for kw in configs}):
+            caches = _caches(ctx, horizon=h, pca=_load_pca(ctx, rank=rank), vocab=vocab)
+            for kwargs in (kw for kw in configs if kw["pca_rank"] == rank):
+                done[_head_key(kwargs)] = _train_one(ctx, horizon=h, kwargs=kwargs, out=out, caches=caches)
+            del caches
+            _release_device_memory()
+        entries = {_head_key(kw): done[_head_key(kw)][0] for kw in configs}
+        tables = {_head_key(kw): done[_head_key(kw)][1] for kw in configs}
         best_by_variant = {v: b1_select.pick_best({k: t for k, t in tables.items() if entries[k]["variant"] == v})
                            for v in VARIANTS}
         _save_tables(os.path.join(out, f"dev_h{h}.json"), tables)
@@ -359,7 +397,7 @@ def _stage_curve(ctx: _Ctx) -> dict:
     train = _load_json(os.path.join(_stage_dir(ctx, "train"), "train.json"))[str(h)]
     sessions = _train_sessions(ctx)
     subsets = b1_train.nested_subsets(sessions, fractions=ctx.cfg.curve_fractions, seed=ctx.cfg.seed)
-    x_of = _x_of(ctx)
+    vocab = _vocab(ctx, horizon=h)
     curve, sizes, improving = {}, [len(s) for s in subsets], {}
     for variant in VARIANTS:
         entry = train["configs"][train["best_by_variant"][variant]]
@@ -372,10 +410,14 @@ def _stage_curve(ctx: _Ctx) -> dict:
             # The subset's own PCA: no statistic of the sessions it leaves out reaches it.
             pca = b1_head.fit_train_pca_from_shards(ctx.dataset_dir, sessions=subset, rank=cfg.pca_rank,
                                                     max_rows=b1_train.PCA_MAX_ROWS, seed=ctx.cfg.train.seed)
-            _, hist = b1_train.train_head(
-                cfg, ctx.cfg.train, train_groups=lambda s=subset: _groups(ctx, split="train", horizon=h, sessions=s),
-                dev_groups=lambda: _groups(ctx, split="dev", horizon=h), x_of=x_of, pca=pca)
-            values.append(hist["best_dev_table"]["cells"]["reads=1"]["pooled"]["precision"])
+            caches = _caches(ctx, horizon=h, pca=pca, vocab=vocab, sessions=subset)
+            model, _ = b1_train.train_head_cached(cfg, ctx.cfg.train, train_cache=caches.train,
+                                                  dev_cache=caches.dev, pca=caches.pca, vocab=vocab)
+            table = b1_train.dev_table(model, dev_cache=caches.dev, dev_groups=_groups(ctx, split="dev", horizon=h),
+                                       name=variant)
+            values.append(table.cells["reads=1"]["pooled"].precision)
+            del caches, model
+            _release_device_memory()
         curve[variant] = dict(zip(LEARNING_LABELS, values, strict=True))
         improving[variant] = b1_select.still_improving(*values)
     result = {"curve": curve, "sizes": sizes, "still_improving": improving}
