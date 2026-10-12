@@ -8953,6 +8953,149 @@ The gate's checks on the merged feature, on divix01 (`divix01-pytest`, GPU lane 
 | `scripts/lint/check_no_bare_pytest_main.py` | passed | 0 |
 | GPU: `test_residency_capture_cuda.py`, `test_exl3_ram_miss_graph_gpu.py` | 10 passed, 15 warnings in 23.78 s | 0 |
 
+### 33.26 B1/B2: learned L+1..L+4 expert predictor against the native gate (2026-10-12)
+
+Track B1 and B2 of `RAM_PREFETCH_PREDICTOR_HANDOFF.md`. On the locked-test sessions of the §33.25 corpus, does a
+learned head beat the native gate (with and without the packaged margin floors) at predicting the rows that will be NVMe
+misses at demand, at equal reads per layer? The verdict is on L+1 only; L+2 and L+4 are evidence for the lead-time lever
+with no bar. The feature's checks build and test the code on synthetic blocks (gate run: `py_compile` exit 0; CPU suite
+96 passed, 1 skipped, exit 0; `--gpu` `test_b1_cost.py` 2 passed, exit 0; `check_no_bare_pytest_main.py` exit 0);
+**every number below is `pending`**, filled by the orchestrating session after the merge.
+
+**Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_b1_<module>.py`):
+
+| Tool | Role |
+|---|---|
+| `b1_rows.py` | The Group contract (row identity, labels, masks, gate top-12) and shard I/O |
+| `b1_extract.py` | Per-session extraction from a B0 block: joins route log, router capture and residency files, decodes the gate |
+| `b1_dataset.py` | Builds per-split, per-horizon shards and `dataset.json` (row, eligible-row and dropped-cell counts) |
+| `b1_score.py` | The one shared scoring function and metrics (recall, precision, never-candidate recovery, saving) |
+| `b1_baselines.py` | Gate (with and without floors), `prev` and `pop` scorers |
+| `b1_head.py`, `b1_train.py` | The E2/E5 head and its training (PCA fit on training rows only) |
+| `b1_select.py` | Grid, cut calibration, selection file, locked-test guard, learning curve, bootstrap, verdict |
+| `b1_cost.py` | Scorer bytes (bf16) and CUDA-graph median time for 6 tokens, one layer |
+| `b1_report.py`, `b1_run.py` | Markdown rendering; the resumable driver over all stages |
+
+**Corpus and split.** `divix01:/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012` (100 sessions, blocks b000-b003, 19
+drive-flagged, 4 warm-start). Whole-session split train 60 / dev 15 / calib 10 / locked_test 15. Warm-up forwards
+(`rids == []`) and the integrity report's one non-tie mismatch cell (b000 seq 1283, layer 39, token 1) are dropped and
+counted. Flagged sessions are kept; every final table also reports the pooled result without them.
+
+**Shard layout.** Each session has one x shard (uint16 bf16 words, [N, 5120]) per split, written once; each horizon
+(1, 2, 4) has its own group shards per session that hold labels, masks, gate top-12 and identity, and point into the x
+shard by `x_offset`. x is never copied per horizon. Readers stream shard by shard (x through `np.memmap`) and never hold
+the corpus.
+
+**Scoring contract.** One function scores every scorer, so rows, eligible rows and denominators are identical across
+tables on a split (a test asserts it).
+- Eligible row: a target route of kind `LaneKind.MISS_GPU` or `MISS_CPU`, once per (forward, target layer, expert).
+  A VRAM-hot row (kind 0) is never eligible and reading one counts as wasted.
+- Hot rows (`tier_sim.load_forwards` `fwd["hot"][layer]`) and rows the snapshot shows in RAM are skipped inside the shared
+  function. The top `reads` rows per (forward, target layer) are read, at 1/2/3 reads and at calibrated cuts.
+- Gate: union over live tokens ordered by (-best margin to the 6th score, expert id). Head: 1 - prod(1 - p).
+- Never-candidate set: eligible rows outside the target gate's top-12 for every live token of the forward.
+- Fits (PCA, popularity, normalisation) use training-split rows only; cuts use calib only; locked test is read once.
+
+**Verdict bar (L+1, §1.2 of the spec).** Advance if, at 1 read per layer, precision rises by >= 0.15 over
+gate-with-floors, or at the gate-with-floors' precision eligible-row recall is >= 1.25x; with the session-bootstrap 95%
+interval's lower bound (head minus gate-with-floors) above zero, and the scorer within 0.1 ms per layer. Otherwise the
+native gate is the ceiling for same-token L+1 prediction at this budget.
+
+**Learning-curve rule (D5).** E2 and E5 are retrained on 15/30/60 training sessions (nested, seeded) and measured on dev.
+"Still improving" means the 50 -> 100% step raises dev L+1 precision at 1 read by more than half the 25 -> 50% step. A
+second, disjoint capture is warranted only if the head is near the bar and still improving.
+
+**Paths.**
+- Dataset: `divix01:/mnt/nvme1/nvfp4-work/b1-dataset-<date>/` (`dataset.json` manifest).
+- Run: `divix01:/mnt/nvme1/nvfp4-work/b1-run-<date>/` with `stages/<name>/DONE.json`, the frozen selection file,
+  `results.json` and `REPORT.md`.
+- Integrity report: `divix01:/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012/integrity.json`.
+
+**Rerun.** On divix01, from a private worktree at the pushed commit, `PYTHONPATH=$PWD/python`, production stopped. Stages
+resume from their `DONE.json`.
+
+```bash
+OUT=/mnt/nvme1/nvfp4-work/b1-run-<date>
+DATA=/mnt/nvme1/nvfp4-work/b1-dataset-<date>
+CORPUS=/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012
+PY=/data/models/slang/.venv/bin/python
+RUN="$PY analysis/dsv41-drive/prefetch-replay/b1_run.py <MODEL_PATH> --corpus $CORPUS \
+  --integrity $CORPUS/integrity.json --out $OUT --dataset $DATA"
+CAP="systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0"
+export OMP_NUM_THREADS=8
+export PYTHONPATH=$PWD/python  # without it the venv imports sglang from another tree
+
+# (a) dataset, fit, baselines: CPU, cores 0-63 under the analysis cap
+$CAP taskset -c 0-63 $RUN --stages dataset fit baselines
+
+# (b) train and curve need the GPU: cc-gpu.lock, cores 32-63
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages train curve
+
+# (c) cuts, freeze, then the locked test (refused without the frozen selection file): CPU
+$CAP taskset -c 0-63 $RUN --stages cuts freeze locked --device cpu
+
+# (d) scorer cost: GPU, cc-gpu.lock, cores 32-63
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $RUN --stages cost
+
+# (e) report (needs every earlier stage's DONE marker)
+$CAP taskset -c 0-63 $RUN --stages report --device cpu
+
+# opt-in smoke on 5 train-split sessions (no locked-test session is extracted); every stage, cost needs the GPU
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 $PY analysis/dsv41-drive/prefetch-replay/b1_run.py \
+  <MODEL_PATH> --corpus $CORPUS --integrity $CORPUS/integrity.json --out $OUT-smoke --smoke
+```
+
+Tests (`divix01-pytest <named test_b1_*.py files> -q -p no:randomly`; `--gpu` for `test_b1_cost.py`; the real-corpus
+smoke needs `SGLANG_B1_CORPUS`, `SGLANG_B1_MODEL` and `SGLANG_B1_INTEGRITY`).
+
+**Results** (all pending; locked-test sessions, 15; sha256 of the frozen selection file: pending).
+
+Dataset (rows / eligible rows / dropped cells):
+
+| Split | Horizon | Rows | Eligible rows | Dropped cells |
+|---|---|---|---|---|
+| train | L+1 / L+2 / L+4 | pending | pending | pending |
+| dev | L+1 / L+2 / L+4 | pending | pending | pending |
+| calib | L+1 / L+2 / L+4 | pending | pending | pending |
+| locked_test | L+1 / L+2 / L+4 | pending | pending | pending |
+
+L+1, locked test, pooled (and without the 19 flagged sessions):
+
+| Scorer | Recall @1 | Prec @1 | Recall @2 | Prec @2 | Recall @3 | Prec @3 | Never-cand. recovered | At cut (R / P) |
+|---|---|---|---|---|---|---|---|---|
+| gate | pending | pending | pending | pending | pending | pending | pending | pending |
+| gate + floors | pending | pending | pending | pending | pending | pending | pending | pending |
+| prev | pending | pending | pending | pending | pending | pending | pending | pending |
+| pop | pending | pending | pending | pending | pending | pending | pending | pending |
+| E2 | pending | pending | pending | pending | pending | pending | pending | pending |
+| E5 | pending | pending | pending | pending | pending | pending | pending | pending |
+
+L+2 and L+4, locked test, pooled (no bar; E3 evidence):
+
+| Horizon | Scorer | Recall @1 | Prec @1 | Recall @3 | Prec @3 | Never-cand. recovered |
+|---|---|---|---|---|---|---|
+| L+2 | gate / E2 / E5 | pending | pending | pending | pending | pending |
+| L+4 | gate / E2 / E5 | pending | pending | pending | pending | pending |
+
+Per layer and per stratum tables: pending (`REPORT.md` in the run directory).
+
+Dev learning curve (L+1 precision at 1 read):
+
+| Variant | 15 sessions | 30 sessions | 60 sessions | Still improving |
+|---|---|---|---|---|
+| E2 | pending | pending | pending | pending |
+| E5 | pending | pending | pending | pending |
+
+Scorer cost of the chosen L+1 head on the RTX 5090 under cc-gpu.lock (6 tokens, one layer, CUDA graph, against 0.1 ms):
+
+| Chosen head | bf16 bytes | Median time (ms) |
+|---|---|---|
+| pending | pending | pending |
+
+Paired per-session median and 95% bootstrap interval, head minus gate-with-floors: pending.
+
+**Verdict (L+1):** pending. Second capture warranted per the learning-curve rule: pending.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
