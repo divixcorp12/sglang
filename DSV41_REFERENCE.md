@@ -9168,7 +9168,8 @@ a mean read budget, with the complete offline scorer cost and a timing-sensitivi
 serving code, capture or A/B. Every number is **exploratory on reused data; independent confirmation pending**. The
 locked test of §33.26 counts as observed: its shards are never loaded (a reader asked for that split raises), and the
 B1 run directory, selection file and verdict are untouched. The feature's checks build and test the code on synthetic
-groups; no real-data result exists yet (all results below are `pending`).
+groups (all green at the final gate, see the check table below); no real-data result exists yet (the study results
+below are `pending`).
 
 **Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_r1_<module>.py`; no `b1_*` module is
 edited except additively):
@@ -9251,6 +9252,19 @@ $GPU $RUN --smoke --out $OUT-smoke
 Tests (`divix01-pytest analysis/dsv41-drive/prefetch-replay/test_r1_<module>.py ... -q -p no:randomly`, naming only
 the affected files; `--gpu -s` for the CUDA tests such as `test_r1_cost.py`; the real-data smoke needs
 `SGLANG_R1_DATASET`, `SGLANG_R1_MODEL` and `SGLANG_R1_CORPUS`). Read pytest's own status via `PIPESTATUS`.
+
+**Checks at the feature's final gate (2026-10-12)**, synthetic groups only (the real-data smoke is opt-in and was not
+run by the gate). Laptop `python3 -m py_compile` on the `r1_*.py` modules; the rest through `divix01-pytest` on the
+named files with `-q -p no:randomly` (`--gpu -s` for the cost files):
+
+| Check | Files | Result | Exit |
+|---|---|---|---|
+| `py_compile` | `r1_groups.py`, `r1_gate.py`, `r1_audit.py`, `r1_stamps.py`, `r1_policy.py`, ... | compiled | 0 |
+| `divix01-pytest` (CPU) | `test_r1_groups.py`, `test_r1_gate.py`, `test_r1_audit.py`, `test_r1_stamps.py`, ... | 149 passed, 1 skipped, 14 warnings in 8.44 s | 0 |
+| `divix01-pytest` (CPU, B1 regression) | `test_b1_rows.py`, `test_b1_extract.py`, `test_b1_dataset.py`, `test_b1_score.py`, ... | 101 passed, 1 skipped, 14 warnings in 14.69 s | 0 |
+| `divix01-pytest --gpu` | `test_r1_cost.py`, `test_b1_cost.py` | 9 passed, 14 warnings in 28.52 s | 0 |
+
+The 14 warnings come from `torch/jit/_script.py:365`. Lint and typecheck were not run by the gate.
 
 **Results.** Pending: the full run is started by the owner. Stage 1 (useful / wasted / eligible, precision, recall,
 reads under caps 1 and 2), the T0-T4 arm curves and checkpoint hashes, the timing replay, the complete-scorer cost and
