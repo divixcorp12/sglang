@@ -4,6 +4,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
 LOAD_UTILS_PATH = (
     Path(__file__).parents[4]
     / "python/sglang/kernels/aot/python/sgl_kernel/load_utils.py"

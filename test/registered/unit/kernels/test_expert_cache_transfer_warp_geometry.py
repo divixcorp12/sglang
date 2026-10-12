@@ -4,8 +4,14 @@ Every case compares the whole destination against a host reference built by
 indexing the sources, so a byte copied wrong or written outside the plan fails.
 """
 
+import sys
+
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -196,3 +202,7 @@ def test_single_tensor_op_matches_reference(rows):
     copy_expert_rows_gpu(source, destination, *_plan(rows, picked_rows, picked_slots))
     torch.cuda.synchronize()
     _assert_matches_reference([source], [destination], picked_rows, picked_slots)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

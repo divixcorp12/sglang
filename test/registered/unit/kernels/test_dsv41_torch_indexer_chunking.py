@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 BUDGET = envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
