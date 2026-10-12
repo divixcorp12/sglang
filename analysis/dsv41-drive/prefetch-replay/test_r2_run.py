@@ -286,7 +286,7 @@ def test_missing_stages_leave_the_gate_not_evaluated_and_numbers_pending(tmp_pat
     assert _main(tmp_path, "plan", "train", "report") == 0
     assert calls == ["train"]
     results = json.loads((_out(tmp_path) / r2_run.RESULTS_NAME).read_text())
-    assert not results["continuation_gate"]["passed"] and results["adds_over_t3"] is None
+    assert results["continuation_gate"]["passed"] is None and results["adds_over_t3"] is None
     assert "have not run" in results["continuation_gate"]["reasons"][0]
     assert "adds anything over T3: pending" in (_out(tmp_path) / r2_run.REPORT_NAME).read_text()
 

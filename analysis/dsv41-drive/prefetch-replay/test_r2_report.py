@@ -12,7 +12,8 @@ import r1_plan  # noqa: E402
 import r2_report  # noqa: E402
 
 SECTIONS = ("Arms: per-seed", "Selection", "Dev comparison", "Calib points",
-            "Timing sensitivity replay", "Scorer cost", "## L+2", "R2 continuation gate", "## Reading")
+            "Timing sensitivity replay", "Scorer cost", "## L+2", "L+2 timing replay",
+            "R2 continuation gate", "## Reading")
 
 
 def _results(*, winner_median: float = 0.40, t3: float = 0.35) -> dict:
@@ -60,6 +61,22 @@ def test_d12_sentence_only_when_winner_does_not_beat_t3():
     assert r2_report.D12_SENTENCE not in r2_report.render(_results(winner_median=0.40, t3=0.35))
     assert r2_report.D12_SENTENCE in r2_report.render(_results(winner_median=0.35, t3=0.35))
     assert r2_report.D12_SENTENCE in r2_report.render(_results(winner_median=0.30, t3=0.35))
+
+
+def test_l2_timing_replay_renders():
+    results = _results()
+    results["l2_timing"] = {"cases": {"nominal": {"T5": {"on_time_useful": 7}}}}
+    text = r2_report.render(results)
+    l2_part = text.split("## L+2 timing replay")[1].split("## R2 continuation gate")[0]
+    assert "nominal" in l2_part and "7" in l2_part
+    assert "Timing cases: pending" in r2_report.render(_results()).split("## L+2 timing replay")[1]
+
+
+def test_unevaluated_gate_renders_pending():
+    results = _results()
+    results["continuation_gate"] = {"passed": None, "reasons": ["not evaluated: stages missing"]}
+    text = r2_report.render(results)
+    assert "Outcome: pending" in text and "Outcome: FAIL" not in text
 
 
 def test_main_writes_file(tmp_path):

@@ -9450,11 +9450,14 @@ $GPU $RUN --stages train select calib --device cuda; echo "EXIT=${PIPESTATUS[0]}
 # (c) scorer cost under a CUDA graph, 6 live tokens: GPU, cc-gpu.lock, cores 32-63
 $GPU $RUN --stages cost --device cuda; echo "EXIT=${PIPESTATUS[0]}"
 
-# (d) L+2 for the winner: GPU, cc-gpu.lock, cores 32-63
+# (d) timing replay: CPU, cores 0-63 (l2 reads its result, so it runs first)
+$CAP taskset -c 0-63 $RUN --stages replay --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+
+# (e) L+2 for the winner: GPU, cc-gpu.lock, cores 32-63
 $GPU $RUN --stages l2 --device cuda; echo "EXIT=${PIPESTATUS[0]}"
 
-# (e) timing replay and report: CPU, cores 0-63
-$CAP taskset -c 0-63 $RUN --stages replay report --device cpu; echo "EXIT=${PIPESTATUS[0]}"
+# (f) report: CPU, cores 0-63
+$CAP taskset -c 0-63 $RUN --stages report --device cpu; echo "EXIT=${PIPESTATUS[0]}"
 
 # opt-in smoke, every stage (needs the GPU)
 $GPU $RUN --smoke --out $OUT-smoke; echo "EXIT=${PIPESTATUS[0]}"
