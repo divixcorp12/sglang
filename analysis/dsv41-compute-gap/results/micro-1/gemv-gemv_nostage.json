@@ -1,0 +1,73 @@
+{
+ "provenance": {
+  "variant": "gemv_nostage",
+  "defines": [
+   "-DGEMV_STAGE_BITS_MASK=0"
+  ],
+  "exllamav3_commit": "02aef45cd681b960a00afcd0749a4ab99e6c1bfe",
+  "patch_sha256": "0c144d9c4e8b9594ec43a590f9ea94db75ccd9153b774d0b6806f586ed3f2a99"
+ },
+ "replays": 400,
+ "device": "NVIDIA GeForce RTX 5090",
+ "kinds": {
+  "wq_a": {
+   "median_us_per_layer": 9.564799815416336,
+   "p10": 9.509599953889847,
+   "p90": 9.612800180912018,
+   "trellis_bytes": 4096000,
+   "implied_TBps": 0.42823687678211064
+  },
+  "wq_b": {
+   "median_us_per_layer": 20.17280012369156,
+   "p10": 20.130400359630585,
+   "p90": 20.22159993648529,
+   "trellis_bytes": 26214400,
+   "implied_TBps": 1.2994923778188334
+  },
+  "wkv": {
+   "median_us_per_layer": 9.11720022559166,
+   "p10": 9.073600172996521,
+   "p90": 9.148799628019333,
+   "trellis_bytes": 1638400,
+   "implied_TBps": 0.17970429073182678
+  },
+  "wo_b": {
+   "median_us_per_layer": 21.160799264907837,
+   "p10": 21.115200221538544,
+   "p90": 21.192799508571625,
+   "trellis_bytes": 26214400,
+   "implied_TBps": 1.2388189912785024
+  },
+  "sh_w1": {
+   "median_us_per_layer": 10.633599758148193,
+   "p10": 10.605599731206894,
+   "p90": 10.683199763298035,
+   "trellis_bytes": 7372800,
+   "implied_TBps": 0.6933493988571889
+  },
+  "sh_w3": {
+   "median_us_per_layer": 10.645600035786629,
+   "p10": 10.605599731206894,
+   "p90": 10.679999738931656,
+   "trellis_bytes": 7372800,
+   "implied_TBps": 0.6925678191191978
+  },
+  "sh_w2": {
+   "median_us_per_layer": 9.592799842357635,
+   "p10": 9.536799788475037,
+   "p90": 9.690400213003159,
+   "trellis_bytes": 7372800,
+   "implied_TBps": 0.7685764449545709
+  },
+  "attn_4": {
+   "median_us_per_layer": 59.6127986907959,
+   "p10": 59.53119993209839,
+   "p90": 59.70720052719116
+  },
+  "shared_3": {
+   "median_us_per_layer": 30.645999312400818,
+   "p10": 30.57439923286438,
+   "p90": 30.723199248313904
+  }
+ }
+}

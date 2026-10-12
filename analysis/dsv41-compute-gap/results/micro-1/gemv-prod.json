@@ -1,0 +1,69 @@
+{
+ "provenance": {
+  "variant": "prod",
+  "build_dir": "/data/models/slang/nvfp4-work/cc-expert-prediction/exl3-build"
+ },
+ "replays": 400,
+ "device": "NVIDIA GeForce RTX 5090",
+ "kinds": {
+  "wq_a": {
+   "median_us_per_layer": 8.562400192022324,
+   "p10": 8.532000333070755,
+   "p90": 8.59839990735054,
+   "trellis_bytes": 4096000,
+   "implied_TBps": 0.4783705395849502
+  },
+  "wq_b": {
+   "median_us_per_layer": 21.04720026254654,
+   "p10": 20.997600257396698,
+   "p90": 21.092000603675842,
+   "trellis_bytes": 26214400,
+   "implied_TBps": 1.2455053248411612
+  },
+  "wkv": {
+   "median_us_per_layer": 7.844000309705734,
+   "p10": 7.817599922418594,
+   "p90": 7.8887999057769775,
+   "trellis_bytes": 1638400,
+   "implied_TBps": 0.2088730157204015
+  },
+  "wo_b": {
+   "median_us_per_layer": 21.990400552749634,
+   "p10": 21.94480001926422,
+   "p90": 22.040799260139465,
+   "trellis_bytes": 26214400,
+   "implied_TBps": 1.19208378842932
+  },
+  "sh_w1": {
+   "median_us_per_layer": 10.45679971575737,
+   "p10": 10.424800217151642,
+   "p90": 10.506399720907211,
+   "trellis_bytes": 7372800,
+   "implied_TBps": 0.7050723166180486
+  },
+  "sh_w3": {
+   "median_us_per_layer": 10.4543998837471,
+   "p10": 10.423199832439423,
+   "p90": 10.50800010561943,
+   "trellis_bytes": 7372800,
+   "implied_TBps": 0.7052341676218162
+  },
+  "sh_w2": {
+   "median_us_per_layer": 9.521999955177307,
+   "p10": 9.44959968328476,
+   "p90": 9.595199674367905,
+   "trellis_bytes": 7372800,
+   "implied_TBps": 0.7742911189567122
+  },
+  "attn_4": {
+   "median_us_per_layer": 58.98560285568237,
+   "p10": 58.92000198364258,
+   "p90": 59.07279849052429
+  },
+  "shared_3": {
+   "median_us_per_layer": 30.155201256275177,
+   "p10": 30.06719946861267,
+   "p90": 30.243998765945435
+  }
+ }
+}

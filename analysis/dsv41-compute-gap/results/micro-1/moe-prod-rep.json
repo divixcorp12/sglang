@@ -1,0 +1,13 @@
+{
+ "provenance": {
+  "variant": "prod",
+  "build_dir": "/data/models/slang/nvfp4-work/cc-expert-prediction/exl3-build",
+  "EXL3_MOE_GROUP_WIDTH": "0",
+  "EXL3_MOE_TILE_N": "0"
+ },
+ "ext_module": "sglang_exl3_ext",
+ "median_us_per_layer": 101.85279846191406,
+ "p10": 101.68559551239014,
+ "p90": 101.95039510726929,
+ "implied_TBps": 0.7844016581427036
+}

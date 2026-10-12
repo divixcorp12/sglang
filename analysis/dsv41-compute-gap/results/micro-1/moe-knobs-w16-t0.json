@@ -1,0 +1,15 @@
+{
+ "provenance": {
+  "variant": "knobs",
+  "defines": [],
+  "exllamav3_commit": "02aef45cd681b960a00afcd0749a4ab99e6c1bfe",
+  "patch_sha256": "0c144d9c4e8b9594ec43a590f9ea94db75ccd9153b774d0b6806f586ed3f2a99",
+  "EXL3_MOE_GROUP_WIDTH": "16",
+  "EXL3_MOE_TILE_N": "0"
+ },
+ "ext_module": "exl3_exp_knobs",
+ "median_us_per_layer": 144.4648027420044,
+ "p10": 144.26239728927612,
+ "p90": 144.5695996284485,
+ "implied_TBps": 0.5530309285278265
+}

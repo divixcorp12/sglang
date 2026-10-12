@@ -1,0 +1,17 @@
+{
+ "provenance": {
+  "variant": "moe_fs2",
+  "defines": [
+   "-DMOE_FRAG_STAGES=2"
+  ],
+  "exllamav3_commit": "02aef45cd681b960a00afcd0749a4ab99e6c1bfe",
+  "patch_sha256": "0c144d9c4e8b9594ec43a590f9ea94db75ccd9153b774d0b6806f586ed3f2a99",
+  "EXL3_MOE_GROUP_WIDTH": "0",
+  "EXL3_MOE_TILE_N": "0"
+ },
+ "ext_module": "exl3_exp_moe_fs2",
+ "median_us_per_layer": 102.32519507408142,
+ "p10": 102.19360589981079,
+ "p90": 102.42160558700562,
+ "implied_TBps": 0.7807803732224374
+}

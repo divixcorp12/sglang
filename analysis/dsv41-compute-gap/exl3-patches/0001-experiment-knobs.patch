@@ -1,0 +1,75 @@
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh
+index e742925..5ac2198 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh
+@@ -307,7 +307,9 @@ __device__ __forceinline__ void gemv_int8_row_sums
+ 
+ // The K cap (fall back to the regular kernel in the DRAM-bound regime) is per-arch; see
+ // exl3_gemv_int8_max_k in exl3_gemv_int8.cu
++#ifndef GEMV_STAGE_D
+ #define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
++#endif
+ #define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
+ 
+ // Per-slice-scale ("sq") kernel parameters
+@@ -704,7 +706,11 @@ __device__ __forceinline__ void gemv_int8_unit_smem
+ // are at the ALU floor / DRAM-bound, wide covers 4)
+ __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
+ {
++#ifdef GEMV_STAGE_BITS_MASK
++    return (GEMV_STAGE_BITS_MASK >> bits) & 1;
++#else
+     return bits == 3 || bits == 5 || bits == 7;
++#endif
+ }
+ 
+ // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe.cu b/exllamav3/exllamav3_ext/quant/exl3_moe.cu
+index 1ce680f..5c3a902 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe.cu
+@@ -19,6 +19,19 @@ int exl3_moe_max_concurrency(int device)
+ 
+ std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
+ 
++// Experimental: EXL3_MOE_GROUP_WIDTH > 0 caps the widened group size for num_active launches.
++// It can only shrink the grid, so the co-residency bound still holds. 0 / unset = automatic.
++static int moe_group_width_override()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char* e = getenv("EXL3_MOE_GROUP_WIDTH");
++        v = e ? atoi(e) : 0;
++    }
++    return v;
++}
++
+ // EXL3_MOE_TILE_N=128 keeps the N = 128 tile shape for dims that are multiples of 256 (which
+ // otherwise take the N = 256 instances); 0 / unset = automatic
+ static int moe_tile_n_override()
+@@ -272,6 +285,7 @@ void exl3_moe
+     {
+         num_groups = MIN(num_groups, num_active);
+         group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
++        if (moe_group_width_override() > 0) group_size = MAX(1, MIN(group_size, moe_group_width_override()));
+     }
+     dim3 grid_dim(group_size, 1, num_groups);
+ 
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh
+index def2895..495ffbb 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh
+@@ -11,8 +11,12 @@
+ #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
+ #define MOE_TILESIZE_K 32
+ #define MOE_TILESIZE_M 16          // default row tile; the 32 / 64 row tiles are separate kernel instances
++#ifndef MOE_SH_STAGES
+ #define MOE_SH_STAGES 3
++#endif
++#ifndef MOE_FRAG_STAGES
+ #define MOE_FRAG_STAGES 3
++#endif
+ 
+ #ifndef EXL3_GEMM_BASE_THREADS
+ #define EXL3_GEMM_BASE_THREADS 256
