@@ -13,6 +13,11 @@ wins.
 > learned predictor**: the bare native gate moved to L+2 beats today's L+1 gate on on-time useful rows by +18% at
 > nominal contention and 2x at adverse. The questions in "What we want from you" below were round 1's; round 2's
 > open questions are at the end of the new section.
+>
+> **Update 2026-10-12 (evening), `master` after `5a5e6344ef`.** Round 2's open question 4 was answered by running the two
+> arms R1 could not (hx feature F107, "R2"): see **"ROUND 3 RESULTS: R2 (T5 and G0)"** at the end and §33.28. Neither
+> adds anything over T3. T5 (trainable projection) ties it exactly; G0 (gate correction, aggregator from scratch) is
+> below the bare gate. Representation changes are exhausted at this data size; lead time remains the lever.
 
 ## What we want from you
 
@@ -981,5 +986,59 @@ in which much of L+1's useful work arrives late, but it does not prove an L+2 va
 - Independent confirmation capture: not taken; none of the above has a fresh locked test.
 - Housekeeping as listed under "Housekeeping still open" (plus `wt-r1-run`, `b1-r1-20261012-smoke`).
 - F105 Q1 in hx stays open on purpose as evidence for an hx display/replan bug investigation.
+
+Production on divix01 is still stopped; only you can restart it.
+
+## ROUND 3 RESULTS: R2 (T5 and G0)
+
+hx feature F107, merged `bce3f674f0`, plus the OOM fix `5a5e6344ef`. Full run
+`divix01:/mnt/nvme1/nvfp4-work/b1-r2-20261012/` (19:08-19:37, every stage exit 0). Details and the rerun block are in
+`DSV41_REFERENCE.md` §33.28. Exploratory on reused data; independent confirmation pending.
+
+**What ran.** These are the two arms R1 skipped because raw x did not fit, now held on the GPU in bf16. The same corpus,
+splits, exclusions, policy (cap 2, mean reads <= 1), calibration and timing model as R1 were used, with seeds 0/1/2.
+- T5: T3 plus a trainable 5120->128 projection initialised from PCA (from T3's seed-0 checkpoint).
+- G0: `z = a[t]*s_native + b[t] + B[t] GELU(A x + pos)` with a block aggregator, from scratch.
+
+**Results (dev recall at cap 2, median of three seeds).**
+
+| Scorer | Recall | Precision | Note |
+|---|---|---|---|
+| T5 | 0.3315 | 0.552 | equal to T3 to the third decimal at L+1, L+2 and in every timing case |
+| T3 (R1) | 0.3308 | 0.552 | |
+| F0 (B1 head) | 0.317 | 0.528 | |
+| native gate | 0.288 | 0.479 | |
+| G0 | 0.240 | 0.404 | below the gate it corrects |
+
+**How R2's continuation gate came out:** it FAILED on cost alone. T5's head is 0.115 ms per layer in bf16, against a
+0.1 ms bar; the projection is now a dense matmul, so T5 is slower than T3's 0.101 ms. Every other criterion was met, but
+"above T3" only by 0.0007, which is inside the seed spread.
+
+**How this session reads it.**
+1. **The representation is not the bottleneck.** T5's dev curve peaks at epoch 1-2 and declines: training the
+   projection only overfits. With the per-layer, position and block-objective arms of R1, every representation change
+   lands within +-0.015 of F0. At this corpus size, T3 is the ceiling for this feature set; more data is the
+   untested lever (question 2).
+2. **G0's failure is about its parametrisation, not about the idea.** Its token logits start exactly at the native
+   scores, but its block aggregator starts from random weights. It began at 0.04 recall and had to relearn the
+   aggregation, plateauing at 0.24. A correction that starts exactly at the gate control would be bounded below by the
+   gate on dev, because early stopping would keep the init. That would need two things:
+   - an aggregator initialised to the gate's own block rule, or the gate's rule frozen with a learned residual on block
+     logits;
+   - the residual's last layer at zero.
+   This is not worth a feature unless the L+2 gate wins in serving and a cheap correction is wanted on top.
+3. **Nothing here changes round 2's reading.** The learned head buys about +10% on-time useful rows at L+1, and costs
+   0.1-0.2 ms per layer. Moving the gate to L+2 buys +18% (nominal) to 2x (adverse) with no model.
+
+**Open questions for the next reader** (round 2's 1-3 still stand; 4 is answered).
+1. Is there any learned-predictor experiment left worth running before a served L+2 gate test? This session's answer is
+   no. The one candidate is a gate-anchored G0 (point 2 above), and only as a step after L+2.
+2. More data (a larger B0 corpus) is the other untested lever for the learned head. B1's learning curve was still
+   rising: E5 dev precision went 0.349 / 0.373 / 0.393 at 15 / 30 / 60 sessions, so rule D5 said "still improving".
+   A larger capture is the one lever with evidence behind it. It would sharpen the head but would not fix its cost,
+   and it would need its own A/B to show a serving effect.
+
+**Housekeeping added this round:** worktree `wt-r2-run`, smoke dir `b1-r2-20261012-smoke`, failed log
+`r2-run-20261012-failed-oom.log`.
 
 Production on divix01 is still stopped; only you can restart it.

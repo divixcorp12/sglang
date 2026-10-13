@@ -9378,7 +9378,8 @@ seed-0 checkpoint) or G0 (a learned low-rank correction to the native gate's ful
 T3 and the native gate at L+1, and the better one at L+2, with a scorer cost measured the way serving would pay it?
 Offline only: no serving code, capture or A/B. Every number is **exploratory on reused data; independent confirmation
 pending**. Locked_test shards are never loaded; R1's and B1's run directories, selection files and verdicts are
-untouched. No real-data result exists yet (the full study is started after merge): every study result below is `pending`.
+untouched. Results below are from the full run of 2026-10-12. **Outcome: FAIL on cost alone; T5 ties T3 and G0 is
+below the native gate, so neither adds anything over T3.**
 
 **Tools** (`analysis/dsv41-drive/prefetch-replay/`, tests beside them as `test_r2_<module>.py`; R1 modules change
 only additively):
@@ -9478,43 +9479,68 @@ the affected files; `--gpu -s` for the CUDA cost tests. The real-data smoke need
 | `divix01-pytest --gpu` | `test_r2_cost.py`, `test_r1_cost.py`, `test_b1_cost.py` | 14 passed | 0 |
 
 **Results** (exploratory on reused data; independent confirmation pending). Run directory
-`divix01:/mnt/nvme1/nvfp4-work/b1-r2-<date>/`; worktree and commit pending.
+`divix01:/mnt/nvme1/nvfp4-work/b1-r2-20261012/` (`REPORT.md`, `results.json`), plan sha256 `99f2d8f1...e909fe`,
+worktree `/data/models/slang/nvfp4-work/wt-r2-run` at `5a5e6344ef`, script and log
+`/mnt/nvme1/nvfp4-work/r2-run-20261012.{sh,log}`; 19:08-19:37, every stage exit 0. Smoke
+`b1-r2-20261012-smoke` clean (2 min).
 
-L+1, cap 2 at mean reads <= 1 per forward-layer, same groups, skip masks and denominators as §33.27:
+The first full attempt (log `r2-run-20261012-failed-oom.log`) died in train with a CUDA OOM: the budget counted only
+bf16 x (8.6 GiB on train), but the train cache also holds 5.6 GiB of fp32 `u` (1,664 features per token), and
+`build_cache` joined chunks with `torch.cat`, holding each tensor twice. Fixed in `5a5e6344ef`: `build_cache` fills
+preallocated tensors (peak = cache + one chunk; identical values) and `r2_arms.check_x_budget` requires free memory for
+u, x and s_native plus the margin (`r1_cache.cache_bytes`). Tests: `test_r2_cache.py` 10 passed (`--gpu`; the new peak
+test fails on the old code at 2.0x the cache size); `test_r1_cache.py test_r2_arms.py test_r2_run.py test_r1_arms.py
+test_r1_train.py` 47 passed, 1 skipped.
+
+L+1, cap 2 at mean reads <= 1 per forward-layer, same groups, skip masks and denominators as §33.27 (calib at 20,787
+reads for every scorer):
 
 | Scorer | Dev recall seeds 0 / 1 / 2 | Median | Dev precision | Calib recall | Calib precision |
 |---|---|---|---|---|---|
-| T5 | pending | pending | pending | pending | pending |
-| G0 | pending | pending | pending | pending | pending |
-| T3 (R1) | 0.332 / 0.331 / 0.331 | 0.331 | pending | 0.348 | 0.609 |
+| T5 | 0.3315 / 0.3317 / 0.3313 | 0.3315 | 0.552 | 0.347 | 0.608 |
+| G0 | 0.243 / 0.239 / 0.240 | 0.240 | 0.404 | - (not the winner) | - |
+| T3 (R1) | 0.332 / 0.331 / 0.331 | 0.331 | 0.552 | 0.348 | 0.609 |
 | F0 | 0.317 | - | 0.528 | 0.330 | 0.578 |
 | gate | 0.288 | - | 0.479 | 0.284 | 0.498 |
+
+- T5's dev curves peak at epoch 1-2 (0.331-0.332) and decline after (0.327 by early stop at 9-12 epochs): the trainable
+  projection never improves on the PCA it starts from, and its L+1 and L+2 numbers equal T3's to the third decimal.
+- G0 starts at 0.04 after epoch 1 and plateaus at 0.24 by epoch ~25 (stopped at 33-38). Its token logits start at the
+  native scores (scale 1, shift 0, residual 0), but its block aggregator is trained from scratch, so nothing at
+  initialisation reproduces the gate control's block rule. This is a negative result for that parametrisation, not
+  evidence that a correction on the native scores cannot help.
 
 Scorer cost (CUDA graph, 6 live tokens, median ms; bf16 / fp32):
 
 | Path | T5 | G0 |
 |---|---|---|
-| head only | pending | pending |
-| complete (offline gate included) | pending | pending |
-| correction given native scores | - | pending |
+| head only | 0.115 / 0.123 | 0.109 / 0.099 |
+| complete (offline gate included) | 0.206 / 0.216 | 0.173 / 0.164 |
+| correction given native scores | - | 0.142 / 0.134 |
 
-Timing replay (cap 2, dev, on-time useful rows; winner pending):
+T5's head (0.115 ms) is slower than T3's (0.101 ms, §33.27): the 5120x128 projection is now a dense matmul per call.
 
-| Contention | Winner | T3 | gate |
+Timing replay (cap 2, dev, on-time useful rows; winner T5, scorer delay 0.206 ms):
+
+| Contention | T5 | T3 | gate |
 |---|---|---|---|
-| zero (1.0x) | pending | 24,067 | 21,165 |
-| nominal (2.0x) | pending | 16,282 | 14,834 |
-| adverse (3.0x) | pending | 8,257 | 7,626 |
+| zero (1.0x) | 24,038 | 24,067 | 21,165 |
+| nominal (2.0x) | 16,235 | 16,282 | 14,834 |
+| adverse (3.0x) | 8,224 | 8,257 | 7,626 |
 
 L+2 (winner, seed 0, dev cap 2):
 
 | Scorer | Dev recall | Dev precision | Nominal on-time useful rows |
 |---|---|---|---|
-| winner (L+2) | pending | pending | pending |
+| T5 (L+2) | 0.319 | 0.509 | 22,153 |
 | T3 ladder (L+2, R1) | 0.319 | 0.509 | 22,166 |
 | gate (L+2) | 0.251 | 0.401 | 17,566 |
 
-**Continuation gate (D10):** pending. Whether T5 or G0 adds anything over T3: pending.
+**Continuation gate (D10): FAIL**, on cost alone. Met: recall 0.3315 vs gate 0.2877 (+15%); above T3's median 0.3308
+(by 0.0007, inside seed spread); calib precision 0.608 vs 0.498 at equal reads; seeds (min 0.3313); without flagged
+sessions 0.3256 vs 0.2856; nominal on-time useful 16,235 vs 14,834. Not met: incremental cost 0.1145 ms per layer
+(bar 0.1). **Whether T5 or G0 adds anything over T3: no.** Per D12, the remaining representation changes add nothing
+at this data size; no further arms in this feature.
 
 ## Sources
 
