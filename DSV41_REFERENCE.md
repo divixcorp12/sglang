@@ -9789,6 +9789,103 @@ Stage 2 of the handoff:
 
 T0 is the cheaper candidate at about 80% of T3's gain.
 
+### 33.31 F123: a serving-shaped fast path for the L+2 learned heads (T0, T3), offline (2026-10-13)
+
+Status: **Stage 2 of `RAM_PREFETCH_L2_HEADS_NEXT_HANDOFF.md`: code built, divix01 run not yet done. Every result cell
+below is `pending` until the owner runs `l2_fast_run.sh`.** Nothing is wired into serving; that is Stage 3. The locked
+test split was not opened, and no run directory of R1, R2, F108 or F109 is written to.
+
+**What was built.**
+- `l2_fast_torch.py` (`fast_head_torch`): a folded torch implementation of T0 and T3, mathematically equal to the
+  reference `r1_models.R1Model` forward. It consumes the biased fp32 target-gate scores. The PCA mean is folded into the
+  first-layer biases. The sparse E5 inputs (route mask, route weights, top-12 scores and margins) are column gathers,
+  not dense [tokens, 384] scatters. The source/target/stratum embedding contributions are one precomputed per
+  (source, target) bias (D4).
+- `spec_head.cuh` (`SpecHeadKernel`, K1-K4, JIT module `expert_stream_spec_head`) with the wrapper
+  `sglang/kernels/ops/moe/spec_head.py`: at most four launches after the native score kernel, on the same stream:
+  PCA projection plus `fc_in`; the residual/gated middle block; `fc_out`; a fused tail (T0 noisy-or or T3 block
+  aggregator MLP, sigmoid, hot/RAM skip masks, threshold, cap-1 argmax). Weights are bf16, accumulation and activations
+  between launches fp32 (D3). The kernels take spec_scores, never the gate weight (D2). They output count 0 or 1, the
+  expert, and the block score in the margin field (serving candidate-record convention).
+- The kernels are offline-only. Nothing under `python/sglang/srt` imports them; `spec_score.cuh`,
+  `spec_candidates.h` and the existing wrappers are unchanged (R3).
+- Harness: `analysis/dsv41-drive/prefetch-replay/l2_fast_{common,torch,kernels,profile,cost,interference,metrics,
+  parity,report}.py` with sibling tests, and `l2_fast_run.sh`.
+
+**Checkpoints** (sha256 verified on load, recorded in `result.json`): T0 `T0_seed0.pt` e6f7661d...; T3 `T3_seed0.pt`
+e675e2bd.... Both from `b1-r1-20261012/stages/l2/`, read only.
+
+**Measurement scopes** (what each number in the run will carry, with the label `observed offline`):
+- Profile (C1): complete `r1_cost` reference path for T0 and T3, six tokens, CUDA graph, one layer's inputs. Medians for
+  gate, feature build (PCA plus E5), head MLP, block aggregation plus sigmoid, and mask-threshold-select, each with its
+  graph node count.
+- Cost (C21-C26): RTX 5090, live widths 1, 2, 4 and 6, CUDA graph, medians of at least 1000 replays, one stream. Gate
+  scores and x rotate across 38 layer slots so the measurement does not sit in L2 (R11); the implied bandwidth is checked
+  against the card's spec. Rows: native `spec_score` plus `spec_select`; native plus the fused learned path plus its
+  select; the folded torch path; incremental cost over native for T0 and T3, each beside the historical 0.1 ms/layer
+  bar.
+- Interference (C13-C20 group): the fused learned path replayed on a side stream while a fixed main-stream load of bf16
+  GEMMs sized like one decode layer's dense work runs. The report gives main-stream slowdown against the native scorer
+  on the same side stream, and against no side work.
+- Parity: every dev (44,536) and calib (20,254) group, T0 and T3, at the F109 frozen calib threshold (budget 0.75) and at
+  budget 1.0, thresholds read from `f109-l2-cap1-20261013/result.json` and never refit (D7). For the folded torch path
+  and the fused kernels: block-score max/p99 |diff|, top-1 agreement, read-set agreement (same read or same
+  abstention), and every disagreement within 1e-3 of the threshold listed separately. It runs twice: with the
+  reference's own fp32 gate scores, and with scores from the serving `spec_score` kernel from the same x at the live
+  gate-weight dtype. Any read-set difference in the second case is reported as a precision candidate with its recall
+  change at the frozen threshold, not hidden.
+
+**Run** (owner starts, on divix01, from a private pushed `wt-*` worktree; `OUT` defaults to
+`/mnt/nvme1/nvfp4-work/f123-l2-fast-<date>`):
+
+```bash
+PYTHONPATH=$PWD/python DATASET=... CORPUS=... B1_HEAD=... MODEL_PATH=... \
+  bash analysis/dsv41-drive/prefetch-replay/l2_fast_run.sh
+```
+
+It refuses `dsv41-direct-prod` and any `OUT` outside `/mnt/nvme1/nvfp4-work` or inside the protected run directories.
+GPU steps run under `flock cc-gpu.lock taskset -c 32-63`, the report under `taskset -c 0-63`. It ends with
+`done: OUT/result.json OUT/REPORT.md`, and every `EXIT=` line in `OUT/commands.txt` must be 0. A cold JIT build of
+`expert_stream_spec_head` on the first run is slow, not a failure.
+
+**Results** (all `pending`; to be filled from `OUT/result.json`, not estimated):
+
+| C1 profile, 6 tokens, graph | gate | feature build | head MLP | aggregation + sigmoid | mask-threshold-select | nodes |
+|---|---:|---:|---:|---:|---:|---:|
+| T0 | pending | pending | pending | pending | pending | pending |
+| T3 | pending | pending | pending | pending | pending | pending |
+
+| C21-C26 cost, graph, 38-slot rotation (ms) | width 1 | width 2 | width 4 | width 6 | bar |
+|---|---:|---:|---:|---:|---:|
+| native `spec_score` + `spec_select` | pending | pending | pending | pending | - |
+| native + fused T0 + select | pending | pending | pending | pending | - |
+| native + fused T3 + select | pending | pending | pending | pending | - |
+| folded torch T0 | pending | pending | pending | pending | - |
+| folded torch T3 | pending | pending | pending | pending | - |
+| incremental over native, T0 | pending | pending | pending | pending | 0.1 |
+| incremental over native, T3 | pending | pending | pending | pending | 0.1 |
+
+| C13-C20 parity (budget 0.75 / 1.0) | max abs diff | p99 abs diff | top-1 agree | read-set agree | near-threshold | precision candidates |
+|---|---:|---:|---:|---:|---:|---:|
+| T0 folded torch, fp32 scores | pending | pending | pending | pending | pending | n/a |
+| T0 fused kernels, fp32 scores | pending | pending | pending | pending | pending | n/a |
+| T0 fused kernels, `spec_score` scores | pending | pending | pending | pending | pending | pending |
+| T3 folded torch, fp32 scores | pending | pending | pending | pending | pending | n/a |
+| T3 fused kernels, fp32 scores | pending | pending | pending | pending | pending | n/a |
+| T3 fused kernels, `spec_score` scores | pending | pending | pending | pending | pending | pending |
+
+| Interference (main-stream slowdown) | vs native on side stream | vs no side work |
+|---|---:|---:|
+| fused T0 | pending | pending |
+| fused T3 | pending | pending |
+
+**Labels.** Numbers the run produces are `observed offline`, with widths, replays, graph or eager, stream and rotation
+beside them. Statements of what the cost or interference will mean in serving are `hypothesis` until Stage 3 serves
+them.
+
+**Not decided here.** The choice between T0 and T3 (D1), made from F109 accuracy against the measured incremental cost,
+and the serving wiring of the fast path are Stage 3.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
