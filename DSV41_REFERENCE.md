@@ -10044,8 +10044,10 @@ idle-drive rule), the speculative reads no longer slow the demand reads measurab
 
 **Reading.** §33.32's "the step is not set by demand NVMe rows" was wrong: misses are about a third of the step and
 read latency moves it one for one. The prefetch is small because it covers one miss in six. The levers, by size: fewer
-misses (the 104 GiB tier took -24%, §33.12), faster or more evenly loaded reads, a cheaper per-layer floor, and only
-then better prediction. Production defaults are the owner's.
+misses, faster or more evenly loaded reads, a cheaper per-layer floor, and only then better prediction. Fewer misses
+cannot come from a larger tier: every arm already runs the 104 GiB tier (`arm_env.py` `PINNED_HOST_MB`, -24% when it
+came in, §33.12) and host memory has no room for more. It has to come from residency (which experts stay in RAM and
+VRAM) or from verifying fewer wrong positions (§33.16 item 4). Production defaults are the owner's.
 
 ## Sources
 
