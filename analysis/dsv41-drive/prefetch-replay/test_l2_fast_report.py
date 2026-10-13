@@ -139,6 +139,17 @@ def test_precision_candidate_tag_survives_stamping_and_reaches_report():
     assert "precision candidate" in cand
 
 
+def test_prefixed_hypothesis_label_keeps_hypothesis_on_its_numbers():
+    """A 'hypothesis: <note>' label (l2_fast_interference.MAIN_LABEL) must not let its numbers read as observed."""
+    inter = _interference()
+    note = "hypothesis: shapes are a guess at one decode layer's dense work"
+    inter["main_load"] = {"label": note, "tokens": 6, "shapes": [[6, 5120, 2048], [6, 2048, 5120]]}
+    main_load = json.loads(json.dumps(_build(interference=inter)))["interference"]["main_load"]
+    leaves = list(_numeric_leaves(main_load))
+    assert leaves and all(lab == rep.HYPOTHESIS for _, _, lab in leaves), leaves
+    assert main_load["kind"] == note
+
+
 def test_write_outputs_is_atomic_and_complete(tmp_path):
     """Both files land in OUT with no tmp leftovers."""
     result = _build(parity=_parity())

@@ -63,8 +63,9 @@ def _stamp(node: object, *, label: str, scope: str) -> object:
             node = {**node, "scope_detail": own, "scope": json.dumps(own, sort_keys=True)}
         if isinstance(node.get("scope"), str):
             scope = node["scope"]
-        if node.get("label") in LABELS:
-            label = node["label"]
+        own_label = _own_label(node.get("label"))
+        if own_label is not None:
+            label = own_label
         out = {k: _stamp(v, label=label, scope=scope) for k, v in node.items()}
         if "label" in node or any(_is_num(v) for v in node.values()):
             if isinstance(node.get("label"), str) and node["label"] not in LABELS:
@@ -76,6 +77,14 @@ def _stamp(node: object, *, label: str, scope: str) -> object:
             return {"values": [_finite(v) for v in node], "label": label, "scope": scope}
         return [_stamp(v, label=label, scope=scope) for v in node]
     return _finite(node)
+
+
+def _own_label(text: object) -> str | None:
+    """A node's label in LABELS, also as the prefix of 'hypothesis: <note>'; None otherwise."""
+    if not isinstance(text, str):
+        return None
+    head = text.split(":", 1)[0].strip()
+    return head if head in LABELS else None
 
 
 def _finite(v: object) -> object:
