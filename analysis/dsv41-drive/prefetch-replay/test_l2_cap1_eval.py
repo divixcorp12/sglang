@@ -98,6 +98,13 @@ def test_cost_paths_refuses_unknown_and_duplicate_names():
         l2_cap1_eval._cost_paths([("L2_T0", "a"), ("L2_T0", "b")])
 
 
+def test_logged_commands_reads_the_run_script_log_or_nothing(tmp_path):
+    assert l2_cap1_eval._logged_commands(str(tmp_path)) == []
+    (tmp_path / "commands.txt").write_text("git_head=abc\n\nCMD: r1_cost.py --cap 1\nEXIT=0\n")
+    assert l2_cap1_eval._logged_commands(str(tmp_path)) == ["git_head=abc", "CMD: r1_cost.py --cap 1", "EXIT=0"]
+
+
+
 def _groups(n: int) -> list:
     return [SimpleNamespace(key=SimpleNamespace(session=f"s{i % 2}", block="b0", seq=i, source_layer=7,
                                                 target_layer=9, horizon=2)) for i in range(n)]

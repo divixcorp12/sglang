@@ -25,11 +25,27 @@ case "$OUT_REAL/" in
   /mnt/nvme1/nvfp4-work/*) ;;
   *) echo "OUT must be under /mnt/nvme1/nvfp4-work" >&2; exit 2;;
 esac
-case "$OUT_REAL" in *b1-run-20261012*|*b1-r1-20261012*|*b1-r2-20261012*) echo "refusing protected OUT" >&2; exit 2;; esac
+case "$OUT_REAL" in
+  *b1-run-20261012*|*b1-r1-20261012*|*b1-r2-20261012*|*l2-ab-20261012*) echo "refusing protected OUT" >&2; exit 2;;
+esac
 
 HERE="$PWD/analysis/dsv41-drive/prefetch-replay"
 export PYTHONPATH="$PWD/python"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+
+# The driver's own guard, before anything is written, so the two protected lists cannot drift.
+PYTHONPATH="$PYTHONPATH:$HERE" "$PYTHON" - "$OUT" "$RUN_DIR" "$HERE" <<'PY'
+import sys
+out, run, here = sys.argv[1:4]
+sys.path.insert(0, here)
+import l2_cap1_eval
+try:
+    l2_cap1_eval.guard_out(out, run_dir=run)
+except l2_cap1_eval.RefusedOut as e:
+    print(f"refused: {e}", file=sys.stderr)
+    sys.exit(2)
+PY
+
 mkdir -p "$OUT/cost"
 CMDS="$OUT/commands.txt"
 
