@@ -3445,7 +3445,9 @@ class ExpertStreamDevice:
         if 1 <= tokens <= self.cpu_tokens_max:
             run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
         top_k = int(head.src_w.shape[1])
-        in_range = x is not None and 1 <= tokens <= spec_head.HEAD_MAX_TOKENS
+        in_range = (
+            x is not None and 1 <= tokens <= min(spec_head.HEAD_MAX_TOKENS, self.cpu_tokens_max)
+        )
         if in_range:
             head.src_w[:tokens].copy_(route_weights.to(torch.float32))
             src_ids = routes[: tokens * top_k].view(tokens, top_k)
@@ -3454,7 +3456,7 @@ class ExpertStreamDevice:
         spec_head.run_spec_head_serving(
             weights=head.weights,
             workspace=head.workspace,
-            x=x,
+            x=x.reshape(tokens, -1) if in_range else x,
             tokens=tokens,
             scores=self.spec_scores,
             src_ids=src_ids,
