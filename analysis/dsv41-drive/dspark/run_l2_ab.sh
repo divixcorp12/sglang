@@ -68,7 +68,7 @@ if not ram.get("spec_issued"):
     bad.append(f"spec_issued={ram.get('spec_issued')}")
 if not ram.get("spec_landed"):
     bad.append(f"spec_landed={ram.get('spec_landed')}")
-if text is None or isinstance(text, str) or "error" in text:
+if text is None or isinstance(text, str) or "error" in text or text.get("pass") is not True:
     bad.append(f"text_vs_reference={text}")
 if bad:
     sys.exit("smoke failed: " + ", ".join(bad))
