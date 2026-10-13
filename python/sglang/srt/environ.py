@@ -2068,6 +2068,9 @@ class Envs:
     # How many layers ahead the speculative scorer targets (1 to 4): 1 scores the next layer's gate, 2 the one after.
     # Above 1 needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS set, since the packaged floors were fit for 1.
     SGLANG_DSV41_RAM_PREFETCH_HORIZON = EnvInt(1)
+    # Path of a folded learned L+2 head file (analysis/dsv41-drive/prefetch-replay/l2_head_export.py) that replaces
+    # the native candidate select. Unset or empty means the native select.
+    SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD = EnvStr(None)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
