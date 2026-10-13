@@ -18,8 +18,24 @@ wins.
 > arms R1 could not (hx feature F107, "R2"): see **"ROUND 3 RESULTS: R2 (T5 and G0)"** at the end and §33.28. Neither
 > adds anything over T3. T5 (trainable projection) ties it exactly; G0 (gate correction, aggregator from scratch) is
 > below the bare gate. Representation changes are exhausted at this data size; lead time remains the lever.
+>
+> **Update 2026-10-12 (night), `master` at `a05f18035e` or later: START HERE if you are the checker.** The lead-time
+> finding was tested on the serving path (hx F108, §33.29); see **"ROUND 4 RESULTS"** at the end.
+> - In the one order run, the native gate moved to L+2 beat the best L+1 arm on the pre-registered measure. Step time
+>   per verify was 0.958, ms/token +4.2%, and L+2 was faster in all 6 unflagged sessions.
+> - Used reads still in flight at use fell from about 40% to 1.4%.
+> - The reversed order was not run, so the pre-registered verdict is not reached.
+> - Against no prefetch the gain is small (0.984 / +3.3%) and inside past order-to-order noise.
+>
+> **What we want from you now** (replacing the round-1 list below):
+> 1. Check the round 4 numbers and code, using its "Threats to validity" and "Questions for the checker".
+> 2. Check the round 3 reading: are T5 and G0 really null, and is G0's failure an initialisation artefact?
+> 3. Say what should run next.
+>
+> The sections in between are the history: round 1 critique, round 2 (R1 and the L+2 spike), round 3 (R2).
+> `DSV41_REFERENCE.md` §33.26-§33.29 is the record; when it and this file disagree, the reference wins.
 
-## What we want from you
+## What we want from you (round 1; superseded by the update at the top)
 
 A second opinion, not more code. Read this file, then §33.26, and tell the owner:
 
@@ -1041,28 +1057,154 @@ splits, exclusions, policy (cap 2, mean reads <= 1), calibration and timing mode
 **Housekeeping added this round:** worktree `wt-r2-run`, smoke dir `b1-r2-20261012-smoke`, failed log
 `r2-run-20261012-failed-oom.log`.
 
-## ROUND 4: the native gate at L+2, served (F108, §33.29)
+## ROUND 4 RESULTS: the native gate at L+2, served (F108, §33.29)
 
-`SGLANG_DSV41_RAM_PREFETCH_HORIZON` (default 1) retargets the GPU scorer to layer T+h's gate. A served A/B was run on
-divix01 with four arms: misscut, idle2-floors (L+1), idle2 (L+1) and idle2-l2 (L+2, no floors). **Only the forward
-order ran;** the reversed order was cancelled for time.
+This is the first *served* test of round 2's main finding (lead time beats a learned predictor). It is the
+experiment a checker should look at hardest: it is the only result in this file measured on the serving path, and it
+is one order of a two-order design.
 
-**Forward order**, flagged sessions excluded:
+### What was built (hx F108, merged `b845d8e63f`; doc fixes `9d86f32d8a`; results `a05f18035e`)
 
-| L+2 against | Step-time ratio | ms/token | Sessions faster |
-|---|---|---|---|
-| L+1 with floors | 0.958 | +4.2% | 4 of 6 |
-| L+1 without floors | 0.960 | +7.4% | 6 of 7 |
-| no prefetch | 0.984 | +3.3% | 5 of 8 |
+- **New knob `SGLANG_DSV41_RAM_PREFETCH_HORIZON`** (int, default 1, accepted 1..4).
+  - Row r now targets the row whose layer is `layer_ids[r] + h`. The layers in between must be consecutive streamed rows, and the target's gate must have a bias.
+  - The only "+1" in serving was `prefetch_targets` (`python/sglang/srt/layers/moe/ram_prefetch.py`).
+  - The GPU score kernels, the 16-slot candidate page, the host stale/abandon logic and the per-target-row pool already handled any target row. No C++ or kernel changed.
+- **Launch check:** a launch with horizon > 1 whose floors would resolve to the packaged L+1 table is refused (`expert_stream_requirements_exl3.py`).
+- **Tests:**
+  - Horizon 1 is byte-identical: the old target-table test is unchanged and the startup log text is pinned.
+  - A host test shows an L+2 job is not dropped as stale while T+1 is served, and is dropped once T+2 is served (`test_exl3_ram_prefetch_gpu_host.py`).
+  - A GPU test shows the L+2 candidates come from row T+2's gate and skip row T+2's hot experts (`test_exl3_ram_prefetch_gpu_scorer_cuda.py`).
+  - Re-run on the merge: CPU 396 passed, GPU 234 passed. The file list is in §33.29.
+- **A/B tooling:**
+  - New arm `dspark-both-prefetch-gpu-misscut-idle2-l2` in `analysis/dsv41-drive/dspark/both_cpu_ab.py`: idle2 plus `HORIZON=2` and `MARGIN_FLOORS=""`. Every other arm pins `HORIZON=1`.
+  - `analysis/dsv41-drive/dspark/l2_ab_report.py`: the pre-registered verdict as a pure function.
+  - `analysis/dsv41-drive/dspark/run_l2_ab.sh`: smoke, forward, reversed, report.
 
-**The mechanism moved as the replay predicted.** Used reads still in flight at use fell to 1.4% at L+2, from 39-43% at
-L+1. Used / landed was 0.35, against 0.46 without floors. NVMe rows per token were 32.5, the same as L+1 without
-floors.
+### Design and the pre-registered bar (written before any run; F108 spec D3-D7)
 
-**Reading.** In this order L+2 beat the best L+1 arm on the pre-registered measure. It is still one order, and its
-margin over no prefetch is inside the noise seen before. Next:
-1. Run the reversed order (about 1.5 h).
-2. If L+2 holds, fit L+2 margin floors. Its precision (0.35) is where L+1 was before floors (0.46 to 0.65).
-3. Defaults stay off and horizon 1 until the owner decides.
+- **Arms:**
+  - misscut: no prefetch, the reference.
+  - idle2-floors: L+1 with the packaged floors, the best arm so far.
+  - idle2: L+1, no floors.
+  - idle2-l2: L+2, no floors, as in the offline spike.
+
+  The two no-floor arms separate horizon from floors. All prefetch arms run idle2 (`IDLE_DRIVE=1 IDLE_SPREAD=1 IDLE_PIECES=2`) with `PER_LAYER=1` and `PER_TOKEN=1`.
+- **Orders:** forward (misscut, idle2-floors, idle2, idle2-l2), then reversed. Past prefetch A/Bs flipped sign between orders (§33.15; idle2 +3.6% then -3.7%, §33.22).
+- **Primary measure:** decode step time per verify, `(total - ttft) / spec_verify_ct` (§33.23), median over sessions with no drive flag in either arm. Accept length does not move it.
+- **Win:** step ratio <= 0.97 against idle2-floors in both orders, and paired ms/token favouring L+2 in both.
+- **Lose:** >= 1.03 in both orders.
+- **Tie:** anything else. The probe text must match.
+- **Mechanism check (D7):** the fraction of used speculative reads still in flight at use. The replay predicts it falls sharply.
+
+### What actually ran
+
+| Step | When (divix01) | Result |
+|---|---|---|
+| First launch | about 20:21 | Stopped at the benchmark generation gate before any server ran: the new python tree was unregistered. Kept as `l2-ab-20261012-failed-generation/`. Registered in the worktree as `f108-prefetch-horizon` (tree `8c1ca644`), the documented convention |
+| Smoke (misscut + idle2-l2, sessions 0-1) | about 20:24-21:06 | Pass. Server log: "38 of 40 rows target layer +2, GPU scorer, 1 per token, 1 per layer, margin floors none". 18,510 reads issued, 17,760 landed, text matched |
+| Forward order, 4 arms | 21:06-22:35 | All timed runs and probes rc 0 |
+| Reversed order | not run | **Cancelled by the owner for time.** The run script was stopped by PID before the reversed order started; the forward A/B finished normally |
+
+The worktree was `/data/models/slang/nvfp4-work/wt-l2-ab` at `9d86f32d8a`. Outputs are in
+`/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-20261012/`:
+- `smoke/` and `fwd/`, each with `summary.json`, `servers/<arm>/run-*/results.jsonl` and `server.log`;
+- the log `l2-ab-20261012.log`.
+
+The numbers below come from `l2_ab_report.analyse_order('<root>/fwd')` and `pair_table`. The full report could not
+run, because it needs both orders.
+
+### Results, forward order only
+
+| L+2 against | Step-time ratio (median) | Paired ms/token (median) | Sessions faster (ms/token) | Sessions used |
+|---|---|---|---|---|
+| idle2-floors (L+1 + floors) | **0.958** | **+4.2%** | 4 of 6 | 6 (DISCA, WRK flagged in floors) |
+| idle2 (L+1, no floors) | 0.960 | +7.4% | 6 of 7 | 7 (VLO flagged in idle2) |
+| misscut (no prefetch) | 0.984 | +3.3% | 5 of 8 | 8 |
+| context: idle2-floors / misscut | 1.032 | -0.5% | 2 of 6 | 6 |
+| context: idle2 / misscut | 1.022 | -2.2% | 2 of 7 | 7 |
+
+**L+2 against L+1 with floors, per session** (step ms; ms/token):
+
+| Session | Step L+1+floors | Step L+2 | Ratio | ms/token L+1+floors | ms/token L+2 | Paired |
+|---|---:|---:|---:|---:|---:|---:|
+| BKR | 294.6 | 288.5 | 0.979 | 135.3 | 124.7 | +7.8% |
+| CDW | 370.7 | 355.6 | 0.959 | 123.5 | 118.5 | +4.1% |
+| ETR | 265.7 | 254.3 | 0.957 | 62.5 | 59.8 | +4.3% |
+| TSCO | 258.6 | 254.5 | 0.984 | 52.9 | 54.1 | -2.2% |
+| VLO | 275.2 | 252.2 | 0.916 | 96.6 | 112.1 | -16.1% (L+2 text shorter at lower accept) |
+| K | 275.2 | 255.9 | 0.930 | 73.7 | 66.2 | +10.1% |
+| DISCA (excluded) | 654.2 | 280.7 | 0.429 | 178.4 | 76.6 | nvme4 stall in the floors arm |
+| WRK (excluded) | 391.0 | 263.6 | 0.674 | 109.5 | 66.8 | nvme4 stall in the floors arm |
+
+L+2's step time was lower in all six unflagged sessions.
+
+**L+2 against no prefetch, per session** (step ratio; paired ms/token):
+
+| Session | Ratio | Paired |
+|---|---:|---:|
+| BKR | 0.983 | +7.5% |
+| CDW | 1.045 | -4.5% |
+| DISCA | 0.954 | +4.6% |
+| ETR | 0.981 | +1.9% |
+| TSCO | 0.991 | -2.9% |
+| VLO | 0.985 | -2.8% |
+| WRK | 1.050 | +5.0% |
+| K | 0.967 | +11.7% |
+
+Step time was faster in 6 of 8 sessions.
+
+**Mechanism (D7):**
+
+| Arm | Used reads in flight at use | Used / landed | Wasted rows / token | NVMe rows / token | Accept length |
+|---|---:|---:|---:|---:|---:|
+| misscut | - | - | 0 | 24.9 | 3.60 |
+| idle2-floors (L+1) | 43% | 0.65 | 2.4 | 29.0 | 3.75 |
+| idle2 (L+1) | 39% | 0.46 | 6.1 | 32.5 | 3.58 |
+| idle2-l2 (L+2) | **1.4%** | 0.35 | 7.4 | 32.5 | 3.65 |
+
+- **Drive flags (all nvme4):**
+  - idle2-l2 had none.
+  - idle2-floors had two sessions, DISCA (+136% busy s per GB) and WRK (+150%).
+  - idle2 had one, VLO (+191%).
+- **Text:** all three prefetch arms passed the probe against misscut. idle2-l2 had 3 flips, all within band, with a max gap of 0.5.
+
+### How this session reads it (an opinion; argue with it)
+
+1. **The mechanism is confirmed in serving.**
+   - The extra layer of lead removes nearly all late reads (1.4% against about 40%), as the replay predicted.
+   - It costs precision: 0.35 against 0.46 for L+1 without floors. The same native gate predicts worse two layers ahead.
+2. **In this order L+2 met the pre-registered win condition against the best L+1 arm** (0.958 and +4.2%), and was faster in every unflagged session.
+3. **Against no prefetch the gain is small** (step 1.6%, ms/token +3.3%) and inside the ±3-4% that idle2 flipped across orders. It is not established that prefetch now pays at all.
+4. **Next, in order:**
+   - (a) Run the reversed order (about 1.5 h: re-run `run_l2_ab.sh`, or `both_cpu_ab.py <root>/rev` with the arms reversed, then `l2_ab_report.py <root>/fwd <root>/rev`).
+   - (b) If L+2 holds, fit L+2 margin floors. L+1's floors raised used / landed from 0.46 to 0.65 and cut waste from 6.1 to 2.4 rows per token. L+2 sits at 0.35 and 7.4.
+   - (c) Defaults stay off and horizon 1 until the owner decides.
+
+### Threats to validity (please check these)
+
+- **One order only.** idle2-l2 ran last in the forward order. If the box drifts over time (drive wear-in, page cache, thermals), the last arm is favoured or penalised systematically; only the reversed order separates that.
+- **Small n.** 6-8 sessions with no confidence interval. The pre-registered bar is a median ratio, not a test.
+- **Flag exclusion.** The two sessions dropped from the main comparison were both nvme4 stalls in the floors arm, the arm L+2 is compared with. Dropping them is pre-registered and *helps* the floors arm (they were L+2's biggest wins), but the comparison rests on 6 sessions.
+- **The L+1 arms were again slower than no prefetch here** (1.032 and 1.022). Part of L+2's lead over L+1 may be "L+1 hurts" rather than "L+2 helps". The L+2 / misscut ratio (0.984) is the cleaner reading of whether prefetch helps.
+- **ms/token is confounded by text length and accept rate** (VLO: L+2 was faster per step but slower per token). The step-time measure was chosen for that reason; check it is computed as described (`l2_ab_report.session_figures`).
+- **Drive traffic:** L+2 reads 30% more NVMe rows per token than no prefetch, and wastes 7.4 rows per token. Under heavier load (more than one request) that traffic could cost more than it saves. Only single-request decode was measured.
+- **Coverage:** at L+2, 38 of 40 rows have a target. The last two rows score nothing, and no row ever prefetches
+  for row 1. At L+1 the last row scores nothing.
+- **The bar and the reading are this session's.** The owner sets how to read it and any default.
+
+### Questions for the checker
+
+1. Do the forward-order numbers support the claim "L+2 beat L+1 in this order"? Recompute them from `fwd/summary.json` and the `results.jsonl` files.
+2. Is the step-time-per-verify measure computed correctly in `l2_ab_report.py`, and is excluding drive-flagged sessions applied symmetrically?
+3. Given idle2's earlier sign flip, how much weight does a single order deserve? Is the reversed order enough, or does this need more sessions?
+4. Is the F108 change really behaviour-identical at horizon 1 (`prefetch_targets`, the launch check, the arm pins in `both_cpu_ab.py`)?
+5. Should the next step be the reversed order, L+2 floors, or both in one A/B?
+
+**Housekeeping added this round:**
+- the worktree `wt-l2-ab`, whose `generations.json` holds the untracked registration;
+- `ram-prefetch/l2-ab-20261012-failed-generation{/,.log}`;
+- the unused `rev/` slot: no directory was created.
+
+Production on divix01 was stopped throughout, and the experiment servers ran on ports 30017/30018 only.
 
 Production on divix01 is still stopped; only you can restart it.

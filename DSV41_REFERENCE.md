@@ -9547,7 +9547,7 @@ at this data size; no further arms in this feature.
 Status: **forward order only; the reversed order was cancelled by the owner for time, so the pre-registered D6
 verdict (which needs both orders) is not reached.** Run `divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-20261012/`
 (`smoke/`, `fwd/`; log `l2-ab-20261012.log`), worktree `wt-l2-ab` at `9d86f32d8a` (merge `b845d8e63f`), generation
-`f108-prefetch-horizon` (python tree `8c1ca644`). Smoke 20:21-21:06, forward 21:06-22:35. The run script was stopped by
+`f108-prefetch-horizon` (python tree `8c1ca644`). Smoke about 20:24-21:06, forward 21:06-22:35. The run script was stopped by
 PID after the forward A/B started its last probe; the forward A/B completed normally. A first launch stopped at the
 generation gate before any server ran (`l2-ab-20261012-failed-generation/`). Numbers below come from
 `l2_ab_report.analyse_order` on `fwd/`. Tests on the merge: CPU 396 passed (prefetch tables, service, requirements,
