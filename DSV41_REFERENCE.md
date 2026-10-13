@@ -9592,7 +9592,7 @@ idle2-l2 / misscut, median over sessions with no drive flag in either arm of the
 | idle2-l2 / misscut | pending | pending |
 | idle2-l2 / idle2 | pending | pending |
 
-**Paired ms/token** (median of per-session difference, L+2 minus the comparator; negative favours L+2):
+**Paired ms/token** (median of per-session paired gain, % of the comparator's ms/token; positive favours L+2):
 
 | Pair | Forward | Reversed |
 |---|---|---|
@@ -9626,13 +9626,13 @@ Combined verdict: **pending**.
 ssh divix01 'git -C /data/models/slang/sglang fetch origin \
   && git -C /data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-l2-ab origin/<branch>'
 cd /data/models/slang/nvfp4-work/wt-l2-ab
-# smoke (L+2 arm, DSV41_SESSION_INDICES=0,1), both orders, then the report:
+# smoke (misscut reference + L+2 arm, sessions 0,1), both orders, then the report:
 analysis/dsv41-drive/dspark/run_l2_ab.sh /data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>
 # the script's last step, on its own:
 python analysis/dsv41-drive/dspark/l2_ab_report.py OUT/fwd OUT/rev --out OUT/report
 ```
 
-The smoke fails unless the L+2 arm issued and landed speculative reads and its probe text matched. The report is
+The smoke runs the misscut reference beside the L+2 arm (the text check needs the reference probe) and fails unless the L+2 arm issued and landed speculative reads and its probe text matched. The report is
 `OUT/report/REPORT.md` with `results.json`.
 
 **Decision.** Prefetch stays default off and the horizon stays 1 whatever the result (D8); this section records what the
