@@ -10049,6 +10049,41 @@ cannot come from a larger tier: every arm already runs the 104 GiB tier (`arm_en
 came in, §33.12) and host memory has no room for more. It has to come from residency (which experts stay in RAM and
 VRAM) or from verifying fewer wrong positions (§33.16 item 4). Production defaults are the owner's.
 
+### 33.34 T3 at two reads per layer: instrumented captures (2026-10-13)
+
+`9d26b8d53c` lets the learned head publish up to two blocks per record (the tail kernel's `picks`, from
+`SGLANG_DSV41_RAM_PREFETCH_PER_LAYER` 1..2; picks 1 writes the cap-1 record byte for byte). T3 keeps its cap-1 calib
+threshold 0.1302, so the second read is any block at or above it: a policy choice, not an F109-calibrated point.
+New arms `...-idle2-l2-cap2` and `...-idle2-l2-t3-cap2`. Three captures as in §33.33 (8 sessions, `--no-verify-split`),
+back to back in the order off, T3 cap 1, T3 cap 2. Run dir
+`divix01:/data/models/slang/nvfp4-work/ram-prefetch/t3-cap2-20261013/` (`{off,t3,t3cap2}/`, `compare-*-vs-off.*`,
+`run.sh`, `run.log`), worktree `wt-t3-cap2`. Instrumented-build times.
+
+| per verify (median) | off | T3 cap 1 | T3 cap 2 |
+|---|---:|---:|---:|
+| verifies | 129 | 131 | 128 |
+| wall ms (vs off) | 275.8 | 274.9 (-0.3%) | 264.5 (-4.1%) |
+| layer gate waits, ms | 214.0 | 213.9 | 201.3 |
+| forced misses / covered / NVMe reads left | 89.3 / 0 / 89.3 | 91.6 / 15.0 / 76.6 | 89.8 / 21.8 / 68.0 |
+| wait of a layer with no miss, ms | 2.74 | 2.90 | 2.73 |
+| layer 0 wait (drift control), ms | 11.07 | 10.99 | 11.34 |
+| speculative issued / landed / used | | 4140 / 3540 / 1979 | 7127 / 5816 / 2836 |
+| used / landed | | 0.56 | 0.49 |
+| used reads still in flight at use | | 1.2% | 15.6% |
+
+- **No drift in cap 2's favour**: layer 0 waits within 3%, cap 2's the slowest. Matched by (row, misses), off's
+  uncovered layers are 0.04 ms (vs T3) and 0.14 ms (vs T3 cap 2) slower per record: the second read adds no
+  measurable cost to demand reads.
+- **Cap 2 covers 45% more misses** (21.8 vs 15.0 per verify) at 75% more reads landed, and its gate waits fall
+  12.6 ms. Timeliness starts to bind: 15.6% of used reads were still landing at use, against 1.2% at cap 1.
+- **T3 cap 1 ties here** (-0.3%) although it covers 15 misses; its no-miss layers waited 0.16 ms more (6 ms per
+  verify over 40 layers), which would cancel the saving. One capture each cannot tell that from noise; §33.33's native
+  L+2 cap 1 was -2.4% against its own control.
+- **Reading.** One capture per arm, about 130 verifies each: -4.1% is suggestive, not a verdict. It is the first
+  prefetch setting whose per-verify gain clearly exceeds the cap-1 arms' 0-2.4%, consistent with §33.33 (misses
+  are a third of the step, cap 1 covers one in six). Next: native L+2 cap 2 (`...-idle2-l2-cap2`) as the control for
+  the head, then a repeated, order-balanced served comparison. Production defaults are the owner's.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
