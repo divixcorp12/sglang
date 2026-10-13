@@ -2030,7 +2030,7 @@ class Envs:
     # 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03: a 1 ms or
     # 3 ms gap then costs nothing). 0: PAUSE only. The team never sleeps either way.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
-    # NVMe-to-RAM prefetch: per NUMA group a thread scores the next layer's gate and reads its pick into a pool of RAM
+    # NVMe-to-RAM prefetch: per NUMA group a thread scores a later layer's gate (the next one by default) and reads its pick into a pool of RAM
     # slots the device never maps; a forced CPU miss on a pooled expert swaps it in. Needs SGLANG_DSV41_CPU_EXPERTS.
     SGLANG_DSV41_RAM_PREFETCH = EnvBool(False)
     # Candidates per live token, in its score order past the hot, mapped and pooled experts.
@@ -2042,7 +2042,7 @@ class Envs:
     # Pick only among each token's predicted top_k: a layer whose predicted experts are all cached reads nothing,
     # rather than an expert the gate ranks below top_k (the 2026-10-08 A/B's unused reads, DSV41_REFERENCE.md 33.14).
     SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
-    # Where the next layer's gate is scored: "cpu", each group's speculative thread on the record's staged input, or
+    # Where the target layer's gate is scored: "cpu", each group's speculative thread on the record's staged input, or
     # "gpu", two kernels after the layer's post inside the decode graph (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer).
     # gpu is the prefetch's best measured arm (DSV41_REFERENCE.md 33.14-33.18) and needs the RAM-miss copy engine.
     SGLANG_DSV41_RAM_PREFETCH_SCORER = EnvStr("gpu")
@@ -2064,6 +2064,9 @@ class Envs:
     # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4), each on a drive no demand
     # reads. One read rows too slowly in that A/B: 35% abandoned, 82% of promotions boosted.
     SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
+    # How many layers ahead the speculative scorer targets (1 to 4): 1 scores the next layer's gate, 2 the one after.
+    # Above 1 needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS set, since the packaged floors were fit for 1.
+    SGLANG_DSV41_RAM_PREFETCH_HORIZON = EnvInt(1)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
