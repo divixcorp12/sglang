@@ -63,7 +63,15 @@ def test_replay_stats_round_robin():
     stats = common.replay_stats(graphs, runs=30, warmup=3)
     assert stats["graphs"] == 3 and stats["runs"] == 30
     assert 0.0 <= stats["median_ms"] <= stats["p99_ms"]
-    assert [int(b[0].item()) for b in bufs] == [11, 11, 11]
+    counts = {int(b[0].item()) for b in bufs}  # a redone chunk replays all three graphs equally again
+    assert len(counts) == 1 and counts.pop() >= 11
+
+
+
+def test_implied_bandwidth_flags_above_spec():
+    """Catches an L2-resident number (above the card's DRAM spec) passing as plausible."""
+    assert common.implied_bandwidth(moved_bytes=10**9, median_ms=1.0)["plausible"]
+    assert not common.implied_bandwidth(moved_bytes=3 * 10**9, median_ms=1.0)["plausible"]
 
 
 @needs_cuda

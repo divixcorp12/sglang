@@ -9,6 +9,7 @@ sys.path.insert(0, str(HERE))
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+import l2_fast_common as common  # noqa: E402
 import l2_fast_cost  # noqa: E402
 import l2_fast_kernels  # noqa: E402
 import r1_cost  # noqa: E402
@@ -49,6 +50,60 @@ def test_slots_never_share_inputs_and_gates_rotate():
     for field in ("x", "scores", "ids", "weights", "skip", "ram_slot"):
         assert len({getattr(s, field).data_ptr() for s in slots}) == 3, field
     assert l2_fast_cost.rotated_gate_bytes(slots) == 3 * l2_fast_cost.EXPERTS * r1_cost.X_DIM * 2
+
+
+def test_check_rotation_refuses_too_few_or_l2_resident_gates():
+    """R11: a real-gate run with fewer gates than slots, or gates that fit in L2, would time a cache-resident cost."""
+    gate_bytes = l2_fast_cost.EXPERTS * r1_cost.X_DIM * 2
+    with pytest.raises(ValueError, match="slots"):
+        l2_fast_cost.check_rotation(l2_fast_cost.synthetic_gates(count=2, device=DEV), slots=3)
+    with pytest.raises(ValueError, match="L2"):
+        l2_fast_cost.check_rotation(l2_fast_cost.synthetic_gates(count=3, device=DEV), slots=3)
+    enough = l2_fast_cost.L2_BYTES // gate_bytes + 1
+    l2_fast_cost.check_rotation(l2_fast_cost.synthetic_gates(count=enough, device=DEV), slots=enough)
+
+
+def test_warnings_flag_l2_resident_and_impossible_bandwidth():
+    """R11: an L2-resident or above-spec width must be flagged in cost.json, not left to the reader."""
+    assert l2_fast_cost.measurement_warnings(bandwidth={"1": 900.0}, rotated={"1": 2 * l2_fast_cost.L2_BYTES}) == []
+    got = l2_fast_cost.measurement_warnings(bandwidth={"1": 3000.0}, rotated={"1": l2_fast_cost.L2_BYTES})
+    assert len(got) == 2 and "L2" in got[0] and "GB/s" in got[1]
+
+
+def test_replay_stats_excludes_host_launch_gap():
+    """R11: per-replay events that include host launch latency inflate small graphs, more so with more nodes."""
+    a = torch.ones(4096, device=DEV)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(4):
+            a.mul_(1.0001)
+    for _ in range(10):
+        graph.replay()
+    torch.cuda.synchronize()
+    reps = 200
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.cuda._sleep(int(20 * common._cycles_per_ms()))  # 20 ms: the host queues every replay before the GPU starts
+    start.record()
+    for _ in range(reps):
+        graph.replay()
+    stop.record()
+    torch.cuda.synchronize()
+    gpu_ms = start.elapsed_time(stop) / reps
+    stats = common.replay_stats([graph], runs=500, warmup=10)
+    assert stats["median_ms"] <= 1.5 * gpu_ms + 0.002, (stats, gpu_ms)
+
+
+def test_queued_times_returns_one_sample_per_run():
+    """A chunk boundary dropping samples would shorten the median's population and misalign side-stream overlap."""
+    seen = []
+
+    def launch(i, start, stop):
+        seen.append(i)
+        start.record()
+        stop.record()
+
+    ms, queue = common.queued_times(launch, runs=7, chunk=3)
+    assert len(ms) == 7 and queue["chunk"] == 3 and sorted(set(seen)) == list(range(7))
 
 
 @pytest.mark.parametrize("t3", [False, True], ids=["T0", "T3"])

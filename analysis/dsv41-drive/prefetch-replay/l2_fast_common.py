@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -40,6 +41,15 @@ HYPOTHESIS = "hypothesis"
 BAR_MS_PER_LAYER = 0.1
 SLOTS = 38
 WIDTHS = (1, 2, 4, 6)
+L2_BYTES = 96 * 2**20
+# RTX 5090 spec: 512-bit GDDR7 at 28 Gbps.
+DRAM_GBPS = 1792.0
+# Arbitrary; 50 launches plus their events stay well inside the CUDA launch queue.
+QUEUE_CHUNK = 50
+# Arbitrary generous first guess at host time per timed launch; doubled per chunk the host fails to queue in time.
+QUEUE_MS_PER_LAUNCH = 0.1
+QUEUE_MAX_REDOS = 8
+_CALIBRATE_CYCLES = 20_000_000
 
 _NODE_LINE = re.compile(r'^\s*"([^"]+)"\s*\[', re.MULTILINE)
 
@@ -80,26 +90,78 @@ def write_json(path: str, obj: object) -> None:
 
 
 def replay_stats(graphs: list[torch.cuda.CUDAGraph], *, runs: int, warmup: int) -> dict:
-    """Replay graphs round-robin (graph i % len) and time each replay with CUDA events."""
+    """Replay graphs round-robin (graph i % len), each timed with CUDA events behind a pre-queued GPU delay."""
     n = len(graphs)
     for i in range(warmup):
         graphs[i % n].replay()
     torch.cuda.synchronize()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(runs)]
-    stops = [torch.cuda.Event(enable_timing=True) for _ in range(runs)]
-    for i in range(runs):
-        starts[i].record()
+
+    def launch(i: int, start: torch.cuda.Event, stop: torch.cuda.Event) -> None:
+        start.record()
         graphs[i % n].replay()
-        stops[i].record()
+        stop.record()
+
+    ms, queue = queued_times(launch, runs=runs)
+    return {**summarize(ms), "runs": runs, "graphs": n, "queue": queue}
+
+
+def summarize(ms: np.ndarray) -> dict:
+    return {"median_ms": float(np.median(ms)), "p90_ms": float(np.percentile(ms, 90)),
+            "p99_ms": float(np.percentile(ms, 99))}
+
+
+def queued_times(launch: Callable[[int, torch.cuda.Event, torch.cuda.Event], None], *, runs: int,
+                 chunk: int = QUEUE_CHUNK) -> tuple[np.ndarray, dict]:
+    """ms between each launch's (start, stop) events, launched in chunks queued behind a GPU sleep.
+
+    Without the sleep the GPU idles while the host launches, so each sample would include host launch latency.
+    A chunk whose sleep ended before its last launch was queued is redone with a doubled sleep.
+    """
+    cycles_per_ms = _cycles_per_ms()
+    sleep_ms = chunk * QUEUE_MS_PER_LAUNCH
+    ms, redone = [], 0
+    for lo in range(0, runs, chunk):
+        while True:
+            got = _queued_chunk(launch, idx=range(lo, min(runs, lo + chunk)), cycles=int(sleep_ms * cycles_per_ms))
+            if got is not None:
+                break
+            redone += 1
+            if redone > QUEUE_MAX_REDOS:
+                raise RuntimeError(f"host could not queue {chunk} launches inside a {sleep_ms:.1f} ms GPU sleep")
+            sleep_ms *= 2
+        ms.extend(got)
+    return np.array(ms, dtype=np.float64), {"chunk": chunk, "sleep_ms": sleep_ms, "redone_chunks": redone}
+
+
+def _queued_chunk(launch, *, idx: range, cycles: int) -> list[float] | None:
+    """Event ms of one chunk queued behind a sleep; None if the GPU caught up with the host."""
+    starts = [torch.cuda.Event(enable_timing=True) for _ in idx]
+    stops = [torch.cuda.Event(enable_timing=True) for _ in idx]
+    torch.cuda._sleep(cycles)
+    awake = torch.cuda.Event()
+    awake.record()
+    for i, start, stop in zip(idx, starts, stops):
+        launch(i, start, stop)
+    caught_up = awake.query()
     torch.cuda.synchronize()
-    ms = np.array([a.elapsed_time(b) for a, b in zip(starts, stops)], dtype=np.float64)
-    return {
-        "median_ms": float(np.median(ms)),
-        "p90_ms": float(np.percentile(ms, 90)),
-        "p99_ms": float(np.percentile(ms, 99)),
-        "runs": runs,
-        "graphs": n,
-    }
+    if caught_up:
+        return None
+    return [a.elapsed_time(b) for a, b in zip(starts, stops)]
+
+
+def _cycles_per_ms() -> float:
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    torch.cuda._sleep(_CALIBRATE_CYCLES)
+    stop.record()
+    stop.synchronize()
+    return _CALIBRATE_CYCLES / start.elapsed_time(stop)
+
+
+def implied_bandwidth(*, moved_bytes: int, median_ms: float) -> dict:
+    """GB/s of ``moved_bytes`` over ``median_ms`` and whether it is below the RTX 5090's DRAM spec."""
+    gbps = moved_bytes / (median_ms * 1e-3) / 1e9
+    return {"gbps": gbps, "ceiling_gbps": DRAM_GBPS, "plausible": gbps <= DRAM_GBPS}
 
 
 def graph_nodes(step) -> int:

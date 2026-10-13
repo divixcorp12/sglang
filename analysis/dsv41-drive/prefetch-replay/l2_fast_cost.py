@@ -48,11 +48,12 @@ MODELS = ("L2_T0", "L2_T3")
 CONFIGS = ("native", "fused", "torch")
 EXPERTS = spec_head.HEAD_EXPERTS
 HORIZON = 2
-L2_BYTES = 96 * 2**20
+L2_BYTES = common.L2_BYTES
 # Arbitrary; the kernels' and torch path's cost does not depend on the threshold value.
 THRESHOLD = 0.5
 NATIVE_HOT = 16  # as l2_fast_interference.native_graphs and bench_exl3_ram_prefetch_score
-SCOPE = ("CUDA graph replay on one stream (CUDA events per replay), one graph per layer slot replayed round-robin; "
+SCOPE = ("CUDA graph replay on one stream (CUDA events per replay, replays queued in chunks behind a GPU sleep so "
+         "host launch latency is excluded), one graph per layer slot replayed round-robin; "
          "each slot has its own bf16 target gate, x, scores and routes (gates rotate past the 96 MiB L2), head weights "
          "shared; median/p90/p99 over --runs replays per width; RTX 5090")
 BANDWIDTH_SCOPE = ("gate + bias + x bytes of one spec_score over the native (score + select) median; a lower bound "
@@ -220,12 +221,37 @@ def sweep(*, heads: dict[str, tuple[l2_fast_torch.FoldedHead, str]], gates: list
                 m = models[name]
                 m["native"][key], m["fused"][key], m["torch"][key] = native, got["fused"], got["torch"]
                 m["incremental_ms"][key] = got["fused"]["median_ms"] - native["median_ms"]
+    warnings = measurement_warnings(bandwidth=bandwidth, rotated=rotated)
+    for line in warnings:
+        print(f"WARNING: {line}", file=sys.stderr)
     return {
         "label": common.OBSERVED, "scope": SCOPE, "widths": list(widths), "slots": slots, "runs": runs,
         "warmup": warmup, "threshold": threshold, "gpu": torch.cuda.get_device_name(),
         "bar_ms_per_layer": common.BAR_MS_PER_LAYER, "models": models, "native_bandwidth_gbps": bandwidth,
-        "native_bandwidth_scope": BANDWIDTH_SCOPE, "rotated_gate_bytes": rotated, "l2_bytes": L2_BYTES,
+        "native_bandwidth_scope": BANDWIDTH_SCOPE, "bandwidth_ceiling_gbps": common.DRAM_GBPS,
+        "rotated_gate_bytes": rotated, "l2_bytes": L2_BYTES, "warnings": warnings,
     }
+
+
+def measurement_warnings(*, bandwidth: dict[str, float], rotated: dict[str, int]) -> list[str]:
+    """One line per width whose gates fit in L2 or whose implied bandwidth exceeds the card's DRAM spec."""
+    out = []
+    for key in rotated:
+        if rotated[key] <= L2_BYTES:
+            out.append(f"width {key}: rotated gates {rotated[key]} B fit in the {L2_BYTES} B L2; cost is cache-resident")
+        if bandwidth[key] > common.DRAM_GBPS:
+            out.append(f"width {key}: native implies {bandwidth[key]:.0f} GB/s, above the {common.DRAM_GBPS:.0f} "
+                       "GB/s spec; impossible from DRAM")
+    return out
+
+
+def check_rotation(gates: list[tuple[torch.Tensor, torch.Tensor]], *, slots: int) -> None:
+    """Refuse a real run whose gates would repeat within the slots or fit in L2 (R11)."""
+    if len(gates) < slots:
+        raise ValueError(f"{len(gates)} distinct gates for {slots} slots; slots would share a gate (R11)")
+    total = sum(w.numel() * w.element_size() for w, _bias in gates[:slots])
+    if total <= L2_BYTES:
+        raise ValueError(f"rotated gates are {total} B, within the {L2_BYTES} B L2 (R11)")
 
 
 def cost_rows(model: r1_models.R1Model, *, slots: int) -> tuple[l2_fast_torch.FoldRow, ...]:
@@ -267,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         gates = model_gates(args.model_path, rows=heads[MODELS[0]][0].rows, device="cuda")
     else:
         gates = synthetic_gates(count=args.slots, device="cuda")
+    check_rotation(gates, slots=args.slots)
     result = sweep(heads=heads, gates=gates, slots=args.slots, runs=args.runs, warmup=args.warmup)
     result["gate_source"] = args.model_path or "synthetic bf16 N(0, 0.02^2), one per slot"
     result["sglang_file"] = sglang.__file__
