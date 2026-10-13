@@ -45,7 +45,8 @@ def _cell(*, near: list, far: int, recall: bool) -> dict:
     cell = {"groups": 10, "max_abs_diff": 1e-6, "p99_abs_diff": 1e-7, "top1_agree": 1.0, "read_agree": 0.8,
             "disagreements": len(near) + far, "near_threshold": near, "far_disagreements": far}
     if recall:
-        cell["recall_change"] = {"ref_recall": 0.5, "got_recall": 0.49, "diff": -0.01, "eligible": 100}
+        cell["recall_change"] = {"ref_recall": 0.5, "got_recall": 0.49, "diff": -0.01, "eligible": 100,
+                                 "label": "precision candidate"}
     return cell
 
 
@@ -127,6 +128,15 @@ def test_report_states_gate_dtype_record_mismatch_and_fp32_section():
     assert "kernel record mismatch" in text and "| 4 |" in text
     assert result["parity_router_fp32"]["status"] == "produced"
     assert _build()["parity_router_fp32"]["status"] == rep.PENDING
+
+
+def test_precision_candidate_tag_survives_stamping_and_reaches_report():
+    """The driver's 'precision candidate' tag on recall_change must not be overwritten by the measurement label."""
+    result = _build(parity=_parity())
+    rc = result["parity"]["cases"]["spec_score"]["calib"]["L2_T0"]["kernel"]["0.75"]["recall_change"]
+    assert rc["kind"] == "precision candidate" and rc["label"] == rep.OBSERVED
+    cand = rep.render_report(result).split("### Precision candidates")[1]
+    assert "precision candidate" in cand
 
 
 def test_write_outputs_is_atomic_and_complete(tmp_path):

@@ -67,6 +67,8 @@ def _stamp(node: object, *, label: str, scope: str) -> object:
             label = node["label"]
         out = {k: _stamp(v, label=label, scope=scope) for k, v in node.items()}
         if "label" in node or any(_is_num(v) for v in node.values()):
+            if isinstance(node.get("label"), str) and node["label"] not in LABELS:
+                out["kind"] = node["label"]
             out["label"], out["scope"] = label, scope
         return out
     if isinstance(node, (list, tuple)):
@@ -318,11 +320,12 @@ def _far_lines(cells: list) -> list[str]:
 
 def _candidate_lines(cells: list) -> list[str]:
     rows = [[" / ".join(path), c["disagreements"], c["recall_change"].get("ref_recall"),
-             c["recall_change"].get("got_recall"), c["recall_change"].get("diff")]
+             c["recall_change"].get("got_recall"), c["recall_change"].get("diff"),
+             c["recall_change"].get("kind", "n/a")]
             for path, c in cells
             if path[0].startswith("spec_score") and c["disagreements"] and "recall_change" in c]
     body = ["### Precision candidates (spec_score gate scores that change a read)", ""]
-    return body + (_table(["where", "read changes", "ref recall", "got recall", "recall change"], rows,
+    return body + (_table(["where", "read changes", "ref recall", "got recall", "recall change", "kind"], rows,
                           label=OBSERVED) if rows else ["none reported", ""])
 
 
