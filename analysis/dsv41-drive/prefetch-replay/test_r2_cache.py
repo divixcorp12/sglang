@@ -115,10 +115,13 @@ def test_build_peak_stays_near_the_cache_size():
     model, rs = _setup()
     rs = rs * 40
     gates = {k: (W.cuda(), b.cuda()) for k, (W, b) in _gates(rs).items()}
+    kw = dict(x_of=_x, pca=model.pca, cfg=model.cfg, vocab=model.vocab, device="cuda", with_x=True, gates=gates,
+              x_dtype=torch.bfloat16)
+    # The first gate matmul allocates cuBLAS's 32 MiB workspace for the process; keep it out of the baseline.
+    r1_cache.collate(rs[:1], **kw)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    cache = r1_cache.build_cache(rs, x_of=_x, pca=model.pca, cfg=model.cfg, vocab=model.vocab, device="cuda",
-                                 with_x=True, gates=gates, chunk=4, x_dtype=torch.bfloat16)
+    cache = r1_cache.build_cache(rs, chunk=4, **kw)
     size = _nbytes(cache.inp)
     assert torch.cuda.max_memory_allocated() - base < 1.5 * size
