@@ -93,6 +93,18 @@ def test_existing_out_is_refused_and_left_untouched(tmp_path, capsys):
     assert out.read_bytes() == b"existing head"
 
 
+def test_guard_accepts_the_fixed_serving_path():
+    """A mutant that guards --out only against l2_fast_common.OUT_ROOT refuses both_cpu_ab.T3_HEAD and turns this red."""
+    import importlib.util
+    import os
+
+    spec = importlib.util.spec_from_file_location("both_cpu_ab", HERE.parent / "dspark" / "both_cpu_ab.py")
+    ab = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ab)
+    assert os.path.dirname(ab.T3_HEAD) == l2_head_export.HEAD_ROOT
+    assert l2_head_export.guard_out(ab.T3_HEAD, run_dir="/nonexistent/run") == os.path.realpath(ab.T3_HEAD)
+
+
 def test_out_inside_protected_run_dir_exits_2(capsys):
     """A mutant that skips guard_out would write into the F109 directory instead of exiting 2."""
     out = "/mnt/nvme1/nvfp4-work/f109-l2-cap1-20261013/head.safetensors"

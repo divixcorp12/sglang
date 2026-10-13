@@ -176,12 +176,12 @@ __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void sp
   uint8_t* const slot =
       serving ? p.candidates + static_cast<int64_t>((seq - 1u) % Cand::kCandRecords) * Cand::kCandStride : p.record;
   st_relaxed_sys<uint32_t>(slot + Cand::kCandSeq, 0u);
-  __threadfence();
+  // The host reads the pinned page as a seqlock, so seq 0 must be visible system-wide before the payload.
+  cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
   st_relaxed_sys<uint32_t>(slot + Cand::kCandCount, found ? 1u : 0u);  // flags 0
   uint8_t* const entry = slot + Cand::kCandEntries;
   st_relaxed_sys<uint32_t>(entry + Cand::kCandExpert, found ? static_cast<uint32_t>(pick) : 0xFFFFu);  // rank 0
   st_relaxed_sys<uint32_t>(entry + Cand::kCandMargin, found ? __float_as_uint(best) : 0u);
-  __threadfence();
   st_release_sys(slot + Cand::kCandSeq, seq);  // orders the payload before the seq
 }
 

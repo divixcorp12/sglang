@@ -8,11 +8,14 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.ram_prefetch_learned_head import LearnedHeadFile
 
 # The host's bounds: host/gate_scorer.h GateScorer::kDepth and kMaxPerLayer, host/ram_prefetch.h SpecPool::kMaxShare.
 MAX_PER_TOKEN = 12
@@ -198,8 +201,7 @@ class GpuScorer:
     candidates: torch.Tensor
     per_token: int
     top_k_only: bool
-    # A LearnedHeadFile (ram_prefetch_learned_head) when SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD is set.
-    learned_head: Optional[object] = None
+    learned_head: Optional[LearnedHeadFile] = None
 
 
 def read_margin_floors(path: str) -> dict[int, float]:

@@ -7,8 +7,8 @@ frozen calib threshold and where it came from. The threshold is read, never refi
 Inputs: a finished R1 run (exclusions, stages/l2/result.json), the B1 dataset and the F109 output directory (result.json,
 read only). Output: --out only; it may not be RUN_DIR, inside it, or inside any protected run directory.
 
---out is checked by its realpath against l2_fast_common.OUT_ROOT (/mnt/nvme1/nvfp4-work): the fixed serving path
-under /data/models/slang/nvfp4-work/ram-prefetch/ is accepted only where that tree resolves there on the box.
+--out must lie under HEAD_ROOT (the directory of both_cpu_ab.T3_HEAD, the fixed serving path) or under
+l2_fast_common.OUT_ROOT, and never inside a protected run directory (l2_fast_common.FORBIDDEN).
 
 Usage: l2_head_export.py RUN_DIR --dataset D --f109 F109_DIR --out PATH [--scorer L2_T3] [--budget 0.75]
 Exit: 0 done, 1 failure, 2 refused --out (protected directory, or the file already exists).
@@ -33,12 +33,30 @@ import l2_fast_common as common  # noqa: E402
 import l2_fast_kernels  # noqa: E402
 import l2_fast_torch  # noqa: E402
 import r1_models  # noqa: E402
+import r1_stage  # noqa: E402
 
 from sglang.srt.layers.moe import ram_prefetch_learned_head as head_file  # noqa: E402
 
 SCORER = "L2_T3"
 BUDGET = "0.75"
 SPLITS = ("dev", "calib")
+# The directory of analysis/dsv41-drive/dspark/both_cpu_ab.py's T3_HEAD (Q1); a test pins the two together.
+HEAD_ROOT = "/data/models/slang/nvfp4-work/ram-prefetch/l2-t3-head"
+
+
+def guard_out(out: str, *, run_dir: str) -> str:
+    """The real --out: under HEAD_ROOT, or wherever l2_fast_common.guard_out accepts it; raises common.RefusedOut."""
+    real_head_root = os.path.realpath(HEAD_ROOT)
+    if not os.path.realpath(out).startswith(real_head_root + os.sep):
+        return common.guard_out(out, run_dir=run_dir)
+    try:
+        real = r1_stage.guard_out_root(out, root=HEAD_ROOT, forbidden=common.FORBIDDEN)
+    except ValueError as e:
+        raise common.RefusedOut(str(e)) from e
+    real_run = os.path.realpath(run_dir)
+    if real == real_run or real.startswith(real_run + os.sep):
+        raise common.RefusedOut(f"--out {out!r} is or lies inside RUN_DIR {run_dir!r}, which is read-only")
+    return real
 
 
 def export_head(model: r1_models.R1Model, *, rows: tuple[l2_fast_torch.FoldRow, ...], checkpoint_sha256: str,
@@ -118,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: {a.out} already exists; the head file is written once, never replaced", file=sys.stderr)
         return 2
     try:
-        out = common.guard_out(a.out, run_dir=a.run_dir)
+        out = guard_out(a.out, run_dir=a.run_dir)
     except common.RefusedOut as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
