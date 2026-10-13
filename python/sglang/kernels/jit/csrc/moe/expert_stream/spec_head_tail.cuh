@@ -1,8 +1,8 @@
 // The fused learned head's tail (the L+2 heads T0 and T3 of analysis/dsv41-drive/prefetch-replay/r1_models.py):
 //
 //   spec_head_tail_kernel  token logits -> block score per expert (T0: noisy-or; T3: r1_aggregator.block_features and
-//                          the aggregator MLP) -> sigmoid -> the hot/RAM skips -> threshold -> cap-1 argmax, published to
-//                          a candidate record (spec_candidates.h) in the serving convention
+//                          the aggregator MLP) -> sigmoid -> the hot/RAM skips -> threshold -> the best `picks` (1 or 2),
+//                          published to a candidate record (spec_candidates.h) in the serving convention
 #pragma once
 
 #include "spec_candidates.h"
@@ -16,6 +16,7 @@ constexpr int kHeadTailThreads = 384;  // the tail's block: one thread per exper
 constexpr int kHeadMaxTokens = 8;      // live tokens per record (the learned heads' MAX_WIDTH is 6)
 constexpr int kBlockFeatures = 10;     // r1_aggregator.N_BLOCK_FEATURES
 constexpr int kAggHidden = 32;         // the aggregator MLP's hidden width
+constexpr int kHeadMaxPicks = 2;       // reads per record; SGLANG_DSV41_RAM_PREFETCH_PER_LAYER's range with a head
 
 static_assert(kHeadTailThreads % 32 == 0 && kHeadMaxExperts <= kHeadTailThreads, "one thread per expert");
 
@@ -45,6 +46,7 @@ struct SpecHeadTailParams {
   int64_t hot_capacity;
   const int32_t* ram_slot;   ///< the target layer's row of the device map: >= 0 mapped in RAM
   const float* threshold;    ///< [1]: a block scoring below it is not read
+  int64_t picks;             ///< 1..kHeadMaxPicks: how many blocks at or above the threshold to publish
   float* block_scores;       ///< [experts]: sigmoid of the block logit, every expert
   float* features;           ///< [experts, kBlockFeatures] block features, or nullptr
   uint8_t* record;           ///< kCandStride bytes: the candidate slot, written as spec_candidates.h lays it out
@@ -54,8 +56,9 @@ struct SpecHeadTailParams {
 
 /// \brief The fused tail: one block of kHeadTailThreads, one thread per expert.
 ///
-/// Computes each expert's block score, then thread 0 publishes the best non-skipped expert at or above the threshold
-/// (ties to the lower id, NaN below all) as count 0 or 1, the expert at kCandExpert and its score at kCandMargin. The
+/// Computes each expert's block score, then thread 0 publishes the best `picks` non-skipped experts at or above the
+/// threshold, best first (ties to the lower id, NaN below all), as count 0..picks: each entry's expert at kCandExpert,
+/// its order at kCandRank and its score at kCandMargin. With picks 1 the record is the cap-1 one, byte for byte. The
 /// record's seq is stored last, after a fence, as spec_score.cuh's select kernel does.
 __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void spec_head_tail_kernel(
     const __grid_constant__ SpecHeadTailParams p) {
@@ -68,6 +71,8 @@ __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void sp
   __shared__ float w2[kAggHidden];
   __shared__ float warp_top[kWarps];
   __shared__ int32_t warp_id[kWarps];
+  __shared__ float pick_score[kHeadMaxPicks];
+  __shared__ int32_t pick_id[kHeadMaxPicks];
   const int tid = threadIdx.x;
   const int lane = tid % 32, warp = tid / 32;
   const bool learned = p.agg_w1 != nullptr;
@@ -141,36 +146,47 @@ __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void sp
   __syncthreads();  // skip is complete
 
   const float threshold = p.threshold[0];
-  float top = neg_inf();
-  int32_t id = 0x7FFFFFFF;
-  if (mine && skip[tid] == 0 && score >= threshold) {  // a NaN score fails the comparison and never ranks
-    top = score;
-    id = tid;
-  }
+  const bool eligible = mine && skip[tid] == 0 && score >= threshold;  // a NaN score fails the comparison
+  for (int k = 0; k < p.picks; ++k) {  // picks is uniform, so every thread reaches each __syncthreads
+    bool taken = false;
+    for (int j = 0; j < k; ++j) taken |= pick_id[j] == tid;
+    float top = neg_inf();
+    int32_t id = 0x7FFFFFFF;
+    if (eligible && !taken) {
+      top = score;
+      id = tid;
+    }
 #pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    const float other = __shfl_xor_sync(0xFFFFFFFFu, top, offset);
-    const int32_t other_id = __shfl_xor_sync(0xFFFFFFFFu, id, offset);
-    if (ranks_above(other, other_id, top, id)) {
-      top = other;
-      id = other_id;
+    for (int offset = 16; offset > 0; offset /= 2) {
+      const float other = __shfl_xor_sync(0xFFFFFFFFu, top, offset);
+      const int32_t other_id = __shfl_xor_sync(0xFFFFFFFFu, id, offset);
+      if (ranks_above(other, other_id, top, id)) {
+        top = other;
+        id = other_id;
+      }
     }
+    if (lane == 0) {
+      warp_top[warp] = top;
+      warp_id[warp] = id;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float best = warp_top[0];
+      int32_t pick = warp_id[0];
+      for (int w = 1; w < kWarps; ++w) {
+        if (ranks_above(warp_top[w], warp_id[w], best, pick)) {
+          best = warp_top[w];
+          pick = warp_id[w];
+        }
+      }
+      pick_score[k] = best;
+      pick_id[k] = pick;
+    }
+    __syncthreads();  // pick_id[k] is visible, and warp_top is free for the next round
   }
-  if (lane == 0) {
-    warp_top[warp] = top;
-    warp_id[warp] = id;
-  }
-  __syncthreads();
   if (tid != 0) return;
-  float best = warp_top[0];
-  int32_t pick = warp_id[0];
-  for (int w = 1; w < kWarps; ++w) {
-    if (ranks_above(warp_top[w], warp_id[w], best, pick)) {
-      best = warp_top[w];
-      pick = warp_id[w];
-    }
-  }
-  const bool found = pick != 0x7FFFFFFF;
+  int count = 0;
+  while (count < p.picks && pick_id[count] != 0x7FFFFFFF) ++count;
   const bool serving = p.candidates != nullptr;
   const uint32_t seq = serving ? static_cast<uint32_t>(p.state[kPosted]) : 1u;
   uint8_t* const slot =
@@ -178,10 +194,17 @@ __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void sp
   st_relaxed_sys<uint32_t>(slot + Cand::kCandSeq, 0u);
   // The host reads the pinned page as a seqlock, so seq 0 must be visible system-wide before the payload.
   cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
-  st_relaxed_sys<uint32_t>(slot + Cand::kCandCount, found ? 1u : 0u);  // flags 0
+  st_relaxed_sys<uint32_t>(slot + Cand::kCandCount, static_cast<uint32_t>(count));  // flags 0
   uint8_t* const entry = slot + Cand::kCandEntries;
-  st_relaxed_sys<uint32_t>(entry + Cand::kCandExpert, found ? static_cast<uint32_t>(pick) : 0xFFFFu);  // rank 0
-  st_relaxed_sys<uint32_t>(entry + Cand::kCandMargin, found ? __float_as_uint(best) : 0u);
+  // Entry 0 is written even at count 0 (expert 0xFFFF), as the cap-1 record always was; rank 0.
+  st_relaxed_sys<uint32_t>(entry + Cand::kCandExpert, count > 0 ? static_cast<uint32_t>(pick_id[0]) : 0xFFFFu);
+  st_relaxed_sys<uint32_t>(entry + Cand::kCandMargin, count > 0 ? __float_as_uint(pick_score[0]) : 0u);
+  for (int k = 1; k < count; ++k) {
+    uint8_t* const e = entry + k * Cand::kCandEntryBytes;
+    // u16 expert, u8 rank = k (the pick's order), the pad byte 0.
+    st_relaxed_sys<uint32_t>(e + Cand::kCandExpert, static_cast<uint32_t>(pick_id[k]) | (static_cast<uint32_t>(k) << 16));
+    st_relaxed_sys<uint32_t>(e + Cand::kCandMargin, __float_as_uint(pick_score[k]));
+  }
   st_release_sys(slot + Cand::kCandSeq, seq);  // orders the payload before the seq
 }
 

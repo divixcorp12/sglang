@@ -21,6 +21,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.moe.expert_stream_transport import CAND_STRIDE
 
 HEAD_MAX_TOKENS = 8  # spec_head_tail.cuh kHeadMaxTokens
+HEAD_MAX_PICKS = 2  # spec_head_tail.cuh kHeadMaxPicks
 HEAD_EXPERTS = 384
 DEFAULT_PCA_RANK = 256  # b1_head.HeadConfig defaults
 DEFAULT_HIDDEN = 512
@@ -177,12 +178,14 @@ def run_spec_head_serving(
     threshold: torch.Tensor,
     state: torch.Tensor,
     candidates: torch.Tensor,
+    picks: int = 1,
 ) -> None:
     """K1-K4 publishing into the post's candidate-page slot, on the current stream; graph-capturable.
 
     The slot is ``(state[kPosted] - 1) % kCandRecords`` of the pinned uint8 ``candidates`` page, read
     on the device, with the seq stored last. ``x`` None or ``tokens`` outside 1..HEAD_MAX_TOKENS
     publishes count 0 with the oversize flag. ``src_ids``/``src_w``/``positions`` lead with ``tokens`` rows.
+    ``picks`` (1..HEAD_MAX_PICKS) is how many blocks at or above the threshold are published, best first.
     """
     module = _module()
     address = int(candidates.data_ptr())
@@ -197,7 +200,7 @@ def run_spec_head_serving(
         w.agg_w1, w.agg_row_bias, w.agg_w2, w.agg_b2,
         int(row), hot_slots, int(hot_capacity), ram_slot, int(target), threshold,
         ws.h, ws.pre, ws.hid, ws.logits, ws.block_scores, ws.features,
-        state, address,
+        state, address, int(picks),
     )  # fmt: skip
 
 

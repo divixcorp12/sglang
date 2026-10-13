@@ -448,10 +448,12 @@ def _check_learned_head(*, scorer: str, horizon: int) -> None:
     floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS
     if not floors.is_set() or floors.get() != "":
         raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS='' (no floors table)")
-    per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
-    if per_layer != 1:
-        raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=1, got {per_layer}")
+    from sglang.kernels.ops.moe.spec_head import HEAD_MAX_PICKS
     from sglang.srt.layers.moe import ram_prefetch_learned_head
+
+    per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
+    if not 1 <= per_layer <= HEAD_MAX_PICKS:
+        raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER in 1..{HEAD_MAX_PICKS}, got {per_layer}")
 
     try:
         ram_prefetch_learned_head.read_head_file(path)

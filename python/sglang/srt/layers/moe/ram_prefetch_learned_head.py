@@ -61,7 +61,8 @@ class ServingHead(msgspec.Struct, frozen=True):
 
     ``src_w`` is fp32 [HEAD_MAX_TOKENS, top_k] staging for the routing weights and ``positions`` is
     int64 [HEAD_MAX_TOKENS] (position 0 is the anchor); ``threshold`` is fp32 [1]. ``row_of_target`` maps a
-    target map row (the device's ``entry.target``) to its head row.
+    target map row (the device's ``entry.target``) to its head row. ``picks`` is how many blocks a launch
+    publishes (the per-layer read cap).
     """
 
     weights: spec_head.SpecHeadWeights
@@ -71,6 +72,7 @@ class ServingHead(msgspec.Struct, frozen=True):
     src_w: torch.Tensor
     row_of_target: dict[int, int]
     meta: HeadMeta
+    picks: int = 1
 
 
 def write_head_file(path: str, *, tensors: dict[str, torch.Tensor], meta: HeadMeta) -> None:
@@ -160,8 +162,10 @@ def load_learned_head(
     )
 
 
-def serving_head(head: LearnedHeadFile, *, device: torch.device | str, top_k: int) -> ServingHead:
+def serving_head(head: LearnedHeadFile, *, device: torch.device | str, top_k: int, picks: int = 1) -> ServingHead:
     """Upload ``head`` and allocate the launch's workspace and static input buffers on ``device``."""
+    if not 1 <= picks <= spec_head.HEAD_MAX_PICKS:
+        raise ValueError(f"picks must be 1..{spec_head.HEAD_MAX_PICKS}, got {picks}")
     t = head.tensors
     weights = spec_head.SpecHeadWeights(
         rows=len(head.meta.rows),
@@ -181,6 +185,7 @@ def serving_head(head: LearnedHeadFile, *, device: torch.device | str, top_k: in
         src_w=torch.zeros(spec_head.HEAD_MAX_TOKENS, top_k, dtype=torch.float32, device=device),
         row_of_target=dict(head.head_row_by_target),
         meta=head.meta,
+        picks=picks,
     )
 
 

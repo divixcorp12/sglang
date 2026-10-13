@@ -401,6 +401,8 @@ IDLE2_ARMS = (
     "dspark-both-prefetch-gpu-misscut-idle2-floors",
     "dspark-both-prefetch-gpu-misscut-idle2-l2",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2-cap2",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2",
 )
 IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", *IDLE2_ARMS)
 
@@ -443,7 +445,22 @@ def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(mon
 HORIZON = "SGLANG_DSV41_RAM_PREFETCH_HORIZON"
 L2_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2"
 T3_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3"
+L2_CAP2_ARM = f"{L2_ARM}-cap2"
+T3_CAP2_ARM = f"{T3_ARM}-cap2"
 LEARNED_HEAD = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
+PER_LAYER = "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER"
+
+
+def test_each_cap2_arm_is_its_cap1_arm_with_two_rows_per_layer_alone():
+    """Mutant: a cap-2 arm also changes another knob (or is built from the wrong arm), so the A/B does not read the
+    budget alone -- red."""
+    ab = _ab()
+    for cap1, cap2 in ((L2_ARM, L2_CAP2_ARM), (T3_ARM, T3_CAP2_ARM)):
+        a, b = ab.ARMS[cap1][0], ab.ARMS[cap2][0]
+        assert (a[PER_LAYER], b[PER_LAYER]) == ("1", "2")
+        assert {k: v for k, v in b.items() if k != PER_LAYER} == {k: v for k, v in a.items() if k != PER_LAYER}
+        assert ab.ARMS[cap2][1] is True
+        assert ab.REFERENCE[cap2] == "dspark-both-misscut"
 
 
 def test_the_l2_arm_is_the_idle2_arm_with_horizon_2_alone_and_no_floors_against_the_miss_cut_arm():
@@ -462,7 +479,7 @@ def test_every_other_arm_pins_horizon_1_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv(HORIZON, "3")
     for arm in ab.ARMS:
-        want = "2" if arm in (L2_ARM, T3_ARM) else "1"
+        want = "2" if arm in (L2_ARM, T3_ARM, L2_CAP2_ARM, T3_CAP2_ARM) else "1"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[HORIZON] == want, arm
 
@@ -477,7 +494,7 @@ def test_the_t3_arm_is_the_l2_arm_with_the_head_file_alone_and_every_other_arm_p
     assert ab.ARMS[T3_ARM][1] is True
     assert ab.REFERENCE[T3_ARM] == "dspark-both-misscut"
     for arm in ab.ARMS:
-        want = ab.T3_HEAD if arm == T3_ARM else ""
+        want = ab.T3_HEAD if arm in (T3_ARM, T3_CAP2_ARM) else ""
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[LEARNED_HEAD] == want, arm
 

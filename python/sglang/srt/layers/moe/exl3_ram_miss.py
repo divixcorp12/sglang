@@ -1388,7 +1388,7 @@ class Exl3RamMissService:
                 **idle,
             )
             targets = picked.targets
-            result = GpuScorer(picked, candidates, per_token, top_k_only, learned_head=learned)
+            result = GpuScorer(picked, candidates, per_token, top_k_only, learned_head=learned, per_layer=per_layer)
             if learned is not None:
                 from sglang.srt.layers.moe.ram_prefetch_learned_head import describe
 
@@ -1549,7 +1549,9 @@ class Exl3RamMissService:
                 if spec.learned_head is not None:
                     from sglang.srt.layers.moe.ram_prefetch_learned_head import serving_head
 
-                    head = serving_head(spec.learned_head, device=cache.device, top_k=spec.picked.top_k)
+                    head = serving_head(
+                        spec.learned_head, device=cache.device, top_k=spec.picked.top_k, picks=spec.per_layer
+                    )
                     self.device_side.enable_spec_head(head)
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was

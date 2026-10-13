@@ -70,8 +70,38 @@ def _slot(page: torch.Tensor, seq: int) -> bytes:
     return bytes(page[off : off + es.CAND_STRIDE].tolist())
 
 
-def _serve(c: _Inputs, weights, workspace, *, x, tokens, state, page) -> None:
-    spec_head.run_spec_head_serving(x=x, tokens=tokens, state=state, candidates=page, **c.common(weights, workspace))
+def _serve(c: _Inputs, weights, workspace, *, x, tokens, state, page, picks: int = 1) -> None:
+    spec_head.run_spec_head_serving(
+        x=x, tokens=tokens, state=state, candidates=page, picks=picks, **c.common(weights, workspace)
+    )
+
+
+def test_two_picks_publish_the_two_best_eligible_blocks_in_order():
+    """picks=2 publishes the best two blocks past the RAM-mapped and VRAM-hot experts and at or above the threshold,
+    best first, rank = order. Mutant: the second round re-picks the first block, skips no taken block, ignores the
+    skips or the threshold, or publishes count 2 when only one block clears it -- red."""
+    weights, c = _weights(), _Inputs(4)
+    page = es.new_candidate_page(pin=True)
+    ws = spec_head.new_workspace(device=DEV, pca_rank=PCA, hidden=DIM, experts=E)
+    _serve(c, weights, ws, x=c.x, tokens=4, state=_state(1), page=page)
+    torch.cuda.synchronize()
+    scores = ws.block_scores.cpu()
+    order = sorted(range(E), key=lambda e: (-scores[e].item(), e))
+    c.ram_slot[1, order[0]] = 0  # mapped in RAM on the target row
+    c.hot_slots[0] = order[1]  # VRAM hot
+    c.threshold.fill_(scores[order[3]].item())  # the fourth best sits exactly at the threshold: read
+    _serve(c, weights, ws, x=c.x, tokens=4, state=_state(2), page=page, picks=2)
+    torch.cuda.synchronize()
+    got = es.read_candidates(page, 2)
+    assert got.count == 2
+    assert [(e, r) for e, r, _ in got.picks] == [(order[2], 0), (order[3], 1)]
+    assert [m for _, _, m in got.picks] == [scores[order[2]].item(), scores[order[3]].item()]
+    above = torch.nextafter(scores[order[3]], torch.tensor(float("inf"))).item()
+    c.threshold.fill_(above)  # now only the third best clears it
+    _serve(c, weights, ws, x=c.x, tokens=4, state=_state(3), page=page, picks=2)
+    torch.cuda.synchronize()
+    got = es.read_candidates(page, 3)
+    assert got.count == 1 and got.picks[0][0] == order[2]
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 8])

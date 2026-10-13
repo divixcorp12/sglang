@@ -202,6 +202,7 @@ class GpuScorer:
     per_token: int
     top_k_only: bool
     learned_head: Optional[LearnedHeadFile] = None
+    per_layer: int = 1
 
 
 def read_margin_floors(path: str) -> dict[int, float]:

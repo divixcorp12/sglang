@@ -389,14 +389,15 @@ struct SpecHeadKernel {
     launch_chain(
         x, scores, src_ids, src_w, positions, w_pca, w_in_pca, b_in, w_in_sparse, row_bias, pos_bias, w_r1, b_r1,
         w_r2, b_r2, w_gate, b_gate, w_out, b_out, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity,
-        ram_slot, target, threshold, h, pre, hid, logits, block_scores, features, &record, nullptr, 0);
+        ram_slot, target, threshold, h, pre, hid, logits, block_scores, features, &record, nullptr, 0, 1);
   }
 
   /// \brief `run`'s four launches, publishing to the post's slot of the pinned candidate page as spec_score.cuh's
   /// select kernel does: slot (state[kPosted] - 1) % kCandRecords, read on the device so a captured graph stays correct,
-  /// the seq stored last. Takes the inputs of `run` less `record`, plus the two below; nothing syncs the host.
+  /// the seq stored last. Takes the inputs of `run` less `record`, plus the three below; nothing syncs the host.
   /// \param state int32 [kStateWords]: the post's device words; kPosted is the record's seq.
   /// \param candidates_address The pinned candidate page's address: nonzero and 128-byte aligned.
+  /// \param picks 1..kHeadMaxPicks: the most blocks published (the serving per-layer read cap).
   static void serve(
       tvm::ffi::TensorView x,
       tvm::ffi::TensorView scores,
@@ -434,12 +435,13 @@ struct SpecHeadKernel {
       tvm::ffi::TensorView block_scores,
       tvm::ffi::TensorView features,
       tvm::ffi::TensorView state,
-      int64_t candidates_address) {
+      int64_t candidates_address,
+      int64_t picks) {
     launch_chain(
         x, scores, src_ids, src_w, positions, w_pca, w_in_pca, b_in, w_in_sparse, row_bias, pos_bias, w_r1, b_r1,
         w_r2, b_r2, w_gate, b_gate, w_out, b_out, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity,
         ram_slot, target, threshold, h, pre, hid, logits, block_scores, features, nullptr, &state,
-        candidates_address);
+        candidates_address, picks);
   }
 
   /// \brief Publishes count 0 with kCandFlagOversize to the post's slot: the record has no x, or tokens outside
@@ -502,7 +504,8 @@ struct SpecHeadKernel {
       tvm::ffi::TensorView features,
       const tvm::ffi::TensorView* record,
       const tvm::ffi::TensorView* state,
-      int64_t candidates_address) {
+      int64_t candidates_address,
+      int64_t picks) {
     using namespace host;
     using namespace device::expert_stream;
     auto device = SymbolicDevice{};
@@ -577,7 +580,7 @@ struct SpecHeadKernel {
     RuntimeCheck(!position || tokens <= W_.unwrap(), "pos_bias: no entry for this width");
     const auto tail = tail_params(
         logits, positions, tokens, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity, ram_slot,
-        target, threshold, block_scores, features, record, state, candidates_address, device, E_, T_);
+        target, threshold, block_scores, features, record, state, candidates_address, picks, device, E_, T_);
     RuntimeCheck(!has_aggregator(agg_w1) || agg_row_bias.size(0) == rows, "agg_row_bias: not row_bias's rows");
     const int64_t experts = E_.unwrap();
     const int64_t widths = position ? W_.unwrap() : 0;
@@ -682,7 +685,7 @@ struct SpecHeadKernel {
     RuntimeCheck(tokens >= 1 && tokens <= kHeadMaxTokens, "positions: 1..", kHeadMaxTokens, " tokens");
     const auto params = tail_params(
         logits, positions, tokens, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity, ram_slot,
-        target, threshold, block_scores, features, &record, nullptr, 0, device, E_, T_);
+        target, threshold, block_scores, features, &record, nullptr, 0, 1, device, E_, T_);
     const auto stream = LaunchKernel::resolve_device(logits.device());
     LaunchKernel(dim3(1), dim3(kHeadTailThreads), stream)(spec_head_tail_kernel, params);
   }
@@ -722,6 +725,7 @@ struct SpecHeadKernel {
       const tvm::ffi::TensorView* record,
       const tvm::ffi::TensorView* state,
       int64_t candidates_address,
+      int64_t picks,
       host::SymbolicDevice& device,
       host::SymbolicSize& E_,
       host::SymbolicSize& T_) {
@@ -793,6 +797,7 @@ struct SpecHeadKernel {
     RuntimeCheck(target >= 0 && target < Rows_.unwrap(), "target: outside the map bank");
     RuntimeCheck(
         record == nullptr || record->size(0) >= Cand::kCandStride, "record: at least ", Cand::kCandStride, " bytes");
+    RuntimeCheck(picks >= 1 && picks <= kHeadMaxPicks, "picks: 1..", kHeadMaxPicks);
     SpecHeadTailParams p{};
     p.logits = static_cast<decltype(p.logits)>(logits.data_ptr());
     p.positions = static_cast<decltype(p.positions)>(positions.data_ptr());
@@ -807,6 +812,7 @@ struct SpecHeadKernel {
     p.hot_capacity = static_cast<decltype(p.hot_capacity)>(hot_capacity);
     p.ram_slot = static_cast<decltype(p.ram_slot)>(static_cast<const int32_t*>(ram_slot.data_ptr()) + target * experts);
     p.threshold = static_cast<decltype(p.threshold)>(threshold.data_ptr());
+    p.picks = picks;
     p.block_scores = static_cast<decltype(p.block_scores)>(block_scores.data_ptr());
     p.features = with_features ? static_cast<decltype(p.features)>(features.data_ptr()) : nullptr;
     if (record != nullptr) {

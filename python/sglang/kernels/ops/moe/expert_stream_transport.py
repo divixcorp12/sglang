@@ -3470,6 +3470,7 @@ class ExpertStreamDevice:
             threshold=head.threshold,
             state=self.state,
             candidates=self.spec_candidates,
+            picks=head.picks,
         )
 
     def _spec_launch(self, entry, x, tokens: int, module, *, routes=None, route_weights=None) -> None:
