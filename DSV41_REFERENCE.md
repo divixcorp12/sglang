@@ -9946,6 +9946,67 @@ them.
 **Not decided here.** The serving wiring of the fast path, and whether it pays in served decode time, are Stage 3.
 Production defaults are the owner's.
 
+### 33.32 F124 quick served check: T3 learned L+2 vs native L+2 (2026-10-13)
+
+**Label: quick check: one order, 4 sessions, cross-day baseline; not a verdict.**
+
+**Run.** `run_l2_t3_quick.sh` at `bd36a12e95` (worktree `wt-l2-t3-quick`, generation `f124-learned-head`):
+native L+2 (`...-idle2-l2`), then T3 (`...-idle2-l2-t3`, head `l2-t3-head/t3-f109-calib-b075.safetensors`, sha
+e675e2bd..., calib threshold 0.1301608383655548). Sessions 0-3, forward order only, against F108's `fwd` misscut
+imported read-only. Output: `divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-t3-quick-20261013/`. Both arms
+`run_timed`/`run_probe` rc=0, valid except the acknowledged step-latency gap, text vs reference pass. The report as first
+written had empty ratio tables (it filtered rows by session index; `results.jsonl` keys them by corpus id). It is kept
+as `report-empty-tables/`; `report/` was regenerated from the same data at `b9a1b2ac99`.
+
+**Step time per verify** ((total - ttft) / verifies, median of 4 sessions, ratio arm / other):
+
+| pair | median step ratio | per session |
+|---|---:|---|
+| T3 / fresh native L+2 | 1.026 | CDW 1.002, ETR 1.013, TSCO 1.039, BKR 1.294 |
+| fresh native L+2 / F108 misscut (off) | 0.998 | 0.92-1.07 |
+| T3 / F108 misscut (off) | 1.059 | 1.00-1.20 |
+| drift: fresh native L+2 / F108 native L+2 | 0.986 | 0.94-1.07 |
+
+**Read counters** (server lifetime, warm-up included; warm-up rounds differ: L2 3, T3 6, off 2, so per-token rates mix
+in different warm-up shares):
+
+| arm | demand NVMe rows / token | all NVMe rows / token | wasted / token | used / landed | in flight at use |
+|---|---:|---:|---:|---:|---:|
+| off (F108) | 24.9 | 24.9 | 0 | n/a | n/a |
+| native L+2 (F108) | 20.4 | 32.5 | 7.4 | 0.35 | 1.4% |
+| native L+2 (quick) | 20.1 | 32.2 | 7.4 | 0.35 | 1.7% |
+| T3 (quick) | 18.6 | 26.2 | 3.7 | 0.47 | 1.2% |
+
+- **T3's mechanism works as the offline work predicted.** Used reads rose 2620 -> 3489 from about the same issued count
+  (7976 vs 7938), wasted reads fell 4895 -> 3899, and demand rows per token fell a further 1.5 below native L+2.
+  Total drive rows per token fell from 32.2 to 26.2, close to the off arm's 24.9.
+- **T3's 4998 `spec_dropped` (native: 21) are mostly abstentions.** A candidate record with count 0 is counted as
+  dropped (`ram_tier.h`, `serve_spec_job`'s `slot.count == 0` branch), and T3 publishes count 0 when the block score
+  is below the threshold. That is the D1 abstention working, not lost reads.
+- **The speed result cannot resolve T3's effect.** The timed set is 276 tokens and 69 verifies per arm; CDW has 2
+  verifies, BKR 16-17. Session-level noise is about +-7% (the drift row). TTFT (8-10 s, prefill streaming 40-60 GB of
+  experts per session) is most of each session's 11-16 s wall, so drive counters over a session measure prefill, not
+  decode prefetch.
+- **Expected size, `hypothesis` (linear in demand rows):** F108's native L+2 / off step ratio was 0.984 (bootstrap
+  about [0.967, 1.045]) for 4.5 fewer demand rows per token, about 0.26 ms per avoided row per verify step (CI from
+  about 0 to 0.55). T3 avoids a further 1.5 rows per token, about 6 per verify: about 1.6 ms (0.5%) of a 250-350 ms
+  step, at most about 1.1%. The T3 side-stream work (41-66 us per layer, F123) is the same order: up to about 2 ms per
+  step if `spec_join` waits on it. Detecting a 0.5% paired effect at this noise would take hundreds of sessions.
+- **BKR's 1.29 is not explained by T3's kernels** (about 1 s more decode on 38 tokens). The harness noted contention
+  in the T3 arm: `htop` at 58-78% on core 34 (inside the GPU lane's 32-63) during CDW, and the scheduler on core 38
+  during BKR.
+- **Per-miss read time** from the shutdown `exl3 expert stream` line (lifetime `read_ms / ram_misses`): off 1.34 ms,
+  F108 native L+2 1.35, T3 1.36, quick native L+2 1.99. The quick L+2 server saw slower drive reads than F108's same
+  arm, without slower steps (drift 0.986), which also points to demand read count and latency not setting step time
+  at this scale.
+
+**Reading.** At cap 1, T3 is a better reader than native L+2 (more used, fewer wasted, less drive load), but the whole
+of L+2 prefetch moves step time by about 1-2% at best, so T3's increment is below what this harness can measure. The
+step is not set by demand NVMe rows at these counts. A larger lever has to remove a larger share of the about 19
+remaining demand rows per token (for example a higher read budget, which T3's lower waste leaves drive room for), or
+target what does set the step. Neither is established here. Production defaults are the owner's; prefetch stays off
+and the horizon 1.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
