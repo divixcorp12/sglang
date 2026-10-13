@@ -359,7 +359,13 @@ def session_bootstrap(cand: PolicyReport, ctrl: PolicyReport, *, n: int = BOOTST
     rec_k = u_k.sum() / total if total else 0.0
     prec_c = u_c.sum() / r_c.sum() if r_c.sum() else 0.0
     prec_k = u_k.sum() / r_k.sum() if r_k.sum() else 0.0
-    return {"diff": float(rec_c - rec_k), "lo": float(lo), "hi": float(hi),
-            "ratio": float(rec_c / rec_k) if rec_k else None, "precision_diff": float(prec_c - prec_k),
-            "cand_recall": float(rec_c), "ctrl_recall": float(rec_k), "sessions": len(names), "n": n, "seed": seed,
-            "denominator": denominator}
+    out = {"diff": float(rec_c - rec_k), "lo": float(lo), "hi": float(hi),
+           "ratio": float(rec_c / rec_k) if rec_k else None, "precision_diff": float(prec_c - prec_k),
+           "cand_recall": float(rec_c), "ctrl_recall": float(rec_k), "sessions": len(names), "n": n, "seed": seed,
+           "denominator": denominator}
+    if useful_ci:
+        u_lo, u_hi = np.percentile(w @ (u_c - u_k), [2.5, 97.5])
+        out.update({"useful_diff": float(u_c.sum() - u_k.sum()), "useful_lo": float(u_lo), "useful_hi": float(u_hi),
+                    "cand_useful": float(u_c.sum()), "ctrl_useful": float(u_k.sum()),
+                    "cand_reads": float(r_c.sum()), "ctrl_reads": float(r_k.sum())})
+    return out
