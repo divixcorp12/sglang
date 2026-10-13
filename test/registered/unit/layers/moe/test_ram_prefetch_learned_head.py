@@ -124,6 +124,16 @@ def test_rows_map_by_layer_pair_not_map_row(tmp_path):
     targets = _targets({1: 3, 2: 4}, rows=5)
     loaded = head_file.load_learned_head(path, layer_ids=[9, 0, 1, 2, 3], targets=targets)
     assert loaded.row_of_target == {1: 0, 2: 1}
+    assert loaded.head_row_by_target == {3: 0, 4: 1}
+
+
+def test_two_sources_sharing_a_target_row_refused(tmp_path):
+    """Mutant: the per-target index silently keeps the last source; the device would score one with the other's row."""
+    meta = _meta(rows=(head_file.HeadRow(0, 2, 0), head_file.HeadRow(1, 2, 1)))
+    with pytest.raises(ValueError, match="target map row 2"):
+        head_file.load_learned_head(
+            _write(tmp_path, meta=meta), layer_ids=[0, 1, 2, 3], targets=_targets({0: 2, 1: 2})
+        )
 
 
 def test_serving_head_holds_static_buffers(tmp_path):

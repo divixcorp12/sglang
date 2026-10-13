@@ -1547,19 +1547,10 @@ class Exl3RamMissService:
                     spec.candidates, top_k=spec.picked.top_k, per_token=spec.per_token, top_k_only=spec.top_k_only
                 )
                 if spec.learned_head is not None:
-                    import msgspec
-
                     from sglang.srt.layers.moe.ram_prefetch_learned_head import serving_head
 
                     head = serving_head(spec.learned_head, device=cache.device, top_k=spec.picked.top_k)
-                    # The device looks a head row up by the entry's target map row; the file keys it by source row.
-                    by_target = {
-                        int(spec.picked.targets[source, 0]): head_row
-                        for source, head_row in head.row_of_target.items()
-                    }
-                    if len(by_target) != len(head.row_of_target):
-                        raise ValueError("two head rows share one prefetch target map row")
-                    self.device_side.enable_spec_head(msgspec.structs.replace(head, row_of_target=by_target))
+                    self.device_side.enable_spec_head(head)
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was
             # dropped (after_host_use), so the snapshot is the source.

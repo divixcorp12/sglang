@@ -46,10 +46,6 @@ def _restrict(figures: dict) -> dict:
     return {sid: fig for sid, fig in figures.items() if sid in SESSIONS}
 
 
-def _flagged(summary: dict, arm: str) -> set:
-    return {f["session_id"] for f in summary[arm].get("drive_flags", [])}
-
-
 def _spec_counters(summary: dict, arm: str) -> dict:
     """Server-lifetime speculative read counters; wasted = landed - used."""
     ram = summary[arm].get("ram") or {}
@@ -77,7 +73,7 @@ def analyse(quick_dir: str, f108_dir: str) -> dict:
     figures, flagged, counters = {}, {}, {}
     for label, (run_dir, summary, arm) in sources.items():
         figures[label] = _restrict(l2_ab_report.session_figures(l2_ab_report._last_run_results(run_dir, arm)))
-        flagged[label] = _flagged(summary, arm)
+        flagged[label] = l2_ab_report._flagged(summary, arm)
         counters[label] = _spec_counters(summary, arm)
         counters[label]["text_status"] = _text_status(counters[label]["text_vs_reference"])
     pairs = {}

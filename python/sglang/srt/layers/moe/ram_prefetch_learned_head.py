@@ -46,19 +46,22 @@ class HeadMeta(msgspec.Struct, frozen=True):
 
 
 class LearnedHeadFile(msgspec.Struct, frozen=True):
-    """A loaded file; ``row_of_target`` maps a prefetch source map row (one with a target) to its head row."""
+    """A loaded file; ``row_of_target`` maps a prefetch source map row (one with a target) to its head row, and
+    ``head_row_by_target`` maps that source's target map row (the device's ``entry.target``) to the same head row."""
 
     path: str
     tensors: dict[str, torch.Tensor]
     meta: HeadMeta
     row_of_target: dict[int, int]
+    head_row_by_target: dict[int, int]
 
 
 class ServingHead(msgspec.Struct, frozen=True):
     """Device state of one launch's head.
 
     ``src_w`` is fp32 [HEAD_MAX_TOKENS, top_k] staging for the routing weights and ``positions`` is
-    int64 [HEAD_MAX_TOKENS] (position 0 is the anchor); ``threshold`` is fp32 [1].
+    int64 [HEAD_MAX_TOKENS] (position 0 is the anchor); ``threshold`` is fp32 [1]. ``row_of_target`` maps a
+    target map row (the device's ``entry.target``) to its head row.
     """
 
     weights: spec_head.SpecHeadWeights
@@ -130,25 +133,31 @@ def load_learned_head(
     """Read ``path`` and map every source map row with a target to its head row by (source, target) layer pair.
 
     ``targets`` is ram_prefetch's int64 [rows, 2] table (target row, gate index) or (-1, -1);
-    ``layer_ids[row]`` is the model layer of a map row. Raises ValueError naming uncovered pairs.
+    ``layer_ids[row]`` is the model layer of a map row. Raises ValueError naming uncovered pairs, or when two source
+    rows share one target map row (the device keys the head row by target).
     """
     tensors, meta = read_head_file(path)
     head_row = {(r.source_layer, r.target_layer): i for i, r in enumerate(meta.rows)}
     row_of_target: dict[int, int] = {}
+    head_row_by_target: dict[int, int] = {}
     uncovered: list[tuple[int, int]] = []
     for row, target_row in enumerate(targets[:, 0].tolist()):
         if target_row < 0:
             continue
         pair = (layer_ids[row], layer_ids[target_row])
-        if pair in head_row:
-            row_of_target[row] = head_row[pair]
-        else:
+        if pair not in head_row:
             uncovered.append(pair)
+            continue
+        if target_row in head_row_by_target:
+            raise ValueError(f"learned head file {path!r}: two source rows share prefetch target map row {target_row}")
+        row_of_target[row] = head_row_by_target[target_row] = head_row[pair]
     if uncovered:
         raise ValueError(
             f"learned head file {path!r} has no row for (source layer, target layer) pairs {uncovered}"
         )
-    return LearnedHeadFile(path=path, tensors=tensors, meta=meta, row_of_target=row_of_target)
+    return LearnedHeadFile(
+        path=path, tensors=tensors, meta=meta, row_of_target=row_of_target, head_row_by_target=head_row_by_target
+    )
 
 
 def serving_head(head: LearnedHeadFile, *, device: torch.device | str, top_k: int) -> ServingHead:
@@ -170,7 +179,7 @@ def serving_head(head: LearnedHeadFile, *, device: torch.device | str, top_k: in
         threshold=torch.tensor([head.meta.threshold], dtype=torch.float32, device=device),
         positions=torch.arange(spec_head.HEAD_MAX_TOKENS, dtype=torch.int64, device=device),
         src_w=torch.zeros(spec_head.HEAD_MAX_TOKENS, top_k, dtype=torch.float32, device=device),
-        row_of_target=dict(head.row_of_target),
+        row_of_target=dict(head.head_row_by_target),
         meta=head.meta,
     )
 

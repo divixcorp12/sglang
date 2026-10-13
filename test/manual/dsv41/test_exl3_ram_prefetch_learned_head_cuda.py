@@ -81,13 +81,11 @@ def _write_head(path: str) -> l2_fast_torch.FoldedHead:
 
 
 def _serving_head(path: str) -> head_file.ServingHead:
-    """The file through the serving loader, keyed by target map row as ``Exl3RamMissService.attach`` keys it."""
+    """The file through the serving loader, as ``Exl3RamMissService.attach`` loads it."""
     targets = torch.full((LAYERS, 2), -1, dtype=torch.int64)
     targets[0, 0], targets[1, 0] = 2, 3
     loaded = head_file.load_learned_head(path, layer_ids=LAYER_IDS, targets=targets)
-    head = head_file.serving_head(loaded, device="cuda", top_k=TOP_K)
-    by_target = {int(targets[row, 0]): index for row, index in loaded.row_of_target.items()}
-    return msgspec.structs.replace(head, row_of_target=by_target)
+    return head_file.serving_head(loaded, device="cuda", top_k=TOP_K)
 
 
 def _prime(chain: Chain) -> torch.Tensor:
