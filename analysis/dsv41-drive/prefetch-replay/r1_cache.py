@@ -124,15 +124,16 @@ def collate(groups: list[R1Group], *, x_of: Callable[[R1Group], np.ndarray], pca
     return ModelInput(batch=batch, u=u, x=x.to(x_dtype) if with_x else None, s_native=s_native)
 
 
-def _cat(parts: list[ModelInput]) -> ModelInput:
-    names = GroupBatch.__struct_fields__
-    batch = GroupBatch(**{n: np.concatenate([getattr(p.batch, n) for p in parts]) for n in names})
+_DEVICE_FIELDS = ("u", "x", "s_native")
 
-    def joined(name: str):
-        values = [getattr(p, name) for p in parts]
-        return None if values[0] is None else torch.cat(values)
 
-    return ModelInput(batch=batch, u=joined("u"), x=joined("x"), s_native=joined("s_native"))
+def _empty_like_rows(part: ModelInput, *, n_groups: int) -> dict[str, torch.Tensor | None]:
+    return {n: None if (t := getattr(part, n)) is None else t.new_empty((n_groups, *t.shape[1:]))
+            for n in _DEVICE_FIELDS}
+
+
+def _cat_batches(batches: list[GroupBatch]) -> GroupBatch:
+    return GroupBatch(**{n: np.concatenate([getattr(b, n) for b in batches]) for n in GroupBatch.__struct_fields__})
 
 
 def x_cache_bytes(n_groups: int, *, x_dtype: torch.dtype) -> int:
@@ -140,36 +141,39 @@ def x_cache_bytes(n_groups: int, *, x_dtype: torch.dtype) -> int:
     return n_groups * MAX_WIDTH * _HIDDEN * torch.empty((), dtype=x_dtype).element_size()
 
 
+def cache_bytes(n_groups: int, *, cfg: b1_head.HeadConfig, x_dtype: torch.dtype, with_s_native: bool,
+                hidden: int = _HIDDEN) -> int:
+    """Device bytes of a with-x cache of ``n_groups``: fp32 u, raw x in ``x_dtype`` and fp32 s_native."""
+    per_slot = 4 * b1_head._feature_dim(cfg) + hidden * torch.empty((), dtype=x_dtype).element_size()
+    per_slot += 4 * NUM_EXPERTS if with_s_native else 0
+    return n_groups * MAX_WIDTH * per_slot
+
+
 def build_cache(groups, *, x_of: Callable[[R1Group], np.ndarray], pca: PCAStats, cfg: b1_head.HeadConfig,
                 vocab: b1_head.Vocab, device, with_x: bool = False,
                 gates: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None, chunk: int = 4096,
                 x_budget_bytes: int = _X_BUDGET_BYTES, x_dtype: torch.dtype = torch.float32) -> GroupCache:
-    """Collate a group stream ``chunk`` groups at a time into one cache; x is refused past ``x_budget_bytes``."""
-    parts: list[ModelInput] = []
-    keys: list[GroupKey] = []
-    pending: list[R1Group] = []
-    held_x = 0
+    """Collate groups ``chunk`` at a time into one cache; x is refused past ``x_budget_bytes``.
 
-    def flush() -> None:
-        nonlocal held_x
-        parts.append(collate(pending, x_of=x_of, pca=pca, cfg=cfg, vocab=vocab, device=device, with_x=with_x,
-                             gates=gates, x_dtype=x_dtype))
-        keys.extend(r.key for r in pending)
-        if with_x:
-            held_x += x_cache_bytes(len(pending), x_dtype=x_dtype)
-            if held_x > x_budget_bytes:
-                raise MemoryError(f"raw x cache needs more than {x_budget_bytes} bytes; stream it instead")
-        pending.clear()
-
-    for r in groups:
-        pending.append(r)
-        if len(pending) >= chunk:
-            flush()
-    if pending:
-        flush()
-    if not parts:
+    Chunks are copied into tensors sized for every group, so the device peak is the cache plus one chunk.
+    """
+    groups = list(groups)
+    if not groups:
         raise ValueError("no groups to cache")
-    return GroupCache(inp=_cat(parts), keys=keys, groups=len(keys))
+    if with_x and x_cache_bytes(len(groups), x_dtype=x_dtype) > x_budget_bytes:
+        raise MemoryError(f"raw x cache needs more than {x_budget_bytes} bytes; stream it instead")
+    out: dict[str, torch.Tensor | None] = {}
+    batches: list[GroupBatch] = []
+    for a in range(0, len(groups), chunk):
+        part = collate(groups[a:a + chunk], x_of=x_of, pca=pca, cfg=cfg, vocab=vocab, device=device, with_x=with_x,
+                       gates=gates, x_dtype=x_dtype)
+        out = out or _empty_like_rows(part, n_groups=len(groups))
+        for name, t in out.items():
+            if t is not None:
+                t[a:a + part.u.shape[0]] = getattr(part, name)
+        batches.append(part.batch)
+    keys = [r.key for r in groups]
+    return GroupCache(inp=ModelInput(batch=_cat_batches(batches), **out), keys=keys, groups=len(keys))
 
 
 def take(cache: GroupCache, idx: torch.Tensor) -> ModelInput:

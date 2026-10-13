@@ -52,19 +52,18 @@ def _x_dtype(plan: r2_plan.R2Plan) -> torch.dtype:
     return _X_DTYPES[plan.x_dtype]
 
 
-def check_x_budget(*, n_groups: int, plan: r2_plan.R2Plan, free_bytes: int, peak_groups: int = 0) -> int:
+def check_x_budget(*, n_groups: int, plan: r2_plan.R2Plan, free_bytes: int, cfg: b1_head.HeadConfig) -> int:
     """Device bytes the raw-x caches of ``n_groups`` need; MemoryError past the plan budget or free memory.
 
-    ``peak_groups`` is the largest split: build_cache's torch.cat holds its chunks and the joined x at once.
+    The plan budget bounds raw x alone; free memory must hold the whole cache (u, x, s_native) plus the margin.
     """
     need = r1_cache.x_cache_bytes(n_groups, x_dtype=_x_dtype(plan))
-    peak = need + r1_cache.x_cache_bytes(peak_groups, x_dtype=_x_dtype(plan))
-    if need > plan.x_budget_bytes or peak + plan.x_margin_bytes > free_bytes:
+    device = r1_cache.cache_bytes(n_groups, cfg=cfg, x_dtype=_x_dtype(plan), with_s_native=True)
+    if need > plan.x_budget_bytes or device + plan.x_margin_bytes > free_bytes:
         raise MemoryError(
-            f"raw x for {n_groups} groups needs {need} bytes ({plan.x_dtype}), {peak} at peak while the largest "
-            f"split of {peak_groups} groups is joined; the plan budget is {plan.x_budget_bytes} bytes and "
-            f"{free_bytes} bytes are free with a {plan.x_margin_bytes} byte margin; "
-            f"raise x_budget_bytes in a new plan or free the GPU")
+            f"raw x for {n_groups} groups needs {need} bytes ({plan.x_dtype}) and the caches {device} bytes with "
+            f"u and s_native; the plan budget is {plan.x_budget_bytes} bytes and {free_bytes} bytes are free with "
+            f"a {plan.x_margin_bytes} byte margin; raise x_budget_bytes in a new plan or free the GPU")
     return need
 
 
@@ -86,7 +85,7 @@ def build_data(ctx: StageCtx, *, plan: r2_plan.R2Plan, exclusions_path: str, hor
     groups = {s: _read_split(ctx, split=s, horizon=horizon, exclusions=exclusions) for s in _SPLITS}
     if full:
         check_x_budget(n_groups=sum(len(g) for g in groups.values()), plan=plan, free_bytes=_free_bytes(ctx.device),
-                       peak_groups=max(len(g) for g in groups.values()))
+                       cfg=f0.cfg)
     gates = r1_arms._target_gates(ctx, groups=groups["train"] + groups["dev"]) if full else None
     extra = {"x_dtype": _x_dtype(plan), "x_budget_bytes": plan.x_budget_bytes} if full else {}
     caches = {s: r1_cache.build_cache(groups[s], x_of=r1_cache.make_x_of(ctx.dataset, split=s), pca=f0.pca,
