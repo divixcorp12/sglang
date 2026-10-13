@@ -177,11 +177,11 @@ def _check_cost_spec(cost: r1_plan.CostSpec) -> None:
 
 def measure_complete(model: r1_models.R1Model, *, W: torch.Tensor, bias: torch.Tensor, cost: r1_plan.CostSpec,
                      tokens: int = 6, runs: int = 1000, warmup: int = 50, device: str = "cuda",
-                     diff: dict | None = None) -> dict:
+                     diff: dict | None = None, cap: int = 2) -> dict:
     """CUDA-graph timings of the complete scorer on the intended dtype path and the reference path, plus bytes.
 
-    ``diff`` ({inputs, skips, threshold}: calib ModelInputs, their skip masks, the calibrated cap-2 threshold)
-    fills read_set_diff_fraction; without it the key is None.
+    ``diff`` ({inputs, skips, threshold}: calib ModelInputs, their skip masks, the calibrated threshold at ``cap``)
+    fills read_set_diff_fraction; without it the key is None. The result carries ``cap`` only when it is not 2.
     """
     _check_cost_spec(cost)
     if tokens != cost.live_tokens:
@@ -194,26 +194,28 @@ def measure_complete(model: r1_models.R1Model, *, W: torch.Tensor, bias: torch.T
         dtype = _dtype(name)
         path_model = ref if dtype == torch.float32 else copy.deepcopy(ref).to(dtype).eval()
         out[_SHORT[name]] = _path_cost(path_model, ref=ref, W=W, bias=bias, st=st, tokens=tokens, dtype=dtype,
-                                       cap=2, runs=runs, warmup=warmup, device=device)
+                                       cap=cap, runs=runs, warmup=warmup, device=device)
     low = out[_SHORT[cost.head_dtype]]
     out["param_bytes"], out["buffer_bytes"] = low["param_bytes"], low["buffer_bytes"]
     out["gate_ms"] = low["complete"]["median_ms"]
-    out["gate_only"] = _gate_only_cost(W=W, bias=bias, st=st, cap=2, runs=runs, warmup=warmup)
+    out["gate_only"] = _gate_only_cost(W=W, bias=bias, st=st, cap=cap, runs=runs, warmup=warmup)
     out["gate_only_ms"] = out["gate_only"]["median_ms"]
-    out["selection_matches_policy"] = _selection_matches_static(ref, W=W, bias=bias, st=st, device=device)
+    out["selection_matches_policy"] = _selection_matches_static(ref, W=W, bias=bias, st=st, device=device, cap=cap)
     out["read_set_diff_fraction"] = None if diff is None else read_set_diff(
-        model, inputs=diff["inputs"], skips=diff["skips"], threshold=float(diff["threshold"]), cap=2)
+        model, inputs=diff["inputs"], skips=diff["skips"], threshold=float(diff["threshold"]), cap=cap)
+    if cap != 2:
+        out["cap"] = cap
     return out
 
 
 def _selection_matches_static(ref: r1_models.R1Model, *, W: torch.Tensor, bias: torch.Tensor, st: _Static,
-                              device: str) -> bool:
+                              device: str, cap: int = 2) -> bool:
     tokens = st.x.shape[0]
     batch = _static_batch(tokens=tokens, dtype=torch.float32, device=device, experts=ref.head.cfg.num_experts)
     with torch.no_grad():
         u = _gate_features(st.x, st.ids, st.weights, ref=ref, W=W, bias=bias).unsqueeze(0)
         scores = torch.sigmoid(ref(ModelInput(batch=batch, u=u, x=None, s_native=None)).float())
-    return selection_mismatches(scores, skips=st.skip.unsqueeze(0), threshold=float(st.threshold), cap=2) == 0
+    return selection_mismatches(scores, skips=st.skip.unsqueeze(0), threshold=float(st.threshold), cap=cap) == 0
 
 
 def selection_mismatches(block_scores: torch.Tensor, *, skips: torch.Tensor, threshold: float, cap: int) -> int:
@@ -266,14 +268,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--runs", type=int, default=1000)
     ap.add_argument("--warmup", type=int, default=50)
-    ap.add_argument("--diff-inputs", help="torch file {inputs, skips, threshold}: calib ModelInputs at the cap-2 threshold")
+    ap.add_argument("--cap", type=int, default=2, help="unique expert reads per forward-layer")
+    ap.add_argument("--diff-inputs", help="torch file {inputs, skips, threshold}: calib ModelInputs at the --cap threshold")
     args = ap.parse_args(argv)
     plan, plan_sha = r1_plan.load_plan(args.plan)
     model, sha, _ = r1_models.load_r1(args.checkpoint)
     W, bias = r1_gate.load_target_gates(args.model_path, layer_ids=[args.layer])[args.layer]
     diff = torch.load(args.diff_inputs, weights_only=False) if args.diff_inputs else None
     result = measure_complete(model, W=W, bias=bias, cost=plan.cost, tokens=plan.cost.live_tokens, runs=args.runs,
-                              warmup=args.warmup, diff=diff)
+                              warmup=args.warmup, diff=diff, cap=args.cap)
     result.update({"checkpoint_sha256": sha, "plan_sha256": plan_sha, "layer": args.layer,
                    "gpu": torch.cuda.get_device_name()})
     tmp = f"{args.out}.tmp"
