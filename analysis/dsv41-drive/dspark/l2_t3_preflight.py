@@ -60,7 +60,8 @@ def main():
     smi = _run(
         ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], ok_codes=(0,)
     )
-    # lsof exits 1 when nothing matches
+    # lsof exits 1 when nothing matches. Run unprivileged, it sees only this user's processes; jobs of other users on
+    # the mirror drives are not detected.
     lsof = _run(["lsof", "-nP", "+f", "--", *MOUNTS], ok_codes=(0, 1))
     roots = tuple(f"{mount}/{MIRROR_DIR}" for mount in MOUNTS)
     gpu = gpu_compute_pids(smi)

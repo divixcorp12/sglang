@@ -125,7 +125,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", required=True)
     p.add_argument("--f109", required=True, help="F109 output directory; only its result.json is read")
     p.add_argument("--out", required=True, help="the head file to write")
-    p.add_argument("--scorer", default=SCORER, choices=("L2_T0", "L2_T3"))
+    # The serving loader needs the T3 block aggregator, so a T0 file would only fail at launch.
+    p.add_argument("--scorer", default=SCORER, choices=("L2_T3",))
     p.add_argument("--budget", default=BUDGET)
     return p
 
