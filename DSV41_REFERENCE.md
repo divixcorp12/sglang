@@ -9676,6 +9676,119 @@ The smoke runs the misscut reference beside the L+2 arm (the text check needs th
 **Decision.** Prefetch stays default off and the horizon stays 1 whatever the result (D8); this section records what the
 A/B shows.
 
+### 33.30 F109: L+2 learned heads vs the native gate at the serving cap of one read per layer, offline (2026-10-13)
+
+Status: **Stage 1 of `RAM_PREFETCH_L2_HEADS_NEXT_HANDOFF.md`, done offline. Exploratory: dev/calib are reused data
+and the locked test was not opened.** Run directory `divix01:/mnt/nvme1/nvfp4-work/f109-l2-cap1-20261013/`
+(`REPORT.md`, `result.json`, `sanity.json`, `cost/`, `commands.txt`; log `../f109-run.log`). Worktree `wt-f109-run` at
+merge `06309613e8`; `sglang.__file__` came from that worktree. Driver `l2_cap1_run.sh` then `l2_cap1_eval.py`, under
+`flock cc-gpu.lock taskset -c 32-63`, 06:00-06:21 UTC, every step exit 0. Tests on the merge:
+`divix01-pytest --gpu test_l2_cap1_*.py test_r1_{policy,metrics,stage1,timing,cost}.py`, 105 passed, exit 0.
+
+**Question.** At L+2, does a learned block head's offline advantage over the native gate (§33.27: dev recall 0.319 vs
+0.251 at cap 2) hold under the policy serving actually runs? That policy is at most one unique read per target layer
+per forward. Should the policy also be allowed to skip weak reads?
+
+**Setup.**
+- Scorers:
+  - native gate at horizon 2 with no floors (`gate_cap1`): the best margin over tokens of each token's best
+    available expert, which is what serving's per-token 1 and per-layer 1 does;
+  - `T0_seed0.pt` (sha e6f7661d...) and `T3_seed0.pt` (sha e675e2bd...) from `b1-r1-20261012/stages/l2/`. Every hash
+    was verified.
+- Budgets: mean reads per forward-layer of 0 (read nothing), 0.25, 0.5, 0.75 and 1.0, all with a hard cap of 1. The
+  threshold is selected on dev and recalibrated on calib's own sweep (R1's D8/D9 rules).
+- Group counts: dev 44,536 and calib 20,254. All of them have a biased target gate, so the coverage filter removed
+  nothing.
+- Sanity: the cap-2 / budget-1.0 rerun reproduced `spike-l2/result.json` exactly (reads, useful and eligible for
+  gate, T0 and T3 on dev and calib).
+
+**Cap-1 operating points** (observed offline; recall over all eligible miss rows):
+
+| Budget | gate dev | T0 dev | T3 dev | gate calib | T0 calib | T3 calib |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.25 | 0.102 | 0.117 | 0.122 | 0.099 | 0.116 | 0.122 |
+| 0.50 | 0.157 | 0.187 | 0.192 | 0.154 | 0.193 | 0.202 |
+| 0.75 | 0.183 | 0.215 | 0.223 | 0.181 | 0.226 | 0.235 |
+| 1.00 | 0.198 | 0.225 | 0.233 | 0.195 | 0.236 | 0.246 |
+
+At budget 1.0, precision is 0.317 for the gate and 0.372 for T3 on dev, and 0.326 vs 0.410 on calib. Recall is lower
+than at cap 2 for every scorer, because cap 2 lets some layers spend two reads within the same mean.
+
+**Learned minus gate at matched achieved reads.** These are 95% CIs from a paired whole-session bootstrap with 10,000
+resamples, observed offline.
+
+| | dev recall diff [CI] | dev useful diff [CI] | calib recall diff [CI] | calib useful diff [CI] |
+|---|---|---|---|---|
+| T3 @1.0 | +0.035 [0.023, 0.051] | +2,487 [2,194, 2,789] | +0.051 [0.043, 0.059] | +1,730 [1,454, 2,038] |
+| T3 @0.5 | +0.036 [0.021, 0.055] | +2,537 | +0.048 [0.041, 0.055] | +1,625 |
+| T0 @1.0 | +0.027 [0.016, 0.043] | +1,937 | +0.041 [0.034, 0.048] | +1,383 |
+
+Every learned-vs-gate CI at every nonzero budget excludes zero. T3 recovers about 18% more eligible rows than the
+gate on dev at budget 1.0 (0.233 vs 0.198), and 26% more on calib. T0 delivers about 78-80% of T3's gain.
+
+**Where the gain comes from (D3 split, dev, budget 1.0).** T3's +2,487 useful reads split as follows:
+- +1,416 on rows inside the gate's top 12, from better ranking or admission;
+- +1,071 on rows outside the top 12, which the gate cannot propose at all.
+
+So about 43% of the gain needs candidates beyond the native top 12.
+
+**DSpark breakdown (dev, budget 1.0).** Recall per row set, gate vs T3:
+
+| Row set | Rows | Gate | T3 |
+|---|---:|---:|---:|
+| anchor-only | 10,028 | 0.176 | 0.236 |
+| draft-only | 58,691 | 0.195 | 0.227 |
+| shared | 2,356 | 0.371 | 0.357 |
+
+By draft position, T3 is ahead at every position from 0 to 5 (0.259 vs 0.213 at the anchor). Live block width is 6 in
+every group but one, so the width breakdown carries no information on this corpus. No ordinary-decode dataset exists,
+so none of this measures ordinary decode.
+
+**Cost at cap 1** (observed offline). Scope: six live tokens, CUDA graph, layer 0, the complete bf16 path with gate
+plus features plus head plus selection, each on its own L+2 checkpoint.
+
+| | Complete ms | Gate-only ms |
+|---|---:|---:|
+| T0 | 0.141 | 0.069 |
+| T3 | 0.202 | 0.069 |
+
+Both fail the historical 0.1 ms/layer bar, which stays as it was. The gate-only figure is the offline fp32 path, not
+the serving scorer's roughly 22 us (§33.15).
+
+**Timing replay** (replay estimate; cap 1, R1's model). At L+2 the window is long enough that the scorer delay barely
+matters:
+- dev budget 1.0, nominal on-time useful: gate 14,063 (3 late), T0 15,999, T3 16,547 (6 late);
+- adverse: 13,880 vs 16,289.
+
+The critical-path cost of the learned scorer in serving is therefore the open question for Stage 2, not lateness.
+
+**Frozen candidates** (owner's rule: the smallest budget whose dev nominal on-time useful rows are within 5% of budget
+1.0's):
+
+| Scorer | Budget | Calib threshold |
+|---|---:|---:|
+| gate | 1.0 | -0.672 |
+| T0 | 0.75 | 0.1149 |
+| T3 | 0.75 | 0.1302 |
+
+T3 at 0.75 reads 25% fewer rows than the gate at 1.0, yet gets 12.6% more on-time useful rows on dev (15,835 vs
+14,063). Its calib recall is 0.235 at precision 0.523, against the gate's 0.195 at 0.326.
+
+**Caveats.**
+- `T0_seed0_best_cap1.pt` (another sha, same epoch 33) gives identical results to `T0_seed0.pt`, so it is redundant.
+- The report labels the dev timing rows `cases` (r1_timing's key name).
+- Per-layer and per-session cells were computed for the bootstraps but are not saved in `result.json`.
+- All of this is offline on reused data. None of it is a serving speedup.
+
+**Reading.** Under the real serving cap the learned L+2 heads still beat the native gate, with every CI excluding
+zero. The case for abstention also holds: T3 at budget 0.75 beats the gate reading at every opportunity. Next is
+Stage 2 of the handoff:
+- profile T0 and T3 on the intended serving path;
+- cut the complete cost toward the native scorer's;
+- verify read-set parity against these frozen thresholds.
+
+T0 is the cheaper candidate at about 80% of T3's gain.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
