@@ -9542,6 +9542,118 @@ sessions 0.3256 vs 0.2856; nominal on-time useful 16,235 vs 14,834. Not met: inc
 (bar 0.1). **Whether T5 or G0 adds anything over T3: no.** Per D12, the remaining representation changes add nothing
 at this data size; no further arms in this feature.
 
+### 33.29 Served A/B: the native gate retargeted to L+2 (2026-10-12)
+
+Status: **pending**. The code and the run script are merged; no served number below is measured yet (the merge gate's
+only listed check, `python3 scripts/lint/check_registered_tests.py`, exited 1; the gate ran no served A/B). Report and
+per-arm data: `divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>/` (`report/REPORT.md`).
+
+The question is whether scoring the native gate of layer T+2 on layer T's hidden state, which gives a speculative read
+two layers of lead instead of one, beats today's L+1 arms on decode time, and whether it moves the mechanism the
+offline replay predicted: fewer used reads still in flight when they are needed (§33.22 measured 37-39% at L+1).
+
+**Knob.** `SGLANG_DSV41_RAM_PREFETCH_HORIZON` (int, default 1, accepted 1..4). With horizon h, row r targets the row
+whose layer is `layer_ids[r] + h`, provided the layers between are consecutive streamed rows and the target gate has a
+bias. At horizon 1 every table, log line and test is what it was. Launch refusals:
+- horizon outside [1, 4];
+- horizon other than 1 with the prefetch off;
+- horizon above 1 with the GPU scorer and `SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS` unset: the packaged floors were fit
+  for horizon 1. Set it to `""` (no floors) or a horizon-matched table.
+
+**Arms** (D3). All prefetch arms use idle2 (`IDLE_DRIVE=1 IDLE_SPREAD=1 IDLE_PIECES=2`, D5), so speculative reads do
+not compete with demand reads for a drive.
+
+| Arm | Prefetch | Horizon | Floors |
+|---|---|---:|---|
+| `dspark-both-misscut` | off | - | - |
+| `dspark-both-prefetch-gpu-misscut-idle2-floors` | GPU scorer | 1 | packaged |
+| `dspark-both-prefetch-gpu-misscut-idle2` | GPU scorer | 1 | none |
+| `dspark-both-prefetch-gpu-misscut-idle2-l2` | GPU scorer | 2 | none (`""`) |
+
+The L+2 arm runs without floors as in the offline spike (D2): the packaged floors were fit to L+1 target rows.
+
+**Orders** (D4). Same worktree, back to back: forward (misscut, idle2-floors, idle2, idle2-l2), then reversed
+(idle2-l2, idle2, idle2-floors, misscut). Past prefetch A/Bs flipped sign between orders, so a result counts only if
+both orders agree.
+
+**Pre-registered reading** (D6; the owner decides defaults, this only says what the A/B shows). Primary metric is the
+decode step time per verify, `(total - ttft) / spec_verify_ct` (§33.23), as the ratio idle2-l2 / idle2-floors and
+idle2-l2 / misscut, median over sessions with no drive flag in either arm of the pair, per order.
+- **L+2 wins:** both orders give a median ratio <= 0.97 against idle2-floors, and the paired ms/token median favours
+  L+2 in both orders.
+- **L+2 loses:** both orders give a median ratio >= 1.03.
+- **Tie:** anything else.
+- The text in the probe must match the reference.
+
+**Step-time ratio** (median over unflagged sessions):
+
+| Pair | Forward | Reversed |
+|---|---|---|
+| idle2-l2 / idle2-floors | pending | pending |
+| idle2-l2 / misscut | pending | pending |
+| idle2-l2 / idle2 | pending | pending |
+
+**Paired ms/token** (median of per-session paired gain, % of the comparator's ms/token; positive favours L+2):
+
+| Pair | Forward | Reversed |
+|---|---|---|
+| idle2-l2 vs idle2-floors | pending | pending |
+| idle2-l2 vs misscut | pending | pending |
+
+**Mechanism** (D7, reported whatever D6 says). The replay predicts the in-flight fraction falls sharply at L+2; if it
+does not, the timing model is wrong for serving and the report says so.
+
+| Arm | Used reads still in flight at use | Used / landed | Wasted rows per token | NVMe rows per token |
+|---|---|---|---|---|
+| idle2-floors (L+1) | 37-39% (§33.22) | pending | pending | pending |
+| idle2 (L+1) | pending | pending | pending | pending |
+| idle2-l2 (L+2) | pending | pending | pending | pending |
+
+**Text match and verdict:**
+
+| Item | Forward | Reversed |
+|---|---|---|
+| Text vs reference, idle2-l2 | pending | pending |
+| Sessions excluded by drive flags | pending | pending |
+| D6 verdict | pending | pending |
+
+Combined verdict: **pending**.
+
+**Rerun.** On divix01, from a pushed commit; production is not started, stopped or restarted (D8). The script takes
+`rowimg-disk.lock` once, and `both_cpu_ab.py` takes `cc-gpu.lock`; every python runs under `taskset -c 0-63` with
+`OMP_NUM_THREADS=8`. It refuses an output root outside `ram-prefetch/` and a cwd that is not a `wt-*` worktree.
+
+```bash
+ssh divix01 'git -C /data/models/slang/sglang fetch origin \
+  && git -C /data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-l2-ab origin/<branch>'
+cd /data/models/slang/nvfp4-work/wt-l2-ab
+# smoke (misscut reference + L+2 arm, sessions 0,1), both orders, then the report:
+bash analysis/dsv41-drive/dspark/run_l2_ab.sh /data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>
+```
+
+The script's steps by hand, with `OUT=/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>`:
+
+```bash
+export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8
+# smoke: misscut reference and the L+2 arm, sessions 0,1
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
+  OUT/smoke --sessions 0,1 dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-l2
+# forward, then reversed
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
+  OUT/fwd dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-floors \
+  dspark-both-prefetch-gpu-misscut-idle2 dspark-both-prefetch-gpu-misscut-idle2-l2
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
+  OUT/rev dspark-both-prefetch-gpu-misscut-idle2-l2 dspark-both-prefetch-gpu-misscut-idle2 \
+  dspark-both-prefetch-gpu-misscut-idle2-floors dspark-both-misscut
+python analysis/dsv41-drive/dspark/l2_ab_report.py OUT/fwd OUT/rev --out OUT/report
+```
+
+The smoke runs the misscut reference beside the L+2 arm (the text check needs the reference probe) and fails unless the L+2 arm issued and landed speculative reads and its probe text matched. The report is
+`OUT/report/REPORT.md` with `results.json`.
+
+**Decision.** Prefetch stays default off and the horizon stays 1 whatever the result (D8); this section records what the
+A/B shows.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

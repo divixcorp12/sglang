@@ -387,7 +387,12 @@ def _check_ram_prefetch() -> None:
         raise ValueError(
             f"SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES must be in [1, {ram_prefetch.MAX_IDLE_PIECES}], got {pieces}"
         )
+    horizon = envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.get()
+    if not 1 <= horizon <= ram_prefetch.MAX_HORIZON:
+        raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_HORIZON must be in [1, {ram_prefetch.MAX_HORIZON}], got {horizon}")
     if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
+        if horizon != 1:
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_HORIZON needs SGLANG_DSV41_RAM_PREFETCH=1")
         if explicit_scorer and scorer == "gpu":
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1")
         if explicit_floors:
@@ -406,6 +411,11 @@ def _check_ram_prefetch() -> None:
             + ("" if explicit_scorer else " (gpu is the default scorer; SGLANG_DSV41_CPU_EXPERTS needs the copy engine too)")
         )
     floors = ram_prefetch.margin_floors_path(scorer)
+    if horizon > 1 and scorer == "gpu" and not envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.is_set():
+        raise ValueError(
+            "the packaged margin floors were fit for horizon 1; set SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS "
+            "to '' or a horizon-matched table"
+        )
     if floors:
         try:
             ram_prefetch.read_margin_floors(floors)

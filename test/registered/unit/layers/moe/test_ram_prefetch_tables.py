@@ -53,6 +53,38 @@ def test_each_row_targets_the_next_consecutive_layer_with_a_biased_gate():
     assert torch.equal(t.bias[1], gates[5].bias) and t.bias.dtype == torch.float32 and t.top_k == 6
 
 
+_H2_LAYERS = [0, 1, 2, 3, 5, 6, 7]
+
+
+def _h2_gates():
+    """Layer 3's gate is hash-routed; layer 4 is not streamed, so row 2 has no layer-4 gate."""
+    return {2: _gate(2.0), 3: _gate(3.0, bias=False), 5: _gate(5.0), 6: _gate(6.0), 7: _gate(7.0)}
+
+
+def test_horizon_two_targets_the_layer_two_ahead_over_consecutive_rows():
+    """Row 3 (layer 3) would reach layer 5 across the 3->5 gap, row 1's layer-3 gate has no bias, the last two rows
+    have no layer two ahead. Mutant: horizon ignored (r + 1) -- red; span check dropped -- row 3 targets row 4, red."""
+    from sglang.srt.layers.moe.residency_capture_ref import horizon_targets
+
+    gates = _h2_gates()
+    picked = prefetch_targets(_H2_LAYERS, gates, hidden=8, horizon=2)
+    assert picked.targets.tolist() == [[2, 0], [-1, -1], [-1, -1], [-1, -1], [6, 1], [-1, -1], [-1, -1]]
+    assert picked.gates == (gates[2], gates[7])
+    ref, _ = horizon_targets(_H2_LAYERS)
+    assert [picked.targets[r, 0].item() for r in (0, 4)] == [ref[0][1], ref[4][1]]
+
+
+def test_horizon_two_cpu_tables_copy_the_gate_two_layers_ahead():
+    """The CPU tables carry row T+2's weights and bias in picks order. Mutant: the table built with horizon 1 -- the
+    gate copies are layer T+1's, red."""
+    gates = _h2_gates()
+    t = prefetch_tables(_H2_LAYERS, gates, hidden=8, horizon=2)
+    assert t.targets.tolist() == [[2, 0], [-1, -1], [-1, -1], [-1, -1], [6, 1], [-1, -1], [-1, -1]]
+    assert t.gates.shape == (2, 4, 8) and t.bias.dtype == torch.float32
+    assert torch.equal(t.gates[0], gates[2].weight) and torch.equal(t.gates[1], gates[7].weight)
+    assert torch.equal(t.bias[0], gates[2].bias) and torch.equal(t.bias[1], gates[7].bias)
+
+
 @pytest.mark.parametrize(
     "gates, why",
     [
@@ -161,6 +193,45 @@ def test_the_cpu_scorer_returns_no_gpu_scorer_and_an_unknown_one_is_refused():
     with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("tpu"):
         with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER"):
             module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+
+
+def test_the_service_builds_both_scorers_tables_at_the_configured_horizon(caplog):
+    """Horizon 2 on layers [0,1,2]: row 0 targets layer 2's gate for both scorers, the host kwargs match horizon 1's
+    and only the log names the horizon. Mutant: horizon not passed to prefetch_targets / prefetch_tables -- row 0
+    targets row 1, red."""
+    gates = {1: _gate(1.0), 2: _gate(2.0)}
+    for layer, gate in gates.items():
+        register_router_gate(layer, gate.weight, gate.bias, 6)
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+
+    def enable(scorer, horizon):
+        calls = []
+        host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+        caplog.clear()
+        with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override(scorer), \
+                envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""), \
+                envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.override(horizon), caplog.at_level(logging.INFO):
+            result = module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1, 2], _numa(), cpu)
+        (args, kw) = calls[0]
+        kw.pop("candidates", None)
+        return result, args, kw, caplog.text
+
+    scorer, args, kw_h2, log = enable("gpu", 2)
+    assert args[0].tolist() == [[2, 0], [-1, -1], [-1, -1]]
+    assert torch.equal(scorer.picked.gates[0].weight, gates[2].weight)
+    assert torch.equal(scorer.picked.gates[0].bias, gates[2].bias)
+    assert "1 of 3 rows target layer +2" in log
+    _, args, kw_h1, log = enable("gpu", 1)
+    assert args[0].tolist() == [[1, 0], [2, 1], [-1, -1]]
+    assert "2 of 3 rows target the next layer" in log
+    assert kw_h1 == kw_h2
+
+    _, args, kw_h2, log = enable("cpu", 2)
+    assert args[0].tolist() == [[2, 0], [-1, -1], [-1, -1]]
+    assert torch.equal(args[1][0], gates[2].weight) and torch.equal(args[2][0], gates[2].bias)
+    assert "1 of 3 rows target layer +2" in log
+    _, _, kw_h1, _ = enable("cpu", 1)
+    assert kw_h1 == kw_h2
 
 
 def test_the_gpu_scorers_table_has_a_row_once_its_target_attached():

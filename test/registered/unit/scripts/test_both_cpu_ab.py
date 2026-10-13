@@ -251,7 +251,7 @@ def test_the_driver_runs_the_arms_in_the_order_given(monkeypatch, tmp_path):
     """The reversed A/B (B first) relies on it."""
     ab = _ab()
     ran = []
-    monkeypatch.setattr(ab, "run_timed", lambda arm, out: ran.append(("timed", arm)) or 0)
+    monkeypatch.setattr(ab, "run_timed", lambda arm, out, **_: ran.append(("timed", arm)) or 0)
     monkeypatch.setattr(ab, "run_probe", lambda arm, out: ran.append(("probe", arm)) or 0)
     monkeypatch.setattr(ab, "summarize", lambda out: {})
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), "dspark-both-prefetch-gpu", "dspark-both"])
@@ -300,7 +300,9 @@ def test_a_saved_baseline_is_imported_instead_of_rerunning_the_reference_arm(mon
     base, out = tmp_path / "base", tmp_path / "out"
     _baseline(base)
     ran = []
-    monkeypatch.setattr(ab, "run_timed", lambda arm, o: ran.append(("timed", arm)) or _session_rows(out, arm, [90.0, 95.0, 110.0]) or 0)
+    monkeypatch.setattr(
+        ab, "run_timed", lambda arm, o, **_: ran.append(("timed", arm)) or _session_rows(out, arm, [90.0, 95.0, 110.0]) or 0
+    )
     monkeypatch.setattr(ab, "run_probe", lambda arm, o: ran.append(("probe", arm)) or 0)
     monkeypatch.setattr(ab, "_compare", lambda a, b: {"ok": True})
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(out), "dspark-both-prefetch-gpu-floors", "--baseline", str(base)])
@@ -321,7 +323,7 @@ def test_a_baseline_missing_any_of_its_files_is_refused_before_any_arm_runs(monk
     _baseline(base)
     target = base / missing
     shutil.rmtree(target) if target.is_dir() else target.unlink()
-    monkeypatch.setattr(ab, "run_timed", lambda arm, o: pytest.fail("ran an arm"))
+    monkeypatch.setattr(ab, "run_timed", lambda arm, o, **_: pytest.fail("ran an arm"))
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path / "out"), "dspark-both-prefetch-gpu-floors", "--baseline", str(base)])
     with pytest.raises(SystemExit, match="baseline"):
         ab.main()
@@ -331,7 +333,7 @@ def test_a_baseline_cannot_be_both_imported_and_rerun(monkeypatch, tmp_path):
     ab = _ab()
     base = tmp_path / "base"
     _baseline(base)
-    monkeypatch.setattr(ab, "run_timed", lambda arm, o: pytest.fail("ran an arm"))
+    monkeypatch.setattr(ab, "run_timed", lambda arm, o, **_: pytest.fail("ran an arm"))
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path / "out"), "dspark-both", "--baseline", str(base)])
     with pytest.raises(SystemExit, match="baseline"):
         ab.main()
@@ -394,7 +396,11 @@ def test_the_idle_drive_arm_is_the_prefetch_miss_cut_arm_with_idle_drive_reads_a
 
 IDLE_SPREAD = "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD"
 IDLE_PIECES = "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES"
-IDLE2_ARMS = ("dspark-both-prefetch-gpu-misscut-idle2", "dspark-both-prefetch-gpu-misscut-idle2-floors")
+IDLE2_ARMS = (
+    "dspark-both-prefetch-gpu-misscut-idle2",
+    "dspark-both-prefetch-gpu-misscut-idle2-floors",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2",
+)
 IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", *IDLE2_ARMS)
 
 
@@ -431,6 +437,46 @@ def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(mon
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert (overrides[IDLE], overrides[IDLE_DEADLINE]) == want, arm
             assert (overrides[IDLE_SPREAD], overrides[IDLE_PIECES]) == knobs, arm
+
+
+HORIZON = "SGLANG_DSV41_RAM_PREFETCH_HORIZON"
+L2_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2"
+
+
+def test_the_l2_arm_is_the_idle2_arm_with_horizon_2_alone_and_no_floors_against_the_miss_cut_arm():
+    """Mutant: the arm also changes the floors or another idle2 knob, so the horizon is not what the A/B reads -- red."""
+    ab = _ab()
+    i, l2 = ab.ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0], ab.ARMS[L2_ARM][0]
+    assert (i[HORIZON], l2[HORIZON]) == ("1", "2")
+    assert (i["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"], l2["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"]) == ("", "")
+    assert {k: v for k, v in l2.items() if k != HORIZON} == {k: v for k, v in i.items() if k != HORIZON}
+    assert ab.ARMS[L2_ARM][1] is True
+    assert ab.REFERENCE[L2_ARM] == "dspark-both-misscut"
+
+
+def test_every_other_arm_pins_horizon_1_against_an_exported_shell(monkeypatch):
+    """Mutant: an arm leaves the horizon unset and inherits a shell's 2 -- red."""
+    ab = _ab()
+    monkeypatch.setenv(HORIZON, "3")
+    for arm in ab.ARMS:
+        want = "2" if arm == L2_ARM else "1"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[HORIZON] == want, arm
+
+
+def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
+    """Mutant: the smoke's subset is ignored and all eight sessions run -- red."""
+    ab = _ab()
+    seen = []
+    monkeypatch.setattr(
+        ab.subprocess, "run", lambda cmd, env, cwd: seen.append(env["DSV41_SESSION_INDICES"]) or type("R", (), {"returncode": 0})()
+    )
+    monkeypatch.setattr(ab, "run_probe", lambda arm, out: 0)
+    monkeypatch.setattr(ab, "summarize", lambda out: {})
+    for argv in ([], ["--sessions", "0,1"]):
+        monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), "dspark-both", *argv])
+        ab.main()
+    assert seen == ["0,1,2,3,4,5,6,7", "0,1"]
 
 
 def test_the_summary_keeps_the_idle_drive_counters():
@@ -493,7 +539,7 @@ def test_main_prints_the_per_session_drive_table(tmp_path, monkeypatch, capsys):
     ab = _ab()
     _arm_run(tmp_path, "dspark-both")
     (tmp_path / "servers" / "dspark-both" / "run-1" / "boundary-samples.jsonl").write_text(_drive_rows([("s0", 620)]))
-    monkeypatch.setattr(ab, "run_timed", lambda arm, out: 0)
+    monkeypatch.setattr(ab, "run_timed", lambda arm, out, **_: 0)
     monkeypatch.setattr(ab, "run_probe", lambda arm, out: 0)
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), "dspark-both"])
     ab.main()

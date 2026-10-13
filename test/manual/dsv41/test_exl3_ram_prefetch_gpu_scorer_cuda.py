@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 from lease_chain_rig import EXPERTS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_stream_transport as es  # noqa: E402
-from sglang.srt.layers.moe.ram_prefetch import SpecScoreRow  # noqa: E402
+from sglang.srt.layers.moe.ram_prefetch import RouterGate, SpecScoreRow, prefetch_targets, spec_score_rows  # noqa: E402
 from sglang.test.dsv41_ram_prefetch_fixtures import exact_gate_case, gate_reference, lead_gate_case  # noqa: E402
 
 KEEP = es.CAND_MAX  # a reference per_layer that lists every candidate the GPU writes
@@ -290,5 +290,59 @@ def test_the_scoring_runs_on_the_devices_own_stream_until_joined(tmp_path, monke
         c.close()
 
 
-def _mapped(c):
-    return {e for e, slot in enumerate(c.device_map(1)) if slot >= 0}
+def _mapped(c, row=1):
+    return {e for e, slot in enumerate(c.device_map(row)) if slot >= 0}
+
+
+def test_at_horizon_two_row_zero_is_scored_with_row_twos_gate_and_skips_row_twos_experts(tmp_path):
+    """Source row 0 at horizon 2 targets row 2: its candidates are the reference of row 2's gate past row 2's hot and
+    mapped experts, while experts hot or mapped only in row 1 stay candidates. Mutants: score with row 1's gate, or skip
+    row 1's hot and mapped experts instead of row 2's -- red."""
+    c = Chain(tmp_path, layers=3)
+    try:
+        x16, w2, bias2 = exact_gate_case(0, tokens=1, experts=EXPERTS)
+        w1, bias1 = exact_gate_case(1, tokens=1, experts=EXPERTS)[1:]
+        gates = {1: RouterGate(w1.cuda(), bias1.cuda(), TOP_K), 2: RouterGate(w2.cuda(), bias2.cuda(), TOP_K)}
+        free = [e for e, _, _ in gate_reference(x16, w2, bias2, [False] * EXPERTS, top_k=TOP_K, per_token=12,
+                                                per_layer=KEEP, meta=True)]
+        assert len(free) >= 8
+        hot2, mapped2, mapped1, hot1 = free[0:2], free[2:4], free[4:6], free[6:8]
+        hot_row = {
+            1: torch.tensor(hot1 + [-1] * 2, dtype=torch.int64, device="cuda"),
+            2: torch.tensor(hot2 + [-1] * 2, dtype=torch.int64, device="cuda"),
+        }
+        picked = prefetch_targets([0, 1, 2], gates, hidden=int(w2.shape[1]), horizon=2)
+        rows = spec_score_rows(picked, {2: (hot_row[2], 4), 1: (hot_row[1], 4)})
+        assert list(rows) == [0] and rows[0].target == 2
+        assert rows[0].weight.equal(w2.cuda()) and not rows[0].weight.equal(w1.cuda())
+        assert rows[0].hot_slots is hot_row[2]
+
+        page = es.new_candidate_page(pin=True)
+        c.dev.enable_spec_scorer(page, top_k=TOP_K, per_token=12, top_k_only=False)
+        backend = c.backends[0]
+        backend.spec_expected = True
+        backend.spec_score = rows[0]
+        backend.cpu_input = (x16.to(BF16).cuda(), None)
+        _step(c, mapped1, 1)
+        _step(c, mapped1, 1)
+        _step(c, mapped2, 2)
+        _step(c, mapped2, 2)
+        assert c.handled()
+        assert set(mapped1) <= _mapped(c, 1) and set(mapped2) <= _mapped(c, 2)
+        _step(c, [0, 1], 0)
+        assert c.handled()
+        seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
+
+        skip2 = [e in hot2 or e in _mapped(c, 2) for e in range(EXPERTS)]
+        skip1 = [e in hot1 or e in _mapped(c, 1) for e in range(EXPERTS)]
+        kw = dict(top_k=TOP_K, per_token=12, per_layer=KEEP, meta=True)
+        want = gate_reference(x16, w2, bias2, skip2, **kw)
+        assert want != gate_reference(x16, w1, bias1, skip2, **kw), "pick seeds whose gates rank differently"
+        assert want != gate_reference(x16, w2, bias2, skip1, **kw), "pick seeds whose skip sets differ"
+        got = es.read_candidates(page, seq)
+        assert got.status == "ready" and list(got.picks) == want
+        experts = {e for e, _, _ in got.picks}
+        assert experts.isdisjoint(hot2) and experts.isdisjoint(_mapped(c, 2))
+        assert set(hot1 + mapped1) <= experts
+    finally:
+        c.close()

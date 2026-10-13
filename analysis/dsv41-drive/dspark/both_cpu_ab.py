@@ -7,7 +7,7 @@ spec_tokens_details), then a short-lived server on the same env for logprob_prob
 The text bar is dspark_text_band.py against prod. Run on divix01 from the pushed worktree holding rowimg-disk.lock
 only: run_arm.sh takes cc-gpu.lock itself, and the probe phase takes it here (lock order: disk, then GPU).
 
-    flock /data/models/slang/nvfp4-work/rowimg-disk.lock python analysis/dsv41-drive/dspark/both_cpu_ab.py OUT [ARM ...]
+    flock /data/models/slang/nvfp4-work/rowimg-disk.lock python analysis/dsv41-drive/dspark/both_cpu_ab.py OUT [ARM ...] [--sessions 0,1] [--baseline DIR]
 """
 
 import argparse
@@ -158,6 +158,11 @@ IDLE_DRIVE_OFF = {
 }
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(IDLE_DRIVE_OFF)
+# The prefetch scores the gate of layer T+horizon on layer T's hidden state; every arm but the L+2 one states 1, so a
+# shell that exports it cannot carry it into one.
+HORIZON_DEFAULT = {"SGLANG_DSV41_RAM_PREFETCH_HORIZON": "1"}
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm.update(HORIZON_DEFAULT)
 # The GPU-prefetch miss-cut arm with each group's speculative reads on a reader of its own, one piece at a time from a
 # drive no demand reads (DSV41_REFERENCE.md 33.16 item 2: demand reads were 0.4-0.5 ms slower beside them).
 ARMS["dspark-both-prefetch-gpu-misscut-idle"] = (
@@ -180,6 +185,15 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-floors"] = (
     {**ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0], "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": MARGIN_FLOORS},
     True,
 )
+# idle2 with the gate of layer T+2 scored on layer T's hidden state and no floors (the packaged ones were fit at L+1).
+ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2"] = (
+    {
+        **ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0],
+        "SGLANG_DSV41_RAM_PREFETCH_HORIZON": "2",
+        "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
+    },
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -199,7 +213,9 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-misscut-idle": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-floors": "dspark-both-misscut",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2": "dspark-both-misscut",
 }
+DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
     "rows_read",
@@ -245,11 +261,11 @@ def _health_timeout_s(dspark: bool) -> int:
     return arm_env.DSPARK_HEALTH_TIMEOUT_S if dspark else arm_env.HEALTH_TIMEOUT_S
 
 
-def run_timed(arm: str, out: str) -> int:
+def run_timed(arm: str, out: str, sessions: str = DEFAULT_SESSIONS) -> int:
     _, dspark = ARMS[arm]
     env = os.environ | {
         "DSV41_RUN_ROOT": out,
-        "DSV41_SESSION_INDICES": ",".join(str(i) for i in range(8)),
+        "DSV41_SESSION_INDICES": sessions,
         "DSV41_EXTRA_SERVER_ARGS": shlex.join(arm_env.DSPARK_ARGV) if dspark else "",
         "DSV41_HEALTH_TIMEOUT_S": str(_health_timeout_s(dspark)),
     }
@@ -471,7 +487,9 @@ def main():
     p.add_argument("out")
     p.add_argument("arms", nargs="*")
     p.add_argument("--baseline", help="an earlier A/B's directory whose reference arm is imported, not rerun")
+    p.add_argument("--sessions", default=DEFAULT_SESSIONS, help="comma list of corpus session indices to time")
     a = p.parse_args()
+    sessions = ",".join(str(int(i)) for i in a.sessions.split(","))
     out = os.path.abspath(a.out)
     arms = a.arms or list(ARMS)
     if a.baseline:
@@ -482,9 +500,12 @@ def main():
     if a.baseline:
         import_baseline(os.path.abspath(a.baseline), references.pop(), out)
     for arm in arms:
-        for step in (run_timed, run_probe):
-            rc = step(arm, out)
-            print(f"{arm} {step.__name__}: rc={rc}", flush=True)
+        for name, step in (
+            ("run_timed", lambda: run_timed(arm, out, sessions=sessions)),
+            ("run_probe", lambda: run_probe(arm, out)),
+        ):
+            rc = step()
+            print(f"{arm} {name}: rc={rc}", flush=True)
             if rc:
                 sys.exit(rc)
     summary = summarize(out)

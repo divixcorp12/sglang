@@ -42,22 +42,23 @@ class Chain:
         self, tmp_path, *, capacity=CAPACITY, staging=STAGING, mirror_weights=None, timeout_ms=2000, lease_pdl=False,
         copy_engine=False, sm_small_copies=False, copy_wait_ms=2000, start=True, variant="instr", hit_copy="ce",
         cpu_misses=False, gpu_hot=False, lanes=8, experts=EXPERTS, top_k=TOP_K, dst_rows=DST_ROWS, miss_cut=0,
-        miss_cut_max=3,
+        miss_cut_max=3, layers=LAYERS,
     ):
         """``lanes`` is the build's lane count; ``top_k`` is each row's plan width and ``dst_rows`` its destination
-        rows (both at least the widest plan the test posts)."""
+        rows (both at least the widest plan the test posts); ``layers`` is the number of streamed rows."""
         self.lanes, self.experts, self.top_k, self.dst_rows = lanes, experts, top_k, dst_rows
+        self.layers = layers
         wire = wire_layout(lanes)
-        write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=experts, hidden=ROW_IMAGE_DIM,
+        write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts, hidden=ROW_IMAGE_DIM,
                         inter=ROW_IMAGE_DIM, finite=True)
         self.layout = build_exl3_expert_layout(str(tmp_path))
         self.fmt = Exl3ExpertFormat(self.layout, 0, direct=False)
         self.specs = {s.name: s for s in self.fmt.tensor_specs(None)}
         self.names = EXL3_STREAMED_NAMES
-        self.slabs = {row: {} for row in range(LAYERS)}
+        self.slabs = {row: {} for row in range(layers)}
         self.host = None
         try:
-            for row in range(LAYERS):
+            for row in range(layers):
                 for n in self.names:
                     spec = self.specs[n]
                     self.slabs[row][n] = allocate_host_slab(capacity, spec.row_shape, spec.dtype, register=True)
@@ -66,35 +67,35 @@ class Chain:
             self.hot_page = new_hot_page(experts, pin=True) if gpu_hot else None
             self.host = ExpertStreamHost(
                 self.tables, page=self.page,
-                slot_map=torch.full((LAYERS, experts), -1, dtype=torch.int32).pin_memory(), variant=variant,
+                slot_map=torch.full((layers, experts), -1, dtype=torch.int32).pin_memory(), variant=variant,
                 hot_page=self.hot_page, lanes=lanes,
             )
             self.host.reserve_staging(staging)
             self.dest = {
                 row: {n: torch.zeros((dst_rows,) + self.specs[n].row_shape, dtype=self.specs[n].dtype, device="cuda")
                       for n in self.names}
-                for row in range(LAYERS)
+                for row in range(layers)
             }
             self.segments = {
                 row: expert_row_segments([(self.slabs[row][n], self.dest[row][n]) for n in self.names])
-                for row in range(LAYERS)
+                for row in range(layers)
             }
             sm_mask = sm_copy_mask(self.names) if sm_small_copies else 0
             if copy_engine:
                 self.host.enable_copy_engine(torch.cuda.current_device(), wait_timeout_ms=copy_wait_ms)
-                for row in range(LAYERS):
+                for row in range(layers):
                     self.host.set_copy_table(row, self.segments[row].table, dst_rows, sm_mask=sm_mask)
             if start:
                 self.host.start_thread(fatal_wait_s=60.0)
             self.dev = ExpertStreamDevice(
-                self.page, self.host.lease_block, device="cuda", layers=LAYERS, experts=experts,
+                self.page, self.host.lease_block, device="cuda", layers=layers, experts=experts,
                 timeout_ms=timeout_ms, piece_runs=self.host.piece_runs(),
                 row_capacities=[int(c) for c in self.tables.capacity], lease_pdl=lease_pdl,
                 hit_copy=hit_copy, cpu_misses=cpu_misses, hot_page=self.hot_page, lanes=lanes,
                 miss_cut=miss_cut, miss_cut_max=miss_cut_max,
             )
             if copy_engine:
-                for row in range(LAYERS):
+                for row in range(layers):
                     self.dev.set_row_copy(row, dst_rows)
             host_row_map = torch.full((experts,), -1, dtype=torch.int32, device="cuda")
             self.backends = {
@@ -104,7 +105,7 @@ class Chain:
                     copy_engine=copy_engine,
                     copy_sm_table=sm_copy_table(self.segments[row], sm_mask) if sm_mask else None,
                 )
-                for row in range(LAYERS)
+                for row in range(layers)
             }
         except BaseException:
             self.close()
@@ -115,7 +116,7 @@ class Chain:
                 torch.arange(top_k, dtype=torch.int32, device="cuda"),
                 torch.zeros(1, dtype=torch.int32, device="cuda"),
             )
-            for row in range(LAYERS)
+            for row in range(layers)
         }
 
     def close(self):

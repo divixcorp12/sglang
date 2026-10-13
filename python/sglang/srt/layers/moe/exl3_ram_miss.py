@@ -1351,6 +1351,7 @@ class Exl3RamMissService:
         hidden = cpu_experts.services[0].hidden
         cores = [list(plan.spec) for plan in numa.plans]
         floors = margin_floors_path(scorer)
+        horizon = envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.get()
         idle = dict(
             idle_drive=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get(),
             idle_deadline_s=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() / 1e6,
@@ -1358,7 +1359,7 @@ class Exl3RamMissService:
             idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
         )
         if scorer == "gpu":
-            picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden)
+            picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden, horizon=horizon)
             candidates = new_candidate_page(pin=pin)
             min_margin = load_margin_floors(floors, len(layer_ids)) if floors else None
             host.enable_ram_prefetch(
@@ -1378,7 +1379,7 @@ class Exl3RamMissService:
         else:
             # Off node 0, which the tier keeps near full (DSV41_REFERENCE.md section 33.12).
             node = numa.plans[-1].node if numa.nodes > 1 else None
-            tables = prefetch_tables(layer_ids, registered_gates(), hidden=hidden, node=node)
+            tables = prefetch_tables(layer_ids, registered_gates(), hidden=hidden, node=node, horizon=horizon)
             host.enable_ram_prefetch(
                 tables.targets,
                 tables.gates,
@@ -1392,10 +1393,11 @@ class Exl3RamMissService:
             )
             targets, result = tables.targets, None
         logger.info(
-            "exl3 RAM miss prefetch: %d of %d rows target the next layer, %s scorer, %d per token, %d per layer%s, "
+            "exl3 RAM miss prefetch: %d of %d rows target %s, %s scorer, %d per token, %d per layer%s, "
             "cores %s, %s",
             int((targets[:, 0] >= 0).sum()),
             len(layer_ids),
+            "the next layer" if horizon == 1 else f"layer +{horizon}",
             scorer.upper(),
             per_token,
             per_layer,

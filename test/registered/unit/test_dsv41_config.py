@@ -68,6 +68,7 @@ def test_defaults_match_the_env_declarations():
         ram_prefetch_idle_deadline_us=4000,
         ram_prefetch_idle_spread=False,
         ram_prefetch_idle_pieces=1,
+        ram_prefetch_horizon=1,
         enable_prefill_fills=False,
         enable_prefill_share=False,
         enable_prefill_route_plan=False,

@@ -23,6 +23,8 @@ MAX_SPEC_SHARE = 4
 MAX_IDLE_DEADLINE_US = 100_000
 # SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES's bound: host/ram_prefetch.h RamPrefetchConfig::kMaxIdlePieces.
 MAX_IDLE_PIECES = 4
+# SGLANG_DSV41_RAM_PREFETCH_HORIZON's bound: residency_capture_ref.HORIZONS, the deepest lookahead measured offline.
+MAX_HORIZON = 4
 
 # SGLANG_DSV41_RAM_PREFETCH_SCORER's values.
 SCORERS = ("cpu", "gpu")
@@ -88,21 +90,28 @@ class PrefetchTargets:
     top_k: int
 
 
-def prefetch_targets(layer_ids: Sequence[int], gates: Mapping[int, RouterGate], *, hidden: int) -> PrefetchTargets:
-    """Row r targets row r + 1 when that row is the next layer (layer_ids[r] + 1) and its gate has a bias; the last row,
-    a non-consecutive layer and a hash-routed one target nothing. Every target's gate has ``hidden`` columns, one
-    expert count and one top_k."""
+def prefetch_targets(
+    layer_ids: Sequence[int], gates: Mapping[int, RouterGate], *, hidden: int, horizon: int = 1
+) -> PrefetchTargets:
+    """Row r targets the row whose layer is layer_ids[r] + horizon when the rows between are consecutive layers and
+    its gate has a bias; a row with no such target (the last ``horizon`` rows, a gap in the layers, a hash-routed
+    target) targets nothing. Every target's gate has ``hidden`` columns, one expert count and one top_k."""
+    row_of_layer = {layer: row for row, layer in enumerate(layer_ids)}
     picks = []
-    for row in range(len(layer_ids) - 1):
-        nxt = layer_ids[row + 1]
-        gate = gates.get(nxt)
-        if nxt == layer_ids[row] + 1 and gate is not None and gate.bias is not None:
-            picks.append((row, gate, nxt))
+    for row, layer in enumerate(layer_ids):
+        target_row = row_of_layer.get(layer + horizon)
+        if target_row is None or any(
+            layer_ids[row + i] != layer + i for i in range(1, horizon + 1) if row + i < len(layer_ids)
+        ):
+            continue
+        gate = gates.get(layer + horizon)
+        if gate is not None and gate.bias is not None:
+            picks.append((row, gate, layer + horizon, target_row))
     if not picks:
         raise ValueError("RAM prefetch: no streamed row has a next layer with a registered, biased router gate")
     experts = int(picks[0][1].weight.shape[0])
     top_k = picks[0][1].top_k
-    for _, gate, layer_id in picks:
+    for _, gate, layer_id, _ in picks:
         if gate.weight.dim() != 2 or int(gate.weight.shape[1]) != hidden:
             raise ValueError(
                 f"RAM prefetch: layer {layer_id}'s gate has hidden size {int(gate.weight.shape[-1])}, "
@@ -115,18 +124,23 @@ def prefetch_targets(layer_ids: Sequence[int], gates: Mapping[int, RouterGate], 
         if gate.top_k != top_k:
             raise ValueError(f"RAM prefetch: layer {layer_id}'s top_k {gate.top_k} is not {top_k}")
     targets = torch.full((len(layer_ids), 2), -1, dtype=torch.int64)
-    for index, (row, _, _) in enumerate(picks):
-        targets[row, 0], targets[row, 1] = row + 1, index
-    return PrefetchTargets(targets, tuple(gate for _, gate, _ in picks), top_k)
+    for index, (row, _, _, target_row) in enumerate(picks):
+        targets[row, 0], targets[row, 1] = target_row, index
+    return PrefetchTargets(targets, tuple(gate for _, gate, _, _ in picks), top_k)
 
 
 def prefetch_tables(
-    layer_ids: Sequence[int], gates: Mapping[int, RouterGate], *, hidden: int, node: Optional[int] = None
+    layer_ids: Sequence[int],
+    gates: Mapping[int, RouterGate],
+    *,
+    hidden: int,
+    node: Optional[int] = None,
+    horizon: int = 1,
 ) -> PrefetchTables:
     """prefetch_targets with each target's gate copied to host memory once, bound to NUMA ``node`` when given, for the
     CPU scorer. The host scorer reads bf16, so an fp32 router (``router_fp32``) is rounded to bf16 here: its ranking can
     differ slightly from the model's, which costs prefetch hit rate and never correctness."""
-    picked = prefetch_targets(layer_ids, gates, hidden=hidden)
+    picked = prefetch_targets(layer_ids, gates, hidden=hidden, horizon=horizon)
     n = len(picked.gates)
     experts = int(picked.gates[0].weight.shape[0])
     row_bytes = experts * hidden * 2
