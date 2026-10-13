@@ -234,7 +234,6 @@ def test_the_service_builds_both_scorers_tables_at_the_configured_horizon(caplog
     assert kw_h1 == kw_h2
 
 
-
 def test_the_gpu_scorers_table_has_a_row_once_its_target_attached():
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)

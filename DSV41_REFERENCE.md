@@ -9627,8 +9627,23 @@ ssh divix01 'git -C /data/models/slang/sglang fetch origin \
   && git -C /data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-l2-ab origin/<branch>'
 cd /data/models/slang/nvfp4-work/wt-l2-ab
 # smoke (misscut reference + L+2 arm, sessions 0,1), both orders, then the report:
-analysis/dsv41-drive/dspark/run_l2_ab.sh /data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>
-# the script's last step, on its own:
+bash analysis/dsv41-drive/dspark/run_l2_ab.sh /data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>
+```
+
+The script's steps by hand, with `OUT=/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>`:
+
+```bash
+export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8
+# smoke: misscut reference and the L+2 arm, sessions 0,1
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
+  OUT/smoke --sessions 0,1 dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-l2
+# forward, then reversed
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
+  OUT/fwd dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-floors \
+  dspark-both-prefetch-gpu-misscut-idle2 dspark-both-prefetch-gpu-misscut-idle2-l2
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
+  OUT/rev dspark-both-prefetch-gpu-misscut-idle2-l2 dspark-both-prefetch-gpu-misscut-idle2 \
+  dspark-both-prefetch-gpu-misscut-idle2-floors dspark-both-misscut
 python analysis/dsv41-drive/dspark/l2_ab_report.py OUT/fwd OUT/rev --out OUT/report
 ```
 

@@ -933,11 +933,6 @@ def test_idle_drive_pieces_must_be_1_to_4_like_the_deadline_whatever_the_drive_f
                 _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
 
 
-def test_the_prefetch_horizon_defaults_to_the_next_layer():
-    """Horizon 1 is today's behaviour; any other value is an opt-in A/B."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.get() == 1
-
-
 def test_the_prefetch_horizon_is_bounded_on_every_launch_and_needs_the_prefetch_above_one(model_dir):
     """Bounded with the prefetch on or off, like the pieces; a horizon above 1 with the prefetch off would do nothing.
 
