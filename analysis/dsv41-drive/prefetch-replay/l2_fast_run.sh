@@ -39,6 +39,9 @@ except l2_fast_common.RefusedOut as e:
     sys.exit(2)
 PY
 
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+  echo "refusing to overwrite a non-empty OUT: $OUT" >&2; exit 2
+fi
 mkdir -p "$OUT"
 CMDS="$OUT/commands.txt"
 

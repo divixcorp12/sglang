@@ -43,7 +43,7 @@ COMPONENTS = ("gate", "features", "head_mlp", "aggregate_sigmoid", "select", "co
 PROFILED = ("L2_T0", "L2_T3")
 CAP = 1
 SCOPE = ("one CUDA graph per component, 6 live tokens, fixed inputs; no L2-defeating rotation, inputs "
-         "L2-resident; RTX 5090")
+         "L2-resident; replays queued behind a GPU sleep so host launch latency is excluded; RTX 5090")
 
 
 class Steps(msgspec.Struct):
@@ -118,7 +118,8 @@ def profile_model(model: r1_models.R1Model, *, W: torch.Tensor, bias: torch.Tens
     out = {}
     for name in COMPONENTS:
         step = built.steps[name]
-        timing = r1_cost._time_graph(step, runs=runs, warmup=warmup)
+        graph = r1_cost._capture(step)
+        timing = common.replay_stats([graph], runs=runs, warmup=warmup)
         out[name] = {**timing, "nodes": common.graph_nodes(step)}
     return out
 
@@ -147,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     out = common.guard_out(args.out, run_dir=args.run_dir)
     plan, plan_sha = r1_plan.load_plan(args.plan)
+    if plan.cost.live_tokens != 6:
+        raise SystemExit(f"the F123 profile is fixed at 6 live tokens; the plan says {plan.cost.live_tokens}")
     with open(os.path.join(args.run_dir, "stages", "l2", "result.json")) as f:
         checkpoints = l2_cap1_scorers.learned_ckpts(json.load(f))
     W, bias = r1_gate.load_target_gates(args.model_path, layer_ids=[args.layer])[args.layer]
