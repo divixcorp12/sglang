@@ -9544,9 +9544,16 @@ at this data size; no further arms in this feature.
 
 ### 33.29 Served A/B: the native gate retargeted to L+2 (2026-10-12)
 
-Status: **pending**. The code and the run script are merged; no served number below is measured yet (the merge gate's
-only listed check, `python3 scripts/lint/check_registered_tests.py`, exited 1; the gate ran no served A/B). Report and
-per-arm data: `divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>/` (`report/REPORT.md`).
+Status: **forward order only; the reversed order was cancelled by the owner for time, so the pre-registered D6
+verdict (which needs both orders) is not reached.** Run `divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-20261012/`
+(`smoke/`, `fwd/`; log `l2-ab-20261012.log`), worktree `wt-l2-ab` at `9d86f32d8a` (merge `b845d8e63f`), generation
+`f108-prefetch-horizon` (python tree `8c1ca644`). Smoke 20:21-21:06, forward 21:06-22:35. The run script was stopped by
+PID after the forward A/B started its last probe; the forward A/B completed normally. A first launch stopped at the
+generation gate before any server ran (`l2-ab-20261012-failed-generation/`). Numbers below come from
+`l2_ab_report.analyse_order` on `fwd/`. Tests on the merge: CPU 396 passed (prefetch tables, service, requirements,
+config, `test_exl3_ram_prefetch_{gpu_host,pool,step,idle_drive}.py`, `test_both_cpu_ab.py`, `test_l2_ab_report.py`);
+GPU `test_exl3_ram_prefetch_gpu_scorer_cuda.py` 234 passed. The server log confirms the arm: "38 of 40 rows target
+layer +2, GPU scorer, 1 per token, 1 per layer, margin floors none".
 
 The question is whether scoring the native gate of layer T+2 on layer T's hidden state, which gives a speculative read
 two layers of lead instead of one, beats today's L+1 arms on decode time, and whether it moves the mechanism the
@@ -9589,35 +9596,50 @@ idle2-l2 / misscut, median over sessions with no drive flag in either arm of the
 
 | Pair | Forward | Reversed |
 |---|---|---|
-| idle2-l2 / idle2-floors | pending | pending |
-| idle2-l2 / misscut | pending | pending |
-| idle2-l2 / idle2 | pending | pending |
+| idle2-l2 / idle2-floors | **0.958** (6 sessions; DISCA, WRK flagged in floors) | not run |
+| idle2-l2 / misscut | 0.984 (8) | not run |
+| idle2-l2 / idle2 | 0.960 (7; VLO flagged in idle2) | not run |
+| idle2-floors / misscut (context) | 1.032 (6) | not run |
+| idle2 / misscut (context) | 1.022 (7) | not run |
 
 **Paired ms/token** (median of per-session paired gain, % of the comparator's ms/token; positive favours L+2):
 
 | Pair | Forward | Reversed |
 |---|---|---|
-| idle2-l2 vs idle2-floors | pending | pending |
-| idle2-l2 vs misscut | pending | pending |
+| idle2-l2 vs idle2-floors | **+4.2%**, 4 of 6 faster | not run |
+| idle2-l2 vs misscut | +3.3%, 5 of 8 faster | not run |
+| idle2-l2 vs idle2 | +7.4%, 6 of 7 faster | not run |
+
+Per session, idle2-l2 vs idle2-floors (step ratio): BKR 0.979, CDW 0.959, ETR 0.957, TSCO 0.984, VLO 0.916 (but
+ms/token -16.1%: VLO's L+2 text was shorter at lower accept), K 0.930; excluded DISCA 0.429 and WRK 0.674 (nvme4 SPCC
+episodes in the floors arm, +136% / +150% busy s per GB). L+2 was faster on step time in every unflagged session.
 
 **Mechanism** (D7, reported whatever D6 says). The replay predicts the in-flight fraction falls sharply at L+2; if it
 does not, the timing model is wrong for serving and the report says so.
 
 | Arm | Used reads still in flight at use | Used / landed | Wasted rows per token | NVMe rows per token |
 |---|---|---|---|---|
-| idle2-floors (L+1) | 37-39% (§33.22) | pending | pending | pending |
-| idle2 (L+1) | pending | pending | pending | pending |
-| idle2-l2 (L+2) | pending | pending | pending | pending |
+| idle2-floors (L+1) | 43% | 0.65 | 2.4 | 29.0 |
+| idle2 (L+1) | 39% | 0.46 | 6.1 | 32.5 |
+| idle2-l2 (L+2) | **1.4%** | 0.35 | 7.4 | 32.5 |
+| misscut (no prefetch) | - | - | 0 | 24.9 |
+
+The mechanism moved as the replay predicted: at L+2 almost every used read has landed before its layer needs it (1.4%
+in flight at use against 39-43% at L+1), at the cost of lower precision (0.35 used / landed against 0.46 without floors)
+and the same drive traffic as L+1 without floors. The 2-session smoke agreed (1.2% in flight, 0.31 used / landed).
 
 **Text match and verdict:**
 
 | Item | Forward | Reversed |
 |---|---|---|
-| Text vs reference, idle2-l2 | pending | pending |
-| Sessions excluded by drive flags | pending | pending |
-| D6 verdict | pending | pending |
+| Text vs reference, idle2-l2 | pass (3 flips, all within band, max gap 0.5) | not run |
+| Sessions excluded by drive flags | idle2-l2: none; floors: DISCA, WRK; idle2: VLO (all nvme4) | not run |
+| D6 criterion for this order | met (0.958 <= 0.97 and paired ms/token +4.2%) | not run |
 
-Combined verdict: **pending**.
+Combined verdict: **not reached** (one order). The forward order meets the win criterion against the best L+1 arm.
+Against no prefetch, L+2 is ahead on both measures (step 0.984, ms/token +3.3%), but that margin is inside the +-3%
+that past prefetch A/Bs flipped across orders: idle2's first A/B was +3.6% and its repeat -3.7% (§33.22). The reversed order (`run_l2_ab.sh` re-run, or `both_cpu_ab.py $OUT/rev` with the four arms reversed)
+is what would settle it.
 
 **Rerun.** On divix01, from a pushed commit; production is not started, stopped or restarted (D8). The script takes
 `rowimg-disk.lock` once, and `both_cpu_ab.py` takes `cc-gpu.lock`; every python runs under `taskset -c 0-63` with

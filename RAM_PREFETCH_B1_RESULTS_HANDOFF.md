@@ -1041,4 +1041,28 @@ splits, exclusions, policy (cap 2, mean reads <= 1), calibration and timing mode
 **Housekeeping added this round:** worktree `wt-r2-run`, smoke dir `b1-r2-20261012-smoke`, failed log
 `r2-run-20261012-failed-oom.log`.
 
+## ROUND 4: the native gate at L+2, served (F108, §33.29)
+
+`SGLANG_DSV41_RAM_PREFETCH_HORIZON` (default 1) retargets the GPU scorer to layer T+h's gate. A served A/B was run on
+divix01 with four arms: misscut, idle2-floors (L+1), idle2 (L+1) and idle2-l2 (L+2, no floors). **Only the forward
+order ran;** the reversed order was cancelled for time.
+
+**Forward order**, flagged sessions excluded:
+
+| L+2 against | Step-time ratio | ms/token | Sessions faster |
+|---|---|---|---|
+| L+1 with floors | 0.958 | +4.2% | 4 of 6 |
+| L+1 without floors | 0.960 | +7.4% | 6 of 7 |
+| no prefetch | 0.984 | +3.3% | 5 of 8 |
+
+**The mechanism moved as the replay predicted.** Used reads still in flight at use fell to 1.4% at L+2, from 39-43% at
+L+1. Used / landed was 0.35, against 0.46 without floors. NVMe rows per token were 32.5, the same as L+1 without
+floors.
+
+**Reading.** In this order L+2 beat the best L+1 arm on the pre-registered measure. It is still one order, and its
+margin over no prefetch is inside the noise seen before. Next:
+1. Run the reversed order (about 1.5 h).
+2. If L+2 holds, fit L+2 margin floors. Its precision (0.35) is where L+1 was before floors (0.46 to 0.65).
+3. Defaults stay off and horizon 1 until the owner decides.
+
 Production on divix01 is still stopped; only you can restart it.
