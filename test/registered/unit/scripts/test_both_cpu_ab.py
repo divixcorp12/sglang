@@ -400,6 +400,7 @@ IDLE2_ARMS = (
     "dspark-both-prefetch-gpu-misscut-idle2",
     "dspark-both-prefetch-gpu-misscut-idle2-floors",
     "dspark-both-prefetch-gpu-misscut-idle2-l2",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2-t3",
 )
 IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", *IDLE2_ARMS)
 
@@ -441,6 +442,8 @@ def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(mon
 
 HORIZON = "SGLANG_DSV41_RAM_PREFETCH_HORIZON"
 L2_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2"
+T3_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3"
+LEARNED_HEAD = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
 
 
 def test_the_l2_arm_is_the_idle2_arm_with_horizon_2_alone_and_no_floors_against_the_miss_cut_arm():
@@ -459,9 +462,24 @@ def test_every_other_arm_pins_horizon_1_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv(HORIZON, "3")
     for arm in ab.ARMS:
-        want = "2" if arm == L2_ARM else "1"
+        want = "2" if arm in (L2_ARM, T3_ARM) else "1"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[HORIZON] == want, arm
+
+
+def test_the_t3_arm_is_the_l2_arm_with_the_head_file_alone_and_every_other_arm_pins_it_empty(monkeypatch):
+    """Mutant: the T3 arm also changes another knob, or an arm inherits a shell's head path -- red."""
+    ab = _ab()
+    monkeypatch.setenv(LEARNED_HEAD, "/shell/head.safetensors")
+    l2, t3 = ab.ARMS[L2_ARM][0], ab.ARMS[T3_ARM][0]
+    assert (l2[LEARNED_HEAD], t3[LEARNED_HEAD]) == ("", ab.T3_HEAD)
+    assert {k: v for k, v in t3.items() if k != LEARNED_HEAD} == {k: v for k, v in l2.items() if k != LEARNED_HEAD}
+    assert ab.ARMS[T3_ARM][1] is True
+    assert ab.REFERENCE[T3_ARM] == "dspark-both-misscut"
+    for arm in ab.ARMS:
+        want = ab.T3_HEAD if arm == T3_ARM else ""
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[LEARNED_HEAD] == want, arm
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

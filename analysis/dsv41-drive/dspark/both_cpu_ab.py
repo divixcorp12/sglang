@@ -163,6 +163,10 @@ for _overrides_of_arm, _ in ARMS.values():
 HORIZON_DEFAULT = {"SGLANG_DSV41_RAM_PREFETCH_HORIZON": "1"}
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(HORIZON_DEFAULT)
+# The learned L+2 head file is unset in every arm but the T3 one, so a shell that exports it cannot carry it into one.
+LEARNED_HEAD_OFF = {"SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": ""}
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm.update(LEARNED_HEAD_OFF)
 # The GPU-prefetch miss-cut arm with each group's speculative reads on a reader of its own, one piece at a time from a
 # drive no demand reads (DSV41_REFERENCE.md 33.16 item 2: demand reads were 0.4-0.5 ms slower beside them).
 ARMS["dspark-both-prefetch-gpu-misscut-idle"] = (
@@ -194,6 +198,13 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2"] = (
     },
     True,
 )
+# The folded T3 head exported by l2_head_export.py with the F109 calib threshold at budget 0.75.
+T3_HEAD = "/data/models/slang/nvfp4-work/ram-prefetch/l2-t3-head/t3-f109-calib-b075.safetensors"
+# The L+2 arm with the learned T3 scorer served on the prefetch side stream; the head file is the only change.
+ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3"] = (
+    {**ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2"][0], "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": T3_HEAD},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -214,6 +225,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-misscut-idle2": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-floors": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-l2": "dspark-both-misscut",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2-t3": "dspark-both-misscut",
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "

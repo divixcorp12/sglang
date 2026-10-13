@@ -51,7 +51,10 @@ def test_the_device_headers_are_found():
         "lease_device.cuh",
         "lease_kernels.cuh",
         "lease_primitives.cuh",
+        "residency_snapshot.cuh",
         "row_copy_kernels.cuh",
+        "spec_head.cuh",
+        "spec_head_tail.cuh",
         "spec_score.cuh",
     ]
 
@@ -86,12 +89,15 @@ def test_only_the_post_staging_and_cws_gate_close_keep_a_seq_cst_system_fence():
 
 
 def test_the_seqlock_writers_fences_are_two_releases():
-    # The channel's begin_record (write_record's), the hot bitmap record and the GPU scorer's candidate slot: seq 0, a
-    # release fence, the payload, then the seq with a release store.
+    # The channel's begin_record (write_record's), the hot bitmap record, the GPU scorer's candidate slot and the learned
+    # head's candidate slot (its record and its empty record): seq 0, a release fence, the payload, then the seq with a
+    # release store.
     # The device reads no seqlock (the delta block's tag is one acquire), so it has no acquire fence.
     assert [(name, code) for name, _, code in matches(r"atomic_thread_fence")] == [
         ("lease_channel.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+        ("spec_head_tail.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+        ("spec_head_tail.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("spec_score.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
     ]
 

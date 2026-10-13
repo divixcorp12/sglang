@@ -3288,6 +3288,8 @@ class ExpertStreamDevice:
         # The stream the scoring forks onto (spec_score) until spec_join; None on a CPU device.
         self.spec_stream = None
         self._spec_forked = False
+        # The learned head (enable_spec_head, a ServingHead) that replaces spec_select; None when off.
+        self.spec_head = None
 
     def _kernels(self):
         """Return the device module, loading it on first use."""
@@ -3386,23 +3388,46 @@ class ExpertStreamDevice:
         if torch.device(self.state.device).type == "cuda":
             self.spec_stream = torch.cuda.Stream(device=self.state.device)
 
-    def spec_score(self, entry, x: Optional[torch.Tensor]) -> None:
+    def enable_spec_head(self, head) -> None:
+        """Serve the learned head (a ``ServingHead``) after ``spec_score``'s native scoring instead of
+        ``spec_select``. Runs after ``enable_spec_scorer`` and before any graph captures ``spec_score``."""
+        if self._spec is None:
+            raise RuntimeError("enable_spec_scorer must run before enable_spec_head")
+        if self.spec_head is not None:
+            raise RuntimeError("a learned head is already enabled on this device")
+        experts, hidden = int(head.weights.w_out.shape[0]), int(head.weights.w_pca.shape[1])
+        if experts != self.experts or hidden != int(self.cpu_out_rows.shape[-1]):
+            raise ValueError(
+                f"the head has {experts} experts and hidden size {hidden}; this device has {self.experts} "
+                f"and {int(self.cpu_out_rows.shape[-1])}"
+            )
+        self.spec_head = head
+
+    def spec_score(
+        self,
+        entry,
+        x: Optional[torch.Tensor],
+        *,
+        routes: Optional[torch.Tensor] = None,
+        route_weights: Optional[torch.Tensor] = None,
+    ) -> None:
         """Score the record this device just posted: layer T's MoE input ``x`` (bf16 [tokens, hidden] or [hidden], or
         None) against ``entry`` (a ``SpecScoreRow``), then publish its candidates to the record's slot. A record of no
         input or more than cpu_tokens_max tokens publishes count 0. Right after ``post``: forks onto ``spec_stream``
-        until ``spec_join``, so the post's stream goes on to C1 without waiting for it."""
+        until ``spec_join``, so the post's stream goes on to C1 without waiting for it. ``routes`` (int64, flat
+        [>= tokens * top_k]) and ``route_weights`` ([tokens, top_k]) feed the learned head and are ignored without one."""
         if self._spec is None:
             raise RuntimeError("the GPU scorer is not enabled on this device (enable_spec_scorer)")
         self._check_row(entry.target)
         tokens = 0 if x is None else (int(x.shape[0]) if x.dim() == 2 else 1)
         module = self._kernels()
         if self.spec_stream is None:
-            self._spec_launch(entry, x, tokens, module)
+            self._spec_launch(entry, x, tokens, module, routes=routes, route_weights=route_weights)
             return
         # A wait_stream fork, which a breakable capture tracks and joins at a segment end if spec_join has not.
         self.spec_stream.wait_stream(torch.cuda.current_stream(self.spec_stream.device))
         with torch.cuda.stream(self.spec_stream):
-            self._spec_launch(entry, x, tokens, module)
+            self._spec_launch(entry, x, tokens, module, routes=routes, route_weights=route_weights)
         self._spec_forked = True
 
     def spec_join(self) -> None:
@@ -3412,7 +3437,45 @@ class ExpertStreamDevice:
             torch.cuda.current_stream(self.spec_stream.device).wait_stream(self.spec_stream)
             self._spec_forked = False
 
-    def _spec_launch(self, entry, x, tokens: int, module) -> None:
+    def _spec_head_launch(self, entry, x, tokens: int, module, routes, route_weights) -> None:
+        # Lazy: spec_head imports this module, and the production path must not load it.
+        from sglang.kernels.ops.moe import spec_head
+
+        head = self.spec_head
+        if 1 <= tokens <= self.cpu_tokens_max:
+            run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
+        top_k = int(head.src_w.shape[1])
+        in_range = (
+            x is not None and 1 <= tokens <= min(spec_head.HEAD_MAX_TOKENS, self.cpu_tokens_max)
+        )
+        if in_range:
+            head.src_w[:tokens].copy_(route_weights.to(torch.float32))
+            src_ids = routes[: tokens * top_k].view(tokens, top_k)
+        else:
+            src_ids = None
+        spec_head.run_spec_head_serving(
+            weights=head.weights,
+            workspace=head.workspace,
+            x=x.reshape(tokens, -1) if in_range else x,
+            tokens=tokens,
+            scores=self.spec_scores,
+            src_ids=src_ids,
+            src_w=head.src_w,
+            positions=head.positions,
+            row=head.row_of_target[entry.target],
+            hot_slots=entry.hot_slots,
+            hot_capacity=entry.hot_capacity,
+            ram_slot=self.map_bank["ram_slot"],
+            target=entry.target,
+            threshold=head.threshold,
+            state=self.state,
+            candidates=self.spec_candidates,
+        )
+
+    def _spec_launch(self, entry, x, tokens: int, module, *, routes=None, route_weights=None) -> None:
+        if self.spec_head is not None:
+            self._spec_head_launch(entry, x, tokens, module, routes, route_weights)
+            return
         top_k, per_token, top_k_only = self._spec
         if 1 <= tokens <= self.cpu_tokens_max:
             run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
