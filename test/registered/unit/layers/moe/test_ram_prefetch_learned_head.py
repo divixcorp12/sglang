@@ -166,7 +166,12 @@ def test_gate_accepts_a_complete_learned_head_launch(tmp_path):
 def test_gate_refuses_the_head_without_the_prefetch(tmp_path):
     """Mutant: the prefetch-off early return skips the head check; the variable would pass unused."""
     with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH=1"):
-        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH=False, SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+        _gate(
+            _write(tmp_path),
+            SGLANG_DSV41_RAM_PREFETCH=False,
+            SGLANG_DSV41_RAM_PREFETCH_HORIZON=1,
+            SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu",
+        )
 
 
 def test_gate_refuses_the_head_with_the_cpu_scorer(tmp_path):
