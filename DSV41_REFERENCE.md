@@ -9791,8 +9791,19 @@ T0 is the cheaper candidate at about 80% of T3's gain.
 
 ### 33.31 F123: a serving-shaped fast path for the L+2 learned heads (T0, T3), offline (2026-10-13)
 
-Status: **Stage 2 of `RAM_PREFETCH_L2_HEADS_NEXT_HANDOFF.md`: code built, divix01 run not yet done. Every result cell
-below is `pending` until the owner runs `l2_fast_run.sh`.** Nothing is wired into serving; that is Stage 3. The locked
+Status: **Stage 2 of `RAM_PREFETCH_L2_HEADS_NEXT_HANDOFF.md`: built and run. Run directory
+`divix01:/mnt/nvme1/nvfp4-work/f123-l2-fast-20261013/` (log `../f123-run.log`).**
+- Worktree `wt-f123-run` at `1da2624bba`. That is merge `7d45628819`, plus the skipped B3 batch merged by hand
+  (`8ca8023e0f`), plus the follow-up `1da2624bba`: queued profile timing, a 6-token check, and refusal of a non-empty
+  OUT.
+- Run 10:44-10:58 CDT; every `EXIT=` is 0. A 15 s GPU-process sampler (`../f123-gpu-apps.log`) saw only this run's
+  processes on the GPU.
+- Tests on that commit: `divix01-pytest --gpu test_l2_fast_*.py test_exl3_ram_prefetch_gpu_scorer_cuda.py`, 317 passed,
+  exit 0.
+- An earlier attempt at 04:55 failed 271 tests. A MiMo REAP `observe.py` was holding 31.9 of the 32 GB GPU at the time,
+  without the GPU lock. The same tests pass on the free GPU.
+
+Nothing is wired into serving; that is Stage 3. The locked
 test split was not opened, and no run directory of R1, R2, F108 or F109 is written to.
 
 **What was built.**
@@ -9858,45 +9869,82 @@ siblings) 59 passed, exit 0; GPU tests (`--gpu`, `test_l2_fast_{kernels,parity,p
 Typecheck was not run by the gate. These are test results, not measurements: the cells below stay `pending` because the
 gate did not run `l2_fast_run.sh`.
 
-**Results** (all `pending`; to be filled from `OUT/result.json`, not estimated):
+**Results** (observed offline; from `OUT/result.json`; times in us):
 
 | C1 profile, 6 tokens, graph | gate | feature build | head MLP | aggregation + sigmoid | mask-threshold-select | nodes |
 |---|---:|---:|---:|---:|---:|---:|
-| T0 | pending | pending | pending | pending | pending | pending |
-| T3 | pending | pending | pending | pending | pending | pending |
+| T0 | 24.3 | 38.6 | 28.4 | 16.1 | 38.6 | 4 / 15 / 18 / 12 / 22 = 71 |
+| T3 | 24.3 | 40.6 | 38.6 | 75.5 | 40.6 | 4 / 15 / 24 / 55 / 22 = 120 |
 
-| C21-C26 cost, graph, 38-slot rotation (ms) | width 1 | width 2 | width 4 | width 6 | bar |
+The complete path is 136.9 us for T0 and 212.7 us for T3. Inputs are L2-resident and replays are queued, so host launch latency is
+excluded. T3's extra cost is almost all in its block aggregator: 55 graph nodes, 75 us.
+
+| C21-C26 cost, graph, 38-slot rotation (us) | width 1 | width 2 | width 4 | width 6 | bar |
 |---|---:|---:|---:|---:|---:|
-| native `spec_score` + `spec_select` | pending | pending | pending | pending | - |
-| native + fused T0 + select | pending | pending | pending | pending | - |
-| native + fused T3 + select | pending | pending | pending | pending | - |
-| folded torch T0 | pending | pending | pending | pending | - |
-| folded torch T3 | pending | pending | pending | pending | - |
-| incremental over native, T0 | pending | pending | pending | pending | 0.1 |
-| incremental over native, T3 | pending | pending | pending | pending | 0.1 |
+| native `spec_score` + `spec_select` | 20.2 | 20.1 | 22.2 | 26.3 | - |
+| native + fused T0 + select | 57.0 | 61.1 | 71.3 | 87.7 | - |
+| native + fused T3 + select | 61.1 | 65.2 | 75.4 | 91.8 | - |
+| folded torch T0 | 134.8 | 153.2 | 155.3 | 159.4 | - |
+| folded torch T3 | 188.1 | 204.4 | 208.6 | 212.7 | - |
+| **incremental over native, T0** | 36.9 | 41.0 | 49.2 | **61.4** | 100 |
+| **incremental over native, T3** | 41.0 | 45.1 | 53.2 | **65.6** | 100 |
 
-| C13-C20 parity (budget 0.75 / 1.0) | max abs diff | p99 abs diff | top-1 agree | read-set agree | near-threshold | precision candidates |
-|---|---:|---:|---:|---:|---:|---:|
-| T0 folded torch, fp32 scores | pending | pending | pending | pending | pending | n/a |
-| T0 fused kernels, fp32 scores | pending | pending | pending | pending | pending | n/a |
-| T0 fused kernels, `spec_score` scores | pending | pending | pending | pending | pending | pending |
-| T3 folded torch, fp32 scores | pending | pending | pending | pending | pending | n/a |
-| T3 fused kernels, fp32 scores | pending | pending | pending | pending | pending | n/a |
-| T3 fused kernels, `spec_score` scores | pending | pending | pending | pending | pending | pending |
-| T0 fused kernels, `spec_score` scores, float32 gate weight (`parity-fp32.json`) | pending | pending | pending | pending | pending | pending |
-| T3 fused kernels, `spec_score` scores, float32 gate weight (`parity-fp32.json`) | pending | pending | pending | pending | pending | pending |
+What the cost table shows:
+- The fused kernels add 5 graph nodes in place of 71 or 120, and both heads now sit inside the historical 0.1 ms/layer
+  bar.
+- The folded torch path (88 nodes) is not faster than the reference, so only the fused kernels pay.
+- Implied bandwidth is 5-11% of the RTX 5090's spec. The path is latency-bound; there is headroom, but no bandwidth
+  problem.
 
-| Interference (main-stream slowdown) | vs native on side stream | vs no side work |
+| C13-C20 parity, dev (44,536 groups), budget 0.75 | max abs diff | p99 abs diff | top-1 agree | read agree (0.75 / 1.0) | disagreements near threshold |
+|---|---:|---:|---:|---:|---:|
+| T0 folded torch | 0.981 | 9e-8 | 0.9998 | 0.9998 / 0.9998 | 0 |
+| T0 fused kernels | 0.981 | 3.9e-4 | 0.9976 | 0.9982 / 0.9976 | 29 |
+| T3 folded torch | 0.933 | 1.2e-7 | 0.9998 | 0.9998 / 0.9998 | 0 |
+| T3 fused kernels | 0.933 | 5.4e-4 | 0.9973 | 0.9976 / 0.9973 | 42 |
+
+Calib (20,254 groups) gives the same picture: read agree is 0.9996-0.9997 for torch and 0.9964-0.9977 for the kernels.
+The rows above use the reference's fp32 gate scores. Every row is identical, to the reported precision, when the
+scores come from the serving `spec_score` kernel with either a bf16 or an fp32 router weight (`parity.json`,
+`parity-fp32.json`). The checkpoint's router weight is evidently bf16-exact, so `W.float()` loses nothing.
+
+Reading the parity results:
+- **The outliers are reference tie artifacts, not fold bugs** (debug probe `/mnt/nvme1/nvfp4-work/f123-debug/`).
+  - Every |diff| > 1e-3 on the torch path is a group where an exact fp32 tie straddles gate rank 12: 26 of 44,536 dev
+    groups and 27 of 20,254 calib groups. These are the `stored_top12_tie_only` counts in `parity.json`.
+  - The reference's top-12 E5 features come from the dataset's stored `gate_ids`, written by CPU `torch.topk`.
+    libstdc++ `nth_element` breaks exact ties in an order set by how it shuffles the array; a port of it reproduces the
+    stored set in 26/26 and 27/27 tie tokens.
+  - The fold and the kernels break ties by the lowest id, as `r1_gate` documents.
+  - The ties sit mostly at layers 38-39 at token 0. There the logits are -20 to -26, so `sqrt(softplus)` is about
+    1e-5, below one fp32 step at a bias of about 34, and up to 23 experts score exactly 33.96875.
+  - Serving cannot reproduce a CPU library's tie order and should not try. These groups are reported, not fixed.
+- **The kernels' extra disagreements are bf16 weight precision.** Their p99 is about 4-5e-4. The disagreements are
+  either threshold crossings within 1e-3, or top-1 swaps between near-equal experts. `kernel_record_mismatch` (record
+  versus scores) is 0 everywhere.
+- **Recall at the frozen thresholds changes by at most 0.0002 absolute** in every precision candidate, for example
+  T3 calib at budget 0.75: 0.2353 -> 0.2355. Per the spec, the kernels are a precision candidate, kept with that change
+  reported and not recalibrated.
+
+| C26 interference, width 6, main load 0.139 ms of bf16 GEMMs | main-stream slowdown vs native on side stream | vs no side work |
 |---|---:|---:|
-| fused T0 | pending | pending |
-| fused T3 | pending | pending |
+| fused T0 | +3.1% | +6.1% |
+| fused T3 | +4.1% | +7.2% |
+
+The native scorer alone on the side stream costs the main stream +2.9% (0.1389 -> 0.1430 ms). The main-load sizing is a
+`hypothesis` for one decode layer's dense work, not a measured layer.
+
+**Choice for Stage 3 (D1).** T3: recall is about 0.01 higher (calib 0.235 vs 0.226 at budget 0.75) for 4.2 us more
+per layer at width 6 (65.6 vs 61.4 us) and one point more interference. Stage 3 must still show that roughly 61-66 us
+of side-stream work per streamed layer, partly overlapped, buys more than it costs in served decode time. That is not
+established here.
 
 **Labels.** Numbers the run produces are `observed offline`, with widths, replays, graph or eager, stream and rotation
 beside them. Statements of what the cost or interference will mean in serving are `hypothesis` until Stage 3 serves
 them.
 
-**Not decided here.** The choice between T0 and T3 (D1), made from F109 accuracy against the measured incremental cost,
-and the serving wiring of the fast path are Stage 3.
+**Not decided here.** The serving wiring of the fast path, and whether it pays in served decode time, are Stage 3.
+Production defaults are the owner's.
 
 ## Sources
 
