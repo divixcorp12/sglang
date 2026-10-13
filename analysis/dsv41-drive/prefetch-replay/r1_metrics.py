@@ -141,12 +141,13 @@ class PolicyReport(msgspec.Struct):
     forward_totals: dict[str, float]  # capped reads per forward over its target layers
 
 
-def _keys(r: R1Group) -> list[str]:
+def _keys(r: R1Group, *, widths: bool = False) -> list[str]:
     g = r.g
     keys = ["pooled", "flagged" if g.flagged else "pooled_noflag"]
     if g.warm_start:
         keys.append("warm")
-    return keys + [f"layer:{g.target_layer}", f"stratum:{g.target_stratum}", f"session:{g.session}"]
+    keys += [f"layer:{g.target_layer}", f"stratum:{g.target_stratum}", f"session:{g.session}"]
+    return keys + [f"width:{len(g.tokens)}"] if widths else keys
 
 
 def _mask(ids: np.ndarray) -> np.ndarray:
@@ -260,7 +261,7 @@ def _forward_totals(per_forward: dict[tuple, int]) -> dict[str, float]:
 
 
 def policy_report(groups: list[R1Group], cands: list[Candidates], *, scorer: str, cap: int,
-                  threshold: float) -> PolicyReport:
+                  threshold: float, widths: bool = False) -> PolicyReport:
     """Every metric of one scorer's capped policy (reads >= threshold, at most cap per group) on one split."""
     _check_inputs(groups, cands)
     cells: dict[str, PolicyCell] = {}
@@ -275,7 +276,7 @@ def policy_report(groups: list[R1Group], cands: list[Candidates], *, scorer: str
         passing = c.ids[c.vals >= threshold]
         read, dropped = r1_policy.select(c, threshold=threshold, cap=cap), passing[cap:]
         one = _group_cell(r, read=read, dropped=dropped)
-        for key in _keys(r):
+        for key in _keys(r, widths=widths):
             _accumulate(cells.setdefault(key, PolicyCell()), one)
             precap.setdefault(key, []).append(len(passing))
         fwd = (r.key.session, r.key.block, r.key.seq)
