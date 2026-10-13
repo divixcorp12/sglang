@@ -77,6 +77,8 @@ def _module():
         cuda_wrappers=[
             ("spec_head_run", "SpecHeadKernel::run"),
             ("spec_head_tail", "SpecHeadKernel::tail"),
+            ("spec_head_serve", "SpecHeadKernel::serve"),
+            ("spec_head_serve_empty", "SpecHeadKernel::serve_empty"),
         ],
     )
 
@@ -154,6 +156,48 @@ def run_spec_head_tail(
         logits, positions, w.agg_w1, w.agg_row_bias, w.agg_w2, w.agg_b2,
         int(row), hot_slots, int(hot_capacity), ram_slot, int(target), threshold,
         ws.block_scores, ws.features, ws.record,
+    )  # fmt: skip
+
+
+def run_spec_head_serving(
+    *,
+    weights: SpecHeadWeights,
+    workspace: SpecHeadWorkspace,
+    x: torch.Tensor | None,
+    tokens: int,
+    scores: torch.Tensor,
+    src_ids: torch.Tensor,
+    src_w: torch.Tensor,
+    positions: torch.Tensor,
+    row: int,
+    hot_slots: torch.Tensor,
+    hot_capacity: int,
+    ram_slot: torch.Tensor,
+    target: int,
+    threshold: torch.Tensor,
+    state: torch.Tensor,
+    candidates: torch.Tensor,
+) -> None:
+    """K1-K4 publishing into the post's candidate-page slot, on the current stream; graph-capturable.
+
+    The slot is ``(state[kPosted] - 1) % kCandRecords`` of the pinned uint8 ``candidates`` page, read
+    on the device, with the seq stored last. ``x`` None or ``tokens`` outside 1..HEAD_MAX_TOKENS
+    publishes count 0 with the oversize flag. ``src_ids``/``src_w``/``positions`` lead with ``tokens`` rows.
+    """
+    module = _module()
+    address = int(candidates.data_ptr())
+    if x is None or not 1 <= tokens <= HEAD_MAX_TOKENS:
+        module.spec_head_serve_empty(state, address)
+        return
+    w, ws = weights, workspace
+    module.spec_head_serve(
+        x[:tokens], scores, src_ids[:tokens], src_w[:tokens], positions[:tokens],
+        w.w_pca, w.w_in_pca, w.b_in, w.w_in_sparse, w.row_bias, w.pos_bias,
+        w.w_r1, w.b_r1, w.w_r2, w.b_r2, w.w_gate, w.b_gate, w.w_out, w.b_out,
+        w.agg_w1, w.agg_row_bias, w.agg_w2, w.agg_b2,
+        int(row), hot_slots, int(hot_capacity), ram_slot, int(target), threshold,
+        ws.h, ws.pre, ws.hid, ws.logits, ws.block_scores, ws.features,
+        state, address,
     )  # fmt: skip
 
 

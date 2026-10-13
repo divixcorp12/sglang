@@ -48,6 +48,8 @@ struct SpecHeadTailParams {
   float* block_scores;       ///< [experts]: sigmoid of the block logit, every expert
   float* features;           ///< [experts, kBlockFeatures] block features, or nullptr
   uint8_t* record;           ///< kCandStride bytes: the candidate slot, written as spec_candidates.h lays it out
+  const int32_t* state;      ///< serving: the post's state words, kPosted is the record's seq; nullptr offline
+  uint8_t* candidates;       ///< serving: the pinned candidate page, slot (seq - 1) % kCandRecords; nullptr offline
 };
 
 /// \brief The fused tail: one block of kHeadTailThreads, one thread per expert.
@@ -169,7 +171,10 @@ __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void sp
     }
   }
   const bool found = pick != 0x7FFFFFFF;
-  uint8_t* const slot = p.record;
+  const bool serving = p.candidates != nullptr;
+  const uint32_t seq = serving ? static_cast<uint32_t>(p.state[kPosted]) : 1u;
+  uint8_t* const slot =
+      serving ? p.candidates + static_cast<int64_t>((seq - 1u) % Cand::kCandRecords) * Cand::kCandStride : p.record;
   st_relaxed_sys<uint32_t>(slot + Cand::kCandSeq, 0u);
   __threadfence();
   st_relaxed_sys<uint32_t>(slot + Cand::kCandCount, found ? 1u : 0u);  // flags 0
@@ -177,7 +182,20 @@ __global__ __launch_bounds__(device::expert_stream::kHeadTailThreads, 1) void sp
   st_relaxed_sys<uint32_t>(entry + Cand::kCandExpert, found ? static_cast<uint32_t>(pick) : 0xFFFFu);  // rank 0
   st_relaxed_sys<uint32_t>(entry + Cand::kCandMargin, found ? __float_as_uint(best) : 0u);
   __threadfence();
-  st_release_sys(slot + Cand::kCandSeq, 1u);  // orders the payload before the seq
+  st_release_sys(slot + Cand::kCandSeq, seq);  // orders the payload before the seq
+}
+
+/// \brief Serving's empty publication: one thread writes count 0 with kCandFlagOversize to the post's slot, for a
+/// record with no x or tokens outside 1..kHeadMaxTokens, in spec_score.cuh's select order (seq 0, fence, payload, seq).
+__global__ void spec_head_empty_kernel(const int32_t* state, uint8_t* candidates) {
+  using namespace device::expert_stream;
+  using Cand = ::sglang::expert_stream::wire::SpecCandidates;
+  const uint32_t seq = static_cast<uint32_t>(state[kPosted]);
+  uint8_t* const slot = candidates + static_cast<int64_t>((seq - 1u) % Cand::kCandRecords) * Cand::kCandStride;
+  st_relaxed_sys<uint32_t>(slot + Cand::kCandSeq, 0u);
+  cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
+  st_relaxed_sys<uint32_t>(slot + Cand::kCandCount, Cand::kCandFlagOversize << 16);  // count 0
+  st_release_sys(slot + Cand::kCandSeq, seq);
 }
 
 }  // namespace sglang
