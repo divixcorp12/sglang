@@ -1,15 +1,37 @@
 #!/usr/bin/env python3
-"""Quiet-box preflight for the T3 quick run: refuse while any GPU compute process or drive user exists.
+"""Quiet-box preflight for the T3 quick run: refuse while any GPU compute process exists or an expert drive is busy.
 
-Exit 0 prints "preflight ok"; exit 1 lists the offending GPU pids and the pids holding files on the
-expert drives outside their `dsv41_flash` mirror roots.
+Exit 0 prints "preflight ok"; exit 1 lists the offending GPU pids or the busy drives. Pids holding files on the expert
+drives outside their `dsv41_flash` mirror roots are listed as notes only: idle long-lived holders (a Ray cluster's
+logs, a virtualenv) were present during the F108 baseline too, and what disturbs a run is traffic, not an open file.
 """
 
 import subprocess
 import sys
+import time
 
 MOUNTS = ("/mnt/nvme0", "/mnt/nvme2", "/mnt/nvme4")
 MIRROR_DIR = "dsv41_flash"
+SAMPLE_S = 5.0
+# Arbitrary: well above idle log writes (tens of kB/s), far below any real reader.
+BUSY_MB_PER_S = 1.0
+SECTOR_BYTES = 512
+
+
+def diskstat_bytes(diskstats_text, *, devices):
+    """{device: bytes read + written} from /proc/diskstats for the named devices (e.g. nvme0n1p1)."""
+    out = {}
+    for line in diskstats_text.splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[2] in devices:
+            out[f[2]] = (int(f[5]) + int(f[9])) * SECTOR_BYTES
+    return out
+
+
+def busy_devices(before, after, *, seconds, limit_mb_per_s=BUSY_MB_PER_S):
+    """{device: MB/s} of devices whose read+write rate between two diskstat_bytes samples exceeds the limit."""
+    rates = {d: (after[d] - before[d]) / seconds / 1e6 for d in after if d in before}
+    return {d: r for d, r in rates.items() if r > limit_mb_per_s}
 
 
 def gpu_compute_pids(nvidia_smi_csv):
@@ -66,13 +88,22 @@ def main():
     roots = tuple(f"{mount}/{MIRROR_DIR}" for mount in MOUNTS)
     gpu = gpu_compute_pids(smi)
     users = drive_users(lsof, mounts=MOUNTS, allowed_roots=roots)
-    if not gpu and not users:
-        print("preflight ok")
+    devices = {_run(["findmnt", "-n", "-o", "SOURCE", m], ok_codes=(0,)).strip().removeprefix("/dev/") for m in MOUNTS}
+    with open("/proc/diskstats") as f:
+        before = diskstat_bytes(f.read(), devices=devices)
+    time.sleep(SAMPLE_S)
+    with open("/proc/diskstats") as f:
+        after = diskstat_bytes(f.read(), devices=devices)
+    busy = busy_devices(before, after, seconds=SAMPLE_S)
+    for pid, paths in sorted(users.items()):
+        print(f"preflight note: pid {pid} holds {len(set(paths))} file(s) on the expert drives, e.g. {sorted(paths)[0]}")
+    if not gpu and not busy:
+        print(f"preflight ok (expert drives under {BUSY_MB_PER_S} MB/s over {SAMPLE_S:.0f} s)")
         return 0
     for pid in gpu:
         print(f"preflight refused: GPU compute process pid {pid}")
-    for pid, paths in sorted(users.items()):
-        print(f"preflight refused: pid {pid} uses {', '.join(sorted(set(paths)))}")
+    for device, rate in sorted(busy.items()):
+        print(f"preflight refused: {device} moved {rate:.1f} MB/s over {SAMPLE_S:.0f} s")
     return 1
 
 

@@ -51,6 +51,21 @@ def test_file_elsewhere_on_a_mount_refuses():
     assert users == {10: ["/mnt/nvme4/scratch/other.bin"], 11: ["/mnt/nvme2/dsv41_flash2/x"]}
 
 
+def _diskstats(**sectors):
+    # /proc/diskstats: major minor name reads merged sectors_read ms writes merged sectors_written ms ...
+    return "".join(f" 259 1 {d} 1 0 {r} 0 1 0 {w} 0 0 0 0\n" for d, (r, w) in sectors.items())
+
+
+def test_drive_busy_counts_read_and_written_sectors_of_named_devices_only():
+    """Mutant: only reads are counted, sectors are not scaled by 512, or an unnamed device leaks in -- red."""
+    pf = _preflight()
+    before = pf.diskstat_bytes(_diskstats(nvme0n1p1=(0, 0), nvme3n1p1=(0, 0)), devices={"nvme0n1p1"})
+    after = pf.diskstat_bytes(_diskstats(nvme0n1p1=(4000, 6000), nvme3n1p1=(10**9, 0)), devices={"nvme0n1p1"})
+    assert after == {"nvme0n1p1": 10000 * 512}
+    assert pf.busy_devices(before, after, seconds=1.0) == {"nvme0n1p1": 10000 * 512 / 1e6}
+    assert pf.busy_devices(before, after, seconds=10.0) == {}
+
+
 def test_path_with_spaces_is_kept_whole():
     """Mutant: NAME is cut at the first space, hiding a non-mirror path -- red."""
     text = _lsof(("py", 12, "/mnt/nvme0/my files/a b.bin"))
