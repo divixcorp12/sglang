@@ -169,7 +169,9 @@ def _timing_cell(res: r1_timing.TimingResult, *, eligible: int) -> dict:
 
 def _delay_for(scorer_delay_ms: float | dict[str, float], *, name: str) -> float:
     if isinstance(scorer_delay_ms, dict):
-        return scorer_delay_ms.get(name, scorer_delay_ms["*"])  # "*" is the default for scorers not listed
+        if name in scorer_delay_ms:
+            return scorer_delay_ms[name]
+        return scorer_delay_ms["*"]  # "*" is the default for scorers not listed
     return scorer_delay_ms
 
 
