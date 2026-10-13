@@ -53,6 +53,38 @@ def test_each_row_targets_the_next_consecutive_layer_with_a_biased_gate():
     assert torch.equal(t.bias[1], gates[5].bias) and t.bias.dtype == torch.float32 and t.top_k == 6
 
 
+_H2_LAYERS = [0, 1, 2, 3, 5, 6, 7]
+
+
+def _h2_gates():
+    """Layer 3's gate is hash-routed; layer 4 is not streamed, so row 2 has no layer-4 gate."""
+    return {2: _gate(2.0), 3: _gate(3.0, bias=False), 5: _gate(5.0), 6: _gate(6.0), 7: _gate(7.0)}
+
+
+def test_horizon_two_targets_the_layer_two_ahead_over_consecutive_rows():
+    """Row 3 (layer 3) would reach layer 5 across the 3->5 gap, row 1's layer-3 gate has no bias, the last two rows
+    have no layer two ahead. Mutant: horizon ignored (r + 1) -- red; span check dropped -- row 3 targets row 4, red."""
+    from sglang.srt.layers.moe.residency_capture_ref import horizon_targets
+
+    gates = _h2_gates()
+    picked = prefetch_targets(_H2_LAYERS, gates, hidden=8, horizon=2)
+    assert picked.targets.tolist() == [[2, 0], [-1, -1], [-1, -1], [-1, -1], [6, 1], [-1, -1], [-1, -1]]
+    assert picked.gates == (gates[2], gates[7])
+    ref, _ = horizon_targets(_H2_LAYERS)
+    assert [picked.targets[r, 0].item() for r in (0, 4)] == [ref[0][1], ref[4][1]]
+
+
+def test_horizon_two_cpu_tables_copy_the_gate_two_layers_ahead():
+    """The CPU tables carry row T+2's weights and bias in picks order. Mutant: the table built with horizon 1 -- the
+    gate copies are layer T+1's, red."""
+    gates = _h2_gates()
+    t = prefetch_tables(_H2_LAYERS, gates, hidden=8, horizon=2)
+    assert t.targets.tolist() == [[2, 0], [-1, -1], [-1, -1], [-1, -1], [6, 1], [-1, -1], [-1, -1]]
+    assert t.gates.shape == (2, 4, 8) and t.bias.dtype == torch.float32
+    assert torch.equal(t.gates[0], gates[2].weight) and torch.equal(t.gates[1], gates[7].weight)
+    assert torch.equal(t.bias[0], gates[2].bias) and torch.equal(t.bias[1], gates[7].bias)
+
+
 @pytest.mark.parametrize(
     "gates, why",
     [
