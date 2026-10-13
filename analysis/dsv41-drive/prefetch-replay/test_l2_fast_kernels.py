@@ -128,10 +128,12 @@ def test_tie_goes_to_lowest_expert_id(t3):
     """Two experts with identical output rows and biases score equal; the read must be the lower id."""
     head = l2_fast_kernels.KernelHead(_folded(t3=t3, tie=(300, 17)), device=DEV)
     count, expert, _, got = head.score(**_kernel_args(_case([0, 1, 2]), row=0, skip=_no_skip(), threshold=0.0))
-    if got[17] == got[300]:
-        assert (count, expert) == (1, 17)
-    else:  # T3's block features may rank the two apart; the pick must still be the best score
-        assert expert == int(got.argmax())
+    # T3's block features may rank the two apart or leave a third expert on top; the pick is
+    # the lowest id among the best scores.
+    assert count == 1
+    assert expert == int((got == got.max()).nonzero()[0])
+    if got[17] == got[300] and float(got[17]) == float(got.max()):
+        assert expert == 17
 
 
 @T0_T3
@@ -181,13 +183,14 @@ def test_tail_features_equal_block_features():
     head = l2_fast_kernels.KernelHead(folded, device=DEV, features=True)
     g = torch.Generator().manual_seed(5)
     positions = torch.tensor([0, 1, 3, 4], dtype=torch.int64, device=DEV)
-    logits = (torch.randn((4, E), generator=g) * 2).to(DEV)
+    logits = torch.zeros((spec_head.HEAD_MAX_TOKENS, E), device=DEV)
+    logits[:4] = (torch.randn((4, E), generator=g) * 2).to(DEV)
     threshold = torch.zeros(1, device=DEV)
     spec_head.run_spec_head_tail(
         weights=head.weights, workspace=head.workspace, logits=logits, positions=positions, row=0,
         hot_slots=head.hot_slots, hot_capacity=0, ram_slot=head.ram_slot, target=0, threshold=threshold)
     live = torch.ones((1, 4), dtype=torch.bool, device=DEV)
-    want = r1_aggregator.block_features(logits.unsqueeze(0), live=live, position=positions.unsqueeze(0))[0]
+    want = r1_aggregator.block_features(logits[:4].unsqueeze(0), live=live, position=positions.unsqueeze(0))[0]
     torch.testing.assert_close(head.workspace.features, want, atol=1e-4, rtol=1e-4)
 
 

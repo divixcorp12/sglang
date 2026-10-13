@@ -9845,10 +9845,11 @@ PYTHONPATH=$PWD/python DATASET=... CORPUS=... B1_HEAD=... MODEL_PATH=... \
 
 It refuses `dsv41-direct-prod` and any `OUT` outside `/mnt/nvme1/nvfp4-work` or inside the protected run directories.
 GPU steps run under `flock cc-gpu.lock taskset -c 32-63`, the report under `taskset -c 0-63`. It ends with
-`done: OUT/result.json OUT/REPORT.md`, and every `EXIT=` line in `OUT/commands.txt` must be 0. Its artifacts are
+`done: OUT/result.json OUT/REPORT.md`, and every `EXIT=` line in `OUT/commands.txt` must be 0. Artifacts:
 `OUT/{profile,cost,interference,parity,parity-fp32}.json`. `parity.json` holds the fp32-gate case and the `spec_score`
-case at `GATE_DTYPE` (default bfloat16); `parity-fp32.json` (written when `GATE_DTYPE` is bfloat16) holds the
-`spec_score` case with a float32 gate weight (router_fp32, Q1), rendered as its own parity section in the report. A cold JIT build of
+case at `GATE_DTYPE` (default bfloat16); `parity-fp32.json` (always written) holds the `spec_score` case with a float32
+gate weight (router_fp32, Q1), so the fp32-gate-weight rows of the parity table come from it, and the report renders it
+as its own parity section. A cold JIT build of
 `expert_stream_spec_head` on the first run is slow, not a failure.
 
 **Results** (all `pending`; to be filled from `OUT/result.json`, not estimated):

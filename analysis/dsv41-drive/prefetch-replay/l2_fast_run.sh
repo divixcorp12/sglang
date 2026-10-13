@@ -2,7 +2,7 @@
 # F123 owner-started divix01 run: L+2 fast-path profile, cost, interference, parity, then result.json and REPORT.md.
 # Inputs (env or positional RUN_DIR DATASET CORPUS B1_HEAD MODEL_PATH F109 OUT): the R1 run dir (read only), the B0
 # dataset, corpus and F0 head, the model path, the F109 output dir (read only). Optional GATE_DTYPE (default bfloat16)
-# is the spec_score gate-weight dtype of the parity run; float32 is added as a second parity run when it is bfloat16.
+# is the spec_score gate-weight dtype of parity.json; parity-fp32.json is always the float32 (router_fp32) run.
 # Output: OUT/{profile,cost,interference,parity,parity-fp32}.json, OUT/commands.txt, OUT/result.json, OUT/REPORT.md.
 # Usage: run from a private pushed worktree on divix01:
 #   DATASET=... CORPUS=... B1_HEAD=... MODEL_PATH=... bash analysis/dsv41-drive/prefetch-replay/l2_fast_run.sh
@@ -80,10 +80,9 @@ PARITY=("$HERE/l2_fast_parity.py" "$RUN_DIR" --dataset "$DATASET" --corpus "$COR
         --model-path "$MODEL_PATH" --f109 "$F109")
 _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity.json" --gate-dtype "$GATE_DTYPE" --device cuda
 
-# Q1: the float32 gate-weight spec_score case is a separate run into parity-fp32.json (report: parity_router_fp32).
-if [ "$GATE_DTYPE" = bfloat16 ]; then
-  _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity-fp32.json" --gate-dtype float32 --device cuda
-fi
+# Q1 / K-T13 v2: the float32 gate-weight (router_fp32) spec_score case always goes to parity-fp32.json
+# (report: parity_router_fp32).
+_logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity-fp32.json" --gate-dtype float32 --device cuda
 
 _logged taskset -c 0-63 "$PYTHON" "$HERE/l2_fast_report.py" --out "$OUT"
 echo "done: $OUT/result.json $OUT/REPORT.md" | tee -a "$CMDS"

@@ -37,11 +37,6 @@ constexpr int kMidMaxSlice = kHeadMaxHidden / kMidCluster;
 static_assert(kHeadMaxTokens <= kScoreTokenTile, "K1 covers every token in one tile");
 static_assert(kHeadMaxExperts / 32 <= 32, "K1's per-lane taken mask is one word");
 
-// torch's exact (erf) gelu.
-SGL_DEVICE float head_gelu(float v) {
-  return 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
-}
-
 SGL_DEVICE float head_sigmoid(float v) {
   return 1.0f / (1.0f + expf(-v));
 }
