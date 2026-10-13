@@ -59,8 +59,13 @@ def test_fused_graph_record_equals_eager_kernel_score(t3):
     slots = l2_fast_cost.build_slots(gates=l2_fast_cost.synthetic_gates(count=2, device=DEV), width=2, slots=2,
                                      device=DEV)
     threshold = torch.zeros(1, dtype=torch.float32, device=DEV)
-    steps = [l2_fast_cost.fused_step(s, head=head, rows=len(folded.rows), threshold=threshold) for s in slots]
+    sel = l2_fast_cost.new_native_select(device=DEV)
+    steps = [l2_fast_cost.fused_step(s, head=head, rows=len(folded.rows), sel=sel, threshold=threshold)
+             for s in slots]
     with torch.no_grad():
+        # Extra cast/copy nodes inside the graph would inflate the incremental cost: score + 4 head kernels only.
+        score_nodes = l2_fast_cost.common.graph_nodes(lambda: l2_fast_cost._score(slots[0]))
+        assert l2_fast_cost.common.graph_nodes(steps[0]) == score_nodes + 4
         graphs = [r1_cost._capture(step) for step in steps]
     for slot, graph in zip(slots, graphs):
         slot.scores.zero_()

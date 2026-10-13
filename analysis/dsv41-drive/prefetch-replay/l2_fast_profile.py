@@ -42,7 +42,8 @@ from sglang.srt.layers.moe.expert_prediction.training import llapor  # noqa: E40
 COMPONENTS = ("gate", "features", "head_mlp", "aggregate_sigmoid", "select", "complete")
 PROFILED = ("L2_T0", "L2_T3")
 CAP = 1
-SCOPE = "one CUDA graph per component, 6 live tokens, fixed inputs, RTX 5090"
+SCOPE = ("one CUDA graph per component, 6 live tokens, fixed inputs; no L2-defeating rotation, inputs "
+         "L2-resident; RTX 5090")
 
 
 class Steps(msgspec.Struct):

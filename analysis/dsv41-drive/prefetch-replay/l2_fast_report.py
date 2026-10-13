@@ -248,14 +248,17 @@ def _cost_lines(result: dict) -> list[str]:
             for m in MODELS for path in PATHS for w in common.WIDTHS]
     inc = [[m, w, _get(c, "incremental_vs_bar", m, str(w), "incremental_ms"), common.BAR_MS_PER_LAYER,
             _get(c, "incremental_vs_bar", m, str(w), "within_bar")] for m in MODELS for w in common.WIDTHS]
-    bw = [[w, _get(c, "native_bandwidth_gbps", str(w))] for w in common.WIDTHS]
+    bw = [[w, p, _get(c, "bandwidth_check", str(w), p, "gbps"),
+           _get(c, "bandwidth_check", str(w), p, "fraction_of_spec"),
+           _get(c, "bandwidth_check", str(w), p, "plausible")] for w in common.WIDTHS for p in ("native", *MODELS)]
     body = [f"Scope: {c['scope']}. Medians over {_fmt(_get(c, 'runs'))} replays; inputs rotate over "
             f"{_fmt(_get(c, 'slots'))} layer slots so the runs do not sit in L2.", "",
             *_table(["model", "path", "width", *STATS], rows, label=OBSERVED), "### Incremental cost over native", "",
             *_table(["model", "width", "incremental ms (fused - native)", "bar ms/layer", "within bar"], inc,
                     label=OBSERVED),
-            "### Implied native bandwidth (lower bound; includes select)", "",
-            *_table(["width", "GB/s"], bw, label=OBSERVED)]
+            "### Implied bandwidth against the RTX 5090 spec (lower bound; gate + bias + x, plus head weights "
+            "for fused; plausible means <= spec)", "",
+            *_table(["width", "path", "GB/s", "fraction of spec", "plausible"], bw, label=OBSERVED)]
     return _section_lines("C21-C25 cost by live width", body)
 
 

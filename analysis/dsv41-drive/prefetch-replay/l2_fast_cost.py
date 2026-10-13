@@ -51,6 +51,7 @@ HORIZON = 2
 L2_BYTES = 96 * 2**20
 # Arbitrary; the kernels' and torch path's cost does not depend on the threshold value.
 THRESHOLD = 0.5
+HBM_SPEC_GBPS = 1792.0  # RTX 5090 spec memory bandwidth
 NATIVE_HOT = 16  # as l2_fast_interference.native_graphs and bench_exl3_ram_prefetch_score
 SCOPE = ("CUDA graph replay on one stream (CUDA events per replay), one graph per layer slot replayed round-robin; "
          "each slot has its own bf16 target gate, x, scores and routes (gates rotate past the 96 MiB L2), head weights "
@@ -138,12 +139,15 @@ def native_step(slot: Slot, *, sel: NativeSelect) -> Callable[[], None]:
     return step
 
 
-def fused_step(slot: Slot, *, head: l2_fast_kernels.KernelHead, rows: int,
+def fused_step(slot: Slot, *, head: l2_fast_kernels.KernelHead, rows: int, sel: NativeSelect,
                threshold: torch.Tensor) -> Callable[[], None]:
+    """spec_score plus exactly the four spec_head kernels, with the native arm's hot and ram_slot inputs."""
     def step() -> None:
         _score(slot)
-        head.launch(scores=slot.scores, x=slot.x, src_ids=slot.ids, src_w=slot.weights, positions=slot.positions,
-                    row=slot.index % rows, skip=slot.skip, threshold=threshold)
+        spec_head.run_spec_head(
+            weights=head.weights, workspace=head.workspace, x=slot.x, scores=slot.scores, src_ids=slot.ids,
+            src_w=slot.weights, positions=slot.positions, row=slot.index % rows, hot_slots=sel.hot,
+            hot_capacity=NATIVE_HOT, ram_slot=slot.ram_slot, target=0, threshold=threshold)
 
     return step
 
@@ -178,6 +182,17 @@ def gate_gbps(slot: Slot, *, median_ms: float) -> float:
     return moved / (median_ms * 1e-3) / 1e9
 
 
+def head_weight_bytes(weights: spec_head.SpecHeadWeights) -> int:
+    return sum(getattr(weights, n).numel() * getattr(weights, n).element_size()
+               for n in weights.__struct_fields__ if isinstance(getattr(weights, n), torch.Tensor))
+
+
+def bandwidth_check(*, moved_bytes: int, median_ms: float) -> dict:
+    """Implied GB/s of ``moved_bytes`` over a median, its fraction of the 5090's HBM spec and a plausible flag."""
+    gbps = moved_bytes / (median_ms * 1e-3) / 1e9
+    return {"gbps": gbps, "fraction_of_spec": gbps / HBM_SPEC_GBPS, "plausible": gbps <= HBM_SPEC_GBPS}
+
+
 def rotated_gate_bytes(slots: list[Slot]) -> int:
     distinct = {s.gate.data_ptr(): s.gate.numel() * s.gate.element_size() for s in slots}
     return sum(distinct.values())
@@ -189,8 +204,8 @@ def _sweep_width(slots: list[Slot], *, heads: dict, sel: NativeSelect, threshold
     native = time_steps([native_step(s, sel=sel) for s in slots], runs=runs, warmup=warmup)
     per_model = {}
     for name, (kernel, folded) in heads.items():
-        fused = time_steps([fused_step(s, head=kernel, rows=len(folded.rows), threshold=threshold) for s in slots],
-                           runs=runs, warmup=warmup)
+        fused = time_steps([fused_step(s, head=kernel, rows=len(folded.rows), sel=sel, threshold=threshold)
+                            for s in slots], runs=runs, warmup=warmup)
         torch_path = time_steps([torch_step(s, folded=folded, threshold=threshold) for s in slots], runs=runs,
                                 warmup=warmup)
         per_model[name] = {"fused": fused, "torch": torch_path}
@@ -207,7 +222,7 @@ def sweep(*, heads: dict[str, tuple[l2_fast_torch.FoldedHead, str]], gates: list
     thr = torch.full((1,), threshold, dtype=torch.float32, device=device)
     models = {name: {"checkpoint_sha256": sha, "native": {}, "fused": {}, "torch": {}, "incremental_ms": {}}
               for name, (_folded, sha) in heads.items()}
-    bandwidth, rotated = {}, {}
+    bandwidth, rotated, checks = {}, {}, {}
     with torch.no_grad():
         for w in widths:
             slot_list = build_slots(gates=gates, width=w, slots=slots, device=device, seed=w)
@@ -216,7 +231,13 @@ def sweep(*, heads: dict[str, tuple[l2_fast_torch.FoldedHead, str]], gates: list
             key = str(w)
             bandwidth[key] = gate_gbps(slot_list[0], median_ms=native["median_ms"])
             rotated[key] = rotated_gate_bytes(slot_list)
+            slot0 = slot_list[0]
+            slot_bytes = sum(t.numel() * t.element_size() for t in (slot0.gate, slot0.bias, slot0.x))
+            checks[key] = {"native": bandwidth_check(moved_bytes=slot_bytes, median_ms=native["median_ms"])}
             for name, got in per_model.items():
+                checks[key][name] = bandwidth_check(
+                    moved_bytes=slot_bytes + head_weight_bytes(built[name][0].weights),
+                    median_ms=got["fused"]["median_ms"])
                 m = models[name]
                 m["native"][key], m["fused"][key], m["torch"][key] = native, got["fused"], got["torch"]
                 m["incremental_ms"][key] = got["fused"]["median_ms"] - native["median_ms"]
@@ -225,6 +246,8 @@ def sweep(*, heads: dict[str, tuple[l2_fast_torch.FoldedHead, str]], gates: list
         "warmup": warmup, "threshold": threshold, "gpu": torch.cuda.get_device_name(),
         "bar_ms_per_layer": common.BAR_MS_PER_LAYER, "models": models, "native_bandwidth_gbps": bandwidth,
         "native_bandwidth_scope": BANDWIDTH_SCOPE, "rotated_gate_bytes": rotated, "l2_bytes": L2_BYTES,
+        "hbm_spec_gbps": HBM_SPEC_GBPS, "bandwidth_check": checks,
+        "bandwidth_plausible": all(c["plausible"] for per_w in checks.values() for c in per_w.values()),
     }
 
 

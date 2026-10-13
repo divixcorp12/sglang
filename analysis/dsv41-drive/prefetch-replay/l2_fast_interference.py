@@ -160,14 +160,17 @@ def native_graphs(inputs: SideInputs, *, width: int, device: str) -> list[torch.
 
 def fused_graphs(inputs: SideInputs, *, head: l2_fast_kernels.KernelHead, device: str) -> list[torch.cuda.CUDAGraph]:
     """One graph per slot: spec_score then the fused learned path (its tail selects)."""
-    skip = torch.zeros(EXPERTS, dtype=torch.bool, device=device)
+    hot = torch.full((16,), -1, dtype=torch.int64, device=device)
+    ram_slot = torch.full((2, EXPERTS), -1, dtype=torch.int32, device=device)
     threshold = torch.full((1,), 0.5, dtype=torch.float32, device=device)  # arbitrary; cost does not depend on it
     graphs = []
     for i in range(len(inputs.gates)):
         def step(i=i) -> None:
             es.run_spec_score(inputs.xs[i], inputs.gates[i], inputs.bias, inputs.scores[i])
-            head.launch(scores=inputs.scores[i], x=inputs.xs[i], src_ids=inputs.ids, src_w=inputs.weights,
-                        positions=inputs.positions, row=0, skip=skip, threshold=threshold)
+            spec_head.run_spec_head(
+                weights=head.weights, workspace=head.workspace, x=inputs.xs[i], scores=inputs.scores[i],
+                src_ids=inputs.ids, src_w=inputs.weights, positions=inputs.positions, row=0, hot_slots=hot,
+                hot_capacity=16, ram_slot=ram_slot, target=1, threshold=threshold)
 
         graphs.append(_capture(step))
     return graphs
