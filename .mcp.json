@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "agent-lsp": {
+    "lsp": {
       "type": "stdio",
       "command": "agent-lsp",
       "args": [

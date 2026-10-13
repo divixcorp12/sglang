@@ -1,33 +1,11 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: when an agent reads or edits code (Python, C++, CUDA, Rust) through grep/sed/cat, Read or Edit, remind it to use
-agent-lsp, with the one ToolSearch call that loads its tools. A nudge, never a block: it says so the first three
-times in a session, then every tenth time."""
+"""PreToolUse hook: when an agent rewrites a repo file with a script or a shell redirect, remind it to use Edit (or Write
+for a new file). Reading and editing code through agent-lsp is enforced elsewhere: by ~/.claude/hooks/lsp-enforce.py
+in your own sessions, and by hx itself for its agents."""
 
 import json
-import os
 import re
 import sys
-import tempfile
-
-TOOLS = ",".join(f"mcp__agent-lsp__{t}" for t in (
-    "start_lsp", "list_symbols", "find_symbol", "get_symbol_source", "inspect_symbol", "find_references",
-    "find_callers", "go_to_definition", "get_diagnostics", "blast_radius", "replace_symbol_body",
-    "insert_after_symbol", "insert_before_symbol", "safe_delete_symbol", "rename_symbol"))
-READING = re.compile(r"(^|[|;&(]\s*)(grep|rg|sed|cat|head|tail|awk|less|nl)\b")
-PY = re.compile(r"\.(py|cpp|cc|cu|cuh|h|hpp|rs)\b|--include[= ]['\"]?\*\.(py|cpp|cc|cu|cuh|h|hpp|rs)|-t\s*(py|cpp|cuda|rust)\b|--type[= ](py|cpp|cuda|rust)\b")
-CODE = (".py", ".cpp", ".cc", ".cu", ".cuh", ".h", ".hpp", ".rs")
-
-
-def python_code(tool: str, inp: dict) -> bool:
-    if tool == "Bash":
-        cmd = str(inp.get("command") or "")
-        return bool(READING.search(cmd) and PY.search(cmd))
-    if tool in ("Read", "Edit", "MultiEdit"):
-        return str(inp.get("file_path") or "").endswith(CODE)
-    if tool == "Grep":
-        return str(inp.get("path") or "").endswith(CODE) or str(inp.get("type") or "") in ("py", "cpp", "cuda", "rust") or bool(PY.search(str(inp.get("glob") or "")))
-    return False
-
 
 # A shell command that rewrites a file in place: python's open(..., "w"), sed -i, perl -pi, a redirect or tee.
 REWRITE = re.compile(r"open\([^)]*,\s*['\"][wa]['\"]|\.write_text\(|\bsed\s+(-[a-zA-Z]*\s+)*-i|\bperl\s+-[a-z]*p[a-z]*i|\btee\s+(-a\s+)?[\w./~-]+\.\w+|(^|[^>&0-9])>{1,2}\s*[\w./~-]+\.(md|py|cpp|cc|cu|cuh|h|hpp|rs|json|toml|yaml|yml|txt)\b")
@@ -50,30 +28,6 @@ def main() -> None:
             "Change files in this repo with Edit (or Write for a new file), not a python/sed/perl script or a shell "
             "redirect: Edit works on Markdown and every other text file, shows the change, and keeps the diff reviewable. "
             "For code, use agent-lsp's symbol edits. Scripts are fine for scratch files under /tmp."}}))
-        return
-    if not python_code(tool, inp):
-        return
-    state = os.path.join(tempfile.gettempdir(), f"agent-lsp-nudge-{payload.get('session_id', 'x')}")
-    try:
-        n = int(open(state).read() or 0) + 1
-    except (OSError, ValueError):
-        n = 1
-    try:
-        open(state, "w").write(str(n))
-    except OSError:
-        pass
-    if n > 3 and n % 10:
-        return
-    editing = tool in ("Edit", "MultiEdit")
-    say = ("This repo's code (Python, C++/CUDA, Rust) goes through agent-lsp, not "
-           + ("Edit: change a function or class with replace_symbol_body, insert_after_symbol or insert_before_symbol, "
-              "and keep Edit for imports, module constants and non-code files. " if editing else
-              "grep/sed/cat or a whole-file Read: list_symbols for a file's outline, get_symbol_source or inspect_symbol "
-              "for one symbol, find_symbol to locate a name, find_references / find_callers for usages. Keep grep for "
-              "docs, logs and config. ")
-           + f"If its tools aren't loaded yet, load them in one call: ToolSearch with query \"select:{TOOLS}\"; then "
-           "call start_lsp once with root_dir = the project folder (the repo root, or python/ for the Python package).")
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": say}}))
 
 
 if __name__ == "__main__":
