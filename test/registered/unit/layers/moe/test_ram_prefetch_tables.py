@@ -195,6 +195,45 @@ def test_the_cpu_scorer_returns_no_gpu_scorer_and_an_unknown_one_is_refused():
             module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
 
 
+def test_the_service_builds_both_scorers_tables_at_the_configured_horizon(caplog):
+    """Horizon 2 on layers [0,1,2]: row 0 targets layer 2's gate for both scorers, the host kwargs match horizon 1's
+    and only the log names the horizon. Mutant: horizon not passed to prefetch_targets / prefetch_tables -- row 0
+    targets row 1, red."""
+    gates = {1: _gate(1.0), 2: _gate(2.0)}
+    for layer, gate in gates.items():
+        register_router_gate(layer, gate.weight, gate.bias, 6)
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+
+    def enable(scorer, horizon):
+        calls = []
+        host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+        caplog.clear()
+        with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override(scorer), \
+                envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""), \
+                envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.override(horizon), caplog.at_level(logging.INFO):
+            result = module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1, 2], _numa(), cpu)
+        (args, kw) = calls[0]
+        kw.pop("candidates", None)
+        return result, args, kw, caplog.text
+
+    scorer, args, kw_h2, log = enable("gpu", 2)
+    assert args[0].tolist() == [[2, 0], [-1, -1], [-1, -1]]
+    assert scorer.picked.gates[0] is gates[2]
+    assert "1 of 3 rows target layer +2" in log
+    _, args, kw_h1, log = enable("gpu", 1)
+    assert args[0].tolist() == [[1, 0], [2, 1], [-1, -1]]
+    assert "2 of 3 rows target the next layer" in log
+    assert kw_h1 == kw_h2
+
+    _, args, kw_h2, log = enable("cpu", 2)
+    assert args[0].tolist() == [[2, 0], [-1, -1], [-1, -1]]
+    assert torch.equal(args[1][0], gates[2].weight) and torch.equal(args[2][0], gates[2].bias)
+    assert "1 of 3 rows target layer +2" in log
+    _, _, kw_h1, _ = enable("cpu", 1)
+    assert kw_h1 == kw_h2
+
+
+
 def test_the_gpu_scorers_table_has_a_row_once_its_target_attached():
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
