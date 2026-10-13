@@ -9852,6 +9852,12 @@ gate weight (router_fp32, Q1), so the fp32-gate-weight rows of the parity table 
 as its own parity section. A cold JIT build of
 `expert_stream_spec_head` on the first run is slow, not a failure.
 
+**Gate checks** (merged feature; unit and kernel tests only, no divix01 measurement run): `py_compile` of the new
+modules exit 0; `check_no_bare_pytest_main.py` exit 0; CPU tests (`test_l2_fast_{common,torch,metrics,report}.py` and
+siblings) 59 passed, exit 0; GPU tests (`--gpu`, `test_l2_fast_{kernels,parity,profile,cost,...}.py`) 275 passed, exit 0.
+Typecheck was not run by the gate. These are test results, not measurements: the cells below stay `pending` because the
+gate did not run `l2_fast_run.sh`.
+
 **Results** (all `pending`; to be filled from `OUT/result.json`, not estimated):
 
 | C1 profile, 6 tokens, graph | gate | feature build | head MLP | aggregation + sigmoid | mask-threshold-select | nodes |
