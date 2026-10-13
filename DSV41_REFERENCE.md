@@ -9997,15 +9997,55 @@ in different warm-up shares):
   during BKR.
 - **Per-miss read time** from the shutdown `exl3 expert stream` line (lifetime `read_ms / ram_misses`): off 1.34 ms,
   F108 native L+2 1.35, T3 1.36, quick native L+2 1.99. The quick L+2 server saw slower drive reads than F108's same
-  arm, without slower steps (drift 0.986), which also points to demand read count and latency not setting step time
-  at this scale.
+  arm, without slower steps (drift 0.986). (Corrected by §33.33: this lifetime figure mixes in prefill reads, and
+  the decode layer records show read latency does set step time.)
 
 **Reading.** At cap 1, T3 is a better reader than native L+2 (more used, fewer wasted, less drive load), but the whole
-of L+2 prefetch moves step time by about 1-2% at best, so T3's increment is below what this harness can measure. The
-step is not set by demand NVMe rows at these counts. A larger lever has to remove a larger share of the about 19
+of L+2 prefetch moves step time by about 1-2% at best, so T3's increment is below what this harness can measure.
+(An earlier version said the step is not set by demand NVMe rows; §33.33 shows it is, about 36% of a verify, and that
+L+2 covers too few of them to show.) A larger lever has to remove a larger share of the about 19
 remaining demand rows per token (for example a higher read budget, which T3's lower waste leaves drive room for), or
 target what does set the step. Neither is established here. Production defaults are the owner's; prefetch stays off
 and the horizon 1.
+
+### 33.33 What sets the verify step now: a per-layer floor and the NVMe misses (2026-10-13)
+
+Three instrumented captures (`spec_margin_capture.py --no-verify-split`, 8 sessions, 128 tokens) at `af2dcb2d52`, in
+the order off, native L+2, off again, broken down by `layer_misses.py`. Run dir
+`divix01:/data/models/slang/nvfp4-work/ram-prefetch/step-time-20261013/` (`off/`, `l2/`, `off2/`,
+`compare-off{,2}-vs-l2.{txt,json}`; `failed-oom-1658/` is a first attempt killed by another GPU job taking 26.6 GiB
+during model load). Arms: `dspark-both-misscut` and `dspark-both-prefetch-gpu-misscut-idle2-l2`. Instrumented-build
+times: compare only with each other.
+
+| per verify (median) | off | native L+2 | off2 |
+|---|---:|---:|---:|
+| verifies | 127 | 134 | |
+| wall ms | 297.3 | 260.6 | 267.1 |
+| layer gate waits, ms (share) | 238.4 (80%) | 203.7 (78%) | 209.1 (78%) |
+| outside the gate waits, ms | 58.9 | 56.9 | 58.0 |
+| forced misses / covered by the pool / NVMe reads left | 87.9 / 0 / 87.9 | 89.1 / 13.9 / 75.1 | 86.6 / 0 / 86.6 |
+| wait of a layer with no miss, ms | 2.87 | 2.67 | 2.79 |
+| layer 0 wait (never covered), ms | 12.64 | 10.75 | 10.77 |
+| lifetime read ms per RAM miss (shutdown line) | 2.16 | 1.34 | 1.46 |
+
+**Where a verify goes** (off2, the clean baseline): about 112 ms (42%) is the per-layer floor, 40 layers at 2.8 ms
+that a layer waits even with no miss (§33.12 found that floor was mostly the CPU hit job, about 2.5 ms per layer; not
+re-measured here). About 97 ms (36%) is the NVMe misses, about 87 per verify at about 1.1 ms each. About 58 ms (22%)
+is everything outside the per-layer waits (attention, GEMMs, draft, host). The floor and the misses are the step.
+
+**Drift is larger than the prefetch.** The first off run followed a heavy GPU/IO job and its drive reads were 48%
+slower per miss (2.16 vs 1.46 ms); its verify took 11% longer (297 vs 267 ms), layer 0 included. Drive read latency
+sets step time directly; two arms run at different drive states cannot be compared, and layer 0's wait is a cheap
+control for that (10.75 vs 10.77 ms between L+2 and off2).
+
+**Native L+2 against off2:** 260.6 vs 267.1 ms, -2.4%, in line with F108's 0.984. It covers 13.9 of about 88 misses
+per verify. Matched by (row, misses), its uncovered layers are 0.3 ms faster, not slower: unlike §33.16 (before the
+idle-drive rule), the speculative reads no longer slow the demand reads measurably.
+
+**Reading.** §33.32's "the step is not set by demand NVMe rows" was wrong: misses are about a third of the step and
+read latency moves it one for one. The prefetch is small because it covers one miss in six. The levers, by size: fewer
+misses (the 104 GiB tier took -24%, §33.12), faster or more evenly loaded reads, a cheaper per-layer floor, and only
+then better prediction. Production defaults are the owner's.
 
 ## Sources
 
