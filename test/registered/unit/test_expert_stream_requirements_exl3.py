@@ -933,6 +933,48 @@ def test_idle_drive_pieces_must_be_1_to_4_like_the_deadline_whatever_the_drive_f
                 _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
 
 
+def test_the_prefetch_horizon_defaults_to_the_next_layer():
+    """Horizon 1 is today's behaviour; any other value is an opt-in A/B."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.get() == 1
+
+
+def test_the_prefetch_horizon_is_bounded_on_every_launch_and_needs_the_prefetch_above_one(model_dir):
+    """Bounded with the prefetch on or off, like the pieces; a horizon above 1 with the prefetch off would do nothing.
+
+    Mutant: the bound check moved into the prefetch-on branch -- red (0 and 5 pass with it off).
+    Mutant: the prefetch-off branch drops the horizon refusal -- red (2 passes silently).
+    """
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True)
+    for horizon in (1, 4):
+        _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="", SGLANG_DSV41_RAM_PREFETCH_HORIZON=horizon)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+    for env in (on, CPU_EXPERTS_ENV):
+        for horizon in (0, 5):
+            with pytest.raises(ValueError, match=r"SGLANG_DSV41_RAM_PREFETCH_HORIZON must be in \[1, 4\], got"):
+                _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_HORIZON=horizon)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_HORIZON needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2)
+
+
+def test_a_horizon_above_one_is_refused_with_the_packaged_gpu_floors(model_dir, tmp_path):
+    """The packaged floors were fit for L+1 target rows; at horizon 2 they would filter with the wrong table.
+
+    Mutant: the refusal drops the is_set() test -- red (floors "" is refused).
+    Mutant: the refusal drops the scorer test -- red (the CPU scorer, which has no floors, is refused).
+    """
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    path = tmp_path / "floors.json"
+    path.write_text('{"min_margin": {"1": 0.25}}')
+    gpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    with pytest.raises(ValueError, match="packaged margin floors were fit for horizon 1"):
+        _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2)
+    _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="")
+    _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+    cpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
+    _gate(args, **cpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2)
+
+
 THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
 
 
