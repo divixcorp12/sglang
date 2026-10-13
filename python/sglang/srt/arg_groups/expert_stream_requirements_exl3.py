@@ -399,6 +399,8 @@ def _check_ram_prefetch() -> None:
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH=1")
         if envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get():
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_DSV41_RAM_PREFETCH=1")
+        if envs.SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD.get():
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH=1")
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.
@@ -429,6 +431,32 @@ def _check_ram_prefetch() -> None:
         value = getattr(envs, name).get()
         if not 1 <= value <= high:
             raise ValueError(f"{name} must be in [1, {high}], got {value}")
+    _check_learned_head(scorer=scorer, horizon=horizon)
+
+
+def _check_learned_head(*, scorer: str, horizon: int) -> None:
+    """``SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD``'s prerequisites and its file (a prefetching launch only; the
+    prefetch-off case is refused in ``_check_ram_prefetch``'s early return). Row coverage is checked at enable."""
+    path = envs.SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD.get()
+    if not path:
+        return
+    name = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
+    if scorer != "gpu":
+        raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu")
+    if horizon != 2:
+        raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_HORIZON=2, got {horizon}")
+    floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS
+    if not floors.is_set() or floors.get() != "":
+        raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS='' (no floors table)")
+    per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
+    if per_layer != 1:
+        raise ValueError(f"{name} needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=1, got {per_layer}")
+    from sglang.srt.layers.moe import ram_prefetch_learned_head
+
+    try:
+        ram_prefetch_learned_head.read_head_file(path)
+    except ValueError as error:
+        raise ValueError(f"{name}: {error}") from error
 
 
 def _check_mirror_caps() -> None:

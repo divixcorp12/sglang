@@ -1,8 +1,12 @@
 """The learned L+2 head file format and its serving loader (CPU)."""
 
+from contextlib import ExitStack
+
 import pytest
 import torch
 
+from sglang.srt.arg_groups.expert_stream_requirements_exl3 import _check_ram_prefetch
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import ram_prefetch_learned_head as head_file
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -133,3 +137,77 @@ def test_serving_head_holds_static_buffers(tmp_path):
     assert serving.src_w.shape == (8, 3) and serving.weights.rows == 2
     text = head_file.describe(loaded)
     assert "learned L+2 scorer active" in text and "ab" * 32 in text and "0.1301608383655548" in text
+
+
+LAUNCH_ENV = {
+    "SGLANG_DSV41_RAM_PREFETCH": True,
+    "SGLANG_DSV41_CPU_EXPERTS": True,
+    "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": True,
+    "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu",
+    "SGLANG_DSV41_RAM_PREFETCH_HORIZON": 2,
+    "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
+    "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": 1,
+}  # fmt: skip
+
+
+def _gate(path: str, **changes) -> None:
+    with ExitStack() as stack:
+        stack.enter_context(envs.SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD.override(path))
+        for name, value in {**LAUNCH_ENV, **changes}.items():
+            stack.enter_context(getattr(envs, name).override(value))
+        _check_ram_prefetch()
+
+
+def test_gate_accepts_a_complete_learned_head_launch(tmp_path):
+    """Mutant: a new condition refuses the reference launch (T3 arm: gpu scorer, horizon 2, no floors, per-layer 1)."""
+    _gate(_write(tmp_path))
+
+
+def test_gate_refuses_the_head_without_the_prefetch(tmp_path):
+    """Mutant: the prefetch-off early return skips the head check; the variable would pass unused."""
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH=False, SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+
+
+def test_gate_refuses_the_head_with_the_cpu_scorer(tmp_path):
+    """Mutant: the scorer condition is dropped; the head would be set but the CPU scorer would run."""
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu"):
+        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
+
+
+def test_gate_refuses_the_head_at_horizon_one(tmp_path):
+    """Mutant: the horizon condition is dropped; an L+2 head would score L+1 targets."""
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_HORIZON=2"):
+        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+
+
+def test_gate_refuses_the_head_with_a_floors_table(tmp_path):
+    """Mutant: the floors condition is dropped; a floors file set alongside the head would pass."""
+    floors = tmp_path / "floors.json"
+    floors.write_text('{"min_margin": {"1": 0.25}}')
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"):
+        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(floors))
+
+
+def test_gate_refuses_the_head_with_per_layer_above_one(tmp_path):
+    """Mutant: the per-layer condition is dropped; the head publishes one candidate per layer only."""
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=1"):
+        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=2)
+
+
+def test_gate_refuses_an_unreadable_head_file(tmp_path):
+    """Mutant: the gate stops reading the file; a bad path would only fail at service start."""
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD: .*nope.safetensors"):
+        _gate(str(tmp_path / "nope.safetensors"))
+
+
+def test_gate_refuses_a_head_file_of_another_format_version(tmp_path):
+    """Mutant: the version check is dropped from the gate's read; a future file would be accepted."""
+    path = _write(tmp_path, meta=_meta(format_version=head_file.HEAD_FORMAT_VERSION + 1))
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD: .*format_version"):
+        _gate(path)
+
+
+def test_gate_ignores_an_empty_head_variable():
+    """Mutant: '' is treated as a path; the off state (unset or empty) would refuse launches."""
+    _gate("", SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu", SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
