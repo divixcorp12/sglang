@@ -42,8 +42,12 @@ def _load_summary(run_dir: str) -> dict:
         return json.load(f)
 
 
-def _restrict(figures: dict) -> dict:
-    return {sid: fig for sid, fig in figures.items() if sid in SESSIONS}
+def _timed_ids(figures: dict) -> set:
+    """The quick run's session ids: results.jsonl keys rows by corpus id, not by the index passed to --sessions."""
+    ids = set(figures[QUICK_L2])
+    if ids != set(figures[QUICK_T3]) or len(ids) != len(SESSIONS):
+        raise SystemExit(f"quick arms timed different or unexpected sessions: {sorted(ids)} vs {sorted(figures[QUICK_T3])}")
+    return ids
 
 
 def _spec_counters(summary: dict, arm: str) -> dict:
@@ -72,10 +76,12 @@ def analyse(quick_dir: str, f108_dir: str) -> dict:
     }
     figures, flagged, counters = {}, {}, {}
     for label, (run_dir, summary, arm) in sources.items():
-        figures[label] = _restrict(l2_ab_report.session_figures(l2_ab_report._last_run_results(run_dir, arm)))
+        figures[label] = l2_ab_report.session_figures(l2_ab_report._last_run_results(run_dir, arm))
         flagged[label] = l2_ab_report._flagged(summary, arm)
         counters[label] = _spec_counters(summary, arm)
         counters[label]["text_status"] = _text_status(counters[label]["text_vs_reference"])
+    timed = _timed_ids(figures)
+    figures = {label: {sid: fig for sid, fig in figs.items() if sid in timed} for label, figs in figures.items()}
     pairs = {}
     for name, arm, other, criterion in PAIRS:
         pair = l2_ab_report.pair_table(figures, flagged, arm, other)

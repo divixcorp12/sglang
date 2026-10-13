@@ -32,13 +32,17 @@ def _row(session_id, step_ms, ms_per_token):
     }
 
 
-def _write_dir(path, arms, text=None):
-    """arms: {arm: (step_ms, ms_per_token, (issued, landed, used))}; sessions 0-5 are written."""
+# Real results.jsonl rows carry corpus ids, not the indices passed to --sessions.
+IDS = tuple(f"cfq-train-Single_X/201{i}/page_{i}.pdf-1" for i in range(6))
+
+
+def _write_dir(path, arms, text=None, sessions=6):
+    """arms: {arm: (step_ms, ms_per_token, (issued, landed, used))}; the first `sessions` ids are written."""
     summary = {}
     for arm, (step_ms, ms_per_token, (issued, landed, used)) in arms.items():
         run = path / "servers" / arm / "run-a"
         run.mkdir(parents=True)
-        rows = [_row(s, step_ms, ms_per_token) for s in range(6)]
+        rows = [_row(sid, step_ms, ms_per_token) for sid in IDS[:sessions]]
         (run / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
         summary[arm] = {
             "drive_flags": [],
@@ -59,18 +63,21 @@ def _dirs(tmp_path, r, text=None):
         tmp_path / "quick",
         {r.L2: (82.0, 41.0, counters), r.T3: (60.0, 30.0, (120, 90, 70))},
         text=text,
+        sessions=4,
     )
     return quick, f108
 
 
 def test_ratios_pair_by_session_id_over_sessions_0_to_3_and_t3_is_read_against_the_fresh_l2(tmp_path):
-    """Mutant: T3 compared against F108's L+2 instead of the fresh L+2, or sessions 4-5 left in -- red."""
+    """Mutant: T3 compared against F108's L+2 instead of the fresh L+2, F108's extra sessions left in, or rows
+    filtered by integer index (real ids are corpus strings, so every table came out empty) -- red."""
     r = _report()
     quick, f108 = _dirs(tmp_path, r)
     result = r.analyse(quick, f108)
     t3_vs_fresh = result["pairs"]["t3_vs_fresh_l2"]
     assert t3_vs_fresh["other"] == r.QUICK_L2
-    assert [row["session_id"] for row in t3_vs_fresh["sessions"]] == [0, 1, 2, 3]
+    assert [row["session_id"] for row in t3_vs_fresh["sessions"]] == sorted(IDS[:4])
+    assert [row["session_id"] for row in result["pairs"]["t3_vs_f108_misscut"]["sessions"]] == sorted(IDS[:4])
     assert abs(t3_vs_fresh["step_ratio_median"] - 60.0 / 82.0) < 1e-9
     assert abs(result["pairs"]["t3_vs_f108_misscut"]["step_ratio_median"] - 0.6) < 1e-9
     assert abs(result["pairs"]["fresh_l2_vs_f108_l2_drift"]["step_ratio_median"] - 82.0 / 80.0) < 1e-9
