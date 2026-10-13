@@ -78,12 +78,7 @@ _logged "${GPU[@]}" "$HERE/l2_fast_interference.py" --run-dir "$RUN_DIR" --out "
 
 PARITY=("$HERE/l2_fast_parity.py" "$RUN_DIR" --dataset "$DATASET" --corpus "$CORPUS" --b1-head "$B1_HEAD"
         --model-path "$MODEL_PATH" --f109 "$F109")
-if [ "$GATE_DTYPE" = bfloat16 ]; then
-  # No --gate-dtype: the driver's default covers its documented cases.
-  _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity.json" --device cuda
-else
-  _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity.json" --gate-dtype "$GATE_DTYPE" --device cuda
-fi
+_logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity.json" --gate-dtype "$GATE_DTYPE" --device cuda
 
 # Q1: the float32 gate-weight spec_score case is a separate run into parity-fp32.json (report: parity_router_fp32).
 if [ "$GATE_DTYPE" = bfloat16 ]; then
