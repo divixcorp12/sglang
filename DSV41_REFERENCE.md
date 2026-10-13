@@ -9824,7 +9824,7 @@ e675e2bd.... Both from `b1-r1-20261012/stages/l2/`, read only.
   against the card's spec. Rows: native `spec_score` plus `spec_select`; native plus the fused learned path plus its
   select; the folded torch path; incremental cost over native for T0 and T3, each beside the historical 0.1 ms/layer
   bar.
-- Interference (C13-C20 group): the fused learned path replayed on a side stream while a fixed main-stream load of bf16
+- Interference (C26): the fused learned path replayed on a side stream while a fixed main-stream load of bf16
   GEMMs sized like one decode layer's dense work runs. The report gives main-stream slowdown against the native scorer
   on the same side stream, and against no side work.
 - Parity: every dev (44,536) and calib (20,254) group, T0 and T3, at the F109 frozen calib threshold (budget 0.75) and at

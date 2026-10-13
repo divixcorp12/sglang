@@ -2,8 +2,8 @@
 # F123 owner-started divix01 run: L+2 fast-path profile, cost, interference, parity, then result.json and REPORT.md.
 # Inputs (env or positional RUN_DIR DATASET CORPUS B1_HEAD MODEL_PATH F109 OUT): the R1 run dir (read only), the B0
 # dataset, corpus and F0 head, the model path, the F109 output dir (read only). Optional GATE_DTYPE (default bfloat16)
-# is the spec_score gate-weight dtype of the parity run; float32 is added when parity.json lacks that case.
-# Output: OUT/{profile,cost,interference,parity}.json, OUT/commands.txt, OUT/result.json, OUT/REPORT.md.
+# is the spec_score gate-weight dtype of the parity run; float32 is added as a second parity run when it is bfloat16.
+# Output: OUT/{profile,cost,interference,parity,parity-fp32}.json, OUT/commands.txt, OUT/result.json, OUT/REPORT.md.
 # Usage: run from a private pushed worktree on divix01:
 #   DATASET=... CORPUS=... B1_HEAD=... MODEL_PATH=... bash analysis/dsv41-drive/prefetch-replay/l2_fast_run.sh
 set -euo pipefail
@@ -85,13 +85,8 @@ else
   _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity.json" --gate-dtype "$GATE_DTYPE" --device cuda
 fi
 
-# A single-dtype driver leaves the router_fp32 case out of parity.json; run it into its own file then.
-if [ "$GATE_DTYPE" = bfloat16 ] && ! "$PYTHON" -I - "$OUT/parity.json" <<'PY'
-import json, sys
-cases = json.load(open(sys.argv[1]))["cases"]
-sys.exit(0 if any(k.startswith("spec_score") and k.endswith("float32") for k in cases) else 1)
-PY
-then
+# Q1: the float32 gate-weight spec_score case is a separate run into parity-fp32.json (report: parity_router_fp32).
+if [ "$GATE_DTYPE" = bfloat16 ]; then
   _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity-fp32.json" --gate-dtype float32 --device cuda
 fi
 

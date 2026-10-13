@@ -1,6 +1,6 @@
 """L+2 fast-path report: result.json and REPORT.md from the profile, cost, interference and parity artifacts (C27).
 
-Inputs: OUT/{profile,cost,interference,parity}.json and OUT/commands.txt, whichever exist. A missing artifact renders
+Inputs: OUT/{profile,cost,interference,parity,parity-fp32}.json and OUT/commands.txt, whichever exist. A missing artifact renders
 `pending`; nothing is estimated. Checkpoint sha256s are read from the artifacts, git_head and sglang.__file__ from
 commands.txt.
 Output: OUT/result.json and OUT/REPORT.md, written atomically. Every dict holding a number also holds a `label`
@@ -34,7 +34,8 @@ MODELS = tuple(EXPECTED_PREFIX)
 COMPONENTS = ("gate", "features", "head_mlp", "aggregate_sigmoid", "select", "complete")
 PATHS = ("native", "fused", "torch")
 STATS = ("median_ms", "p90_ms", "p99_ms", "runs", "nodes")
-ARTIFACTS = ("profile", "cost", "interference", "parity")
+ARTIFACTS = {"profile": "profile.json", "cost": "cost.json", "interference": "interference.json",
+             "parity": "parity.json", "parity_router_fp32": "parity-fp32.json"}
 BUDGET_KEY = "0.75"
 _RESULT_NAME = "result.json"
 _REPORT_NAME = "REPORT.md"
@@ -44,6 +45,7 @@ _SCOPES = {
     "cost": "widths 1/2/4/6, CUDA graph per layer slot replayed round-robin over 38 slots, one stream",
     "interference": "fused or native scorer replayed on a side stream under a fixed main-stream bf16 GEMM load",
     "parity": "every covered dev and calib group, frozen F109 calib thresholds, budgets 0.75 and 1.0",
+    "parity_router_fp32": "same groups and thresholds as parity, spec_score case with a float32 gate weight",
 }
 _TEXT = ("Stage 2 offline measurements of the L+2 learned heads T0 and T3 as a serving-shaped fast path. "
          "Nothing is wired into serving; no number here measures ordinary decode.")
@@ -168,7 +170,7 @@ def _best(rows: dict, *, key: str, high: bool) -> str:
 
 
 def build_result(*, out: str, commands: str | None, profile: dict | None, cost: dict | None,
-                 interference: dict | None, parity: dict | None) -> dict:
+                 interference: dict | None, parity: dict | None, parity_router_fp32: dict | None = None) -> dict:
     """result.json content; `commands` is the text of commands.txt. A None artifact is `pending`."""
     meta = _parse_commands(commands)
     cost_section = {**_section(cost, name="cost"), "incremental_vs_bar": _incremental(cost)}
@@ -179,13 +181,14 @@ def build_result(*, out: str, commands: str | None, profile: dict | None, cost: 
         "provenance": {"label": OBSERVED, "scope": "read from commands.txt and the artifacts' own fields",
                        **meta, "checkpoints": _checkpoints(profile=profile, cost=cost, interference=interference,
                                                             parity=parity),
-                       "artifacts": {n: os.path.join(out, f"{n}.json") for n in ARTIFACTS}
+                       "artifacts": {n: os.path.join(out, f) for n, f in ARTIFACTS.items()}
                        | {"result_json": os.path.join(out, _RESULT_NAME),
                           "report_md": os.path.join(out, _REPORT_NAME)}},
         "profile": _section(profile, name="profile"),
         "cost": cost_section,
         "interference": _section(interference, name="interference"),
         "parity": _section(parity, name="parity"),
+        "parity_router_fp32": _section(parity_router_fp32, name="parity_router_fp32"),
         "tradeoff": _tradeoff(cost, parity),
     }
     return _stamp(result, label=OBSERVED, scope=_TEXT)
@@ -278,23 +281,24 @@ def _parity_rows(cells: list) -> list[list[object]]:
         rc = c.get("recall_change", {})
         rows.append([" / ".join(path), c["groups"], c["max_abs_diff"], c["p99_abs_diff"], c["top1_agree"],
                      c["read_agree"], c["disagreements"], len(c["near_threshold"]), c["far_disagreements"],
+                     c.get("kernel_record_mismatch", "n/a"),
                      rc.get("ref_recall", "n/a"), rc.get("got_recall", "n/a"), rc.get("diff", "n/a")])
     return rows
 
 
-def _parity_lines(result: dict) -> list[str]:
-    p = result["parity"]
+def _parity_lines(result: dict, *, key: str = "parity",
+                  title: str = "C13-C20 parity against the F109 reference") -> list[str]:
+    p = result[key]
     cells = list(_cells(_get(p, "cases")))
     head = ["case / split / scorer / path / budget", "groups", "max |diff|", "p99 |diff|", "top-1 agree",
-            "read agree", "disagreements", "near threshold", "far", "ref recall", "got recall", "recall change"]
-    body = [f"Scope: {p['scope']}.", ""]
-    dtypes = _get(p, "gate_dtypes")
-    if isinstance(dtypes, dict):
-        rows = [[k, _get(v, "dtype"), _get(v, "label")] for k, v in dtypes.items() if k not in _META_KEYS]
-        body += _table(["case", "gate weight dtype", "dtype label"], rows, label=OBSERVED)
+            "read agree", "disagreements", "near threshold", "far", "kernel record mismatch", "ref recall",
+            "got recall", "recall change"]
+    body = [f"Scope: {p['scope']}.", "",
+            *_table(["spec_score gate weight dtype", "dtype label"],
+                    [[_get(p, "gate_dtype"), _get(p, "gate_dtype_label")]], label=OBSERVED)]
     body += _table(head, _parity_rows(cells), label=OBSERVED) if cells else [PENDING, ""]
     body += _near_lines(cells) + _far_lines(cells) + _candidate_lines(cells)
-    return _section_lines("C13-C20 parity against the F109 reference", body)
+    return _section_lines(title, body)
 
 
 def _near_lines(cells: list) -> list[str]:
@@ -351,6 +355,8 @@ def _provenance_lines(result: dict) -> list[str]:
 def render_report(result: dict) -> str:
     parts = [["# L+2 learned heads: serving-shaped fast path (Stage 2)", ""], _scope_lines(result),
              _profile_lines(result), _cost_lines(result), _interference_lines(result), _parity_lines(result),
+             _parity_lines(result, key="parity_router_fp32",
+                           title="Q1 parity with float32 gate weight (router_fp32 follow-up run)"),
              _tradeoff_lines(result), _provenance_lines(result)]
     return "\n".join(line for part in parts for line in part) + "\n"
 
@@ -390,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     out = common.guard_out(args.out)
     result = build_result(out=out, commands=_read_text(os.path.join(out, "commands.txt")),
-                          **{n: _read_json(os.path.join(out, f"{n}.json")) for n in ARTIFACTS})
+                          **{n: _read_json(os.path.join(out, f)) for n, f in ARTIFACTS.items()})
     result_path, report_path = write_outputs(out, result)
     print(result_path)
     print(report_path)
