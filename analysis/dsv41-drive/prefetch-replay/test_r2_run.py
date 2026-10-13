@@ -13,6 +13,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import b1_head  # noqa: E402
 import r1_plan  # noqa: E402
 import r1_stage  # noqa: E402
 import r2_arms  # noqa: E402
@@ -221,7 +222,7 @@ def test_the_x_budget_refusal_is_a_clean_nonzero_exit_with_its_message(tmp_path,
     assert _main(tmp_path, "plan") == 0
 
     def stage_train(ctx, *, plan, **_):
-        r2_arms.check_x_budget(n_groups=1 << 30, plan=plan, free_bytes=1 << 50)
+        r2_arms.check_x_budget(n_groups=1 << 30, plan=plan, free_bytes=1 << 50, cfg=b1_head.HeadConfig())
 
     monkeypatch.setattr(r2_run.r2_arms, "stage_train", stage_train)
     assert _main(tmp_path, "train") == r2_run.BUDGET_EXIT

@@ -117,30 +117,35 @@ def _train(env, *, seeds=SEEDS, parents=None):
                               seeds=seeds, horizon=1, out_dir=os.path.join(env.ctx.out, "ckpt"))
 
 
+def _check(n, plan, free):
+    return r2_arms.check_x_budget(n_groups=n, plan=plan, free_bytes=free, cfg=HEAD_CFG)
+
+
 def test_budget_refuses_one_group_past_and_accepts_at_budget():
     n = 7
     need = r1_cache.x_cache_bytes(n, x_dtype=torch.bfloat16)
+    device = r1_cache.cache_bytes(n, cfg=HEAD_CFG, x_dtype=torch.bfloat16, with_s_native=True)
     base = SimpleNamespace(x_dtype="bfloat16", x_budget_bytes=need, x_margin_bytes=0)
-    assert r2_arms.check_x_budget(n_groups=n, plan=base, free_bytes=need) == need
+    assert _check(n, base, device) == need
     with pytest.raises(MemoryError, match="budget"):
-        r2_arms.check_x_budget(n_groups=n + 1, plan=base, free_bytes=10 * need)
+        _check(n + 1, base, 10 * device)
     with pytest.raises(MemoryError, match="free"):
-        r2_arms.check_x_budget(n_groups=n, plan=base, free_bytes=need - 1)
+        _check(n, base, device - 1)
     margin = SimpleNamespace(x_dtype="bfloat16", x_budget_bytes=need, x_margin_bytes=5)
     with pytest.raises(MemoryError):
-        r2_arms.check_x_budget(n_groups=n, plan=margin, free_bytes=need + 4)
-    assert r2_arms.check_x_budget(n_groups=n, plan=margin, free_bytes=need + 5) == need
+        _check(n, margin, device + 4)
+    assert _check(n, margin, device + 5) == need
 
 
-def test_budget_counts_the_join_peak_of_the_largest_split():
-    train, dev = 5, 2
-    need = r1_cache.x_cache_bytes(train + dev, x_dtype=torch.bfloat16)
-    peak = need + r1_cache.x_cache_bytes(train, x_dtype=torch.bfloat16)
-    plan = SimpleNamespace(x_dtype="bfloat16", x_budget_bytes=need, x_margin_bytes=3)
-    # Free memory that holds the caches but not the transient torch.cat copy is refused, not left to a CUDA OOM.
-    with pytest.raises(MemoryError, match="peak"):
-        r2_arms.check_x_budget(n_groups=train + dev, plan=plan, free_bytes=peak + 2, peak_groups=train)
-    assert r2_arms.check_x_budget(n_groups=train + dev, plan=plan, free_bytes=peak + 3, peak_groups=train) == need
+def test_free_memory_must_hold_u_and_s_native_beside_x():
+    # The real train split held 8.6 GiB of bf16 x beside 5.6 GiB of fp32 u; counting x alone let it OOM.
+    n = 7
+    need = r1_cache.x_cache_bytes(n, x_dtype=torch.bfloat16)
+    device = r1_cache.cache_bytes(n, cfg=HEAD_CFG, x_dtype=torch.bfloat16, with_s_native=True)
+    assert device > need
+    plan = SimpleNamespace(x_dtype="bfloat16", x_budget_bytes=need, x_margin_bytes=0)
+    with pytest.raises(MemoryError, match="u and s_native"):
+        _check(n, plan, device - 1)
 
 
 def test_three_seeds_per_arm_with_parent_hashes(env):

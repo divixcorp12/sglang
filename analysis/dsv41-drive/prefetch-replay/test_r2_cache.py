@@ -79,3 +79,46 @@ def test_s_native_is_independent_of_x_dtype():
     half = r1_cache.collate(rs, x_dtype=torch.bfloat16, **kw)
     assert half.s_native.dtype == torch.float32 and torch.equal(half.s_native, full.s_native)
     assert half.x.dtype == torch.bfloat16 and torch.equal(half.u, full.u)
+
+
+def _nbytes(inp) -> int:
+    return sum(t.numel() * t.element_size() for t in (inp.u, inp.x, inp.s_native) if t is not None)
+
+
+@pytest.mark.parametrize("x_dtype", DTYPES)
+def test_cache_bytes_counts_u_x_and_s_native_of_a_built_cache(x_dtype):
+    model, rs = _setup()
+    cache = _build(model, rs, x_dtype=x_dtype, gates=_gates(rs))
+    assert _nbytes(cache.inp) == r1_cache.cache_bytes(len(rs), cfg=model.cfg, x_dtype=x_dtype, with_s_native=True,
+                                                      hidden=DIM)
+    plain = _build(model, rs, x_dtype=x_dtype)
+    assert _nbytes(plain.inp) == r1_cache.cache_bytes(len(rs), cfg=model.cfg, x_dtype=x_dtype, with_s_native=False,
+                                                      hidden=DIM)
+
+
+def test_chunked_cache_equals_one_collate():
+    model, rs = _setup()
+    gates = _gates(rs)
+    cache = _build(model, rs, x_dtype=torch.bfloat16, gates=gates)
+    whole = r1_cache.collate(rs, x_of=_x, pca=model.pca, cfg=model.cfg, vocab=model.vocab, device="cpu",
+                             with_x=True, gates=gates, x_dtype=torch.bfloat16)
+    assert len(rs) > 4 and cache.groups == len(rs)
+    for name in ("u", "x", "s_native"):
+        assert torch.equal(getattr(cache.inp, name), getattr(whole, name)), name
+    for name in whole.batch.__struct_fields__:
+        np.testing.assert_array_equal(getattr(cache.inp.batch, name), getattr(whole.batch, name), err_msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_build_peak_stays_near_the_cache_size():
+    # The real train split died joining chunks: chunks plus the joined copy held every tensor twice.
+    model, rs = _setup()
+    rs = rs * 40
+    gates = {k: (W.cuda(), b.cuda()) for k, (W, b) in _gates(rs).items()}
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    cache = r1_cache.build_cache(rs, x_of=_x, pca=model.pca, cfg=model.cfg, vocab=model.vocab, device="cuda",
+                                 with_x=True, gates=gates, chunk=4, x_dtype=torch.bfloat16)
+    size = _nbytes(cache.inp)
+    assert torch.cuda.max_memory_allocated() - base < 1.5 * size
