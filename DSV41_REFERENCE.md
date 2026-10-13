@@ -9544,7 +9544,8 @@ at this data size; no further arms in this feature.
 
 ### 33.29 Served A/B: the native gate retargeted to L+2 (2026-10-12)
 
-Status: **pending**. The code and the run script are merged; no served number below is measured yet. Report and
+Status: **pending**. The code and the run script are merged; no served number below is measured yet (the merge gate's
+only listed check, `python3 scripts/lint/check_registered_tests.py`, exited 1; the gate ran no served A/B). Report and
 per-arm data: `divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-ab-<date>/` (`report/REPORT.md`).
 
 The question is whether scoring the native gate of layer T+2 on layer T's hidden state, which gives a speculative read
