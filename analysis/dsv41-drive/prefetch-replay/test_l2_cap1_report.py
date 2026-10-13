@@ -85,6 +85,20 @@ def test_missing_timing_renders_pending() -> None:
     assert "pending" in text
 
 
+def test_budget_zero_read_nothing_row_shows_inf_not_pending() -> None:
+    result = _result()
+    for threshold in (None, math.inf):
+        b0 = _budget(learned=False)
+        b0["point"].update(budget=0.0, threshold=threshold, reads=0, mean_reads=0.0, useful=0, wasted=0, recall=0.0,
+                           precision=0.0)
+        result["cap1"]["splits"]["dev"]["gate_cap1"]["budgets"] = {"0.0": b0}
+        rows = [line for line in l2_cap1_report.render_report(result).splitlines()
+                if line.startswith("| gate_cap1 | 0.0 | inf (read nothing) |")]
+        assert len(rows) == 1
+        assert "pending" not in rows[0]
+
+
+
 def test_write_outputs_is_valid_json_with_null_for_inf(tmp_path: Path) -> None:
     out = str(tmp_path / "out")
     result_path, report_path = l2_cap1_report.write_outputs(out, _result())
