@@ -218,7 +218,8 @@ def test_the_service_builds_both_scorers_tables_at_the_configured_horizon(caplog
 
     scorer, args, kw_h2, log = enable("gpu", 2)
     assert args[0].tolist() == [[2, 0], [-1, -1], [-1, -1]]
-    assert scorer.picked.gates[0] is gates[2]
+    assert torch.equal(scorer.picked.gates[0].weight, gates[2].weight)
+    assert torch.equal(scorer.picked.gates[0].bias, gates[2].bias)
     assert "1 of 3 rows target layer +2" in log
     _, args, kw_h1, log = enable("gpu", 1)
     assert args[0].tolist() == [[1, 0], [2, 1], [-1, -1]]
