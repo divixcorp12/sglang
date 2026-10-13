@@ -194,9 +194,10 @@ def _split_d3_lines(result: dict) -> list[str]:
 def _cost_lines(result: dict) -> list[str]:
     c = result["costs"]
     head = ["scorer", "cap", "tokens", "complete bf16 median ms", "gate-only ms", "param bytes", "buffer bytes",
-            "selection matches policy"]
+            "selection matches policy", "cost source"]
     rows = [[n, d.get("cap"), d.get("tokens"), d.get("gate_ms"), d.get("gate_only_ms"), d.get("param_bytes"),
-             d.get("buffer_bytes"), d.get("selection_matches_policy")] for n, d in c["scorers"].items()]
+             d.get("buffer_bytes"), d.get("selection_matches_policy"), d.get("cost_source")]
+            for n, d in c["scorers"].items()]
     body = [f"Scope: {c['scope']}.", "", *_table(head, rows, label=OBSERVED)] if rows else [PENDING, ""]
     return _section("Scorer cost at cap 1", body)
 

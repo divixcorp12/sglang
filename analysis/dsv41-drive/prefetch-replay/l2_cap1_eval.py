@@ -38,6 +38,7 @@ import l2_cap1_timing  # noqa: E402
 import r1_arms  # noqa: E402
 import r1_groups  # noqa: E402
 import r1_metrics  # noqa: E402
+import r1_models  # noqa: E402
 import r1_plan  # noqa: E402
 import r1_policy  # noqa: E402
 import r1_stage  # noqa: E402
@@ -189,17 +190,24 @@ def _read_groups(dataset: str, *, exclusions) -> dict[str, list[R1Group]]:
 
 def _load_costs(paths: dict[str, str], *, ckpts: dict[str, dict]) -> dict[str, dict]:
     """Each cost file with its path and sha256; a cost must come from its scorer's own checkpoint (or T0's for
-    best_cap1, which the record then says)."""
+    best_cap1 when the two configs are identical, which the record then says)."""
     out: dict[str, dict] = {}
     for name, path in sorted(paths.items()):
         cost = _read(path)
         own, t0 = ckpts[name]["sha"], ckpts["L2_T0"]["sha"]
         measured_on = cost.get("checkpoint_sha256")
-        if measured_on != own and not (name == "L2_T0_best_cap1" and measured_on == t0):
+        borrowed = measured_on != own and name == "L2_T0_best_cap1" and measured_on == t0
+        if measured_on != own and not borrowed:
             raise ValueError(f"cost {path} for {name} was measured on {measured_on}, not {own}")
+        if borrowed and _ckpt_cfg(ckpts[name]["path"]) != _ckpt_cfg(ckpts["L2_T0"]["path"]):
+            raise ValueError(f"cost for {name} borrows L2_T0's, but the two checkpoints' configs differ")
         out[name] = {**cost, "path": path, "file_sha256": r1_stage.sha256_file(path),
-                     "cost_source": "own checkpoint" if measured_on == own else "L2_T0 checkpoint (T0_seed0)"}
+                     "cost_source": "L2_T0 checkpoint (T0_seed0)" if borrowed else "own checkpoint"}
     return out
+
+
+def _ckpt_cfg(path: str):
+    return r1_models.load_r1(path)[0].cfg
 
 
 # ===== Sanity (C2) =====
