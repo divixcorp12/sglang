@@ -9637,19 +9637,19 @@ The script's steps by hand, with `OUT=/data/models/slang/nvfp4-work/ram-prefetch
 export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8
 # smoke: misscut reference and the L+2 arm, sessions 0,1
 flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
-  OUT/smoke --sessions 0,1 dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-l2
+  $OUT/smoke dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-l2 --sessions 0,1
 # forward, then reversed
 flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
-  OUT/fwd dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-floors \
+  $OUT/fwd dspark-both-misscut dspark-both-prefetch-gpu-misscut-idle2-floors \
   dspark-both-prefetch-gpu-misscut-idle2 dspark-both-prefetch-gpu-misscut-idle2-l2
 flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 python analysis/dsv41-drive/dspark/both_cpu_ab.py \
-  OUT/rev dspark-both-prefetch-gpu-misscut-idle2-l2 dspark-both-prefetch-gpu-misscut-idle2 \
+  $OUT/rev dspark-both-prefetch-gpu-misscut-idle2-l2 dspark-both-prefetch-gpu-misscut-idle2 \
   dspark-both-prefetch-gpu-misscut-idle2-floors dspark-both-misscut
-python analysis/dsv41-drive/dspark/l2_ab_report.py OUT/fwd OUT/rev --out OUT/report
+python analysis/dsv41-drive/dspark/l2_ab_report.py $OUT/fwd $OUT/rev --out $OUT/report
 ```
 
 The smoke runs the misscut reference beside the L+2 arm (the text check needs the reference probe) and fails unless the L+2 arm issued and landed speculative reads and its probe text matched. The report is
-`OUT/report/REPORT.md` with `results.json`.
+`$OUT/report/REPORT.md` with `results.json`.
 
 **Decision.** Prefetch stays default off and the horizon stays 1 whatever the result (D8); this section records what the
 A/B shows.
