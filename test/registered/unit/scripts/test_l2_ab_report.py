@@ -114,7 +114,10 @@ def test_the_report_files_carry_the_verdict_and_say_whether_the_in_flight_fracti
 def test_a_faster_l2_arm_whose_text_differs_from_the_reference_is_not_a_win(tmp_path):
     """Mutant: the verdict from step ratios alone, ignoring text_vs_reference -- red."""
     r = _report()
-    arms = {r.FLOORS: [_row(0, 0.10), _row(1, 0.10)], r.L2: [_row(0, 0.08), _row(1, 0.08)]}
+    arms = {
+        r.FLOORS: [_row(0, 0.10), _row(1, 0.10)],
+        r.L2: [_row(0, 0.08, ms_per_token=45.0), _row(1, 0.08, ms_per_token=45.0)],
+    }
     rev = _write_order(tmp_path, "rev", arms)
     for i, text in enumerate(({"pass": False}, {"error": "no flips"}, "missing reference probe")):
         fwd = _write_order(tmp_path, f"fwd{i}", arms, text=text)
