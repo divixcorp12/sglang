@@ -349,6 +349,16 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _logged_commands(out: str) -> list[str]:
+    """Lines l2_cap1_run.sh logged to OUT/commands.txt (cost commands, git head, sglang.__file__), or []."""
+    path = os.path.join(out, "commands.txt")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [line.rstrip("\n") for line in f if line.strip()]
+
+
+
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
     try:
@@ -356,7 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     except RefusedOut as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
-    commands = [shlex.join([sys.executable, *(sys.argv if argv is None else [__file__, *argv])])]
+    commands = [*_logged_commands(out),
+                shlex.join([sys.executable, *(sys.argv if argv is None else [__file__, *argv])])]
     try:
         result = run(run_dir=a.run_dir, dataset=a.dataset, corpus=a.corpus, b1_head_path=a.b1_head, out=out,
                      cost_paths=_cost_paths(a.cost), device=a.device, commands=commands)

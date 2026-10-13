@@ -30,6 +30,7 @@ REPLAY = l2_cap1_timing.LABEL
 HYPOTHESIS = "hypothesis"
 LABELS = (OBSERVED, REPLAY, HYPOTHESIS)
 PENDING = "pending"
+READ_NOTHING = "inf (read nothing)"
 NO_ORDINARY_DECODE = ("No ordinary-decode dataset exists, so nothing in this report measures ordinary decode; every "
                       "row is a DSpark draft-verify forward.")
 COVERED_TEXT = ("Headline numbers use only the target layers the serving path can cover (biased target gate, "
@@ -70,6 +71,8 @@ def _fmt(value: object) -> str:
     if value is None:
         return PENDING
     if isinstance(value, float):
+        if value == math.inf:
+            return READ_NOTHING
         return f"{value:.4f}" if math.isfinite(value) else PENDING
     return str(value)
 
@@ -115,7 +118,9 @@ def _budget_rows(scorer: str, budgets: dict) -> list[list[object]]:
     rows = []
     for key, b in budgets.items():
         p, c = b["point"], b["coverage"]
-        rows.append([scorer, key, p["threshold"], p["mean_reads"], p["reads"], p["useful"], p["wasted"],
+        # A produced point stores threshold inf as None (the _finite convention): read nothing, not pending.
+        threshold = math.inf if p["threshold"] is None else p["threshold"]
+        rows.append([scorer, key, threshold, p["mean_reads"], p["reads"], p["useful"], p["wasted"],
                      p["recall"], p["precision"], c["abstention_rate"], c["fully_covered"], c["partly_covered"]])
     return rows
 
