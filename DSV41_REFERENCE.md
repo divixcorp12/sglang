@@ -9824,7 +9824,7 @@ e675e2bd.... Both from `b1-r1-20261012/stages/l2/`, read only.
   against the card's spec. Rows: native `spec_score` plus `spec_select`; native plus the fused learned path plus its
   select; the folded torch path; incremental cost over native for T0 and T3, each beside the historical 0.1 ms/layer
   bar.
-- Interference (C13-C20 group): the fused learned path replayed on a side stream while a fixed main-stream load of bf16
+- Interference (C26): the fused learned path replayed on a side stream while a fixed main-stream load of bf16
   GEMMs sized like one decode layer's dense work runs. The report gives main-stream slowdown against the native scorer
   on the same side stream, and against no side work.
 - Parity: every dev (44,536) and calib (20,254) group, T0 and T3, at the F109 frozen calib threshold (budget 0.75) and at
@@ -9846,8 +9846,10 @@ PYTHONPATH=$PWD/python DATASET=... CORPUS=... B1_HEAD=... MODEL_PATH=... \
 It refuses `dsv41-direct-prod` and any `OUT` outside `/mnt/nvme1/nvfp4-work` or inside the protected run directories.
 GPU steps run under `flock cc-gpu.lock taskset -c 32-63`, the report under `taskset -c 0-63`. It ends with
 `done: OUT/result.json OUT/REPORT.md`, and every `EXIT=` line in `OUT/commands.txt` must be 0. Artifacts:
-`OUT/{profile,cost,interference,parity,parity-fp32}.json`; `parity-fp32.json` holds the `spec_score` case with a
-float32 gate weight, so the fp32-gate-weight rows of the parity table come from it. A cold JIT build of
+`OUT/{profile,cost,interference,parity,parity-fp32}.json`. `parity.json` holds the fp32-gate case and the `spec_score`
+case at `GATE_DTYPE` (default bfloat16); `parity-fp32.json` (always written) holds the `spec_score` case with a float32
+gate weight (router_fp32, Q1), so the fp32-gate-weight rows of the parity table come from it, and the report renders it
+as its own parity section. A cold JIT build of
 `expert_stream_spec_head` on the first run is slow, not a failure.
 
 **Results** (all `pending`; to be filled from `OUT/result.json`, not estimated):
@@ -9875,6 +9877,8 @@ float32 gate weight, so the fp32-gate-weight rows of the parity table come from 
 | T3 folded torch, fp32 scores | pending | pending | pending | pending | pending | n/a |
 | T3 fused kernels, fp32 scores | pending | pending | pending | pending | pending | n/a |
 | T3 fused kernels, `spec_score` scores | pending | pending | pending | pending | pending | pending |
+| T0 fused kernels, `spec_score` scores, float32 gate weight (`parity-fp32.json`) | pending | pending | pending | pending | pending | pending |
+| T3 fused kernels, `spec_score` scores, float32 gate weight (`parity-fp32.json`) | pending | pending | pending | pending | pending | pending |
 
 | Interference (main-stream slowdown) | vs native on side stream | vs no side work |
 |---|---:|---:|
