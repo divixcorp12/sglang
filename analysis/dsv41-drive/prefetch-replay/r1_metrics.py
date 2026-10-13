@@ -335,7 +335,7 @@ def _session_arrays(rep: PolicyReport, *, names: list[str], denominator: str) ->
 
 
 def session_bootstrap(cand: PolicyReport, ctrl: PolicyReport, *, n: int = BOOTSTRAP_RESAMPLES, seed: int = 0,
-                      denominator: Literal["all", "addressable"] = "all") -> dict:
+                      denominator: Literal["all", "addressable"] = "all", useful_ci: bool = False) -> dict:
     """D15: pooled recall difference (cand - ctrl), sessions resampled with replacement, paired, percentile 95% CI."""
     if denominator not in ("all", "addressable"):
         raise ValueError(f"unknown denominator {denominator!r}")
