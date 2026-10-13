@@ -213,6 +213,11 @@ def time_main(main: list[torch.cuda.CUDAGraph], side_graphs: list[torch.cuda.CUD
         main[i % len(main)].replay()
         if stop is not None:
             stop.record(mains)
+        if side_graphs is not None:
+            # Next gate waits for this side replay, so the side stream cannot fall behind and miss its main replay.
+            joined = torch.cuda.Event()
+            joined.record(side)
+            mains.wait_event(joined)
 
     for i in range(warmup):
         one(i, None, None)
