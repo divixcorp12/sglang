@@ -699,7 +699,17 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             )
         if self.spec_expected:
             # Layer T+1's gate on this layer's input, forked off this stream so C1 does not wait for it; joined below.
-            side.spec_score(entry=self.spec_score, x=self.cpu_input[0] if self.cpu_input is not None else None)
+            x = self.cpu_input[0] if self.cpu_input is not None else None
+            # getattr: the unit tests' recording sides predate the head and carry no such field.
+            if getattr(side, "spec_head", None) is not None:
+                side.spec_score(
+                    entry=self.spec_score,
+                    x=x,
+                    routes=self.routes,
+                    route_weights=self.cpu_input[1] if self.cpu_input is not None else None,
+                )
+            else:
+                side.spec_score(entry=self.spec_score, x=x)
         side.copy_engine_captured |= captured
         copy_expert_row_segments_gpu(
             self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1
@@ -1362,6 +1372,12 @@ class Exl3RamMissService:
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden, horizon=horizon)
             candidates = new_candidate_page(pin=pin)
             min_margin = load_margin_floors(floors, len(layer_ids)) if floors else None
+            learned = None
+            head_path = envs.SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD.get()
+            if head_path:
+                from sglang.srt.layers.moe.ram_prefetch_learned_head import load_learned_head
+
+                learned = load_learned_head(head_path, layer_ids=layer_ids, targets=picked.targets)
             host.enable_ram_prefetch(
                 picked.targets,
                 None,
@@ -1375,7 +1391,12 @@ class Exl3RamMissService:
                 min_margin=min_margin,
                 **idle,
             )
-            targets, result = picked.targets, GpuScorer(picked, candidates, per_token, top_k_only)
+            targets = picked.targets
+            result = GpuScorer(picked, candidates, per_token, top_k_only, learned_head=learned)
+            if learned is not None:
+                from sglang.srt.layers.moe.ram_prefetch_learned_head import describe
+
+                logger.info("exl3 RAM miss prefetch: %s", describe(learned))
         else:
             # Off node 0, which the tier keeps near full (DSV41_REFERENCE.md section 33.12).
             node = numa.plans[-1].node if numa.nodes > 1 else None
@@ -1529,6 +1550,18 @@ class Exl3RamMissService:
                 self.device_side.enable_spec_scorer(
                     spec.candidates, top_k=spec.picked.top_k, per_token=spec.per_token, top_k_only=spec.top_k_only
                 )
+                if spec.learned_head is not None:
+                    import msgspec
+
+                    from sglang.srt.layers.moe.ram_prefetch_learned_head import serving_head
+
+                    head = serving_head(spec.learned_head, device=cache.device, top_k=spec.picked.top_k)
+                    # The device looks a head row up by the entry's target map row; the file keys it by source row.
+                    by_target = {
+                        int(spec.picked.targets[source, 0]): head_row
+                        for source, head_row in head.row_of_target.items()
+                    }
+                    self.device_side.enable_spec_head(msgspec.structs.replace(head, row_of_target=by_target))
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was
             # dropped (after_host_use), so the snapshot is the source.

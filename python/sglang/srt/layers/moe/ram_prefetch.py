@@ -198,6 +198,8 @@ class GpuScorer:
     candidates: torch.Tensor
     per_token: int
     top_k_only: bool
+    # A LearnedHeadFile (ram_prefetch_learned_head) when SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD is set.
+    learned_head: Optional[object] = None
 
 
 def read_margin_floors(path: str) -> dict[int, float]:
