@@ -93,6 +93,15 @@ def test_existing_out_is_refused_and_left_untouched(tmp_path, capsys):
     assert out.read_bytes() == b"existing head"
 
 
+def test_t0_scorer_is_an_argparse_error(capsys):
+    """A mutant that accepts --scorer L2_T0 again (a file the serving loader refuses) turns this red."""
+    with pytest.raises(SystemExit) as exc:
+        l2_head_export.main(["/nonexistent/run", "--dataset", "d", "--f109", "/nonexistent/f109",
+                             "--out", "/nonexistent/out.safetensors", "--scorer", "L2_T0"])
+    assert exc.value.code == 2
+    assert "L2_T0" in capsys.readouterr().err
+
+
 def test_guard_accepts_the_fixed_serving_path():
     """A mutant that guards --out only against l2_fast_common.OUT_ROOT refuses both_cpu_ab.T3_HEAD and turns this red."""
     import importlib.util
