@@ -3,16 +3,16 @@ every serving-covered dev and calib group, at the F109 frozen calib thresholds (
 refit). Dev and calib only (never locked_test); trains nothing.
 
 Cases: 'fp32_gate' feeds both fast paths the reference's own fp32 gate scores (r1_gate.full_gate_scores);
-'spec_score' feeds them serving's spec_score kernel scores from bf16 x with a bf16 gate weight (production's default
-router dtype, router_fp32 unset) and 'spec_score_float32' with an fp32 gate weight (the router_fp32 variant). A
-spec_score* read-set change is reported as a precision candidate with its recall change, never hidden (D2, D3).
+'spec_score' feeds them serving's spec_score kernel scores from bf16 x with the gate weight in --gate-dtype (bfloat16,
+production's default router dtype; float32 is the router_fp32 variant, run separately into its own OUT). A spec_score
+read-set change is reported as a precision candidate with its recall change, never hidden (D2, D3).
 
 Inputs: a finished R1 run (exclusions, stages/l2/result.json), the B1 dataset, the B0 corpus, the F0 head, the model
 directory (target gates) and the F109 output directory (result.json, read only).
 Output: OUT/parity.json only. OUT may not be RUN_DIR, inside it, or inside any protected run directory.
 
 Usage: l2_fast_parity.py RUN_DIR --dataset D --corpus C --b1-head H --model-path M --f109 F109_DIR
-       --out OUT/parity.json [--gate-dtype bfloat16] [--gate-dtype float32] [--device cuda] [--limit N]
+       --out OUT/parity.json [--gate-dtype bfloat16|float32] [--device cuda] [--limit N]
 Exit: 0 done, 1 failure, 2 refused --out.
 """
 
@@ -59,10 +59,10 @@ PATHS = ("torch", "kernel")
 FP32_GATE = "fp32_gate"
 SPEC_SCORE = "spec_score"
 PRECISION = "precision candidate"
-# Case key and label per spec_score gate-weight dtype (Q1: both are run and reported separately).
+# spec_score gate-weight dtype and its label (Q1: run once per dtype, into separate outputs).
 GATE_DTYPES = {
-    "bfloat16": (torch.bfloat16, SPEC_SCORE, "production default router dtype (router_fp32 unset)"),
-    "float32": (torch.float32, f"{SPEC_SCORE}_float32", "router_fp32 variant"),
+    "bfloat16": (torch.bfloat16, "production default router dtype (router_fp32 unset)"),
+    "float32": (torch.float32, "router_fp32 variant"),
 }
 SCOPE = ("eager (no CUDA graph), current stream, one group per launch, live widths 1-6 as the groups have them; "
          "serving-covered dev and calib groups at horizon 2 with R1 exclusions")
@@ -266,7 +266,7 @@ def _split_cases(groups: list[R1Group], *, split: str, dataset: str, models: dic
 
 
 def run(*, run_dir: str, dataset: str, corpus: str, b1_head_path: str, model_path: str, f109_dir: str,
-        gate_dtypes: tuple[str, ...], device: str, limit: int | None, commands: list[str]) -> dict:
+        gate_dtype: str, device: str, limit: int | None, commands: list[str]) -> dict:
     inputs = l2_cap1_eval._load_inputs(run_dir=run_dir, corpus=corpus, b1_head_path=b1_head_path)
     recorded = frozen_thresholds(l2_cap1_eval._read(os.path.join(f109_dir, "result.json")))
     thresholds = {name: {b: _threshold(v) for b, v in t.items()} for name, t in recorded.items()}
@@ -277,7 +277,7 @@ def run(*, run_dir: str, dataset: str, corpus: str, b1_head_path: str, model_pat
     heads = _heads(models, rows=l2_fast_torch.serving_rows(every), device=device)
     raw = r1_gate.load_target_gates(model_path, layer_ids=sorted({r.g.target_layer for r in every}))
     gates = {FP32_GATE: _gate_table(raw, device=device, dtype=torch.float32),
-             **{GATE_DTYPES[d][1]: _gate_table(raw, device=device, dtype=GATE_DTYPES[d][0]) for d in gate_dtypes}}
+             SPEC_SCORE: _gate_table(raw, device=device, dtype=GATE_DTYPES[gate_dtype][0])}
 
     cases: dict = {case: {} for case in gates}
     top12: dict = {}
@@ -287,16 +287,16 @@ def run(*, run_dir: str, dataset: str, corpus: str, b1_head_path: str, model_pat
         for case, t in per_case.items():
             cases[case][split] = t
     return _result(recorded=recorded, ckpts=ckpts, groups=groups, top12=top12, cases=cases,
-                   gate_dtypes=gate_dtypes, limit=limit, commands=commands, f109_dir=f109_dir)
+                   gate_dtype=gate_dtype, limit=limit, commands=commands, f109_dir=f109_dir)
 
 
-def _result(*, recorded: dict, ckpts: dict, groups: dict, top12: dict, cases: dict, gate_dtypes: tuple[str, ...],
+def _result(*, recorded: dict, ckpts: dict, groups: dict, top12: dict, cases: dict, gate_dtype: str,
             limit: int | None, commands: list[str], f109_dir: str) -> dict:
     return {
         "label": common.OBSERVED,
         "scope": {"text": SCOPE, "limit": limit, "smoke": limit is not None},
-        "gate_dtypes": {FP32_GATE: {"dtype": "float32", "label": "reference fp32 gate (r1_gate.full_gate_scores)"},
-                        **{GATE_DTYPES[d][1]: {"dtype": d, "label": GATE_DTYPES[d][2]} for d in gate_dtypes}},
+        "gate_dtype": gate_dtype,
+        "gate_dtype_label": GATE_DTYPES[gate_dtype][1],
         "thresholds": recorded,
         "thresholds_source": {"path": os.path.join(f109_dir, "result.json"), "split": "calib",
                               "rule": "frozen, read only, never refit (D7)"},
@@ -318,8 +318,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--model-path", required=True)
     p.add_argument("--f109", required=True, help="F109 output directory; only its result.json is read")
     p.add_argument("--out", required=True, help="OUT/parity.json")
-    p.add_argument("--gate-dtype", action="append", choices=tuple(GATE_DTYPES), default=None,
-                   help="spec_score gate-weight dtype; repeatable (default: bfloat16 and float32)")
+    p.add_argument("--gate-dtype", choices=tuple(GATE_DTYPES), default="bfloat16",
+                   help="spec_score gate-weight dtype; run float32 (router_fp32) separately into its own --out")
     p.add_argument("--device", default="cuda", choices=("cuda",), help="the spec_score / spec_head kernels need CUDA")
     p.add_argument("--limit", type=int, default=None, help="first N covered groups per split; smoke tests only")
     return p
@@ -333,9 +333,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: {e}", file=sys.stderr)
         return 2
     commands = [shlex.join([sys.executable, *(sys.argv if argv is None else [__file__, *argv])])]
-    gate_dtypes = tuple(dict.fromkeys(a.gate_dtype or GATE_DTYPES))
     result = run(run_dir=a.run_dir, dataset=a.dataset, corpus=a.corpus, b1_head_path=a.b1_head,
-                 model_path=a.model_path, f109_dir=a.f109, gate_dtypes=gate_dtypes, device=a.device, limit=a.limit,
+                 model_path=a.model_path, f109_dir=a.f109, gate_dtype=a.gate_dtype, device=a.device, limit=a.limit,
                  commands=commands)
     common.write_json(out, result)
     print(json.dumps({"parity": out}))
