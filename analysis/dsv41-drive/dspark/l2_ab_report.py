@@ -137,6 +137,10 @@ def combine(orders: dict) -> dict:
     else:
         outcome = verdict(ratios, gains, ratios)
         note = ""
+        texts = [orders[name]["counters"].get(L2, {}).get("text_vs_reference") for name in ORDERS]
+        if outcome == "win" and not all(isinstance(t, dict) and t.get("pass") is True for t in texts):
+            outcome = "tie"
+            note = "the L+2 probe text differed from the reference (or was not compared), so the win is not claimed"
     return {
         "verdict": outcome,
         "note": note,

@@ -31,8 +31,8 @@ def _row(session_id, step_s, verifies=10, ms_per_token=50.0, ttft=1.0):
     }
 
 
-def _write_order(tmp_path, name, arms, flags=None, in_flight=None):
-    """arms: {arm: [row]}; flags: {arm: [session_id]}; in_flight: {arm: fraction}."""
+def _write_order(tmp_path, name, arms, flags=None, in_flight=None, text=None):
+    """arms: {arm: [row]}; flags: {arm: [session_id]}; in_flight: {arm: fraction}; text: text_vs_reference of each arm."""
     order = tmp_path / name
     summary = {}
     for arm, rows in arms.items():
@@ -45,6 +45,7 @@ def _write_order(tmp_path, name, arms, flags=None, in_flight=None):
             "drive_flags": [{"session_id": s} for s in (flags or {}).get(arm, [])],
             "ram": {"spec_landed": 100, "spec_used": 60},
             "spec_in_flight_at_use": (in_flight or {}).get(arm),
+            "text_vs_reference": {"pass": True} if text is None else text,
         }
     (order / "summary.json").write_text(json.dumps(summary))
     return str(order)
@@ -108,3 +109,15 @@ def test_the_report_files_carry_the_verdict_and_say_whether_the_in_flight_fracti
     assert r.in_flight_reading(
         {"forward": r.analyse_order(fwd), "reversed": r.analyse_order(rev2)}
     )["text"].startswith("the in-flight fraction did NOT fall")
+
+
+def test_a_faster_l2_arm_whose_text_differs_from_the_reference_is_not_a_win(tmp_path):
+    """Mutant: the verdict from step ratios alone, ignoring text_vs_reference -- red."""
+    r = _report()
+    arms = {r.FLOORS: [_row(0, 0.10), _row(1, 0.10)], r.L2: [_row(0, 0.08), _row(1, 0.08)]}
+    rev = _write_order(tmp_path, "rev", arms)
+    for i, text in enumerate(({"pass": False}, {"error": "no flips"}, "missing reference probe")):
+        fwd = _write_order(tmp_path, f"fwd{i}", arms, text=text)
+        combined = r.combine({"forward": r.analyse_order(fwd), "reversed": r.analyse_order(rev)})
+        assert combined["verdict"] == "tie"
+        assert "text" in combined["note"]

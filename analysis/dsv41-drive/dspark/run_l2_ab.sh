@@ -52,7 +52,7 @@ record_commit() {
 
 record_commit "$OUT"
 record_commit "$OUT/smoke"
-run "$DSPARK/both_cpu_ab.py" "$OUT/smoke" "$L2" --sessions 0,1
+run "$DSPARK/both_cpu_ab.py" "$OUT/smoke" "$MISSCUT" "$L2" --sessions 0,1
 
 run - "$OUT/smoke/summary.json" "$L2" <<'EOF'
 import json
