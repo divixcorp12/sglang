@@ -79,7 +79,9 @@ _logged "${GPU[@]}" "$HERE/l2_fast_interference.py" --run-dir "$RUN_DIR" --out "
 PARITY=("$HERE/l2_fast_parity.py" "$RUN_DIR" --dataset "$DATASET" --corpus "$CORPUS" --b1-head "$B1_HEAD"
         --model-path "$MODEL_PATH" --f109 "$F109")
 _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity.json" --gate-dtype "$GATE_DTYPE" --device cuda
-# The router_fp32 gate-weight variant always goes to its own file (K-T13 v2).
+
+# Q1 / K-T13 v2: the float32 gate-weight (router_fp32) spec_score case always goes to parity-fp32.json
+# (report: parity_router_fp32).
 _logged "${GPU[@]}" "${PARITY[@]}" --out "$OUT/parity-fp32.json" --gate-dtype float32 --device cuda
 
 _logged taskset -c 0-63 "$PYTHON" "$HERE/l2_fast_report.py" --out "$OUT"

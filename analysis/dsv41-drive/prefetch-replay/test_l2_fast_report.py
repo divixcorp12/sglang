@@ -45,19 +45,22 @@ def _cell(*, near: list, far: int, recall: bool) -> dict:
     cell = {"groups": 10, "max_abs_diff": 1e-6, "p99_abs_diff": 1e-7, "top1_agree": 1.0, "read_agree": 0.8,
             "disagreements": len(near) + far, "near_threshold": near, "far_disagreements": far}
     if recall:
-        cell["recall_change"] = {"ref_recall": 0.5, "got_recall": 0.49, "diff": -0.01, "eligible": 100}
+        cell["recall_change"] = {"ref_recall": 0.5, "got_recall": 0.49, "diff": -0.01, "eligible": 100,
+                                 "label": "precision candidate"}
     return cell
 
 
 def _parity() -> dict:
     near = [{"group": 3, "session": "S-NEAR", "ref_read": "e7", "got_read": "none", "ref_score": 0.5004,
              "got_score": 0.4996}]
+    mismatch = {"kernel_record_mismatch": 4}
     cases = {
         "fp32_gate": {"calib": {"L2_T0": {"kernel": {"0.75": _cell(near=[], far=0, recall=False)}}}},
-        "spec_score": {"calib": {m: {"kernel": {"0.75": _cell(near=near, far=7, recall=True)}} for m in _MODELS}},
+        "spec_score": {"calib": {m: {"kernel": {"0.75": {**_cell(near=near, far=7, recall=True), **mismatch}}}
+                                 for m in _MODELS}},
     }
     return {"label": rep.OBSERVED, "scope": {"limit": None, "devices": "cuda"},
-            "gate_dtypes": {"spec_score": {"dtype": "bfloat16", "label": "production default"}},
+            "gate_dtype": "bfloat16", "gate_dtype_label": "production default",
             "thresholds": {m: {"0.75": 0.5, "1.0": 0.4} for m in _MODELS},
             "ckpts": {m: {"path": f"/ck/{m}", "sha256": _SHA[m]} for m in _MODELS}, "cases": cases}
 
@@ -114,6 +117,37 @@ def test_report_lists_near_threshold_apart_from_far_disagreements():
     assert near < text.index("S-NEAR") < far < cand
     assert "| 7 |" in text[far:cand]
     assert "S-NEAR" not in text[far:]
+
+
+def test_report_states_gate_dtype_record_mismatch_and_fp32_section():
+    """The spec_score gate dtype, the kernel record mismatch and the float32 follow-up must reach REPORT.md."""
+    fp32 = {**_parity(), "gate_dtype": "float32", "gate_dtype_label": "router_fp32"}
+    result = _build(parity=_parity(), parity_router_fp32=fp32)
+    text = rep.render_report(result)
+    assert "production default" in text and "router_fp32" in text
+    assert "kernel record mismatch" in text and "| 4 |" in text
+    assert result["parity_router_fp32"]["status"] == "produced"
+    assert _build()["parity_router_fp32"]["status"] == rep.PENDING
+
+
+def test_precision_candidate_tag_survives_stamping_and_reaches_report():
+    """The driver's 'precision candidate' tag on recall_change must not be overwritten by the measurement label."""
+    result = _build(parity=_parity())
+    rc = result["parity"]["cases"]["spec_score"]["calib"]["L2_T0"]["kernel"]["0.75"]["recall_change"]
+    assert rc["kind"] == "precision candidate" and rc["label"] == rep.OBSERVED
+    cand = rep.render_report(result).split("### Precision candidates")[1]
+    assert "precision candidate" in cand
+
+
+def test_prefixed_hypothesis_label_keeps_hypothesis_on_its_numbers():
+    """A 'hypothesis: <note>' label (l2_fast_interference.MAIN_LABEL) must not let its numbers read as observed."""
+    inter = _interference()
+    note = "hypothesis: shapes are a guess at one decode layer's dense work"
+    inter["main_load"] = {"label": note, "tokens": 6, "shapes": [[6, 5120, 2048], [6, 2048, 5120]]}
+    main_load = json.loads(json.dumps(_build(interference=inter)))["interference"]["main_load"]
+    leaves = list(_numeric_leaves(main_load))
+    assert leaves and all(lab == rep.HYPOTHESIS for _, _, lab in leaves), leaves
+    assert main_load["kind"] == note
 
 
 def test_write_outputs_is_atomic_and_complete(tmp_path):
