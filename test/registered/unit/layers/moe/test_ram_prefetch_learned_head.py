@@ -1,13 +1,17 @@
 """The learned L+2 head file format and its serving loader (CPU)."""
 
 from contextlib import ExitStack
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.srt.arg_groups.expert_stream_requirements_exl3 import _check_ram_prefetch
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import exl3_ram_miss
 from sglang.srt.layers.moe import ram_prefetch_learned_head as head_file
+from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
+from sglang.srt.layers.moe.ram_prefetch import GpuScorer, clear_router_gates, register_router_gate
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -226,3 +230,53 @@ def test_gate_refuses_a_head_file_of_another_format_version(tmp_path):
 def test_gate_ignores_an_empty_head_variable():
     """Mutant: '' is treated as a path; the off state (unset or empty) would refuse launches."""
     _gate("", SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu", SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+
+
+def _enable(path: str, host) -> GpuScorer:
+    """Exl3RamMissService._enable_ram_prefetch over layers [0, 1, 2] at horizon 2: row 0 targets row 2 (layer 2)."""
+    w = torch.arange(32, dtype=torch.float32).reshape(4, 8).to(torch.bfloat16)
+    numa = SimpleNamespace(
+        nodes=1, plans=[NodePlan(group=0, node=0, ram=17, cpu=(8, 9), sq=None, busy_poll=True, spec=(0, 1))]
+    )
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+    clear_router_gates()
+    try:
+        register_router_gate(2, w, torch.arange(4, dtype=torch.float32), 6)
+        with ExitStack() as stack:
+            for name, value in (
+                ("SGLANG_DSV41_RAM_PREFETCH_SCORER", "gpu"),
+                ("SGLANG_DSV41_RAM_PREFETCH_HORIZON", 2),
+                ("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS", ""),
+                ("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD", path),
+            ):
+                stack.enter_context(getattr(envs, name).override(value))
+            return exl3_ram_miss.Exl3RamMissService._enable_ram_prefetch(host, [0, 1, 2], numa, cpu)
+    finally:
+        clear_router_gates()
+
+
+def test_enable_refuses_an_uncovered_head_before_the_host_starts_the_prefetch(tmp_path):
+    """Mutant: the service drops load_learned_head or calls it after host.enable_ram_prefetch; the launch would start
+    reading with a head that never serves (C14 must refuse before any capture)."""
+    calls = []
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+    meta = _meta(rows=(head_file.HeadRow(1, 3, 0),))
+    path = _write(tmp_path, tensors=_tensors(rows=1), meta=meta)
+    with pytest.raises(ValueError, match=r"\(0, 2\)"):
+        _enable(path, host)
+    assert calls == []
+
+
+def test_enable_returns_the_learned_head_and_logs_it(tmp_path, caplog):
+    """Mutant: the GpuScorer is built without learned_head (the device never enables the head) or the startup line
+    is dropped; the served arm would silently run the native select."""
+    calls = []
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+    meta = _meta(rows=(head_file.HeadRow(0, 2, 0),))
+    path = _write(tmp_path, tensors=_tensors(rows=1), meta=meta)
+    with caplog.at_level("INFO", logger=exl3_ram_miss.logger.name):
+        scorer = _enable(path, host)
+    assert isinstance(scorer, GpuScorer) and scorer.learned_head is not None
+    assert scorer.learned_head.head_row_by_target == {2: 0} and len(calls) == 1
+    assert calls[0][1]["min_margin"] is None
+    assert "learned L+2 scorer active" in caplog.text and path in caplog.text
