@@ -81,6 +81,18 @@ def test_infeasible_threshold_is_refused(tmp_path):
     assert not (tmp_path / "x.safetensors").exists()
 
 
+def test_existing_out_is_refused_and_left_untouched(tmp_path, capsys):
+    """A mutant that drops the existence check and rewrites the file turns this red."""
+    out = tmp_path / "head.safetensors"
+    out.write_bytes(b"existing head")
+    rc = l2_head_export.main(["/nonexistent/run", "--dataset", "d", "--f109", "/nonexistent/f109", "--out", str(out)])
+    assert rc == 2
+    assert str(out) in capsys.readouterr().err
+    with pytest.raises(FileExistsError):
+        _export(_model(t3=True), out)
+    assert out.read_bytes() == b"existing head"
+
+
 def test_out_inside_protected_run_dir_exits_2(capsys):
     """A mutant that skips guard_out would write into the F109 directory instead of exiting 2."""
     out = "/mnt/nvme1/nvfp4-work/f109-l2-cap1-20261013/head.safetensors"

@@ -8,7 +8,7 @@ Inputs: a finished R1 run (exclusions, stages/l2/result.json), the B1 dataset an
 read only). Output: --out only; it may not be RUN_DIR, inside it, or inside any protected run directory.
 
 Usage: l2_head_export.py RUN_DIR --dataset D --f109 F109_DIR --out PATH [--scorer L2_T3] [--budget 0.75]
-Exit: 0 done, 1 failure, 2 refused --out.
+Exit: 0 done, 1 failure, 2 refused --out (protected directory, or the file already exists).
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ SPLITS = ("dev", "calib")
 def export_head(model: r1_models.R1Model, *, rows: tuple[l2_fast_torch.FoldRow, ...], checkpoint_sha256: str,
                 threshold: float, threshold_source: dict, out: str) -> head_file.HeadMeta:
     """Fold ``model`` over ``rows`` and write the head file to ``out``; returns the metadata written."""
+    if os.path.exists(out):
+        raise FileExistsError(f"{out} already exists; the head file is written once, never replaced")
     if threshold is None or not math.isfinite(threshold):
         raise ValueError(f"threshold must be a finite float, got {threshold!r}")
     strata = model.head.vocab.strata
@@ -109,6 +111,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
+    if os.path.exists(a.out):
+        print(f"refused: {a.out} already exists; the head file is written once, never replaced", file=sys.stderr)
+        return 2
     try:
         out = common.guard_out(a.out, run_dir=a.run_dir)
     except common.RefusedOut as e:
