@@ -68,7 +68,6 @@ def build_result(*, run_dir: str, out: str, commands: list[str], plan_sha: str, 
 
 
 def _fmt(value: object) -> str:
-def _fmt(value: object) -> str:
     if value is None:
         return PENDING
     if isinstance(value, float):
@@ -115,7 +114,6 @@ def _group_lines(result: dict) -> list[str]:
     return _section("Group counts", body)
 
 
-def _budget_rows(scorer: str, budgets: dict) -> list[list[object]]:
 def _budget_rows(scorer: str, budgets: dict) -> list[list[object]]:
     rows = []
     for key, b in budgets.items():
