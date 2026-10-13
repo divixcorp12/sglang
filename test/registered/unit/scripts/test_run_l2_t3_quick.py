@@ -39,6 +39,13 @@ def test_preflight_runs_before_the_arms_and_the_lock_is_the_disk_lock():
     assert "cc-gpu.lock" not in text.replace("takes cc-gpu.lock itself", "")
 
 
+def test_out_must_be_a_new_l2_t3_quick_directory_never_a_protected_run():
+    """Mutant: accepting any path under the ram-prefetch root (OUT inside F108's l2-ab dir, R10) turns this red."""
+    text = _text()
+    assert 'case "${OUT#"$ROOT"/}" in\n    l2-t3-quick-*) ;;' in text
+    assert text.index("l2-t3-quick-*") < text.index("record_commit \"$OUT\"")
+
+
 def test_f108_path_is_only_baseline_and_f108_argument():
     """Mutant: passing the F108 dir as an out dir or arm arg (a write into F108) turns this red."""
     text = _text()

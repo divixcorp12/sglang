@@ -7,6 +7,9 @@ frozen calib threshold and where it came from. The threshold is read, never refi
 Inputs: a finished R1 run (exclusions, stages/l2/result.json), the B1 dataset and the F109 output directory (result.json,
 read only). Output: --out only; it may not be RUN_DIR, inside it, or inside any protected run directory.
 
+--out is checked by its realpath against l2_fast_common.OUT_ROOT (/mnt/nvme1/nvfp4-work): the fixed serving path
+under /data/models/slang/nvfp4-work/ram-prefetch/ is accepted only where that tree resolves there on the box.
+
 Usage: l2_head_export.py RUN_DIR --dataset D --f109 F109_DIR --out PATH [--scorer L2_T3] [--budget 0.75]
 Exit: 0 done, 1 failure, 2 refused --out (protected directory, or the file already exists).
 """

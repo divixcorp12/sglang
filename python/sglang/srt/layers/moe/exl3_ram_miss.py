@@ -700,16 +700,12 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         if self.spec_expected:
             # Layer T+1's gate on this layer's input, forked off this stream so C1 does not wait for it; joined below.
             x = self.cpu_input[0] if self.cpu_input is not None else None
-            # getattr: the unit tests' recording sides predate the head and carry no such field.
-            if getattr(side, "spec_head", None) is not None:
-                side.spec_score(
-                    entry=self.spec_score,
-                    x=x,
-                    routes=self.routes,
-                    route_weights=self.cpu_input[1] if self.cpu_input is not None else None,
-                )
-            else:
-                side.spec_score(entry=self.spec_score, x=x)
+            side.spec_score(
+                entry=self.spec_score,
+                x=x,
+                routes=self.routes,
+                route_weights=self.cpu_input[1] if self.cpu_input is not None else None,
+            )
         side.copy_engine_captured |= captured
         copy_expert_row_segments_gpu(
             self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1
@@ -1561,6 +1557,8 @@ class Exl3RamMissService:
                         int(spec.picked.targets[source, 0]): head_row
                         for source, head_row in head.row_of_target.items()
                     }
+                    if len(by_target) != len(head.row_of_target):
+                        raise ValueError("two head rows share one prefetch target map row")
                     self.device_side.enable_spec_head(msgspec.structs.replace(head, row_of_target=by_target))
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was

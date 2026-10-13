@@ -17,6 +17,10 @@ case "$OUT" in
     "$ROOT"/*) ;;
     *) echo "OUT_ROOT must be under $ROOT, got $OUT" >&2; exit 2 ;;
 esac
+case "${OUT#"$ROOT"/}" in
+    l2-t3-quick-*) ;;
+    *) echo "OUT_ROOT must be $ROOT/l2-t3-quick-<date>[/...], got $OUT" >&2; exit 2 ;;
+esac
 
 HERE=$(pwd -P)
 case "$HERE" in

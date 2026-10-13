@@ -1,7 +1,7 @@
 """Python wrapper of the fused learned block head (csrc/moe/expert_stream/spec_head.cuh).
 
-Offline-only: no serving path, flag or default references this module, and nothing under
-``sglang.srt`` imports it. It is its own JIT module (``expert_stream_spec_head``), so the
+Offline use plus the opt-in serving path behind ``SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD``
+(``run_spec_head_serving``). It is its own JIT module (``expert_stream_spec_head``), so the
 production expert-stream device module's build key is untouched.
 
 ``run_spec_head`` launches K1-K4 (PCA + fc_in, gated middle block, fc_out, fused tail) on the
