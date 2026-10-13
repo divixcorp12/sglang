@@ -16,6 +16,7 @@ from sglang.test.dsv41_ram_prefetch_fixtures import (
     LOGITS,
     enable,
     enable_gpu,
+    forced,
     gate,
     load,
     prefetch_rig,
@@ -130,6 +131,65 @@ def test_a_job_whose_target_was_served_first_is_dropped_without_waiting(tmp_path
         _record(rig, 1)
         assert rig.host.spec_pump(0)
         assert _counts(rig, "spec_dropped", "spec_late", "spec_issued") == (1, 0, 0)
+    finally:
+        rig.host.stop()
+
+
+L2_TARGETS = torch.tensor([[2, 0], [-1, -1], [-1, -1]], dtype=torch.int64)  # horizon 2: row 0 targets row 2
+
+
+def _l2_job_past_row_1(tmp_path):
+    """Row 0 targets row 2; row 0's record, its ready slot (expert 2), then row 1's record served before the job."""
+    rig = prefetch_rig(tmp_path, rows=3)
+    try:
+        page = enable_gpu(rig, targets=L2_TARGETS)
+        req = _record(rig, 0)
+        write_candidate_slot(page, req.seq, [(2, 0, 1.0)])
+        _record(rig, 1)
+    except BaseException:
+        rig.host.stop()
+        raise
+    return rig
+
+
+def test_an_l2_job_is_not_stale_while_the_row_between_is_served(tmp_path):
+    """Horizon 2: row 1 going into service after row 0's record is not row 2's, so the read is still ahead of its
+    target. Mutant: spec_stale checking every row in source..target -- red (spec_dropped 1)."""
+    rig = _l2_job_past_row_1(tmp_path)
+    try:
+        assert rig.host.spec_pump(0) and not rig.host.spec_pump(0)
+        assert _counts(rig, "spec_dropped", "spec_issued") == (0, 1)
+        assert _landed(rig.host, 2) == [2] and _landed(rig.host, 1) == []
+    finally:
+        rig.host.stop()
+
+
+def test_an_l2_job_whose_target_row_was_served_after_its_record_is_dropped(tmp_path):
+    """A record of row 2 later than the source's entered service first: the read would land behind it. Mutant:
+    spec_stale checking the source row only -- red (spec_issued 1)."""
+    rig = prefetch_rig(tmp_path, rows=3)
+    try:
+        page = enable_gpu(rig, targets=L2_TARGETS)
+        req = _record(rig, 0)
+        write_candidate_slot(page, req.seq, [(2, 0, 1.0)])
+        _record(rig, 2)
+        assert rig.host.spec_pump(0)
+        assert _counts(rig, "spec_dropped", "spec_issued") == (1, 0)
+    finally:
+        rig.host.stop()
+
+
+def test_an_l2_pooled_row_is_swapped_in_by_a_forced_miss_of_its_target(tmp_path):
+    """The row landed for target 2 serves row 2's forced miss without a read. Mutant: serve_spec_job pooling under
+    row job.row + 1 instead of config.target -- red (rows_read grows, spec_used 0)."""
+    rig = _l2_job_past_row_1(tmp_path)
+    try:
+        assert rig.host.spec_pump(0)
+        entry = next(e for e in rig.host.spec_pool(2) if e["state"] == "landed")
+        rows = rig.host.counters()["rows_read"]
+        forced(rig, 2, [2])
+        c = rig.host.counters()
+        assert c["spec_used"] == 1 and c["rows_read"] == rows and rig.host.mapping(2)[2] == entry["slot"]
     finally:
         rig.host.stop()
 
