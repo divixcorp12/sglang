@@ -60,7 +60,8 @@ def delays_from_costs(costs: dict[str, dict]) -> dict[str, float]:
 
 
 def replay_budgets(evals: dict[str, dict], *, groups: dict[str, list[R1Group]], plan: r1_plan.RunPlan, windows: dict,
-    view = timing_view(plan, cap=CAP)
+                   delays: dict[str, float]) -> dict:
+    view =timing_view(plan, cap=CAP)
     measured = r1_stage1._timing(evals, groups=groups, plan=view, windows=windows, scorer_delay_ms=dict(delays))
     zero = {name: 0.0 for name in delays}
     zero_delay = r1_stage1._timing(evals, groups=groups, plan=view, windows=windows, scorer_delay_ms=zero)
