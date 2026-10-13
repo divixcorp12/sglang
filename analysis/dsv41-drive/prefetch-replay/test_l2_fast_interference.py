@@ -46,6 +46,16 @@ def test_side_work_runs_on_a_stream_other_than_the_main_stream():
         l2_fast_interference.time_main(main.graphs, None, side=torch.cuda.current_stream(), runs=1, warmup=0)
 
 
+def test_side_graph_overlaps_the_main_replay():
+    """R11: a side graph that finishes before the main GEMMs start (host launch gap) would understate interference."""
+    r = _measure(shapes=[(4096, 4096), (4096, 4096)], runs=40)
+    overlap = r["side_overlap"]
+    assert {"main_alone", "native", "L2_T0", "L2_T3"} <= set(overlap)
+    for arm in ("native", "L2_T0", "L2_T3"):
+        assert overlap[arm]["overlapping_fraction"] >= 0.5, (arm, overlap[arm])
+    assert set(r["main_load"]["implied_bandwidth"]) >= {"gbps", "ceiling_gbps", "plausible"}
+
+
 def test_main_weights_rotate_past_twice_l2():
     """One weight copy resident in L2 would time the load from cache, not HBM."""
     one_mib = 2**20

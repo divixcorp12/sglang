@@ -8,7 +8,8 @@ replay. The main-load shapes are CLI parameters; how representative they are of 
 Inputs: an R1 run dir (stages/l2/result.json names the L2_T0 and L2_T3 checkpoints, verified by sha256).
 Output: --out interference.json {label, scope, main_load, width, runs, gpu, streams, main_alone, native_side,
         native_slowdown_vs_none, models: {L2_T0|L2_T3: {checkpoint_sha256, fused_side, slowdown_vs_native,
-        slowdown_vs_none}}}.
+        slowdown_vs_none}}, side_overlap: {main_alone|native|L2_T0|L2_T3: {queue, ...}}}; main_load carries the
+        implied DRAM bandwidth of the load alone, flagged when above the card's spec.
 Usage: flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 python l2_fast_interference.py
        --run-dir RUN_DIR --out /mnt/nvme1/nvfp4-work/f123-l2-fast-DATE/interference.json --runs 1000 --width 6
 """
@@ -43,13 +44,19 @@ from sglang.kernels.ops.moe import expert_stream_transport as es  # noqa: E402
 from sglang.kernels.ops.moe import spec_head  # noqa: E402
 
 MODELS = ("L2_T0", "L2_T3")
-L2_BYTES = 96 * 2**20
+L2_BYTES = common.L2_BYTES
 EXPERTS = spec_head.HEAD_EXPERTS
 # Arbitrary; one decode layer's dense work (attention projections plus shared expert), no evidence it is exact.
 DEFAULT_SHAPES = "5120x1536,1536x8192,8192x5120,5120x4096,2048x5120"
 SCOPE = ("main stream: one CUDA graph of bf16 GEMMs per weight copy, replayed round-robin; side stream: one CUDA graph "
-         "per layer slot launched at the start of each main replay; only the main stream is timed (CUDA events); "
-         "RTX 5090, graph replay")
+         "per layer slot gated on an event recorded just before each main replay; replays queued in chunks behind a "
+         "GPU sleep so the host launch gap is excluded and side and main start together; only the main stream is "
+         "timed (CUDA events); RTX 5090, graph replay")
+OVERLAP_SCOPE = ("per arm: the queue used (chunk, final sleep ms, redone chunks) and, with side work, side-graph events "
+                 "on the side stream relative to the main start event: median start lag, median side ms and the "
+                 "fraction of replays whose side graph ran inside the main replay's window")
+BANDWIDTH_SCOPE = ("one weight copy's bytes (one main replay reads one copy) over the main_alone median; a lower "
+                   "bound on DRAM traffic, compared against the RTX 5090's spec")
 MAIN_LABEL = f"{common.HYPOTHESIS}: shapes are a guess at one decode layer's dense work"
 
 
@@ -182,35 +189,61 @@ def _check_side(side: torch.cuda.Stream) -> None:
 
 
 def time_main(main: list[torch.cuda.CUDAGraph], side_graphs: list[torch.cuda.CUDAGraph] | None, *,
-              side: torch.cuda.Stream, runs: int, warmup: int) -> dict:
-    """Median/p90/p99 ms of a main replay with ``side_graphs`` (or nothing) launched alongside, on ``side``."""
+              side: torch.cuda.Stream, runs: int, warmup: int) -> tuple[dict, dict]:
+    """(main replay median/p90/p99 ms, queue and side overlap) with ``side_graphs`` (or nothing) launched on ``side``.
+
+    Replays are queued behind a GPU sleep, so the side and main graphs start together on release of the gate event.
+    """
     _check_side(side)
     mains = torch.cuda.current_stream()
+    side_events: dict[int, tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] = {}
 
     def one(i: int, start: torch.cuda.Event | None, stop: torch.cuda.Event | None) -> None:
         gate = torch.cuda.Event()
         gate.record(mains)
         if side_graphs is not None:
             side.wait_event(gate)
+            timed = start is not None
+            if timed:
+                side_events[i] = (start, torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                side_events[i][1].record(side)
             with torch.cuda.stream(side):
                 side_graphs[i % len(side_graphs)].replay()
+            if timed:
+                side_events[i][2].record(side)
         if start is not None:
             start.record(mains)
         main[i % len(main)].replay()
         if stop is not None:
             stop.record(mains)
+        if side_graphs is not None:
+            # Next gate waits for this side replay, so the side stream cannot fall behind and miss its main replay.
+            joined = torch.cuda.Event()
+            joined.record(side)
+            mains.wait_event(joined)
 
     for i in range(warmup):
         one(i, None, None)
     torch.cuda.synchronize()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(runs)]
-    stops = [torch.cuda.Event(enable_timing=True) for _ in range(runs)]
-    for i in range(runs):
-        one(i, starts[i], stops[i])
-    torch.cuda.synchronize()
-    ms = np.array([a.elapsed_time(b) for a, b in zip(starts, stops)], dtype=np.float64)
-    return {"median_ms": float(np.median(ms)), "p90_ms": float(np.percentile(ms, 90)),
-            "p99_ms": float(np.percentile(ms, 99)), "runs": runs, "graphs": len(main)}
+    ms, queue = common.queued_times(one, runs=runs)
+    stats = {**common.summarize(ms), "runs": runs, "graphs": len(main)}
+    if side_graphs is None:
+        return stats, {"queue": queue}
+    return stats, {"queue": queue, **_overlap(side_events, main_ms=ms)}
+
+
+def _overlap(side_events: dict, *, main_ms: np.ndarray) -> dict:
+    """Side replay timing relative to its main replay's start event; overlapping = side ran inside the main window."""
+    lag, end, side_ms = [], [], []
+    for i in range(len(main_ms)):
+        main_start, side_start, side_stop = side_events[i]
+        lag.append(main_start.elapsed_time(side_start))
+        end.append(main_start.elapsed_time(side_stop))
+        side_ms.append(side_start.elapsed_time(side_stop))
+    lag_a, end_a = np.array(lag), np.array(end)
+    overlapping = (lag_a < main_ms) & (end_a > 0.0)
+    return {"side_start_lag_ms_median": float(np.median(lag_a)), "side_ms_median": float(np.median(side_ms)),
+            "overlapping_fraction": float(overlapping.mean())}
 
 
 def serving_row(model: r1_models.R1Model) -> tuple[l2_fast_torch.FoldRow, ...]:
@@ -238,24 +271,30 @@ def measure(*, heads: dict[str, tuple[l2_fast_torch.FoldedHead, str]], shapes: l
     inputs = build_side_inputs(slots=slots, width=width, device=device)
     side = torch.cuda.Stream()
     streams = {"main_stream_ptr": int(torch.cuda.current_stream().cuda_stream), "side_stream_ptr": int(side.cuda_stream)}
-    alone = time_main(main.graphs, None, side=side, runs=runs, warmup=warmup)
-    native = time_main(main.graphs, native_graphs(inputs, width=width, device=device), side=side, runs=runs,
-                       warmup=warmup)
-    models = {}
+    alone, alone_q = time_main(main.graphs, None, side=side, runs=runs, warmup=warmup)
+    native, native_q = time_main(main.graphs, native_graphs(inputs, width=width, device=device), side=side,
+                                 runs=runs, warmup=warmup)
+    models, overlap = {}, {"main_alone": alone_q, "native": native_q}
     for name, (folded, sha) in heads.items():
         head = l2_fast_kernels.KernelHead(folded, device=device)
-        fused = time_main(main.graphs, fused_graphs(inputs, head=head, device=device), side=side, runs=runs,
-                          warmup=warmup)
+        fused, overlap[name] = time_main(main.graphs, fused_graphs(inputs, head=head, device=device), side=side,
+                                         runs=runs, warmup=warmup)
         models[name] = {"checkpoint_sha256": sha, "fused_side": fused,
                         "slowdown_vs_native": fused["median_ms"] / native["median_ms"] - 1.0,
                         "slowdown_vs_none": fused["median_ms"] / alone["median_ms"] - 1.0}
+    bandwidth = common.implied_bandwidth(moved_bytes=main.bytes_per_copy, median_ms=alone["median_ms"])
+    if not bandwidth["plausible"]:
+        print(f"WARNING: main load implies {bandwidth['gbps']:.0f} GB/s, above the {common.DRAM_GBPS:.0f} GB/s spec; "
+              "it is timing L2, not DRAM", file=sys.stderr)
     return {
         "label": common.OBSERVED, "scope": SCOPE,
         "main_load": {"label": MAIN_LABEL, "shapes": main.shapes, "tokens": main_tokens,
-                      "bytes": main.bytes_per_copy, "copies": main.copies, "rotated_bytes": main.bytes_per_copy * main.copies},
+                      "bytes": main.bytes_per_copy, "copies": main.copies, "rotated_bytes": main.bytes_per_copy * main.copies,
+                      "implied_bandwidth": {**bandwidth, "label": common.OBSERVED, "scope": BANDWIDTH_SCOPE}},
         "width": width, "runs": runs, "slots": slots, "gpu": torch.cuda.get_device_name(), "streams": streams,
         "main_alone": alone, "native_side": native,
         "native_slowdown_vs_none": native["median_ms"] / alone["median_ms"] - 1.0, "models": models,
+        "side_overlap": {**overlap, "label": common.OBSERVED, "scope": OVERLAP_SCOPE},
     }
 
 
