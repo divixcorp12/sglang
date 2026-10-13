@@ -9866,8 +9866,8 @@ as its own parity section. A cold JIT build of
 **Gate checks** (merged feature; unit and kernel tests only, no divix01 measurement run): `py_compile` of the new
 modules exit 0; `check_no_bare_pytest_main.py` exit 0; CPU tests (`test_l2_fast_{common,torch,metrics,report}.py` and
 siblings) 59 passed, exit 0; GPU tests (`--gpu`, `test_l2_fast_{kernels,parity,profile,cost,...}.py`) 275 passed, exit 0.
-Typecheck was not run by the gate. These are test results, not measurements: the cells below stay `pending` because the
-gate did not run `l2_fast_run.sh`.
+Typecheck was not run by the gate. These are test results, not measurements; the measurements below come from the
+divix01 run named in the status line.
 
 **Results** (observed offline; from `OUT/result.json`; times in us):
 
