@@ -386,6 +386,123 @@ struct SpecHeadKernel {
       tvm::ffi::TensorView block_scores,
       tvm::ffi::TensorView features,
       tvm::ffi::TensorView record) {
+    launch_chain(
+        x, scores, src_ids, src_w, positions, w_pca, w_in_pca, b_in, w_in_sparse, row_bias, pos_bias, w_r1, b_r1,
+        w_r2, b_r2, w_gate, b_gate, w_out, b_out, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity,
+        ram_slot, target, threshold, h, pre, hid, logits, block_scores, features, &record, nullptr, 0);
+  }
+
+  /// \brief `run`'s four launches, publishing to the post's slot of the pinned candidate page as spec_score.cuh's
+  /// select kernel does: slot (state[kPosted] - 1) % kCandRecords, read on the device so a captured graph stays correct,
+  /// the seq stored last. Takes the inputs of `run` less `record`, plus the two below; nothing syncs the host.
+  /// \param state int32 [kStateWords]: the post's device words; kPosted is the record's seq.
+  /// \param candidates_address The pinned candidate page's address: nonzero and 128-byte aligned.
+  static void serve(
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView scores,
+      tvm::ffi::TensorView src_ids,
+      tvm::ffi::TensorView src_w,
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView w_pca,
+      tvm::ffi::TensorView w_in_pca,
+      tvm::ffi::TensorView b_in,
+      tvm::ffi::TensorView w_in_sparse,
+      tvm::ffi::TensorView row_bias,
+      tvm::ffi::TensorView pos_bias,
+      tvm::ffi::TensorView w_r1,
+      tvm::ffi::TensorView b_r1,
+      tvm::ffi::TensorView w_r2,
+      tvm::ffi::TensorView b_r2,
+      tvm::ffi::TensorView w_gate,
+      tvm::ffi::TensorView b_gate,
+      tvm::ffi::TensorView w_out,
+      tvm::ffi::TensorView b_out,
+      tvm::ffi::TensorView agg_w1,
+      tvm::ffi::TensorView agg_row_bias,
+      tvm::ffi::TensorView agg_w2,
+      tvm::ffi::TensorView agg_b2,
+      int64_t row,
+      tvm::ffi::TensorView hot_slots,
+      int64_t hot_capacity,
+      tvm::ffi::TensorView ram_slot,
+      int64_t target,
+      tvm::ffi::TensorView threshold,
+      tvm::ffi::TensorView h,
+      tvm::ffi::TensorView pre,
+      tvm::ffi::TensorView hid,
+      tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView block_scores,
+      tvm::ffi::TensorView features,
+      tvm::ffi::TensorView state,
+      int64_t candidates_address) {
+    launch_chain(
+        x, scores, src_ids, src_w, positions, w_pca, w_in_pca, b_in, w_in_sparse, row_bias, pos_bias, w_r1, b_r1,
+        w_r2, b_r2, w_gate, b_gate, w_out, b_out, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity,
+        ram_slot, target, threshold, h, pre, hid, logits, block_scores, features, nullptr, &state,
+        candidates_address);
+  }
+
+  /// \brief Publishes count 0 with kCandFlagOversize to the post's slot: the record has no x, or tokens outside
+  /// 1..kHeadMaxTokens, as spec_score.cuh's select does for an oversize record. One thread, no host sync.
+  /// \param state int32 [kStateWords]: the post's device words; kPosted is the record's seq.
+  /// \param candidates_address The pinned candidate page's address: nonzero and 128-byte aligned.
+  static void serve_empty(tvm::ffi::TensorView state, int64_t candidates_address) {
+    using namespace host;
+    using namespace device::expert_stream;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    expert_stream::verify_named(
+        "state", TensorMatcher({kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    RuntimeCheck(
+        candidates_address != 0 && candidates_address % 128 == 0, "candidates: a nonzero 128-byte aligned address");
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    LaunchKernel(dim3(1), dim3(1), stream)(
+        spec_head_empty_kernel,
+        static_cast<const int32_t*>(state.data_ptr()),
+        reinterpret_cast<uint8_t*>(candidates_address));
+  }
+
+ private:
+  // Checks everything, then K1-K4. Exactly one of `record` (offline: slot 0, seq 1) and `state` (serving) is set.
+  static void launch_chain(
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView scores,
+      tvm::ffi::TensorView src_ids,
+      tvm::ffi::TensorView src_w,
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView w_pca,
+      tvm::ffi::TensorView w_in_pca,
+      tvm::ffi::TensorView b_in,
+      tvm::ffi::TensorView w_in_sparse,
+      tvm::ffi::TensorView row_bias,
+      tvm::ffi::TensorView pos_bias,
+      tvm::ffi::TensorView w_r1,
+      tvm::ffi::TensorView b_r1,
+      tvm::ffi::TensorView w_r2,
+      tvm::ffi::TensorView b_r2,
+      tvm::ffi::TensorView w_gate,
+      tvm::ffi::TensorView b_gate,
+      tvm::ffi::TensorView w_out,
+      tvm::ffi::TensorView b_out,
+      tvm::ffi::TensorView agg_w1,
+      tvm::ffi::TensorView agg_row_bias,
+      tvm::ffi::TensorView agg_w2,
+      tvm::ffi::TensorView agg_b2,
+      int64_t row,
+      tvm::ffi::TensorView hot_slots,
+      int64_t hot_capacity,
+      tvm::ffi::TensorView ram_slot,
+      int64_t target,
+      tvm::ffi::TensorView threshold,
+      tvm::ffi::TensorView h,
+      tvm::ffi::TensorView pre,
+      tvm::ffi::TensorView hid,
+      tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView block_scores,
+      tvm::ffi::TensorView features,
+      const tvm::ffi::TensorView* record,
+      const tvm::ffi::TensorView* state,
+      int64_t candidates_address) {
     using namespace host;
     using namespace device::expert_stream;
     auto device = SymbolicDevice{};
@@ -460,7 +577,7 @@ struct SpecHeadKernel {
     RuntimeCheck(!position || tokens <= W_.unwrap(), "pos_bias: no entry for this width");
     const auto tail = tail_params(
         logits, positions, tokens, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity, ram_slot,
-        target, threshold, block_scores, features, record, device, E_, T_);
+        target, threshold, block_scores, features, record, state, candidates_address, device, E_, T_);
     RuntimeCheck(!has_aggregator(agg_w1) || agg_row_bias.size(0) == rows, "agg_row_bias: not row_bias's rows");
     const int64_t experts = E_.unwrap();
     const int64_t widths = position ? W_.unwrap() : 0;
@@ -522,6 +639,7 @@ struct SpecHeadKernel {
     LaunchKernel(dim3(1), dim3(kHeadTailThreads), stream)(spec_head_tail_kernel, tail);
   }
 
+ public:
   /// \brief Launches the tail alone over precomputed token logits: the block score, sigmoid, skips, threshold and
   /// the cap-1 record, as `run`'s last launch.
   /// \param logits fp32 [kHeadMaxTokens, experts]: token logits, rows 0..tokens-1 live.
@@ -564,7 +682,7 @@ struct SpecHeadKernel {
     RuntimeCheck(tokens >= 1 && tokens <= kHeadMaxTokens, "positions: 1..", kHeadMaxTokens, " tokens");
     const auto params = tail_params(
         logits, positions, tokens, agg_w1, agg_row_bias, agg_w2, agg_b2, row, hot_slots, hot_capacity, ram_slot,
-        target, threshold, block_scores, features, record, device, E_, T_);
+        target, threshold, block_scores, features, &record, nullptr, 0, device, E_, T_);
     const auto stream = LaunchKernel::resolve_device(logits.device());
     LaunchKernel(dim3(1), dim3(kHeadTailThreads), stream)(spec_head_tail_kernel, params);
   }
@@ -601,7 +719,9 @@ struct SpecHeadKernel {
       tvm::ffi::TensorView threshold,
       tvm::ffi::TensorView block_scores,
       tvm::ffi::TensorView features,
-      tvm::ffi::TensorView record,
+      const tvm::ffi::TensorView* record,
+      const tvm::ffi::TensorView* state,
+      int64_t candidates_address,
       host::SymbolicDevice& device,
       host::SymbolicSize& E_,
       host::SymbolicSize& T_) {
@@ -652,17 +772,27 @@ struct SpecHeadKernel {
           "features",
           TensorMatcher({E_, kBlockFeatures}).with_dtype<fp32_t>().with_device<kDLCUDA>(device),
           features);
-    expert_stream::verify_named(
-        "record", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCUDA, kDLCUDAHost>(record_mem), record);
     RuntimeCheck(
-        all_contiguous({logits, positions, hot_slots, ram_slot, block_scores, record}) &&
-            (!with_features || features.is_contiguous()),
+        (record != nullptr) != (state != nullptr), "spec_head: exactly one of record (offline) and state (serving)");
+    if (record != nullptr)
+      expert_stream::verify_named(
+          "record", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCUDA, kDLCUDAHost>(record_mem), *record);
+    else {
+      expert_stream::verify_named(
+          "state", TensorMatcher({kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), *state);
+      RuntimeCheck(
+          candidates_address != 0 && candidates_address % 128 == 0, "candidates: a nonzero 128-byte aligned address");
+    }
+    RuntimeCheck(
+        all_contiguous({logits, positions, hot_slots, ram_slot, block_scores}) &&
+            (record == nullptr || record->is_contiguous()) && (!with_features || features.is_contiguous()),
         "spec_head tail: every tensor must be contiguous");
     const int64_t experts = E_.unwrap();
     RuntimeCheck(experts >= kSpecDepth && experts <= kHeadMaxExperts, "experts: ", kSpecDepth, "..", kHeadMaxExperts);
     RuntimeCheck(hot_capacity >= 0 && hot_capacity <= hot_slots.size(0), "hot_capacity: at most hot_slots' size");
     RuntimeCheck(target >= 0 && target < Rows_.unwrap(), "target: outside the map bank");
-    RuntimeCheck(record.size(0) >= Cand::kCandStride, "record: at least ", Cand::kCandStride, " bytes");
+    RuntimeCheck(
+        record == nullptr || record->size(0) >= Cand::kCandStride, "record: at least ", Cand::kCandStride, " bytes");
     SpecHeadTailParams p{};
     p.logits = static_cast<decltype(p.logits)>(logits.data_ptr());
     p.positions = static_cast<decltype(p.positions)>(positions.data_ptr());
@@ -679,7 +809,12 @@ struct SpecHeadKernel {
     p.threshold = static_cast<decltype(p.threshold)>(threshold.data_ptr());
     p.block_scores = static_cast<decltype(p.block_scores)>(block_scores.data_ptr());
     p.features = with_features ? static_cast<decltype(p.features)>(features.data_ptr()) : nullptr;
-    p.record = static_cast<decltype(p.record)>(record.data_ptr());
+    if (record != nullptr) {
+      p.record = static_cast<decltype(p.record)>(record->data_ptr());
+    } else {
+      p.state = static_cast<decltype(p.state)>(state->data_ptr());
+      p.candidates = reinterpret_cast<decltype(p.candidates)>(candidates_address);
+    }
     return p;
   }
 };
