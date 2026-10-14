@@ -334,6 +334,19 @@ def test_a_landed_row_with_no_delta_waiting_counts_no_delta_and_stays_landed(tmp
         rig.host.stop()
 
 
+def test_two_groups_count_each_landed_row_with_no_delta_once(tmp_path):
+    """One landed row in each group's pool, no delta pending, both groups serve row 0's record: no_delta is 2. Mutant:
+    each group counts every group's entries -- red on 4."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        rig.host.spec_place(1, 4)
+        rig.host.spec_place(1, 3)
+        load(rig, 0, [1])
+        assert rig.host.counters()["spec_promote_no_delta"] == 2
+    finally:
+        rig.host.stop()
+
+
 def test_the_group_that_loses_the_claim_does_not_count_the_leftovers_as_no_delta(tmp_path):
     """Two groups serve row 0's record; the winner claims row 1's delta and leaves 4 landed (no victim), the loser finds
     the word empty. Mutant: count no_delta on every lost claim -- red on no_delta 1."""

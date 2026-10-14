@@ -2721,14 +2721,14 @@ class RamTier {
     return promoted;
   }
 
-  // Trigger 1 found no delta waiting for `row`: its landed pool rows stay unpromoted, one count each.
+  // Trigger 1 found no delta waiting for `row`: its landed pool rows stay unpromoted, one count each. Every group serves
+  // the record, so each counts only its own pool entries.
   void count_landed_no_delta(Group& claimer, int64_t row) {
-    for (int g = 0; g < dist_.size(); ++g) {
-      std::lock_guard<std::mutex> lock(pool_->mutex(g));
-      for (int i = 0; i < pool_->share(); ++i)
-        if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_relaxed)) == kPoolLanded)
-          count<kSpecPromoteNoDelta>(claimer);
-    }
+    const int g = claimer.index;
+    std::lock_guard<std::mutex> lock(pool_->mutex(g));
+    for (int i = 0; i < pool_->share(); ++i)
+      if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_relaxed)) == kPoolLanded)
+        count<kSpecPromoteNoDelta>(claimer);
   }
 
   // Maps landed pool rows of `row` into its claimed delta (evicting a victim each), counts into the claimer's block,
