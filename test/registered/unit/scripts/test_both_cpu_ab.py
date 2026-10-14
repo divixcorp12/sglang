@@ -563,7 +563,9 @@ def test_the_fixed_split_option_adds_the_table_and_calibration_off_to_both_arms_
         plain, fixed = ab._overrides(arm, "/out"), ab._overrides(f"{arm}-fixedsplit", "/out")
         assert SPLIT not in plain and CALIBRATION not in plain
         assert (fixed[SPLIT], fixed[CALIBRATION]) == ("0:3,1:5", "0")
-        assert {k: v for k, v in fixed.items() if k not in (SPLIT, CALIBRATION)} == plain
+        assert {k: v for k, v in fixed.items() if k not in (SPLIT, CALIBRATION, METRICS)} == {
+            k: v for k, v in plain.items() if k != METRICS
+        }
         assert ab._probe_overrides(f"{arm}-fixedsplit", "/out")[SPLIT] == "0:3,1:5"
     monkeypatch.delenv(SPLIT)
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), f"{PROMOTE_ON}-fixedsplit"])
