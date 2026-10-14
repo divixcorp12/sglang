@@ -120,6 +120,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "inject_group_stall",
     "spec_place",
     "spec_pump",
+    "hold_row",
     "inject_spec",
     "inject_demand_load",
     "copy_engine_fail",
@@ -1448,6 +1449,15 @@ COUNTERS = (
     "spec_abandoned",
     "spec_boosted",
     "spec_moved_root",
+    "spec_promoted_early",
+    "spec_promote_no_delta",
+    "spec_promote_no_room",
+    "spec_promote_no_victim",
+    "spec_promote_victim_routed",
+    "spec_promote_used",
+    "spec_promote_reading",
+    "spec_publish_backstop",
+    "spec_promote_row_busy",
     "spec_scored",
     "spec_score_ns",
 )
@@ -1482,6 +1492,15 @@ CORE_COUNTERS = (
     "spec_abandoned",
     "spec_boosted",
     "spec_moved_root",
+    "spec_promoted_early",
+    "spec_promote_no_delta",
+    "spec_promote_no_room",
+    "spec_promote_no_victim",
+    "spec_promote_victim_routed",
+    "spec_promote_used",
+    "spec_promote_reading",
+    "spec_publish_backstop",
+    "spec_promote_row_busy",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -2153,6 +2172,7 @@ class ExpertStreamHost:
         idle_deadline_s: float = 0.004,
         idle_spread: bool = False,
         idle_pieces: int = 1,
+        promote: bool = False,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
@@ -2166,7 +2186,10 @@ class ExpertStreamHost:
         one; off, the speculative reads take turns with the demand reads on the group's reader. With it,
         ``idle_spread`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
         rotating from row to row, and ``idle_pieces`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
-        row's pieces may be in flight at once."""
+        row's pieces may be in flight at once.
+
+        ``promote`` (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
+        that layer's map delta, so the device types them as RAM hits."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:
@@ -2243,6 +2266,7 @@ class ExpertStreamHost:
             idle_deadline_ns,
             int(bool(idle_spread)),
             int(idle_pieces),
+            int(bool(promote)),
         )
         self.ram_prefetch_tensors = (gates, bias, candidates, min_margin)
 
@@ -2701,6 +2725,12 @@ class ExpertStreamHost:
         _refuse_test_only("spec_place", self.variant)
         self._check(row, expert)
         return int(self._module.expert_stream_spec_place(self.handle, row, expert))
+
+    def hold_row(self, row: int, group: int, hold: bool = True) -> None:
+        """Test only: a helper thread holds ``group``'s row lock of ``row`` until a call with ``hold=False``, so a
+        promotion claim finds the row busy. Never serve ``row`` while it is held."""
+        _refuse_test_only("hold_row", self.variant)
+        self._module.expert_stream_hold_row(self.handle, int(row), int(group), int(hold))
 
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.

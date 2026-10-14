@@ -145,6 +145,8 @@ struct RamPrefetchConfig {
   bool idle_spread = false;
   int idle_pieces = 1;
   static constexpr int kMaxIdlePieces = 4;
+  // SGLANG_DSV41_RAM_PREFETCH_PROMOTE: landed pool rows are mapped into the target layer's map delta before its record.
+  bool promote = false;
 };
 
 // The GPU scorer's wait for a record's candidate slot: spin, then sleep in steps (the speculative thread may share its

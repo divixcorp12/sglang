@@ -230,6 +230,37 @@ lane 31 is bit 31.
 A record with no lanes only stamps recency. A record with lanes reads its hot sidecar: if the sidecar
 was lapped, an all-`HIT_SM` record is counted as an overrun and skipped, and any other record fails stop.
 
+**Deferred publication (`SGLANG_DSV41_RAM_PREFETCH_PROMOTE=1`).** With the flag off, step 3 publishes the delta as
+above and nothing here applies. With it on, rows that some source row targets (`RamPrefetchConfig::target`; row 0 and
+untargeted rows publish immediately) change step 3:
+
+- **Stash.** The record's combined entries, count and chain are held in the `NumaNodeDistributor` (a pending word per
+  row, claimed by CAS) instead of being written. The previous delta of that row must still be chain - 1, else the
+  record fails.
+- **Row r-1's write.** The serve of row r-1's record in the next forward claims row r's pending delta, writes it
+  through the same `write()` (entries before the tag), then releases its swapped victims. This runs in
+  `RamTier::pump_demand` for every record that is not torn, before `handle_record` and on the lapped-hot skip path.
+- **Backstop.** The same place publishes any pending delta of row r or an earlier row that was stashed in an earlier
+  forward (the forward counter advances when the row number does not increase); a delta stashed in the caller's own
+  forward, as another group's serve of the same record finds it, is left for row r-1's serve. The claim checks the
+  stash's forward against the word it CASes, so a delta re-stashed meanwhile is never taken. It is counted in
+  `spec_publish_backstop`. A delta is therefore written before row r's next record is served, and no later than the
+  device's deadline allows.
+- **No delta.** A group that loses row r-1's claim counts row r's landed entries in `spec_promote_no_delta` only when
+  no delta is pending and no group's serve of the same forward claimed one, and only its own pool's entries.
+- **Write order.** The claimer copies the entries, frees the pending word, then writes: once the tag is out the device
+  may post row r's next record, whose stash must find the word free.
+- **Promotion at publish.** The claimer, before writing, maps landed pool rows of row r into the delta: each takes a
+  victim (no wanted list), appends the victim's unmap and the expert's `{expert, pool slot}`, and the pool entry becomes
+  swapped holding the victim until this delta is written. A delta never exceeds `Wire::kDeltaMaxEntries`; what does
+  not fit is skipped and counted. Only a delta already pending can carry promotions, so the device types the promoted
+  expert as a hit at row r's next post.
+- **Row lock.** `NumaGroup::row_mutex[row]` is per (row, group). The group's service thread takes row_mutex, then the
+  pool mutex, while it touches row r's tier. The claimer takes the pool mutex, then try_locks row_mutex; when the row
+  is busy it leaves that group's entries landed and counts each in `spec_promote_row_busy`.
+- **Trace.** Each deferred write emits `delta_publish` (row, chain, trigger 0 immediate, 1 row r-1's serve, 2 backstop,
+  3 flush; promoted count).
+
 ## Deltas and the bulk delta
 
 The decode chain's map changes travel only as per-row deltas, one per record with a miss, numbered by `map_chain`.
@@ -240,6 +271,11 @@ The eager paths (prefill fills, `assign`, `release`) change the tier with the se
 ends equal to the host's. The host publishes each row's first delta (tag 1: its staging slots) when the service starts
 (`reserve_staging`: the first `min(8, capacity - 1)` slots of every row, taken before any slot is filled), so it evicts
 nothing and needs no bulk entry.
+
+With deferred publication, every pending delta is written before a caller takes the tier: `RamThread::pause` flushes
+after the service threads park, `stop` after they join, and `bulk_delta_count` (so `take_bulk_delta`) before the
+bulk is counted (`RamTier::flush_pending`, trigger 3). `map_bulk_apply` skips an unwritten tag, so a missed flush
+would leave the device map behind the host's.
 
 ## Why it is safe without leases
 
@@ -255,6 +291,10 @@ staging only as a victim. So the question is whether a victim can still be read 
    post.
 4. **Not by the eager paths.** They run with the service paused and the stream synchronized
    (`before_host_use`/`after_host_use`), and read through the host mirror, which shows a row only once it landed.
+
+**Deferred publication keeps this.** A deferred delta is written before row r-1's next gate opens, so the device
+has it at row r's next post: the chain check at that post sees every unmap the host made, and a promoted victim is
+unmapped there, before any later record can read it.
 
 A miss's bytes are read only after they land: S waits for PieceMask, the CPU's late job for the read, and the next
 post maps the staging slot only after this chain, and so its reads, ended.
@@ -337,7 +377,8 @@ secondary be scheduled.
 1. **`_establish_gpu_completion`:** a device barrier while the service still serves, so every in-flight chain
    finishes normally.
 2. **`close_admission`,** a host flag.
-3. **`stop`:** opens any closed gate, then joins the service thread and the watchdog. The copy and CPU threads end
+3. **`stop`:** opens any closed gate, then joins the service thread and the watchdog, then flushes every pending
+   deferred delta (a no-op with the promote flag off). The copy and CPU threads end
    when the tier is destroyed after `close`.
 4. **Free the slabs.**
 
@@ -351,6 +392,10 @@ shutdown; it waits for its deadline, where it traps (`test_exl3_slot_map_kernels
   Python reference): `test/registered/unit/kernels/test_exl3_ram_miss_*.py`, chiefly `test_exl3_ram_miss_slot_map.py`
   and `test_ram_slot_map.py`. Every failure is a subprocess that must die of SIGABRT with its FATAL line
   (`run_host_script`, `assert_aborted` in `python/sglang/test/dsv41_ram_miss_fixtures.py`).
+- **Promotion** (CPU, `test_exl3_ram_prefetch_swap.py` for promotion and release, `test_exl3_ram_prefetch_step.py` for
+  publication order, backstop, flush and the promote counters): the typed kinds come from `ChainSim.post`. The GPU
+  case, a promoted expert typed as a hit by the real post, is a new `test/manual/dsv41/*_cuda.py` on
+  `lease_chain_rig.py`.
 - **GPU** (`test/manual/dsv41/`, the production chain against the real service through `lease_chain_rig.py`):
   - `test_exl3_slot_map_kernels_cuda.py`: the CUDA typing against the reference (200 random maps per switch), a delta
     applied once, the deadline trap, a miss streamed from staging;

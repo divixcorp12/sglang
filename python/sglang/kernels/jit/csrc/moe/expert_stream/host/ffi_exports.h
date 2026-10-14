@@ -757,6 +757,7 @@ struct HostExports {
   // the caller's affinity). Cores 64-71 are refused. `min_margin` float32 [rows] (GPU scorer only), per target row the
   // least margin a candidate needs, or [0]: no floors. `idle_deadline_ns` > 0: idle-drive speculative reads
   // (RamPrefetchConfig::idle_deadline_ns), 0: the shared reader; `idle_spread` and `idle_pieces` shape them.
+  // `promote` != 0: RamPrefetchConfig::promote.
   static void enable_ram_prefetch(
       int64_t handle,
       TensorView targets,
@@ -772,7 +773,8 @@ struct HostExports {
       TensorView min_margin,
       int64_t idle_deadline_ns,
       int64_t idle_spread,
-      int64_t idle_pieces) {
+      int64_t idle_pieces,
+      int64_t promote) {
     using namespace host;
     using Cand = expert_stream::wire::SpecCandidates;
     auto cpu = SymbolicDevice{};
@@ -826,6 +828,7 @@ struct HostExports {
     config.min_margin.assign(floors, floors + min_margin.size(0));
     config.idle_deadline_ns = idle_deadline_ns;
     config.idle_spread = idle_spread != 0;
+    config.promote = promote != 0;
     // Clamped into one past the bound, so a value beyond int's range is refused rather than wrapped into it.
     config.idle_pieces = static_cast<int>(std::clamp<int64_t>(idle_pieces, 0, RamPrefetchConfig::kMaxIdlePieces + 1));
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());

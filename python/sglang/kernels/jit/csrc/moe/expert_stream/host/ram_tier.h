@@ -161,6 +161,7 @@ class RamTier {
   // and the counter blocks, so it must stop before they are destroyed; the CPU thread stops last because the copy
   // thread reads its done().
   ~RamTier() {
+    release_row_hold();
     stop_spec();  // the speculative threads read through the groups' readers into the pool's slabs
     fill_join();  // the fill thread reads through group 0's reader into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
@@ -291,6 +292,7 @@ class RamTier {
         }
       }
       if (spec_ != nullptr) note_serving(group, request);
+      if (promote_) publish_due(group, request);
       if (!skip) handle_record(group, request);
       // Every group sees the record, served or skipped, so both groups score the same jobs.
       if (spec_ != nullptr) offer_spec(group, request);
@@ -1164,8 +1166,24 @@ class RamTier {
       }
       spec->groups.push_back(std::move(group));
     }
+    if (config.promote) {
+      // Row r defers its delta when some source targets it; row 0 and untargeted rows publish at once.
+      std::vector<uint8_t> deferred(static_cast<size_t>(layers_), 0);
+      for (int64_t row = 0; row < layers_; ++row)
+        if (config.target[row] > 0) deferred[config.target[row]] = 1;
+      dist_.set_deferred(std::move(deferred));
+      promote_ = true;
+    }
     spec->config = std::move(config);
     spec_ = std::move(spec);
+  }
+
+  // Writes every pending deferred delta; the bulk apply kernel skips an unwritten tag. Owner only, once the service
+  // threads are parked or joined. A no-op with the flag off.
+  void flush_pending() {
+    if (!promote_) return;
+    for (int64_t row = 0; row < layers_; ++row)
+      if (dist_.deferred(row)) publish_pending(dist_.group(0), Request{}, row, 3);
   }
 
   // The number of eager-path map changes since the last take, {row, expert, slot} each with slot -1 an unmap: the bulk
@@ -1175,6 +1193,7 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("bulk_delta_count");
     fill_join();
+    flush_pending();
     return static_cast<int64_t>(bulk_.size());
   }
 
@@ -1357,6 +1376,27 @@ class RamTier {
     std::vector<uint8_t> packed;
     if (land_pool_row(g, row, i, id, &packed) != 1) throw std::runtime_error(prefix + "the read failed");
     return pool_->entry(row, g, i).slot;
+  }
+
+  // Test only (InstrBuild): with `hold`, a helper thread takes group g's row_mutex[row] and keeps it until the next call;
+  // the call without `hold` only releases it. Serving `row` meanwhile would block on the lock.
+  void hold_row(int64_t row, int g, bool hold)
+    requires(Build::kFaults)
+  {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    release_row_hold();
+    if (!hold) return;
+    row_capacity(row);
+    if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
+    row_held_.store(false, std::memory_order_relaxed);
+    row_hold_release_.store(false, std::memory_order_relaxed);
+    row_holder_ = std::thread([this, row, g] {
+      std::lock_guard<std::mutex> lock(dist_.group(g).row_mutex[row]);
+      row_held_.store(true, std::memory_order_release);
+      while (!row_hold_release_.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!row_held_.load(std::memory_order_acquire)) std::this_thread::yield();
   }
 
   // Test only (InstrBuild): serves group g's next speculative job on the caller, as its speculative thread would;
@@ -2001,7 +2041,9 @@ class RamTier {
   // that is not VRAM-hot, not routed by this record (`wanted`), and not filling. Its expert is unmapped on the host
   // mirror (the device learns it from the delta) and returned in `old` (-1 for a free slot). Returns -1 when none
   // qualifies: the miss is read into its staging slot but not cached.
-  int64_t take_victim_locked(Group& group, int64_t row, std::span<const int32_t> wanted, int32_t* old) {
+  // `count_eviction` false: a promotion's pick, run by another group's thread, which must not count into this block.
+  int64_t take_victim_locked(
+      Group& group, int64_t row, std::span<const int32_t> wanted, int32_t* old, bool count_eviction = true) {
     Tier& tier = tiers_[row];
     GroupRow& own = group.rows[row];
     *old = -1;
@@ -2021,7 +2063,7 @@ class RamTier {
     tier.expert_slot[*old] = -1;
     tier.slot_to_expert[best] = -1;
     disown_locked(own, tier, best);
-    count<kEvictions>(group);
+    if (count_eviction) count<kEvictions>(group);
     return best;
   }
 
@@ -2085,6 +2127,7 @@ class RamTier {
     const bool cpu_row = host_lanes && group.cpu != nullptr && group.cpu->eligible(request.row);
     CopyJob& job = plan->job;
     GroupRow& own = group.rows[request.row];
+    const bool judging = own.promoted_chain != 0;  // the row's last promotion is judged on this record
     for (size_t j = 0; j < request.lanes.size(); ++j) {
       const Lane& lane = request.lanes[j];
       if (Wire::home(lane.expert) != group.index) continue;  // another group's lane
@@ -2112,6 +2155,7 @@ class RamTier {
             group.trace.emit("miss_expert", request.row, request.gen, request.seq, group.index, lane.expert,
                              static_cast<int64_t>(j));
         }
+        if (judging && listed(own.promote_evicted, lane.expert)) count<kSpecPromoteVictimRouted>(group);
         plan->missing.push_back(lane.expert);
         plan->slots.push_back(lane.slot);
         plan->miss_lane.push_back(static_cast<int32_t>(j));
@@ -2123,6 +2167,7 @@ class RamTier {
       }
       tier.stamp[lane.slot] = ++group.tick;
       disown_locked(own, tier, lane.slot);
+      if (judging && listed(own.promoted, lane.expert)) count<kSpecPromoteUsed>(group);
       if (lane.kind == Wire::kKindHitCopy) {
         if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst))
           fail(": a copy-engine lane on an ineligible row");
@@ -2134,6 +2179,11 @@ class RamTier {
       }
       job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
       job.mask |= Wire::LaneMask{1} << j;
+    }
+    if (judging) {
+      own.promoted.clear();
+      own.promote_evicted.clear();
+      own.promoted_chain = 0;
     }
     if (NumaNodeDistributor<Source>::miss_nodes(request) != 0) {
       // A group's own miss is checked against the row's last published delta, which is exact: the device waits for the
@@ -2659,15 +2709,127 @@ class RamTier {
   // The row's publisher, right after it publishes `request`'s delta: every group's entry swapped by this record becomes
   // empty, so no speculative read lands in a victim the device may still map. A reporter's swaps precede its report,
   // which the publisher's report acquires, so each is in place by now.
-  void release_swapped(const Request& request) {
+  void release_swapped(int64_t row, uint64_t chain) {
     for (int g = 0; g < dist_.size(); ++g) {
       std::lock_guard<std::mutex> lock(pool_->mutex(g));
       for (int i = 0; i < pool_->share(); ++i) {
-        PoolEntry& entry = pool_->entry(request.row, g, i);
-        if (pool_state(entry.word.load(std::memory_order_relaxed)) == kPoolSwapped && entry.freed_at == request.chain)
+        PoolEntry& entry = pool_->entry(row, g, i);
+        if (pool_state(entry.word.load(std::memory_order_relaxed)) == kPoolSwapped && entry.freed_at == chain)
           entry.word.store(kPoolEmpty, std::memory_order_release);
       }
     }
+  }
+
+  // Writes row's pending delta (claimed by the caller's CAS), then frees its swapped victims. Returns the promoted
+  // count, or -1 when another thread already claimed it. `by` is the record whose serve triggered it; trigger is
+  // 0 immediate, 1 claim from row-1's record, 2 backstop, 3 flush.
+  int publish_pending(Group& group, const Request& by, int64_t row, int trigger) {
+    uint64_t chain = 0;
+    // The backstop takes only a delta stashed in an earlier forward than the caller's.
+    const uint64_t forward = forward_[group.index].id;
+    if (!dist_.claim(row, &chain, trigger == 2 ? forward : ~0ull)) {
+      // Another group's serve of this record may have claimed it: its leftovers are not no_delta.
+      if (trigger == 1 && pool_ != nullptr && !dist_.delta_taken(row, forward)) count_landed_no_delta(group, row);
+      return -1;
+    }
+    if (trigger == 1) dist_.mark_claimed(row, forward);
+    const int promoted = promote_landed(group, row, chain);
+    dist_.write_pending(lease_, row);
+    if (pool_ != nullptr) release_swapped(row, chain);
+    if constexpr (Build::kMetrics)
+      group.trace.emit(
+          "delta_publish", row, by.gen, by.seq, group.index, static_cast<int64_t>(chain), static_cast<int64_t>(trigger),
+          static_cast<int64_t>(promoted));
+    return promoted;
+  }
+
+  // Trigger 1 found no delta waiting for `row`: its landed pool rows stay unpromoted, one count each. Every group serves
+  // the record, so each counts only its own pool entries.
+  void count_landed_no_delta(Group& claimer, int64_t row) {
+    const int g = claimer.index;
+    std::lock_guard<std::mutex> lock(pool_->mutex(g));
+    for (int i = 0; i < pool_->share(); ++i)
+      if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_relaxed)) == kPoolLanded)
+        count<kSpecPromoteNoDelta>(claimer);
+  }
+
+  // Maps landed pool rows of `row` into its claimed delta (evicting a victim each), counts into the claimer's block,
+  // and returns how many. The service thread takes row_mutex[row], then the pool mutex; the claimer takes the pool
+  // mutex, then try_locks row_mutex[row], and when busy leaves the entries landed (spec_promote_row_busy each).
+  int promote_landed(Group& claimer, int64_t row, uint64_t chain) {
+    if (pool_ == nullptr) return 0;
+    int promoted = 0;
+    Tier& tier = tiers_[row];
+    for (int g = 0; g < dist_.size(); ++g) {
+      Group& owner = dist_.group(g);
+      std::lock_guard<std::mutex> pool_lock(pool_->mutex(g));
+      std::unique_lock<std::mutex> row_lock(owner.row_mutex[row], std::try_to_lock);
+      if (!row_lock.owns_lock()) {
+        for (int i = 0; i < pool_->share(); ++i)
+          if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_acquire)) == kPoolLanded)
+            count<kSpecPromoteRowBusy>(claimer);
+        continue;
+      }
+      GroupRow& own = owner.rows[row];
+      for (int i = 0; i < pool_->share(); ++i) {
+        PoolEntry& entry = pool_->entry(row, g, i);
+        const uint32_t word = entry.word.load(std::memory_order_acquire);
+        if (pool_state(word) == kPoolReading) {
+          count<kSpecPromoteReading>(claimer);
+          continue;
+        }
+        if (pool_state(word) != kPoolLanded) continue;
+        const int32_t expert = pool_expert(word);
+        if (tier.expert_slot[expert] >= 0) continue;  // already mapped: an ordinary hit
+        if (dist_.pending_count(row) + 2 > Wire::kDeltaMaxEntries) {
+          count<kSpecPromoteNoRoom>(claimer);
+          continue;
+        }
+        int32_t old = -1;
+        const int64_t victim = take_victim_locked(owner, row, {}, &old, false);
+        if (victim < 0) {
+          count<kSpecPromoteNoVictim>(claimer);
+          continue;
+        }
+        const int32_t slot = entry.slot;
+        if (old >= 0) dist_.append_pending(row, old, -1);
+        dist_.append_pending(row, expert, slot);
+        tier.expert_slot[expert] = slot;
+        tier.slot_to_expert[slot] = expert;
+        tier.state[slot] = kReady;
+        tier.stamp[slot] = tier.stamp[victim];  // the promoted row inherits the victim's recency
+        publish_mirror(row, expert, slot);
+        tier.state[victim] = kSpec;
+        entry.slot = static_cast<int32_t>(victim);
+        entry.freed_at = chain;
+        entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
+        if (own.promoted_chain != chain) {
+          own.promoted.clear();
+          own.promote_evicted.clear();
+          own.promoted_chain = chain;
+        }
+        own.promoted.push_back(expert);
+        own.promote_evicted.push_back(old);
+        count<kSpecPromotedEarly>(claimer);
+        ++promoted;
+      }
+    }
+    return promoted;
+  }
+
+  // Deferred publication for one served or skipped record: the backstop for the record's own row and for earlier
+  // rows stranded since an earlier forward, then the claim of row + 1's delta, which this record's row precedes.
+  void publish_due(Group& group, const Request& request) {
+    if (request.row < 0 || request.row >= layers_) return;
+    ForwardState& fwd = forward_[group.index];
+    if (request.row <= fwd.last_row) ++fwd.id;
+    fwd.last_row = request.row;
+    // A delta another group stashed from this very record (same forward) still waits for row - 1's next serve.
+    for (int64_t p = 0; p <= request.row; ++p)
+      if (dist_.deferred(p) && publish_pending(group, request, p, 2) >= 0)
+        count<kSpecPublishBackstop>(group);
+    if (request.row + 1 < layers_ && dist_.deferred(request.row + 1))
+      publish_pending(group, request, request.row + 1, 1);
   }
 
   // Picks the victims and publishes the delta, before any read, so a served chain always has its delta published. A
@@ -2733,9 +2895,21 @@ class RamTier {
     own.staging = part.staging;
     const uint32_t reporters = NumaNodeDistributor<Source>::miss_nodes(request);
     if (dist_.report(request, group.index, part, reporters)) {
-      if (!dist_.publish(lease_, request, reporters))
-        fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
-      if (pool_ != nullptr) release_swapped(request);
+      if (dist_.deferred(request.row)) {
+        // Written by the serve of row - 1's next record; its swapped victims are released then.
+        if (!dist_.stash(request, reporters, forward_[group.index].id))
+          fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
+      } else {
+        if (!dist_.publish(lease_, request, reporters))
+          fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
+        if (pool_ != nullptr) release_swapped(request.row, request.chain);
+        if constexpr (Build::kMetrics) {
+          if (promote_)
+            group.trace.emit(
+                "delta_publish", request.row, request.gen, request.seq, group.index,
+                static_cast<int64_t>(request.chain), int64_t{0}, int64_t{0});
+        }
+      }
     }
   }
 
@@ -2998,6 +3172,10 @@ class RamTier {
   // episode so the watchdog can time it.
   void handle_record(Group& group, const Request& request) {
     begin_busy(group);
+    // A promoter of another group may map into this row's tier; it takes the same lock.
+    std::unique_lock<std::mutex> row_lock;
+    if (promote_ && request.row >= 0 && request.row < layers_)
+      row_lock = std::unique_lock<std::mutex>(group.row_mutex[request.row]);
     if (!request.lanes.empty()) {
       if (serve_record(group, request)) {
         count<kServedRequests>(group);
@@ -3015,6 +3193,23 @@ class RamTier {
       }
     }
     end_busy(group);
+  }
+
+  // Per group, owned by its service thread: the forward counts up when a record's row is not past the last one's.
+  struct alignas(64) ForwardState {
+    int64_t last_row = -1;
+    uint64_t id = 0;
+  };
+  std::array<ForwardState, Wire::kNodes> forward_{};
+  bool promote_ = false;  // set in enable_ram_prefetch, before the service thread starts
+  // hold_row's helper (InstrBuild tests only); joined by release_row_hold.
+  std::thread row_holder_;
+  std::atomic<bool> row_held_{false};
+  std::atomic<bool> row_hold_release_{false};
+  void release_row_hold() {
+    if (!row_holder_.joinable()) return;
+    row_hold_release_.store(true, std::memory_order_release);
+    row_holder_.join();
   }
 
   uint8_t* page_;

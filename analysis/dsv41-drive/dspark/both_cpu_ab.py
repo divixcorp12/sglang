@@ -158,6 +158,11 @@ IDLE_DRIVE_OFF = {
 }
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(IDLE_DRIVE_OFF)
+# Promoting landed speculative rows into the tier map is off in every arm but the promote one, pinned so a shell that
+# exports it cannot carry it into one.
+PROMOTE = "SGLANG_DSV41_RAM_PREFETCH_PROMOTE"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[PROMOTE] = "0"
 # The prefetch scores the gate of layer T+horizon on layer T's hidden state; every arm but the L+2 one states 1, so a
 # shell that exports it cannot carry it into one.
 HORIZON_DEFAULT = {"SGLANG_DSV41_RAM_PREFETCH_HORIZON": "1"}
@@ -219,6 +224,19 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3"] = (
     },
     True,
 )
+# The promote pair: the T3 cap-2 arm with landed rows promoted into the target layer's map, and its twin with the flag
+# stated off (identical otherwise). The off twin is the on arm's reference, so the A/B reads the flag alone.
+PROMOTE_OFF_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-off"
+PROMOTE_ON_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote"
+ARMS[PROMOTE_OFF_ARM] = ({**ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2"][0], PROMOTE: "0"}, True)
+ARMS[PROMOTE_ON_ARM] = ({**ARMS[PROMOTE_OFF_ARM][0], PROMOTE: "1"}, True)
+# The pair's fixed-split option: the CPU split is the off capture's table (the driver's SGLANG_DSV41_CPU_EXPERTS_SPLIT)
+# with calibration off, so both arms split alike and the A/B does not read calibration drift.
+FIXED_SPLIT_VAR = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
+FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0"}
+FIXED_SPLIT_SUFFIX = "-fixedsplit"
+for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM):
+    ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -251,6 +269,10 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3": "dspark-both-misscut",
     "dspark-both-misscut-engram-verify-graph": "dspark-both-misscut",
+    PROMOTE_OFF_ARM: "dspark-both-misscut",
+    PROMOTE_ON_ARM: PROMOTE_OFF_ARM,
+    PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX: "dspark-both-misscut",
+    PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
@@ -268,6 +290,15 @@ RAM_KEYS = (
     "spec_abandoned",
     "spec_boosted",
     "spec_moved_root",
+    "spec_promoted_early",
+    "spec_promote_no_delta",
+    "spec_promote_no_room",
+    "spec_promote_no_victim",
+    "spec_promote_victim_routed",
+    "spec_promote_used",
+    "spec_promote_reading",
+    "spec_publish_backstop",
+    "spec_promote_row_busy",
 )
 
 
@@ -283,6 +314,8 @@ TWO_STAGE_OFF = {
 def _overrides(arm: str, out: str) -> dict:
     overrides, _ = ARMS[arm]
     passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
+    if arm.endswith(FIXED_SPLIT_SUFFIX) and os.environ.get(FIXED_SPLIT_VAR):
+        passed[FIXED_SPLIT_VAR] = os.environ[FIXED_SPLIT_VAR]
     return {
         **TWO_STAGE_OFF, **overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")
     }
@@ -529,6 +562,8 @@ def main():
     sessions = ",".join(str(int(i)) for i in a.sessions.split(","))
     out = os.path.abspath(a.out)
     arms = a.arms or list(ARMS)
+    if not os.environ.get(FIXED_SPLIT_VAR) and any(arm.endswith(FIXED_SPLIT_SUFFIX) for arm in arms):
+        sys.exit(f"a {FIXED_SPLIT_SUFFIX} arm needs {FIXED_SPLIT_VAR} set to the off capture's split table")
     if a.baseline:
         references = {REFERENCE[arm] for arm in arms if arm in REFERENCE}
         if len(references) != 1 or references & set(arms):

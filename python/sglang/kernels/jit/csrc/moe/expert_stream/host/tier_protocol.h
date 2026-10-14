@@ -68,6 +68,24 @@ enum Counter : int {
   kSpecAbandoned,
   kSpecBoosted,
   kSpecMovedRoot,
+  // Promote-on-land: rows mapped into a pending delta before their layer's record.
+  kSpecPromotedEarly,
+  // ... landed rows left unpromoted: target row had no pending delta,
+  kSpecPromoteNoDelta,
+  // ... the delta had no room under kDeltaMaxEntries,
+  kSpecPromoteNoRoom,
+  // ... or no victim slot could be taken.
+  kSpecPromoteNoVictim,
+  // ... promotions whose victim was routed to the layer anyway,
+  kSpecPromoteVictimRouted,
+  // ... promoted entries the layer's record then used as hits,
+  kSpecPromoteUsed,
+  // ... promoted entries a record found still being read,
+  kSpecPromoteReading,
+  // ... deltas written by the backstop rather than row r-1's serve,
+  kSpecPublishBackstop,
+  // ... and landed entries left landed because their group's row lock was busy at the claim.
+  kSpecPromoteRowBusy,
   // ... the scorer's records scored and their scoring time in ns (metrics).
   kSpecScored,
   kSpecScoreNs,
@@ -101,6 +119,15 @@ constexpr bool is_core_counter(int k) {
     case kSpecAbandoned:
     case kSpecBoosted:
     case kSpecMovedRoot:
+    case kSpecPromotedEarly:
+    case kSpecPromoteNoDelta:
+    case kSpecPromoteNoRoom:
+    case kSpecPromoteNoVictim:
+    case kSpecPromoteVictimRouted:
+    case kSpecPromoteUsed:
+    case kSpecPromoteReading:
+    case kSpecPublishBackstop:
+    case kSpecPromoteRowBusy:
       return true;
     default:
       return false;

@@ -11,7 +11,7 @@
 //              read_rows_idle: one speculative read under IdleRoots;
 //              read_rows_two_span: a read's first-span signal
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
-//              trace_clock_reads, spec_place, spec_pump, inject_spec, inject_demand_load
+//              trace_clock_reads, spec_place, spec_pump, hold_row, inject_spec, inject_demand_load
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
@@ -1734,6 +1734,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (RamTier::hold_row): a helper thread holds group `group`'s row lock of `row` until a call without `hold`.
+  static void hold_row(int64_t handle, int64_t row, int64_t group, int64_t hold) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)row, (void)group, (void)hold;
+      test_only("hold_row");
+    } else {
+      find(handle)->hold_row(row, static_cast<int>(group), hold != 0);
+    }
+  }
+
   // Test only (RamTier::spec_pump): serves group `group`'s next speculative job on the caller; 1 if it served one.
   static int64_t spec_pump(int64_t handle, int64_t group) {
     if constexpr (!Build::kFaults) {
@@ -1900,6 +1910,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_group_stall, Exports::inject_group_stall);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_place, Exports::spec_place);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_pump, Exports::spec_pump);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_hold_row, Exports::hold_row);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_spec, Exports::inject_spec);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_demand_load, Exports::inject_demand_load);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \

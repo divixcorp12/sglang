@@ -42,10 +42,11 @@ class Chain:
         self, tmp_path, *, capacity=CAPACITY, staging=STAGING, mirror_weights=None, timeout_ms=2000, lease_pdl=False,
         copy_engine=False, sm_small_copies=False, copy_wait_ms=2000, start=True, variant="instr", hit_copy="ce",
         cpu_misses=False, gpu_hot=False, lanes=8, experts=EXPERTS, top_k=TOP_K, dst_rows=DST_ROWS, miss_cut=0,
-        miss_cut_max=3, layers=LAYERS,
+        miss_cut_max=3, layers=LAYERS, spec_share=0,
     ):
         """``lanes`` is the build's lane count; ``top_k`` is each row's plan width and ``dst_rows`` its destination
-        rows (both at least the widest plan the test posts); ``layers`` is the number of streamed rows."""
+        rows (both at least the widest plan the test posts); ``layers`` is the number of streamed rows;
+        ``spec_share`` the speculative pool's entries per row and group (0: no pool)."""
         self.lanes, self.experts, self.top_k, self.dst_rows = lanes, experts, top_k, dst_rows
         self.layers = layers
         wire = wire_layout(lanes)
@@ -71,6 +72,8 @@ class Chain:
                 hot_page=self.hot_page, lanes=lanes,
             )
             self.host.reserve_staging(staging)
+            if spec_share:
+                self.host.reserve_spec_pool(spec_share)
             self.dest = {
                 row: {n: torch.zeros((dst_rows,) + self.specs[n].row_shape, dtype=self.specs[n].dtype, device="cuda")
                       for n in self.names}

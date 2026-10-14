@@ -6619,6 +6619,7 @@ the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed onc
 | `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES` | `False` | `1` | Copy engine moves only the two trellis tensors; the wait reads the four small ones. |
 | `SGLANG_DSV41_ENABLE_LAYER_FUSION` | `False` | `1` | JIT kernels replace about 89 small torch kernels per layer. |
 | `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION` | `False` | `1` | BS1 decode cast fusion. |
+| `SGLANG_DSV41_RAM_PREFETCH_PROMOTE` | `False` | - | Defers each row's map delta to the previous row's next record and folds landed prefetch-pool rows into it, so the GPU types them as RAM hits; needs `SGLANG_DSV41_RAM_PREFETCH=1`. |
 | `SGLANG_DSV41_ENABLE_LEASE_PDL` | `False` | `1` | Programmatic dependent launch for the chain kernels. |
 | `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM` | `False` | - | Shared expert and DIRECT commit on a side stream. |
 | `SGLANG_DSV41_ENABLE_PREFILL_FILLS` | `False` | `1` | Eager pinned-tier misses read by the native reader into the slabs. |
@@ -10157,7 +10158,96 @@ cap 2 beat off in only 4 of 8 sessions.
 `reserve_victims_locked` and re-reads NVMe. `analysis/dsv41-drive/dspark/read_split.py` splits a capture's
 `rows_read`: in the T3 cap-3 run dir (§33.35) 3,950-4,450 reads per run (25-35%) are such "other reads", and
 prefetch does not reduce them. F125 (`SGLANG_DSV41_RAM_PREFETCH_PROMOTE`) targets them by mapping landed rows into
-the tier before the target layer; its served pair uses the fixed table above. Results: pending.
+the tier before the target layer; its served pair uses the fixed table above. Results: §33.37.
+
+### 33.37 RAM prefetch promote-on-land: the served A/B report (2026-10-14)
+
+One capture pair on divix01 (instrumented, `spec_margin_capture.py`, 8 sessions), code `b992e11134`, worktree
+`wt-f125-ab`, run dir `divix01:/data/models/slang/nvfp4-work/ram-prefetch/promote-ab-20261014/` (`aborted-tmp-full-on`
+is a discarded attempt: the root volume was full and the server never started).
+
+**Sprint choices** (`SGLANG_DSV41_RAM_PREFETCH_PROMOTE`, default off, `Dsv41Config.ram_prefetch_promote`, no device
+change):
+
+| | choice |
+|---|---|
+| D1 | defer each row's map delta from the end of its own record to the serving of the previous row's record in the next forward, and fold that row's landed pool rows into it |
+| D2 | promotion only rides a delta already pending: the device advances a row's chain only on a record with a miss, so a miss-free row has none to carry (the demand-time swap stays for it) |
+| D3 | victims by `take_victim_locked` with no wanted list (the layer's routes are not known yet); an evicted expert the layer routes to is an ordinary miss |
+| D4 | row 0 and rows no source row targets publish immediately, as before |
+| D5 | env flag, launch refuses it without `SGLANG_DSV41_RAM_PREFETCH=1` |
+| D6 | one feature: no device change, no layout change |
+
+**Capture.** The promote pair from `both_cpu_ab.py`, `-fixedsplit` arms, order on then off, with
+`SGLANG_DSV41_CPU_EXPERTS_SPLIT` the final calibrated table of the §33.35 off capture
+(`0,1,2,2,3,3,4,5,5,...,24,24,25,26,26`, 41 entries); both servers' stats lines show that table on both groups.
+`read_split.py` is the "other reads" measure. The general form of the commands (the run used `run.sh` in the run dir,
+with `TMPDIR` on `/mnt/nvme1`):
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-<name>
+export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8
+D=analysis/dsv41-drive/dspark
+OUT=/data/models/slang/nvfp4-work/ram-prefetch/promote-<date>
+# off twin first; its split table becomes SGLANG_DSV41_CPU_EXPERTS_SPLIT for the -fixedsplit arms
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nvfp4-work/cc-gpu.lock \
+  taskset -c 0-63 /data/models/slang/.venv/bin/python $D/spec_margin_capture.py $OUT/off \
+  --arm dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-off-fixedsplit
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nvfp4-work/cc-gpu.lock \
+  taskset -c 0-63 /data/models/slang/.venv/bin/python $D/spec_margin_capture.py $OUT/on \
+  --arm dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-fixedsplit
+/data/models/slang/.venv/bin/python $D/read_split.py $OUT/off $OUT/on
+```
+
+**Results** (`layer_misses.py`, `read_split.py`):
+
+| per verify (median) | off | on |
+|---|---:|---:|
+| wall ms | 257.1 | 263.7 (+2.6%) |
+| layer gate waits, ms | 204.6 | 212.8 |
+| wait of a layer with no miss, ms | 2.69 | 2.86 |
+| forced misses / covered by the pool | 89.5 / 22.1 | 89.4 / 16.8 |
+| matched per record vs off, ms | | -0.14 |
+| run `rows_read` / other reads | 13,081 / 4,253 (33%) | 13,386 / 4,025 (30%) |
+| `spec_used` / `spec_promote_used` | 2,891 / 0 | 2,164 / 741 |
+
+- **No measured gain.** Matched per record the flag is 0.14 ms faster; the wall median moved +2.6%, but the no-miss
+  layer moved +0.17 ms too, so most of it is drift. Neither direction is established by one pair.
+- **Promotion converts, it does not add.** Rows used through promotion plus pool-served misses (741 + 2,164 = 2,905)
+  equal off's pool-served misses (2,891): promotion turns misses the pool already covered into hits. Other reads fell
+  by 228 (~5%).
+- **Safe.** No chain-check or deadline failure in either server log; every promote counter is zero with the flag off.
+- **Output text is not comparable from one pair.** On vs off: 4 of 8 sessions identical. Two captures of identical
+  settings agree on only 5-6 of 8 (§33.34's and §33.35's cap-2 captures 6/8, their off captures 5/8): the CPU/GPU
+  expert split is not bit-deterministic run to run, so "identical per session" is not a usable criterion here.
+- `delta_publish` timing: events captured, not analysed.
+
+**Gate checks** (feature gate, not served): `py_compile` of the changed Python files exit 0;
+`scripts/lint/check_registered_tests.py` exit 1 (check remains failed); `check_no_bare_pytest_main.py` over `test/`
+exit 0; the CPU unit selection (`test/registered/unit/kernels` plus the config, requirements, spec-margin, both-cpu-ab,
+prefetch-tables and miss-service files) exit 0, 2,662 passed, 34 skipped, 0 failed of 2,696 (testmon reuse, 0 executed
+this run); the GPU selection (`test_exl3_ram_prefetch_promote_cuda.py`, `test_exl3_lease_kernels_cuda.py`,
+`test_exl3_lease_ordering_cuda.py`, `test_exl3_ram_miss_graph_gpu.py`) exit 0, 58 passed in 166.86 s. The registered-
+tests lint fails identically at the feature's base (the same 69 lines).
+
+**Design §5 assumptions** (flag-on arm's counters line):
+
+| Assumption | Counter(s) | Value | Held? |
+|---|---|---:|---|
+| Most landed rows ride a pending delta | `spec_promoted_early` / `spec_promote_no_delta` | 2,582 / 2,670 | **No**: half find no delta |
+| Leftover delta room is enough | `spec_promote_no_room` | 0 | Yes |
+| A victim is always available | `spec_promote_no_victim` | 0 | Yes |
+| Blind LRU victims rarely hit the layer's routes | `spec_promote_victim_routed` | 131 (5% of promoted) | Yes |
+| Promoted rows are used | `spec_promote_used` | 741 (29% of promoted) | Partly: the prediction's hit rate |
+| Most rows have landed by publish time | `spec_promote_reading` | 2,541 | **No**: as many still reading as promoted |
+| The deferral never makes a post wait | `spec_publish_backstop` | 0 | Yes (`delta_publish` timing not analysed) |
+| The row lock is rarely busy at claim time | `spec_promote_row_busy` | 0 | Yes |
+| Bypassed unforced misses shrink | other reads | 4,253 to 4,025 | Barely (-5%) |
+
+**Decisions to revisit.** D2 and D1's timing are the failed ones: a row whose previous record had no miss has no
+delta to ride, and row r-1's serve is too early for half the reads. Both need the device to bind a landed row at row
+r's own post, which is a device and wire change (the follow-up design: a per-row table of landed pool entries the post
+reads). The flag stays default off.
 
 ## Sources
 
