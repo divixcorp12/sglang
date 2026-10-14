@@ -161,11 +161,11 @@ def _evaluate(node, known):
 
 
 def _constants(*paths: Path, known: dict[str, int] | None = None) -> dict[str, int]:
-    """Every column-0 ``constexpr <type> kName = <integer expression>;`` of the given C++ sources, read as one text;
-    indented ones are function locals. A name defined twice fails. ``known`` seeds names defined elsewhere (the wire
-    header)."""
+    """Every file-scope ``constexpr <type> kName = <integer expression>;`` of the given C++ sources, read as one text;
+    a name defined twice fails. ``known`` seeds names defined elsewhere (the wire header)."""
     seeded = dict(known or {})
     found: dict[str, int] = {}
+    # Column 0 only: indented ones are function-local (each spec kernel has its own kWarps) and cannot clash.
     pattern = r"^(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=\s*([^;]+);"
     for name, expression in re.findall(pattern, joined_text(paths), re.MULTILINE):
         if "::" in expression:
