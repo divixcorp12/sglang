@@ -119,6 +119,7 @@ class RamThread {
     watch_stop_.store(true);
     if (watchdog_.joinable()) watchdog_.join();
     tier_->set_threaded(false);
+    tier_->flush_pending();
   }
 
   /// Asks the service threads to park and, once every one has, takes ownership of the tier until resume().
@@ -155,6 +156,7 @@ class RamThread {
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
     tier_->set_parked(true);
+    tier_->flush_pending();
     if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {
       resume_locked();
       return kPauseRefused;
