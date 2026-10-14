@@ -140,17 +140,21 @@ class NumaNodeDistributor {
     }
     row.pending_count = count;
     row.pending_chain = request.chain;
-    row.pending_forward = forward;
+    row.pending_forward.store(forward, std::memory_order_relaxed);
     row.pending.store(request.chain << 1, std::memory_order_release);
     return true;
   }
 
-  // CAS the row's pending delta from unclaimed to claimed; exactly one caller wins and gets its chain.
-  bool claim(int64_t row_index, uint64_t* chain) {
-    std::atomic<uint64_t>& word = rows_[row_index].pending;
+  // CAS the row's pending delta from unclaimed to claimed; exactly one caller wins and gets its chain. A delta stashed
+  // in forward `before` or later is left alone: stash stores the forward before the word, and every stash changes the
+  // word (a new chain), so the forward read after `seen` belongs to it whenever the CAS from `seen` succeeds.
+  bool claim(int64_t row_index, uint64_t* chain, uint64_t before = ~0ull) {
+    RowCombine& row = rows_[row_index];
+    std::atomic<uint64_t>& word = row.pending;
     uint64_t seen = word.load(std::memory_order_acquire);
     while (seen != 0 && (seen & 1u) == 0) {
-      if (word.compare_exchange_weak(seen, seen | 1u, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      if (row.pending_forward.load(std::memory_order_acquire) >= before) return false;
+      if (word.compare_exchange_strong(seen, seen | 1u, std::memory_order_acq_rel, std::memory_order_acquire)) {
         *chain = seen >> 1;
         return true;
       }
@@ -158,12 +162,22 @@ class NumaNodeDistributor {
     return false;
   }
 
+  // The claim winner records the forward of the record that claimed; before write_pending, whose release publishes it.
+  void mark_claimed(int64_t row, uint64_t forward) {
+    rows_[row].claimed_forward.store(forward, std::memory_order_relaxed);
+  }
+  // A losing claimer's question: is a delta pending, or did another group's serve of the same forward claim it?
+  bool delta_taken(int64_t row, uint64_t forward) const {
+    if (rows_[row].pending.load(std::memory_order_acquire) != 0) return true;
+    return rows_[row].claimed_forward.load(std::memory_order_relaxed) == forward;
+  }
+
   // The claim winner's reads and appends; the buffer is not shared until write_pending clears the word.
   uint64_t pending_chain(int64_t row) const {
     return rows_[row].pending_chain;
   }
   uint64_t pending_forward(int64_t row) const {
-    return rows_[row].pending_forward;
+    return rows_[row].pending_forward.load(std::memory_order_acquire);
   }
   int pending_count(int64_t row) const {
     return rows_[row].pending_count;
@@ -178,11 +192,16 @@ class NumaNodeDistributor {
     return true;
   }
 
-  // Writes the claimed delta through write(), then frees the pending word for the row's next stash.
+  // Frees the pending word, then writes the claimed delta: once the tag is out the row's next record may stash, so the
+  // word must already be 0. The entries are copied first since a later stash reuses the buffer.
   void write_pending(uint8_t* lease, int64_t row_index) {
     RowCombine& row = rows_[row_index];
-    write(lease, row_index, row.pending_chain, row.pending_entries, row.pending_count);
+    int32_t entries[Wire::kDeltaMaxEntries][2];
+    const int count = row.pending_count;
+    const uint64_t chain = row.pending_chain;
+    std::copy_n(&row.pending_entries[0][0], 2 * count, &entries[0][0]);
     row.pending.store(0, std::memory_order_release);
+    write(lease, row_index, chain, entries, count);
   }
 
  private:
@@ -191,7 +210,8 @@ class NumaNodeDistributor {
     int32_t pending_entries[Wire::kDeltaMaxEntries][2];
     int pending_count = 0;
     uint64_t pending_chain = 0;
-    uint64_t pending_forward = 0;
+    std::atomic<uint64_t> pending_forward{0};  // read unclaimed by the backstop
+    std::atomic<uint64_t> claimed_forward{~0ull};  // the forward of the last claim; none yet
     std::atomic<uint64_t> reported{0};
     std::atomic<uint64_t> written{0};  // the chain of the row's last delta
     std::array<FixedVec<int32_t, Wire::kLanes>, Wire::kNodes> staging;

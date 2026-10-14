@@ -161,6 +161,7 @@ class RamTier {
   // and the counter blocks, so it must stop before they are destroyed; the CPU thread stops last because the copy
   // thread reads its done().
   ~RamTier() {
+    release_row_hold();
     stop_spec();  // the speculative threads read through the groups' readers into the pool's slabs
     fill_join();  // the fill thread reads through group 0's reader into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
@@ -1375,6 +1376,27 @@ class RamTier {
     std::vector<uint8_t> packed;
     if (land_pool_row(g, row, i, id, &packed) != 1) throw std::runtime_error(prefix + "the read failed");
     return pool_->entry(row, g, i).slot;
+  }
+
+  // Test only (InstrBuild): with `hold`, a helper thread takes group g's row_mutex[row] and keeps it until the next call;
+  // the call without `hold` only releases it. Serving `row` meanwhile would block on the lock.
+  void hold_row(int64_t row, int g, bool hold)
+    requires(Build::kFaults)
+  {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    release_row_hold();
+    if (!hold) return;
+    row_capacity(row);
+    if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
+    row_held_.store(false, std::memory_order_relaxed);
+    row_hold_release_.store(false, std::memory_order_relaxed);
+    row_holder_ = std::thread([this, row, g] {
+      std::lock_guard<std::mutex> lock(dist_.group(g).row_mutex[row]);
+      row_held_.store(true, std::memory_order_release);
+      while (!row_hold_release_.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!row_held_.load(std::memory_order_acquire)) std::this_thread::yield();
   }
 
   // Test only (InstrBuild): serves group g's next speculative job on the caller, as its speculative thread would;
@@ -2703,10 +2725,14 @@ class RamTier {
   // 0 immediate, 1 claim from row-1's record, 2 backstop, 3 flush.
   int publish_pending(Group& group, const Request& by, int64_t row, int trigger) {
     uint64_t chain = 0;
-    if (!dist_.claim(row, &chain)) {
-      if (trigger == 1 && pool_ != nullptr) count_landed_no_delta(group, row);
+    // The backstop takes only a delta stashed in an earlier forward than the caller's.
+    const uint64_t forward = forward_[group.index].id;
+    if (!dist_.claim(row, &chain, trigger == 2 ? forward : ~0ull)) {
+      // Another group's serve of this record may have claimed it: its leftovers are not no_delta.
+      if (trigger == 1 && pool_ != nullptr && !dist_.delta_taken(row, forward)) count_landed_no_delta(group, row);
       return -1;
     }
+    if (trigger == 1) dist_.mark_claimed(row, forward);
     const int promoted = promote_landed(group, row, chain);
     dist_.write_pending(lease_, row);
     if (pool_ != nullptr) release_swapped(row, chain);
@@ -2717,19 +2743,19 @@ class RamTier {
     return promoted;
   }
 
-  // Trigger 1 found no delta waiting for `row`: its landed pool rows stay unpromoted, one count each.
+  // Trigger 1 found no delta waiting for `row`: its landed pool rows stay unpromoted, one count each. Every group serves
+  // the record, so each counts only its own pool entries.
   void count_landed_no_delta(Group& claimer, int64_t row) {
-    for (int g = 0; g < dist_.size(); ++g) {
-      std::lock_guard<std::mutex> lock(pool_->mutex(g));
-      for (int i = 0; i < pool_->share(); ++i)
-        if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_relaxed)) == kPoolLanded)
-          count<kSpecPromoteNoDelta>(claimer);
-    }
+    const int g = claimer.index;
+    std::lock_guard<std::mutex> lock(pool_->mutex(g));
+    for (int i = 0; i < pool_->share(); ++i)
+      if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_relaxed)) == kPoolLanded)
+        count<kSpecPromoteNoDelta>(claimer);
   }
 
   // Maps landed pool rows of `row` into its claimed delta (evicting a victim each), counts into the claimer's block,
-  // and returns how many. Lock order: the group's pool mutex, then row_mutex[row]; the serve takes them the other way,
-  // so the row mutex is only tried and a busy row keeps its entries landed.
+  // and returns how many. The service thread takes row_mutex[row], then the pool mutex; the claimer takes the pool
+  // mutex, then try_locks row_mutex[row], and when busy leaves the entries landed (spec_promote_row_busy each).
   int promote_landed(Group& claimer, int64_t row, uint64_t chain) {
     if (pool_ == nullptr) return 0;
     int promoted = 0;
@@ -2738,7 +2764,12 @@ class RamTier {
       Group& owner = dist_.group(g);
       std::lock_guard<std::mutex> pool_lock(pool_->mutex(g));
       std::unique_lock<std::mutex> row_lock(owner.row_mutex[row], std::try_to_lock);
-      if (!row_lock.owns_lock()) continue;
+      if (!row_lock.owns_lock()) {
+        for (int i = 0; i < pool_->share(); ++i)
+          if (pool_state(pool_->entry(row, g, i).word.load(std::memory_order_acquire)) == kPoolLanded)
+            count<kSpecPromoteRowBusy>(claimer);
+        continue;
+      }
       GroupRow& own = owner.rows[row];
       for (int i = 0; i < pool_->share(); ++i) {
         PoolEntry& entry = pool_->entry(row, g, i);
@@ -2793,11 +2824,10 @@ class RamTier {
     ForwardState& fwd = forward_[group.index];
     if (request.row <= fwd.last_row) ++fwd.id;
     fwd.last_row = request.row;
-    for (int64_t p = 0; p < request.row; ++p)
-      if (dist_.deferred(p) && dist_.pending_forward(p) < fwd.id && publish_pending(group, request, p, 2) >= 0)
+    // A delta another group stashed from this very record (same forward) still waits for row - 1's next serve.
+    for (int64_t p = 0; p <= request.row; ++p)
+      if (dist_.deferred(p) && publish_pending(group, request, p, 2) >= 0)
         count<kSpecPublishBackstop>(group);
-    if (dist_.deferred(request.row) && publish_pending(group, request, request.row, 2) >= 0)
-      count<kSpecPublishBackstop>(group);
     if (request.row + 1 < layers_ && dist_.deferred(request.row + 1))
       publish_pending(group, request, request.row + 1, 1);
   }
@@ -3172,6 +3202,15 @@ class RamTier {
   };
   std::array<ForwardState, Wire::kNodes> forward_{};
   bool promote_ = false;  // set in enable_ram_prefetch, before the service thread starts
+  // hold_row's helper (InstrBuild tests only); joined by release_row_hold.
+  std::thread row_holder_;
+  std::atomic<bool> row_held_{false};
+  std::atomic<bool> row_hold_release_{false};
+  void release_row_hold() {
+    if (!row_holder_.joinable()) return;
+    row_hold_release_.store(true, std::memory_order_release);
+    row_holder_.join();
+  }
 
   uint8_t* page_;
   int32_t* map_;

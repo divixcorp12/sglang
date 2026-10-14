@@ -133,6 +133,7 @@ RAW_EXPORTS = {
     "inject_group_stall": lambda m, h: m.expert_stream_inject_group_stall(h, 0, 0),
     "spec_place": lambda m, h: m.expert_stream_spec_place(h, 0, 0),
     "spec_pump": lambda m, h: m.expert_stream_spec_pump(h, 0),
+    "hold_row": lambda m, h: m.expert_stream_hold_row(h, 0, 0, 0),
     "inject_spec": lambda m, h: m.expert_stream_inject_spec(h, 0, 0),
     "inject_demand_load": lambda m, h: m.expert_stream_inject_demand_load(h, torch.zeros(ops.DRIVE_SLOTS, dtype=torch.int64)),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),

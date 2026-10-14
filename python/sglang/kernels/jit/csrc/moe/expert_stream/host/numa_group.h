@@ -45,8 +45,8 @@ struct NumaGroup {
   const int sq_thread_cpu;  // its ring's SQPOLL core; -1 unpinned, -2 the env's (BasicUringReader::kEnvSqThreadCpu)
   Source reader;            // its own io_uring ring
   std::vector<GroupRow> rows;
-  // Per (row, group): the service thread holds it while it touches the row's tier, a claimer while it promotes.
-  // Lock order: this group's pool mutex, then row_mutex[row].
+  // Per (row, group): the service thread takes it, then the pool mutex, while it touches the row's tier; a claimer takes
+  // the pool mutex, then try_locks it, and when busy leaves the entries landed (spec_promote_row_busy).
   std::unique_ptr<std::mutex[]> row_mutex;
   std::unique_ptr<CpuExpertEngine> cpu;  // CPU experts on this node's cores, when enabled
   uint64_t tick = 0;                     // its LRU clock: stamps compare only within its own slots

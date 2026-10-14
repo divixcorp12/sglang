@@ -26,6 +26,7 @@ PROMOTE_COUNTERS = (
     "spec_promote_used",
     "spec_promote_reading",
     "spec_publish_backstop",
+    "spec_promote_row_busy",
 )
 EIGHT_LOGITS = [[30, 25, 40, 22, 35, 21, 28, 27]]
 
@@ -312,6 +313,7 @@ def test_row_rs_next_record_counts_the_promotion_used_and_the_victim_routed(tmp_
         assert req.kinds[0] in (LaneKind.HIT_COPY, LaneKind.HIT_SM) and req.kinds[1] == LaneKind.MISS_GPU
         c = rig.host.counters()
         assert (c["spec_promote_used"], c["spec_promote_victim_routed"]) == (1, 1)
+        load(rig, 0, [5])  # claims the delta row 1's miss on 0 left pending
         load(rig, 1, [4])
         c = rig.host.counters()
         assert (c["spec_promote_used"], c["spec_promote_victim_routed"]) == (1, 1)
@@ -329,6 +331,38 @@ def test_a_landed_row_with_no_delta_waiting_counts_no_delta_and_stays_landed(tmp
         c = rig.host.counters()
         assert (c["spec_promote_no_delta"], c["spec_promoted_early"]) == (1, 0)
         assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
+    finally:
+        rig.host.stop()
+
+
+def test_two_groups_count_each_landed_row_with_no_delta_once(tmp_path):
+    """One landed row in each group's pool, no delta pending, both groups serve row 0's record: no_delta is 2. Mutant:
+    each group counts every group's entries -- red on 4."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        rig.host.spec_place(1, 4)
+        rig.host.spec_place(1, 3)
+        load(rig, 0, [1])
+        assert rig.host.counters()["spec_promote_no_delta"] == 2
+    finally:
+        rig.host.stop()
+
+
+def test_the_group_that_loses_the_claim_does_not_count_the_leftovers_as_no_delta(tmp_path):
+    """Two groups serve row 0's record; the winner claims row 1's delta and leaves 4 landed (no victim), the loser finds
+    the word empty. Mutant: count no_delta on every lost claim -- red on no_delta 1."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        load(rig, 1, [0])  # with 2, both of group 0's cache slots (one staging slot: one miss a record)
+        load(rig, 0, [1])
+        load(rig, 1, [2])
+        rig.host.set_hot(1, [0, 2])
+        rig.host.spec_place(1, 4)
+        tag = rig.sim.delta(1)[0]
+        load(rig, 0, [3])
+        c = rig.host.counters()
+        assert (c["spec_promote_no_victim"], c["spec_promote_no_delta"]) == (1, 0)
+        assert rig.sim.delta(1)[0] != tag
     finally:
         rig.host.stop()
 
@@ -351,11 +385,34 @@ def test_a_landed_row_with_no_evictable_victim_counts_no_victim_and_stays_landed
         rig.host.stop()
 
 
+def test_a_busy_row_lock_at_the_claim_counts_row_busy_and_leaves_the_row_landed(tmp_path):
+    """Group 0's row lock of row 1 is held while row 0's record claims row 1's delta: the delta is written without the
+    promotion and the landed 4 stays landed. Mutant: skip a busy group without counting -- red on row_busy 0."""
+    rig = _promote_rig(tmp_path)
+    try:
+        load(rig, 1, [0, 1])
+        slot = rig.host.spec_place(1, 4)
+        tag = rig.sim.delta(1)[0]
+        rig.host.hold_row(1, 0)
+        try:
+            load(rig, 0, [5])
+        finally:
+            rig.host.hold_row(1, 0, hold=False)
+        c = rig.host.counters()
+        assert (c["spec_promote_row_busy"], c["spec_promoted_early"]) == (1, 0)
+        assert rig.sim.delta(1)[0] != tag and rig.host.mapping(1)[4] == -1
+        assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
+    finally:
+        rig.host.stop()
+
+
 def test_a_row_still_reading_at_the_claim_counts_reading_and_is_left_alone(tmp_path):
     """The speculative read of 2 is held 0.6 s; row 0's next record claims row 1's delta meanwhile. Mutant: treat a
     reading entry as landed -- red (a promotion of an unlanded row)."""
-    rig = _promote_rig(tmp_path)
+    rig = prefetch_rig(tmp_path)
     try:
+        # An idle-drive read sleeps off the demand reader's turn, so row 1's record is served while it is in flight.
+        enable(rig, LOGITS, promote=True, idle_deadline_s=5.0)
         rig.host.inject_spec(delay_s=0.6)
         rig.host.start_thread(fatal_wait_s=5.0)
         trigger(rig)
@@ -367,6 +424,46 @@ def test_a_row_still_reading_at_the_claim_counts_reading_and_is_left_alone(tmp_p
         load(rig, 0, [5])
         c = rig.host.counters()
         assert (c["spec_promote_reading"], c["spec_promoted_early"]) == (1, 0)
+    finally:
+        rig.host.stop()
+
+
+def test_a_promotion_past_the_deltas_entry_limit_counts_no_room_and_stays_landed(tmp_path):
+    """Seven misses each evicting a resident expert leave row 1's delta at 14 of kDeltaMaxEntries (16): the first
+    landed row fits (16), the second counts no_room and stays landed. Mutant: check room for one entry instead of the
+    eviction and the insert -- the second promotes (an oversized delta) and no_room stays 0."""
+    experts = 14
+    rig = prefetch_rig(tmp_path, experts=experts, capacity=17, staging=8)  # 7 cache slots beside staging and the pool
+    try:
+        enable(rig, [[21 + e for e in range(experts)]], promote=True)
+        load(rig, 1, range(7))
+        load(rig, 0, [0])  # claims the first record's delta
+        load(rig, 1, range(7, 14))
+        assert len(rig.sim.delta(1)[2]) == 7, "row 1's second delta is still pending"
+        rig.host.spec_place(1, 0)
+        rig.host.spec_place(1, 1)
+        load(rig, 0, [0])
+        c = rig.host.counters()
+        assert (c["spec_promoted_early"], c["spec_promote_no_room"]) == (1, 1)
+        assert len(rig.sim.delta(1)[2]) == 16
+        assert [e["state"] for e in rig.host.spec_pool(1)].count("landed") == 1
+    finally:
+        rig.host.stop()
+
+
+def test_another_groups_serve_of_the_stashing_record_does_not_backstop_its_delta(tmp_path):
+    """Group 0 (expert 0's home) stashes row 1's delta, then group 1 serves the same record: the delta must wait for
+    row 0's next record, which promotes the landed 2 into it. Mutant: backstop the record's own row whatever its
+    forward -- group 1 writes the delta, red on backstop 1 and no promotion."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        load(rig, 1, [0])
+        slot = rig.host.spec_place(1, 2)
+        assert 0 <= slot < 4
+        load(rig, 0, [1])
+        c = rig.host.counters()
+        assert (c["spec_publish_backstop"], c["spec_promoted_early"]) == (0, 1)
+        assert rig.host.mapping(1)[2] == slot and (2, slot) in rig.sim.delta(1)[2]
     finally:
         rig.host.stop()
 

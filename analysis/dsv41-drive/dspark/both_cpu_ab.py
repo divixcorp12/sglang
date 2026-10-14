@@ -298,6 +298,7 @@ RAM_KEYS = (
     "spec_promote_used",
     "spec_promote_reading",
     "spec_publish_backstop",
+    "spec_promote_row_busy",
 )
 
 
