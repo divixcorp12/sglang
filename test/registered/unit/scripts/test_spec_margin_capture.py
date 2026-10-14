@@ -44,6 +44,17 @@ def test_the_counter_summary_reads_the_last_counters_line(tmp_path):
     assert cap.counter_summary(str(tmp_path / "missing.log")) == {}
 
 
+def test_the_counter_summary_carries_the_promotion_counters(tmp_path):
+    cap = _capture()
+    keys = ("rows_read", "spec_promoted_early", "spec_promote_no_delta", "spec_promote_no_room",
+            "spec_promote_no_victim", "spec_promote_victim_routed", "spec_promote_used",
+            "spec_promote_reading", "spec_publish_backstop")
+    log = tmp_path / "server.log"
+    log.write_text("exl3 RAM miss thread counters " + json.dumps({k: i + 1 for i, k in enumerate(keys)}) + "\n")
+    s = cap.counter_summary(str(log))
+    assert {k: s[k] for k in keys} == {k: i + 1 for i, k in enumerate(keys)}
+
+
 def test_the_capture_runs_any_ab_arm_and_leaves_its_scorer_alone_unless_asked():
     cap = _capture()
     off = cap.server_env("/out", False, arm="dspark-both")
