@@ -125,3 +125,63 @@ def test_every_forced_miss_leaves_a_miss_expert_event_on_its_group(tmp_path, mon
     events = [e for e in map(json.loads, files[0].read_text().splitlines()[1:-1]) if e["event"] == "miss_expert"]
     assert sorted((e["row"], e["gen"], e["seq"], e["a"], e["b"]) for e in events) == [
         (1, req.gen, req.seq, 2, 0), (1, req.gen, req.seq, 5, 2)]
+
+
+def _tier_events(tmp_path, kinds):
+    files = list(tmp_path.glob("jobs.*.exl3-tier0.*.jsonl"))
+    assert len(files) == 1
+    return [e for e in map(json.loads, files[0].read_text().splitlines()[1:-1]) if e["event"] in kinds]
+
+
+def _read_record(rig):
+    (record,) = [r for r in rig.host.drain_trace() if r["kind"] == "demand" and r["status"] == "served" and r["rows"]]
+    return record
+
+
+def test_each_read_miss_leaves_a_miss_land_event_with_its_expert_and_the_pool_state_it_saw(tmp_path, monkeypatch):
+    """miss_land (stage trace on): a = the expert, b = when its row landed, within the record's read, c = 1 for a miss
+    whose row had landed in the pool when planned (pool serve would have copied it), 0 for one the pool lacked.
+    Mutant: drop the pool state -- red on c."""
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    (tmp_path / "rig").mkdir()
+    rig = prefetch_rig(tmp_path / "rig")
+    try:
+        rig.host.enable_trace()
+        rig.host.spec_place(1, 4)
+        req = load(rig, 1, [2, 4])
+        record = _read_record(rig)
+    finally:
+        rig.host.stop()
+    events = _tier_events(tmp_path, {"miss_land"})
+    assert sorted((e["row"], e["gen"], e["seq"], e["a"], e["c"]) for e in events) == [
+        (1, req.gen, req.seq, 2, 0), (1, req.gen, req.seq, 4, 1)]
+    for e in events:
+        assert record["submit"] < e["b"] <= record["done"], e
+
+
+def test_with_pool_serve_a_copied_miss_leaves_pool_copy_events_and_the_read_one_its_own_land(tmp_path, monkeypatch):
+    """A copied miss is not read: pool_copy_start and pool_copy_end (a = expert, b = lane, c = miss index) instead of a
+    miss_land; the read miss's miss_land carries its own row's landing although its read ordinal (0) is not its miss
+    index (1). Mutant: take the stage record's row by miss index -- red on b."""
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    (tmp_path / "rig").mkdir()
+    rig = prefetch_rig(tmp_path / "rig")
+    try:
+        enable(rig, LOGITS, pool_serve=True)
+        rig.host.enable_trace()
+        rig.host.spec_place(1, 4)
+        req = load(rig, 1, [4, 2])
+        record = _read_record(rig)
+    finally:
+        rig.host.stop()
+    events = _tier_events(tmp_path, {"miss_land", "pool_copy_start", "pool_copy_end"})
+    by_kind = collections.defaultdict(list)
+    for e in events:
+        by_kind[e["event"]].append(e)
+    (land,) = by_kind["miss_land"]
+    assert (land["seq"], land["a"], land["c"]) == (req.seq, 2, 0)
+    assert record["submit"] < land["b"] <= record["done"]
+    (start,), (end,) = by_kind["pool_copy_start"], by_kind["pool_copy_end"]
+    for e in (start, end):
+        assert (e["row"], e["gen"], e["seq"], e["a"], e["b"], e["c"]) == (1, req.gen, req.seq, 4, 0, 0)
+    assert start["ns"] <= end["ns"]

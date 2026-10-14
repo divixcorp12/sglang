@@ -2093,7 +2093,10 @@ class RamTier {
     Wire::LaneMask copied = 0;
     int8_t copy_entry[Wire::kLanes] = {};
     int copy_next = 0;
+    // InstrBuild trace (miss_land): unforced miss i's pool entry when planned, a PoolSeen.
+    int8_t pool_seen[Wire::kLanes] = {};
   };
+  enum PoolSeen : int8_t { kPoolSeenNone = 0, kPoolSeenLanded = 1, kPoolSeenReading = 2 };
 
   // The record's CPU-miss jobs still to submit, advanced as rows land.
   struct CpuMissBatch {
@@ -2265,10 +2268,10 @@ class RamTier {
   }
 
   // An unforced miss reads NVMe even when its group's pool of the row holds the expert (DSV41_REFERENCE.md
-  // section 33.36); counts those by the entry's state and the lane's kind.
-  void count_skipped_pooled(Group& group, int64_t row, const Lane& lane) {
+  // section 33.36); counts those by the entry's state and the lane's kind, and returns that state.
+  PoolSeen count_skipped_pooled(Group& group, int64_t row, const Lane& lane) {
     const int i = pool_->find(row, group.index, lane.expert);
-    if (i < 0) return;
+    if (i < 0) return kPoolSeenNone;
     const bool landed =
         pool_state(pool_->entry(row, group.index, i).word.load(std::memory_order_acquire)) == kPoolLanded;
     const bool cpu = lane.kind == Wire::kKindMissCpu;
@@ -2276,6 +2279,7 @@ class RamTier {
       cpu ? count<kSpecSkipLandedCpu>(group) : count<kSpecSkipLandedGpu>(group);
     else
       cpu ? count<kSpecSkipReadingCpu>(group) : count<kSpecSkipReadingGpu>(group);
+    return landed ? kPoolSeenLanded : kPoolSeenReading;
   }
 
   // Unforced miss i: with pool_serve_, a GPU miss whose row landed in its group's pool is claimed to be copied into its
@@ -2291,7 +2295,7 @@ class RamTier {
         return;
       }
     }
-    if constexpr (Build::kMetrics) count_skipped_pooled(group, request.row, lane);
+    if constexpr (Build::kMetrics) plan.pool_seen[i] = count_skipped_pooled(group, request.row, lane);
   }
 
   // Takes group g's landed entry of `row` holding `expert` for a demand to copy from: swapped with freed_at
@@ -2339,6 +2343,10 @@ class RamTier {
     const size_t segments = t.segments.size();
     PieceRun* runs = serve_runs_[g].data();
     if (j == 0) {
+      // a = expert, b = its record lane, c = its miss index; pool_copy_end has the same.
+      if constexpr (Build::kMetrics)
+        group.trace.emit("pool_copy_start", request.row, request.gen, request.seq, g, plan.missing[i],
+                         plan.miss_lane[i], static_cast<int64_t>(i));
       RowGeometry geometry;
       if (!row_geometry(t, static_cast<size_t>(request.row * experts_ + plan.missing[i]), geometry, runs))
         fail_record(request, "a pooled row cannot be cut into pieces");
@@ -2357,7 +2365,12 @@ class RamTier {
     uint64_t* const word = reinterpret_cast<uint64_t*>(piece_word_at(plan.idx, plan.miss_lane[i]));
     if (!publish_piece(word, request.gen, static_cast<uint8_t>(1u << j)))
       fail_record(request, "a pooled piece's readiness word refused it");
-    if (++plan.copy_next % kPieces == 0) release_pool_copy(group, request.row, plan.copy_entry[i]);
+    if (++plan.copy_next % kPieces == 0) {
+      if constexpr (Build::kMetrics)
+        group.trace.emit("pool_copy_end", request.row, request.gen, request.seq, g, plan.missing[i],
+                         plan.miss_lane[i], static_cast<int64_t>(i));
+      release_pool_copy(group, request.row, plan.copy_entry[i]);
+    }
     return true;
   }
 
@@ -3137,6 +3150,9 @@ class RamTier {
     const std::span<const int32_t> lanes = pooled ? plan.read_lanes.span() : plan.miss_lane.span();
     if (!experts.empty()) {
       read_rows(group, request, plan, experts, slots, lanes, misses, cur);
+      if constexpr (Build::kMetrics) {
+        if (cur) trace_miss_lands(group, request, plan, cur);
+      }
     } else {
       // Every miss came from the pool: a read of no rows. It counts as a demand, and its read stamps sit at the
       // reservation (no clock read), so the stage order holds and the record shows no read time.
@@ -3149,6 +3165,27 @@ class RamTier {
     if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
     if (misses->staged != 0) fail_record(request, "a staged CPU miss's row never landed whole");
     return kStatusServed;
+  }
+
+  // One miss_land per read miss, from the stage record (so only with the stage trace on): a = expert, b = when its row
+  // landed (its last piece vetted, else its packing ended; 0 past kTraceRows), c = its PoolSeen | 4 for a CPU miss.
+  void trace_miss_lands(Group& group, const Request& request, const RecordPlan& plan, const StageRecord* cur)
+    requires(Build::kMetrics)
+  {
+    const bool pooled = plan.pooled != 0;
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      const int32_t o = pooled ? plan.ordinal[i] : static_cast<int32_t>(i);
+      if (o < 0) continue;
+      int64_t landed = 0;
+      if (o < kTraceRows) {
+        for (int j = 0; j < kPieces; ++j)
+          landed = std::max(landed, cur->piece_cqe[o][j]);
+        if (landed == 0) landed = cur->row_pack_end[o];
+      }
+      const bool cpu = request.lanes[plan.miss_lane[i]].kind == Wire::kKindMissCpu;
+      group.trace.emit("miss_land", request.row, request.gen, request.seq, group.index, plan.missing[i], landed,
+                       static_cast<int64_t>(plan.pool_seen[i]) | (cpu ? 4 : 0));
+    }
   }
 
   // read_misses' demand read of `experts` into `slots` (`lanes` their record lanes), in read order.
