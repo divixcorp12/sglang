@@ -351,6 +351,109 @@ def test_enable_refuses_what_the_step_could_not_serve(tmp_path):
         host.stop()
 
 
+def _handled(rig, row):
+    """An empty record of `row` (no lane, so the post waits for no delta), served on the test's thread."""
+    req = rig.sim.post(row, [])
+    assert rig.host.pump() == 1 and rig.sim.wait_handled(req)
+    return req
+
+
+def test_flag_off_writes_the_delta_right_after_the_miss_record(tmp_path):
+    """Mutant: defer even with the flag off (branch on targets instead of config.promote) -- red on the tag."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS)
+        req = load(rig, 1, [3])
+        assert req.chain >= 1 and rig.sim.delta(1)[0] == req.chain
+        assert rig.host.counters()["spec_publish_backstop"] == 0
+    finally:
+        rig.host.stop()
+
+
+def test_a_deferred_delta_is_written_while_the_previous_rows_next_record_is_served(tmp_path):
+    """Mutant: publish at the end of row r's own record -- red on the first assert; claim only in handle_record
+    -- still green here, red in the skipped-row case of the backstop test."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS, promote=True)
+        req = load(rig, 1, [3])
+        assert rig.sim.delta(1)[0] != req.chain
+        _handled(rig, 0)
+        assert rig.sim.delta(1)[0] == req.chain
+        assert rig.host.counters()["spec_publish_backstop"] == 0
+    finally:
+        rig.host.stop()
+
+
+def test_row_zero_and_an_untargeted_row_publish_immediately(tmp_path):
+    """Nothing can be promoted into row 0 or a row no source targets. Mutant: defer every row -- red."""
+    rig = prefetch_rig(tmp_path, rows=3)
+    try:
+        enable(rig, LOGITS, promote=True)
+        for row in (0, 2):
+            req = load(rig, row, [1])
+            assert rig.sim.delta(row)[0] == req.chain
+    finally:
+        rig.host.stop()
+
+
+def test_a_skipped_previous_row_falls_to_the_backstop_when_the_row_itself_is_served(tmp_path):
+    """Row 0's next record never comes; row 1's own next record writes the delta first and counts one backstop.
+    Mutant: no backstop in pump_demand -- the post below raises on the unwritten delta."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS, promote=True)
+        req = load(rig, 1, [3])
+        assert rig.sim.delta(1)[0] != req.chain
+        _handled(rig, 1)
+        assert rig.sim.delta(1)[0] == req.chain
+        assert rig.host.counters()["spec_publish_backstop"] == 1
+        rig.sim.post(1, [3])  # the post applies the published delta
+    finally:
+        rig.host.stop()
+
+
+def test_a_later_row_of_the_same_forward_does_not_backstop(tmp_path):
+    """Row 1's delta waits for row 0's next record; row 2's record of the same forward is not that. Mutant: backstop
+    every earlier row -- red on the counter and on the written tag."""
+    rig = prefetch_rig(tmp_path, rows=3)
+    try:
+        enable(rig, LOGITS, promote=True)
+        _handled(rig, 0)
+        req = load(rig, 1, [3])
+        _handled(rig, 2)
+        assert rig.sim.delta(1)[0] != req.chain
+        assert rig.host.counters()["spec_publish_backstop"] == 0
+    finally:
+        rig.host.stop()
+
+
+def test_bulk_delta_count_flushes_a_pending_delta(tmp_path):
+    """Mutant: bulk_delta_count without flush_pending -- the apply kernel skips the unwritten tag (red)."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS, promote=True)
+        req = load(rig, 1, [3])
+        assert rig.sim.delta(1)[0] != req.chain
+        rig.host.take_bulk_delta()
+        assert rig.sim.delta(1)[0] == req.chain
+    finally:
+        rig.host.stop()
+
+
+def test_stop_flushes_a_pending_delta_after_the_threads_join(tmp_path):
+    """Mutant: RamThread::stop without flush_pending -- the tag stays unwritten (red)."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS, promote=True)
+        rig.host.start_thread(fatal_wait_s=5.0)
+        req = load(rig, 1, [3])
+        rig.host.stop()
+        assert rig.sim.delta(1)[0] == req.chain
+    finally:
+        rig.host.stop()
+
+
 @pytest.mark.parametrize("top_k_only, picks", [(False, [0]), (True, [])])
 def test_top_k_only_reads_nothing_when_the_predicted_top_k_is_cached(tmp_path, top_k_only, picks):
     """top_k 2: 2 and 4 are the predicted pair, 2 VRAM-hot and 4 mapped. The full walk reads rank 2's expert 0;
