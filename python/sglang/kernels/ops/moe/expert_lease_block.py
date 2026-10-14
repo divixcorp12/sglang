@@ -93,6 +93,7 @@ class WireLayout:
     block_align = 4096
     piece_mask = 0
     piece_mask_line_bytes = 128
+    piece_source = 8
     copy_done_bytes = 8
 
     @property
@@ -155,7 +156,7 @@ class WireLayout:
             "kKindMissGpu": int(LaneKind.MISS_GPU), "kKindMissCpu": int(LaneKind.MISS_CPU), "kHotHeaderBytes": 8, "kHotAlignment": 64,
             "kHotRecords": self.demand_records, "kLeaseBlockAlign": self.block_align,
             "kLeasePieceMask": self.piece_mask, "kLeasePieceMaskLineBytes": self.piece_mask_line_bytes,
-            "kLeaseCopyDone": self.copy_done, "kLeaseCopyDoneBytes": self.copy_done_bytes,
+            "kLeasePieceSource": self.piece_source, "kLeaseCopyDone": self.copy_done, "kLeaseCopyDoneBytes": self.copy_done_bytes,
             "kLeaseCopyGate": self.copy_gate, "kLeaseGateClosed": GATE["closed"], "kLeaseGateOpen": GATE["open"],
             "kLeaseGateSeqShift": GATE_SEQ_SHIFT, "kLeaseGateSeqMask": GATE_SEQ_MASK, "kCopyArmed": self.copy_armed,
             "kSplit": self.split, "kSplitStride": self.split_stride, "kLeaseBlockBytes": self.lease_block_bytes,

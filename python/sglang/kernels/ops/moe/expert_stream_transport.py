@@ -923,6 +923,16 @@ def piece_word(generation: int, bits: int = 0) -> int:
     return ((generation & ((1 << 56) - 1)) << 8) | bits
 
 
+def piece_source_slot(word: int, generation: int) -> int:
+    """The slot a lane's ``PieceSource`` word names for ``generation``, or -1 (S streams from the staging slot).
+
+    The word is generation40 << 24 | (slot + 1), as ``piece_source_word`` in host/piece_geometry.h writes it and
+    ``piece_source_slot`` in row_copy_kernels.cuh reads it.
+    """
+    slot1 = word & 0xFFFFFF
+    return slot1 - 1 if (word >> 24) == (generation & ((1 << 40) - 1)) and slot1 != 0 else -1
+
+
 def read_rows_pieces(
     tables,
     row: int,
@@ -2198,8 +2208,9 @@ class ExpertStreamHost:
         ``promote`` (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
         that layer's map delta, so the device types them as RAM hits.
 
-        ``pool_serve`` (SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE) fills a GPU miss whose row landed in the pool by copying
-        the pool slot into its staging slot, piece by piece, instead of reading it from NVMe."""
+        ``pool_serve`` (SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE) serves a GPU miss whose row landed in the pool by naming
+        the pool slot in the lane's PieceSource word, so the stream kernel copies from it, instead of reading it from
+        NVMe."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:

@@ -159,37 +159,37 @@ def test_each_read_miss_leaves_a_miss_land_event_with_its_expert_and_the_pool_st
         assert record["submit"] < e["b"] <= record["done"], e
 
 
-def test_with_pool_serve_a_copied_miss_leaves_pool_copy_events_and_the_read_one_its_own_land(tmp_path, monkeypatch):
-    """A copied miss is not read: pool_copy_start and pool_copy_end (a = expert, b = lane, c = miss index) instead of a
-    miss_land; the read miss's miss_land carries its own row's landing although its read ordinal (0) is not its miss
-    index (1). Mutant: take the stage record's row by miss index -- red on b."""
+def test_with_pool_serve_a_pooled_miss_leaves_a_pool_point_and_the_read_one_its_own_land(tmp_path, monkeypatch):
+    """A pool-served miss is not read: one pool_point (a = expert, b = the pool slot S streams from, c = the victim
+    pooled in its place) instead of a miss_land; the read miss's miss_land carries its own row's landing although its
+    read ordinal (0) is not its miss index (1). Mutant: take the stage record's row by miss index -- red on b; report
+    the staging slot as b -- red on the slot."""
     monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
         enable(rig, LOGITS, pool_serve=True)
         rig.host.enable_trace()
-        rig.host.spec_place(1, 4)
+        slot = rig.host.spec_place(1, 4)
+        before = rig.host.slot_info(1)
         req = load(rig, 1, [4, 2])
         record = _read_record(rig)
+        spec = 4  # slot_info's kSpec
+        (victim,) = [s for s, (b, a) in enumerate(zip(before, rig.host.slot_info(1))) if b[0] != spec and a[0] == spec]
     finally:
         rig.host.stop()
-    events = _tier_events(tmp_path, {"miss_land", "pool_copy_start", "pool_copy_end", "svc_record", "svc_side"})
+    events = _tier_events(tmp_path, {"miss_land", "pool_point", "svc_record"})
     by_kind = collections.defaultdict(list)
     for e in events:
         by_kind[e["event"]].append(e)
     (land,) = by_kind["miss_land"]
     assert (land["seq"], land["a"], land["c"]) == (req.seq, 2, 0)
     assert record["submit"] < land["b"] <= record["done"]
-    (start,), (end,) = by_kind["pool_copy_start"], by_kind["pool_copy_end"]
-    for e in (start, end):
-        assert (e["row"], e["gen"], e["seq"], e["a"], e["b"], e["c"]) == (1, req.gen, req.seq, 4, 0, 0)
-    assert start["ns"] <= end["ns"]
-    # svc_record / svc_side: one each per record; the copying record spent time copying, inside its service time.
+    (point,) = by_kind["pool_point"]
+    assert (point["row"], point["gen"], point["seq"], point["a"], point["b"]) == (1, req.gen, req.seq, 4, slot)
+    assert point["c"] == victim
     (svc,) = [e for e in by_kind["svc_record"] if e["seq"] == req.seq]
-    (side,) = [e for e in by_kind["svc_side"] if e["seq"] == req.seq]
-    assert 0 < svc["c"] <= svc["a"] and 0 < side["b"] <= svc["a"]
-    assert all(e["b"] == 0 for e in by_kind["svc_side"] if e["seq"] != req.seq)
+    assert 0 < svc["c"] <= svc["a"]
 
 
 def test_a_demand_miss_on_a_full_tier_evicts_the_least_recently_used_expert_and_says_so(tmp_path, monkeypatch):

@@ -109,6 +109,7 @@ def test_the_transport_and_lease_modules_carry_the_trait_values():
         ("kLeaseBlockAlign", w.block_align),
         ("kLeasePieceMask", w.piece_mask),
         ("kLeasePieceMaskLineBytes", w.piece_mask_line_bytes),
+        ("kLeasePieceSource", w.piece_source),
         ("kLeaseCopyDone", w.copy_done),
         ("kLeaseCopyDoneBytes", w.copy_done_bytes),
         ("kLeaseCopyGate", w.copy_gate),

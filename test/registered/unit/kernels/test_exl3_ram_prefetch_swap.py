@@ -35,6 +35,11 @@ def _entry(host, row, expert):
     return next((e for e in host.spec_pool(row) if e["expert"] == expert), None)
 
 
+def _slot_state(host, row, slot):
+    (state,) = [e["state"] for e in host.spec_pool(row) if e["slot"] == slot]
+    return state
+
+
 def _pooled_victim(before, after):
     """The one slot a swap gave the pool: not SPEC in `before` (slot_info), SPEC in `after`."""
     (victim,) = [s for s, (b, a) in enumerate(zip(before, after)) if b[0] != SPEC and a[0] == SPEC]
@@ -180,57 +185,107 @@ def _pool_serve_rig(tmp_path, *, promote=False, **kwargs):
     return rig
 
 
-def test_with_pool_serve_a_gpu_miss_on_a_landed_pool_row_is_copied_into_staging_and_not_read(tmp_path):
-    """Every piece published (wait_served), the staging slot holds the row and is mapped, nothing read, the pool entry
-    emptied with its slot still pooled. Mutant: skip one piece's publish -- the serve times out; copy from the staging
-    slot instead of the pool slot -- red on the bytes; leave the entry claimed -- red on the pool state."""
+def test_with_pool_serve_a_gpu_miss_on_a_landed_pool_row_is_streamed_from_the_pool_slot_and_not_read(tmp_path):
+    """S is pointed at the pool slot (PieceSource) with every piece published at once; the delta maps the expert there,
+    the staging list and the staging slot's bytes are untouched, and the victim is pooled in its place. Mutant: leave
+    the source word unwritten -- red on stream_slot; swap the staging list as a read miss does -- red on the staging
+    list; keep the victim out of the pool -- red on the entry."""
     rig = _pool_serve_rig(tmp_path)
     try:
         slot = rig.host.spec_place(1, 4)
         rows = rig.host.counters()["rows_read"]
+        staging, before = rig.sim.staging(1), rig.host.slot_info(1)
+        staged = {s: rig.sim.read_slot(1, s) for s in staging if s >= 0}
         req = load(rig, 1, [4])
         assert req.kinds == [LaneKind.MISS_GPU]
-        mapped = rig.host.mapping(1)[4]
-        assert mapped not in (-1, slot) and _same_row(rig, 1, mapped, 4)
-        assert _entry(rig.host, 1, 4) is None and rig.host.slot_info(1)[slot][0] == SPEC
+        assert rig.sim.stream_slot(req, 0) == slot != req.slots[0]
+        assert rig.host.mapping(1)[4] == slot and _same_row(rig, 1, slot, 4)
+        assert rig.sim.delta(1)[1:] == (staging, [(4, slot)])
+        got = rig.sim.read_slot(1, req.slots[0])
+        assert all(same_bytes(got[name], staged[req.slots[0]][name]) for name in got)
+        victim = _pooled_victim(before, rig.host.slot_info(1))
+        assert {"group": 0, "slot": victim, "state": "empty", "expert": -1} in rig.host.spec_pool(1)
         c = rig.host.counters()
         assert (c["rows_read"], c["spec_pool_served"], c["spec_skip_landed_gpu"]) == (rows, 1, 0)
     finally:
         rig.host.stop()
 
 
-def test_with_promote_also_on_a_gpu_miss_on_a_landed_row_left_unpromoted_is_copied_and_never_promoted(tmp_path):
-    """Promote and pool serve both take a landed entry under the group's pool mutex, so a row goes to one: here no
-    record of row 0 promoted it, the miss copies it, and the later delta has nothing left to promote. Mutant: let
-    promote_landed take a claimed (kPoolCopying) entry -- red on spec_promoted or the bytes."""
+def test_with_promote_also_on_a_pool_served_row_keeps_its_victim_pooled_until_the_deferred_delta(tmp_path):
+    """Row 1's delta is deferred to row 0's next record, so the swapped entry is released only then, and nothing is
+    left to promote. Mutant: release the entry at the swap -- red on the swapped state; let promote_landed take a
+    swapped entry -- red on the mapping or spec_promoted_early."""
     rig = _pool_serve_rig(tmp_path, promote=True)
     try:
         slot = rig.host.spec_place(1, 4)
         rows = rig.host.counters()["rows_read"]
+        before = rig.host.slot_info(1)
         req = load(rig, 1, [4])
-        assert req.kinds == [LaneKind.MISS_GPU]
-        mapped = rig.host.mapping(1)[4]
-        assert mapped not in (-1, slot) and _same_row(rig, 1, mapped, 4)
-        load(rig, 0, [2])  # row 0's record publishes row 1's deferred delta
-        assert _entry(rig.host, 1, 4) is None and rig.host.slot_info(1)[slot][0] == SPEC
+        assert rig.sim.stream_slot(req, 0) == slot and rig.host.mapping(1)[4] == slot
+        victim = _pooled_victim(before, rig.host.slot_info(1))
+        assert {"group": 0, "slot": victim, "state": "swapped", "expert": -1} in rig.host.spec_pool(1)
+        load(rig, 0, [2])  # row 0's record publishes row 1's deferred delta (and may score a read into the freed entry)
+        assert _slot_state(rig.host, 1, victim) != "swapped"
+        assert (4, slot) in rig.sim.delta(1)[2] and rig.host.mapping(1)[4] == slot
         c = rig.host.counters()
-        assert (c["rows_read"], c["spec_pool_served"], c["spec_promoted"]) == (rows + 1, 1, 0)
+        assert (c["rows_read"], c["spec_pool_served"], c["spec_promoted_early"]) == (rows + 1, 1, 0)
     finally:
         rig.host.stop()
 
 
-def test_with_pool_serve_a_record_mixing_a_copied_and_a_read_gpu_miss_lands_both(tmp_path):
-    """The copy runs inside the other miss's read (one piece a drain turn) and finishes after it; both rows land whole
-    and only the unpooled one is read. Mutant: copy pieces into the read miss's slot -- red on the bytes."""
+def test_with_pool_serve_a_record_mixing_a_pooled_and_a_read_gpu_miss_lands_both(tmp_path):
+    """The read's piece words are set up for the read lanes only, so the pooled lane's word keeps every bit. Mutant:
+    init_piece_words_locked over every miss lane -- the pooled lane is reset and the serve times out."""
     rig = _pool_serve_rig(tmp_path)
     try:
-        rig.host.spec_place(1, 4)
+        slot = rig.host.spec_place(1, 4)
         rows = rig.host.counters()["rows_read"]
         req = load(rig, 1, [4, 2])
         assert req.kinds == [LaneKind.MISS_GPU, LaneKind.MISS_GPU]
-        assert _same_row(rig, 1, rig.host.mapping(1)[4], 4) and _same_row(rig, 1, rig.host.mapping(1)[2], 2)
+        assert rig.sim.stream_slot(req, 0) == slot and rig.sim.stream_slot(req, 1) == req.slots[1]
+        assert rig.sim.piece_word(req, 0) == piece_word(req.gen, ALL_PIECES)
+        assert _same_row(rig, 1, slot, 4) and _same_row(rig, 1, rig.host.mapping(1)[2], 2)
         c = rig.host.counters()
         assert (c["rows_read"], c["spec_pool_served"]) == (rows + 1, 1)
+    finally:
+        rig.host.stop()
+
+
+def test_with_pool_serve_and_no_victim_the_row_is_streamed_uncached_and_its_entry_freed_at_the_next_record(tmp_path):
+    """Both RAM slots hold hot experts: S still streams 4 from the pool slot, 4 stays unmapped, and the entry stays
+    swapped (nothing may land in the slot S reads) until the group's next record proves that S ended. Mutant: free the
+    entry at the swap -- red on the swapped state; never free it -- red on the last check."""
+    rig = _pool_serve_rig(tmp_path)
+    try:
+        load(rig, 1, [0, 1])
+        rig.host.set_hot(1, [0, 1])
+        slot = rig.host.spec_place(1, 4)
+        skipped = rig.host.counters()["ram_insert_skipped"]
+        req = load(rig, 1, [4])
+        assert rig.sim.stream_slot(req, 0) == slot and _same_row(rig, 1, slot, 4)
+        assert rig.host.mapping(1)[4] == -1 and rig.host.counters()["ram_insert_skipped"] == skipped + 1
+        assert {"group": 0, "slot": slot, "state": "swapped", "expert": -1} in rig.host.spec_pool(1)
+        load(rig, 0, [2])
+        assert _slot_state(rig.host, 1, slot) != "swapped"
+    finally:
+        rig.host.stop()
+
+
+def test_a_pool_served_lanes_source_word_does_not_redirect_its_ring_index_s_next_record(tmp_path):
+    """Ring index idx's record G + 16 reads the same lane from NVMe: its words carry G + 16, so the source word G left
+    names no slot for it and S streams from the new staging slot. Mutant: piece_source_word dropping the generation
+    -- red on stream_slot (the device decodes as stream_slot does; the GPU test covers its own decode)."""
+    rig = _pool_serve_rig(tmp_path)
+    try:
+        slot = rig.host.spec_place(1, 4)
+        first = load(rig, 1, [4])
+        assert rig.sim.stream_slot(first, 0) == slot
+        for _ in range(15):
+            load(rig, 1, [4])  # hits: no miss lane touches the ring's words
+        again = load(rig, 1, [5])
+        assert again.idx == first.idx and again.kinds == [LaneKind.MISS_GPU]
+        assert rig.sim.stream_slot(again, 0) == again.slots[0] != slot
+        assert _same_row(rig, 1, rig.host.mapping(1)[5], 5)
     finally:
         rig.host.stop()
 

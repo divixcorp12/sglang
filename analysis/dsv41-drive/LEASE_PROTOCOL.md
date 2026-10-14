@@ -132,7 +132,7 @@ the target's lease channel (["The lease channel"](#the-lease-channel)):
 
 | Offset | Area | Writer |
 |---|---|---|
-| 0 | `PieceMask[16][8]`, one 128-byte line per lane: `G << 8 \| piece bits` | host |
+| 0 | `PieceMask[16][8]`, one 128-byte line per lane: `G << 8 \| piece bits`; at +8 in the line, `PieceSource`: `G40 << 24 \| slot + 1` | host |
 | 16384 | `CopyDone[16]`: G once every DMA and CPU job of G completed | copy thread |
 | 16512 | the gate | CW closes, copy thread or CW opens |
 | 16640 | `kCopyArmed` u32: 1 once the service armed its copy engine | host |
@@ -165,7 +165,9 @@ unmaps. Sixteen entries are an insert and an eviction per lane. The post reads t
       record with the delta under this number. It writes the hot sidecar, the record (seqlock: seq 0,
       release fence, payload, seq with a release), and `demand_head` with a release.
 2. **C1** copies the `HIT_SM` lanes from their RAM slots into their destination slots.
-3. **S** copies the `MISS_GPU` lanes from their staging slots, piece by piece as PieceMask bits for G appear.
+3. **S** copies the `MISS_GPU` lanes from their staging slots, piece by piece as PieceMask bits for G appear. When a
+   lane's first bits appear and its `PieceSource` word carries G's low 40 bits, S copies from that slot instead
+   (bounds-checked like the staging slot); a word left by an earlier record at the ring index names nothing.
 4. **CW** reads the `HIT_COPY` lanes' small tensors itself when SM small copies are on. If any lane is `HIT_COPY` or a
    CPU kind, it closes the gate for G and checks CopyDone (see "Copy engine"). It leaves `ce_mask` (int32[3]) for CC:
    `{the HIT_COPY and CPU lanes, the CPU lanes, the CPU output parts used}`, each a bit set indexed by lane (the parts:
@@ -219,6 +221,13 @@ lane 31 is bit 31.
    inserted, and is counted in `ram_insert_skipped`; the delta is still published, with whatever entries the record
    has, possibly none.
 4. **Read the misses** into their staging slots, publishing each piece's PieceMask bit as it lands.
+
+   **Pool serve (`SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE=1`).** At step 3, a `MISS_GPU` lane whose row already landed in
+   its group's pool is not read: the host writes the pool slot into the lane's `PieceSource`, then every PieceMask bit
+   in one release. With a victim the pool slot becomes the expert's RAM slot in the delta and the victim takes its place
+   in the pool (swapped until the delta is written, as a forced swap's); the lane's staging slot stays staging. With no
+   victim the row is not inserted and the entry stays swapped until the group's next posted record, which the device
+   posts only after this chain (and so S) ended. A pool row still being read is not waited for: the lane is read.
 5. **CPU lanes go straight from the service to the CPU expert thread.** The service claims one job sequence per job
    the record can need (the hits', one per `MISS_CPU` lane) and submits the hits as part 0 before the copy job. Each
    `MISS_CPU` lane goes into part 1 as soon as its read landed; rows landing together share a job, and every job after

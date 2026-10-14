@@ -20,6 +20,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     WORDS,
     hot_record_bytes,
     page_word,
+    piece_source_slot,
     piece_word,
 )
 from sglang.srt.layers.moe.ram_slot_map import LaneKind, MapReplica, type_lanes
@@ -113,6 +114,13 @@ class ChainSim:
     def piece_word(self, req: SimRequest, lane: int) -> int:
         w = self.wire
         return self.read_u64(w.piece_mask + (req.idx * w.lanes + lane) * w.piece_mask_line_bytes)
+
+    def stream_slot(self, req: SimRequest, lane: int) -> int:
+        """The slot S streams MISS_GPU lane ``lane`` from: its PieceSource word's for ``req``, else its staging slot."""
+        w = self.wire
+        line = w.piece_mask + (req.idx * w.lanes + lane) * w.piece_mask_line_bytes
+        source = piece_source_slot(self.read_u64(line + w.piece_source), req.gen)
+        return source if source >= 0 else req.slots[lane]
 
     def copy_done(self, req: SimRequest) -> int:
         return self.read_u64(self.wire.copy_done + req.idx * self.wire.copy_done_bytes)

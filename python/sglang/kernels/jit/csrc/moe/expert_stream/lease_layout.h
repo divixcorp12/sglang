@@ -94,6 +94,9 @@ struct LeaseLayout {
   static constexpr int64_t kLeaseBlockAlign = 4096;
   static constexpr int64_t kLeasePieceMask = 0;  // u64[kDemandRecords][kLanes], one 128-byte line each
   static constexpr int64_t kLeasePieceMaskLineBytes = 128;
+  // u64 at this offset in a lane's PieceMask line: the slot S streams from instead of the lane's staging slot when it
+  // carries the record's G (piece_source_word); written before the PieceMask word's bits.
+  static constexpr int64_t kLeasePieceSource = 8;
   static constexpr int64_t kLeaseCopyDone = kLeasePieceMask + kDemandRecords * kLanes * kLeasePieceMaskLineBytes;
   static constexpr int64_t kLeaseCopyDoneBytes = 8;
   static constexpr int64_t kLeaseCopyGate = kLeaseCopyDone + 128;

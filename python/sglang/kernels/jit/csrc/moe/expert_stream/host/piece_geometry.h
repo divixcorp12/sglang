@@ -225,6 +225,13 @@ inline uint64_t piece_word(uint64_t generation) {
   return (generation & ((uint64_t{1} << 56) - 1)) << 8;
 }
 
+// A lane's PieceSource word (Wire::kLeasePieceSource): generation40 << 24 | (slot + 1). S reads it only under the
+// same record's PieceMask bits, so G's low 40 bits tell it from ring index idx's earlier records; row_copy_kernels.cuh
+// decodes it (piece_source_slot).
+inline uint64_t piece_source_word(uint64_t generation, int64_t slot) {
+  return (generation & ((uint64_t{1} << 40) - 1)) << 24 | static_cast<uint64_t>(slot + 1);
+}
+
 // Sets `bit` in `word` only while the word still carries `generation` and does not have the bit; otherwise returns
 // false and leaves the word untouched. A late publish from an older request fails the generation check instead of
 // setting a bit under the new one, and a piece published twice fails the bit check.

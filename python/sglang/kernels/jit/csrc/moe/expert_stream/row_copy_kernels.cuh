@@ -1,6 +1,7 @@
 // Row-copy kernels: the stream kernel (S) and the copy wait (CW, then CC), which move expert rows into device slots.
 //
-//   S   StreamParams    streams a miss lane's rows from its staging slot as the host publishes each piece
+//   S   StreamParams    streams a miss lane's rows from its staging slot (or PieceSource's) as the host publishes each
+//                       piece
 //   CW  CopyWaitParams  reads small tensors with SMs when asked, closes the copy gate for the copy engine's lanes
 //   CC  CopyCommitParams  after the stream waits on the gate, checks CopyDone and reports the CPU lanes
 //   RowCopyKernel<L>    the checked host launchers for the chain's tail (S, CW, the gate wait, CC)
@@ -104,7 +105,7 @@ SGL_DEVICE void stream_copy_piece(
 // S's per-block shared state, one slot per lane. Only thread 0 of the leader loop updates `done` and `finished`.
 struct StreamLanes {
   int32_t mine[Wire::kLanes];   // a kMissGpu lane: this kernel's
-  int32_t slot[Wire::kLanes];   // its staging slot
+  int32_t slot[Wire::kLanes];   // its staging slot, or the PieceSource slot once its first bits name one
   uint32_t done[Wire::kLanes];  // pieces this block has copied its slice of
   uint32_t todo[Wire::kLanes];  // pieces to copy this pass
   int finished;                // every piece of every lane copied
@@ -113,6 +114,13 @@ struct StreamLanes {
 // The ready-piece bits of a PieceMask word, or 0 when the word still belongs to an earlier generation.
 SGL_DEVICE uint32_t piece_bits(uint64_t word, uint64_t generation) {
   return (word >> 8) == (generation & kGenerationMask) ? static_cast<uint32_t>(word & 0xFFu) : 0u;
+}
+
+// The slot a PieceSource word (host piece_source_word) names for this generation, or -1 when it belongs to another.
+SGL_DEVICE int32_t piece_source_slot(uint64_t word, uint64_t generation) {
+  constexpr uint64_t kMask40 = (1ull << 40) - 1;
+  const uint64_t slot1 = word & 0xFFFFFFull;
+  return (word >> 24) == (generation & kMask40) && slot1 != 0 ? static_cast<int32_t>(slot1 - 1) : -1;
 }
 
 }  // namespace device::expert_stream
@@ -178,7 +186,16 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
 
   while (sh.finished == 0) {
     if (tid < Wire::kLanes && sh.mine[tid] != 0) {
-      const uint32_t bits = piece_bits(ld_acquire_sys64(masks + tid * Wire::kLeasePieceMaskLineBytes), generation);
+      const uint8_t* line = masks + tid * Wire::kLeasePieceMaskLineBytes;
+      const uint32_t bits = piece_bits(ld_acquire_sys64(line), generation);
+      if (bits != 0 && sh.done[tid] == 0) {
+        // The lane's first bits: a row served from the pool names its slot, stored before them.
+        const int32_t source = piece_source_slot(ld_acquire_sys64(line + Wire::kLeasePieceSource), generation);
+        if (source >= 0) {
+          if (static_cast<uint32_t>(source) >= p.row_capacity) __trap();
+          sh.slot[tid] = source;
+        }
+      }
       sh.todo[tid] = bits & ~sh.done[tid];
     }
     __syncthreads();

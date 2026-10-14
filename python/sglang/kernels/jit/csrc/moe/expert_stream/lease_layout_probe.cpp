@@ -20,7 +20,7 @@ std::string members() {
   P(kRecProtectCount); P(kRecHeaderBytes); P(kRecProtect); P(kRecLaneExpert); P(kRecLaneSlot); P(kRecLaneDst);
   P(kRecLaneWeight); P(kRecPayloadEnd); P(kRecordBytes); P(kRecIdMax); P(kPageBytes); P(kKindHitCopy); P(kKindHitSm);
   P(kKindHitCpu); P(kKindMissGpu); P(kKindMissCpu); P(kHotHeaderBytes); P(kHotAlignment); P(kHotRecords);
-  P(kLeaseBlockAlign); P(kLeasePieceMask); P(kLeasePieceMaskLineBytes); P(kLeaseCopyDone); P(kLeaseCopyDoneBytes);
+  P(kLeaseBlockAlign); P(kLeasePieceMask); P(kLeasePieceMaskLineBytes); P(kLeasePieceSource); P(kLeaseCopyDone); P(kLeaseCopyDoneBytes);
   P(kLeaseCopyGate); P(kLeaseGateClosed); P(kLeaseGateOpen); P(kLeaseGateSeqShift); P(kLeaseGateSeqMask);
   P(kCopyArmed); P(kSplit); P(kSplitStride); P(kLeaseBlockBytes); P(kDeltaBase); P(kDeltaTag); P(kDeltaCount);
   P(kDeltaStaging); P(kDeltaEntries); P(kDeltaMaxEntries); P(kDeltaStride);

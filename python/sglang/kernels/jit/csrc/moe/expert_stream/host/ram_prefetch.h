@@ -7,9 +7,9 @@
 //
 // Threads. An entry's word, for_seq and landed are atomics any thread may load. Its slot, freed_at, and every
 // transition of its word out of empty, landed or swapped, is under its group's mutex: the group's speculative thread
-// claims entries, the group's service thread swaps them (RamTier::take_pooled_locked), and the row's publisher, any
-// group's service thread, releases swapped ones (RamTier::release_swapped). Only the claimer stores a reading word's
-// successor.
+// claims entries, the group's service thread swaps them (RamTier::take_pooled_locked, point_pooled_locked), and the
+// row's publisher, any group's service thread, releases swapped ones (RamTier::release_swapped; the group's own service
+// thread, release_streamed). Only the claimer stores a reading word's successor.
 #pragma once
 
 #include <atomic>
@@ -147,14 +147,15 @@ struct RamPrefetchConfig {
   static constexpr int kMaxIdlePieces = 4;
   // SGLANG_DSV41_RAM_PREFETCH_PROMOTE: landed pool rows are mapped into the target layer's map delta before its record.
   bool promote = false;
-  // SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE: a GPU miss whose row landed in its group's pool is copied from the pool slot
-  // into its staging slot, piece by piece, instead of read from NVMe.
+  // SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE: a GPU miss whose row landed in its group's pool is streamed by S straight
+  // from the pool slot (the lane's PieceSource word) instead of read from NVMe.
   bool pool_serve = false;
 };
 
-// A kPoolSwapped entry's freed_at while a demand copies out of it (RamTier::claim_pool_copy_locked): no map chain is
-// ever this, so release_swapped never frees it; the copier empties it.
-constexpr uint64_t kPoolCopying = ~uint64_t{0};
+// A kPoolSwapped entry's freed_at while S streams an uncached pool row out of it (RamTier::point_pooled_locked, no
+// victim): no map chain is ever this, so release_swapped never frees it; the group's next record does
+// (release_streamed).
+constexpr uint64_t kPoolStreaming = ~uint64_t{0};
 
 // The GPU scorer's wait for a record's candidate slot: spin, then sleep in steps (the speculative thread may share its
 // core with the polling RAM thread), up to kCandWaitNs; a slot not ready by then counts spec_late.

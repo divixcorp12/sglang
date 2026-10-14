@@ -78,9 +78,10 @@ def test_a_landed_pool_row_is_typed_a_hit_after_the_previous_rows_next_record(tm
 
 @pytest.mark.parametrize("pool_serve", [True, False], ids=["pool_serve_on", "pool_serve_off"])
 def test_a_gpu_miss_on_a_landed_pool_row_streams_the_rows_bytes_with_or_without_a_read(tmp_path, pool_serve):
-    """Expert 7 landed in row 1's pool; row 1's gather misses 7 and 3 on the GPU. On, the host copies 7 from the pool
-    slot piece by piece while 3 is read, and the real stream kernel copies both rows' exact bytes with one row read.
-    Off, both are read. Mutation: publish each piece before its copy, or copy the wrong piece's runs -- red on the bytes."""
+    """Expert 7 landed in row 1's pool; row 1's gather misses 7 and 3 on the GPU. On, the host names 7's pool slot in
+    lane 0's PieceSource word and the real stream kernel copies both rows' exact bytes (7 from the pool slot, 3 from
+    its staging slot) with one row read, 7 then mapped at the pool slot. Off, both are read. Mutation: S ignoring the
+    source word -- red on 7's bytes (nothing writes its staging slot)."""
     c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2)
     try:
         x_rows = torch.zeros((LAYERS, x_token_bytes()), dtype=torch.uint8).pin_memory()
@@ -99,7 +100,7 @@ def test_a_gpu_miss_on_a_landed_pool_row_streams_the_rows_bytes_with_or_without_
 
         landed, other = 7, 3
         with paused(c.host):
-            c.host.spec_place(1, landed)
+            slot = c.host.spec_place(1, landed)
         read = c.host.counters()["rows_read"]
         c.plan([landed, other], 1)
         c.gather(1)
@@ -111,6 +112,50 @@ def test_a_gpu_miss_on_a_landed_pool_row_streams_the_rows_bytes_with_or_without_
         served = c.host.counters()
         assert served["rows_read"] == read + (1 if pool_serve else 2)
         assert served["spec_pool_served"] == (1 if pool_serve else 0)
+        with paused(c.host):
+            assert (c.host.mapping(1)[landed] == slot) == pool_serve
+    finally:
+        c.close()
+
+
+def test_a_pool_served_lanes_source_word_does_not_redirect_its_ring_index_s_next_record(tmp_path):
+    """Record G streams 7 from its pool slot on lane 0; 15 hit records later, record G + 16 reuses the ring index and
+    reads 5 from NVMe on lane 0. Its PieceSource word still holds G's, which must name nothing for G + 16. Mutation:
+    S's piece_source_slot ignoring the generation -- 5's lane streams 7's slot, red on the bytes."""
+    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2)
+    try:
+        x_rows = torch.zeros((LAYERS, x_token_bytes()), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (c.lanes + 1), cores, x_rows, out_rows,
+                                  threads=2)
+        for row in range(LAYERS):
+            c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        enable(SimpleNamespace(host=c.host, x_rows=x_rows), [[30.0] * EXPERTS], pool_serve=True)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        for row in range(LAYERS):
+            c.dev.set_row_cpu(row)
+        c.host.arm_copy_engine()
+        landed, fresh = 7, 5
+        with paused(c.host):
+            c.host.spec_place(1, landed)
+        c.plan([landed], 1)
+        c.gather(1)
+        torch.cuda.synchronize()
+        assert c.handled() and c.host.counters()["spec_pool_served"] == 1
+        first = int(c.dev.stats()["posted"])
+        while int(c.dev.stats()["posted"]) != first + 15:
+            c.gather(1)  # 7 is resident now: hits, which leave the ring's PieceMask lines alone
+            torch.cuda.synchronize()
+        assert c.handled()
+        c.plan([fresh], 1)
+        c.gather(1)
+        snapshot = c.snapshot(1)
+        torch.cuda.synchronize()
+        assert c.handled() and int(c.dev.stats()["posted"]) == first + 16
+        assert c.kinds(1) == [int(LaneKind.MISS_GPU)]
+        c.check([fresh], snapshot, 1)
     finally:
         c.close()
 

@@ -86,7 +86,7 @@ enum Counter : int {
   kSpecPublishBackstop,
   // ... and landed entries left landed because their group's row lock was busy at the claim.
   kSpecPromoteRowBusy,
-  // SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE: GPU misses copied from a landed pool row instead of read.
+  // SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE: GPU misses streamed from a landed pool row's slot instead of read.
   kSpecPoolServed,
   // Unforced misses (a staging slot) read from NVMe while their group's pool of the row held the expert, landed or
   // reading, on a GPU miss lane or a CPU lane (metrics).
