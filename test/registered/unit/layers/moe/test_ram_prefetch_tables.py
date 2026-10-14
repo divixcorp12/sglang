@@ -138,7 +138,7 @@ def test_the_service_enables_the_host_with_the_registered_gates_options_and_spar
     assert targets.tolist() == [[1, 0], [-1, -1]] and torch.equal(gates[0], gate.weight)
     assert kw == dict(
         top_k=6, per_token=1, per_layer=2, cores=[[0, 1]], top_k_only=False, idle_drive=False, idle_deadline_s=0.004,
-        idle_spread=False, idle_pieces=1,
+        idle_spread=False, idle_pieces=1, promote=False,
     )
     with envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.override(True):
         module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
@@ -177,7 +177,7 @@ def test_the_gpu_scorer_enables_the_host_with_a_candidate_page_and_no_host_gate_
     assert page.dtype == torch.uint8 and page.numel() == CAND_PAGE_BYTES and not page.is_pinned()
     assert kw == dict(
         top_k=6, per_token=1, per_layer=1, cores=[[0, 1]], top_k_only=False, min_margin=None, idle_drive=False,
-        idle_deadline_s=0.004, idle_spread=False, idle_pieces=1,
+        idle_deadline_s=0.004, idle_spread=False, idle_pieces=1, promote=False,
     )
     assert scorer.candidates is page and scorer.picked.gates[0].weight is gate.weight
     assert (scorer.per_token, scorer.top_k_only, scorer.picked.top_k) == (1, False, 6)
