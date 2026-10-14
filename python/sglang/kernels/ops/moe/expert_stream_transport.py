@@ -2169,6 +2169,7 @@ class ExpertStreamHost:
         idle_deadline_s: float = 0.004,
         idle_spread: bool = False,
         idle_pieces: int = 1,
+        promote: bool = False,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
@@ -2182,7 +2183,10 @@ class ExpertStreamHost:
         one; off, the speculative reads take turns with the demand reads on the group's reader. With it,
         ``idle_spread`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
         rotating from row to row, and ``idle_pieces`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
-        row's pieces may be in flight at once."""
+        row's pieces may be in flight at once.
+
+        ``promote`` (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
+        that layer's map delta, so the device types them as RAM hits."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:
@@ -2259,6 +2263,7 @@ class ExpertStreamHost:
             idle_deadline_ns,
             int(bool(idle_spread)),
             int(idle_pieces),
+            int(bool(promote)),
         )
         self.ram_prefetch_tensors = (gates, bias, candidates, min_margin)
 
