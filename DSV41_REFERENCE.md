@@ -10142,6 +10142,74 @@ One pair, off then on (arm `dspark-both-misscut-engram-verify-graph`, prefetch o
   by the owner's decision. End-to-end output identity under the flag is covered by the GPU test's exact rows, not
   yet by a served output comparison.
 
+### 33.37 RAM prefetch promote-on-land: the served A/B report (2026-10-13)
+
+Status: **skeleton, every measured value `pending`**. The owner's session fills it from one capture pair on divix01;
+no task or check launches the server (run protocol: private worktree, production untouched).
+
+**Sprint choices** (`SGLANG_DSV41_RAM_PREFETCH_PROMOTE`, default off, `Dsv41Config.ram_prefetch_promote`, no device
+change):
+
+| | choice |
+|---|---|
+| D1 | defer each row's map delta from the end of its own record to the serving of the previous row's record in the next forward, and fold that row's landed pool rows into it |
+| D2 | promotion only rides a delta already pending: the device advances a row's chain only on a record with a miss, so a miss-free row has none to carry (the demand-time swap stays for it) |
+| D3 | victims by `take_victim_locked` with no wanted list (the layer's routes are not known yet); an evicted expert the layer routes to is an ordinary miss |
+| D4 | row 0 and rows no source row targets publish immediately, as before |
+| D5 | env flag, launch refuses it without `SGLANG_DSV41_RAM_PREFETCH=1` |
+| D6 | one feature: no device change, no layout change |
+
+**Capture plan.** The promote pair from `both_cpu_ab.py`: the T3 cap-2 arm with the flag on
+(`dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote`) and its off twin (`...-cap2-promote-off`), order off then
+on, run through `spec_margin_capture.py`. The fixed split is the arm-name suffix `-fixedsplit` (sets
+`SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0`; `SGLANG_DSV41_CPU_EXPERTS_SPLIT` is the off capture's table, which the
+driver must export). `read_split.py` is the "other reads" measure. Commands, in a private worktree at the pushed
+commit, locks in protocol order (disk, then GPU; `spec_margin_capture.py` takes both through `run_locks.take`, or
+accepts them held by an outer `flock`):
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-<name>
+export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8
+D=analysis/dsv41-drive/dspark
+OUT=/data/models/slang/nvfp4-work/ram-prefetch/promote-<date>
+# off twin first; its split table becomes SGLANG_DSV41_CPU_EXPERTS_SPLIT for the -fixedsplit arms
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nvfp4-work/cc-gpu.lock \
+  taskset -c 0-63 /data/models/slang/.venv/bin/python $D/spec_margin_capture.py $OUT/off \
+  --arm dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-off-fixedsplit
+flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nvfp4-work/cc-gpu.lock \
+  taskset -c 0-63 /data/models/slang/.venv/bin/python $D/spec_margin_capture.py $OUT/on \
+  --arm dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-fixedsplit
+/data/models/slang/.venv/bin/python $D/read_split.py $OUT/off $OUT/on
+```
+
+**Results** (all `pending`):
+
+| per verify (median) | off | on |
+|---|---:|---:|
+| wall ms | pending | pending |
+| layer gate waits, ms | pending | pending |
+| forced misses / covered | pending | pending |
+| demand `rows_read` | pending | pending |
+| `delta_publish` write to row's next record, us (p50 / min) | pending | pending |
+
+**Checks** (all `pending`): per-session output text equal off vs on: pending; chain-check or deadline failures in
+`server.log`: pending; per-layer gate waits (§33.34 method): pending.
+
+**Design §5 assumptions** (counters from the RAM-miss thread counters line / `counters.json`, flag-on arm):
+
+| Assumption | Counter(s) | Value | Held? |
+|---|---|---:|---|
+| Most landed rows ride a pending delta | `spec_promoted_early`, `spec_promote_no_delta` | pending | pending |
+| Leftover delta room is enough | `spec_promote_no_room` | pending | pending |
+| A victim is always available | `spec_promote_no_victim` | pending | pending |
+| Blind LRU victims rarely hit the layer's routes | `spec_promote_victim_routed` | pending | pending |
+| Promoted rows are used | `spec_promote_used` | pending | pending |
+| Most rows have landed by publish time | `spec_promote_reading` | pending | pending |
+| The deferral never makes a post wait | `spec_publish_backstop`, `delta_publish` timing | pending | pending |
+| Bypassed unforced misses shrink | `rows_read` vs forced CPU misses minus pool-served | pending | pending |
+
+**Decisions to revisit** from the data: pending.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
