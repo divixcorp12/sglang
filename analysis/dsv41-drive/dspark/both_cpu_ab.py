@@ -238,12 +238,16 @@ ARMS[PROMOTE_ON_ARM] = ({**ARMS[PROMOTE_OFF_ARM][0], PROMOTE: "1"}, True)
 # off arm, so the A/B reads the flag alone.
 POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-poolserve"
 ARMS[POOL_SERVE_ARM] = ({**ARMS[PROMOTE_OFF_ARM][0], POOL_SERVE: "1"}, True)
+# Both: landed rows promoted ahead of their record, and a GPU miss on a landed row the promotion left copied from the
+# pool; its reference is the promote-on arm, so the A/B reads pool serve alone.
+PROMOTE_POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-poolserve"
+ARMS[PROMOTE_POOL_SERVE_ARM] = ({**ARMS[PROMOTE_ON_ARM][0], POOL_SERVE: "1"}, True)
 # The pair's fixed-split option: the CPU split is the off capture's table (the driver's SGLANG_DSV41_CPU_EXPERTS_SPLIT)
 # with calibration off, so both arms split alike and the A/B does not read calibration drift.
 FIXED_SPLIT_VAR = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0"}
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
-for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM):
+for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
@@ -283,6 +287,8 @@ REFERENCE = {
     PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
     POOL_SERVE_ARM: PROMOTE_OFF_ARM,
     POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
+    PROMOTE_POOL_SERVE_ARM: PROMOTE_ON_ARM,
+    PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "

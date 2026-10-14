@@ -170,10 +170,10 @@ def test_a_gpu_miss_on_a_pooled_expert_is_read_and_the_pool_row_stays(tmp_path):
         rig.host.stop()
 
 
-def _pool_serve_rig(tmp_path, **kwargs):
+def _pool_serve_rig(tmp_path, *, promote=False, **kwargs):
     rig = prefetch_rig(tmp_path, **kwargs)
     try:
-        enable(rig, LOGITS, pool_serve=True)
+        enable(rig, LOGITS, pool_serve=True, promote=promote)
     except BaseException:
         rig.host.stop()
         raise
@@ -195,6 +195,26 @@ def test_with_pool_serve_a_gpu_miss_on_a_landed_pool_row_is_copied_into_staging_
         assert _entry(rig.host, 1, 4) is None and rig.host.slot_info(1)[slot][0] == SPEC
         c = rig.host.counters()
         assert (c["rows_read"], c["spec_pool_served"], c["spec_skip_landed_gpu"]) == (rows, 1, 0)
+    finally:
+        rig.host.stop()
+
+
+def test_with_promote_also_on_a_gpu_miss_on_a_landed_row_left_unpromoted_is_copied_and_never_promoted(tmp_path):
+    """Promote and pool serve both take a landed entry under the group's pool mutex, so a row goes to one: here no
+    record of row 0 promoted it, the miss copies it, and the later delta has nothing left to promote. Mutant: let
+    promote_landed take a claimed (kPoolCopying) entry -- red on spec_promoted or the bytes."""
+    rig = _pool_serve_rig(tmp_path, promote=True)
+    try:
+        slot = rig.host.spec_place(1, 4)
+        rows = rig.host.counters()["rows_read"]
+        req = load(rig, 1, [4])
+        assert req.kinds == [LaneKind.MISS_GPU]
+        mapped = rig.host.mapping(1)[4]
+        assert mapped not in (-1, slot) and _same_row(rig, 1, mapped, 4)
+        load(rig, 0, [2])  # row 0's record publishes row 1's deferred delta
+        assert _entry(rig.host, 1, 4) is None and rig.host.slot_info(1)[slot][0] == SPEC
+        c = rig.host.counters()
+        assert (c["rows_read"], c["spec_pool_served"], c["spec_promoted"]) == (rows + 1, 1, 0)
     finally:
         rig.host.stop()
 
