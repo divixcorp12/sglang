@@ -209,12 +209,12 @@ def test_gate_refuses_the_head_with_a_floors_table(tmp_path):
 
 
 def test_gate_takes_per_layer_up_to_the_heads_picks(tmp_path):
-    """The head publishes at most HEAD_MAX_PICKS (2) blocks per record. Mutant: the per-layer condition is dropped (3
-    would launch and silently read 2) or still pinned to 1 (the cap-2 arm is refused)."""
+    """The head publishes at most HEAD_MAX_PICKS (3) blocks per record. Mutant: the per-layer condition is dropped (4
+    would launch and silently read 3) or still pinned to 1 (the cap-2 and cap-3 arms are refused)."""
     path = _write(tmp_path)
-    _gate(path, SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=2)
-    with pytest.raises(ValueError, match=r"LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER in 1\.\.2, got 3"):
-        _gate(path, SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=3)
+    _gate(path, SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=3)
+    with pytest.raises(ValueError, match=r"LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER in 1\.\.3, got 4"):
+        _gate(path, SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=4)
 
 
 def test_gate_refuses_an_unreadable_head_file(tmp_path):
@@ -295,5 +295,5 @@ def test_per_layer_reaches_the_serving_heads_picks(tmp_path):
     assert scorer.per_layer == 2
     serving = head_file.serving_head(scorer.learned_head, device="cpu", top_k=3, picks=scorer.per_layer)
     assert serving.picks == 2
-    with pytest.raises(ValueError, match="picks must be 1..2"):
-        head_file.serving_head(scorer.learned_head, device="cpu", top_k=3, picks=3)
+    with pytest.raises(ValueError, match="picks must be 1..3"):
+        head_file.serving_head(scorer.learned_head, device="cpu", top_k=3, picks=4)

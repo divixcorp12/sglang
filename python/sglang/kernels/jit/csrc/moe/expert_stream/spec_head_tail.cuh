@@ -1,7 +1,7 @@
 // The fused learned head's tail (the L+2 heads T0 and T3 of analysis/dsv41-drive/prefetch-replay/r1_models.py):
 //
 //   spec_head_tail_kernel  token logits -> block score per expert (T0: noisy-or; T3: r1_aggregator.block_features and
-//                          the aggregator MLP) -> sigmoid -> the hot/RAM skips -> threshold -> the best `picks` (1 or 2),
+//                          the aggregator MLP) -> sigmoid -> the hot/RAM skips -> threshold -> the best `picks` (1 to 3),
 //                          published to a candidate record (spec_candidates.h) in the serving convention
 #pragma once
 
@@ -16,7 +16,7 @@ constexpr int kHeadTailThreads = 384;  // the tail's block: one thread per exper
 constexpr int kHeadMaxTokens = 8;      // live tokens per record (the learned heads' MAX_WIDTH is 6)
 constexpr int kBlockFeatures = 10;     // r1_aggregator.N_BLOCK_FEATURES
 constexpr int kAggHidden = 32;         // the aggregator MLP's hidden width
-constexpr int kHeadMaxPicks = 2;       // reads per record; SGLANG_DSV41_RAM_PREFETCH_PER_LAYER's range with a head
+constexpr int kHeadMaxPicks = 3;       // reads per record; SGLANG_DSV41_RAM_PREFETCH_PER_LAYER's range with a head
 
 static_assert(kHeadTailThreads % 32 == 0 && kHeadMaxExperts <= kHeadTailThreads, "one thread per expert");
 

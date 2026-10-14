@@ -21,7 +21,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.moe.expert_stream_transport import CAND_STRIDE
 
 HEAD_MAX_TOKENS = 8  # spec_head_tail.cuh kHeadMaxTokens
-HEAD_MAX_PICKS = 2  # spec_head_tail.cuh kHeadMaxPicks
+HEAD_MAX_PICKS = 3  # spec_head_tail.cuh kHeadMaxPicks
 HEAD_EXPERTS = 384
 DEFAULT_PCA_RANK = 256  # b1_head.HeadConfig defaults
 DEFAULT_HIDDEN = 512

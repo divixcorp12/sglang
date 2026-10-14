@@ -209,6 +209,16 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3"] = (
 # verify); T3 keeps its cap-1 calib threshold, so its second read is any block at or above it.
 for _cap1 in ("dspark-both-prefetch-gpu-misscut-idle2-l2", "dspark-both-prefetch-gpu-misscut-idle2-l2-t3"):
     ARMS[f"{_cap1}-cap2"] = ({**ARMS[_cap1][0], "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "2"}, True)
+# T3 at three rows per layer, with three pool slots per row and group: with two, a layer's third read that lands in the
+# same group as its other two finds no claimable slot (a job never reclaims its own pick) and is dropped.
+ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3"] = (
+    {
+        **ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3"][0],
+        "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "3",
+        "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "3",
+    },
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -232,6 +242,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-cap2": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2": "dspark-both-misscut",
+    "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3": "dspark-both-misscut",
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "

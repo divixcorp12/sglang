@@ -102,6 +102,11 @@ def test_two_picks_publish_the_two_best_eligible_blocks_in_order():
     torch.cuda.synchronize()
     got = es.read_candidates(page, 3)
     assert got.count == 1 and got.picks[0][0] == order[2]
+    c.threshold.fill_(0.0)  # sigmoid scores: every unskipped block clears it
+    _serve(c, weights, ws, x=c.x, tokens=4, state=_state(4), page=page, picks=3)
+    torch.cuda.synchronize()
+    got = es.read_candidates(page, 4)
+    assert [(e, r) for e, r, _ in got.picks] == [(order[2], 0), (order[3], 1), (order[4], 2)]
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 8])
