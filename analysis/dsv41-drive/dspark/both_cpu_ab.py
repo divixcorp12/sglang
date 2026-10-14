@@ -163,6 +163,10 @@ for _overrides_of_arm, _ in ARMS.values():
 PROMOTE = "SGLANG_DSV41_RAM_PREFETCH_PROMOTE"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[PROMOTE] = "0"
+# Serving GPU misses from landed pool rows is off in every arm but the pool-serve one, likewise pinned.
+POOL_SERVE = "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[POOL_SERVE] = "0"
 # The prefetch scores the gate of layer T+horizon on layer T's hidden state; every arm but the L+2 one states 1, so a
 # shell that exports it cannot carry it into one.
 HORIZON_DEFAULT = {"SGLANG_DSV41_RAM_PREFETCH_HORIZON": "1"}
@@ -230,12 +234,16 @@ PROMOTE_OFF_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-off
 PROMOTE_ON_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote"
 ARMS[PROMOTE_OFF_ARM] = ({**ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2"][0], PROMOTE: "0"}, True)
 ARMS[PROMOTE_ON_ARM] = ({**ARMS[PROMOTE_OFF_ARM][0], PROMOTE: "1"}, True)
+# The promote-off arm with GPU misses on landed pool rows copied from the pool instead of read; its reference is the
+# off arm, so the A/B reads the flag alone.
+POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-poolserve"
+ARMS[POOL_SERVE_ARM] = ({**ARMS[PROMOTE_OFF_ARM][0], POOL_SERVE: "1"}, True)
 # The pair's fixed-split option: the CPU split is the off capture's table (the driver's SGLANG_DSV41_CPU_EXPERTS_SPLIT)
 # with calibration off, so both arms split alike and the A/B does not read calibration drift.
 FIXED_SPLIT_VAR = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0"}
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
-for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM):
+for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
@@ -273,6 +281,8 @@ REFERENCE = {
     PROMOTE_ON_ARM: PROMOTE_OFF_ARM,
     PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX: "dspark-both-misscut",
     PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
+    POOL_SERVE_ARM: PROMOTE_OFF_ARM,
+    POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
@@ -299,6 +309,7 @@ RAM_KEYS = (
     "spec_promote_reading",
     "spec_publish_backstop",
     "spec_promote_row_busy",
+    "spec_pool_served",
 )
 
 

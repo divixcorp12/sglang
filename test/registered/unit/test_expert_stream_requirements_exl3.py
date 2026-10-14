@@ -925,6 +925,15 @@ def test_prefetch_promote_needs_the_prefetch_and_defaults_off(model_dir):
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_PROMOTE=True)
 
 
+def test_prefetch_pool_serve_needs_the_prefetch_and_defaults_off(model_dir):
+    """Pool serving copies from the prefetch pool. Mutant: the refusal dropped -- red (the launch passes silently)."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE.get() is False
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE needs SGLANG_DSV41_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE=True)
+
+
 def test_idle_drive_spread_and_pieces_default_to_todays_reads():
     """Off until their served A/B is accepted: ties to the lowest root, the row on its root, one piece in flight."""
     assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get() is False

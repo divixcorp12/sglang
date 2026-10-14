@@ -143,6 +143,7 @@ def enable(
     idle_spread=False,
     idle_pieces=1,
     promote=False,
+    pool_serve=False,
 ) -> None:
     """Row 0 targets row 1 with `logits`' gate; every later row targets nothing. `idle_deadline_s`: idle-drive
     speculative reads with that deadline, `idle_spread` and `idle_pieces` (None: the shared reader)."""
@@ -158,6 +159,7 @@ def enable(
         cores=cores if cores is not None else [[] for _ in range(rig.host.nodes)],
         top_k_only=top_k_only,
         promote=promote,
+        pool_serve=pool_serve,
         **(
             {}
             if idle_deadline_s is None

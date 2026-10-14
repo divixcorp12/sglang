@@ -1365,6 +1365,7 @@ class Exl3RamMissService:
             idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
         )
         promote = envs.SGLANG_DSV41_RAM_PREFETCH_PROMOTE.get()
+        pool_serve = envs.SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE.get()
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden, horizon=horizon)
             candidates = new_candidate_page(pin=pin)
@@ -1387,6 +1388,7 @@ class Exl3RamMissService:
                 candidates=candidates,
                 min_margin=min_margin,
                 promote=promote,
+                pool_serve=pool_serve,
                 **idle,
             )
             targets = picked.targets
@@ -1409,6 +1411,7 @@ class Exl3RamMissService:
                 cores=cores,
                 top_k_only=top_k_only,
                 promote=promote,
+                pool_serve=pool_serve,
                 **idle,
             )
             targets, result = tables.targets, None

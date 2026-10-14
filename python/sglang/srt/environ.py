@@ -2072,6 +2072,9 @@ class Envs:
     # Defer each row's map delta to the previous row's next record and fold landed pool rows into it, so the GPU types
     # them as RAM hits. Needs SGLANG_DSV41_RAM_PREFETCH=1.
     SGLANG_DSV41_RAM_PREFETCH_PROMOTE = EnvBool(False)
+    # Fill a GPU miss whose row already landed in the prefetch pool by copying it from the pool slot instead of reading
+    # it again from NVMe. Needs SGLANG_DSV41_RAM_PREFETCH=1.
+    SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE = EnvBool(False)
     # How many layers ahead the speculative scorer targets (1 to 4): 1 scores the next layer's gate, 2 the one after.
     # Above 1 needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS set, since the packaged floors were fit for 1.
     SGLANG_DSV41_RAM_PREFETCH_HORIZON = EnvInt(1)

@@ -31,7 +31,7 @@ for run in sys.argv[1:]:
     if "spec_skip_landed_gpu" in c:
         # Other reads whose expert the pool already held: what serving them from the pool would save.
         print(
-            "%-26s pooled other reads: landed GPU %5d CPU %5d  reading GPU %5d CPU %5d"
+            "%-26s pooled other reads: landed GPU %5d CPU %5d  reading GPU %5d CPU %5d  pool-served GPU misses %5d"
             % ("", c["spec_skip_landed_gpu"], c["spec_skip_landed_cpu"], c["spec_skip_reading_gpu"],
-               c["spec_skip_reading_cpu"])
+               c["spec_skip_reading_cpu"], c.get("spec_pool_served", 0))
         )

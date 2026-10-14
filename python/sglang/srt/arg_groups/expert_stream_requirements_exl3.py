@@ -403,6 +403,8 @@ def _check_ram_prefetch() -> None:
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH=1")
         if envs.SGLANG_DSV41_RAM_PREFETCH_PROMOTE.get():
             raise ValueError("SGLANG_DSV41_RAM_PREFETCH_PROMOTE needs SGLANG_DSV41_RAM_PREFETCH=1")
+        if envs.SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE.get():
+            raise ValueError("SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE needs SGLANG_DSV41_RAM_PREFETCH=1")
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.

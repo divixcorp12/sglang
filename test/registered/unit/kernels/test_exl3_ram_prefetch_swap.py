@@ -170,6 +170,51 @@ def test_a_gpu_miss_on_a_pooled_expert_is_read_and_the_pool_row_stays(tmp_path):
         rig.host.stop()
 
 
+def _pool_serve_rig(tmp_path, **kwargs):
+    rig = prefetch_rig(tmp_path, **kwargs)
+    try:
+        enable(rig, LOGITS, pool_serve=True)
+    except BaseException:
+        rig.host.stop()
+        raise
+    return rig
+
+
+def test_with_pool_serve_a_gpu_miss_on_a_landed_pool_row_is_copied_into_staging_and_not_read(tmp_path):
+    """Every piece published (wait_served), the staging slot holds the row and is mapped, nothing read, the pool entry
+    emptied with its slot still pooled. Mutant: skip one piece's publish -- the serve times out; copy from the staging
+    slot instead of the pool slot -- red on the bytes; leave the entry claimed -- red on the pool state."""
+    rig = _pool_serve_rig(tmp_path)
+    try:
+        slot = rig.host.spec_place(1, 4)
+        rows = rig.host.counters()["rows_read"]
+        req = load(rig, 1, [4])
+        assert req.kinds == [LaneKind.MISS_GPU]
+        mapped = rig.host.mapping(1)[4]
+        assert mapped not in (-1, slot) and _same_row(rig, 1, mapped, 4)
+        assert _entry(rig.host, 1, 4) is None and rig.host.slot_info(1)[slot][0] == SPEC
+        c = rig.host.counters()
+        assert (c["rows_read"], c["spec_pool_served"], c["spec_skip_landed_gpu"]) == (rows, 1, 0)
+    finally:
+        rig.host.stop()
+
+
+def test_with_pool_serve_a_record_mixing_a_copied_and_a_read_gpu_miss_lands_both(tmp_path):
+    """The copy runs inside the other miss's read (one piece a drain turn) and finishes after it; both rows land whole
+    and only the unpooled one is read. Mutant: copy pieces into the read miss's slot -- red on the bytes."""
+    rig = _pool_serve_rig(tmp_path)
+    try:
+        rig.host.spec_place(1, 4)
+        rows = rig.host.counters()["rows_read"]
+        req = load(rig, 1, [4, 2])
+        assert req.kinds == [LaneKind.MISS_GPU, LaneKind.MISS_GPU]
+        assert _same_row(rig, 1, rig.host.mapping(1)[4], 4) and _same_row(rig, 1, rig.host.mapping(1)[2], 2)
+        c = rig.host.counters()
+        assert (c["rows_read"], c["spec_pool_served"]) == (rows + 1, 1)
+    finally:
+        rig.host.stop()
+
+
 def test_a_two_group_swap_stays_in_the_experts_home_range(tmp_path):
     rig = prefetch_rig(tmp_path, nodes=2, share=1)
     try:

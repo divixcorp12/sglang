@@ -1458,6 +1458,7 @@ COUNTERS = (
     "spec_promote_reading",
     "spec_publish_backstop",
     "spec_promote_row_busy",
+    "spec_pool_served",
     "spec_skip_landed_gpu",
     "spec_skip_landed_cpu",
     "spec_skip_reading_gpu",
@@ -1505,6 +1506,7 @@ CORE_COUNTERS = (
     "spec_promote_reading",
     "spec_publish_backstop",
     "spec_promote_row_busy",
+    "spec_pool_served",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -2177,6 +2179,7 @@ class ExpertStreamHost:
         idle_spread: bool = False,
         idle_pieces: int = 1,
         promote: bool = False,
+        pool_serve: bool = False,
     ) -> None:
         """Enable the RAM prefetch over the pool ``reserve_spec_pool`` took, after ``enable_cpu_experts`` and before
         the thread. ``targets`` int64 ``[layers, 2]``: per source row its target row and gate index, or (-1, -1);
@@ -2193,7 +2196,10 @@ class ExpertStreamHost:
         row's pieces may be in flight at once.
 
         ``promote`` (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
-        that layer's map delta, so the device types them as RAM hits."""
+        that layer's map delta, so the device types them as RAM hits.
+
+        ``pool_serve`` (SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE) fills a GPU miss whose row landed in the pool by copying
+        the pool slot into its staging slot, piece by piece, instead of reading it from NVMe."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
         if candidates is not None:
@@ -2271,6 +2277,7 @@ class ExpertStreamHost:
             int(bool(idle_spread)),
             int(idle_pieces),
             int(bool(promote)),
+            int(bool(pool_serve)),
         )
         self.ram_prefetch_tensors = (gates, bias, candidates, min_margin)
 

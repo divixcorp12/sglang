@@ -1174,6 +1174,12 @@ class RamTier {
       dist_.set_deferred(std::move(deferred));
       promote_ = true;
     }
+    if (config.pool_serve) {
+      const size_t segments = dist_.group(0).reader.tables().segments.size();
+      for (auto& runs : serve_runs_)
+        runs.assign(static_cast<size_t>(kPieces) * segments, PieceRun{});
+      pool_serve_ = true;
+    }
     spec->config = std::move(config);
     spec_ = std::move(spec);
   }
@@ -2082,6 +2088,11 @@ class RamTier {
     FixedVec<int64_t, Wire::kLanes> read_slots;
     FixedVec<int32_t, Wire::kLanes> read_lanes;
     FixedVec<int32_t, Wire::kLanes> ordinal;
+    // Bit i (also in pooled): GPU miss i is copied into its staging slot from its group's pool entry copy_entry[i]
+    // (SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE). copy_next is the next (miss, piece) to copy, as miss * kPieces + piece.
+    Wire::LaneMask copied = 0;
+    int8_t copy_entry[Wire::kLanes] = {};
+    int copy_next = 0;
   };
 
   // The record's CPU-miss jobs still to submit, advanced as rows land.
@@ -2156,8 +2167,6 @@ class RamTier {
                              static_cast<int64_t>(j));
         }
         if (judging && listed(own.promote_evicted, lane.expert)) count<kSpecPromoteVictimRouted>(group);
-        if constexpr (Build::kMetrics)
-          if (lane.slot >= 0 && pool_ != nullptr) count_skipped_pooled(group, request.row, lane);
         plan->missing.push_back(lane.expert);
         plan->slots.push_back(lane.slot);
         plan->miss_lane.push_back(static_cast<int32_t>(j));
@@ -2267,6 +2276,99 @@ class RamTier {
       cpu ? count<kSpecSkipLandedCpu>(group) : count<kSpecSkipLandedGpu>(group);
     else
       cpu ? count<kSpecSkipReadingCpu>(group) : count<kSpecSkipReadingGpu>(group);
+  }
+
+  // Unforced miss i: with pool_serve_, a GPU miss whose row landed in its group's pool is claimed to be copied into its
+  // staging slot (plan.copied, and pooled: not read); any other is counted when the pool held its expert.
+  void plan_pool_copy_locked(Group& group, const Request& request, RecordPlan& plan, size_t i) {
+    const Lane& lane = request.lanes[plan.miss_lane[i]];
+    if (pool_serve_ && lane.kind == Wire::kKindMissGpu) {
+      const int entry = claim_pool_copy_locked(group, request.row, lane.expert);
+      if (entry >= 0) {
+        plan.copied |= Wire::LaneMask{1} << i;
+        plan.pooled |= Wire::LaneMask{1} << i;
+        plan.copy_entry[i] = static_cast<int8_t>(entry);
+        return;
+      }
+    }
+    if constexpr (Build::kMetrics) count_skipped_pooled(group, request.row, lane);
+  }
+
+  // Takes group g's landed entry of `row` holding `expert` for a demand to copy from: swapped with freed_at
+  // kPoolCopying, so no claim reclaims it, no find matches it and release_swapped leaves it, until release_pool_copy
+  // empties it. Returns the entry, or -1 when none is landed (one still reading is left to its read).
+  int claim_pool_copy_locked(Group& group, int64_t row, int32_t expert) {
+    const int g = group.index;
+    const int i = pool_->find(row, g, expert);
+    if (i < 0) return -1;
+    PoolEntry& entry = pool_->entry(row, g, i);
+    std::lock_guard<std::mutex> lock(pool_->mutex(g));
+    if (entry.word.load(std::memory_order_acquire) != pool_word(kPoolLanded, expert)) return -1;
+    entry.freed_at = kPoolCopying;
+    entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
+    return i;
+  }
+
+  // The readiness word of record lane `lane` (init_piece_words_locked's).
+  uint64_t* piece_word_at(int64_t idx, int32_t lane) {
+    return reinterpret_cast<uint64_t*>(
+        lease_ + Wire::kLeasePieceMask +
+        (idx * Wire::kLanes + static_cast<int64_t>(lane)) * Wire::kLeasePieceMaskLineBytes);
+  }
+
+  // Before the first copied piece: each copied miss's readiness word carries the record's generation, no bit set.
+  void begin_pool_copies(const Request& request, const RecordPlan& plan) {
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      if ((plan.copied >> i & 1u) != 0)
+        store_release64(piece_word_at(plan.idx, plan.miss_lane[i]), piece_word(request.gen));
+    }
+    _mm_sfence();
+  }
+
+  // Copies the record's next pool piece (plan.copy_next) from the pool slot into the miss's staging slot and publishes
+  // it. A piece is the device's: row_geometry's runs, as the stream kernel's piece-run table has them. The last piece of
+  // a miss releases its entry. Returns false once every piece is copied.
+  bool copy_pool_piece(Group& group, const Request& request, RecordPlan& plan) {
+    const int total = static_cast<int>(plan.missing.size()) * kPieces;
+    while (plan.copy_next < total && (plan.copied >> (plan.copy_next / kPieces) & 1u) == 0)
+      plan.copy_next += kPieces;
+    if (plan.copy_next >= total) return false;
+    const size_t i = static_cast<size_t>(plan.copy_next / kPieces);
+    const int j = plan.copy_next % kPieces;
+    const int g = group.index;
+    const Tables& t = group.reader.tables();
+    const size_t segments = t.segments.size();
+    PieceRun* runs = serve_runs_[g].data();
+    if (j == 0) {
+      RowGeometry geometry;
+      if (!row_geometry(t, static_cast<size_t>(request.row * experts_ + plan.missing[i]), geometry, runs))
+        fail_record(request, "a pooled row cannot be cut into pieces");
+    }
+    const int64_t src = pool_->entry(request.row, g, plan.copy_entry[i]).slot;  // stable: the entry is ours
+    const int64_t dst = plan.slots[i];
+    for (size_t k = 0; k < segments; ++k) {
+      const PieceRun& run = runs[static_cast<size_t>(j) * segments + k];
+      if (run.lo >= run.hi) continue;
+      const Segment& s = t.segments[k];
+      uint8_t* const at = t.slabs[request.row][s.name] + s.dst + run.lo;
+      const int64_t stride = t.row_bytes[s.name];
+      std::memcpy(at + dst * stride, at + src * stride, static_cast<size_t>(run.hi - run.lo));
+    }
+    _mm_sfence();  // the piece's bytes, non-temporal stores included, before its bit
+    if (!publish_piece(piece_word_at(plan.idx, plan.miss_lane[i]), request.gen, static_cast<uint8_t>(1u << j)))
+      fail_record(request, "a pooled piece's readiness word refused it");
+    if (++plan.copy_next % kPieces == 0) release_pool_copy(group, request.row, plan.copy_entry[i]);
+    return true;
+  }
+
+  // The copy is done: the row's bytes are in the staging slot, so the entry empties and its slot is free to read into.
+  void release_pool_copy(Group& group, int64_t row, int i) {
+    const int g = group.index;
+    {
+      std::lock_guard<std::mutex> lock(pool_->mutex(g));
+      pool_->entry(row, g, i).word.store(kPoolEmpty, std::memory_order_release);
+    }
+    count<kSpecPoolServed>(group);
   }
 
   // A forced miss's pool row: when group g's pool of the row holds `expert` landed, returns the entry's slot and gives
@@ -2888,6 +2990,7 @@ class RamTier {
     }
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       if (placed[i]) continue;
+      if (pool_ != nullptr) plan_pool_copy_locked(group, request, plan, i);
       int32_t old = -1;
       const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
       if (victim < 0) {
@@ -3028,6 +3131,7 @@ class RamTier {
       }
       submit_landed_cpu_misses(group, request, plan, misses);
     }
+    if (plan.copied != 0) begin_pool_copies(request, plan);
     const std::span<const int32_t> experts = pooled ? plan.read_experts.span() : plan.missing.span();
     const std::span<const int64_t> slots = pooled ? plan.read_slots.span() : plan.slots.span();
     const std::span<const int32_t> lanes = pooled ? plan.read_lanes.span() : plan.miss_lane.span();
@@ -3039,6 +3143,8 @@ class RamTier {
       ++group.demands_read;
       if (cur) cur->submit = cur->first_cqe = cur->last_cqe = cur->pack_start = cur->pack_end = cur->reserved;
     }
+    while (copy_pool_piece(group, request, plan)) {
+    }
     submit_landed_cpu_misses(group, request, plan, misses);
     if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
     if (misses->staged != 0) fail_record(request, "a staged CPU miss's row never landed whole");
@@ -3049,7 +3155,7 @@ class RamTier {
   void read_rows(
       Group& group,
       const Request& request,
-      const RecordPlan& plan,
+      RecordPlan& plan,
       std::span<const int32_t> experts,
       std::span<const int64_t> slots,
       std::span<const int32_t> lanes,
@@ -3094,8 +3200,12 @@ class RamTier {
         cur,
         &group.packed,
         SIZE_MAX,
-        // read() runs this once per drain-loop turn and once per finished row.
-        [&] { submit_landed_cpu_misses(group, request, plan, misses); },
+        // read() runs this once per drain-loop turn and once per finished row. Its first turn runs before any read is
+        // submitted, so pool copies start on the second: one piece a turn while the reads are in flight.
+        [&, turns = 0]() mutable {
+          submit_landed_cpu_misses(group, request, plan, misses);
+          if (plan.copied != 0 && turns++ > 0) copy_pool_piece(group, request, plan);
+        },
         publishing ? &group.piece_publish : nullptr,
         TableRoots{},
         TwoSpanRows{two_stage ? group.two_span.data() : nullptr, two_stage ? &group.prefix : nullptr});
@@ -3218,6 +3328,9 @@ class RamTier {
   };
   std::array<ForwardState, Wire::kNodes> forward_{};
   bool promote_ = false;  // set in enable_ram_prefetch, before the service thread starts
+  bool pool_serve_ = false;  // likewise
+  // Per group, owned by its service thread: the piece runs of the pool row it is copying (copy_pool_piece).
+  std::array<std::vector<PieceRun>, Wire::kNodes> serve_runs_;
   // hold_row's helper (InstrBuild tests only); joined by release_row_hold.
   std::thread row_holder_;
   std::atomic<bool> row_held_{false};

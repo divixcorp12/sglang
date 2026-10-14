@@ -382,7 +382,12 @@ def test_the_max_m8_arm_is_the_miss_cut_arm_with_four_tokens_per_cpu_chunk():
 PROMOTE = "SGLANG_DSV41_RAM_PREFETCH_PROMOTE"
 PROMOTE_ON = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote"
 PROMOTE_OFF = f"{PROMOTE_ON}-off"
-PROMOTE_PAIR_ARMS = (PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit")
+POOL_SERVE = "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE"
+POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-poolserve"
+PROMOTE_PAIR_ARMS = (
+    PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
+    f"{POOL_SERVE_ARM}-fixedsplit",
+)
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
 IDLE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE"
@@ -541,6 +546,21 @@ def test_every_arm_pins_promote_off_but_the_promote_arm_against_an_exported_shel
         want = "1" if arm.startswith(PROMOTE_ON) and not arm.removeprefix(PROMOTE_ON).startswith("-off") else "0"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[PROMOTE] == want, arm
+
+
+def test_every_arm_pins_pool_serve_off_but_the_pool_serve_arm_which_differs_from_promote_off_in_it_alone(monkeypatch):
+    """Mutant: an arm inherits a shell's 1, the pool-serve arm changes another knob or is compared with the wrong
+    arm -- red."""
+    ab = _ab()
+    monkeypatch.setenv(POOL_SERVE, "1")
+    for arm in ab.ARMS:
+        want = "1" if arm.startswith(POOL_SERVE_ARM) else "0"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[POOL_SERVE] == want, arm
+    on, off = ab.ARMS[POOL_SERVE_ARM][0], ab.ARMS[PROMOTE_OFF][0]
+    assert {k: v for k, v in on.items() if k != POOL_SERVE} == {k: v for k, v in off.items() if k != POOL_SERVE}
+    assert ab.REFERENCE[POOL_SERVE_ARM] == PROMOTE_OFF
+    assert ab.REFERENCE[f"{POOL_SERVE_ARM}-fixedsplit"] == f"{PROMOTE_OFF}-fixedsplit"
 
 
 def test_the_promote_pair_differs_in_the_flag_alone_and_the_on_arm_is_compared_with_its_off_twin():
