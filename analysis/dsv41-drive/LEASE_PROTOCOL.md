@@ -240,10 +240,14 @@ untargeted rows publish immediately) change step 3:
 - **Row r-1's write.** The serve of row r-1's record in the next forward claims row r's pending delta, writes it
   through the same `write()` (entries before the tag), then releases its swapped victims. This runs in
   `RamTier::pump_demand` for every record that is not torn, before `handle_record` and on the lapped-hot skip path.
-- **Backstop.** The same place publishes row r's own pending delta at its record, and any earlier row's still pending
-  from an earlier forward (the forward counter advances when the row number does not increase). It is counted in
+- **Backstop.** The same place publishes any pending delta of row r or an earlier row that was stashed in an earlier
+  forward (the forward counter advances when the row number does not increase); a delta stashed in the caller's own
+  forward, as another group's serve of the same record finds it, is left for row r-1's serve. The claim checks the
+  stash's forward against the word it CASes, so a delta re-stashed meanwhile is never taken. It is counted in
   `spec_publish_backstop`. A delta is therefore written before row r's next record is served, and no later than the
   device's deadline allows.
+- **Write order.** The claimer copies the entries, frees the pending word, then writes: once the tag is out the device
+  may post row r's next record, whose stash must find the word free.
 - **Promotion at publish.** The claimer, before writing, maps landed pool rows of row r into the delta: each takes a
   victim (no wanted list), appends the victim's unmap and the expert's `{expert, pool slot}`, and the pool entry becomes
   swapped holding the victim until this delta is written. A delta never exceeds `Wire::kDeltaMaxEntries`; what does

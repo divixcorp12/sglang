@@ -2703,7 +2703,8 @@ class RamTier {
   // 0 immediate, 1 claim from row-1's record, 2 backstop, 3 flush.
   int publish_pending(Group& group, const Request& by, int64_t row, int trigger) {
     uint64_t chain = 0;
-    if (!dist_.claim(row, &chain)) {
+    // The backstop takes only a delta stashed in an earlier forward than the caller's.
+    if (!dist_.claim(row, &chain, trigger == 2 ? forward_[group.index].id : ~0ull)) {
       if (trigger == 1 && pool_ != nullptr) count_landed_no_delta(group, row);
       return -1;
     }
@@ -2793,11 +2794,10 @@ class RamTier {
     ForwardState& fwd = forward_[group.index];
     if (request.row <= fwd.last_row) ++fwd.id;
     fwd.last_row = request.row;
-    for (int64_t p = 0; p < request.row; ++p)
-      if (dist_.deferred(p) && dist_.pending_forward(p) < fwd.id && publish_pending(group, request, p, 2) >= 0)
+    // A delta another group stashed from this very record (same forward) still waits for row - 1's next serve.
+    for (int64_t p = 0; p <= request.row; ++p)
+      if (dist_.deferred(p) && publish_pending(group, request, p, 2) >= 0)
         count<kSpecPublishBackstop>(group);
-    if (dist_.deferred(request.row) && publish_pending(group, request, request.row, 2) >= 0)
-      count<kSpecPublishBackstop>(group);
     if (request.row + 1 < layers_ && dist_.deferred(request.row + 1))
       publish_pending(group, request, request.row + 1, 1);
   }

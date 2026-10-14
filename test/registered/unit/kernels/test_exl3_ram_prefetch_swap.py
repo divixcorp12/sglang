@@ -374,6 +374,46 @@ def test_a_row_still_reading_at_the_claim_counts_reading_and_is_left_alone(tmp_p
         rig.host.stop()
 
 
+def test_a_promotion_past_the_deltas_entry_limit_counts_no_room_and_stays_landed(tmp_path):
+    """Seven misses each evicting a resident expert leave row 1's delta at 14 of kDeltaMaxEntries (16): the first
+    landed row fits (16), the second counts no_room and stays landed. Mutant: check room for one entry instead of the
+    eviction and the insert -- the second promotes (an oversized delta) and no_room stays 0."""
+    experts = 14
+    rig = prefetch_rig(tmp_path, experts=experts, capacity=17, staging=8)  # 7 cache slots beside staging and the pool
+    try:
+        enable(rig, [[21 + e for e in range(experts)]], promote=True)
+        load(rig, 1, range(7))
+        load(rig, 0, [0])  # claims the first record's delta
+        load(rig, 1, range(7, 14))
+        assert len(rig.sim.delta(1)[2]) == 7, "row 1's second delta is still pending"
+        rig.host.spec_place(1, 0)
+        rig.host.spec_place(1, 1)
+        load(rig, 0, [0])
+        c = rig.host.counters()
+        assert (c["spec_promoted_early"], c["spec_promote_no_room"]) == (1, 1)
+        assert len(rig.sim.delta(1)[2]) == 16
+        assert [e["state"] for e in rig.host.spec_pool(1)].count("landed") == 1
+    finally:
+        rig.host.stop()
+
+
+def test_another_groups_serve_of_the_stashing_record_does_not_backstop_its_delta(tmp_path):
+    """Group 0 (expert 0's home) stashes row 1's delta, then group 1 serves the same record: the delta must wait for
+    row 0's next record, which promotes the landed 2 into it. Mutant: backstop the record's own row whatever its
+    forward -- group 1 writes the delta, red on backstop 1 and no promotion."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        load(rig, 1, [0])
+        slot = rig.host.spec_place(1, 2)
+        assert 0 <= slot < 4
+        load(rig, 0, [1])
+        c = rig.host.counters()
+        assert (c["spec_publish_backstop"], c["spec_promoted_early"]) == (0, 1)
+        assert rig.host.mapping(1)[2] == slot and (2, slot) in rig.sim.delta(1)[2]
+    finally:
+        rig.host.stop()
+
+
 def test_a_two_group_promotion_lands_in_the_experts_home_range(tmp_path):
     """Expert 3 is group 1's: its promotion maps the pool slot of group 1's range and pools group 1's victim. Mutant:
     take the victim from the claimer's group -- red on the range."""
