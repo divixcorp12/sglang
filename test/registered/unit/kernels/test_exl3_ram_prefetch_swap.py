@@ -334,6 +334,25 @@ def test_a_landed_row_with_no_delta_waiting_counts_no_delta_and_stays_landed(tmp
         rig.host.stop()
 
 
+def test_the_group_that_loses_the_claim_does_not_count_the_leftovers_as_no_delta(tmp_path):
+    """Two groups serve row 0's record; the winner claims row 1's delta and leaves 4 landed (no victim), the loser finds
+    the word empty. Mutant: count no_delta on every lost claim -- red on no_delta 1."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        load(rig, 1, [0])  # with 2, both of group 0's cache slots (one staging slot: one miss a record)
+        load(rig, 0, [1])
+        load(rig, 1, [2])
+        rig.host.set_hot(1, [0, 2])
+        rig.host.spec_place(1, 4)
+        tag = rig.sim.delta(1)[0]
+        load(rig, 0, [3])
+        c = rig.host.counters()
+        assert (c["spec_promote_no_victim"], c["spec_promote_no_delta"]) == (1, 0)
+        assert rig.sim.delta(1)[0] != tag
+    finally:
+        rig.host.stop()
+
+
 def test_a_landed_row_with_no_evictable_victim_counts_no_victim_and_stays_landed(tmp_path):
     """Both RAM slots of row 1 hold hot experts: take_victim finds none, the landed 4 stays in the pool and the delta
     is still written. Mutant: promote into a staging slot -- red on the entry state."""

@@ -246,6 +246,8 @@ untargeted rows publish immediately) change step 3:
   stash's forward against the word it CASes, so a delta re-stashed meanwhile is never taken. It is counted in
   `spec_publish_backstop`. A delta is therefore written before row r's next record is served, and no later than the
   device's deadline allows.
+- **No delta.** A group that loses row r-1's claim counts row r's landed entries in `spec_promote_no_delta` only when
+  no delta is pending and no group's serve of the same forward claimed one.
 - **Write order.** The claimer copies the entries, frees the pending word, then writes: once the tag is out the device
   may post row r's next record, whose stash must find the word free.
 - **Promotion at publish.** The claimer, before writing, maps landed pool rows of row r into the delta: each takes a

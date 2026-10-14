@@ -2704,10 +2704,13 @@ class RamTier {
   int publish_pending(Group& group, const Request& by, int64_t row, int trigger) {
     uint64_t chain = 0;
     // The backstop takes only a delta stashed in an earlier forward than the caller's.
-    if (!dist_.claim(row, &chain, trigger == 2 ? forward_[group.index].id : ~0ull)) {
-      if (trigger == 1 && pool_ != nullptr) count_landed_no_delta(group, row);
+    const uint64_t forward = forward_[group.index].id;
+    if (!dist_.claim(row, &chain, trigger == 2 ? forward : ~0ull)) {
+      // Another group's serve of this record may have claimed it: its leftovers are not no_delta.
+      if (trigger == 1 && pool_ != nullptr && !dist_.delta_taken(row, forward)) count_landed_no_delta(group, row);
       return -1;
     }
+    if (trigger == 1) dist_.mark_claimed(row, forward);
     const int promoted = promote_landed(group, row, chain);
     dist_.write_pending(lease_, row);
     if (pool_ != nullptr) release_swapped(row, chain);

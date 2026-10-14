@@ -162,6 +162,16 @@ class NumaNodeDistributor {
     return false;
   }
 
+  // The claim winner records the forward of the record that claimed; before write_pending, whose release publishes it.
+  void mark_claimed(int64_t row, uint64_t forward) {
+    rows_[row].claimed_forward.store(forward, std::memory_order_relaxed);
+  }
+  // A losing claimer's question: is a delta pending, or did another group's serve of the same forward claim it?
+  bool delta_taken(int64_t row, uint64_t forward) const {
+    if (rows_[row].pending.load(std::memory_order_acquire) != 0) return true;
+    return rows_[row].claimed_forward.load(std::memory_order_relaxed) == forward;
+  }
+
   // The claim winner's reads and appends; the buffer is not shared until write_pending clears the word.
   uint64_t pending_chain(int64_t row) const {
     return rows_[row].pending_chain;
@@ -201,6 +211,7 @@ class NumaNodeDistributor {
     int pending_count = 0;
     uint64_t pending_chain = 0;
     std::atomic<uint64_t> pending_forward{0};  // read unclaimed by the backstop
+    std::atomic<uint64_t> claimed_forward{~0ull};  // the forward of the last claim; none yet
     std::atomic<uint64_t> reported{0};
     std::atomic<uint64_t> written{0};  // the chain of the row's last delta
     std::array<FixedVec<int32_t, Wire::kLanes>, Wire::kNodes> staging;
