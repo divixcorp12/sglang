@@ -2105,6 +2105,7 @@ class RamTier {
     const bool cpu_row = host_lanes && group.cpu != nullptr && group.cpu->eligible(request.row);
     CopyJob& job = plan->job;
     GroupRow& own = group.rows[request.row];
+    const bool judging = own.promoted_chain != 0;  // the row's last promotion is judged on this record
     for (size_t j = 0; j < request.lanes.size(); ++j) {
       const Lane& lane = request.lanes[j];
       if (Wire::home(lane.expert) != group.index) continue;  // another group's lane
@@ -2132,6 +2133,7 @@ class RamTier {
             group.trace.emit("miss_expert", request.row, request.gen, request.seq, group.index, lane.expert,
                              static_cast<int64_t>(j));
         }
+        if (judging && listed(own.promote_evicted, lane.expert)) count<kSpecPromoteVictimRouted>(group);
         plan->missing.push_back(lane.expert);
         plan->slots.push_back(lane.slot);
         plan->miss_lane.push_back(static_cast<int32_t>(j));
@@ -2143,6 +2145,7 @@ class RamTier {
       }
       tier.stamp[lane.slot] = ++group.tick;
       disown_locked(own, tier, lane.slot);
+      if (judging && listed(own.promoted, lane.expert)) count<kSpecPromoteUsed>(group);
       if (lane.kind == Wire::kKindHitCopy) {
         if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst))
           fail(": a copy-engine lane on an ineligible row");
@@ -2154,6 +2157,11 @@ class RamTier {
       }
       job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
       job.mask |= Wire::LaneMask{1} << j;
+    }
+    if (judging) {
+      own.promoted.clear();
+      own.promote_evicted.clear();
+      own.promoted_chain = 0;
     }
     if (NumaNodeDistributor<Source>::miss_nodes(request) != 0) {
       // A group's own miss is checked against the row's last published delta, which is exact: the device waits for the
