@@ -166,6 +166,32 @@ def test_stats_count_the_jobs_whose_routes_share_a_slot(request, mode):
 
 
 @pytest.mark.parametrize("mode", MODES)
+def test_draft_shape_counts_the_cpu_routes_and_their_distinct_experts(request, mode, monkeypatch, tmp_path):
+    """draft_shape: a = the routes the CPU computes (-1 is a GPU-resident expert, not one), b = the distinct experts
+    among them, c = rows; the per-expert cost of a draft call divides by b. Mutant: count -1 as a route, or count a
+    repeated slot twice -- red."""
+    import json
+
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    areas, host = _host(request, mode)
+    slots = [[0, 1, 2], [2, -1, 5]]
+    _stage(areas, 0, len(slots), 3)
+    areas.slots[0, : len(slots), :3] = torch.tensor(slots, dtype=areas.slots.dtype)
+    _post(areas, 0, len(slots), 3, seq=1)
+    _finish(areas, 1)
+    host.stop()
+    if mode == "shared":
+        host.expert_host.stop()
+    shapes = [
+        e
+        for path in tmp_path.glob("jobs.*.jsonl")
+        for e in map(json.loads, path.read_text().splitlines()[1:-1])
+        if e.get("event") == "draft_shape"
+    ]
+    assert [(e["seq"], e["a"], e["b"], e["c"]) for e in shapes] == [(1, 5, 4, 2)]
+
+
+@pytest.mark.parametrize("mode", MODES)
 def test_three_stages_in_turn_each_run_their_own_layer(request, mode):
     areas, host = _host(request, mode)
     for seq, stage in enumerate(range(STAGES), start=1):

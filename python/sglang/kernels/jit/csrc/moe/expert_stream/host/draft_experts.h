@@ -211,6 +211,20 @@ class DraftExperts {
     call.weights = weights;
     call.out = d.out + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden;
     if constexpr (Build::kMetrics) trace_.draft_prepared(now_ns(), stage, epoch, seq);
+    if constexpr (Build::kMetrics) {
+      // draft_shape, before the clock starts: a = routes the CPU computes (slot >= 0; the rest are the draft's
+      // GPU-resident experts), b = distinct experts among them, c = rows; for verify jobs cpu_shape gives the same.
+      int live = 0, distinct = 0;
+      for (int i = 0; i < rows * k; ++i) {
+        if (slots[i] < 0) continue;
+        ++live;
+        bool seen = false;
+        for (int j = 0; j < i && !seen; ++j)
+          seen = slots[j] == slots[i];
+        distinct += seen ? 0 : 1;
+      }
+      trace_.emit("draft_shape", stage, epoch, seq, -1, live, distinct, rows);
+    }
     const int64_t start = now_ns();
     if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
     if constexpr (Build::kMetrics) trace_.resources("draft_faults_start", "draft_switches_start", stage, epoch, seq);
