@@ -255,9 +255,9 @@ untargeted rows publish immediately) change step 3:
   swapped holding the victim until this delta is written. A delta never exceeds `Wire::kDeltaMaxEntries`; what does
   not fit is skipped and counted. Only a delta already pending can carry promotions, so the device types the promoted
   expert as a hit at row r's next post.
-- **Row lock.** `NumaGroup::row_mutex[row]` is held by a group's service thread while it touches row r's tier. The
-  claimer takes it after that group's pool mutex (always pool mutex, then row mutex), and skips the group's entries
-  when it is busy.
+- **Row lock.** `NumaGroup::row_mutex[row]` is per (row, group). The group's service thread takes row_mutex, then the
+  pool mutex, while it touches row r's tier. The claimer takes the pool mutex, then try_locks row_mutex; when the row
+  is busy it leaves that group's entries landed and counts each in `spec_promote_row_busy`.
 - **Trace.** Each deferred write emits `delta_publish` (row, chain, trigger 0 immediate, 1 row r-1's serve, 2 backstop,
   3 flush; promoted count).
 

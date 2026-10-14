@@ -120,6 +120,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "inject_group_stall",
     "spec_place",
     "spec_pump",
+    "hold_row",
     "inject_spec",
     "inject_demand_load",
     "copy_engine_fail",
@@ -1456,6 +1457,7 @@ COUNTERS = (
     "spec_promote_used",
     "spec_promote_reading",
     "spec_publish_backstop",
+    "spec_promote_row_busy",
     "spec_scored",
     "spec_score_ns",
 )
@@ -1498,6 +1500,7 @@ CORE_COUNTERS = (
     "spec_promote_used",
     "spec_promote_reading",
     "spec_publish_backstop",
+    "spec_promote_row_busy",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -2722,6 +2725,12 @@ class ExpertStreamHost:
         _refuse_test_only("spec_place", self.variant)
         self._check(row, expert)
         return int(self._module.expert_stream_spec_place(self.handle, row, expert))
+
+    def hold_row(self, row: int, group: int, hold: bool = True) -> None:
+        """Test only: a helper thread holds ``group``'s row lock of ``row`` until a call with ``hold=False``, so a
+        promotion claim finds the row busy. Never serve ``row`` while it is held."""
+        _refuse_test_only("hold_row", self.variant)
+        self._module.expert_stream_hold_row(self.handle, int(row), int(group), int(hold))
 
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.

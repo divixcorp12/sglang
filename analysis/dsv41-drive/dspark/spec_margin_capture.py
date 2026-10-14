@@ -73,7 +73,7 @@ def counter_summary(log_path: str) -> dict:
     keys = ("spec_scored", "spec_score_ns", "spec_issued", "spec_landed", "spec_used", "spec_promoted",
             "spec_dropped", "spec_late", "rows_read", "spec_promoted_early", "spec_promote_no_delta",
             "spec_promote_no_room", "spec_promote_no_victim", "spec_promote_victim_routed", "spec_promote_used",
-            "spec_promote_reading", "spec_publish_backstop")
+            "spec_promote_reading", "spec_publish_backstop", "spec_promote_row_busy")
     out = {k: c.get(k) for k in keys}
     if c.get("spec_scored"):
         out["wait_or_score_us_per_record"] = c["spec_score_ns"] / c["spec_scored"] / 1000

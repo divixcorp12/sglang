@@ -82,8 +82,10 @@ enum Counter : int {
   kSpecPromoteUsed,
   // ... promoted entries a record found still being read,
   kSpecPromoteReading,
-  // ... and deltas written by the backstop rather than row r-1's serve.
+  // ... deltas written by the backstop rather than row r-1's serve,
   kSpecPublishBackstop,
+  // ... and landed entries left landed because their group's row lock was busy at the claim.
+  kSpecPromoteRowBusy,
   // ... the scorer's records scored and their scoring time in ns (metrics).
   kSpecScored,
   kSpecScoreNs,
@@ -125,6 +127,7 @@ constexpr bool is_core_counter(int k) {
     case kSpecPromoteUsed:
     case kSpecPromoteReading:
     case kSpecPublishBackstop:
+    case kSpecPromoteRowBusy:
       return true;
     default:
       return false;

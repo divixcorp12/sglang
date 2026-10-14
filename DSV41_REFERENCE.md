@@ -10206,6 +10206,7 @@ flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nv
 | Promoted rows are used | `spec_promote_used` | pending | pending |
 | Most rows have landed by publish time | `spec_promote_reading` | pending | pending |
 | The deferral never makes a post wait | `spec_publish_backstop`, `delta_publish` timing | pending | pending |
+| The row lock is rarely busy at claim time | `spec_promote_row_busy` | pending | pending |
 | Bypassed unforced misses shrink | `rows_read` vs forced CPU misses minus pool-served | pending | pending |
 
 **Decisions to revisit** from the data: pending.

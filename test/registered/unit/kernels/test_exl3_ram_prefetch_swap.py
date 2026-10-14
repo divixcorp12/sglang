@@ -26,6 +26,7 @@ PROMOTE_COUNTERS = (
     "spec_promote_used",
     "spec_promote_reading",
     "spec_publish_backstop",
+    "spec_promote_row_busy",
 )
 EIGHT_LOGITS = [[30, 25, 40, 22, 35, 21, 28, 27]]
 
@@ -379,6 +380,27 @@ def test_a_landed_row_with_no_evictable_victim_counts_no_victim_and_stays_landed
         c = rig.host.counters()
         assert (c["spec_promote_no_victim"], c["spec_promoted_early"]) == (1, 0)
         assert rig.sim.delta(1)[0] != tag
+        assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
+    finally:
+        rig.host.stop()
+
+
+def test_a_busy_row_lock_at_the_claim_counts_row_busy_and_leaves_the_row_landed(tmp_path):
+    """Group 0's row lock of row 1 is held while row 0's record claims row 1's delta: the delta is written without the
+    promotion and the landed 4 stays landed. Mutant: skip a busy group without counting -- red on row_busy 0."""
+    rig = _promote_rig(tmp_path)
+    try:
+        load(rig, 1, [0, 1])
+        slot = rig.host.spec_place(1, 4)
+        tag = rig.sim.delta(1)[0]
+        rig.host.hold_row(1, 0)
+        try:
+            load(rig, 0, [5])
+        finally:
+            rig.host.hold_row(1, 0, hold=False)
+        c = rig.host.counters()
+        assert (c["spec_promote_row_busy"], c["spec_promoted_early"]) == (1, 0)
+        assert rig.sim.delta(1)[0] != tag and rig.host.mapping(1)[4] == -1
         assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
     finally:
         rig.host.stop()
