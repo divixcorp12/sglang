@@ -86,6 +86,12 @@ enum Counter : int {
   kSpecPublishBackstop,
   // ... and landed entries left landed because their group's row lock was busy at the claim.
   kSpecPromoteRowBusy,
+  // Unforced misses (a staging slot) read from NVMe while their group's pool of the row held the expert, landed or
+  // reading, on a GPU miss lane or a CPU lane (metrics).
+  kSpecSkipLandedGpu,
+  kSpecSkipLandedCpu,
+  kSpecSkipReadingGpu,
+  kSpecSkipReadingCpu,
   // ... the scorer's records scored and their scoring time in ns (metrics).
   kSpecScored,
   kSpecScoreNs,

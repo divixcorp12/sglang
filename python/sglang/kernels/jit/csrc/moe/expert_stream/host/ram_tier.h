@@ -2156,6 +2156,8 @@ class RamTier {
                              static_cast<int64_t>(j));
         }
         if (judging && listed(own.promote_evicted, lane.expert)) count<kSpecPromoteVictimRouted>(group);
+        if constexpr (Build::kMetrics)
+          if (lane.slot >= 0 && pool_ != nullptr) count_skipped_pooled(group, request.row, lane);
         plan->missing.push_back(lane.expert);
         plan->slots.push_back(lane.slot);
         plan->miss_lane.push_back(static_cast<int32_t>(j));
@@ -2251,6 +2253,20 @@ class RamTier {
     }
     copy_engine_->submit(group.index, job);
     return misses;
+  }
+
+  // An unforced miss reads NVMe even when its group's pool of the row holds the expert (DSV41_REFERENCE.md
+  // section 33.36); counts those by the entry's state and the lane's kind.
+  void count_skipped_pooled(Group& group, int64_t row, const Lane& lane) {
+    const int i = pool_->find(row, group.index, lane.expert);
+    if (i < 0) return;
+    const bool landed =
+        pool_state(pool_->entry(row, group.index, i).word.load(std::memory_order_acquire)) == kPoolLanded;
+    const bool cpu = lane.kind == Wire::kKindMissCpu;
+    if (landed)
+      cpu ? count<kSpecSkipLandedCpu>(group) : count<kSpecSkipLandedGpu>(group);
+    else
+      cpu ? count<kSpecSkipReadingCpu>(group) : count<kSpecSkipReadingGpu>(group);
   }
 
   // A forced miss's pool row: when group g's pool of the row holds `expert` landed, returns the entry's slot and gives

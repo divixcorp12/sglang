@@ -1458,6 +1458,10 @@ COUNTERS = (
     "spec_promote_reading",
     "spec_publish_backstop",
     "spec_promote_row_busy",
+    "spec_skip_landed_gpu",
+    "spec_skip_landed_cpu",
+    "spec_skip_reading_gpu",
+    "spec_skip_reading_cpu",
     "spec_scored",
     "spec_score_ns",
 )

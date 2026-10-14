@@ -162,7 +162,10 @@ def test_a_gpu_miss_on_a_pooled_expert_is_read_and_the_pool_row_stays(tmp_path):
         assert req.kinds == [LaneKind.MISS_GPU]
         assert rig.host.mapping(1)[4] not in (-1, slot)
         assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
-        assert rig.host.counters()["spec_used"] == 0
+        c = rig.host.counters()
+        assert c["spec_used"] == 0
+        skips = ("spec_skip_landed_gpu", "spec_skip_landed_cpu", "spec_skip_reading_gpu", "spec_skip_reading_cpu")
+        assert [c[k] for k in skips] == [1, 0, 0, 0]
     finally:
         rig.host.stop()
 
