@@ -291,6 +291,7 @@ class RamTier {
         }
       }
       if (spec_ != nullptr) note_serving(group, request);
+      if (promote_) publish_due(group, request);
       if (!skip) handle_record(group, request);
       // Every group sees the record, served or skipped, so both groups score the same jobs.
       if (spec_ != nullptr) offer_spec(group, request);
@@ -1163,6 +1164,14 @@ class RamTier {
         group->spec_reader = std::move(reader);
       }
       spec->groups.push_back(std::move(group));
+    }
+    if (config.promote) {
+      // Row r defers its delta when some source targets it; row 0 and untargeted rows publish at once.
+      std::vector<uint8_t> deferred(static_cast<size_t>(layers_), 0);
+      for (int64_t row = 0; row < layers_; ++row)
+        if (config.target[row] > 0) deferred[config.target[row]] = 1;
+      dist_.set_deferred(std::move(deferred));
+      promote_ = true;
     }
     spec->config = std::move(config);
     spec_ = std::move(spec);
@@ -2659,15 +2668,52 @@ class RamTier {
   // The row's publisher, right after it publishes `request`'s delta: every group's entry swapped by this record becomes
   // empty, so no speculative read lands in a victim the device may still map. A reporter's swaps precede its report,
   // which the publisher's report acquires, so each is in place by now.
-  void release_swapped(const Request& request) {
+  void release_swapped(int64_t row, uint64_t chain) {
     for (int g = 0; g < dist_.size(); ++g) {
       std::lock_guard<std::mutex> lock(pool_->mutex(g));
       for (int i = 0; i < pool_->share(); ++i) {
-        PoolEntry& entry = pool_->entry(request.row, g, i);
-        if (pool_state(entry.word.load(std::memory_order_relaxed)) == kPoolSwapped && entry.freed_at == request.chain)
+        PoolEntry& entry = pool_->entry(row, g, i);
+        if (pool_state(entry.word.load(std::memory_order_relaxed)) == kPoolSwapped && entry.freed_at == chain)
           entry.word.store(kPoolEmpty, std::memory_order_release);
       }
     }
+  }
+
+  // Writes row's pending delta (claimed by the caller's CAS), then frees its swapped victims. Returns the promoted
+  // count, or -1 when another thread already claimed it. `by` is the record whose serve triggered it; trigger is
+  // 0 immediate, 1 claim from row-1's record, 2 backstop, 3 flush.
+  int publish_pending(Group& group, const Request& by, int64_t row, int trigger) {
+    uint64_t chain = 0;
+    if (!dist_.claim(row, &chain)) return -1;
+    const int promoted = promote_landed(group, row, chain);
+    dist_.write_pending(lease_, row);
+    if (pool_ != nullptr) release_swapped(row, chain);
+    if constexpr (Build::kMetrics)
+      group.trace.emit(
+          "delta_publish", row, by.gen, by.seq, group.index, static_cast<int64_t>(chain), static_cast<int64_t>(trigger),
+          static_cast<int64_t>(promoted));
+    return promoted;
+  }
+
+  // Maps landed pool rows of `row` into its claimed delta; returns how many. Filled in by the promotion task.
+  int promote_landed([[maybe_unused]] Group& claimer, [[maybe_unused]] int64_t row, [[maybe_unused]] uint64_t chain) {
+    return 0;
+  }
+
+  // Deferred publication for one served or skipped record: the backstop for the record's own row and for earlier
+  // rows stranded since an earlier forward, then the claim of row + 1's delta, which this record's row precedes.
+  void publish_due(Group& group, const Request& request) {
+    if (request.row < 0 || request.row >= layers_) return;
+    ForwardState& fwd = forward_[group.index];
+    if (request.row <= fwd.last_row) ++fwd.id;
+    fwd.last_row = request.row;
+    for (int64_t p = 0; p < request.row; ++p)
+      if (dist_.deferred(p) && dist_.pending_forward(p) < fwd.id && publish_pending(group, request, p, 2) >= 0)
+        count<kSpecPublishBackstop>(group);
+    if (dist_.deferred(request.row) && publish_pending(group, request, request.row, 2) >= 0)
+      count<kSpecPublishBackstop>(group);
+    if (request.row + 1 < layers_ && dist_.deferred(request.row + 1))
+      publish_pending(group, request, request.row + 1, 1);
   }
 
   // Picks the victims and publishes the delta, before any read, so a served chain always has its delta published. A
@@ -2733,9 +2779,21 @@ class RamTier {
     own.staging = part.staging;
     const uint32_t reporters = NumaNodeDistributor<Source>::miss_nodes(request);
     if (dist_.report(request, group.index, part, reporters)) {
-      if (!dist_.publish(lease_, request, reporters))
-        fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
-      if (pool_ != nullptr) release_swapped(request);
+      if (dist_.deferred(request.row)) {
+        // Written by the serve of row - 1's next record; its swapped victims are released then.
+        if (!dist_.stash(request, reporters, forward_[group.index].id))
+          fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
+      } else {
+        if (!dist_.publish(lease_, request, reporters))
+          fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
+        if (pool_ != nullptr) release_swapped(request.row, request.chain);
+        if constexpr (Build::kMetrics) {
+          if (promote_)
+            group.trace.emit(
+                "delta_publish", request.row, request.gen, request.seq, group.index,
+                static_cast<int64_t>(request.chain), int64_t{0}, int64_t{0});
+        }
+      }
     }
   }
 
@@ -2998,6 +3056,10 @@ class RamTier {
   // episode so the watchdog can time it.
   void handle_record(Group& group, const Request& request) {
     begin_busy(group);
+    // A promoter of another group may map into this row's tier; it takes the same lock.
+    std::unique_lock<std::mutex> row_lock;
+    if (promote_ && request.row >= 0 && request.row < layers_)
+      row_lock = std::unique_lock<std::mutex>(group.row_mutex[request.row]);
     if (!request.lanes.empty()) {
       if (serve_record(group, request)) {
         count<kServedRequests>(group);
@@ -3016,6 +3078,14 @@ class RamTier {
     }
     end_busy(group);
   }
+
+  // Per group, owned by its service thread: the forward counts up when a record's row is not past the last one's.
+  struct alignas(64) ForwardState {
+    int64_t last_row = -1;
+    uint64_t id = 0;
+  };
+  std::array<ForwardState, Wire::kNodes> forward_{};
+  bool promote_ = false;  // set in enable_ram_prefetch, before the service thread starts
 
   uint8_t* page_;
   int32_t* map_;
