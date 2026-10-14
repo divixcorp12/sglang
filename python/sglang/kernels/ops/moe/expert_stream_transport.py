@@ -1448,6 +1448,14 @@ COUNTERS = (
     "spec_abandoned",
     "spec_boosted",
     "spec_moved_root",
+    "spec_promoted_early",
+    "spec_promote_no_delta",
+    "spec_promote_no_room",
+    "spec_promote_no_victim",
+    "spec_promote_victim_routed",
+    "spec_promote_used",
+    "spec_promote_reading",
+    "spec_publish_backstop",
     "spec_scored",
     "spec_score_ns",
 )
@@ -1482,6 +1490,14 @@ CORE_COUNTERS = (
     "spec_abandoned",
     "spec_boosted",
     "spec_moved_root",
+    "spec_promoted_early",
+    "spec_promote_no_delta",
+    "spec_promote_no_room",
+    "spec_promote_no_victim",
+    "spec_promote_victim_routed",
+    "spec_promote_used",
+    "spec_promote_reading",
+    "spec_publish_backstop",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
