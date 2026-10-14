@@ -1177,6 +1177,14 @@ class RamTier {
     spec_ = std::move(spec);
   }
 
+  // Writes every pending deferred delta; the bulk apply kernel skips an unwritten tag. Owner only, once the service
+  // threads are parked or joined. A no-op with the flag off.
+  void flush_pending() {
+    if (!promote_) return;
+    for (int64_t row = 0; row < layers_; ++row)
+      if (dist_.deferred(row)) publish_pending(dist_.group(0), Request{}, row, 3);
+  }
+
   // The number of eager-path map changes since the last take, {row, expert, slot} each with slot -1 an unmap: the bulk
   // delta that map_bulk_apply writes on the device. Owner only (a paused caller). Joins a running fill first, so a
   // failed fill's unmaps are counted.
@@ -1184,6 +1192,7 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("bulk_delta_count");
     fill_join();
+    flush_pending();
     return static_cast<int64_t>(bulk_.size());
   }
 
