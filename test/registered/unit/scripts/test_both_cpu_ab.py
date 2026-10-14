@@ -379,6 +379,12 @@ def test_the_max_m8_arm_is_the_miss_cut_arm_with_four_tokens_per_cpu_chunk():
     assert ab.REFERENCE["dspark-both-misscut-maxm8"] == "dspark-both-misscut"
 
 
+PROMOTE = "SGLANG_DSV41_RAM_PREFETCH_PROMOTE"
+PROMOTE_ON = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote"
+PROMOTE_OFF = f"{PROMOTE_ON}-off"
+PROMOTE_PAIR_ARMS = (PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit")
+SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
+CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
 IDLE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE"
 IDLE_DEADLINE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US"
 
@@ -404,6 +410,7 @@ IDLE2_ARMS = (
     "dspark-both-prefetch-gpu-misscut-idle2-l2-cap2",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3",
+    *PROMOTE_PAIR_ARMS,
 )
 IDLE_ARMS = ("dspark-both-prefetch-gpu-misscut-idle", *IDLE2_ARMS)
 
@@ -506,7 +513,7 @@ def test_every_other_arm_pins_horizon_1_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv(HORIZON, "3")
     for arm in ab.ARMS:
-        want = "2" if arm in (L2_ARM, T3_ARM, L2_CAP2_ARM, T3_CAP2_ARM, T3_CAP3_ARM) else "1"
+        want = "2" if arm in (L2_ARM, T3_ARM, L2_CAP2_ARM, T3_CAP2_ARM, T3_CAP3_ARM, *PROMOTE_PAIR_ARMS) else "1"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[HORIZON] == want, arm
 
@@ -521,9 +528,47 @@ def test_the_t3_arm_is_the_l2_arm_with_the_head_file_alone_and_every_other_arm_p
     assert ab.ARMS[T3_ARM][1] is True
     assert ab.REFERENCE[T3_ARM] == "dspark-both-misscut"
     for arm in ab.ARMS:
-        want = ab.T3_HEAD if arm in (T3_ARM, T3_CAP2_ARM, T3_CAP3_ARM) else ""
+        want = ab.T3_HEAD if arm in (T3_ARM, T3_CAP2_ARM, T3_CAP3_ARM, *PROMOTE_PAIR_ARMS) else ""
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[LEARNED_HEAD] == want, arm
+
+
+def test_every_arm_pins_promote_off_but_the_promote_arm_against_an_exported_shell(monkeypatch):
+    """Mutant: an arm leaves the flag unset and inherits a shell's 1, or the on arm is not on -- red."""
+    ab = _ab()
+    monkeypatch.setenv(PROMOTE, "1")
+    for arm in ab.ARMS:
+        want = "1" if arm.startswith(PROMOTE_ON) and not arm.removeprefix(PROMOTE_ON).startswith("-off") else "0"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[PROMOTE] == want, arm
+
+
+def test_the_promote_pair_differs_in_the_flag_alone_and_the_on_arm_is_compared_with_its_off_twin():
+    """Mutant: the twin also changes another knob, or the on arm is built from the wrong arm -- red."""
+    ab = _ab()
+    base = ab.ARMS[T3_CAP2_ARM][0]
+    on, off = ab.ARMS[PROMOTE_ON][0], ab.ARMS[PROMOTE_OFF][0]
+    assert (on[PROMOTE], off[PROMOTE]) == ("1", "0")
+    assert {k: v for k, v in on.items() if k != PROMOTE} == {k: v for k, v in off.items() if k != PROMOTE}
+    assert off == base
+    assert ab.ARMS[PROMOTE_ON][1] is True and ab.REFERENCE[PROMOTE_ON] == PROMOTE_OFF
+    assert ab.REFERENCE[PROMOTE_OFF] == "dspark-both-misscut"
+
+
+def test_the_fixed_split_option_adds_the_table_and_calibration_off_to_both_arms_of_the_pair(monkeypatch, tmp_path):
+    """Mutant: the option reaches one arm only, leaves calibration on, or drops the table -- red."""
+    ab = _ab()
+    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    for arm in (PROMOTE_ON, PROMOTE_OFF):
+        plain, fixed = ab._overrides(arm, "/out"), ab._overrides(f"{arm}-fixedsplit", "/out")
+        assert SPLIT not in plain and CALIBRATION not in plain
+        assert (fixed[SPLIT], fixed[CALIBRATION]) == ("0:3,1:5", "0")
+        assert {k: v for k, v in fixed.items() if k not in (SPLIT, CALIBRATION)} == plain
+        assert ab._probe_overrides(f"{arm}-fixedsplit", "/out")[SPLIT] == "0:3,1:5"
+    monkeypatch.delenv(SPLIT)
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), f"{PROMOTE_ON}-fixedsplit"])
+    with pytest.raises(SystemExit, match=SPLIT):
+        ab.main()
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
