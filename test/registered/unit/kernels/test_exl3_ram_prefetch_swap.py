@@ -312,6 +312,7 @@ def test_row_rs_next_record_counts_the_promotion_used_and_the_victim_routed(tmp_
         assert req.kinds[0] in (LaneKind.HIT_COPY, LaneKind.HIT_SM) and req.kinds[1] == LaneKind.MISS_GPU
         c = rig.host.counters()
         assert (c["spec_promote_used"], c["spec_promote_victim_routed"]) == (1, 1)
+        load(rig, 0, [5])  # claims the delta row 1's miss on 0 left pending
         load(rig, 1, [4])
         c = rig.host.counters()
         assert (c["spec_promote_used"], c["spec_promote_victim_routed"]) == (1, 1)
@@ -354,8 +355,10 @@ def test_a_landed_row_with_no_evictable_victim_counts_no_victim_and_stays_landed
 def test_a_row_still_reading_at_the_claim_counts_reading_and_is_left_alone(tmp_path):
     """The speculative read of 2 is held 0.6 s; row 0's next record claims row 1's delta meanwhile. Mutant: treat a
     reading entry as landed -- red (a promotion of an unlanded row)."""
-    rig = _promote_rig(tmp_path)
+    rig = prefetch_rig(tmp_path)
     try:
+        # An idle-drive read sleeps off the demand reader's turn, so row 1's record is served while it is in flight.
+        enable(rig, LOGITS, promote=True, idle_deadline_s=5.0)
         rig.host.inject_spec(delay_s=0.6)
         rig.host.start_thread(fatal_wait_s=5.0)
         trigger(rig)
