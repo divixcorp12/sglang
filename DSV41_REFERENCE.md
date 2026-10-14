@@ -10211,7 +10211,11 @@ flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nv
 | `delta_publish` write to row's next record, us (p50 / min) | pending | pending |
 
 **Gate checks** (feature gate, not served): `py_compile` of the changed Python files exit 0;
-`scripts/lint/check_registered_tests.py` exit 1; the unit and CUDA test suites were not run by the gate. The served
+`scripts/lint/check_registered_tests.py` exit 1 (check remains failed); `check_no_bare_pytest_main.py` over `test/`
+exit 0; the CPU unit selection (`test/registered/unit/kernels` plus the config, requirements, spec-margin, both-cpu-ab,
+prefetch-tables and miss-service files) exit 0, 2,662 passed, 34 skipped, 0 failed of 2,696 (testmon reuse, 0 executed
+this run); the GPU selection (`test_exl3_ram_prefetch_promote_cuda.py`, `test_exl3_lease_kernels_cuda.py`,
+`test_exl3_lease_ordering_cuda.py`, `test_exl3_ram_miss_graph_gpu.py`) exit 0, 58 passed in 166.86 s. The served
 values in this section stay `pending` until the owner's capture.
 
 **Checks** (all `pending`): per-session output text equal off vs on: pending; chain-check or deadline failures in
