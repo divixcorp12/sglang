@@ -149,7 +149,11 @@ def test_the_tier_declares_only_the_callers_mutex():
     The RAM prefetch (ram_prefetch.h) adds two, off the request path's own state: the pool's per-group mutex
     (SpecPool::mutex, taken as pool_->mutex(g)) over its entries' transitions, and SpecGroup::turn, the shared
     reader's turn between a demand read and a speculative one, which an idle-drive group
-    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes."""
+    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes.
+
+    The promote flag (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) adds NumaGroup::row_mutex[row], declared in numa_group.h: the
+    claimer locks it (owner.row_mutex[row]) beside the pool mutex(g), and an InstrBuild test hold takes
+    dist_.group(g).row_mutex[row]. Order is fixed: row_mutex[row] of g, then pool mutex(g)."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex", "turn"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
@@ -158,7 +162,8 @@ def test_the_tier_declares_only_the_callers_mutex():
     locked = set(re.findall(r"(?:lock_guard|unique_lock|scoped_lock)<[^>]*>\s*\w+\(([^)]*)\)", code))
     # The regex stops at the first ")": the pool's mutex reads as "pool_->mutex(g".
     assert locked == {
-        "caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "pool_->mutex(g", "spec.turn, std::defer_lock"
+        "caller_mutex_", "trace_.mutex", "faults_.fault_mutex", "pool_->mutex(g", "spec.turn, std::defer_lock",
+        "owner.row_mutex[row], std::try_to_lock", "dist_.group(g"
     }, locked
     assert "std::unique_lock<std::mutex>(spec_->groups[group.index]->turn, std::try_to_lock)" in code
     assert "std::mutex mutex_" not in code and "guard(mutex_)" not in code and "self->mutex_" not in code

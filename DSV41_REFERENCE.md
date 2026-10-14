@@ -10210,6 +10210,10 @@ flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nv
 | demand `rows_read` | pending | pending |
 | `delta_publish` write to row's next record, us (p50 / min) | pending | pending |
 
+**Gate checks** (feature gate, not served): `py_compile` of the changed Python files exit 0;
+`scripts/lint/check_registered_tests.py` exit 1; the unit and CUDA test suites were not run by the gate. The served
+values in this section stay `pending` until the owner's capture.
+
 **Checks** (all `pending`): per-session output text equal off vs on: pending; chain-check or deadline failures in
 `server.log`: pending; per-layer gate waits (§33.34 method): pending.
 
