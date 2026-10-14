@@ -10142,6 +10142,24 @@ One pair, off then on (arm `dspark-both-misscut-engram-verify-graph`, prefetch o
   by the owner's decision. End-to-end output identity under the flag is covered by the GPU test's exact rows, not
   yet by a served output comparison.
 
+### 33.36 What a fair prefetch A/B must hold fixed, and the reads prefetch does not reach (2026-10-13)
+
+**The CPU split table is not fixed between arms.** Startup calibration (`CpuExpertService.calibrate`) picks the
+table that maps eligible lanes to a CPU share, and it differed at entries 2-8 across all eight of the day's captures
+(off group 0 began `[0,1,2,2,3,3,4,5,5,...]`, cap 1 `[0,1,1,2,3,3,3,4,5,...]`). Today's wall comparisons in §33.32-
+§33.35 therefore carry a split-table confound besides drift. A controlled pair pins the table with existing knobs:
+`SGLANG_DSV41_CPU_EXPERTS_SPLIT` set to the off capture's table (an explicit split already bypasses calibration)
+plus `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0` to make the intent visible, and asserts the effective table
+in each server's stats line. Layer 0's wait is not a drift control (it carries the miss cost of a new token), and
+cap 2 beat off in only 4 of 8 sessions.
+
+**Prefetch removes only forced CPU misses' reads.** A landed pool row serves a forced CPU miss (`take_pooled_locked`,
+`ram_tier.h`), but an unforced miss (a staging slot: GPU lane, or CPU with staging) skips the pool in
+`reserve_victims_locked` and re-reads NVMe. `analysis/dsv41-drive/dspark/read_split.py` splits a capture's
+`rows_read`: in the T3 cap-3 run dir (§33.35) 3,950-4,450 reads per run (25-35%) are such "other reads", and
+prefetch does not reduce them. F125 (`SGLANG_DSV41_RAM_PREFETCH_PROMOTE`) targets them by mapping landed rows into
+the tier before the target layer; its served pair uses the fixed table above. Results: pending.
+
 ### 33.37 RAM prefetch promote-on-land: the served A/B report (2026-10-13)
 
 Status: **skeleton, every measured value `pending`**. The owner's session fills it from one capture pair on divix01;
