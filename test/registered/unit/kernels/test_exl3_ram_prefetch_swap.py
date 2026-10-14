@@ -4,16 +4,30 @@ goes to the CPU at once. spec_place lands a pool row as a speculative read would
 
 import time
 
+import pytest
+
 from sglang.kernels.ops.moe.expert_stream_transport import piece_word
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ALL_PIECES
 from sglang.test.dsv41_ram_miss_fixtures import same_bytes
-from sglang.test.dsv41_ram_prefetch_fixtures import forced, load, prefetch_rig
+from sglang.test.dsv41_ram_prefetch_fixtures import LOGITS, enable, forced, load, prefetch_rig, trigger
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 FREE, READY, SPEC = 0, 2, 4
+
+PROMOTE_COUNTERS = (
+    "spec_promoted_early",
+    "spec_promote_no_delta",
+    "spec_promote_no_room",
+    "spec_promote_no_victim",
+    "spec_promote_victim_routed",
+    "spec_promote_used",
+    "spec_promote_reading",
+    "spec_publish_backstop",
+)
+EIGHT_LOGITS = [[30, 25, 40, 22, 35, 21, 28, 27]]
 
 
 def _entry(host, row, expert):
@@ -208,5 +222,184 @@ def test_a_swapped_victim_joins_the_pool_only_once_the_rows_delta_is_published(t
         assert rig.sim.delta(1)[0] != tag and (1, -1) in rig.sim.delta(1)[2] and (3, slot) in rig.sim.delta(1)[2]
         pool = [e for e in rig.host.spec_pool(1) if e["group"] == 1]
         assert pool == [{"group": 1, "slot": victim, "state": "empty", "expert": -1}]
+    finally:
+        rig.host.stop()
+
+
+def _promote_rig(tmp_path, logits=LOGITS, **kwargs):
+    rig = prefetch_rig(tmp_path, **kwargs)
+    try:
+        enable(rig, logits, promote=True)
+    except BaseException:
+        rig.host.stop()
+        raise
+    return rig
+
+
+def _promoted(rig):
+    """Row 1 holds 0 and 1 with its delta pending, 4 lands in its pool, then row 0's record claims row 1's delta.
+    Returns (pool slot of 4, victim slot of expert 0, the delta tag before the claim)."""
+    load(rig, 1, [0, 1])
+    slot = rig.host.spec_place(1, 4)
+    victim = rig.host.mapping(1)[0]  # 0 is the LRU of the two
+    tag = rig.sim.delta(1)[0]
+    load(rig, 0, [5])
+    return slot, victim, tag
+
+
+def test_a_landed_row_is_mapped_into_the_pending_delta_and_the_pool_entry_is_released(tmp_path):
+    """Row 1's delta stays unwritten until row 0's next record, which maps the landed 4 and evicts the LRU victim, then
+    the swapped entry empties and the victim slot is pooled. Mutant: write the delta at the end of row 1's own record
+    -- red on the unchanged tag; skip release_swapped after a promotion -- red on the pool state."""
+    rig = _promote_rig(tmp_path)
+    try:
+        load(rig, 1, [0, 1])
+        slot = rig.host.spec_place(1, 4)
+        victim = rig.host.mapping(1)[0]
+        tag = rig.sim.delta(1)[0]
+        with pytest.raises(AssertionError):
+            rig.sim.post(1, [2])  # the device would wait: row 1's delta is not written yet
+        load(rig, 0, [5])
+        got_tag, _, entries = rig.sim.delta(1)
+        assert got_tag != tag and entries[-2:] == [(0, -1), (4, slot)]
+        assert rig.host.mapping(1)[4] == slot and rig.host.mapping(1)[0] == -1
+        assert rig.host.slot_info(1)[slot][0] == READY
+        assert _entry(rig.host, 1, 4) is None
+        assert {"group": 0, "slot": victim, "state": "empty", "expert": -1} in rig.host.spec_pool(1)
+        assert rig.host.counters()["spec_promoted_early"] == 1
+    finally:
+        rig.host.stop()
+
+
+def test_a_promoted_row_types_as_a_hit_on_row_rs_next_post_and_is_not_read(tmp_path):
+    """The post after the claim types 4 as an unforced hit and reads nothing. Mutant: leave the promoted expert out of
+    the delta's entries -- MISS_GPU and one more row read."""
+    rig = _promote_rig(tmp_path)
+    try:
+        slot, _, _ = _promoted(rig)
+        rows, layer_rows = rig.host.counters()["rows_read"], rig.host.layer_rows()
+        req = load(rig, 1, [4])
+        assert req.kinds[0] in (LaneKind.HIT_COPY, LaneKind.HIT_SM)
+        assert rig.host.counters()["rows_read"] == rows and rig.host.layer_rows() == layer_rows
+        assert _same_row(rig, 1, slot, 4)
+    finally:
+        rig.host.stop()
+
+
+def test_a_promoted_row_is_a_cpu_hit_on_a_forced_lane_and_is_not_read(tmp_path):
+    """A forced lane that would be a CPU miss is a CPU hit at the promoted slot, with no read. Mutant: the pool bypass
+    at the unforced-miss path left in place for a promoted expert -- red on MISS_CPU or rows_read."""
+    rig = _promote_rig(tmp_path)
+    try:
+        slot, _, _ = _promoted(rig)
+        rows = rig.host.counters()["rows_read"]
+        req = forced(rig, 1, [4])
+        assert req.kinds == [LaneKind.HIT_CPU] and req.slots == [slot]
+        assert rig.host.counters()["rows_read"] == rows
+        assert rig.host.test_kernel_calls()[-1]["slots"] == [slot]
+    finally:
+        rig.host.stop()
+
+
+def test_row_rs_next_record_counts_the_promotion_used_and_the_victim_routed(tmp_path):
+    """A record routing the promoted 4 and its evicted 0: 4 is a hit (used), 0 a miss (victim routed), each once.
+    Mutant: judge in the claim instead of at row r's record -- both zero; keep the lists past the record -- the next
+    record counts again."""
+    rig = _promote_rig(tmp_path)
+    try:
+        _promoted(rig)
+        req = load(rig, 1, [4, 0])
+        assert req.kinds[0] in (LaneKind.HIT_COPY, LaneKind.HIT_SM) and req.kinds[1] == LaneKind.MISS_GPU
+        c = rig.host.counters()
+        assert (c["spec_promote_used"], c["spec_promote_victim_routed"]) == (1, 1)
+        load(rig, 1, [4])
+        c = rig.host.counters()
+        assert (c["spec_promote_used"], c["spec_promote_victim_routed"]) == (1, 1)
+    finally:
+        rig.host.stop()
+
+
+def test_a_landed_row_with_no_delta_waiting_counts_no_delta_and_stays_landed(tmp_path):
+    """Row 1 had no miss, so no delta waits for row 0's record to carry it. Mutant: promote without a pending delta --
+    red on the entry state; not counting the landed row -- red on the count."""
+    rig = _promote_rig(tmp_path)
+    try:
+        slot = rig.host.spec_place(1, 4)
+        load(rig, 0, [5])
+        c = rig.host.counters()
+        assert (c["spec_promote_no_delta"], c["spec_promoted_early"]) == (1, 0)
+        assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
+    finally:
+        rig.host.stop()
+
+
+def test_a_landed_row_with_no_evictable_victim_counts_no_victim_and_stays_landed(tmp_path):
+    """Both RAM slots of row 1 hold hot experts: take_victim finds none, the landed 4 stays in the pool and the delta
+    is still written. Mutant: promote into a staging slot -- red on the entry state."""
+    rig = _promote_rig(tmp_path)
+    try:
+        load(rig, 1, [0, 1])
+        rig.host.set_hot(1, [0, 1])
+        slot = rig.host.spec_place(1, 4)
+        tag = rig.sim.delta(1)[0]
+        load(rig, 0, [5])
+        c = rig.host.counters()
+        assert (c["spec_promote_no_victim"], c["spec_promoted_early"]) == (1, 0)
+        assert rig.sim.delta(1)[0] != tag
+        assert _entry(rig.host, 1, 4) == {"group": 0, "slot": slot, "state": "landed", "expert": 4}
+    finally:
+        rig.host.stop()
+
+
+def test_a_row_still_reading_at_the_claim_counts_reading_and_is_left_alone(tmp_path):
+    """The speculative read of 2 is held 0.6 s; row 0's next record claims row 1's delta meanwhile. Mutant: treat a
+    reading entry as landed -- red (a promotion of an unlanded row)."""
+    rig = _promote_rig(tmp_path)
+    try:
+        rig.host.inject_spec(delay_s=0.6)
+        rig.host.start_thread(fatal_wait_s=5.0)
+        trigger(rig)
+        deadline = time.monotonic() + 5.0
+        while rig.host.counters()["spec_issued"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert rig.host.counters()["spec_issued"] == 1
+        load(rig, 1, [3])
+        load(rig, 0, [5])
+        c = rig.host.counters()
+        assert (c["spec_promote_reading"], c["spec_promoted_early"]) == (1, 0)
+    finally:
+        rig.host.stop()
+
+
+def test_a_two_group_promotion_lands_in_the_experts_home_range(tmp_path):
+    """Expert 3 is group 1's: its promotion maps the pool slot of group 1's range and pools group 1's victim. Mutant:
+    take the victim from the claimer's group -- red on the range."""
+    rig = _promote_rig(tmp_path, logits=EIGHT_LOGITS, nodes=2, share=1)
+    try:
+        load(rig, 1, [1])
+        slot = rig.host.spec_place(1, 3)
+        assert 4 <= slot < 8
+        load(rig, 0, [0])
+        assert rig.host.mapping(1)[3] == slot and (3, slot) in rig.sim.delta(1)[2]
+        pool = [e for e in rig.host.spec_pool(1) if e["group"] == 1]
+        assert len(pool) == 1 and pool[0]["state"] == "empty" and 4 <= pool[0]["slot"] < 8
+        assert rig.host.counters()["spec_promoted_early"] == 1
+    finally:
+        rig.host.stop()
+
+
+def test_with_the_flag_off_the_delta_is_written_at_once_and_no_promote_counter_moves(tmp_path):
+    """Row 1's post needs no row 0 record in between, a pooled row is swapped in as before, and all eight counters
+    stay 0. Mutant: count a promotion or a backstop on the flag-off path -- red."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS)
+        load(rig, 1, [0, 1])
+        slot = rig.host.spec_place(1, 4)
+        load(rig, 1, [2])  # raises unless the previous record's delta is already written
+        forced(rig, 1, [4])
+        c = rig.host.counters()
+        assert c["spec_used"] == 1 and rig.host.mapping(1)[4] == slot
+        assert [c[name] for name in PROMOTE_COUNTERS] == [0] * len(PROMOTE_COUNTERS)
     finally:
         rig.host.stop()
