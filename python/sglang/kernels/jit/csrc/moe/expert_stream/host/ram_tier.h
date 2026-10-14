@@ -2310,10 +2310,9 @@ class RamTier {
   }
 
   // The readiness word of record lane `lane` (init_piece_words_locked's).
-  uint64_t* piece_word_at(int64_t idx, int32_t lane) {
-    return reinterpret_cast<uint64_t*>(
-        lease_ + Wire::kLeasePieceMask +
-        (idx * Wire::kLanes + static_cast<int64_t>(lane)) * Wire::kLeasePieceMaskLineBytes);
+  uint8_t* piece_word_at(int64_t idx, int32_t lane) {
+    return lease_ + Wire::kLeasePieceMask +
+           (idx * Wire::kLanes + static_cast<int64_t>(lane)) * Wire::kLeasePieceMaskLineBytes;
   }
 
   // Before the first copied piece: each copied miss's readiness word carries the record's generation, no bit set.
@@ -2355,7 +2354,8 @@ class RamTier {
       std::memcpy(at + dst * stride, at + src * stride, static_cast<size_t>(run.hi - run.lo));
     }
     _mm_sfence();  // the piece's bytes, non-temporal stores included, before its bit
-    if (!publish_piece(piece_word_at(plan.idx, plan.miss_lane[i]), request.gen, static_cast<uint8_t>(1u << j)))
+    uint64_t* const word = reinterpret_cast<uint64_t*>(piece_word_at(plan.idx, plan.miss_lane[i]));
+    if (!publish_piece(word, request.gen, static_cast<uint8_t>(1u << j)))
       fail_record(request, "a pooled piece's readiness word refused it");
     if (++plan.copy_next % kPieces == 0) release_pool_copy(group, request.row, plan.copy_entry[i]);
     return true;
