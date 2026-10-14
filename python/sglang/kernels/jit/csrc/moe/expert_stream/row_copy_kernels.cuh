@@ -13,6 +13,7 @@
 
 #include "lane_mask.cuh"
 #include "lease_device.cuh"
+#include "device_stamps.cuh"
 #include "stream_wait.h"
 #include "row_layout.h"
 #include "tensor_checks.h"
@@ -165,7 +166,10 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
     sh.done[tid] = 0;
     sh.todo[tid] = 0;
   }
-  if (tid == 0) sh.finished = 0;
+  if (tid == 0) {
+    sh.finished = 0;
+    if (blockIdx.x == 0) stamp_point(seq, kStampStreamStart);
+  }
   __syncthreads();
 
   const uint8_t* masks = p.lease + Wire::kLeasePieceMask + idx * Wire::kLanes * Wire::kLeasePieceMaskLineBytes;
@@ -200,6 +204,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
       }
       if (all) {
         sh.finished = 1;
+        if (blockIdx.x == 0) stamp_point(seq, kStampStreamEnd);
       } else {
         // The one device spin nothing else bounds (a dead service, a read that never lands): trap, so the process
         // fails instead of hanging decode.
@@ -344,6 +349,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   // Dekker with the copy thread (RamTier::copy_completed, the channel's complete): the close is ordered before the
   // CopyDone load, so one side always sees the other's store and opens the gate.
   channel::close_gate<TargetChannel>(lease, seq, generation);
+  stamp_point(seq, kStampWaitStart);
 }
 
 // CC, launched after the stream wait on the gate. It is a plain launch because the wait node before it is not a kernel.
@@ -362,6 +368,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   if (armed == 0) return;
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
+  stamp_point(seq, kStampWaitEnd);
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
   channel::commit_or_trap<TargetChannel>(p.lease, seq, generation);
@@ -380,6 +387,26 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 /// \tparam L The streamed row's compile-time layout (`expert_stream::ExpertRowLayout`).
 template <expert_stream::ExpertRowLayout L>
 struct RowCopyKernel {
+#ifdef EXL3_RAM_MISS_DEVICE_STAMPS
+  /// Points the device stamps (device_stamps.cuh) at `ring`, int64 [kStampRing * kStampWords] pinned host memory the
+  /// caller keeps alive and reads only once the device is idle. Call before any chain runs.
+  static void set_device_stamps(tvm::ffi::TensorView ring) {
+    using namespace host;
+    using namespace device::expert_stream;
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    expert_stream::verify_named(
+        "ring",
+        TensorMatcher({static_cast<int64_t>(kStampRing) * kStampWords})
+            .with_dtype<int64_t>()
+            .with_device<kDLCPU, kDLCUDAHost>(on_host),
+        ring);
+    void* const address = ring.data_ptr();
+    const cudaError_t r = cudaMemcpyToSymbol(g_stamp_ring, &address, sizeof(address));
+    RuntimeCheck(r == cudaSuccess, "set_device_stamps: cudaMemcpyToSymbol failed: ", cudaGetErrorString(r));
+  }
+#endif
+
   /// Launches S. Argument meanings follow StreamParams; `segments` is the copy table ({src, dst, row bytes} per
   /// entry), `segment_map` and `piece_runs` the reader's piece geometry (host/ffi_exports.h, piece_runs).
   static void lease_stream(

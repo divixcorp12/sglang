@@ -2943,19 +2943,39 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ]
 
 
+def device_stamps_enabled() -> bool:
+    """Whether this process loads the stamped device module (device_stamps.cuh): with a job trace, as host_variant
+    picks the instrumented host build."""
+    return bool(os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"))
+
+
+# device_stamps.cuh's ring: kStampRing rows of kStampWords int64, the seq then one %globaltimer ns per point.
+DEVICE_STAMP_RING = 65536
+DEVICE_STAMP_WORDS = 8
+DEVICE_STAMP_POINTS = ("post_start", "post_end", "stream_start", "stream_end", "wait_start", "wait_end")
+
+
 def _device_module(layout: str = "exl3", lanes: int = 8, nodes: int = 1) -> Module:
     """Return the cached device module for ``layout``, ``lanes`` and ``nodes``."""
     wire = expert_lease_block.wire_layout(lanes, nodes)
-    return _device_module_cached(layout, wire.lanes, wire.nodes)
+    return _device_module_cached(layout, wire.lanes, wire.nodes, device_stamps_enabled())
 
 
 @cache_once
-def _device_module_cached(layout: str, lanes: int, nodes: int) -> Module:
+def _device_module_cached(layout: str, lanes: int, nodes: int, stamps: bool) -> Module:
+    wrappers = _device_wrappers(layout)
+    if stamps:
+        device_layout = LAYOUTS[layout].device_layout
+        wrappers = wrappers + [
+            ("expert_stream_set_device_stamps", f"RowCopyKernel<{device_layout}>::set_device_stamps")
+        ]
     return load_jit(
         f"expert_stream_{layout}{_suffix(lanes, nodes)}",
+        *(["stamps"] if stamps else []),
         cuda_files=[LAYOUTS[layout].device_source],
-        cuda_wrappers=_device_wrappers(layout),
+        cuda_wrappers=wrappers,
         extra_cuda_cflags=[
+            *(["-DEXL3_RAM_MISS_DEVICE_STAMPS"] if stamps else []),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
@@ -3331,6 +3351,7 @@ class ExpertStreamDevice:
         self._spec_forked = False
         # The learned head (enable_spec_head, a ServingHead) that replaces spec_select; None when off.
         self.spec_head = None
+        self._stamp_ring: Optional[torch.Tensor] = None  # enable_device_stamps
 
     def _kernels(self):
         """Return the device module, loading it on first use."""
@@ -3339,6 +3360,29 @@ class ExpertStreamDevice:
                 self._layout, self.wire.lanes, self.wire.nodes
             )
         return self._module
+
+    def enable_device_stamps(self) -> None:
+        """Point the stamped module's chain kernels at a pinned ring (device_stamps.cuh). Needs
+        ``device_stamps_enabled()``; the ring lives as long as this object."""
+        if not device_stamps_enabled():
+            raise RuntimeError("device stamps need SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX (the stamped device module)")
+        ring = torch.zeros(DEVICE_STAMP_RING * DEVICE_STAMP_WORDS, dtype=torch.int64).pin_memory()
+        self._kernels().expert_stream_set_device_stamps(ring)
+        self._stamp_ring = ring
+
+    def dump_device_stamps(self, path: str) -> int:
+        """Write each stamped record as a JSON line (seq, then each DEVICE_STAMP_POINTS in %globaltimer ns, 0 when
+        not reached), by post_start. Call once the device is idle. Returns the record count; 0 without stamps."""
+        ring = self._stamp_ring
+        if ring is None:
+            return 0
+        rows = ring.view(DEVICE_STAMP_RING, DEVICE_STAMP_WORDS).tolist()
+        records = sorted((r for r in rows if r[0] != 0), key=lambda r: r[1])
+        with open(path, "w") as f:
+            f.write(json.dumps({"schema": 1, "clock": "globaltimer", "points": list(DEVICE_STAMP_POINTS)}) + "\n")
+            for r in records:
+                f.write(json.dumps({"seq": r[0], **dict(zip(DEVICE_STAMP_POINTS, r[1:]))}) + "\n")
+        return len(records)
 
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
         """Take the same pinned rows the host's ``enable_cpu_experts`` took.

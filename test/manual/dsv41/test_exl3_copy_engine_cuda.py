@@ -95,6 +95,40 @@ def test_captured_hits_are_copied_by_the_engine_byte_exact_armed_and_unarmed(tmp
         c.close()
 
 
+def test_device_stamps_record_each_armed_chain_in_chain_order(tmp_path, monkeypatch):
+    """With a job trace the chain kernels stamp %globaltimer per record (device_stamps.cuh): every armed replay's
+    record carries all six points, in chain order, under its own seq. Mutant: stamp CC before the gate wait -- red on
+    the order; drop the post's clearing of a lapped row -- red on the seq check."""
+    import json
+
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    c = Chain(tmp_path, copy_engine=True)
+    try:
+        c.dev.enable_device_stamps()
+        graph, stream = _capture(c)
+        c.host.arm_copy_engine()
+        rng = random.Random(5)
+        for _ in range(4):
+            _replay(c, graph, stream, _plans(rng))
+        assert c.handled()
+        torch.cuda.synchronize()
+        path = tmp_path / "stamps.jsonl"
+        count = c.dev.dump_device_stamps(str(path))
+    finally:
+        c.close()
+    lines = path.read_text().splitlines()
+    points = json.loads(lines[0])["points"]
+    records = [json.loads(line) for line in lines[1:]]
+    assert count == len(records) > 0
+    # A record whose lanes are all misses has no gate to wait on, so only records with an engine copy carry the wait.
+    full = [r for r in records if r["wait_end"] != 0]
+    assert full
+    for r in full:
+        stamps = [r[p] for p in points]
+        assert all(s > 0 for s in stamps) and stamps == sorted(stamps), r
+    assert len({r["seq"] for r in records}) == len(records)
+
+
 def test_an_eager_gather_never_copies_on_the_engine(tmp_path):
     """Only a captured post lets the service copy: an eager gather may load a kernel module while a copy wait holds the
     stream, so it is served by C1 even with the engine armed."""

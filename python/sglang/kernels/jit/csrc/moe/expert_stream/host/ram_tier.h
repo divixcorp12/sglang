@@ -2073,6 +2073,15 @@ class RamTier {
     return best;
   }
 
+  // A demand miss took `victim`: evict carries a = the evicted expert (-1 for a free slot), b = its age in the group's
+  // use ticks (each routed lane's use is one tick), c = the expert moving in. Before the miss restamps the slot.
+  void trace_evict(Group& group, const Tier& tier, const Request& request, int64_t victim, int32_t old, int32_t incoming)
+    requires(Build::kMetrics)
+  {
+    const int64_t age = old >= 0 ? static_cast<int64_t>(group.tick - tier.stamp[victim]) : -1;
+    group.trace.emit("evict", request.row, request.gen, request.seq, group.index, old, age, incoming);
+  }
+
   // What serve_record's phases hand on: the copy job, the misses in lane order, and every expert the record routes.
   // Fixed-capacity members keep the record path free of allocation.
   struct RecordPlan {
@@ -2225,6 +2234,7 @@ class RamTier {
   // Submits the record's CPU-hit job, then its copy job, so the CPU starts first. Returns the CPU misses' batch, whose
   // jobs read_misses submits as their rows land.
   CpuMissBatch submit_host_lanes(Group& group, const Request& request, RecordPlan* plan) {
+    const SvcTimer timer(svc_[group.index].cpu_ns);
     CopyJob& job = plan->job;
     CpuMissBatch misses;
     misses.left = job.late_cpu;
@@ -2332,6 +2342,7 @@ class RamTier {
   // it. A piece is the device's: row_geometry's runs, as the stream kernel's piece-run table has them. The last piece of
   // a miss releases its entry. Returns false once every piece is copied.
   bool copy_pool_piece(Group& group, const Request& request, RecordPlan& plan) {
+    const SvcTimer timer(svc_[group.index].copy_ns);
     const int total = static_cast<int>(plan.missing.size()) * kPieces;
     while (plan.copy_next < total && (plan.copied >> (plan.copy_next / kPieces) & 1u) == 0)
       plan.copy_next += kPieces;
@@ -2980,6 +2991,7 @@ class RamTier {
       int32_t old = -1;
       const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
       if (victim < 0) fail_record(request, "a forced CPU miss found no RAM victim on its node");
+      if constexpr (Build::kMetrics) trace_evict(group, tier, request, victim, old, plan.missing[i]);
       if (old >= 0) {
         part.entries[part.count][0] = old;
         part.entries[part.count][1] = -1;
@@ -3010,6 +3022,7 @@ class RamTier {
         this->template count<kRamInsertSkipped>(group);
         continue;
       }
+      if constexpr (Build::kMetrics) trace_evict(group, tier, request, victim, old, plan.missing[i]);
       if (old >= 0) {
         part.entries[part.count][0] = old;
         part.entries[part.count][1] = -1;
@@ -3088,6 +3101,7 @@ class RamTier {
   // and after the read. Every job after the record's first adds into the part. With two-stage CPU misses a miss goes
   // once its first stage landed, and a job holding a row not yet whole is staged: its second stage opens once they are.
   void submit_landed_cpu_misses(Group& group, const Request& request, const RecordPlan& plan, CpuMissBatch* misses) {
+    const SvcTimer timer(svc_[group.index].cpu_ns);
     if (misses->staged != 0) open_landed_stage_two(group, plan, misses);
     if (misses->left == 0) return;
     const CopyJob& job = plan.job;
@@ -3198,6 +3212,7 @@ class RamTier {
       std::span<const int32_t> lanes,
       CpuMissBatch* misses,
       StageRecord* cur) {
+    const SvcTimer timer(svc_[group.index].read_ns);
     // The group's reader takes turns with its speculative thread: a demand waits for at most the one speculative row.
     // An idle-drive speculative thread reads through its own reader and takes no turn.
     std::unique_lock<std::mutex> turn;
@@ -3334,6 +3349,12 @@ class RamTier {
   // Serves one record: a lane-less one only refreshes recency, one with lanes goes to serve_record. Held in one busy
   // episode so the watchdog can time it.
   void handle_record(Group& group, const Request& request) {
+    int64_t svc_start = 0;
+    if constexpr (Build::kMetrics) {
+      svc_start = now_ns();
+      SvcClock& svc = svc_[group.index];
+      svc.cpu_ns = svc.copy_ns = svc.read_ns = 0;
+    }
     begin_busy(group);
     // A promoter of another group may map into this row's tier; it takes the same lock.
     std::unique_lock<std::mutex> row_lock;
@@ -3356,7 +3377,40 @@ class RamTier {
       }
     }
     end_busy(group);
+    if constexpr (Build::kMetrics) trace_svc(group, request, svc_start);
   }
+
+  // svc_record: a = the record's service ns, b = the idle ns since the group's previous record ended (-1 for its
+  // first), c = ns inside read_rows (which includes the side work its drain loop runs). svc_side: a = ns submitting
+  // CPU jobs, b = ns copying pool pieces (copy_pool_piece), both also inside the read when its loop ran them.
+  void trace_svc(Group& group, const Request& request, int64_t start)
+    requires(Build::kMetrics)
+  {
+    SvcClock& svc = svc_[group.index];
+    const int64_t end = now_ns();
+    const int64_t idle = svc.last_end > 0 ? start - svc.last_end : -1;
+    group.trace.emit("svc_record", request.row, request.gen, request.seq, group.index, end - start, idle, svc.read_ns);
+    group.trace.emit("svc_side", request.row, request.gen, request.seq, group.index, svc.cpu_ns, svc.copy_ns, 0);
+    svc.last_end = end;
+  }
+
+  // Per group, owned by its service thread: the current record's time split (trace_svc), InstrBuild only.
+  struct alignas(64) SvcClock {
+    int64_t last_end = 0;
+    int64_t cpu_ns = 0;
+    int64_t copy_ns = 0;
+    int64_t read_ns = 0;
+  };
+  std::array<SvcClock, Wire::kNodes> svc_{};
+  // Adds its scope's duration to `total` in InstrBuild; ProdBuild reads no clock.
+  struct SvcTimer {
+    int64_t* total;
+    int64_t start;
+    explicit SvcTimer(int64_t& t) : total(&t), start(Build::kMetrics ? now_ns() : 0) {}
+    ~SvcTimer() {
+      if constexpr (Build::kMetrics) *total += now_ns() - start;
+    }
+  };
 
   // Per group, owned by its service thread: the forward counts up when a record's row is not past the last one's.
   struct alignas(64) ForwardState {

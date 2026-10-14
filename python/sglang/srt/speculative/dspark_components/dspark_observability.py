@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import statistics
 import time
 from collections import deque
@@ -722,6 +724,36 @@ class ConfidenceMetricsProbe:
 _STS_COLLECT_FLUSH_EVERY: int = 256
 
 
+class VerifyMarkers:
+    """verify_begin and verify_end lines beside the expert job trace (``<prefix>.<pid>.verify.jsonl``), in its event
+    format and CLOCK_MONOTONIC clock, so a trace can be cut into verifies exactly. gen = the batch's forward_iter,
+    a = the batch size. Host times: end is when the host observed the verify, which it reads no tensor to know."""
+
+    def __init__(self, path: str) -> None:
+        self._file = open(path, "w", buffering=1)
+        clock = {"monotonic_ns": time.monotonic_ns(), "epoch_ns": time.time_ns()}
+        self._file.write(json.dumps({"schema": 1, "clock": "CLOCK_MONOTONIC", **clock}) + "\n")
+        self._begin_ns = 0
+
+    @classmethod
+    def from_env(cls, tp_rank: int) -> Optional["VerifyMarkers"]:
+        prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
+        if not prefix or tp_rank != 0:
+            return None
+        return cls(f"{prefix}.{os.getpid()}.verify.jsonl")
+
+    def _write(self, event: str, ns: int, forward_ct: int, bs: int) -> None:
+        line = {"event": event, "ns": ns, "row": -1, "gen": forward_ct, "seq": 0, "group": -1, "a": bs, "b": 0, "c": 0}
+        self._file.write(json.dumps(line) + "\n")
+
+    def begin(self) -> None:
+        self._begin_ns = time.monotonic_ns()
+
+    def end(self, *, forward_ct: int, bs: int) -> None:
+        self._write("verify_begin", self._begin_ns, forward_ct, bs)
+        self._write("verify_end", time.monotonic_ns(), forward_ct, bs)
+
+
 class DsparkStepObservers:
     """Facade over the per-step observability sinks (info dumper, confidence
     probe, STS collection, block-accept estimator). The worker's decode path
@@ -768,11 +800,14 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+        self._verify_markers = VerifyMarkers.from_env(tp_rank)
 
     # --- step lifecycle -------------------------------------------------
 
     def begin_step(self) -> None:
         self._info_dumper.begin_step()
+        if self._verify_markers is not None:
+            self._verify_markers.begin()
 
     def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
         return self._info_dumper.segment(name)
@@ -837,6 +872,8 @@ class DsparkStepObservers:
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
     ) -> None:
+        if self._verify_markers is not None:
+            self._verify_markers.end(forward_ct=forward_ct, bs=bs)
         planner = self._planner
         if not proposal_folded:
             self._maybe_record_sts_collect(

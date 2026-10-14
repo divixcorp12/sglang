@@ -35,6 +35,7 @@ from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
     ExpertStreamHost,
+    device_stamps_enabled,
     host_layout,
     new_candidate_page,
     new_hot_page,
@@ -1543,6 +1544,8 @@ class Exl3RamMissService:
                 lanes=self.lanes,
                 nodes=self.wire.nodes,
             )
+            if device_stamps_enabled():
+                self.device_side.enable_device_stamps()
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(
                     self.cpu_experts.x_rows, self.cpu_experts.out_rows
@@ -2071,6 +2074,20 @@ class Exl3RamMissService:
         except Exception as error:  # noqa: BLE001 - a diagnostic must not change the shutdown's outcome
             logger.warning("exl3 RAM miss: reading the DSpark draft's counters failed: %r", error)
 
+    def _dump_device_stamps(self) -> None:
+        """Write the chain's device stamps beside the job trace, as ``<prefix>.<pid>.device-stamps.jsonl``. A failure is
+        logged, not raised: it must not turn an orderly shutdown into a quarantine."""
+        prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
+        if not prefix:
+            return
+        path = f"{prefix}.{os.getpid()}.device-stamps.jsonl"
+        try:
+            count = self.device_side.dump_device_stamps(path)
+        except Exception:  # noqa: BLE001
+            logger.exception("exl3 RAM miss: writing the device stamps to %s failed", path)
+            return
+        logger.info("exl3 RAM miss: %d device-stamped records written to %s", count, path)
+
     def shutdown(self, *, at_exit: bool = False) -> None:
         """Shut the service down: free the tiers if safe, else quarantine them.
 
@@ -2108,6 +2125,8 @@ class Exl3RamMissService:
                         if at_exit
                         else self._establish_gpu_completion()
                     )
+                if uncertain is None and self.device_side is not None:
+                    self._dump_device_stamps()
                 self.host.close_admission()
                 if uncertain is None and self._stages_traced:
                     # host.stop() closes its native handle, so freeze the reader between

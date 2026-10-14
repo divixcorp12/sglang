@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>
 
 #include "lease_device.cuh"
+#include "device_stamps.cuh"
 #include "cpu_token_table.h"
 #include "tensor_checks.h"
 #include <cuda_bf16.h>
@@ -294,6 +295,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   // A release orders every earlier store of this thread: the hot page and the record come first.
   channel::publish_head<TargetChannel>(p.page, seq);
   state[kPending] = count > 0 ? static_cast<int32_t>(seq) : 0;
+  if (count > 0) stamp_post(seq, deadline - static_cast<uint64_t>(p.timeout_ns));
   state[kPendingEpoch] = state[kEpoch];
   store_deadline(state, global_ns() + static_cast<uint64_t>(p.timeout_ns));
 }

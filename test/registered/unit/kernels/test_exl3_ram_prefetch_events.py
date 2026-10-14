@@ -174,7 +174,7 @@ def test_with_pool_serve_a_copied_miss_leaves_pool_copy_events_and_the_read_one_
         record = _read_record(rig)
     finally:
         rig.host.stop()
-    events = _tier_events(tmp_path, {"miss_land", "pool_copy_start", "pool_copy_end"})
+    events = _tier_events(tmp_path, {"miss_land", "pool_copy_start", "pool_copy_end", "svc_record", "svc_side"})
     by_kind = collections.defaultdict(list)
     for e in events:
         by_kind[e["event"]].append(e)
@@ -185,3 +185,30 @@ def test_with_pool_serve_a_copied_miss_leaves_pool_copy_events_and_the_read_one_
     for e in (start, end):
         assert (e["row"], e["gen"], e["seq"], e["a"], e["b"], e["c"]) == (1, req.gen, req.seq, 4, 0, 0)
     assert start["ns"] <= end["ns"]
+    # svc_record / svc_side: one each per record; the copying record spent time copying, inside its service time.
+    (svc,) = [e for e in by_kind["svc_record"] if e["seq"] == req.seq]
+    (side,) = [e for e in by_kind["svc_side"] if e["seq"] == req.seq]
+    assert 0 < svc["c"] <= svc["a"] and 0 < side["b"] <= svc["a"]
+    assert all(e["b"] == 0 for e in by_kind["svc_side"] if e["seq"] != req.seq)
+
+
+def test_a_demand_miss_on_a_full_tier_evicts_the_least_recently_used_expert_and_says_so(tmp_path, monkeypatch):
+    """evict: a = the evicted expert (-1: a free slot), b = its age in use ticks, c = the expert moving in. Loading one
+    expert at a time, the evictions take them in load order. Mutant: report the incoming expert as a -- red."""
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    (tmp_path / "rig").mkdir()
+    rig = prefetch_rig(tmp_path / "rig")
+    order = [0, 1, 2, 3, 5]
+    try:
+        for expert in order:
+            load(rig, 1, [expert])
+    finally:
+        rig.host.stop()
+    events = _tier_events(tmp_path, {"evict"})
+    assert [e["c"] for e in events] == order
+    evicted = [(e["a"], e["c"]) for e in events if e["a"] >= 0]
+    assert evicted, "the tier never filled"
+    first = len(order) - len(evicted)
+    assert evicted == list(zip(order, order[first:]))
+    assert all(e["b"] > 0 for e in events if e["a"] >= 0)
+    assert all(e["b"] == -1 for e in events if e["a"] < 0)

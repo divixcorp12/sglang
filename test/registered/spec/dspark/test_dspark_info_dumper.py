@@ -1,4 +1,8 @@
+import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -13,6 +17,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoComponent,
+    VerifyMarkers,
     _PendingStep,
     logger,
     resolve_components,
@@ -433,6 +438,37 @@ class TestDumpCrossesMsgpackIpc(CustomTestCase):
         decoded = msgpack_decode(msgpack_encode(output))
         self.assertNotIsInstance(decoded, PickleWrapper)
         self.assertEqual(decoded, output)
+
+
+_JOB_TRACE_PREFIX = "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"
+
+
+class TestVerifyMarkers(CustomTestCase):
+    """The verify markers join the expert job trace by its event format and clock; layer analyses cut verifies by
+    them. Off without the job trace prefix and on any rank but 0."""
+
+    def test_off_without_the_prefix_or_off_rank_zero(self):
+        env = {k: v for k, v in os.environ.items() if k != _JOB_TRACE_PREFIX}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(VerifyMarkers.from_env(0))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {_JOB_TRACE_PREFIX: f"{tmp}/jobs"}):
+            self.assertIsNone(VerifyMarkers.from_env(1))
+
+    def test_each_verify_writes_a_begin_and_an_end_in_the_job_event_format(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {_JOB_TRACE_PREFIX: f"{tmp}/jobs"}):
+            markers = VerifyMarkers.from_env(0)
+            for forward_ct in (7, 8):
+                markers.begin()
+                markers.end(forward_ct=forward_ct, bs=1)
+            path = f"{tmp}/jobs.{os.getpid()}.verify.jsonl"
+            lines = [json.loads(line) for line in open(path).read().splitlines()]
+        self.assertEqual(lines[0]["clock"], "CLOCK_MONOTONIC")
+        events = lines[1:]
+        self.assertEqual([(e["event"], e["gen"], e["a"]) for e in events], [
+            ("verify_begin", 7, 1), ("verify_end", 7, 1), ("verify_begin", 8, 1), ("verify_end", 8, 1)])
+        self.assertEqual([e["ns"] for e in events], sorted(e["ns"] for e in events))
+        for e in events:
+            self.assertEqual(set(e), {"event", "ns", "row", "gen", "seq", "group", "a", "b", "c"})
 
 
 if __name__ == "__main__":
