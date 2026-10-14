@@ -1364,6 +1364,7 @@ class Exl3RamMissService:
             idle_spread=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get(),
             idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
         )
+        promote = envs.SGLANG_DSV41_RAM_PREFETCH_PROMOTE.get()
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden, horizon=horizon)
             candidates = new_candidate_page(pin=pin)
@@ -1385,6 +1386,7 @@ class Exl3RamMissService:
                 top_k_only=top_k_only,
                 candidates=candidates,
                 min_margin=min_margin,
+                promote=promote,
                 **idle,
             )
             targets = picked.targets
@@ -1406,12 +1408,13 @@ class Exl3RamMissService:
                 per_layer=per_layer,
                 cores=cores,
                 top_k_only=top_k_only,
+                promote=promote,
                 **idle,
             )
             targets, result = tables.targets, None
         logger.info(
             "exl3 RAM miss prefetch: %d of %d rows target %s, %s scorer, %d per token, %d per layer%s, "
-            "cores %s, %s",
+            "cores %s, %s, promote landed rows %s",
             int((targets[:, 0] >= 0).sum()),
             len(layer_ids),
             "the next layer" if horizon == 1 else f"layer +{horizon}",
@@ -1427,6 +1430,7 @@ class Exl3RamMissService:
                 if idle["idle_drive"]
                 else "shared reader (turns with demand)"
             ),
+            "on" if promote else "off",
         )
         return result
 
