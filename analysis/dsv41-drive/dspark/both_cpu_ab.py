@@ -220,7 +220,8 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3"] = (
     True,
 )
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
-# breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.3 item 6).
+# breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
+# default since then, so this arm now equals its A unless the shell exports the flag as 0.
 ARMS["dspark-both-misscut-engram-verify-graph"] = (
     {**ARMS["dspark-both-misscut"][0], "SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH": "1"},
     True,

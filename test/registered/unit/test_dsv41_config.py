@@ -20,6 +20,7 @@ def test_defaults_match_the_env_declarations():
         engram_ram_gib=0.0,
         engram_host_node_cache_uring=False,
         enable_engram_device_wait=False,
+        engram_verify_in_graph=True,
         expert_stream=False,
         expert_dir="",
         expert_trace_path="",

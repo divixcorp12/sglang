@@ -6655,6 +6655,7 @@ the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed onc
 | `SGLANG_DSV41_ENGRAM_RAM_GIB` | `0.0` | `5` | Engram RAM row cache in GiB; misses use O_DIRECT. |
 | `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING` | `False` | `1` | Layer-1 lookup as a CUDA host node with an io_uring worker. |
 | `SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT` | `False` | `1` | Device post and wait kernels, no host nodes in the graph. |
+| `SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH` | `True` | - | With the device wait, a DSpark target verify's lookups too: the verify graph has no Engram breaks (§33.35). |
 | `SGLANG_DSV41_TORCH_PREFILL_INDEXER` | `False` | `1` | Torch prefill indexer instead of the DeepGEMM kernel. |
 | `SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB` | `0` | `128` | Cap on one bf16 score chunk; `0` is 1 GiB. |
 | `SGLANG_DSV41_FUSED_WO_A` | `True` | - | SM100/SM103 `wo_a` verify megakernel. |
@@ -10083,6 +10084,62 @@ back to back in the order off, T3 cap 1, T3 cap 2. Run dir
   prefetch setting whose per-verify gain clearly exceeds the cap-1 arms' 0-2.4%, consistent with §33.33 (misses
   are a third of the step, cap 1 covers one in six). Next: native L+2 cap 2 (`...-idle2-l2-cap2`) as the control for
   the head, then a repeated, order-balanced served comparison. Production defaults are the owner's.
+
+### 33.35 T3 at three reads per layer; the verify graph without its Engram breaks (2026-10-13)
+
+**T3 cap 3** (`db9398a8b7`: `kHeadMaxPicks` 3; arm `...-idle2-l2-t3-cap3`, `PER_LAYER` 3 with `SPEC_SHARE` 3, since
+a job never reclaims its own pick and a third same-group read would find no slot). Captures as in §33.34, in the
+order T3 cap 3, T3 cap 2 (a repeat), off. Run dir `divix01:/data/models/slang/nvfp4-work/ram-prefetch/t3-cap3-20261013/`,
+worktree `wt-t3-cap3`.
+
+| per verify (median) | off | T3 cap 2 (repeat) | T3 cap 3 |
+|---|---:|---:|---:|
+| wall ms (vs off) | 278.2 | 265.7 (-4.5%) | 277.4 (-0.3%) |
+| layer gate waits, ms | 224.0 | 205.0 | 216.2 |
+| forced misses / covered | 88.9 / 0 | 93.3 / 23.1 | 89.8 / 28.5 |
+| matched per record vs off, ms | | -0.90 | -0.35 |
+| lifetime NVMe read ms per RAM miss | 1.35 | 1.51 | 1.63 |
+| layer 0 wait (drift control), ms | 10.72 | 11.42 | 11.53 |
+
+- **Cap 2 repeats**: 265.7 against §33.34's 264.5.
+- **Cap 3 covers more and saves less**: 28.5 covered against 23.1, but every NVMe read slows (1.63 ms per miss) and
+  the matched saving per record falls from 0.90 to 0.35 ms. The third read contends with demand reads: at the
+  current threshold (0.1302) the extra reads cost more than they save. A per-rank threshold (higher for picks 2-3)
+  is the lever if cap 3 is pursued; cap 2 is the best served setting so far.
+
+**The verify graph without its Engram breaks** (`7413b974de`). Since `3c9d547cbd` a DSpark verify runs in the
+breakable decode graph with `segments=3 breaks=2`: 1 + 13 + 26 layers, the breaks being the Engram file-table
+lookups of layers 1 and 14, which `_captures_native_lookup` (`python/sglang/srt/layers/engram.py`) admitted only for
+one-token decode (§33.3 item 6). The device-wait post/wait kernels and the native ring service were already sized by
+id count, so only the gate changed: `SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH` (with the device wait) admits a captured
+target verify, and `post_engram_device_lookups` posts both layers' lookups as the hash ids exist. GPU test: a
+6-token verify captures as one segment and replays every token's exact rows (`test_engram_device_wait_gpu.py`).
+
+One pair, off then on (arm `dspark-both-misscut-engram-verify-graph`, prefetch off), captures as above. Run dir
+`divix01:/data/models/slang/nvfp4-work/ram-prefetch/engram-verify-20261013/` (`gaps.py` computes the gaps; the two
+`aborted-*` dirs are discarded attempts, the second contaminated by an orphaned server). The flag's server log shows
+`segments=1 breaks=0` on all three verify variants.
+
+| per verify (median) | off | Engram in graph |
+|---|---:|---:|
+| gap before row 1 (submit of row r minus gate of row r-1), ms | 4.59 | 1.07 |
+| gap before row 14, ms | 5.20 | 1.34 |
+| gap before any other row, ms | 1.24 | 1.21 |
+| sum of per-row gaps, ms | 59.8 | 51.8 |
+| wall ms | 260.7 | 275.9 |
+| layer gate waits, ms | 203.9 | 222.1 |
+| wait of a layer with no miss, ms | 2.71 | 2.92 |
+| layer 0 wait (drift control), ms | 10.29 | 11.01 |
+| matched per record vs off, ms | | -0.21 |
+
+- **The breaks are gone and so are their gaps**: rows 1 and 14 now start like any other row, 8.0 ms per verify
+  (~3%). Row 1's own wait rose ~1 ms (7.62 to 8.67): part of the lookup now shows as the device wait.
+- **The wall median moved the other way (+5.8%) and is drift**: the flag cannot touch the no-miss floor or layer 0,
+  and both moved (0.21 ms per layer, 0.72 ms). Matched per record the flag is 0.21 ms faster, about the gap saving.
+  One pair cannot size the net effect; the gap removal is the measured result.
+- **Default on** since this section (`EnvBool(True)`; it acts only with `SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT`),
+  by the owner's decision. End-to-end output identity under the flag is covered by the GPU test's exact rows, not
+  yet by a served output comparison.
 
 ## Sources
 

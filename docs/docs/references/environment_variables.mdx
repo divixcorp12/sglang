@@ -1580,6 +1580,11 @@ Decode computes a layer's RAM-tier experts on the CPU, in place over the pinned 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With the host-node cache, capture the decode lookup as a device post kernel plus a device wait kernel served by a polling thread, leaving no host nodes in the decode graph.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With the device wait, also capture a speculative target verify's Engram lookups (every verify token) as device post and wait kernels, so the verify graph has no Engram breaks. <code>false</code> runs them as eager breaks.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -29,6 +29,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     engram_ram_gib: float
     engram_host_node_cache_uring: bool
     enable_engram_device_wait: bool
+    engram_verify_in_graph: bool
     expert_stream: bool
     expert_dir: str
     expert_trace_path: str
@@ -102,6 +103,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             engram_ram_gib=envs.SGLANG_DSV41_ENGRAM_RAM_GIB.get(),
             engram_host_node_cache_uring=envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get(),
             enable_engram_device_wait=envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get(),
+            engram_verify_in_graph=envs.SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH.get(),
             expert_stream=envs.SGLANG_DSV41_EXPERT_STREAM.get(),
             expert_dir=envs.SGLANG_DSV41_EXPERT_DIR.get(),
             expert_trace_path=envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get(),
