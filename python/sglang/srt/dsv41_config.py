@@ -78,6 +78,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     ram_prefetch_idle_deadline_us: int
     ram_prefetch_idle_spread: bool
     ram_prefetch_idle_pieces: int
+    ram_prefetch_promote: bool
     ram_prefetch_horizon: int
     enable_prefill_fills: bool
     enable_prefill_share: bool
@@ -152,6 +153,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             ram_prefetch_idle_deadline_us=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get(),
             ram_prefetch_idle_spread=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get(),
             ram_prefetch_idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
+            ram_prefetch_promote=envs.SGLANG_DSV41_RAM_PREFETCH_PROMOTE.get(),
             ram_prefetch_horizon=envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.get(),
             enable_prefill_fills=envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get(),
             enable_prefill_share=envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.get(),
