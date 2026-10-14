@@ -130,12 +130,22 @@ def _captures_native_lookup(
         getattr(embed, "layer_id", None) in (1, 14)
         and getattr(embed, "tp_size", None) == 1
         and indices.is_cuda
-        and indices.shape[0] == 1
         and getattr(embed.file_table, "_host_node_extension", None) is not None
         and getattr(embed.file_table, "_native_store", None) is not None
         and forward_batch is not None
-        and forward_batch.forward_mode.is_decode()
+        and _graphable_lookup_shape(indices, forward_batch.forward_mode)
         and is_breakable_graph_capturing()
+    )
+
+
+def _graphable_lookup_shape(indices: torch.Tensor, mode) -> bool:
+    if mode.is_decode():
+        return indices.shape[0] == 1
+    # Only the device wait serves several tokens: the host-node path is untested past one.
+    return (
+        mode.is_target_verify()
+        and envs.SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH.get()
+        and envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get()
     )
 
 

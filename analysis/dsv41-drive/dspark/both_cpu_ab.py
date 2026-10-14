@@ -219,6 +219,12 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3"] = (
     },
     True,
 )
+# The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
+# breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.3 item 6).
+ARMS["dspark-both-misscut-engram-verify-graph"] = (
+    {**ARMS["dspark-both-misscut"][0], "SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH": "1"},
+    True,
+)
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -243,6 +249,7 @@ REFERENCE = {
     "dspark-both-prefetch-gpu-misscut-idle2-l2-cap2": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2": "dspark-both-misscut",
     "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3": "dspark-both-misscut",
+    "dspark-both-misscut-engram-verify-graph": "dspark-both-misscut",
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "

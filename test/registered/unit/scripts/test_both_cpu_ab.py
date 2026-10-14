@@ -466,6 +466,18 @@ def test_the_t3_cap3_arm_is_the_t3_arm_with_three_rows_per_layer_and_three_pool_
     assert ab.REFERENCE[T3_CAP3_ARM] == "dspark-both-misscut"
 
 
+def test_the_engram_verify_graph_arm_is_the_misscut_arm_with_the_flag_alone_on_the_device_wait():
+    """Mutant: the arm also changes another knob, drops the device wait (the flag then does nothing), or is not
+    compared with its A -- red."""
+    ab = _ab()
+    flag = "SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH"
+    a, b = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-misscut-engram-verify-graph"][0]
+    assert flag not in a and {k: v for k, v in b.items() if k != flag} == a and b[flag] == "1"
+    env = {**ab.arm_env.base_env(), **ab._overrides("dspark-both-misscut-engram-verify-graph", "/out")}
+    assert env["SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT"] == "1"
+    assert ab.REFERENCE["dspark-both-misscut-engram-verify-graph"] == "dspark-both-misscut"
+
+
 def test_each_cap2_arm_is_its_cap1_arm_with_two_rows_per_layer_alone():
     """Mutant: a cap-2 arm also changes another knob (or is built from the wrong arm), so the A/B does not read the
     budget alone -- red."""

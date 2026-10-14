@@ -1852,6 +1852,9 @@ class Envs:
     # wait kernel served by a polling thread instead of a host node; the decode graph
     # then has no host nodes, which is asserted at capture.
     SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT = EnvBool(False)
+    # With the device wait, also capture a target verify's lookups (every verify token) that
+    # way, so the verify graph has no Engram breaks; off runs them as eager breaks.
+    SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH = EnvBool(False)
 
     # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
     # checkpoint loader skips them and each MoE layer gathers the experts it

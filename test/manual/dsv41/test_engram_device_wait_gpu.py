@@ -92,10 +92,18 @@ def _open(directory, monkeypatch, *, device_wait: bool):
     return _layer(directory, 1, store), _layer(directory, 14, store)
 
 
-def _capture_two_layers(layer1, layer14, ids, *, early_post: bool, forbid_host_nodes: bool, registry=None):
+def _verify_batch():
+    return types.SimpleNamespace(
+        forward_mode=types.SimpleNamespace(is_decode=lambda: False, is_target_verify=lambda: True)
+    )
+
+
+def _capture_two_layers(
+    layer1, layer14, ids, *, early_post: bool, forbid_host_nodes: bool, registry=None, batch=None
+):
     """Capture the decode step's shape: hash ids exist first, then layer 1 and layer 14 look up."""
     graph = BreakableCUDAGraph(deduped_cuda_graph=registry)
-    batch = _batch()
+    batch = batch or _batch()
     with torch.cuda.stream(torch.cuda.Stream()):
         with BreakableCUDAGraphCapture(graph, forbid_host_nodes=forbid_host_nodes):
             if early_post:
@@ -252,6 +260,37 @@ def test_a_timed_out_wait_fails_loudly_and_latches_the_fatal_word(tmp_path):
     assert "device-side assert" in result["message"] or "timed out or failed" in result["message"]
     assert result["control"][engram_ring.FATAL_SEQ] == 1
     assert result["control"][engram_ring.FATAL_STATUS] == engram_ring.DEVICE_TIMEOUT
+
+
+VERIFY_TOKENS = 6  # DSpark block 5: one verify is six tokens
+
+
+@pytest.mark.parametrize("in_graph", [True, False])
+def test_a_verify_is_captured_whole_only_with_the_verify_flag(tmp_path, monkeypatch, in_graph):
+    """With SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH a six-token verify's two lookups are one segment that replays every
+    token's exact rows; without it they stay two eager breaks. Mutant: the gate admitting verify without the flag,
+    or a lookup serving only the first token's ids -- red."""
+    weights = _make_table(tmp_path)
+    layer1, layer14 = _open(tmp_path, monkeypatch, device_wait=True)
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH", "1" if in_graph else "0")
+    g = torch.Generator().manual_seed(3)
+    ids = torch.randint(0, ROWS, (VERIFY_TOKENS, 2, 3), generator=g).cuda()
+    graph, out1, out14 = _capture_two_layers(
+        layer1, layer14, ids, early_post=True, forbid_host_nodes=True, batch=_verify_batch()
+    )
+    if not in_graph:
+        assert (len(graph._segments), len(graph._break_fns)) == (3, 2)
+        return
+    assert len(graph._segments) == 1 and not graph._break_fns
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            step_ids = torch.randint(0, ROWS, ids.shape, generator=g)
+            ids.copy_(step_ids.cuda())
+            graph.replay()
+            stream.synchronize()
+            for layer, index, out in ((1, 0, out1), (14, 1, out14)):
+                assert torch.equal(out.cpu(), _want(*weights[layer], step_ids[:, index].tolist())), layer
 
 
 def test_the_flag_needs_the_native_store(tmp_path, monkeypatch):
