@@ -6619,6 +6619,7 @@ the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed onc
 | `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES` | `False` | `1` | Copy engine moves only the two trellis tensors; the wait reads the four small ones. |
 | `SGLANG_DSV41_ENABLE_LAYER_FUSION` | `False` | `1` | JIT kernels replace about 89 small torch kernels per layer. |
 | `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION` | `False` | `1` | BS1 decode cast fusion. |
+| `SGLANG_DSV41_RAM_PREFETCH_PROMOTE` | `False` | - | Defers each row's map delta to the previous row's next record and folds landed prefetch-pool rows into it, so the GPU types them as RAM hits; needs `SGLANG_DSV41_RAM_PREFETCH=1`. |
 | `SGLANG_DSV41_ENABLE_LEASE_PDL` | `False` | `1` | Programmatic dependent launch for the chain kernels. |
 | `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM` | `False` | - | Shared expert and DIRECT commit on a side stream. |
 | `SGLANG_DSV41_ENABLE_PREFILL_FILLS` | `False` | `1` | Eager pinned-tier misses read by the native reader into the slabs. |

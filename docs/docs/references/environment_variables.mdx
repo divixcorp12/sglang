@@ -1350,6 +1350,11 @@ These variables configure DeepSeek V4.1: streaming EXL3 routed experts from disk
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_RAM_PREFETCH_PROMOTE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Defer each row's map delta to the previous row's next record and fold landed prefetch-pool rows into it, so the GPU types them as RAM hits. Needs <code>SGLANG_DSV41_RAM_PREFETCH=1</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_LEASE_PDL</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Launch the lease-chain kernels with programmatic dependent launch to overlap launch latency. Outputs are unchanged.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

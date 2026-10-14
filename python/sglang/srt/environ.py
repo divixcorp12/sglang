@@ -2069,6 +2069,9 @@ class Envs:
     # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4), each on a drive no demand
     # reads. One read rows too slowly in that A/B: 35% abandoned, 82% of promotions boosted.
     SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
+    # Defer each row's map delta to the previous row's next record and fold landed pool rows into it, so the GPU types
+    # them as RAM hits. Needs SGLANG_DSV41_RAM_PREFETCH=1.
+    SGLANG_DSV41_RAM_PREFETCH_PROMOTE = EnvBool(False)
     # How many layers ahead the speculative scorer targets (1 to 4): 1 scores the next layer's gate, 2 the one after.
     # Above 1 needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS set, since the packaged floors were fit for 1.
     SGLANG_DSV41_RAM_PREFETCH_HORIZON = EnvInt(1)
