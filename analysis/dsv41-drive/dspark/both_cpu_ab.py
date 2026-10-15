@@ -351,6 +351,57 @@ ARMS["dspark-both-misscut-engram-verify-graph"] = (
     {**ARMS["dspark-both-misscut"][0], "SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH": "1"},
     True,
 )
+# The triton FlashMLA merge in token chunks, off in every arm but -mergechunk.
+MERGE_BUDGET = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[MERGE_BUDGET] = "0"
+# The OFF -mem arm's init, from its server.log (cores-ab-20261014/splitmodel-stream-mem, 0.78 / 10840 MiB): free memory
+# before loading, the KV pool, its bytes a token, and the hot cache's slot (853 slots of 10840 MiB).
+OFF_PRE_LOAD_GIB = 29.35
+OFF_KV_TOKENS = 339712
+KV_BYTES_PER_TOKEN = 1670.75
+HOT_SLOT_BYTES = 13315584
+# Free memory before loading moved 0.02 GiB between launches (29.33 in mem-budget/L2, 29.35 here); the KV budget moves
+# by that times the fraction, so the fraction carries it as margin and --max-total-tokens pins the pool.
+PRE_LOAD_JITTER_GIB = 0.02
+
+
+def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
+    """--mem-fraction-static that funds a hot cache of hot_mb MiB and a KV pool of at least kv_tokens on top of the OFF
+    arm's init. The pool's budget is free memory less pre_load * (1 - fraction), and the hot cache comes out of it, so
+    every extra byte of either raises the fraction by bytes / pre_load. Rounded up to 4 places."""
+    pre_load = OFF_PRE_LOAD_GIB * 2**30
+    off_slots = int(arm_env.DSPARK_HOT_GPU_MB) * 2**20 // HOT_SLOT_BYTES
+    hot = (hot_mb * 2**20 // HOT_SLOT_BYTES - off_slots) * HOT_SLOT_BYTES
+    kv = (kv_tokens - OFF_KV_TOKENS) * KV_BYTES_PER_TOKEN
+    off = float(arm_env.DSPARK_MEM_FRACTION_STATIC)
+    jitter = PRE_LOAD_JITTER_GIB * 2**30 * off
+    return f"{-(-round((off + (hot + kv + jitter) / pre_load) * 1e6) // 100) / 1e4:.4f}"
+
+
+# The splitmodel -mem arm with the merge chunked under MERGE_CHUNK_MB, which frees about 1.5 GiB of the 4096-token
+# prefill peak, spent on the hot cache (arm_env's TODO at DSPARK_MEM_FRACTION_STATIC); the KV pool is pinned.
+MERGE_CHUNK_MB = 128
+MERGE_HOT_GPU_MB = 12040
+MERGE_KV_TOKENS = 381184
+MERGE_CHUNK_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-mergechunk"
+ARMS[MERGE_CHUNK_ARM] = (
+    {
+        **ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0],
+        MERGE_BUDGET: str(MERGE_CHUNK_MB),
+        "SGLANG_MOE_HOT_GPU_MB": str(MERGE_HOT_GPU_MB),
+    },
+    True,
+)
+# An arm's own --mem-fraction-static and KV pool, appended to its argv (the last --mem-fraction-static wins).
+ARM_MEMORY_FLAGS = {
+    MERGE_CHUNK_ARM: (
+        "--mem-fraction-static",
+        fraction_keeping_kv(MERGE_HOT_GPU_MB, MERGE_KV_TOKENS),
+        "--max-total-tokens",
+        str(MERGE_KV_TOKENS),
+    ),
+}
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -394,13 +445,14 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
 }
 
 
 def server_flags(arm: str) -> tuple[str, ...]:
     """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop, for
-    the -mem arms and those built on them."""
-    return MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ()
+    the -mem arms and those built on them, and an arm's own fraction and KV pool (ARM_MEMORY_FLAGS)."""
+    return (MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ()) + ARM_MEMORY_FLAGS.get(arm, ())
 
 
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
