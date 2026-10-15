@@ -84,9 +84,9 @@ def test_physics_moves_a_lane_from_the_hit_job_to_the_copy_fifo():
     g = _group(hits=2, dma=1, hit=(0.0, 2.0), issue=0.0)
     n = _node(0, [1, 1, 1], [1, 2], g=g)
     today = {1: 1, 2: 1}
-    assert sr.physics({}, [n], today, FLAT, 1.0, 1.0) == 2.0
-    assert sr.physics({}, [n], {2: 1}, FLAT, 1.0, 1.0) == 2.0  # CPU 1, copy 2
-    assert sr.physics({}, [n], {0: 1, 1: 1, 2: 1}, FLAT, 1.0, 1.0) == 3.0
+    assert sr.physics({}, [n], [today], FLAT, 1.0, 1.0) == 2.0
+    assert sr.physics({}, [n], [{2: 1}], FLAT, 1.0, 1.0) == 2.0  # CPU 1, copy 2
+    assert sr.physics({}, [n], [{0: 1, 1: 1, 2: 1}], FLAT, 1.0, 1.0) == 3.0
 
 
 def test_layer_effect_delays_the_gpu_only_when_its_stream_kernel_runs():
