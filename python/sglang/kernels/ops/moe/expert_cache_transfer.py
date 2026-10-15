@@ -148,13 +148,24 @@ def copy_expert_row_segments_gpu(
     source_rows: torch.Tensor,
     destination_slots: torch.Tensor,
     count: torch.Tensor,
+    *,
+    grid_blocks: int = 0,
 ) -> None:
     """Copy the planned rows of every tensor pair in ``segments`` in one launch.
 
     Each launched thread copies its lane of the selected row in every segment,
     so a layer's tensors cost one kernel launch instead of one per tensor.
+    ``grid_blocks`` 0 keeps the narrow grid sized for pulls over PCIe; a
+    device-to-device copy passes ``device_copy_grid_blocks``.
     """
     _validate_plan(segments.table.device, source_rows, destination_slots, count)
     _jit_expert_cache_transfer_module().copy_expert_row_segments_gpu(
-        segments.table, source_rows, destination_slots, count
+        segments.table, source_rows, destination_slots, count, grid_blocks
     )
+
+
+@functools.cache
+def device_copy_grid_blocks(device: torch.device) -> int:
+    """Blocks for a device-to-device row copy: each thread keeps one 16-byte unit in flight,
+    so HBM speed needs every SM busy (4 per SM; arbitrary, not tuned)."""
+    return 4 * torch.cuda.get_device_properties(device).multi_processor_count

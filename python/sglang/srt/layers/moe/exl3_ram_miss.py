@@ -30,7 +30,11 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, expert_row_segments
+from sglang.kernels.ops.moe.expert_cache_transfer import (
+    copy_expert_row_segments_gpu,
+    device_copy_grid_blocks,
+    expert_row_segments,
+)
 from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
@@ -718,7 +722,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         if self.drip_segments is not None:
             # C1s: the HIT_SCRATCH lanes, from the GPU drip's scratch slots (LEASE_PROTOCOL.md, "The GPU drip").
             copy_expert_row_segments_gpu(
-                self.drip_segments, side.scratch_rows_1, side.scratch_dst_1, side.scratch_go_1
+                self.drip_segments,
+                side.scratch_rows_1,
+                side.scratch_dst_1,
+                side.scratch_go_1,
+                grid_blocks=device_copy_grid_blocks(self.drip_segments.table.device),
             )
         side.stream(
             self.row,

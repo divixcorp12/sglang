@@ -163,7 +163,7 @@ class Chain:
     def chain(self, row=0, *, captured=False, before_c1=None, before_cw=None):
         """``backend.post``'s chain step by step, eagerly: ``captured`` sets the record flag an eager post never
         carries (so the post may type copy-engine and CPU lanes), and the hooks run on the stream between the steps."""
-        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, device_copy_grid_blocks
 
         backend, plan, dev = self.backends[row], self.plans[row], self.dev
         backend._stage_planned(plan)
@@ -172,7 +172,13 @@ class Chain:
             before_c1()
         copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
         if backend.drip_segments is not None:
-            copy_expert_row_segments_gpu(backend.drip_segments, dev.scratch_rows_1, dev.scratch_dst_1, dev.scratch_go_1)
+            copy_expert_row_segments_gpu(
+                backend.drip_segments,
+                dev.scratch_rows_1,
+                dev.scratch_dst_1,
+                dev.scratch_go_1,
+                grid_blocks=device_copy_grid_blocks(backend.drip_segments.table.device),
+            )
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
         if before_cw is not None:
             before_cw()
