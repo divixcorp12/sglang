@@ -394,7 +394,7 @@ PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
 PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
 PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
-                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995")
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -797,6 +797,21 @@ def test_the_decay_arm_is_arm_a_with_the_hot_decay_alone(monkeypatch):
     assert {k: v for k, v in d.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"} == \
         {k: v for k, v in a.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"}
     assert ab.REFERENCE[decay] == arm_a and ab.server_flags(decay) == ("--weight-loader-drop-cache-after-load",)
+
+
+def test_the_tiebreak_arm_is_arm_a_with_the_tiebreak_alone(monkeypatch):
+    """-tiebreak is -hicache1 with SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK=1; every other arm states 0 against
+    a shell's. Mutant: another arm inherits the shell's flag, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK", "1")
+    tiebreak, arm_a = PIN01_HICACHE_ARMS[3], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"] == (
+            "1" if arm == tiebreak else "0"), arm
+    t, a = ab.ARMS[tiebreak][0], ab.ARMS[arm_a][0]
+    key = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
+    assert {k: v for k, v in t.items() if k != key} == {k: v for k, v in a.items() if k != key}
+    assert ab.REFERENCE[tiebreak] == arm_a and ab.server_flags(tiebreak) == ("--weight-loader-drop-cache-after-load",)
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

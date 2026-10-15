@@ -339,9 +339,11 @@ for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
 HICACHE_NODE = "SGLANG_HICACHE_HOST_NUMA_NODE"
 ENGRAM_NATIVE_GIB = "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"
 HOT_DECAY = "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"
+RESIDENCY_TIEBREAK = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[ENGRAM_NATIVE_GIB] = "5"
     _overrides_of_arm[HOT_DECAY] = "0.98"
+    _overrides_of_arm[RESIDENCY_TIEBREAK] = "0"
 PIN01_SPLIT_MODEL_HICACHE1_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-hicache1"
 ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0], HICACHE_NODE: "1"}, True)
 PIN01_SPLIT_MODEL_ENGRAM0_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-engram0"
@@ -350,6 +352,10 @@ ARMS[PIN01_SPLIT_MODEL_ENGRAM0_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0
 # +5.5 VRAM hits a verify, so the routed-pair hit rate is the evidence and ms/token only a regression check.
 PIN01_SPLIT_MODEL_DECAY_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-decay995"
 ARMS[PIN01_SPLIT_MODEL_DECAY_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], HOT_DECAY: "0.995"}, True)
+# The split model's residency tiebreak (equal-token lanes of a node: the CPU takes the lowest residency keys): the
+# breakdown-base replay gives the same saving with 56% fewer inverted pairs; compared with -hicache1.
+PIN01_SPLIT_MODEL_TIEBREAK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-tiebreak"
+ARMS[PIN01_SPLIT_MODEL_TIEBREAK_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], RESIDENCY_TIEBREAK: "1"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -401,6 +407,7 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     PIN01_SPLIT_MODEL_DECAY_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_TIEBREAK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
 }
 
 
