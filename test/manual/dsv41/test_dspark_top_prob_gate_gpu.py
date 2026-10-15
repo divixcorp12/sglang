@@ -1,0 +1,179 @@
+"""DSpark's top-probability verify gate on the GPU: the in-graph top probability of the sharded greedy proposal, the
+static epilogue's capped accept, and a captured 6-token verify whose cut rows route no experts through the EXL3 lease
+chain.
+"""
+
+import os
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+sys.path.insert(0, os.path.dirname(__file__))
+from test_exl3_ram_miss_graph_gpu import HIDDEN, INTER, REL_BOUND, _reference, _rel  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+ACT_LIMIT = 10.0
+TOP_K, TOKENS, LANES, EXPERTS = 6, 6, 8, 48
+SINGLE_RANK = SimpleNamespace(world_size=1)
+
+
+def test_the_sharded_greedy_step_reduces_the_softmax_top_probability_with_its_argmax():
+    from sglang.kernels.ops.speculative.dspark.sharded_greedy import sharded_greedy_step
+
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    rows, vocab = 4, 129_280  # the V4.1 vocabulary: 32 blocks, the last one partial
+    base = torch.randn((rows, vocab), device="cuda", generator=generator) * 4
+    bias = (torch.randn((rows, vocab), device="cuda", generator=generator) * 2).to(torch.bfloat16)
+    base[1, 1000] = 60.0  # a near-certain row
+    base[2, 7:4000] = -float("inf")  # masked entries, a whole block of them included
+    base[2, 4096:8192] = -float("inf")
+    want_tokens = torch.argmax(base + bias.float(), dim=-1)
+    want_probs = torch.softmax(base + bias.float(), dim=-1).amax(dim=-1)
+
+    plain = sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0)
+    # A column of a [rows, gamma] buffer, as the draft sampler passes it.
+    probs = torch.full((rows, 5), -1.0, device="cuda")
+    tokens = sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0, top_prob_out=probs[:, 2])
+    assert torch.equal(tokens, plain) and torch.equal(tokens, want_tokens)
+    assert torch.allclose(probs[:, 2], want_probs, rtol=1e-4, atol=1e-7)
+    assert bool((probs[:, [0, 1, 3, 4]] == -1.0).all())
+    assert float(probs[1, 2]) > 0.999
+
+    base[3, 17] = float("nan")
+    sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0, top_prob_out=probs[:, 2])
+    assert torch.isnan(probs[3, 2]) and not bool(torch.isnan(probs[:3, 2]).any())
+
+
+def test_the_static_epilogue_stops_the_accept_at_the_gates_cut():
+    from sglang.srt.speculative.dspark_components.dspark_verify import DsparkVerifyEpilogue
+    from sglang.srt.speculative.spec_tp_sync import SpecTpSync
+
+    stride, vocab = TOKENS, 4096
+    epilogue = DsparkVerifyEpilogue(
+        max_bs=1, verify_num_draft_tokens=stride, device="cuda", tp_sync=SpecTpSync(SINGLE_RANK), static_cutoff=True
+    )
+    drafts = [7, 3, 9, 2, 5]
+    predict = drafts + [11]  # the target agrees with every draft
+    logits = torch.full((stride, vocab), -10.0, device="cuda")
+    logits[torch.arange(stride), torch.tensor(predict)] = 10.0
+    batch = SimpleNamespace(
+        batch_size=1,
+        input_ids=torch.tensor([1] + drafts, device="cuda"),
+        seq_lens=torch.tensor([100], device="cuda"),
+    )
+
+    def accept():
+        epilogue._static_epilogue(SimpleNamespace(next_token_logits=logits), batch)
+        out = epilogue.read_accept(1)
+        return int(out.correct_len), int(out.bonus), int(out.commit_lens), out.out_tokens[0].tolist()
+
+    # Three rows verified: the anchor and drafts 1-2. Draft 3 matched but was cut, so the bonus after draft 2 is the
+    # target's prediction there (draft 3's token), and the commit is drafts 1-2 plus that bonus.
+    epilogue.begin_gated_static_step(torch.tensor([3], device="cuda"), armed=False)
+    correct_len, bonus, commit_len, out_tokens = accept()
+    assert (correct_len, bonus, commit_len, out_tokens[:commit_len]) == (2, 9, 3, [7, 3, 9])
+    epilogue.begin_static_step(1, armed=False)  # an ungated step verifies every draft again
+    correct_len, bonus, commit_len, out_tokens = accept()
+    assert (correct_len, bonus, commit_len, out_tokens) == (5, 11, 6, drafts + [11])
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
+def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import exl3_ram_miss as service_module
+    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+    from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+    from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows, mask_dead_routes
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+    from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+
+    write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
+    layout = build_exl3_expert_layout(str(tmp_path))
+    service_module.Exl3RamMissService._instance = None
+    service = service_module.Exl3RamMissService.get()
+    service.plan_gather_width(LANES)
+    try:
+        with (
+            service_row_images(tmp_path),
+            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
+            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
+            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
+            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
+            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused),
+        ):
+            model = torch.nn.Module()
+            layer = torch.nn.Module()
+            layer.layer_id, layer.top_k = 0, TOP_K
+            fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))
+            fmt.max_gather_rows = LANES
+            streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
+            layer._nvfp4_expert_streamer = streamer
+            model.add_module("expert_layer", layer)
+            ExpertPinnedHostCache(streamer, 4 * LANES, **fmt.pinned_tier_options(layer))
+            manager = ExpertHotCacheManager.from_model(
+                model, budget_bytes=2 * LANES * streamer.bytes_per_expert,
+                seed_path=None, dynamic=True, update_prefill_tokens=16,
+                min_residence_forwards=0, benefit_ratio=0.0,
+                graph_gather_batch_size=TOKENS, graph_gather_miss_lanes=LANES, update_decode_forwards=1,
+                gpu_residency_update=True, insert_on_miss=2,
+            )
+            updater = manager.gpu_residency
+
+            dead_rows = VerifyDeadRows(max_rows=TOKENS, device="cuda")
+            generator = torch.Generator(device="cpu").manual_seed(41)
+            x = (torch.randn((TOKENS, HIDDEN), generator=generator) * 0.5).to("cuda", torch.bfloat16)
+            weights = torch.full((TOKENS, TOP_K), 1.0 / TOP_K, device="cuda")
+            ids = torch.tensor([list(range(TOP_K))] * TOKENS, device="cuda", dtype=torch.int32)
+
+            def gated_apply():
+                # What Exl3MoEMethod.apply runs for a layer that verify_dead_rows reached.
+                masked_ids, masked_weights = mask_dead_routes(topk_ids=ids, topk_weights=weights, dead=dead_rows.dead)
+                return Exl3MoEMethod._apply_graph(
+                    layer, streamer, x, masked_weights, masked_ids, ACT_LIMIT, dead=dead_rows.dead
+                )
+
+            gated_apply()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = gated_apply()
+            manager.discard_graph_capture_routes()
+
+            def mapping():
+                return updater.mapping[0, :EXPERTS].cpu().tolist()
+
+            outsiders = [expert for expert, slot in enumerate(mapping()) if slot < 0]
+            live, cut = outsiders[:TOP_K], outsiders[TOP_K : TOP_K + 12]
+            # Two live rows share 6 misses; the four cut rows route 12 others, more than the 8 lanes on their own.
+            routes = [live, live] + [[cut[(2 * t + k) % 12] for k in range(TOP_K)] for t in range(TOKENS - 2)]
+            ids.copy_(torch.tensor(routes, device="cuda", dtype=torch.int32))
+
+            updater.overflow_flag.zero_()
+            dead_rows.set_live_rows(torch.tensor([2], device="cuda"))
+            graph.replay()
+            torch.cuda.synchronize()
+            service.fail_stop_check()
+            assert streamer.row_backend.keep.item() == 1.0
+            assert int(updater.overflow_flag.item()) == 0, "a cut row took a miss lane"
+            now = mapping()
+            assert all(now[e] >= 0 for e in live)
+            assert all(now[e] < 0 for e in cut), "a cut row's expert was read"
+            for t in range(2):
+                slots = torch.tensor([now[e] for e in live])
+                ref = _reference(x[t : t + 1], weights[t], slots, manager.caches[0].tensors)
+                assert _rel(out[t : t + 1], ref) <= REL_BOUND, t
+            assert not bool(out[2:].float().any()), "a cut row has routed output"
+
+            # The same graph with every row live: the cut rows' 12 misses are back, past the lanes.
+            dead_rows.clear()
+            graph.replay()
+            torch.cuda.synchronize()
+            service.fail_stop_check()
+            assert int(updater.overflow_flag.item()) == 1
+    finally:
+        service.shutdown()

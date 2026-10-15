@@ -24,6 +24,11 @@ from sglang.srt.layers.moe.exl3_stream_trace import (
     get_exl3_stream_trace,
 )
 from sglang.srt.layers.moe.expert_format import STREAMER_ATTRIBUTE, expert_streamer_of
+from sglang.srt.layers.moe.verify_dead_rows import (
+    dead_routes_cleared,
+    dead_rows_as_row0,
+    mask_dead_routes,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -385,6 +390,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = None
         self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
         self.route_plan = envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get()
+        # [max_rows, 1] bool: a speculative verify's dead rows (layers/moe/verify_dead_rows.py), or None.
+        self.verify_dead_rows: Optional[torch.Tensor] = None
 
     def create_weights(
         self,
@@ -584,6 +591,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             topk = topk.to_standard(layer_id=layer.layer_id)
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         streamer = expert_streamer_of(layer)
+        dead = self.verify_dead_rows
+        if dead is not None and (
+            streamer is None or topk_ids.shape[0] > dead.shape[0]
+        ):
+            dead = None
+        if dead is not None:
+            topk_ids, topk_weights = mask_dead_routes(
+                topk_ids=topk_ids, topk_weights=topk_weights, dead=dead
+            )
         scale = (
             cfg.routed_scaling_factor
             if cfg.routed_scaling_factor is not None
@@ -592,6 +608,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         x = dispatch_output.hidden_states
         if streamer is not None and streamer.serves_graph_gather(topk):
+            graph_kwargs = {} if dead is None else {"dead": dead}
             if self.cast_fusion and scale is not None and x.dtype == torch.bfloat16:
                 from sglang.kernels.ops.moe.exl3_cast_fusion import exl3_scale_to_bf16
 
@@ -603,12 +620,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     topk_ids,
                     cfg.swiglu_limit,
                     cast=False,
+                    **graph_kwargs,
                 )
                 return StandardCombineInput(
                     hidden_states=exl3_scale_to_bf16(out, scale)
                 )
             out = self._apply_graph(
-                layer, streamer, x, topk_weights, topk_ids, cfg.swiglu_limit
+                layer,
+                streamer,
+                x,
+                topk_weights,
+                topk_ids,
+                cfg.swiglu_limit,
+                **graph_kwargs,
             )
         elif streamer is not None:
             assert_not_capturing("Exl3MoEMethod.apply")
@@ -648,7 +672,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def _apply_graph(
-        layer, streamer, x, topk_weights, topk_ids, swiglu_limit, cast=True
+        layer, streamer, x, topk_weights, topk_ids, swiglu_limit, cast=True, dead=None
     ):
         """BS1 decode inside a CUDA graph: device-only gather, then the fused MoE over slots.
 
@@ -685,6 +709,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # The option C post protects every routed expert of this layer. Captured as a
             # device copy, so every replay refreshes it from the live topk_ids.
             flat = topk_ids.reshape(-1)
+            if dead is not None:
+                # Dead rows hold row 0's experts (verify_dead_rows.py); -1 keeps them out of the CPU token mask.
+                flat = dead_routes_cleared(
+                    flat_ids=flat, top_k=topk_ids.shape[1], dead=dead
+                )
             routes[: flat.numel()].copy_(flat)
             routes[flat.numel() :].fill_(-1)
         backend = streamer.row_backend
@@ -696,7 +725,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # layer's activation limit registers its pinned slabs with the CPU kernel.
             Exl3RamMissService.get().cpu_experts.register(backend.row, float(swiglu_limit))
             # The post stages x and the lanes' weights for the CPU expert thread (Exl3RamMissRowBackend.post).
-            backend.cpu_input = (x, topk_weights)
+            backend.cpu_input = (
+                x if dead is None else dead_rows_as_row0(x=x, dead=dead),
+                topk_weights,
+            )
         try:
             remap, _ = streamer.gather(topk_ids)
         finally:

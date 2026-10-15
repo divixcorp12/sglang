@@ -12,6 +12,10 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.moe.verify_dead_rows import (
+    VerifyDeadRows,
+    attach_verify_dead_rows,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -73,6 +77,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+)
+from sglang.srt.speculative.dspark_components.dspark_top_prob_gate import (
+    TopProbGate,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -363,6 +370,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
+        self._top_prob_gate = TopProbGate.from_envs()
+        self._verify_dead_rows = None
+        if self._top_prob_gate is not None:
+            self._verify_dead_rows = self._init_top_prob_gate()
         if (
             get_parallel().enable_dp_attention
             and not self._draft_is_moe
@@ -392,6 +403,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            record_top_prob=self._top_prob_gate is not None,
         )
         self._verify_epilogue = None
         target_is_dsv41 = (
@@ -422,6 +434,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=self.device,
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
+                static_cutoff=self._top_prob_gate is not None,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -481,6 +494,49 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _init_top_prob_gate(self) -> VerifyDeadRows:
+        """Refuse a launch the top-probability gate cannot serve, and point the target's EXL3 MoE at its dead rows."""
+        refusals = []
+        if self._verify_planner.mode_value != "static":
+            refusals.append(f"SGLANG_RAGGED_VERIFY_MODE={self._verify_planner.mode_value} (needs static)")
+        if self.ps.tp_size != 1:
+            # The sharded greedy proposal's top probability is one rank's softmax.
+            refusals.append(f"tp_size={self.ps.tp_size} (needs 1)")
+        if get_parallel().enable_dp_attention:
+            refusals.append("--enable-dp-attention")
+        if float(envs.SGLANG_SIMULATE_ACC_LEN.get()) > 0:
+            refusals.append("SGLANG_SIMULATE_ACC_LEN")
+        if refusals:
+            raise ValueError(
+                "SGLANG_DSPARK_TOP_PROB_GATE is unsupported with " + ", ".join(refusals)
+                + "; unset it (0) to verify every draft."
+            )
+        # One request's verify rows: the gate applies at bs 1 only (dspark_top_prob_gate.py).
+        dead_rows = VerifyDeadRows(
+            max_rows=self.verify_num_draft_tokens, device=self.device
+        )
+        attached = attach_verify_dead_rows(self.model_runner.model, dead_rows)
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark top-probability verify gate on (threshold=%s): %d EXL3 MoE layers "
+                "route no experts for cut drafts.",
+                self._top_prob_gate.threshold,
+                attached,
+            )
+        return dead_rows
+
+    def _gate_verify_lens(
+        self, *, bs: int, sampling_info, draft_block
+    ) -> Optional[torch.Tensor]:
+        """This step's [bs] verify lengths under the top-probability gate, or None when every draft is verified."""
+        if (
+            self._top_prob_gate is None
+            or draft_block.top_probs is None
+            or not self._top_prob_gate.applies(bs=bs, sampling_info=sampling_info)
+        ):
+            return None
+        return self._top_prob_gate.verify_lens(draft_block.top_probs)
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -609,6 +665,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            record_top_prob=self._top_prob_gate is not None,
         )
 
     def clear_cache_pool(self):
@@ -860,6 +917,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        gate_verify_lens = self._gate_verify_lens(
+            bs=bs, sampling_info=sampling_info, draft_block=draft_block
+        )
         draft_probs = None
         if self._draft_top_prob_log is not None:
             # Before the verify: the draft graph's output hidden states are only live until then.
@@ -946,14 +1006,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self._verify_epilogue is not None
                     and self._verify_planner.mode_value == "static"
                 ):
-                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
-                target_verify = self._verify_executor.run_non_compact(
-                    batch=batch,
-                    draft_input=draft_input,
-                    verify_ids_2d=verify_ids_2d,
-                    verify_window=verify_window,
-                    sampling_info=sampling_info,
-                )
+                    if gate_verify_lens is None:
+                        self._verify_epilogue.begin_static_step(bs, fold_eligible)
+                    else:
+                        self._verify_epilogue.begin_gated_static_step(
+                            gate_verify_lens, fold_eligible
+                        )
+                if gate_verify_lens is not None:
+                    self._verify_dead_rows.set_live_rows(gate_verify_lens)
+                try:
+                    target_verify = self._verify_executor.run_non_compact(
+                        batch=batch,
+                        draft_input=draft_input,
+                        verify_ids_2d=verify_ids_2d,
+                        verify_window=verify_window,
+                        sampling_info=sampling_info,
+                    )
+                finally:
+                    if gate_verify_lens is not None:
+                        self._verify_dead_rows.clear()
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
@@ -987,6 +1058,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            gate_verify_lens=gate_verify_lens,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
@@ -1055,6 +1127,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 rids=[req.rid for req in batch.reqs],
                 probs=draft_probs,
                 num_correct_drafts=accept.correct_len,
+                gate_verify_lens=gate_verify_lens,
             )
 
         next_draft_input = make_next_draft_input(
@@ -1067,7 +1140,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             accept_lens=accept.commit_lens,
             block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
             cap_lens=(
-                layout.verify_lens.to(torch.int32) if layout is not None else None
+                layout.verify_lens.to(torch.int32)
+                if layout is not None
+                else (
+                    gate_verify_lens.to(torch.int32)
+                    if gate_verify_lens is not None
+                    else None
+                )
             ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,

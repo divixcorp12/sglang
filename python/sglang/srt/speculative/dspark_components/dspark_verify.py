@@ -149,13 +149,15 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        gate_verify_lens: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
         Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
-        override.
+        override. ``gate_verify_lens`` caps a static verify's accept at the
+        top-probability gate's cut.
         """
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
@@ -170,6 +172,7 @@ class TargetVerifyExecutor:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
+            cutoff_verify_lens=gate_verify_lens,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -543,10 +546,13 @@ class DsparkVerifyEpilogue:
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
         fused_argmax: bool = False,
+        static_cutoff: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
         self._fused_argmax = bool(fused_argmax)
+        # Caps the static (strided) verify's accept at verify_lens_buf, which the top-probability gate sets per step.
+        self._static_cutoff = bool(static_cutoff)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -621,6 +627,15 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
 
+    def begin_gated_static_step(self, verify_lens: torch.Tensor, armed: bool) -> None:
+        """A static step whose accept stops at the top-probability gate's per-request ``verify_lens``."""
+        assert self._static_cutoff
+        bs = verify_lens.shape[0]
+        self._static_step_state = None
+        self.verify_lens_buf[:bs].copy_(verify_lens)
+        self.verify_lens_buf[bs:].zero_()
+        self.inject_gate_buf.fill_(int(armed))
+
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
         verify_lens = self.verify_lens_buf[:bs]
@@ -630,6 +645,7 @@ class DsparkVerifyEpilogue:
             logits=out.next_token_logits,
             draft_tokens=candidates[:, 1:].contiguous(),
             seq_lens=forward_batch.seq_lens,
+            cutoff_verify_lens=verify_lens if self._static_cutoff else None,
         )
         if not self.folds_commit:
             return
@@ -826,9 +842,13 @@ def accept_draft_tokens(
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``cutoff_verify_lens`` caps a verify that has no ``cutoff_layout`` (a static one); never both."""
     greedy_mask = draft_block.greedy_mask
-    cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
+    if cutoff_layout is not None:
+        assert cutoff_verify_lens is None
+        cutoff_verify_lens = cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
     if all_greedy:
         return AcceptGreedy.execute(

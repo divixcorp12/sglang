@@ -23,6 +23,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_top_prob_gate import (
+    recording_top_prob,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -69,6 +72,8 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    # [bs, gamma] softmax top-1 probability per draft step; only recorded for the top-probability verify gate.
+    top_probs: Optional[torch.Tensor] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -137,6 +142,7 @@ def sample_draft_block(
     markov_head,
     device: torch.device,
     tp_sync: SpecTpSync,
+    record_top_prob: bool = False,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -187,17 +193,24 @@ def sample_draft_block(
                     torch.where(greedy_mask, argmax_tokens, sampled_tokens),
                 )
 
+    # The gate applies to greedy batches only, so a sampling batch records nothing.
+    top_probs = (
+        torch.empty(base_logits.shape[:2], dtype=torch.float32, device=device)
+        if record_top_prob and not any_sampling
+        else None
+    )
     draft_tokens, corrected_logits = markov_head.sample_block(
         base_logits,
         first_prev_tokens=anchor_tokens,
         hidden_states=draft_hidden,
-        sampler=sampler,
+        sampler=recording_top_prob(sampler, top_prob_out=top_probs),
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=corrected_logits,
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        top_probs=top_probs,
     )
 
 
@@ -212,8 +225,10 @@ class DraftBlockProposer:
         draft_block_spec_info,
         tp_sync: SpecTpSync,
         dp_moe_sync: bool = False,
+        record_top_prob: bool = False,
     ) -> None:
         self.draft_model = draft_model
+        self._record_top_prob = record_top_prob
         self.draft_model_runner = draft_model_runner
         self.gamma = gamma
         self.sample_from_anchor = bool(draft_model.sample_from_anchor)
@@ -312,6 +327,11 @@ class DraftBlockProposer:
                 corrected_logits=corrected_logits,
                 greedy_mask=greedy_mask,
                 temperatures=temperatures,
+                top_probs=(
+                    None
+                    if draft_sampler.top_prob_out is None
+                    else draft_sampler.top_prob_out[:bs]
+                ),
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
@@ -329,6 +349,7 @@ class DraftBlockProposer:
                 markov_head=self.draft_model.markov_head,
                 device=device,
                 tp_sync=self._tp_sync,
+                record_top_prob=self._record_top_prob,
             )
         proposal_block_ids = (
             draft_block_ids

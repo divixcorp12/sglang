@@ -595,6 +595,23 @@ def test_the_fixed_split_option_adds_the_table_and_calibration_off_to_both_arms_
         ab.main()
 
 
+def test_the_gate_arm_is_its_fixed_split_reference_with_the_gate_alone_and_every_other_arm_pins_it_off(monkeypatch):
+    """Mutant: an arm inherits a shell's gate, the gate arm changes another knob, is compared with the wrong arm, or
+    loses the driver's fixed split -- red."""
+    ab = _ab()
+    gate, arm = "SGLANG_DSPARK_TOP_PROB_GATE", f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-confgate"
+    reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
+    assert arm == "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-poolserve-fixedsplit-confgate"
+    monkeypatch.setenv(gate, "0.9")
+    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    for name in ab.ARMS:
+        assert ab._overrides(name, "/out")[gate] == ("0.4" if name == arm else "0"), name
+    on, off = ab.ARMS[arm][0], ab.ARMS[reference][0]
+    assert {k: v for k, v in on.items() if k != gate} == {k: v for k, v in off.items() if k != gate}
+    assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == reference
+    assert ab._overrides(arm, "/out")[SPLIT] == "0:3,1:5"
+
+
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
     """Mutant: the smoke's subset is ignored and all eight sessions run -- red."""
     ab = _ab()

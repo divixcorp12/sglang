@@ -249,6 +249,16 @@ FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
 for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
+# DSpark's top-probability verify gate is off in every arm but the gate one, pinned so a shell that exports it cannot
+# carry it into one.
+TOP_PROB_GATE = "SGLANG_DSPARK_TOP_PROB_GATE"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[TOP_PROB_GATE] = "0"
+# The fixed-split promote + pool-serve arm with the gate at the offline replay's best threshold: a verify stops at the
+# first draft where the running product of the draft's top-1 probabilities falls below 0.4. Its reference is that arm,
+# so the A/B reads the gate alone; it takes the driver's fixed split as its reference does.
+TOP_PROB_GATE_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-confgate"
+ARMS[TOP_PROB_GATE_ARM] = ({**ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0], TOP_PROB_GATE: "0.4"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -289,6 +299,7 @@ REFERENCE = {
     POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
     PROMOTE_POOL_SERVE_ARM: PROMOTE_ON_ARM,
     PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX,
+    TOP_PROB_GATE_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
@@ -328,10 +339,14 @@ TWO_STAGE_OFF = {
 }
 
 
+def _takes_fixed_split(arm: str) -> bool:
+    return arm.endswith(FIXED_SPLIT_SUFFIX) or arm == TOP_PROB_GATE_ARM
+
+
 def _overrides(arm: str, out: str) -> dict:
     overrides, _ = ARMS[arm]
     passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
-    if arm.endswith(FIXED_SPLIT_SUFFIX) and os.environ.get(FIXED_SPLIT_VAR):
+    if _takes_fixed_split(arm) and os.environ.get(FIXED_SPLIT_VAR):
         passed[FIXED_SPLIT_VAR] = os.environ[FIXED_SPLIT_VAR]
     return {
         **TWO_STAGE_OFF, **overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")
@@ -579,7 +594,7 @@ def main():
     sessions = ",".join(str(int(i)) for i in a.sessions.split(","))
     out = os.path.abspath(a.out)
     arms = a.arms or list(ARMS)
-    if not os.environ.get(FIXED_SPLIT_VAR) and any(arm.endswith(FIXED_SPLIT_SUFFIX) for arm in arms):
+    if not os.environ.get(FIXED_SPLIT_VAR) and any(_takes_fixed_split(arm) for arm in arms):
         sys.exit(f"a {FIXED_SPLIT_SUFFIX} arm needs {FIXED_SPLIT_VAR} set to the off capture's split table")
     if a.baseline:
         references = {REFERENCE[arm] for arm in arms if arm in REFERENCE}

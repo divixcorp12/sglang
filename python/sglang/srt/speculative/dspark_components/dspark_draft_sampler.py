@@ -13,6 +13,9 @@ from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
+from sglang.srt.speculative.dspark_components.dspark_top_prob_gate import (
+    recording_top_prob,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,7 @@ class DsparkDraftSampler:
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
+        record_top_prob: bool = False,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -71,6 +75,12 @@ class DsparkDraftSampler:
         self.confidence_out = (
             torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
             if confidence_fn is not None
+            else None
+        )
+        # [bs, gamma] softmax top-1 probability of each step's logits, for the top-probability verify gate.
+        self.top_prob_out = (
+            torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
+            if record_top_prob
             else None
         )
         self.folded_sampling = folded_sampling
@@ -129,11 +139,17 @@ class DsparkDraftSampler:
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
         # through to the block sampler below.
         draft_tokens = None
-        fused_greedy = getattr(self.markov_head, "supports_sharded_greedy", False) or (
+        top_prob_out = None if self.top_prob_out is None else self.top_prob_out[:bs]
+        sharded_greedy = getattr(self.markov_head, "supports_sharded_greedy", False)
+        fused_greedy = sharded_greedy or (
             envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
             and isinstance(self.markov_head, VanillaMarkov)
         )
-        if not self.folded_sampling and fused_greedy:
+        if not self.folded_sampling and sharded_greedy and top_prob_out is not None:
+            draft_tokens = self.markov_head.sample_block_greedy_fused(
+                base_logits, first_prev_tokens=anchor, top_prob_out=top_prob_out
+            )
+        elif not self.folded_sampling and fused_greedy and top_prob_out is None:
             draft_tokens = self.markov_head.sample_block_greedy_fused(
                 base_logits, first_prev_tokens=anchor
             )
@@ -168,7 +184,7 @@ class DsparkDraftSampler:
                 base_logits,
                 first_prev_tokens=anchor,
                 hidden_states=sample_hidden,
-                sampler=sampler,
+                sampler=recording_top_prob(sampler, top_prob_out=top_prob_out),
                 collect_corrected=self.folded_sampling,
             )
             if self.folded_sampling:
@@ -231,6 +247,7 @@ def maybe_build_draft_sampler(
     available_memory_gb: float,
     confidence_fn=None,
     out=None,
+    record_top_prob: bool = False,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -268,4 +285,5 @@ def maybe_build_draft_sampler(
         confidence_fn=confidence_fn,
         out=out,
         folded_sampling=folded_sampling,
+        record_top_prob=record_top_prob,
     )

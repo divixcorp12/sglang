@@ -3,7 +3,8 @@
 One JSON line per request per DSpark verify step, in step order: ``rid``, ``k`` (its verifies before this one, the
 ordinal verify_accept_log.py also writes, so the two join on ``(rid, k)``), and per draft position ``top_prob`` and
 ``second_prob`` (the draft's softmax top-1 and top-2 probability over its Markov-corrected step logits) and
-``argmax_agree`` (whether that top-1 is the drafted token), then ``num_correct_drafts``.
+``argmax_agree`` (whether that top-1 is the drafted token), then ``num_correct_drafts``, and ``gate_verify_len`` (rows
+the top-probability gate verified, anchor included) when SGLANG_DSPARK_TOP_PROB_GATE applied to the step.
 
 The folded greedy proposal keeps no logits, so they are recomputed eagerly from the draft's hidden states with the
 drafted tokens teacher-forced: one extra LM-head pass per verify. Diagnostics only: unset, nothing is opened,
@@ -65,17 +66,18 @@ class DraftTopProbLog:
         rids: list[str],
         probs: dict[str, torch.Tensor],
         num_correct_drafts: torch.Tensor,
+        gate_verify_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Stage this step's rows for an async copy; the previous step's rows are written first."""
         self._drain()
         if self._d2h_stream is None:
             self._d2h_stream = torch.cuda.Stream(device=num_correct_drafts.device)
+        tensors = {**probs, "num_correct_drafts": num_correct_drafts}
+        if gate_verify_lens is not None:
+            tensors["gate_verify_len"] = gate_verify_lens
         self._pending = (
             list(rids),
-            FutureTensors.device_to_host(
-                {**probs, "num_correct_drafts": num_correct_drafts},
-                d2h_stream=self._d2h_stream,
-            ),
+            FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream),
         )
 
     def write_rows(self, *, rids: list[str], host: dict[str, torch.Tensor]) -> None:
@@ -83,22 +85,21 @@ class DraftTopProbLog:
         second = host["second_prob"].tolist()
         agree = host["argmax_agree"].tolist()
         correct = host["num_correct_drafts"].tolist()
+        gate = host["gate_verify_len"].tolist() if "gate_verify_len" in host else None
         for row, rid in enumerate(rids):
             k = self._k[rid]
             self._k[rid] = k + 1
-            self._file.write(
-                json.dumps(
-                    {
-                        "rid": rid,
-                        "k": k,
-                        "top_prob": [round(p, 5) for p in top[row]],
-                        "second_prob": [round(p, 5) for p in second[row]],
-                        "argmax_agree": [bool(a) for a in agree[row]],
-                        "num_correct_drafts": int(correct[row]),
-                    }
-                )
-                + "\n"
-            )
+            entry = {
+                "rid": rid,
+                "k": k,
+                "top_prob": [round(p, 5) for p in top[row]],
+                "second_prob": [round(p, 5) for p in second[row]],
+                "argmax_agree": [bool(a) for a in agree[row]],
+                "num_correct_drafts": int(correct[row]),
+            }
+            if gate is not None:
+                entry["gate_verify_len"] = int(gate[row])
+            self._file.write(json.dumps(entry) + "\n")
 
     def _drain(self) -> None:
         if self._pending is None:
