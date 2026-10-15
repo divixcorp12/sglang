@@ -107,6 +107,9 @@ enum Counter : int {
   kDripAbandoned,
   kDripNoSlot,
   kDripPaused,
+  // ... the bytes an abandoned drip never copied, and scored picks dropped because their target had posted already.
+  kDripSkippedBytes,
+  kDripLate,
   kCounterCount,
 };
 
@@ -153,6 +156,8 @@ constexpr bool is_core_counter(int k) {
     case kDripAbandoned:
     case kDripNoSlot:
     case kDripPaused:
+    case kDripSkippedBytes:
+    case kDripLate:
       return true;
     default:
       return false;

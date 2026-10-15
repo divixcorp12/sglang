@@ -315,7 +315,9 @@ The lane takes no staging slot and is not eligible, so its node's split reads on
   (published or retiring) is the lane's row and expert (`GpuDrip::holds`), else a fail-stop. It counts `drip_used`.
   `HIT_SCRATCH` is device-copied like `HIT_SM`: nothing waits on the host for it, so such a record may lap.
 - **Counters.** `drip_issued` (first chunk), `drip_landed` (every chunk landed, source unchanged), `drip_used`,
-  `drip_abandoned`, `drip_no_slot`, `drip_paused`; InstrBuild events `drip_admit`, `drip_issue`, `drip_land`, `drip_abandon`, `drip_retire` (the copy
+  `drip_abandoned` (no further chunk is issued for it; only one in flight finishes), `drip_no_slot`, `drip_paused`,
+  `drip_skipped_bytes` (what abandoned drips never copied), `drip_late` (scored picks whose target had posted before
+  the copy thread read them: never issued); InstrBuild events `drip_admit`, `drip_issue`, `drip_land`, `drip_abandon`, `drip_retire` (the copy
   thread's `<layout>-drip` job trace) and `drip_use` (the service's).
 - **Outputs.** A scratch lane's destination bytes equal a copied lane's. A lane the drip moves off the CPU is computed
   on the GPU instead, so a step's sums can differ from the drip-off run's in the last bits, as any split change does.

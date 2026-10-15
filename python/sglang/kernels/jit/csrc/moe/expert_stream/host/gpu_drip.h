@@ -342,10 +342,16 @@ class GpuDrip {
     else if (slot.state == kPublishing) slot.target_posted = true;
   }
 
-  // Drops a filling slot: at once, or when its chunk in flight lands (poll_op), since the DMA still writes it.
+  // Drops a filling slot: no further chunk is issued for it (issue_chunk skips it), and it is freed at once, or when
+  // its chunk in flight lands (poll_op), since the DMA still writes it. Its word was never stored, so no post can have
+  // read it and no quarantine applies. Counts the bytes it will now never copy.
   void abandon(int s, [[maybe_unused]] int why) {
     Slot& slot = slots_[s];
     count<kDripAbandoned>();
+    int64_t left = -slot.offset;
+    for (size_t k = slot.entry; k < scratch_.size(); ++k)
+      left += scratch_[k].bytes;
+    count<kDripSkippedBytes>(left);
     if constexpr (Build::kMetrics) trace_.emit("drip_abandon", slot.row, 0, slot.source_seq, -1, why, s, slot.expert);
     if (op_slot_ == s) {
       slot.abandoned = true;
@@ -437,7 +443,11 @@ class GpuDrip {
     if (row < 0 || row >= rows_ || !scratch_ready_.load(std::memory_order_acquire) ||
         !sources_[row].ready.load(std::memory_order_acquire) || !owner_->copy_armed())
       return;
-    if (source_seq != 0 && last_posted_[row] != 0 && reached(last_posted_[row], source_seq)) return;
+    // scan() ran first this step, so a target record already posted is in last_posted_.
+    if (source_seq != 0 && last_posted_[row] != 0 && reached(last_posted_[row], source_seq)) {
+      count<kDripLate>();
+      return;
+    }
     int taken = 0;
     for (const int32_t expert : experts) {
       if (taken >= config_.picks) break;
@@ -509,7 +519,7 @@ class GpuDrip {
   bool issue_chunk(CopyBackend& backend) {
     int s = -1;
     for (int i = 0; i < config_.slots; ++i)
-      if (slots_[i].state == kFilling && (s < 0 || slots_[i].order < slots_[s].order)) s = i;
+      if (slots_[i].state == kFilling && !slots_[i].abandoned && (s < 0 || slots_[i].order < slots_[s].order)) s = i;
     if (s < 0) return false;
     Slot& slot = slots_[s];
     if (slot.entry == 0 && slot.offset == 0) {

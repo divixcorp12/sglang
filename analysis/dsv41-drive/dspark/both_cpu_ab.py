@@ -342,6 +342,8 @@ RAM_KEYS = (
     "drip_abandoned",
     "drip_no_slot",
     "drip_paused",
+    "drip_skipped_bytes",
+    "drip_late",
 )
 
 

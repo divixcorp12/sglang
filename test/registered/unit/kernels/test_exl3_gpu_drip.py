@@ -194,6 +194,28 @@ def test_the_drip_issues_nothing_while_a_records_device_pulls_may_still_run(tmp_
         rig.host.stop()
 
 
+def test_a_drip_whose_target_posts_mid_fill_copies_no_further_chunk(tmp_path):
+    """The target posts while the drip's first chunk is in flight: that chunk may finish, but no other chunk crosses
+    the link, the slot is freed (its word never stored), and drip_skipped_bytes counts the rest of the row. Mutation:
+    abandon() only marking the drip unusable while issue_chunk keeps copying it -- red on the mark count."""
+    rig = Rig(tmp_path)
+    try:
+        rig.load([3])
+        rig.host.drip_offer(ROW, [3])
+        assert _until(lambda: rig.host.copy_engine_marked() == 1)
+        rig.sim.post(ROW, [])
+        assert _until(lambda: rig.host.counters()["drip_abandoned"] == 1)
+        rig.host.copy_engine_release(-1)
+        assert _until(lambda: rig.state()["state"] == "free")
+        time.sleep(0.1)
+        row_bytes = sum(slab[0].numel() * slab.element_size() for slab in rig.slabs.values())
+        assert row_bytes > CHUNK and rig.host.copy_engine_marked() == 1
+        c = rig.host.counters()
+        assert (c["drip_skipped_bytes"], c["drip_landed"]) == (row_bytes - CHUNK, 0) and rig.word() == 0
+    finally:
+        rig.host.stop()
+
+
 def test_a_drip_whose_source_row_was_evicted_meanwhile_is_not_published(tmp_path):
     """The RAM row is released (unmapped, its slot free to rewrite) while the drip's chunks are in flight: the mirror
     generation moved, so the landed copy is dropped. Mutation: land() without source_unchanged -- red on the word."""
@@ -277,7 +299,9 @@ def test_the_scorers_picks_drip_for_the_target_row_unless_it_posted_first(tmp_pa
         assert rig.host.pump() == 1 and rig.host.pump() == 1
         _write_drips(page, late.seq, [4])
         time.sleep(0.1)
+        assert _until(lambda: rig.host.counters()["drip_late"] == 1)
         assert rig.host.counters()["drip_issued"] == 1, "a pick published after its target posted was dripped"
+        assert all(s["state"] == "free" or s["expert"] != 4 for s in rig.host.drip_slots())
     finally:
         rig.host.stop()
 

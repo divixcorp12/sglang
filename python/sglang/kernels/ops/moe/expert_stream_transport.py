@@ -1488,6 +1488,8 @@ COUNTERS = (
     "drip_abandoned",
     "drip_no_slot",
     "drip_paused",
+    "drip_skipped_bytes",
+    "drip_late",
 )
 
 # The counters a production host keeps: the shutdown line's served, rows and errors,
@@ -1536,6 +1538,8 @@ CORE_COUNTERS = (
     "drip_abandoned",
     "drip_no_slot",
     "drip_paused",
+    "drip_skipped_bytes",
+    "drip_late",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
