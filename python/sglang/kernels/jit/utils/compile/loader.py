@@ -39,6 +39,14 @@ logger = logging.getLogger(__name__)
 _LOCK_FILE = ".lock"
 
 
+class JitCompileForbidden(RuntimeError):
+    """A module missed the cache while ``SGLANG_CRASH_ON_JIT_COMPILE`` was set.
+
+    Its own type so a caller probing the cache (``warm.load_in_parallel``) can
+    tell a miss from a module that is broken.
+    """
+
+
 # JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
 # `os.lstat`, etc.) that Dynamo cannot trace. When a lazily-loaded kernel is
 # first reached from inside a `@torch.compile`d region, tracing into it produces
@@ -137,7 +145,7 @@ def load_jit(
     # Before the lock: with the flag set no process ever publishes a build,
     # so waiting on the lock cannot turn this miss into a hit.
     if envs.SGLANG_CRASH_ON_JIT_COMPILE.get():
-        raise RuntimeError(
+        raise JitCompileForbidden(
             f"JIT module '{spec.module_name}' has no usable cached build under "
             f"{scope}, and SGLANG_CRASH_ON_JIT_COMPILE forbids compiling at "
             "runtime. Seed the cache with prebuilt artifacts matching this "
