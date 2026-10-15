@@ -258,7 +258,7 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
-    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline_.load(std::memory_order_relaxed))) break;": 1,
+    "((in_flight.empty() && !drip_busy) || now_ns() > drain_deadline_.load(std::memory_order_relaxed)))": 1,
     # seqlock_stress, test only (refused on ProdBuild): its run's deadline, on the caller's thread.
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
