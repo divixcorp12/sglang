@@ -1383,6 +1383,12 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Byte cap (MiB) on the fp32 temporaries of the triton backend's LSE merge and
+    # attention-sink scaling, which peak at 3 fp32 copies of the [tokens, heads,
+    # head_dim_v] output (1.5 GiB at a 4096-token prefill chunk). Tokens are merged
+    # independently, so chunking them under the cap gives bitwise the same output.
+    # 0 keeps the one-pass merge.
+    SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB = EnvInt(0)
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
