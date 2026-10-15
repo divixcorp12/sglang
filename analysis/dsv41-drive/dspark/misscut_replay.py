@@ -75,6 +75,8 @@ class Group:
     misses: list  # [(submit, dur)] of the miss jobs, ms, in sequence order
     free: float  # the team's first start for this record
     cpu_end: float  # measured
+    hit_live: int = 0  # the hit job's live (token, expert) pairs (cpu_shape c)
+    miss_live: list = dataclasses.field(default_factory=list)  # each miss job's
 
 
 def split_take(split, n: int) -> int:
@@ -210,15 +212,20 @@ def _verifies(d: str) -> list:
     return list(zip(begins, ends))
 
 
-def load(d: str, split) -> tuple[list, dict]:
-    """Records (dicts with row, verify, wait, gate, groups) and the fitted costs."""
-    ev = _events(d)
+def load(d: str, split, ev: dict | None = None) -> tuple[list, dict]:
+    """Records (dicts with row, verify, wait, gate, groups, lane_list) and the fitted costs. ``ev``: the capture's
+    events, when the caller has loaded them already."""
+    ev = _events(d) if ev is None else ev
     jobs = {}
     for kind in ("cpu_submit", "cpu_start", "cpu_end"):
         for e in ev[kind]:
             j = jobs.setdefault((e["team"], e["seq"]), {"part": e["a"], "k": e["b"]})
             j[kind] = e["ns"] / MS
-    recs = collections.defaultdict(lambda: {"g": collections.defaultdict(dict), "lanes": collections.defaultdict(list)})
+    for e in ev["cpu_shape"]:  # c = the job's live (token, expert) pairs
+        if (e["team"], e["seq"]) in jobs:
+            jobs[(e["team"], e["seq"])]["live"] = e["c"]
+    recs = collections.defaultdict(lambda: {"g": collections.defaultdict(dict), "lanes": collections.defaultdict(list),
+                                            "lane_list": collections.defaultdict(list)})
     for e in ev["copy_submit"]:
         recs[(e["row"], e["gen"])]["g"][e["group"]].update(first=e["seq"], last=e["a"], m=e["b"], mask=e["c"])
     for e in ev["copy_issue"]:
@@ -235,6 +242,7 @@ def load(d: str, split) -> tuple[list, dict]:
         r["start"] = min(r.get("start", float("inf")), (e["ns"] - e["a"]) / MS)
     for e in ev["lane_kind"]:
         recs[(e["row"], e["gen"])]["lanes"][e["group"]].append(e["b"])
+        recs[(e["row"], e["gen"])]["lane_list"][e["group"]].append((e["a"], e["b"], e["c"]))
     has_kinds = bool(ev["lane_kind"])
 
     # Per-lane costs (ms): CPU hit lanes per team from the hit jobs' lengths, misses from k=1 jobs, DMA from the
@@ -267,7 +275,9 @@ def load(d: str, split) -> tuple[list, dict]:
             own = [jobs.get((gi, q)) for q in range(g["first"], g["last"] + 1)]
             own = [j for j in own if j and {"cpu_submit", "cpu_start", "cpu_end"} <= j.keys()]
             hit = next(((j["cpu_start"], j["cpu_end"] - j["cpu_start"]) for j in own if j["part"] == 0), None)
+            hit_live = next((j.get("live", j["k"]) for j in own if j["part"] == 0), 0)
             misses = [(j["cpu_submit"], j["cpu_end"] - j["cpu_start"]) for j in own if j["part"] == 1]
+            miss_live = [j.get("live", j["k"]) for j in own if j["part"] == 1]
             hits = bin(g["mask"]).count("1")
             if has_kinds:
                 kinds = r["lanes"][gi]
@@ -279,10 +289,12 @@ def load(d: str, split) -> tuple[list, dict]:
                 m=g["m"], hits=hits, dma=g["dma"], forced_hits=forced, take=take, cut=flat_cut(g["m"], take),
                 issue=g["issue"], dma_end=g.get("dma_end", g["issue"]), hit=hit, misses=misses,
                 free=min((j["cpu_start"] for j in own), default=g["issue"]),
-                cpu_end=max((j["cpu_end"] for j in own), default=float("-inf")))
+                cpu_end=max((j["cpu_end"] for j in own), default=float("-inf")), hit_live=hit_live,
+                miss_live=miss_live)
         if ok:
             out.append({"row": row, "gen": gen, "seq": r["seq"], "start": r.get("start", r["gate"]), "gate": r["gate"],
-                        "groups": groups, "kinds": dict(r["lanes"]) if has_kinds else None})
+                        "groups": groups, "kinds": dict(r["lanes"]) if has_kinds else None,
+                        "lane_list": dict(r["lane_list"]) if has_kinds else None})
     return out, {"cpu_lane": cpu_lane, "miss_lane": miss_lane, "copy_lane": copy_lane, "has_kinds": has_kinds}
 
 
@@ -301,6 +313,7 @@ def attach(d: str, recs: list, skip: int) -> list:
         r["wait_start"] = s["wait_start"] / MS
         r["wait_end"] = s["wait_end"] / MS if s["wait_end"] else r["wait_start"]
         r["wait"] = r["wait_end"] - r["wait_start"]
+        r["stream"] = (s["stream_end"] - s["stream_start"]) / MS if s["stream_end"] and s["stream_start"] else 0.0
         out.append(r)
     return out
 
@@ -396,9 +409,10 @@ def policy_cuts(r: dict, policy: str, rule: Rule, costs: dict) -> dict:
     return cuts
 
 
-def oracle_cuts(r: dict, copy_lane: float, cpu_lane: dict, mode: str = "oracle", cap: int = 3) -> dict:
+def oracle_cuts(r: dict, copy_lane: float, cpu_lane: dict, mode: str = "oracle", cap: int = 3, score=None) -> dict:
     """The record's best cut pair on the measured landings. ``oracle`` varies every node (split tuning included);
-    ``oracle-miss`` only nodes with 1..cap misses; ``oracle-miss-up`` those, never below the flat cut."""
+    ``oracle-miss`` only nodes with 1..cap misses; ``oracle-miss-up`` those, never below the flat cut. ``score``
+    (cuts -> value, lower is better) replaces the replayed gate."""
     gs = sorted(r["groups"].items())
 
     def choices(g):
@@ -411,13 +425,41 @@ def oracle_cuts(r: dict, copy_lane: float, cpu_lane: dict, mode: str = "oracle",
     best, best_gate = None, None
     for combo in itertools.product(*[choices(g) for _, g in gs]):
         cuts = {gi: c for (gi, _), c in zip(gs, combo)}
-        gate = replay_record(r["groups"], cuts, copy_lane, cpu_lane)
+        gate = replay_record(r["groups"], cuts, copy_lane, cpu_lane) if score is None else score(cuts)
         if best_gate is None or gate < best_gate - 1e-9:
             best, best_gate = cuts, gate
     return best
 
 
-def evaluate(recs: list, policy: str, rule: Rule, costs: dict, delta: dict, copy_lane: float | None = None) -> dict:
+STREAM_COUPLED_MS = 0.05
+# Off by default: replaying split B on split A's capture (split-ab-20261014 A2, and A on B1) at coupling 0 puts B
+# 2-4 ms/verify behind A, near the served pair (verify median +2.6, wall -1.4); 0.5 matches the measured stream
+# growth but puts B 7-8 ms behind.
+STREAM_COUPLING = 0.0
+
+
+def layer_effect(r: dict, end: float, shift: float, dlanes: int, copy_lane: float, coupling: float = 1.0):
+    """(saving, arrival shift, gate-wait change) of a layer whose host gate moves by `shift` while the copy FIFO
+    gains `dlanes` lanes. `end` is the baseline gate as the GPU sees it. The GPU reaches the gate after its stream
+    kernel (S), which runs only when the record has GPU NVMe misses and whose pulls share the link with the copy FIFO,
+    so with S running its arrival moves by coupling * copy_lane per added lane, never earlier than S's start
+    (STREAM_COUPLING has the calibration)."""
+    arrive = r["wait_start"]
+    if coupling and r.get("stream", 0.0) > STREAM_COUPLED_MS:
+        arrive_cf = arrive + max(-r["stream"], coupling * copy_lane * dlanes)
+    else:
+        arrive_cf = arrive
+    wait = max(0.0, end - arrive)
+    wait_cf = max(0.0, end + shift - arrive_cf)
+    return max(arrive, end) - max(arrive_cf, end + shift), arrive_cf - arrive, wait_cf - wait
+
+
+def layer_saving(r: dict, end: float, shift: float, dlanes: int, copy_lane: float, coupling: float = 1.0) -> float:
+    return layer_effect(r, end, shift, dlanes, copy_lane, coupling)[0]
+
+
+def evaluate(recs: list, policy: str, rule: Rule, costs: dict, delta: dict, copy_lane: float | None = None,
+             coupled: float = STREAM_COUPLING) -> dict:
     """Per-record saving (ms of GPU gate wait) of `policy` against the captured flat cut. delta: per verify, the
     measured wait end less the host's gate_open."""
     copy_lane = rule.copy_lane if copy_lane is None else copy_lane
@@ -428,13 +470,19 @@ def evaluate(recs: list, policy: str, rule: Rule, costs: dict, delta: dict, copy
     moved = collections.Counter()
     for r in recs:
         base = replay_record(r["groups"], {gi: g.cut for gi, g in r["groups"].items()}, copy_lane, cpu_lane)
+        end = r["wait_end"] if r["wait"] > WAIT_NS / MS else r["gate"] + delta[r["verify"]]
+
+        def save(cuts, r=r, base=base, end=end):
+            shift = replay_record(r["groups"], cuts, copy_lane, cpu_lane) - base
+            dlanes = sum(cuts[gi] - g.cut for gi, g in r["groups"].items())
+            return layer_saving(r, end, shift, dlanes, copy_lane, coupled)
+
         if policy.startswith("oracle"):
-            cuts = oracle_cuts(r, copy_lane, cpu_lane, policy, rule.cap)
+            cuts = oracle_cuts(r, copy_lane, cpu_lane, policy, rule.cap,
+                               score=lambda c: -save(c) + 1e-4 * sum(c.values()))
         else:
             cuts = policy_cuts(r, policy, rule, costs)
-        shift = replay_record(r["groups"], cuts, copy_lane, cpu_lane) - base
-        end = r["wait_end"] if r["wait"] > WAIT_NS / MS else r["gate"] + delta[r["verify"]]
-        saving = max(0.0, end - r["wait_start"]) - max(0.0, end + shift - r["wait_start"])
+        saving = save(cuts)
         per_v[r["verify"]] += saving
         by_rows[_row_group(r["row"])] += saving
         crit = max(r["groups"].values(), key=lambda g: max(g.cpu_end, g.dma_end))
@@ -484,9 +532,12 @@ def main() -> int:
     p.add_argument("--split", default="0,1,2,2,3,3,4,5,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17,17,18,19,19,"
                    "20,21,21,22,23,23,24,24,25,26,26", help="SGLANG_DSV41_CPU_EXPERTS_SPLIT of the capture")
     p.add_argument("--infer-forced", action="store_true", help="infer forced CPU hits even when lane_kind is traced")
+    p.add_argument("--stream-coupling", type=float, default=STREAM_COUPLING,
+                   help="the GPU stream kernel's delay per added copy lane, in copy lanes (layer_effect); 0: none")
     p.add_argument("--json")
     a = p.parse_args()
     split = [int(x) for x in a.split.split(",")]
+    coupled = a.stream_coupling
     recs, costs = load(a.capture, split)
     recs = attach(a.capture, recs, a.skip)
     if not recs:
@@ -507,6 +558,7 @@ def main() -> int:
     walls = [(e - b) / MS for b, e in _verifies(a.capture)[a.skip:]]
     res = {"capture": os.path.abspath(a.capture), "verifies": nv, "records": len(recs),
            "verify_wall_ms_mean": round(statistics.mean(walls), 1), "tokens_per_verify": tpv, "costs_ms": costs, "infer_forced": a.infer_forced,
+           "stream_coupling": coupled,
            "gate_to_wait_end_ms": _dist(list(delta.values())),
            "accounting": accounting, "fidelity": fidelity(recs, costs, delta),
            "rule": dataclasses.asdict(rule0)}
@@ -516,7 +568,7 @@ def main() -> int:
     policies = []
     for pol in ("none", "flat", "flat2", "flat3", "first", "first+", "graded-nocopy", "graded", "graded+",
                 "oracle-miss-up", "oracle-miss", "oracle"):
-        e = evaluate(recs, pol, rule0, costs, delta)
+        e = evaluate(recs, pol, rule0, costs, delta, coupled=coupled)
         e["ms_per_token"] = round(e["ms_per_verify"] / tpv, 3)
         policies.append(e)
     res["policies"] = policies
@@ -527,9 +579,9 @@ def main() -> int:
         rule = dataclasses.replace(rule0, first_byte=fb, per_expert=pe, copy_lane=cl, cap=cap)
         row = {"first_byte": fb, "per_expert": pe, "copy_lane": round(cl, 3), "cap": cap}
         for pol in SWEPT:
-            row[pol] = evaluate(recs, pol, rule, costs, delta)["ms_per_verify"]
+            row[pol] = evaluate(recs, pol, rule, costs, delta, coupled=coupled)["ms_per_verify"]
         if fb == 1.1 and pe == 2.3:
-            row["oracle-miss"] = evaluate(recs, "oracle-miss", rule, costs, delta)["ms_per_verify"]
+            row["oracle-miss"] = evaluate(recs, "oracle-miss", rule, costs, delta, coupled=coupled)["ms_per_verify"]
         sweep.append(row)
     res["sweep"] = sweep
     report(res)
