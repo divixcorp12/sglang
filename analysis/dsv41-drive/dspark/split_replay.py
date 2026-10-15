@@ -159,6 +159,23 @@ def rule_greedy(nodes: list, costs: dict, p: Params, scale: float, tokens: bool,
     return sets
 
 
+def residency_tiebreak(nodes: list, sets: list) -> list:
+    """The split-model branch's residency tiebreak: per node and token count, keep how many lanes the CPU takes and
+    give it the highest plan indexes (lowest residency keys), the copy engine the rest."""
+    out = []
+    for n, s in zip(nodes, sets):
+        groups: dict = {}
+        for lane, tok in n.elig:
+            groups.setdefault(tok, []).append(lane)
+        new = {}
+        for tok, lanes in groups.items():
+            k = sum(1 for lane in lanes if lane in s)
+            for lane in sorted(lanes, reverse=True)[:k]:
+                new[lane] = tok
+        out.append(new)
+    return out
+
+
 def physics(r: dict, nodes: list, sets: list, costs: dict, copy_lane: float, scale: float) -> float:
     """The replayed gate (ms) when node i's CPU takes eligible lanes sets[i]: the measured hit job plus the fitted cost
     of its change, every CPU job scaled by `scale`, the copy FIFO at `copy_lane` per lane."""
@@ -284,6 +301,8 @@ def evaluate(recs: list, nodes_by: dict, rule: str, costs: dict, phys: dict, p: 
             sets = rule_greedy(nodes, costs, p, scale, tokens)
         elif rule == "greedy-stream":
             sets = rule_greedy(nodes, costs, p, scale, tokens, streamed=r["gpu_miss"])
+        elif rule == "greedy-stream-tb":
+            sets = residency_tiebreak(nodes, rule_greedy(nodes, costs, p, scale, tokens, streamed=r["gpu_miss"]))
         else:
             raise ValueError(rule)
         saving, d_arrive, d_wait = effect(sets)
