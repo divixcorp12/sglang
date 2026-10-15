@@ -71,7 +71,41 @@ def load(d: str, skip: int):
     if header is None or not recs:
         raise ValueError(f"{d}: no schema-2 graph_routes with hot sets")
     attach_acceptance(d, recs)
+    attach_router(d, recs, header)
     return header, recs[skip:]
+
+
+def attach_router(d: str, recs: list, header: dict) -> None:
+    """Join the router capture (``router.{json,ids.bin,w.bin}``: every graph forward's top-k ids and gate weights per
+    token and layer) by the route record's ``router`` index: ``r["gate_w"][layer]`` maps expert -> its largest gate
+    weight over the forward's tokens."""
+    meta_path = os.path.join(d, "router.json")
+    if not os.path.exists(meta_path):
+        for r in recs:
+            r["gate_w"] = None
+        return
+    import numpy as np
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+    layers, tokens, topk = len(meta["layer_ids"]), int(meta["tokens"]), int(meta["topk"])
+    ids = np.fromfile(os.path.join(d, "router.ids.bin"), dtype=np.int32).reshape(-1, layers, tokens, topk)
+    w = np.fromfile(os.path.join(d, "router.w.bin"), dtype=np.float32).reshape(-1, layers, tokens, topk)
+    for r in recs:
+        i = r.get("router")
+        if i is None or i >= ids.shape[0]:
+            r["gate_w"] = None
+            continue
+        live = int(r.get("forward_tokens") or tokens)
+        per_layer = []
+        for L in range(layers):
+            best = {}
+            for tok in range(min(live, tokens)):
+                for e, wt in zip(ids[i, L, tok].tolist(), w[i, L, tok].tolist()):
+                    if e >= 0 and wt > best.get(e, -1.0):
+                        best[e] = wt
+            per_layer.append(best)
+        r["gate_w"] = per_layer
 
 
 def attach_acceptance(d: str, recs: list) -> None:
@@ -113,13 +147,23 @@ class LayerTrace:
         self.reported_misses = []
         self.has_accept = all(r.get("accepted") is not None for r in recs)
         self.has_conf = all(r.get("conf") for r in recs)
+        self.first_pos = []  # expert -> earliest token position routing it
+        self.pos_acc = []  # expert -> P(every draft up to that position is accepted), from the draft's top_prob
+        self.train = [bool(r.get("train", True)) for r in recs]
+        self.gate_w = [(r.get("gate_w") or [None] * (layer + 1))[layer] for r in recs]
+        self.has_gate_w = all(g is not None for g in self.gate_w)
         for r in recs:
             flat = r["routes"][layer]
             ntok = int(r.get("forward_tokens") or 1)
             topk = len(flat) // ntok if ntok else len(flat)
             cnt, acc, conf = collections.Counter(), collections.Counter(), collections.Counter()
+            fpos, pacc = {}, {}
             accepted = r.get("accepted")
             probs = r.get("conf")
+            cum = [1.0]
+            if probs is not None:
+                for p in probs:
+                    cum.append(cum[-1] * p)
             for i, e in enumerate(flat):
                 if e < 0:
                     continue
@@ -129,9 +173,14 @@ class LayerTrace:
                     acc[e] += 1
                 if probs is not None:
                     conf[e] += 1.0 if tok == 0 else (probs[tok - 1] if tok - 1 < len(probs) else 0.0)
+                if e not in fpos or tok < fpos[e]:
+                    fpos[e] = tok
+                    pacc[e] = cum[min(tok, len(cum) - 1)]
             self.counts.append(cnt)
             self.acc_counts.append(acc)
             self.conf_counts.append(conf)
+            self.first_pos.append(fpos)
+            self.pos_acc.append(pacc)
             self.hot.append(frozenset(r["hot"][layer]))
             self.tokens.append(ntok)
             self.reported_misses.append(int(r["misses"][layer]))
@@ -147,6 +196,46 @@ class LayerTrace:
         for t in range(self.n):
             for e in self.counts[t]:
                 self.occurrences[e].append(t)
+
+    # ---- gather-time features and the table predictor -------------------------------------------------------------
+
+    @staticmethod
+    def score_bucket(s: float) -> int:
+        return 0 if s <= 0 else 1 if s < 1 else 2 if s < 3 else 3 if s < 8 else 4
+
+    def miss_features(self, t: int, e: int, score: float) -> tuple:
+        """What the gather knows about a miss: its token count, earliest position, that position's acceptance odds
+        (draft confidence, 1.0 for the bonus token or without confidence), and its prior insert score."""
+        pa = self.pos_acc[t].get(e, 1.0) if self.has_conf else 1.0
+        gw = self.gate_w[t].get(e, 0.0) if self.has_gate_w else 0.0
+        return (min(self.counts[t][e], 3), min(self.first_pos[t].get(e, 0), 3),
+                0 if pa < 0.2 else 1 if pa < 0.5 else 2 if pa < 0.8 else 3, self.score_bucket(score),
+                0 if gw < 0.1 else 1 if gw < 0.2 else 2 if gw < 0.3 else 3)
+
+    @staticmethod
+    def resident_features(score: float, age: int) -> tuple:
+        """What the boundary knows about an unrouted resident: its score and verifies since it was last routed."""
+        return (LayerTrace.score_bucket(score), 1 if age <= 1 else 2 if age <= 2 else 3 if age <= 4 else 4 if age <= 8 else 5)
+
+    def feature_pass(self, decay: float = 0.98):
+        """Yield per forward the (features, recurs next verify) pairs of its misses against the capture's own hot
+        set, and of its unrouted residents, with the decayed score and last-use ages the live policy would hold."""
+        score = collections.defaultdict(float)
+        last_used = {}
+        for t in range(self.n):
+            cnt = self.counts[t]
+            u = set(cnt)
+            hot = self.hot[t]
+            nxt = set(self.counts[t + 1]) if t + 1 < self.n else set()
+            misses = [(e, self.miss_features(t, e, score[e]), e in nxt) for e in u - hot]
+            residents = [(r, self.resident_features(score[r], t - last_used.get(r, -99)), r in nxt) for r in hot - u]
+            yield t, misses, residents
+            d = decay ** self.tokens[t]
+            for e in list(score):
+                score[e] *= d
+            for e, c in cnt.items():
+                score[e] += c
+                last_used[e] = t
 
     def _next_after(self, e: int, t: int) -> int:
         """The first forward after t that routes e, INF when none."""
@@ -245,7 +334,7 @@ class LayerTrace:
 
     def simulate(self, policy: str, capacity: int, *, decay: float = 0.98, margin: float = 0.0, budget: int = 0,
                  actual_k: bool = False, order: str = "score", bypass: str = "none", score_mode: str = "all",
-                 seed: int = 1) -> dict:
+                 seed: int = 1, tables: dict | None = None, victim_by: str = "score") -> dict:
         resident = set()
         score = collections.defaultdict(float)
         last_used = {}
@@ -264,6 +353,14 @@ class LayerTrace:
             out["pairs_hit"] += sum(cnt[e] for e in hits)
             out["pairs"] += sum(cnt.values())
             out["unique"] += len(u)
+            if not self.train[t]:
+                out["hits_test"] += len(hits)
+                out["unique_test"] += len(u)
+            # the table predictor reads the score before this forward's counts are folded in, as the gather would
+            if tables is not None and (order == "table" or victim_by == "table"):
+                p_miss = {e: tables["miss"].get(self.miss_features(t, e, score[e]), tables["miss_rate"]) for e in misses}
+                p_res = {r: tables["res"].get(self.resident_features(score[r], t - last_used.get(r, -99)),
+                                              tables["res_rate"]) for r in resident if r not in u}
             for e in hits:
                 insert_t.pop(e, None)
             if policy.startswith("belady"):
@@ -343,6 +440,8 @@ class LayerTrace:
             elif order == "random":
                 plan = sorted(misses)
                 rng.shuffle(plan)
+            elif order == "table":
+                plan = sorted(misses, key=lambda e: (-p_miss[e], -score[e], e))
             else:
                 raise ValueError(order)
             k = len(plan)
@@ -367,6 +466,8 @@ class LayerTrace:
                     victim = min(cands, key=lambda r: last_used.get(r, -1))
                 elif policy == "lfu":
                     victim = min(cands, key=lambda r: (freq[r], last_used.get(r, -1)))
+                elif victim_by == "table":
+                    victim = min(cands, key=lambda r: (p_res[r], score[r], -r))
                 else:
                     victim = min(cands, key=lambda r: (r in routed_prev, score[r], -r))
                     if margin and score[e] <= score[victim] + margin:
@@ -381,6 +482,79 @@ class LayerTrace:
             routed_prev = u
         out["wasted_inserts"] = wasted
         return dict(out)
+
+
+def fit_tables(traces: list, decay: float) -> dict:
+    """P(recurs next verify | features) for misses and unrouted residents, counted on the training forwards with
+    one pseudo-count at the global rate."""
+    miss_n, miss_y = collections.Counter(), collections.Counter()
+    res_n, res_y = collections.Counter(), collections.Counter()
+    for tr in traces:
+        for t, misses, residents in tr.feature_pass(decay):
+            if not tr.train[t] or t + 1 >= tr.n:
+                continue
+            for _, f, y in misses:
+                miss_n[f] += 1
+                miss_y[f] += y
+            for _, f, y in residents:
+                res_n[f] += 1
+                res_y[f] += y
+    miss_rate = sum(miss_y.values()) / max(1, sum(miss_n.values()))
+    res_rate = sum(res_y.values()) / max(1, sum(res_n.values()))
+    return {
+        "miss": {f: (miss_y[f] + miss_rate) / (miss_n[f] + 1) for f in miss_n},
+        "res": {f: (res_y[f] + res_rate) / (res_n[f] + 1) for f in res_n},
+        "miss_rate": miss_rate, "res_rate": res_rate,
+        "miss_cells": {str(f): (miss_n[f], round(miss_y[f] / miss_n[f], 3)) for f in sorted(miss_n)},
+        "res_cells": {str(f): (res_n[f], round(res_y[f] / res_n[f], 3)) for f in sorted(res_n)},
+    }
+
+
+def predictor_report(traces: list, tables: dict, decay: float) -> dict:
+    """On the test forwards, against the capture's own hot sets: of the k misses each key ranks first (k = the
+    lanes the capture inserted), the share routed next verify (precision) and their share of all recurring misses
+    (recall); of the k unrouted residents each key would evict first, the share not routed next verify. ``actual``
+    is what the capture inserted and evicted; ``oracle`` knows the next verify."""
+    keys = ("actual", "score", "score+cur", "table", "oracle")
+    agg = {k: collections.Counter() for k in keys}
+    for tr in traces:
+        score = collections.defaultdict(float)
+        for t, misses, residents in tr.feature_pass(decay):
+            if t + 1 >= tr.n:
+                break
+            if not tr.train[t]:
+                nxt_hot = tr.hot[t + 1]
+                recur = {e for e, _, y in misses if y}
+                inserted = {e for e, _, _ in misses if e in nxt_hot}
+                k = len(inserted)
+                evicted = tr.hot[t] - nxt_hot
+                kv = len(evicted)
+                rank = {
+                    "actual": (inserted, evicted),
+                    "score": ([e for e, _, _ in sorted(misses, key=lambda m: (-score[m[0]], m[0]))][:k],
+                              [r for r, _, _ in sorted(residents, key=lambda m: (score[m[0]], -m[0]))][:kv]),
+                    "score+cur": ([e for e, _, _ in sorted(misses, key=lambda m: (-(score[m[0]] + tr.counts[t][m[0]]), m[0]))][:k],
+                                  [r for r, _, _ in sorted(residents, key=lambda m: (score[m[0]], -m[0]))][:kv]),
+                    "table": ([e for e, _, _ in sorted(misses, key=lambda m: (-tables["miss"].get(m[1], tables["miss_rate"]), -score[m[0]], m[0]))][:k],
+                              [r for r, _, _ in sorted(residents, key=lambda m: (tables["res"].get(m[1], tables["res_rate"]), score[m[0]], -m[0]))][:kv]),
+                    "oracle": ([e for e, _, y in sorted(misses, key=lambda m: (not m[2], m[0]))][:k],
+                               [r for r, _, y in sorted(residents, key=lambda m: (m[2], m[0]))][:kv]),
+                }
+                for key, (ins, ev) in rank.items():
+                    a = agg[key]
+                    a["k"] += k
+                    a["tp"] += sum(1 for e in ins if e in recur)
+                    a["recur"] += len(recur)
+                    a["kv"] += kv
+                    a["good_evict"] += sum(1 for r in ev if r not in set(tr.counts[t + 1]))
+            d = decay ** tr.tokens[t]
+            for e in list(score):
+                score[e] *= d
+            for e, c in tr.counts[t].items():
+                score[e] += c
+    return {key: {"precision": a["tp"] / max(1, a["k"]), "recall": a["tp"] / max(1, a["recur"]),
+                  "evict_precision": a["good_evict"] / max(1, a["kv"]), "k_per_forward": a["k"]}
+            for key, a in agg.items()}
 
 
 def quantiles(xs, qs=(0.5, 0.75, 0.9)):
@@ -425,6 +599,10 @@ POLICIES = [
     ("score-budget-6", "score", dict(budget=6, order="cur")),
     ("lru", "lru", {}),
     ("lfu", "lfu", {}),
+    ("table-k", "score", dict(actual_k=True, order="table", victim_by="table")),
+    ("table-lanes-k", "score", dict(actual_k=True, order="table", victim_by="score")),
+    ("table-victims-k", "score", dict(actual_k=True, order="cur", victim_by="table")),
+    ("table-k-d0.995", "score", dict(actual_k=True, order="table", victim_by="table", decay=0.995)),
     ("next1", "next1", {}),
     ("next1-k", "next1", dict(actual_k=True)),
     ("belady", "belady", {}),
@@ -448,8 +626,15 @@ def main() -> int:
     header, recs = load(args.capture, args.skip)
     layers = list(range(len(header["layer_ids"])))
     cap_hdr = header["hot_capacity"]
+    # whole-request split: every other request (by first appearance) trains the tables, the rest test them
+    order_of = {}
+    for r in recs:
+        rid = (r.get("rids") or ["?"])[0]
+        order_of.setdefault(rid, len(order_of))
+        r["train"] = order_of[rid] % 2 == 0
     traces = [LayerTrace(L, recs) for L in layers]
     nv = len(recs)
+    tables = fit_tables(traces, args.decay)
     res = {"capture": os.path.abspath(args.capture), "verifies": nv, "skipped": args.skip,
            "hot_capacity": cap_hdr, "slots": sum(cap_hdr), "tokens_per_verify": statistics.mean(traces[0].tokens),
            "accept_joined": sum(1 for r in recs if r.get("accepted") is not None),
@@ -501,19 +686,28 @@ def main() -> int:
         "lru_hit_rate_at": {str(c): sum(d < c for d in fin_sd) / n for c in (8, 16, 22, 24, 32, 48, 64, 96, 128, 192)},
     }
 
+    res["split"] = {"requests": len(order_of), "train_forwards": sum(1 for r in recs if r["train"]),
+                    "test_forwards": sum(1 for r in recs if not r["train"])}
+    res["tables"] = {"miss_rate": tables["miss_rate"], "res_rate": tables["res_rate"],
+                     "miss_cells": tables["miss_cells"], "res_cells": tables["res_cells"]}
+    res["predictors"] = predictor_report(traces, tables, args.decay)
+
     res["policies"] = {}
     base_hits = res["actual"]["hits_per_verify"]
     base_ins = res["actual"]["inserted_per_verify"]
+    n_test = res["split"]["test_forwards"]
     for name, pol, kw in POLICIES:
         tot = collections.Counter()
         rows = []
         for tr in traces:
-            s = tr.simulate(pol, cap_hdr[tr.layer], **({"decay": args.decay} | kw))
+            s = tr.simulate(pol, cap_hdr[tr.layer], tables=tables, **({"decay": args.decay} | kw))
             tot.update(s)
             rows.append(round(s["hits"] / max(1, s["unique"]), 3))
         hp = tot["hits"] / nv
         res["policies"][name] = {
             "hit_rate": tot["hits"] / tot["unique"], "hits_per_verify": hp,
+            "test_hit_rate": tot["hits_test"] / max(1, tot["unique_test"]),
+            "test_hits_per_verify": tot["hits_test"] / max(1, n_test),
             "pair_hit_rate": tot["pairs_hit"] / tot["pairs"], "inserts_per_verify": tot["inserts"] / nv,
             "wasted_insert_share": tot["wasted_inserts"] / max(1, tot["inserts"]),
             "d_hits_vs_actual": hp - base_hits, "d_inserts_vs_actual": tot["inserts"] / nv - base_ins,
@@ -597,11 +791,28 @@ def report(res: dict) -> None:
     print(f"reuse: {r['accesses']} accesses, first touch {r['first_touch_share']:.3f}, verify distance "
           f"q={r['verify_distance_quantiles']}, stack distance q={r['stack_distance_quantiles']}")
     print("  LRU hit rate at capacity: " + ", ".join(f"{k}:{v:.3f}" for k, v in r["lru_hit_rate_at"].items()))
-    print("policies at the live capacity (d = vs actual; ms traced at --ms-per-hit):")
+    sp = res["split"]
+    print(f"split: {sp['requests']} requests, {sp['train_forwards']} train / {sp['test_forwards']} test forwards; "
+          f"table rates miss {res['tables']['miss_rate']:.3f} resident {res['tables']['res_rate']:.3f}")
+    print("miss table (tokens, first position, P(accepted to there) bucket, score bucket, gate weight bucket) -> n, "
+          "P(recurs next verify):")
+    cells = res["tables"]["miss_cells"]
+    big = sorted(cells.items(), key=lambda kv: -kv[1][0])[:16]
+    for f, (n, p) in big:
+        print(f"  {f:16s} n={n:7d} p={p:.3f}")
+    print("resident table (score bucket, age bucket) -> n, P(routed next verify):")
+    for f, (n, p) in sorted(res["tables"]["res_cells"].items(), key=lambda kv: -kv[1][0])[:12]:
+        print(f"  {f:16s} n={n:7d} p={p:.3f}")
+    print("predictors on test forwards at k = the capture's inserts (misses: precision/recall of recurring next verify;"
+          " residents: share of the k evicted-first that are not routed next verify):")
+    for key, p in res["predictors"].items():
+        print(f"  {key:10s} precision {p['precision']:.3f} recall {p['recall']:.3f} evict_precision {p['evict_precision']:.3f}")
+    print("policies at the live capacity (d = vs actual; ms traced at --ms-per-hit; test = held-out requests only):")
     for name, p in res["policies"].items():
         print(f"  {name:26s} hit {p['hit_rate']:.3f} ({p['hits_per_verify']:6.1f}/verify, d{p['d_hits_vs_actual']:+6.1f} = "
-              f"{p['ms_per_verify_vs_actual']:+5.1f} ms/verify) pairs {p['pair_hit_rate']:.3f} inserts "
-              f"{p['inserts_per_verify']:6.1f}/verify (d{p['d_inserts_vs_actual']:+6.1f}) wasted {p['wasted_insert_share']:.3f}")
+              f"{p['ms_per_verify_vs_actual']:+5.1f} ms/verify) test {p['test_hit_rate']:.3f} ({p['test_hits_per_verify']:6.1f}) "
+              f"pairs {p['pair_hit_rate']:.3f} inserts {p['inserts_per_verify']:6.1f}/verify (d{p['d_inserts_vs_actual']:+6.1f}) "
+              f"wasted {p['wasted_insert_share']:.3f}")
     print("capacity sweep (hit rate | inserts/verify):")
     for name, sw in res["capacity_sweep"].items():
         print(f"  {name:12s} " + " ".join(f"{c}:{v['hit_rate']:.3f}|{v['inserts_per_verify']:.0f}" for c, v in sw.items()))
