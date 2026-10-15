@@ -557,6 +557,44 @@ def test_the_split_model_off_types_lanes_as_the_table():
         assert (kinds, slots) == ([int(k) for k in want], want_slots)
 
 
+def test_split_model_off_words_type_lanes_as_the_table():
+    """Cost words whose copy_lane is SPLIT_MODEL_OFF (the service's words until its calibration publishes, and after
+    one fails) type as the table and the miss cut, bit for bit, and count nothing. Mutation: the post ignoring the
+    copy_lane sign -- red."""
+    from sglang.srt.layers.moe.ram_slot_map import split_model_off_words
+
+    lanes, nodes = 16, 2
+    w = lease.wire_layout(lanes, nodes)
+    rng = random.Random(6)
+    split = [max(0, (2 * n) // 3) for _ in range(nodes) for n in range(w.lanes + 1)]
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    for _ in range(100):
+        _, planned, ram, forced_from, dst, routes, _ = _split_model_case(rng, lanes, nodes)
+        kinds, slots, _, stats = _raw_post(lanes, nodes, planned, ram, staging, split=split, captured=True,
+                                           cpu_on=True, copy_ce=True, dst=dst, spill=True, routes=routes, miss_cut=1,
+                                           split_model=split_model_off_words(nodes))
+        want, want_slots = type_lanes(
+            planned, ram, staging, split, lanes=w.lanes, captured=True, copy_armed=True, hit_copy="ce", cpu_on=True,
+            cpu_misses=False, dst_ok=[0 <= d < w.lanes for d in dst], nodes=nodes, forced_from=forced_from,
+            miss_cut=1, miss_cut_max=3)
+        assert (kinds, slots) == ([int(k) for k in want], want_slots) and stats == [0] * (1 + 2 * nodes)
+
+
+def test_the_calibration_pull_copies_pinned_host_ranges():
+    """The split model calibration's stand-in for S's pulls copies each {source, destination, bytes} range of pinned
+    host memory into device memory, aligned and not, with S's grid."""
+    host = torch.randint(0, 256, (1 << 20,), dtype=torch.uint8).pin_memory()
+    dst = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+    ranges = [(0, 0, 4096), (8192, 8192, 300_000), (1, 400_001, 777)]  # (source offset, destination offset, bytes)
+    table = torch.tensor([[host.data_ptr() + s, dst.data_ptr() + d, n] for s, d, n in ranges], dtype=torch.int64,
+                         device="cuda")
+    ops._device_module("exl3", 8, 1).expert_stream_calibration_pull(table)
+    torch.cuda.synchronize()
+    for s, d, n in ranges:
+        assert torch.equal(dst[d : d + n].cpu(), host[s : s + n]), (s, d, n)
+    assert not dst[4096:8192].any()
+
+
 def _scratch_word(tag, row, expert):
     """A scratch-table word as host/gpu_drip.h publishes it."""
     return tag << 32 | row << 16 | expert

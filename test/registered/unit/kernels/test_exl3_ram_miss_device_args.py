@@ -446,9 +446,31 @@ def test_the_split_model_reaches_the_post_before_use_pdl_with_room_for_its_count
             "records": 1, "to_cpu": list(range(2, 2 + 2 * nodes, 2)), "to_copy": list(range(3, 3 + 2 * nodes, 2))}
 
 
+def test_set_split_model_costs_replaces_the_cost_words_and_keeps_the_counters():
+    """The calibration's and the refinement's publish path: the post's split_model bank (the same tensor the captured
+    post reads) takes the new cost words in place, its counters untouched; a word count the build cannot read, or a
+    device with the model off, is refused. Mutation: the copy writing the counters too -- red."""
+    from sglang.srt.layers.moe.ram_slot_map import split_model_off_words
+
+    for nodes in (1, 2):
+        dev = _device(nodes=nodes, split_model=split_model_off_words(nodes))
+        bank = dev.split_model
+        assert dev.split_model_costs() == split_model_off_words(nodes)
+        bank[5 * nodes + 5 :] = 7
+        words = list(range(100, 100 + 5 * nodes + 5))
+        dev.set_split_model_costs(words)
+        assert dev.split_model is bank and bank.tolist() == words + [7] * (1 + 2 * nodes)
+        assert dev.split_model_costs() == words
+        with pytest.raises(ValueError, match="cost words"):
+            dev.set_split_model_costs(words[:-1])
+    with pytest.raises(ValueError, match="off"):
+        _device().set_split_model_costs([0] * 10)
+
+
 def test_the_service_builds_its_device_side_with_the_split_model_words():
-    """exl3_ram_miss passes _split_model_words(): the env's words when SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL is on and
-    CPU experts run, else None."""
+    """exl3_ram_miss passes _split_model_words(): with SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL on and CPU experts running,
+    words that hold the model off until the calibration publishes its costs (whatever the env's costs say), else
+    None."""
     import sglang.srt.layers.moe.exl3_ram_miss as service
 
     tree = ast.parse(Path(service.__file__).read_text())
@@ -464,7 +486,7 @@ def test_the_service_builds_its_device_side_with_the_split_model_words():
     with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True), \
             envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=2"):
         got = words(stub)
-        assert len(got) == 15 and got[10] == 2_000_000
+        assert len(got) == 15 and got[10] < 0 and not any(got[:10] + got[11:])
         assert words(SimpleNamespace(cpu_experts=None, wire=stub.wire)) is None
 
 

@@ -394,7 +394,7 @@ class CpuExpertService:
             # A timed-out DMA may still write into the scratch: keep its block out of
             # the allocator.
             self._calibration_scratch = scratch
-            self._exclude_calibration_stats(before)
+            self.exclude_calibration_stats(before)
             logger.warning(
                 "CPU experts group %d calibration failed (%s); keeping split %s",
                 self.group,
@@ -402,7 +402,7 @@ class CpuExpertService:
                 self.split,
             )
             return None
-        self._exclude_calibration_stats(before)
+        self.exclude_calibration_stats(before)
         split = capped_split(grid, width, self.split)
         self.split, self.calibrated = split, True
         self.host.set_cpu_split(split, group=self.group)
@@ -416,13 +416,16 @@ class CpuExpertService:
         )
         return split
 
-    def _exclude_calibration_stats(self, before: dict[str, int]) -> None:
-        """Account calibration's own CPU jobs apart from decode's.
+    def exclude_calibration_stats(self, before: dict[str, int]) -> None:
+        """Account a calibration's own CPU jobs since ``before`` (a ``host.cpu_stats``) apart from decode's: this
+        split's calibration and the split model's (split_model_calibration.py) add up.
 
         ``log_stats`` subtracts them and ``retune`` starts counting after them.
         """
         after = self.host.cpu_stats(self.group)
-        self._calibration_stats = {key: after[key] - before[key] for key in after}
+        self._calibration_stats = {
+            key: self._calibration_stats.get(key, 0) + after[key] - before[key] for key in after
+        }
         self._last_stats = after
 
 

@@ -878,6 +878,16 @@ class RamTier {
     out[5] = cpu != nullptr ? cpu->stage_two_wait_ns() : 0;
   }
 
+  // Group g's CPU fit moments (CpuExpertEngine::fit_moments), 2 * kFitMoments int64; zeros when its CPU experts are off.
+  void cpu_fit_moments(int g, int64_t* out) const {
+    const CpuExpertEngine* cpu = cpu_engine(g);
+    if (cpu == nullptr) {
+      std::fill(out, out + 2 * CpuExpertEngine::kFitMoments, int64_t{0});
+      return;
+    }
+    cpu->fit_moments(out);
+  }
+
   // Every group's CPU experts' cores, empty without CPU experts. For the caller, before the service thread starts.
   std::vector<int> cpu_cores() const {
     std::vector<int> cores;
@@ -993,6 +1003,156 @@ class RamTier {
     cpu->write_calibration_table(row, tokens);
     s.timeout_ns = timeout_ns;
     calibrate_split(s, out);
+    shutdown.idle = true;
+  }
+
+  // The split model's startup calibration (split_calibration.h kSplitCell*) on group g: out[i] is the mean ms of
+  // cells[i] ({kind, a, b}), over `reps` runs after a warm-up. CPU and DMA runs rotate over `rows` (registered CPU rows)
+  // and the group's slots of each; the DMA copies rows[0]'s table into `scratch` (the most DMA lanes of a cell, on
+  // `device`; -1: the test backend). A landing cell reads a of the group's own experts of rows[i] into its staging slots
+  // through the group's reader (O_DIRECT, so no page cache serves it), the rows rotating. The caller owns the tier and
+  // has not armed the copy engine. Throws on bad arguments, a failed copy or read, or a timeout.
+  void calibrate_split_model(
+      int g,
+      const int64_t* rows,
+      int64_t row_count,
+      const int64_t* cells,
+      int64_t cell_count,
+      int64_t device,
+      int64_t reps,
+      uint64_t scratch,
+      int64_t scratch_bytes,
+      int64_t timeout_ns,
+      double* out) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("calibrate_split_model");
+    const std::string prefix = error_prefix<Layout>() + "split model calibration: ";
+    if (g < 0 || g >= groups()) throw std::runtime_error(prefix + "group " + std::to_string(g) + " does not exist");
+    Group& group = dist_.group(g);
+    const std::unique_ptr<CpuExpertEngine>& cpu = group.cpu;
+    if (cpu == nullptr) throw std::runtime_error(prefix + "CPU experts are not enabled");
+    if (copy_engine_ == nullptr) throw std::runtime_error(prefix + "the copy engine is not enabled");
+    if (row_count < 1) throw std::runtime_error(prefix + "it needs a row");
+    if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
+    SplitRotation rot;
+    int64_t slots = std::numeric_limits<int64_t>::max();
+    for (int64_t i = 0; i < row_count; ++i) {
+      const int64_t row = rows[i];
+      if (row < 0 || row >= layers_) throw std::runtime_error(prefix + "row out of range");
+      if (!cpu->eligible(row))
+        throw std::runtime_error(prefix + "row " + std::to_string(row) + " has no registered CPU layer");
+      rot.rows.push_back(row);
+      rot.lo.push_back(group.rows[row].lo);
+      slots = std::min(slots, group.rows[row].hi - group.rows[row].lo);
+    }
+    rot.slots = slots;  // every row's range is walked as far as the smallest
+    SplitRotation copy_rot;
+    copy_rot.rows = {rot.rows[0]};
+    copy_rot.lo = {rot.lo[0]};
+    copy_rot.slots = group.rows[rot.rows[0]].hi - group.rows[rot.rows[0]].lo;
+    BasicCalibrationSetup<Build> s;
+    s.cpu = cpu.get();
+    s.row = rot.rows[0];
+    s.entries = copy_engine_->dma_entries(s.row);
+    s.reps = static_cast<int>(reps);
+    s.tokens = static_cast<int>(cpu->tokens());
+    s.timeout_ns = timeout_ns;
+    int64_t dma_lanes = 0;
+    for (int64_t i = 0; i < cell_count; ++i) {
+      const int64_t kind = cells[3 * i], a = cells[3 * i + 1], b = cells[3 * i + 2];
+      const bool cpu_cell = kind == kSplitCellHit || kind == kSplitCellMiss;
+      if (kind < kSplitCellHit || kind > kSplitCellLanding)
+        throw std::runtime_error(prefix + "cell " + std::to_string(i) + " has kind " + std::to_string(kind));
+      if (a < 1 || a > Wire::kLanes || a > slots)
+        throw std::runtime_error(
+            prefix + "cell " + std::to_string(i) + " asks for " + std::to_string(a) + " lanes; the build has " +
+            std::to_string(Wire::kLanes) + " and the group's rows " + std::to_string(slots) + " slots");
+      if (cpu_cell && (b < 1 || b > s.tokens))
+        throw std::runtime_error(
+            prefix + "cell " + std::to_string(i) + " routes " + std::to_string(b) + " tokens a lane; the rows hold " +
+            std::to_string(s.tokens));
+      if (kind == kSplitCellCopy) dma_lanes = std::max(dma_lanes, a);
+      if (kind == kSplitCellLanding)
+        for (const int64_t row : rot.rows)
+          if (a > static_cast<int64_t>(group.rows[row].staging.size()))
+            throw std::runtime_error(
+                prefix + "cell " + std::to_string(i) + " reads " + std::to_string(a) + " rows; row " +
+                std::to_string(row) + " has " + std::to_string(group.rows[row].staging.size()) + " staging slots");
+    }
+    s.lanes = static_cast<int>(std::max<int64_t>(dma_lanes, 1));
+    std::unique_ptr<CopyBackend> backend;
+    if (dma_lanes > 0) {
+      const int64_t need = dma_lanes * calibration_expert_bytes(s.entries);
+      if (need == 0) throw std::runtime_error(prefix + "row " + std::to_string(s.row) + " copies no bytes");
+      if (scratch == 0 || scratch_bytes < need)
+        throw std::runtime_error(
+            prefix + "the scratch holds " + std::to_string(scratch_bytes) + " bytes, it needs " + std::to_string(need));
+      if (device < 0) {
+        auto host = std::make_unique<HostCopyBackend>();
+        s.host_backend = host.get();
+        backend = std::move(host);
+      } else {
+        backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device), prefix + "copy: ");
+      }
+      if (const std::string error = backend->init(); !error.empty()) throw std::runtime_error(prefix + error);
+    }
+    // Release the backend only when idle: after a failure a copy may still be in flight into the scratch.
+    struct Shutdown {
+      CopyBackend* backend;
+      bool idle = false;
+      ~Shutdown() {
+        if (backend != nullptr) backend->shutdown(idle);
+      }
+    } shutdown{backend.get()};
+    s.backend = backend.get();
+    s.scratch = scratch;
+    fill_join();  // a fill reads through group 0's reader, as a landing cell does
+    // The group's own experts (home(e) == g), read in turn so no two runs read one row image.
+    const int64_t own_experts = std::max<int64_t>((experts_ - g + Wire::kNodes - 1) / Wire::kNodes, 1);
+    int64_t next_expert = 0;
+    const auto land = [&](const SplitRotation& r, int64_t m) {
+      const int64_t row = r.row();
+      std::vector<int32_t> experts;
+      std::vector<int64_t> into;
+      for (int64_t j = 0; j < m; ++j) {
+        experts.push_back(static_cast<int32_t>(g + Wire::kNodes * (next_expert++ % own_experts)));
+        into.push_back(group.rows[row].staging[j]);
+      }
+      std::vector<uint8_t> packed;
+      begin_busy(group);  // the watchdog aborts a read that hangs, as it does a demand's
+      const int64_t start = now_ns();
+      int result = 0;
+      try {
+        result = group.reader.read(row, experts, into, kBounceRows, [](size_t) { return false; }, nullptr, &packed);
+      } catch (...) {
+        end_busy(group);
+        throw;
+      }
+      const int64_t ns = now_ns() - start;
+      end_busy(group);
+      if (result != 1) throw std::runtime_error(prefix + "a read of row " + std::to_string(row) + " failed");
+      return ns;
+    };
+    for (int64_t i = 0; i < cell_count; ++i) {
+      const int64_t kind = cells[3 * i];
+      const int a = static_cast<int>(cells[3 * i + 1]), b = static_cast<int>(cells[3 * i + 2]);
+      switch (kind) {
+        case kSplitCellHit:
+        case kSplitCellMiss:
+          out[i] = split_model_mean_ms(rot, s.reps, [&](const SplitRotation& r) {
+            return split_model_cpu_run(s, r, a, kind == kSplitCellHit ? 0 : 1, b);
+          });
+          break;
+        case kSplitCellCopy:
+          // The DMA's sources are rows[0]'s copy table: its slots only.
+          out[i] = split_model_mean_ms(copy_rot, s.reps, [&](const SplitRotation& r) {
+            return split_model_copy_run(s, r, a);
+          });
+          break;
+        default:
+          out[i] = split_model_mean_ms(rot, s.reps, [&](const SplitRotation& r) { return land(r, a); });
+      }
+    }
     shutdown.idle = true;
   }
 
