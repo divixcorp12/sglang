@@ -70,6 +70,10 @@ class Params:
     first_byte: float = 0.8
     per_expert: float = 1.6
     copy_lane: float = 1.05
+    # The stream-aware rule (greedy-stream): with GPU-streamed misses, the GPU's stream kernel ends at stream_base +
+    # first_byte + per_expert * misses + stream_lane * copy lanes, a third side the copy option is charged with.
+    stream_lane: float = 0.65
+    stream_base: float = 0.0
 
 
 def fit_costs(jobs: list, tokens: bool) -> dict:
@@ -131,18 +135,27 @@ def rule_exhaustive(nodes: list, costs: dict, p: Params, scale: float, tokens: b
     return best
 
 
-def rule_greedy(nodes: list, costs: dict, p: Params, scale: float, tokens: bool, gpu_miss: int = 0) -> list:
-    """Hits heaviest first (count-only: plan order, first lanes first), each to the side that would finish first."""
+def rule_greedy(nodes: list, costs: dict, p: Params, scale: float, tokens: bool, gpu_miss: int = 0,
+                streamed: int = 0) -> list:
+    """Hits heaviest first (count-only: plan order, first lanes first), each to the side that would finish first.
+    With `streamed` GPU-streamed misses and p.stream_lane > 0 (greedy-stream), the copy side also ends no earlier than
+    the stream kernel would with one more copy lane."""
     sets = [{} for _ in nodes]
     copy = p.copy_lane * gpu_miss
+    lanes = 0
+    stream0 = p.stream_base + p.first_byte + p.per_expert * streamed
     hits = [(tok, i, lane) for i, n in enumerate(nodes) for lane, tok in n.elig]
     hits.sort(key=lambda h: (-h[0], h[2]) if tokens else (h[2],))
     for tok, i, lane in hits:
         cpu = node_finish(nodes[i], {**sets[i], lane: tok}, costs, p, scale)
-        if cpu <= copy + p.copy_lane:
+        side = copy + p.copy_lane
+        if streamed and p.stream_lane > 0:
+            side = max(side, stream0 + p.stream_lane * (lanes + 1))
+        if cpu <= side:
             sets[i][lane] = tok
         else:
             copy += p.copy_lane
+            lanes += 1
     return sets
 
 
@@ -267,7 +280,10 @@ def evaluate(recs: list, nodes_by: dict, rule: str, costs: dict, phys: dict, p: 
         elif rule == "exh":
             sets = rule_exhaustive(nodes, costs, p, scale, tokens, gpu_miss=coupled * r["gpu_miss"])
         elif rule == "greedy":
-            sets = rule_greedy(nodes, costs, p, scale, tokens, gpu_miss=coupled * r["gpu_miss"])
+            # The served split model (split-model cffc86e9ed): no stream term.
+            sets = rule_greedy(nodes, costs, p, scale, tokens)
+        elif rule == "greedy-stream":
+            sets = rule_greedy(nodes, costs, p, scale, tokens, streamed=r["gpu_miss"])
         else:
             raise ValueError(rule)
         saving, d_arrive, d_wait = effect(sets)
