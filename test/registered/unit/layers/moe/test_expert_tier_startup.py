@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import expert_format, expert_hot_cache, expert_stream
 from sglang.srt.layers.moe.expert_format import (
     inclusive_hot_slot_limit,
@@ -110,6 +111,41 @@ class TestPinnedManagerStartup(unittest.TestCase):
                 model, budget_bytes=2 * streamer.host_bytes_per_expert
             )
         self.assertEqual(built, [(0, 1, {}), (1, 1, {})])
+
+
+class TestFullLayers(unittest.TestCase):
+    """SGLANG_MOE_PINNED_HOST_FULL_LAYERS: listed layers are bought whole first, the rest round-robins as without."""
+
+    def setUp(self):
+        expert_format._WARNED_WITHOUT_TIER_OPTIONS.clear()
+
+    def test_a_full_layer_is_bought_first_and_the_rest_round_robins(self):
+        model, _ = _model(tier_options={"device": "cpu"})
+        row = model.get_submodule("0")._nvfp4_expert_streamer.host_bytes_per_expert
+        # Without the list the same 11 rows split 6/5; with it layer 1 takes every expert.
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+            manager = ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
+        self.assertEqual({k: c.capacity for k, c in manager.caches.items()}, {0: 3, 1: EXPERTS})
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"), self.assertRaisesRegex(ValueError, "fewer layers"):
+            ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS - 1) * row)
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("2"), self.assertRaisesRegex(ValueError, "not streamed"):
+            ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
+
+    def test_each_group_holds_its_homed_experts_and_what_its_table_holds_back(self):
+        # Experts are homed expert % groups; the seam margin applies only between nodes.
+        self.assertEqual(expert_stream.full_layer_group_rows(384, groups=2, held_back=10), [204, 204])
+        self.assertEqual(expert_stream.full_layer_group_rows(7, groups=2, held_back=1), [7, 6])
+        self.assertEqual(expert_stream.full_layer_group_rows(384, groups=1, held_back=10), [394])
+
+    def test_full_layers_are_bought_per_node_and_the_rest_keeps_each_nodes_remainder(self):
+        row = 1000
+        placements, rest_budget, rest = expert_stream._buy_full_layers(
+            {0: ([5, 4], row), 1: ([5, 4], row)}, budget_bytes=190 * row, placement=((0, 100 * row), (1, 90 * row))
+        )
+        self.assertEqual(placements, {0: ((0, 5 * row), (1, 4 * row)), 1: ((0, 5 * row), (1, 4 * row))})
+        self.assertEqual((rest_budget, rest), (172 * row, ((0, 90 * row), (1, 82 * row))))
+        with self.assertRaisesRegex(ValueError, "node 1 needs"):
+            expert_stream._buy_full_layers({0: ([5, 4], row)}, budget_bytes=103 * row, placement=((0, 100 * row), (1, 3 * row)))
 
 
 class TestInclusiveHotSlotLimit(unittest.TestCase):

@@ -407,6 +407,22 @@ def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
             configured_split(8)
 
 
+def test_configured_layer_splits_maps_each_listed_layer_and_refuses_a_bad_entry():
+    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: ';' separates entries and ',' both a LAYERS list and its TABLE, so the
+    first ':' splits them; a layer named twice, an entry without ':' or a bad table is refused. Empty lists none."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.service import configured_layer_splits
+
+    a, b = "0,0,1,2,3,3,4,5,5", "0,0,0,1,2,3,3,4,5"
+    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.override(f"0,1:{a}; 5:{b}"):
+        splits = configured_layer_splits(8)
+    assert splits == {0: [int(v) for v in a.split(",")], 1: [int(v) for v in a.split(",")], 5: [int(v) for v in b.split(",")]}
+    assert configured_layer_splits(8) == {}
+    for spec, match in ((f"0:{a};0:{b}", "twice"), (a, "LAYERS:TABLE"), ("0:0,1,1", "0 <= split")):
+        with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.override(spec), pytest.raises(ValueError, match=match):
+            configured_layer_splits(8)
+
+
 
 def _grid(both, lanes=8):
     """A calibration grid whose concurrent rows come from both(n, k); cpu and link rows from the n == k and k == 0 cells."""

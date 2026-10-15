@@ -23,6 +23,7 @@ import atexit
 import logging
 import os
 import threading
+import time
 import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -35,7 +36,7 @@ from sglang.kernels.ops.moe.expert_cache_transfer import (
     device_copy_grid_blocks,
     expert_row_segments,
 )
-from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
+from sglang.kernels.ops.moe.expert_lease_block import MAX_LANES, WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DRIP_TABLE_SLOTS,
     ExpertStreamDevice,
@@ -61,6 +62,7 @@ from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
+from sglang.srt.layers.moe.expert_stream import pinned_full_layers
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
 from sglang.srt.layers.moe.ram_slot_map import split_miss_cut
 
@@ -409,6 +411,17 @@ class NativePinnedSlotTable:
     def bind_capacity(self, capacity: int) -> None:
         self.capacity = int(capacity)
 
+    def held_back_per_group(self) -> int:
+        """HeldBackSlots, before the service starts: an upper bound on each group's staging and pool slots.
+
+        Staging is at most the victim lanes under spill, else the miss lanes, else the widest wire
+        (plan_graph_gather); the pool is the RAM prefetch's share.
+        """
+        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
+        staging = victims or envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get() or MAX_LANES
+        pool = envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if envs.SGLANG_DSV41_RAM_PREFETCH.get() else 0
+        return min(staging, MAX_LANES) + pool
+
     @property
     def reserved_rows(self) -> int:
         """The row's staging and RAM prefetch pool slots: the service owns them, so ``assign`` never hands one out."""
@@ -546,6 +559,21 @@ def pool_room_shortfall(ranges, *, staging_width: int, share: int) -> list[tuple
         staging = min(staging_width, hi - lo - 1)
         if hi - lo - staging - share < 2:
             short.append((g, lo, hi, staging))
+    return short
+
+
+def full_layer_shortfall(ranges, *, staging_width: int, share: int, experts: int) -> list[tuple[int, int, int]]:
+    """The groups of a row that cannot map every expert homed on them at once, as (group, assignable, homed).
+
+    A group keeps min(width, its slots - 1) staging and ``share`` pool slots out of its range (ram_tier.h,
+    reserve_staging and reserve_spec_pool); the rest must hold the experts e with e % groups == group.
+    """
+    short = []
+    for g, (lo, hi) in enumerate(ranges):
+        assignable = hi - lo - min(staging_width, hi - lo - 1) - share
+        homed = len(range(g, experts, len(ranges)))
+        if assignable < homed:
+            short.append((g, assignable, homed))
     return short
 
 
@@ -885,6 +913,8 @@ class Exl3RamMissService:
         self.sm_small_copies = False
         # SGLANG_DSV41_CPU_EXPERTS: the CPU expert service; None when off.
         self.cpu_experts = None
+        # SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: {layer id: its own split table}, set at start.
+        self._layer_splits: dict[int, list[int]] = {}
         self._cpu_retune_batches = 0
         self._cpu_batches = 0
         self._cpu_log_batches = 0
@@ -1007,6 +1037,58 @@ class Exl3RamMissService:
                     "slots: lower the share or raise the pinned tier"
                 )
 
+    def _check_full_layers(self, tables, experts: int) -> None:
+        """Refuse a SGLANG_MOE_PINNED_HOST_FULL_LAYERS layer whose groups cannot map every expert past their staging
+        and pool slots (full_layer_shortfall)."""
+        full = pinned_full_layers()
+        share = envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if envs.SGLANG_DSV41_RAM_PREFETCH.get() else 0
+        for row, layer_id in enumerate(tables.layer_ids):
+            if layer_id not in full:
+                continue
+            capacity = int(tables.capacity[row])
+            ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
+            short = full_layer_shortfall(ranges, staging_width=self.staging_width(), share=share, experts=experts)
+            if short:
+                raise ValueError(
+                    f"exl3 RAM miss: layer {layer_id} is in SGLANG_MOE_PINNED_HOST_FULL_LAYERS, but its {capacity} "
+                    f"slots leave groups (group, assignable slots, homed experts) {short} short of every expert"
+                )
+
+    @staticmethod
+    def _configured_layer_splits(tables, lanes: int) -> dict[int, list[int]]:
+        """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS for a ``lanes``-lane build; refused without CPU experts or for a
+        layer the service does not stream."""
+        from sglang.srt.layers.moe.cpu_experts.service import configured_layer_splits
+
+        splits = configured_layer_splits(lanes)
+        if not splits:
+            return splits
+        if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS needs SGLANG_DSV41_CPU_EXPERTS")
+        unknown = sorted(set(splits) - {int(layer_id) for layer_id in tables.layer_ids})
+        if unknown:
+            raise ValueError(
+                f"exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS names layers {unknown}, which are not streamed"
+            )
+        for layer_id, split in sorted(splits.items()):
+            logger.info("exl3 RAM miss: layer %d uses its own CPU split %s on every node", layer_id, split)
+        return splits
+
+    def _fill_full_layer(self, streamer) -> None:
+        """Read every expert of a SGLANG_MOE_PINNED_HOST_FULL_LAYERS layer into its tier, so no verify reads one."""
+        began = time.perf_counter()
+        streamer.pinned_host_cache.ensure_rows(torch.arange(streamer.num_experts))
+        mapping = self.host.mapping(self.row_of(streamer.layer_id))
+        missing = [expert for expert, slot in enumerate(mapping) if slot < 0]
+        if missing:
+            raise RuntimeError(f"exl3 RAM miss: full layer {streamer.layer_id} could not map experts {missing}")
+        logger.info(
+            "exl3 RAM miss: full layer %d maps all %d experts (filled in %.2f s)",
+            streamer.layer_id,
+            streamer.num_experts,
+            time.perf_counter() - began,
+        )
+
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
         return min(self.staging_width(), capacity - 1)
@@ -1127,6 +1209,8 @@ class Exl3RamMissService:
                 [plan.node for plan in numa.plans],
             )
         self._node_ranges = node_ranges
+        self._check_full_layers(tables, fmt.layout.num_experts)
+        layer_splits = self._configured_layer_splits(tables, wire_layout(lanes).lanes)
         pin = torch.cuda.is_available()
         self._wire = wire_layout(lanes, numa.nodes)
         page = new_page(pin=pin, wire=self._wire)
@@ -1253,6 +1337,7 @@ class Exl3RamMissService:
         self.hot_page = hot_page
         self.copy_engine = copy_engine
         self.cpu_experts = cpu_experts
+        self._layer_splits = layer_splits
         self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
         self.lease_pdl = cfg.enable_lease_pdl
@@ -1575,6 +1660,8 @@ class Exl3RamMissService:
                 updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
+        if streamer.layer_id in pinned_full_layers():
+            self._fill_full_layer(streamer)
         width = streamer.graph_miss_width
         if width > self.lanes:
             # The post kernel requests min(count, lanes) lanes and traps on a wider
@@ -1733,6 +1820,8 @@ class Exl3RamMissService:
             )
         if self._spec_gpu is not None:
             self._note_spec_row(row, streamer.row_backend)
+        if streamer.layer_id in self._layer_splits:
+            self.device_side.set_row_split(row, self._layer_splits[streamer.layer_id])
         updater = manager.gpu_residency
         if self.cpu_experts is not None and getattr(updater, "victim_lanes", width) < width:
             # Spill: forced CPU misses land in RAM victims (RamTier::reserve_victims_locked), so the layer must have

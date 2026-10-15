@@ -25,15 +25,15 @@ def _runs(layers=2, experts=4):
     return torch.zeros((layers, experts, ram_miss.STAGE_PIECES, 1, 2), dtype=torch.int32)
 
 
-def _device(layers=2, experts=4, page=None, lanes=8, **kwargs):
-    wire = lease.wire_layout(lanes)
+def _device(layers=2, experts=4, page=None, lanes=8, nodes=1, **kwargs):
+    wire = lease.wire_layout(lanes, nodes)
     page = torch.zeros(wire.page_bytes, dtype=torch.uint8) if page is None else page
     kwargs.setdefault("piece_runs", _runs(layers, experts))
     kwargs.setdefault("row_capacities", [5, 7][:layers] + [3] * max(0, layers - 2))
     kwargs.setdefault("timeout_ms", 10)
     return ExpertStreamDevice(
         page, lease.new_lease_block(layers, pin=False, wire=wire), device="cpu", layers=layers, experts=experts,
-        lanes=lanes, **kwargs,
+        lanes=lanes, nodes=nodes, **kwargs,
     )
 
 
@@ -398,6 +398,27 @@ def test_the_device_side_passes_the_split_miss_cut_after_cpu_misses(kwargs, want
     _post(dev, _args())
     ((_, args),) = recorder.calls
     assert (args[26], args[27]) == want
+
+
+def test_a_row_split_reaches_the_post_of_its_row_only():
+    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: the post's row_split bank (before use_pdl) holds the table on every node
+    of the row it was set for, and -1 first (the lease's tables) for every other row; a table the build cannot read is
+    refused. Mutations: set_row_split writing one node or every row -- red."""
+    dev = _device(lanes=8, nodes=2)
+    table = [0, 0, 0, 1, 2, 3, 3, 4, 5]
+    with pytest.raises(ValueError, match="row split"):
+        dev.set_row_split(1, table[:-1])
+    with pytest.raises(ValueError, match="row split"):
+        dev.set_row_split(1, [1] + table[1:])
+    dev.set_row_split(1, table)
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    for row in (0, 1):
+        _post(dev, _args(), row=row)
+    banks = [args[-2] for _, args in recorder.calls]
+    assert banks[0] is banks[1] is dev.row_split
+    assert dev.row_split[0, 0] == -1
+    assert dev.row_split[1].tolist() == table * 2
 
 
 @pytest.mark.parametrize("name", ["miss_cut", "miss_cut_max"])

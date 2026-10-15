@@ -67,6 +67,38 @@ def cpu_trait_for(format_key: str, ext=None, *, source: str):
     raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
 
 
+def _parsed_split(spec: str, lanes: int, name: str) -> list[int]:
+    """A comma-separated split table for a ``lanes``-lane build; ValueError names ``name`` when it is malformed."""
+    try:
+        split = [int(v) for v in spec.split(",")]
+    except ValueError:
+        split = []
+    if len(split) != lanes + 1 or any(not 0 <= k <= n for n, k in enumerate(split)):
+        raise ValueError(f"{name} must list {lanes + 1} counts with 0 <= split[n] <= n, got {spec!r}")
+    return split
+
+
+def configured_layer_splits(lanes: int) -> dict[int, list[int]]:
+    """``SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS`` as {layer id: split table} for a ``lanes``-lane build.
+
+    Raises ``ValueError`` for an entry without ``LAYERS:TABLE``, a bad table, or a layer named twice.
+    """
+    name = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
+    splits: dict[int, list[int]] = {}
+    for entry in (e.strip() for e in envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.get().split(";")):
+        if not entry:
+            continue
+        layers, sep, table = entry.partition(":")
+        if not sep or not all(v.strip().isdigit() for v in layers.split(",")):
+            raise ValueError(f"{name} entries are LAYERS:TABLE with LAYERS comma-separated layer ids, got {entry!r}")
+        split = _parsed_split(table, lanes, name)
+        for layer_id in (int(v) for v in layers.split(",")):
+            if layer_id in splits:
+                raise ValueError(f"{name} names layer {layer_id} twice")
+            splits[layer_id] = split
+    return splits
+
+
 def configured_split(lanes: int) -> list[int]:
     """The split table for a ``lanes``-lane build: ``SGLANG_DSV41_CPU_EXPERTS_SPLIT`` when set, else ``k_star(n)``.
 
@@ -75,12 +107,7 @@ def configured_split(lanes: int) -> list[int]:
     """
     spec = envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get()
     if spec:
-        split = [int(v) for v in spec.split(",")]
-        if len(split) != lanes + 1 or any(not 0 <= k <= n for n, k in enumerate(split)):
-            raise ValueError(
-                f"SGLANG_DSV41_CPU_EXPERTS_SPLIT must list {lanes + 1} counts with 0 <= split[n] <= n, got {spec!r}"
-            )
-        return split
+        return _parsed_split(spec, lanes, "SGLANG_DSV41_CPU_EXPERTS_SPLIT")
     return split_table(
         lanes,
         envs.SGLANG_DSV41_CPU_EXPERTS_CPU_MS.get(),

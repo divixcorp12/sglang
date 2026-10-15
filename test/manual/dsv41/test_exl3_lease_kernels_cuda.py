@@ -292,7 +292,8 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
         torch.zeros(1, dtype=torch.int32, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"),
         0, torch.zeros(ops.DRIP_TABLE_SLOTS, dtype=torch.int64, device="cuda"),
         torch.zeros(w.lanes, dtype=torch.int64, device="cuda"), torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
-        torch.zeros(1, dtype=torch.int32, device="cuda"), 0,
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.full((1, w.nodes * (w.lanes + 1)), -1, dtype=torch.int32, device="cuda"), 0,
     )
     torch.cuda.synchronize()
     record = page[w.demand_ring : w.demand_ring + w.record_bytes].clone()
@@ -316,9 +317,10 @@ def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
 
 
 def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, cpu_on=False, scratch_words=None,
-              scratch_out=None):
+              scratch_out=None, row_split=None):
     """One post of the node-aware device build over one row: ``ram`` its slot map, ``staging`` node-major, ``split``
     node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes.
+    ``row_split``: the row's own node-major table (SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS), else -1 (the block's).
     ``scratch_words``: the GPU drip's scratch table (u64 per slot), written to the block and read by the post as that
     many slots; ``scratch_out`` (a list) then receives C1s's compacted (rows, dst slots, count)."""
     w = lease.wire_layout(lanes, nodes)
@@ -368,7 +370,10 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
         0, int(cpu_on), 0, 0, 3, out["kind"], out["slot"], out["node"], torch.zeros(1, dtype=torch.int32, **cuda),
         torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 1, 32, 0,
         torch.zeros(1, dtype=torch.int32, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
-        scratch_slots, scratch_table, scratch_rows, scratch_dst, scratch_go, 0,
+        scratch_slots, scratch_table, scratch_rows, scratch_dst, scratch_go,
+        torch.tensor([row_split if row_split is not None else [-1] * (nodes * (w.lanes + 1))], dtype=torch.int32,
+                     **cuda),
+        0,
     )
     torch.cuda.synchronize()
     del cpu_buf
@@ -411,6 +416,25 @@ def test_the_split_is_per_node_and_a_zero_split_keeps_a_node_off_the_cpu():
                          cpu_on=True, cpu_misses=False, nodes=nodes)
     assert kinds == [int(k) for k in want] == [int(LaneKind.HIT_SM), int(LaneKind.HIT_SM), int(LaneKind.HIT_CPU),
                                                int(LaneKind.HIT_SM), int(LaneKind.HIT_CPU), int(LaneKind.HIT_SM)]
+
+
+def test_a_row_split_replaces_the_lease_split_for_its_row_only():
+    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: a row with its own table types its lanes by it on every node, whatever
+    the lease's tables say (what calibration and the retune write); -1 at its first word keeps the lease's. Mutations:
+    the post ignoring row_split, or reading it for every row -- red on one of the two posts."""
+    lanes, nodes = 8, 2
+    w = lease.wire_layout(lanes, nodes)
+    lease_split = [n for _ in range(nodes) for n in range(w.lanes + 1)]  # every eligible lane the CPU's
+    own = [max(n - 2, 0) for _ in range(nodes) for n in range(w.lanes + 1)]  # two lanes a node to the link
+    planned, ram = [0, 1, 2, 3, 4, 5], list(range(16))
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    for row_split, split in ((own, own), (None, lease_split)):
+        kinds, _, _ = _raw_post(lanes, nodes, planned, ram, staging, split=lease_split, captured=True, cpu_on=True,
+                                row_split=row_split)
+        want, _ = type_lanes(planned, ram, staging, split, lanes=w.lanes, captured=True, copy_armed=True,
+                             hit_copy="sm", cpu_on=True, cpu_misses=False, nodes=nodes)
+        assert kinds == [int(k) for k in want]
+    assert kinds.count(int(LaneKind.HIT_CPU)) == 6
 
 
 def _scratch_word(tag, row, expert):

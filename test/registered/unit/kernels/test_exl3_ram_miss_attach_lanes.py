@@ -33,6 +33,10 @@ def hang_guard():
 def tiers(tmp_path, monkeypatch):
     """The service reads row images (service_row_images) with O_DIRECT, as in production. The attached layers' copy
     tables are stubs, so their piece maps are too: what is under test is the gather width."""
+    yield from _built_tiers(tmp_path, monkeypatch, [CAPACITY] * LAYERS)
+
+
+def _built_tiers(tmp_path, monkeypatch, capacities):
     monkeypatch.setattr(module, "stream_segment_map", lambda segments, tables, row: None)
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
@@ -46,7 +50,7 @@ def tiers(tmp_path, monkeypatch):
                 fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
-                ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
+                ExpertPinnedHostCache(streamer, capacities[layer_id], device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
         service.plan_gather_width(1)
@@ -64,7 +68,8 @@ def _manager(updater=None):
 
 def _attach(service, streamer, rows, manager=None):
     streamer._graph_pinned_tier = True
-    streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
+    # slot_to_expert: an eager tier use pushes the hot set (NativePinnedSlotTable._push_hot); none is hot here.
+    streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY, slot_to_expert=[-1] * CAPACITY)
     streamer.graph_gather_rows = rows
     streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
     service.attach(manager if manager is not None else _manager(), streamer)
@@ -145,6 +150,35 @@ def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
     for row in range(LAYERS):
         assert len(mapped[row]) == CAPACITY - 1 and not mapped[row] & set(staging[row])
     assert bulk and all(slot not in staging[row] for row, _, slot in bulk if slot >= 0)
+
+
+@pytest.mark.parametrize("extra, refused", [(0, True), (1, False)])
+def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_all(
+    tmp_path, monkeypatch, extra, refused
+):
+    """SGLANG_MOE_PINNED_HOST_FULL_LAYERS: the host keeps a row's staging slot out of assign, so a tier of exactly
+    the expert count cannot map them all and start refuses it; one slot more maps every expert at attach, and a layer
+    not listed is not filled. Mutations: the check ignoring staging, or attach skipping the fill -- red."""
+    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
+        for service, streamers in _built_tiers(tmp_path, monkeypatch, [EXPERTS + extra, CAPACITY]):
+            if refused:
+                with pytest.raises(ValueError, match=r"short of every expert"):
+                    service.ensure_started()
+                continue
+            for streamer in streamers.values():
+                _attach(service, streamer, 1)
+            with paused(service.host):
+                assert all(slot >= 0 for slot in service.host.mapping(0))
+                assert all(slot < 0 for slot in service.host.mapping(1))
+
+
+def test_full_layer_room_is_every_homed_expert_past_staging_and_pool():
+    """Each group keeps min(width, slots - 1) staging and the pool share, and must still hold the experts homed on it
+    (expert % groups): 384 experts on 2 groups need 192 + 8 + 2 slots each."""
+    ranges = [(0, 202), (202, 403)]
+    assert module.full_layer_shortfall(ranges, staging_width=8, share=2, experts=384) == []
+    assert module.full_layer_shortfall([(0, 201), (201, 403)], staging_width=8, share=2, experts=384) == [(0, 191, 192)]
+    assert module.full_layer_shortfall([(0, 6)], staging_width=1, share=0, experts=6) == [(0, 5, 6)]
 
 
 def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):
