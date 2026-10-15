@@ -689,7 +689,7 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     budget = {"SGLANG_MOE_PINNED_HOST_MB", "SGLANG_MOE_PINNED_HOST_NUMA_MB"}
     knobs = budget | {FULL_LAYERS}
     assert {k: v for k, v in pin.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
-    assert {k: v for k, v in gpu.items() if k != SPLIT_LAYERS} == pin
+    assert {k: v for k, v in gpu.items() if k != SPLIT_LAYERS} == {k: v for k, v in pin.items() if k != SPLIT_LAYERS}
     assert ab.REFERENCE[PIN01_ARM] == reference and ab.REFERENCE[PIN01_GPU01_ARM] == PIN01_ARM
     for arm in (PIN01_ARM, PIN01_GPU01_ARM):
         assert ab.ARMS[arm][1] is True and ab._overrides(arm, "/out")[SPLIT] == "0:3,1:5"
