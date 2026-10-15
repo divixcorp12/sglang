@@ -41,11 +41,10 @@ def mask_dead_routes(
     *, topk_ids: torch.Tensor, topk_weights: torch.Tensor, dead: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``topk_ids`` with each dead row's replaced by row 0's, and ``topk_weights`` with each dead row's zeroed."""
-    rows = topk_ids.shape[0]
-    row_dead = dead[:rows]
+    row_dead = dead[: topk_ids.shape[0]]
     return (
         torch.where(row_dead, topk_ids[:1], topk_ids),
-        torch.where(row_dead, torch.zeros_like(topk_weights), topk_weights),
+        torch.where(row_dead, 0.0, topk_weights),
     )
 
 
@@ -54,8 +53,7 @@ def dead_routes_cleared(
 ) -> torch.Tensor:
     """Flat [rows * top_k] route ids with every dead row's set to -1."""
     rows = flat_ids.numel() // top_k
-    route_dead = dead[:rows].expand(rows, top_k).reshape(-1)
-    return torch.where(route_dead, torch.full_like(flat_ids, -1), flat_ids)
+    return torch.where(dead[:rows], -1, flat_ids.reshape(rows, top_k)).reshape(-1)
 
 
 def dead_rows_as_row0(*, x: torch.Tensor, dead: torch.Tensor) -> torch.Tensor:
