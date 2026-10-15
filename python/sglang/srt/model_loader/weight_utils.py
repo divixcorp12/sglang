@@ -1126,6 +1126,14 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def drop_files_cache(paths: List[str]) -> None:
+    """_drop_file_cache_after_load on every path, once the loaded model no longer maps them."""
+    for path in paths:
+        _drop_file_cache_after_load(path)
+    if paths:
+        logger.info("Dropped the page cache of %d weight files after loading", len(paths))
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
