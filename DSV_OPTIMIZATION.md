@@ -156,11 +156,20 @@ vs real 41.1%: read deltas, not absolutes.
 - **GPU drip explained:** drips land in scratch, not residency, so a used drip misses again next verify (measured
   neutral, 69.9 vs 69.3). If kept: land drips in a victim slot and commit residency.
 
-### 3.6 Hot-cache decay 0.995 — arm C in flight
+### 3.6 Hot-cache decay 0.995 — arm C: no detectable gain
 
-Existing env `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY` (0.98 today). Below serving noise, so the evidence is the
-routed-pair VRAM hit rate from the hot-cache metrics counters (expect +0.5-1 point vs arm A); ms/token must only show
-no regression.
+Existing env `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY` (0.98 today). Replay predicted +0.5-1 point of routed-pair VRAM
+hit rate. Arm C (`splitmodel-stream-mem-decay995`) measured 0.514 vs A 0.512: +0.2 points, inside the spread between
+identical configs (0.512-0.516). Insertions per forward were 140.9 vs 141.5. Timing (67.6 ms/token, mean verify 315)
+is confounded: the previous server left 23.2 GiB of file cache on node 1, both nodes went below low during load,
+kswapd1 ran, and 1.8 GiB was swapped out in decode. Team threads still took 0 major faults. **Not adopted; leave at
+0.98.**
+
+**Lesson for every run:** evict leftover file cache before launch, without root (posix_fadvise DONTNEED over the
+model, draft, row-image and Engram files). Log per-node free memory, and wait if node 1 lacks room for the HiCache
+pools. The sampler now records /proc/diskstats. The model shards are on sdb3 (SATA root volume), which fits arm A's
+first-shard stall. Open: ~280 GiB read per NVMe mirror partition during C's decode. Not yet known whether that is
+the server's own reads or an overlapping reader.
 
 ### 3.7 Prefill VRAM spike / hot-cache capacity — agent `prefill-merge`, branch `prefill-merge-chunk` (not pushed yet)
 
