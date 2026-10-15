@@ -121,9 +121,14 @@ def main() -> int:
     p.add_argument("--arm", choices=tuple(both_cpu_ab.ARMS), default="dspark-both-prefetch")
     p.add_argument("--no-verify-split", dest="verify_split", action="store_false",
                    help="skip the route log, router capture and accept log (verify_split.py's inputs)")
+    p.add_argument("--draft-top-prob", action="store_true",
+                   help="also log the draft's per-position top probability each verify (draft-top-prob.*.jsonl); "
+                        "one extra draft LM-head pass per verify, so compare timings only against runs with it on")
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
     env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    if a.draft_top_prob:
+        env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")
     argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
     with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(a.out_dir, "server.log"), "w") as log:

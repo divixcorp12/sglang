@@ -1881,6 +1881,10 @@ class Envs:
     # speculative/verify_accept_log.py), which joins the route log's verify forwards to split misses by verified
     # position (analysis/dsv41-drive/dspark/verify_split.py). Empty: nothing is written.
     SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH = EnvStr("")
+    # Trace runs: a path prefix for one JSON line per request per DSpark verify step with the draft's top-1/top-2
+    # probability at each draft position (speculative/dspark_components/dspark_draft_top_prob_log.py); recomputes the
+    # draft's step logits, one extra LM-head pass per verify. Empty: nothing is computed or written.
+    SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH = EnvStr("")
     # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
     # thread may take per MoE layer, in ms, before the process fails stop. The
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),

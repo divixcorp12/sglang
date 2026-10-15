@@ -52,6 +52,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft_top_prob_log import (
+    draft_top_probs,
+    get_draft_top_prob_log,
+)
 from sglang.srt.speculative.dspark_components.dspark_graphed_verify import (
     draft_graph_allowed,
     draft_runs_exl3,
@@ -473,6 +477,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        self._draft_top_prob_log = get_draft_top_prob_log()
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -855,6 +860,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        draft_probs = None
+        if self._draft_top_prob_log is not None:
+            # Before the verify: the draft graph's output hidden states are only live until then.
+            with self._draft_context():
+                draft_probs = draft_top_probs(
+                    draft_model=self.draft_model,
+                    raw_hidden=proposal.raw_hidden,
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_tokens=draft_tokens,
+                )
 
         confidence = proposal.confidence
         if confidence is None:
@@ -1034,6 +1050,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        if draft_probs is not None:
+            self._draft_top_prob_log.record(
+                rids=[req.rid for req in batch.reqs],
+                probs=draft_probs,
+                num_correct_drafts=accept.correct_len,
+            )
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,

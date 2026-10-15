@@ -85,6 +85,7 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
     folded: bool = False
+    raw_hidden: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -341,6 +342,7 @@ class DraftBlockProposer:
             confidence=folded_confidence,
             confidence_tap=confidence_tap,
             folded=folded,
+            raw_hidden=fwd.raw_hidden,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
