@@ -66,6 +66,14 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   engine takes the higher miss_key. Own env var, off. Cache-tiers replay: heaviest-first costs ~1 hit/verify,
   light-first or random 9-13 (~1 ms/token); the tiebreak guarantees the copy engine never gets the low-score lanes
   systematically. Offline re-score first, no serving unless asked.
+  - **Built:** `ae1b27c189`, `SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK` (off; refused without the split model).
+    The model's lane cost depends only on (node, tokens), so a tie is "same node, same token count" with no
+    tolerance. Within each such group the CPU keeps its count but takes the lowest residency keys, so predicted
+    finish times are unchanged by construction. Device `model_cpu_lanes` (cost words now 5N+6) plus Python mirror.
+  - **Replay (breakdown base):** saving unchanged (+16.94 ms/verify untraced, as greedy); inverted node-records
+    25.4% -> 13.9% (40.5 -> 17.9 pairs/verify); copy-lane next-verify reuse 0.396 -> 0.399 (table 0.402). Better
+    than slack 1 (20.9%, +16.75). The remaining inversions are between lanes with different token counts.
+    CPU tests 124 passed; GPU parity run queued after arm C. No serving run yet.
 
 ### 3.3 Startup calibration of the split-model constants — branch `split-model-calib` (`7171570959`), NOT merged
 
@@ -112,8 +120,12 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
     0.087 incl. prefill warm-up; 831k accesses). B (cache 0) was +3.3 ms/token and wait +7.1 ms/verify, though median
     verify was -4.8 ms and B's sessions flipped to 509 tokens: one run cannot size it. **Decision: keep the Engram
     cache at 5 GiB.**
-  - Found: `--weight-loader-drop-cache-after-load` does not reach the DSpark draft loader (4-5.6 GiB of draft
-    shard cache at ready). Fix in progress.
+  - Found: `--weight-loader-drop-cache-after-load` left the DSpark draft's 7.2 GB shard cached (4-5.6 GiB at
+    ready): the iterator's fadvise runs while a tensor from that shard is still mapped. Fixed in `7e77a55ba2`:
+    `DefaultModelLoader` drops the shards again after `load_weights_and_postprocess`. fincore test reproduces the
+    bug and the fix.
+  - Arm A's 6:19 load was not HiCache (pools took 6 s, as elsewhere): target shard 1 of 40 took 2:21 with no memory
+    pressure, most likely storage contention. The sampler now records /proc/diskstats.
   - C: A plus `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995` (section 3.6): did not run with A/B; running next.
 - **Not done (root, owner's):** `kernel.numa_balancing=0`; IRQ 239 (`eno1-tx-0`) off core 14 (a team0 core);
   optionally `swapoff -a && swapon -a`; possibly revert `compaction_proactiveness` to 20 (was set to 100).
