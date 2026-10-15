@@ -544,7 +544,11 @@ def test_launched_build_reaches_the_tree_through_a_link(tmp_path, monkeypatch):
     """The same module built from two clones must give ccache the same command
     and the same preprocessed text, so no path into the clone may survive."""
     source = str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh")
-    spec = _spec(cuda_files=(source,), cuda_wrappers=(("run", "K::run"),))
+    spec = _spec(
+        cuda_files=(source,),
+        cuda_wrappers=(("run", "K::run"),),
+        include_paths=(str(KERNEL_PATH / "include"),),
+    )
     text = _written_build_file(spec, tmp_path, monkeypatch, "ccache")
     wrapper = (tmp_path / "cuda.cu").read_text()
     root = str(ninja._SOURCE_ROOT)
