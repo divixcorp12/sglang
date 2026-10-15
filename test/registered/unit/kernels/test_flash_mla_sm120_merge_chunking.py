@@ -133,7 +133,7 @@ def _call(tokens: int, extra: bool, sink: bool, seed: int = 0):
 
 @SM120
 @pytest.mark.parametrize("extra", [True, False])
-@pytest.mark.parametrize("tokens", [4096, 2048 + 17, 65])
+@pytest.mark.parametrize("tokens", [4096, 2048 + 17, 171])
 @pytest.mark.parametrize("budget_mb", [64, 1])
 def test_kernel_output_is_bitwise_unchunked(extra, tokens, budget_mb):
     run = _call(tokens, extra, sink=True)
