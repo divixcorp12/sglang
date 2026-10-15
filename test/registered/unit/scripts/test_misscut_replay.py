@@ -8,6 +8,7 @@ _PATH = os.path.join(
 _spec = importlib.util.spec_from_file_location("misscut_replay", _PATH)
 mr = importlib.util.module_from_spec(_spec)
 sys.path.insert(0, os.path.dirname(_PATH))
+sys.modules["misscut_replay"] = mr  # dataclasses resolves string annotations through the module
 _spec.loader.exec_module(mr)
 
 SPLIT = [0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8]
