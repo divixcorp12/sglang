@@ -296,6 +296,26 @@ ARMS[GPU_DRIP_LEAN_ARM] = (
     {**ARMS[GPU_DRIP_ARM][0], "SGLANG_DSV41_GPU_DRIP_PICKS": "2", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "64"},
     True,
 )
+# Whole layers held in the pinned tier and per-layer CPU split tables are off in every arm but the pin ones, pinned so
+# a shell that exports them cannot carry them into one.
+FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
+SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[FULL_LAYERS] = ""
+    _overrides_of_arm[SPLIT_LAYERS] = ""
+# Layers 0 and 1 read 6.6 and 4.5 experts a verify from NVMe, which the L+2 prefetch cannot reach
+# (ram-prefetch/breakdown-20261015). Each full layer takes 204 rows a node (192 homed experts, 8 staging, 2 pool, 2
+# seam), 5182 MiB a node for the pair; the other 7:6 remainder buys the 7966 rows layers 2-39 hold today (210/209).
+PIN01_BUDGET = {"SGLANG_MOE_PINNED_HOST_MB": "111530", "SGLANG_MOE_PINNED_HOST_NUMA_MB": "0:59656,1:51874"}
+PIN01_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-pin01"
+ARMS[PIN01_ARM] = ({**ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0], FULL_LAYERS: "0,1", **PIN01_BUDGET}, True)
+# k*(n) with each group's forced CPU lanes counted (8.4 at layer 0, 4.9 at layer 1, the spilled lanes above), at 0.55
+# ms a CPU lane and 1.1 ms a link lane shared by both groups, capped at the fixed split A: only lanes move to the link.
+# At the 2-4 eligible lanes a group sees, layer 0 moves 1-2 a group and layer 1 at most 1.
+PIN01_SPLIT_L0 = "0,0,0,1,2,3,3,4,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17,17,18,19,19,20,21,21,22,23,23,24,24,25,26,26"
+PIN01_SPLIT_L1 = "0,0,1,2,3,3,4,5,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17,17,18,19,19,20,21,21,22,23,23,24,24,25,26,26"
+PIN01_GPU01_ARM = PIN01_ARM + "-gpu01"
+ARMS[PIN01_GPU01_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_LAYERS: f"0:{PIN01_SPLIT_L0};1:{PIN01_SPLIT_L1}"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -339,6 +359,8 @@ REFERENCE = {
     TOP_PROB_GATE_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
     GPU_DRIP_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
     GPU_DRIP_LEAN_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
+    PIN01_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
+    PIN01_GPU01_ARM: PIN01_ARM,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "

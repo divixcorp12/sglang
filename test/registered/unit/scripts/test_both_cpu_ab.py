@@ -388,6 +388,10 @@ PROMOTE_POOL_SERVE_ARM = f"{PROMOTE_ON}-poolserve"
 GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
 GPU_DRIP_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-gpudrip"
 GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
+PIN01_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-pin01"
+PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
+FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
+SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
 PROMOTE_PAIR_ARMS = (
     PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
     f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit",
@@ -395,6 +399,8 @@ PROMOTE_PAIR_ARMS = (
     f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-confgate",
     GPU_DRIP_ARM,
     GPU_DRIP_LEAN_ARM,
+    PIN01_ARM,
+    PIN01_GPU01_ARM,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -662,6 +668,42 @@ def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_dri
         k: v for k, v in drip.items() if k not in lean_knobs
     }
     assert ab.REFERENCE[GPU_DRIP_LEAN_ARM] == base and ab._overrides(GPU_DRIP_LEAN_ARM, "/out")[SPLIT] == "0:3,1:5"
+
+
+def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(monkeypatch):
+    """pin01 is its fixed-split reference with layers 0 and 1 held whole on a budget raised for them, and gpu01 is pin01
+    with the two layers' split tables; every other arm states both knobs empty against a shell's. The budget buys each
+    full layer's 204 rows a node and leaves the other layers' 7:6 remainder at least today's rows. Mutant: an arm
+    inherits a shell's list or tables, a pin arm changes another knob, is compared with the wrong arm, or loses the
+    fixed split -- red."""
+    ab = _ab()
+    monkeypatch.setenv(FULL_LAYERS, "5")
+    monkeypatch.setenv(SPLIT_LAYERS, "5:0")
+    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM) else ""), arm
+            assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
+    reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
+    pin, plain, gpu = ab.ARMS[PIN01_ARM][0], ab.ARMS[reference][0], ab.ARMS[PIN01_GPU01_ARM][0]
+    budget = {"SGLANG_MOE_PINNED_HOST_MB", "SGLANG_MOE_PINNED_HOST_NUMA_MB"}
+    knobs = budget | {FULL_LAYERS}
+    assert {k: v for k, v in pin.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
+    assert {k: v for k, v in gpu.items() if k != SPLIT_LAYERS} == pin
+    assert ab.REFERENCE[PIN01_ARM] == reference and ab.REFERENCE[PIN01_GPU01_ARM] == PIN01_ARM
+    for arm in (PIN01_ARM, PIN01_GPU01_ARM):
+        assert ab.ARMS[arm][1] is True and ab._overrides(arm, "/out")[SPLIT] == "0:3,1:5"
+    nodes = [(int(n), int(mib) << 20) for n, mib in (e.split(":") for e in pin["SGLANG_MOE_PINNED_HOST_NUMA_MB"].split(","))]
+    assert sum(b for _, b in nodes) == int(pin["SGLANG_MOE_PINNED_HOST_MB"]) << 20
+    row = 13_315_584  # one DSV4.1 EXL3 expert row (2026-10-14 startup log: 111664487424 bytes / 8386 rows)
+    rest = [b - 2 * 204 * row for _, b in nodes]
+    assert sum(rest) // row >= 24 * 210 + 14 * 209 and abs(rest[0] / rest[1] - 57344 / 49152) < 1e-3
+    for spec in gpu[SPLIT_LAYERS].split(";"):
+        _, table = spec.split(":")
+        split = [int(v) for v in table.split(",")]
+        fixed = [0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 13, 14, 15, 15, 16, 17, 17, 18, 19, 19,
+                 20, 21, 21, 22, 23, 23, 24, 24, 25, 26, 26]
+        assert len(split) == len(fixed) and all(a <= b for a, b in zip(split, fixed))  # only lanes to the link
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
