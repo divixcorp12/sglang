@@ -361,9 +361,11 @@ OFF_PRE_LOAD_GIB = 29.35
 OFF_KV_TOKENS = 339712
 KV_BYTES_PER_TOKEN = 1670.75
 HOT_SLOT_BYTES = 13315584
-# Free memory before loading moved 0.02 GiB between launches (29.33 in mem-budget/L2, 29.35 here); the KV budget moves
-# by that times the fraction, so the fraction carries it as margin and --max-total-tokens pins the pool.
-PRE_LOAD_JITTER_GIB = 0.02
+# Free memory before loading moved 0.12 GiB between launches (29.33 in mem-budget/L2 to 29.45 in
+# /mnt/nvme1/prefill-merge/peaks/m1-off-b0); the KV budget moves by that times the fraction, so the fraction carries it
+# as margin and --max-total-tokens pins the pool. With the pool pinned the margin is free: prefill headroom is whatever
+# the pinned pool leaves, whatever the fraction.
+PRE_LOAD_JITTER_GIB = 0.12
 
 
 def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
@@ -379,8 +381,10 @@ def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
     return f"{-(-round((off + (hot + kv + jitter) / pre_load) * 1e6) // 100) / 1e4:.4f}"
 
 
-# The splitmodel -mem arm with the merge chunked under MERGE_CHUNK_MB, which frees about 1.5 GiB of the 4096-token
-# prefill peak, spent on the hot cache (arm_env's TODO at DSPARK_MEM_FRACTION_STATIC); the KV pool is pinned.
+# The splitmodel -mem arm with the merge chunked under MERGE_CHUNK_MB, spent on the hot cache (arm_env's TODO at
+# DSPARK_MEM_FRACTION_STATIC); the KV pool is pinned. Measured by prefill_peak_probe.py (/mnt/nvme1/prefill-merge/peaks,
+# 4096- and 30k-token prompts; the peak is set at startup, the 30k prompt adds 2 MiB): the OFF arm peaks 4337 MiB above
+# init, 3120 chunked (1217 MiB freed), and this arm (at 0.8229, KV 381,184, hot 12040) leaves 630 MiB free at its peak.
 MERGE_CHUNK_MB = 128
 MERGE_HOT_GPU_MB = 12040
 MERGE_KV_TOKENS = 381184
