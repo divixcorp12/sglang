@@ -78,6 +78,13 @@ def _generate(tokens: int, seed: int) -> dict:
         return json.loads(r.read())
 
 
+def _post(path: str, body: dict | None = None) -> None:
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", data=json.dumps(body or {}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        r.read()
+
+
 def _from_log(path: str) -> dict:
     with open(path, errors="replace") as f:
         text = f.read()
@@ -95,6 +102,9 @@ def main() -> int:
     p.add_argument("--arm", choices=tuple(both_cpu_ab.ARMS), required=True)
     p.add_argument("--env", action="append", default=[], help="K=V on top of the arm's overrides")
     p.add_argument("--prompt-tokens", default="4096,30000")
+    p.add_argument("--mem-profile", action="store_true",
+                   help="record torch's allocator history (/start_profile MEM) over the first prompt; the snapshot "
+                        "pickle lands in OUT_DIR (raise SGLANG_MEM_PROFILE_MAX_ENTRIES with --env for a long prompt)")
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
     extra = dict(kv.split("=", 1) for kv in a.env)
@@ -116,6 +126,9 @@ def main() -> int:
             time.sleep(5)
             result["healthy_used_mib"] = sampler.samples[-1][1]
             for i, n in enumerate(int(x) for x in a.prompt_tokens.split(",")):
+                profiling = a.mem_profile and i == 0
+                if profiling:
+                    _post("/start_profile", {"activities": ["MEM"], "output_dir": os.path.abspath(a.out_dir)})
                 start = time.monotonic()
                 try:
                     _generate(n, seed=i)
@@ -123,6 +136,8 @@ def main() -> int:
                 except OSError as e:
                     ok = repr(e)
                 end = time.monotonic()
+                if profiling:
+                    _post("/stop_profile")
                 time.sleep(1)
                 peak = sampler.peak(start, end + 1)
                 result["prompts"].append({"tokens": n, "ok": ok, "seconds": end - start, "peak_used_mib": peak,
