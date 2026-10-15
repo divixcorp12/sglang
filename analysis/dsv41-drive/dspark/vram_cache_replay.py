@@ -58,7 +58,7 @@ import sys
 INF = 1 << 60
 
 
-def load(d: str, skip: int):
+def load(d: str, skip: int, pred: str | None = None):
     header, recs = None, []
     with open(os.path.join(d, "stages.jsonl")) as f:
         for line in f:
@@ -72,7 +72,21 @@ def load(d: str, skip: int):
         raise ValueError(f"{d}: no schema-2 graph_routes with hot sets")
     attach_acceptance(d, recs)
     attach_router(d, recs, header)
+    if pred:
+        attach_pred(pred, recs)
     return header, recs[skip:]
+
+
+def attach_pred(path: str, recs: list) -> None:
+    """Join a predictor file (npz: router, layer, expert, p) to the records by router index."""
+    import numpy as np
+
+    a = np.load(path)
+    by = collections.defaultdict(dict)
+    for ri, L, e, p in zip(a["router"].tolist(), a["layer"].tolist(), a["expert"].tolist(), a["p"].tolist()):
+        by[ri].setdefault(L, {})[e] = p
+    for r in recs:
+        r["pred"] = by.get(r.get("router"))
 
 
 def attach_router(d: str, recs: list, header: dict) -> None:
@@ -152,6 +166,9 @@ class LayerTrace:
         self.train = [bool(r.get("train", True)) for r in recs]
         self.gate_w = [(r.get("gate_w") or [None] * (layer + 1))[layer] for r in recs]
         self.has_gate_w = all(g is not None for g in self.gate_w)
+        # an external gather-time predictor (next_verify_head.py predict): expert -> P(routed next verify)
+        self.pred = [((r.get("pred") or {}).get(layer)) for r in recs]
+        self.has_pred = all(p is not None for p in self.pred)
         for r in recs:
             flat = r["routes"][layer]
             ntok = int(r.get("forward_tokens") or 1)
@@ -442,6 +459,9 @@ class LayerTrace:
                 rng.shuffle(plan)
             elif order == "table":
                 plan = sorted(misses, key=lambda e: (-p_miss[e], -score[e], e))
+            elif order == "head":
+                ph = self.pred[t] or {}
+                plan = sorted(misses, key=lambda e: (-ph.get(e, 0.0), -score[e], e))
             else:
                 raise ValueError(order)
             k = len(plan)
@@ -515,8 +535,9 @@ def predictor_report(traces: list, tables: dict, decay: float) -> dict:
     lanes the capture inserted), the share routed next verify (precision) and their share of all recurring misses
     (recall); of the k unrouted residents each key would evict first, the share not routed next verify. ``actual``
     is what the capture inserted and evicted; ``oracle`` knows the next verify."""
-    keys = ("actual", "score", "score+cur", "table", "oracle")
+    keys = ("actual", "score", "score+cur", "table", "head", "oracle")
     agg = {k: collections.Counter() for k in keys}
+    has_pred = all(tr.has_pred for tr in traces)
     for tr in traces:
         score = collections.defaultdict(float)
         for t, misses, residents in tr.feature_pass(decay):
@@ -540,6 +561,10 @@ def predictor_report(traces: list, tables: dict, decay: float) -> dict:
                     "oracle": ([e for e, _, y in sorted(misses, key=lambda m: (not m[2], m[0]))][:k],
                                [r for r, _, y in sorted(residents, key=lambda m: (m[2], m[0]))][:kv]),
                 }
+                if has_pred:
+                    ph = tr.pred[t] or {}
+                    rank["head"] = ([e for e, _, _ in sorted(misses, key=lambda m: (-ph.get(m[0], 0.0), -score[m[0]], m[0]))][:k],
+                                    rank["table"][1])
                 for key, (ins, ev) in rank.items():
                     a = agg[key]
                     a["k"] += k
@@ -554,7 +579,7 @@ def predictor_report(traces: list, tables: dict, decay: float) -> dict:
                 score[e] += c
     return {key: {"precision": a["tp"] / max(1, a["k"]), "recall": a["tp"] / max(1, a["recur"]),
                   "evict_precision": a["good_evict"] / max(1, a["kv"]), "k_per_forward": a["k"]}
-            for key, a in agg.items()}
+            for key, a in agg.items() if a["k"]}
 
 
 def quantiles(xs, qs=(0.5, 0.75, 0.9)):
@@ -603,6 +628,8 @@ POLICIES = [
     ("table-lanes-k", "score", dict(actual_k=True, order="table", victim_by="score")),
     ("table-victims-k", "score", dict(actual_k=True, order="cur", victim_by="table")),
     ("table-k-d0.995", "score", dict(actual_k=True, order="table", victim_by="table", decay=0.995)),
+    ("head-k", "score", dict(actual_k=True, order="head", victim_by="table")),
+    ("head-lanes-k", "score", dict(actual_k=True, order="head", victim_by="score")),
     ("next1", "next1", {}),
     ("next1-k", "next1", dict(actual_k=True)),
     ("belady", "belady", {}),
@@ -620,10 +647,11 @@ def main() -> int:
     ap.add_argument("--budgets", default="853,951,1200,1600")
     ap.add_argument("--ms-per-hit", type=float, default=0.37,
                     help="traced ms a VRAM hit saves (lane_cost_fit.py: the lane-mix-weighted marginal cost)")
+    ap.add_argument("--pred", default=None, help="next_verify_head.py predict output (npz) to score as 'head'")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
-    header, recs = load(args.capture, args.skip)
+    header, recs = load(args.capture, args.skip, args.pred)
     layers = list(range(len(header["layer_ids"])))
     cap_hdr = header["hot_capacity"]
     # whole-request split: every other request (by first appearance) trains the tables, the rest test them
@@ -696,7 +724,10 @@ def main() -> int:
     base_hits = res["actual"]["hits_per_verify"]
     base_ins = res["actual"]["inserted_per_verify"]
     n_test = res["split"]["test_forwards"]
+    has_pred = all(tr.has_pred for tr in traces)
     for name, pol, kw in POLICIES:
+        if kw.get("order") == "head" and not has_pred:
+            continue
         tot = collections.Counter()
         rows = []
         for tr in traces:
