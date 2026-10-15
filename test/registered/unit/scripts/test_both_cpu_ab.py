@@ -388,6 +388,7 @@ PROMOTE_POOL_SERVE_ARM = f"{PROMOTE_ON}-poolserve"
 PROMOTE_PAIR_ARMS = (
     PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
     f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit",
+    f"{PROMOTE_POOL_SERVE_ARM}-cores13-fixedsplit",
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -593,6 +594,21 @@ def test_the_fixed_split_option_adds_the_table_and_calibration_off_to_both_arms_
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), f"{PROMOTE_ON}-fixedsplit"])
     with pytest.raises(SystemExit, match=SPLIT):
         ab.main()
+
+
+def test_the_cores13_arm_differs_from_its_base_in_node_1s_cpu_expert_cores_alone():
+    """Mutant: the arm also changes node 0's team or another knob, or lists a core another thread holds -- red."""
+    ab = _ab()
+    base = ab.ARMS[f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"][0]
+    cores = ab.ARMS[f"{PROMOTE_POOL_SERVE_ARM}-cores13-fixedsplit"][0]
+    knobs = ("SGLANG_DSV41_CPU_EXPERTS_THREADS", "SGLANG_EXPERT_NUMA_CORES")
+    assert {k: v for k, v in cores.items() if k not in knobs} == {k: v for k, v in base.items() if k not in knobs}
+    from sglang.srt.layers.moe.cpu_experts.threading_config import parse_numa_cores
+
+    plan = parse_numa_cores(cores["SGLANG_EXPERT_NUMA_CORES"])
+    assert plan[0]["cpu"] == list(range(6, 16))
+    assert len(plan[1]["cpu"]) == int(cores["SGLANG_DSV41_CPU_EXPERTS_THREADS"]) == 13
+    assert not set(plan[1]["cpu"]) & set(range(28, 32)) and 35 not in plan[1]["cpu"]
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
