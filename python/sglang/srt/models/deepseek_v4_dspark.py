@@ -514,7 +514,10 @@ class DSparkV4MarkovHead(nn.Module):
             self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
         )
 
-    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+    def sample_block_greedy_fused(
+        self, base_logits, *, first_prev_tokens, top_prob_out=None
+    ):
+        """``top_prob_out`` ([bs, steps] float32), when given, receives each step's softmax top-1 probability."""
         if not self.supports_sharded_greedy or not base_logits.is_cuda:
             return None
         from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
@@ -535,6 +538,7 @@ class DSparkV4MarkovHead(nn.Module):
                 group=self._shard_group,
                 vocab_start=shard.org_vocab_start,
                 gather=self._vocab_gather.gather_stacked,
+                top_prob_out=None if top_prob_out is None else top_prob_out[:, step],
             )
             tokens.append(prev)
         return torch.stack(tokens, dim=1)

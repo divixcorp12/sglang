@@ -273,6 +273,86 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     assert torch.equal(got, torch.full_like(x, 1.5))  # the routed scale still applies
 
 
+def test_a_dead_verify_row_adds_no_distinct_expert_and_no_weight():
+    """A dead row (DSpark's top-probability gate cut it) takes row 0's experts at weight 0, so the deduplicating route
+    planner sees no expert a live row does not route, and its routes in the protect set / CPU mask are -1."""
+    from sglang.srt.layers.moe.verify_dead_rows import (
+        VerifyDeadRows,
+        mask_dead_rows_for_graph,
+    )
+
+    dead_rows = VerifyDeadRows(max_rows=6, device="cpu")
+    topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.5, 0.5], [0.25, 0.75], [0.1, 0.9], [0.6, 0.4]])
+    x = torch.arange(12, dtype=torch.float32).view(4, 3)
+    routes = torch.full((10,), 99, dtype=torch.long)
+
+    def mask():
+        return mask_dead_rows_for_graph(
+            topk_ids=topk_ids, topk_weights=topk_weights, dead=dead_rows.dead, routes=routes, x=x
+        )
+
+    dead_rows.set_live_rows(torch.tensor([2]))
+    ids, weights, row0_x = mask()
+    assert set(ids.flatten().tolist()) == {0, 1, 2, 3}
+    assert torch.equal(ids[:2], topk_ids[:2]) and torch.equal(weights[:2], topk_weights[:2])
+    assert torch.equal(weights[2:], torch.zeros(2, 2))
+    assert routes.tolist() == [0, 1, 2, 3, -1, -1, -1, -1, 99, 99]
+    assert torch.equal(row0_x[:2], x[:2]) and torch.equal(row0_x[2:], x[:1].expand(2, 3))
+    # Outside a gated verify every row is live: the masking is an identity.
+    dead_rows.clear()
+    ids, weights, row0_x = mask()
+    assert torch.equal(ids, topk_ids) and torch.equal(weights, topk_weights) and torch.equal(row0_x, x)
+    assert routes.tolist() == list(range(8)) + [99, 99]
+    dead_rows.set_live_rows(torch.tensor([6]))
+    assert not bool(dead_rows.dead.any())
+
+
+def test_apply_hands_a_verifys_dead_rows_to_the_graph_gather_and_masks_them_on_the_eager_path(monkeypatch):
+    """Mutant: a layer the verify's dead rows reached drops them on either path, or masks a prefill chunk -- red."""
+    calls, streamed = [], []
+
+    def fake_apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit, dead=None):
+        calls.append((topk_ids, dead))
+        return torch.ones_like(x)
+
+    def fake_apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit, route_plan=False):
+        streamed.append((topk_weights, topk_ids))
+        return torch.ones_like(x)
+
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows
+
+    monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
+    monkeypatch.setattr(Exl3MoEMethod, "_apply_streamed", staticmethod(fake_apply_streamed))
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
+        layer = _layer(method)
+    graph_gather = [True]
+    layer._nvfp4_expert_streamer = types.SimpleNamespace(serves_graph_gather=lambda topk: graph_gather[0])
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+    )
+    dead_rows = VerifyDeadRows(max_rows=3, device="cpu")
+    method.verify_dead_rows = dead_rows.dead
+    dead_rows.set_live_rows(torch.tensor([1]))
+    topk_ids = torch.tensor([[5, 0], [3, 1], [2, 4]], dtype=torch.int32)
+    x, topk_weights, dispatch = _routed_inputs(topk_ids)
+
+    method.apply(layer, dispatch)
+    # The in-graph path masks inside _apply_graph, in one kernel with its routes write.
+    assert calls[0][0] is topk_ids and calls[0][1] is dead_rows.dead
+    # More rows than a verify has: a prefill chunk, never masked.
+    method.apply(layer, _routed_inputs(torch.tensor([[5, 0]] * 4, dtype=torch.int32))[2])
+    assert calls[1][1] is None
+    # The eager re-run of an overflowed verify masks before its streamed gather.
+    graph_gather[0] = False
+    method.apply(layer, dispatch)
+    weights, ids = streamed[0]
+    assert ids.tolist() == [[5, 0]] * 3
+    assert torch.equal(weights[0], topk_weights[0]) and not bool(weights[1:].any())
+
+
 def _select(x, logits, cfg):
     from sglang.srt.layers.moe.topk import select_experts
 

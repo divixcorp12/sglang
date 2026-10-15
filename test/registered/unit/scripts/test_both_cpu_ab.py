@@ -389,6 +389,7 @@ PROMOTE_PAIR_ARMS = (
     PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
     f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit",
     f"{PROMOTE_POOL_SERVE_ARM}-cores13-fixedsplit",
+    f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-confgate",
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -611,6 +612,23 @@ def test_the_cores13_arm_differs_from_its_base_in_node_1s_cpu_expert_cores_alone
     assert not set(plan[1]["cpu"]) & set(range(28, 32)) and 35 not in plan[1]["cpu"]
     # The launch refuses node 0's RAM core named both here and by the spin core the recipe sets.
     assert "ram" not in plan[0] and ab.arm_env.arm_env(cores)["SGLANG_DSV41_RAM_MISS_SPIN_CORE"]
+
+
+def test_the_gate_arm_is_its_fixed_split_reference_with_the_gate_alone_and_every_other_arm_pins_it_off(monkeypatch):
+    """Mutant: an arm inherits a shell's gate, the gate arm changes another knob, is compared with the wrong arm, or
+    loses the driver's fixed split -- red."""
+    ab = _ab()
+    gate, arm = "SGLANG_DSPARK_TOP_PROB_GATE", f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-confgate"
+    reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
+    assert arm == "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-poolserve-fixedsplit-confgate"
+    monkeypatch.setenv(gate, "0.9")
+    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    for name in ab.ARMS:
+        assert ab._overrides(name, "/out")[gate] == ("0.4" if name == arm else "0"), name
+    on, off = ab.ARMS[arm][0], ab.ARMS[reference][0]
+    assert {k: v for k, v in on.items() if k != gate} == {k: v for k, v in off.items() if k != gate}
+    assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == reference
+    assert ab._overrides(arm, "/out")[SPLIT] == "0:3,1:5"
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

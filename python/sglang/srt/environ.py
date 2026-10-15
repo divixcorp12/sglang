@@ -811,6 +811,10 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # The top-probability verify gate (speculative/dspark_components/dspark_top_prob_gate.py): a verify stops at the
+    # first draft where the running product of the draft's top-1 softmax probabilities falls below this, and the
+    # target routes no experts for the positions past it. 0 is off. 0.4 was the offline replay's best.
+    SGLANG_DSPARK_TOP_PROB_GATE = EnvFloat(0.0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
