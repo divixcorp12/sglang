@@ -387,9 +387,11 @@ POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-poolserve"
 PROMOTE_POOL_SERVE_ARM = f"{PROMOTE_ON}-poolserve"
 GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
 GPU_DRIP_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-gpudrip"
+GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
 PROMOTE_PAIR_ARMS = (
     PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
     f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit", GPU_DRIP_ARM,
+    GPU_DRIP_LEAN_ARM,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -605,7 +607,7 @@ def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_dri
     monkeypatch.setenv(GPU_DRIP, "7")
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in ab.ARMS:
-        want = "24" if arm == GPU_DRIP_ARM else "0"
+        want = "24" if arm in (GPU_DRIP_ARM, GPU_DRIP_LEAN_ARM) else "0"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[GPU_DRIP] == want, arm
     base = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
@@ -616,6 +618,13 @@ def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_dri
     assert ab.ARMS[GPU_DRIP_ARM][1] is True and ab.REFERENCE[GPU_DRIP_ARM] == base
     assert ab._overrides(GPU_DRIP_ARM, "/out")[SPLIT] == "0:3,1:5"
     assert {"drip_issued", "drip_landed", "drip_used", "drip_abandoned"} <= set(ab.RAM_KEYS)
+    lean = ab.ARMS[GPU_DRIP_LEAN_ARM][0]
+    lean_knobs = {"SGLANG_DSV41_GPU_DRIP_PICKS": "2", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "64"}
+    assert {k: lean[k] for k in lean_knobs} == lean_knobs
+    assert {k: v for k, v in lean.items() if k not in lean_knobs} == {
+        k: v for k, v in drip.items() if k not in lean_knobs
+    }
+    assert ab.REFERENCE[GPU_DRIP_LEAN_ARM] == base and ab._overrides(GPU_DRIP_LEAN_ARM, "/out")[SPLIT] == "0:3,1:5"
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

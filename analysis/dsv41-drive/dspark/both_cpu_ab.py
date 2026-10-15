@@ -268,6 +268,13 @@ ARMS[GPU_DRIP_ARM] = (
     },
     True,
 )
+# The drip arm moving about half the bytes: the top 2 picks (4 used about 48% of landed rows) in 64 KiB chunks
+# (about 5 us of link a pull or post can wait behind); same reference.
+GPU_DRIP_LEAN_ARM = GPU_DRIP_ARM + "-c64p2"
+ARMS[GPU_DRIP_LEAN_ARM] = (
+    {**ARMS[GPU_DRIP_ARM][0], "SGLANG_DSV41_GPU_DRIP_PICKS": "2", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "64"},
+    True,
+)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -309,6 +316,7 @@ REFERENCE = {
     PROMOTE_POOL_SERVE_ARM: PROMOTE_ON_ARM,
     PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX,
     GPU_DRIP_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
+    GPU_DRIP_LEAN_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
