@@ -609,6 +609,8 @@ def test_the_cores13_arm_differs_from_its_base_in_node_1s_cpu_expert_cores_alone
     assert plan[0]["cpu"] == list(range(6, 16))
     assert len(plan[1]["cpu"]) == int(cores["SGLANG_DSV41_CPU_EXPERTS_THREADS"]) == 13
     assert not set(plan[1]["cpu"]) & set(range(28, 32)) and 35 not in plan[1]["cpu"]
+    # The launch refuses node 0's RAM core named both here and by the spin core the recipe sets.
+    assert "ram" not in plan[0] and ab.arm_env.arm_env(cores)["SGLANG_DSV41_RAM_MISS_SPIN_CORE"]
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
