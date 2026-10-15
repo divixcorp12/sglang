@@ -48,13 +48,6 @@ SGL_DEVICE uint4 ld_relaxed_sys_v4(const uint8_t* address) {
   return v;
 }
 
-// Two u64 words, each single-copy atomic (a v4.b32 load may tear a u64 the host stores whole).
-SGL_DEVICE ulonglong2 ld_relaxed_sys_v2_u64(const uint8_t* address) {
-  ulonglong2 v;
-  asm volatile("ld.relaxed.sys.global.v2.u64 {%0, %1}, [%2];" : "=l"(v.x), "=l"(v.y) : "l"(address) : "memory");
-  return v;
-}
-
 // Relaxed system-scope accessors. Every word the host or another kernel accesses concurrently goes through these or
 // the acquire/release forms above, so each call site states its ordering.
 //

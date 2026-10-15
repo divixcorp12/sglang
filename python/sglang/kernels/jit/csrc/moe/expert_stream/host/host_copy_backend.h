@@ -40,6 +40,17 @@ class HostCopyBackend : public CopyBackend {
     return 0;
   }
 
+  /// An 8-byte copy from the open mark's own copy of `value`, landing with the mark like any copy.
+  int write64(uint64_t dst, uint64_t value) override {
+    if (fail_issue_.load(std::memory_order_acquire)) return kIssueFailed;
+    Mark& mark = marks_[open_ % kMarks];
+    if (mark.count == kEntries) return kMarkFull;
+    mark.values[mark.count] = value;
+    mark.entries[mark.count] = CopyEntry{reinterpret_cast<uint64_t>(&mark.values[mark.count]), dst, 8};
+    ++mark.count;
+    return 0;
+  }
+
   /// Closes the open mark (its token is the number of marks closed before it) and opens the next.
   int mark(int64_t* token) override {
     *token = open_++;
@@ -87,6 +98,7 @@ class HostCopyBackend : public CopyBackend {
  private:
   struct Mark {
     std::array<CopyEntry, kEntries> entries{};
+    std::array<uint64_t, kEntries> values{};  // write64's sources
     int count = 0;
   };
   std::array<Mark, kMarks> marks_{};  // about 0.5 MB, allocated once with the backend

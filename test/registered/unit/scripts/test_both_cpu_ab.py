@@ -605,12 +605,12 @@ def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_dri
     monkeypatch.setenv(GPU_DRIP, "7")
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in ab.ARMS:
-        want = "12" if arm == GPU_DRIP_ARM else "0"
+        want = "24" if arm == GPU_DRIP_ARM else "0"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[GPU_DRIP] == want, arm
     base = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
     drip, plain = ab.ARMS[GPU_DRIP_ARM][0], ab.ARMS[base][0]
-    knobs = {GPU_DRIP: "12", "SGLANG_DSV41_GPU_DRIP_PICKS": "4", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "1024"}
+    knobs = {GPU_DRIP: "24", "SGLANG_DSV41_GPU_DRIP_PICKS": "4", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "256"}
     assert {k: drip[k] for k in knobs} == knobs and plain[GPU_DRIP] == "0"
     assert {k: v for k, v in drip.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
     assert ab.ARMS[GPU_DRIP_ARM][1] is True and ab.REFERENCE[GPU_DRIP_ARM] == base

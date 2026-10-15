@@ -1487,6 +1487,7 @@ COUNTERS = (
     "drip_used",
     "drip_abandoned",
     "drip_no_slot",
+    "drip_paused",
 )
 
 # The counters a production host keeps: the shutdown line's served, rows and errors,
@@ -1534,13 +1535,16 @@ CORE_COUNTERS = (
     "drip_used",
     "drip_abandoned",
     "drip_no_slot",
+    "drip_paused",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
 # A speculative pool entry's states (host/ram_prefetch.h kPoolEmpty, kPoolReading, kPoolLanded, kPoolSwapped).
 SPEC_POOL_STATES = ("empty", "reading", "landed", "swapped")
-# A GPU drip scratch slot's states (host/gpu_drip.h kFree, kFilling, kPublished, kRetiring).
-DRIP_STATES = ("free", "filling", "published", "retiring")
+# The GPU drip's scratch table: a u64 per slot (lease_layout.h kScratchSlots).
+DRIP_TABLE_SLOTS = 32
+# A GPU drip scratch slot's states (host/gpu_drip.h kFree, kFilling, kPublished, kRetiring, kPublishing, kClearing).
+DRIP_STATES = ("free", "filling", "published", "retiring", "publishing", "clearing")
 
 
 def seqlock_stress(
@@ -1896,6 +1900,7 @@ class ExpertStreamHost:
         # The GPU drip's candidate page and scratch tensors (enable_gpu_drip, set_drip_scratch), read by address.
         self.drip_candidates: Optional[torch.Tensor] = None
         self.drip_scratch: tuple = ()
+        self.drip_table: Optional[torch.Tensor] = None
         # Allocated here when the caller passes none.
         if lease_block is None:
             lease_block = expert_lease_block.new_lease_block(
@@ -2465,14 +2470,18 @@ class ExpertStreamHost:
         # The page is read through its address: keep it alive with the host.
         self.drip_candidates = candidates
 
-    def set_drip_scratch(self, scratch: Sequence[torch.Tensor]) -> None:
+    def set_drip_scratch(self, scratch: Sequence[torch.Tensor], table: torch.Tensor) -> None:
         """The drip's scratch tensors, one per copy-table entry in its order, each ``[slots, ...]`` rows of that
-        entry's row bytes. The caller keeps them alive while the host runs."""
+        entry's row bytes, and its scratch table: int64 [DRIP_TABLE_SLOTS], zeroed, which the copy stream writes and
+        the post reads (device memory on a GPU, ``ExpertStreamDevice.enable_gpu_drip``'s). Kept alive here."""
+        if table.dtype != torch.int64 or table.numel() != DRIP_TABLE_SLOTS or not table.is_contiguous():
+            raise ValueError(f"the drip's scratch table is a contiguous int64 [{DRIP_TABLE_SLOTS}] tensor")
         entries = torch.tensor(
             [[int(t.data_ptr()), t.numel() // t.shape[0] * t.element_size()] for t in scratch], dtype=torch.int64
         ).reshape(-1, 2)
-        self._module.expert_stream_set_drip_scratch(self.handle, entries)
+        self._module.expert_stream_set_drip_scratch(self.handle, entries, int(table.data_ptr()))
         self.drip_scratch = tuple(scratch)
+        self.drip_table = table
 
     def drip_offer(self, row: int, experts: Sequence[int]) -> None:
         """Test only: offer ``experts`` to the drip for ``row`` as a scored record's picks. Instrumented build only."""
@@ -3451,6 +3460,7 @@ class ExpertStreamDevice:
         # compacted HIT_SCRATCH lanes.
         self.drip_slots = 0
         self.drip_picks = 0
+        self.scratch_table = torch.zeros(DRIP_TABLE_SLOTS, dtype=torch.int64, device=device)  # unread while off
         self.scratch_go_1 = torch.zeros(1, dtype=torch.int32, device=device)
         self.scratch_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
         self.scratch_dst_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
@@ -3563,13 +3573,17 @@ class ExpertStreamDevice:
         self.map_bank["dst_rows"][row] = int(dst_rows)
         self.map_bank["ce_ok"][row] = 1
 
-    def enable_gpu_drip(self, slots: int, *, picks: int = 0) -> None:
+    def enable_gpu_drip(self, slots: int, *, table: torch.Tensor, picks: int = 0) -> None:
         """The GPU drip (host/gpu_drip.h, the host's ``enable_gpu_drip``): every captured armed post from now on reads
-        the scratch table's first ``slots`` words and types a lane whose (row, expert) one names HIT_SCRATCH, for C1s
+        the first ``slots`` words of ``table`` (int64 [DRIP_TABLE_SLOTS] on this device, zeroed, the host's
+        ``set_drip_scratch`` table) and types a lane whose (row, expert) one names HIT_SCRATCH, for C1s
         (``scratch_rows_1``, ``scratch_dst_1``, ``scratch_go_1``). ``picks`` > 0 (needs ``enable_spec_scorer``): each
         ``spec_score`` also publishes that many drip picks of its target layer. Before any graph captures a post."""
-        if not 1 <= slots <= expert_lease_block.WireLayout.scratch_slots:
-            raise ValueError(f"the scratch table holds 1..{expert_lease_block.WireLayout.scratch_slots} slots, not {slots}")
+        if not 1 <= slots <= DRIP_TABLE_SLOTS:
+            raise ValueError(f"the scratch table holds 1..{DRIP_TABLE_SLOTS} slots, not {slots}")
+        if table.dtype != torch.int64 or table.numel() != DRIP_TABLE_SLOTS or table.device != self.state.device:
+            raise ValueError(f"the scratch table is int64 [{DRIP_TABLE_SLOTS}] on {self.state.device}")
+        self.scratch_table = table
         if not 0 <= picks <= CAND_MAX_DRIPS:
             raise ValueError(f"the drip publishes 0..{CAND_MAX_DRIPS} picks a record, not {picks}")
         if picks and self._spec is None:
@@ -3924,6 +3938,7 @@ class ExpertStreamDevice:
             overflow_flag,
             gather_overflow,
             self.drip_slots,
+            self.scratch_table,
             self.scratch_rows_1,
             self.scratch_dst_1,
             self.scratch_go_1,

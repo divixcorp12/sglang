@@ -99,12 +99,14 @@ enum Counter : int {
   kSpecScoreNs,
   // The GPU drip (gpu_drip.h): drips whose first chunk was issued, landed and published, lanes typed kKindHitScratch
   // that the service checked, drips dropped before publishing (target posted, source changed, ring lapped, paused),
-  // and picks dropped for want of a free scratch slot.
+  // picks dropped for want of a free scratch slot, and pull windows (a record's C1/S reads over the link) that held
+  // back a chunk.
   kDripIssued,
   kDripLanded,
   kDripUsed,
   kDripAbandoned,
   kDripNoSlot,
+  kDripPaused,
   kCounterCount,
 };
 
@@ -150,6 +152,7 @@ constexpr bool is_core_counter(int k) {
     case kDripUsed:
     case kDripAbandoned:
     case kDripNoSlot:
+    case kDripPaused:
       return true;
     default:
       return false;

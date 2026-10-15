@@ -112,9 +112,12 @@ class ChainSim:
         return sum((_i32(self.block, w.split + n * w.split_stride, w.lanes + 1).tolist() for n in range(w.nodes)), [])
 
     def scratch_words(self) -> list[int]:
-        """The GPU drip's scratch table, a u64 per slot (0 or tag << 32 | row << 16 | expert)."""
-        w = self.wire
-        return [x & 0xFFFFFFFFFFFFFFFF for x in self.block[w.scratch : w.scratch + 8 * w.scratch_slots].view(torch.int64).tolist()]
+        """The GPU drip's scratch table (the host's drip_table), a u64 per slot (0 or tag << 32 | row << 16 |
+        expert); all 0 without one."""
+        table = self.host.drip_table
+        if table is None:
+            return [0] * self.wire.scratch_slots
+        return [x & 0xFFFFFFFFFFFFFFFF for x in table.tolist()]
 
     def scratch_slots(self, row: int, experts: Sequence[int]) -> list[int]:
         """match_scratch: per expert, the slot whose word names (row, expert) with a nonzero tag, else -1."""

@@ -730,10 +730,11 @@ class RamTier {
     drip_.store(drip_owner_.get(), std::memory_order_release);
   }
 
-  // The drip's scratch tensors, one per copy-table entry in its order: {address, bytes of one row}. Once.
-  void set_drip_scratch(std::vector<ScratchEntry> entries) {
+  // The drip's scratch tensors, one per copy-table entry in its order: {address, bytes of one row}, and its scratch
+  // table's address (device memory, Wire::kScratchSlots zeroed u64 words). Once.
+  void set_drip_scratch(std::vector<ScratchEntry> entries, uint64_t table) {
     if (drip_owner_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the GPU drip is not enabled");
-    drip_owner_->set_scratch(std::move(entries));
+    drip_owner_->set_scratch(std::move(entries), table);
   }
 
   // Test hooks (the exports refuse them in ProdBuild): picks offered as a scored record's; holding the chunks back;

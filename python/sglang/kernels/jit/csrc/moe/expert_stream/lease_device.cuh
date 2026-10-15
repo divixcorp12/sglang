@@ -293,20 +293,16 @@ struct LanePlan {
 };
 
 // The GPU drip (host/gpu_drip.h): out[j] is the scratch slot among the table's first `slots` whose word names (row,
-// planned[j]), else -1. Each word is one atomic u64 load, all issued before the acquire fence that orders the slot's
-// bytes, which the host published before its word, ahead of every later read of this chain (C1s).
+// planned[j]), else -1. The table is device memory the copy stream writes after the slot's bytes (a fenced stream
+// write), so a word seen here has its bytes in device memory before C1s, a later kernel, reads them. Each word is one
+// atomic u64 load; no load crosses the link.
 SGL_DEVICE void match_scratch(
-    const uint8_t* table, int64_t slots, int64_t row, const int64_t* planned, int64_t count,
+    const uint64_t* table, int64_t slots, int64_t row, const int64_t* planned, int64_t count,
     int32_t (&out)[Wire::kLanes]) {
-  static_assert(Wire::kScratch % 16 == 0 && Wire::kScratchSlots % 2 == 0, "scratch loads are whole u64 pairs");
   uint64_t word[Wire::kScratchSlots];
 #pragma unroll
-  for (int s = 0; s < Wire::kScratchSlots; s += 2) {
-    const ulonglong2 v = s < slots ? ld_relaxed_sys_v2_u64(table + 8 * s) : ulonglong2{0, 0};
-    word[s] = v.x;
-    word[s + 1] = s + 1 < slots ? v.y : 0;
-  }
-  cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
+  for (int s = 0; s < Wire::kScratchSlots; ++s)
+    word[s] = s < slots ? ld_relaxed_sys<uint64_t>(table + s) : 0;
 #pragma unroll
   for (int j = 0; j < Wire::kLanes; ++j) {
     out[j] = -1;

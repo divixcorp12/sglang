@@ -1,14 +1,16 @@
 // The GPU drip (SGLANG_DSV41_GPU_DRIP_SLOTS): copies experts the GPU scorer predicts for a later layer from their
-// pinned RAM rows into a small VRAM scratch while the copy engine has no demand copy, and publishes each landed row in
-// the scratch table (Wire::kScratch). The target layer's post types a lane whose (row, expert) a published word names
-// kKindHitScratch, and C1s copies it from the scratch slot, so the lane leaves the CPU split and the demand copies.
+// pinned RAM rows into a small VRAM scratch while the link carries no demand transfer, and publishes each landed row
+// in the scratch table, a device-memory u64 per slot the copy stream writes after the row's bytes. The target layer's
+// post types a lane whose (row, expert) a published word names kKindHitScratch, and C1s copies it from the scratch
+// slot, so the lane leaves the CPU split and the demand copies.
 //
 //   DripConfig    slots, picks per scored record, chunk size, the scorer's targets and candidate page
 //   GpuDrip       the scratch slots' state machine, driven by the copy thread (CopyEngine::run) between its jobs
 //
-// A slot is free, filling (its chunks are being copied), published (its word is in the table) or retiring (its word
-// was cleared, and a post that read it before the clear may still be in its chain). Every state but free is the copy
-// thread's; the service threads read only ident_ (holds), to check a kKindHitScratch lane.
+// A slot is free, filling (its chunks are being copied), publishing (its word's store is queued), published,
+// clearing (its word's zero is queued) or retiring (its word is 0, and a post that read it before may still be in its
+// chain). Every state is the copy thread's; the service threads read only ident_ (holds), to check a kKindHitScratch
+// lane.
 //
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "The GPU drip".
 #pragma once
@@ -33,7 +35,7 @@ namespace expert_stream {
 struct DripConfig {
   int slots = 0;           // scratch slots, 1..Wire::kScratchSlots
   int picks = 0;           // drips admitted per scored record, 1..SpecCandidates::kMaxDrips
-  int64_t chunk_bytes = 0;  // the most one copy-engine mark carries: a demand copy waits behind at most this
+  int64_t chunk_bytes = 0;  // the most one copy-engine mark carries: a demand transfer waits behind at most this
   std::vector<int32_t> target;  // per source row, the row its record's candidates are for (-1: none)
   const uint8_t* candidates = nullptr;  // the GPU scorer's candidate page; null: picks only from offer() (tests)
 };
@@ -50,13 +52,13 @@ struct ScratchEntry {
 template <class Build, class Owner>
 class GpuDrip {
  public:
-  enum : uint8_t { kFree = 0, kFilling = 1, kPublished = 2, kRetiring = 3 };
+  enum : uint8_t { kFree = 0, kFilling = 1, kPublished = 2, kRetiring = 3, kPublishing = 4, kClearing = 5 };
   // Why a drip was dropped before publishing (the drip_abandon event's a).
   enum : int { kWhyTargetPosted = 0, kWhySourceChanged = 1, kWhyLapped = 2 };
 
-  // `page` the request page, `lease` the completion block, `map` the host mirror [rows, experts] and `gen` its
-  // per-entry change counter (RamTier::publish_mirror), all owned by the tier, which outlives this.
-  GpuDrip(DripConfig config, Owner* owner, const uint8_t* page, uint8_t* lease, const int32_t* map,
+  // `page` the request page, `lease` the completion block (its copy gate), `map` the host mirror [rows, experts] and
+  // `gen` its per-entry change counter (RamTier::publish_mirror), all owned by the tier, which outlives this.
+  GpuDrip(DripConfig config, Owner* owner, const uint8_t* page, const uint8_t* lease, const int32_t* map,
           const std::atomic<uint32_t>* gen, int64_t rows, int64_t experts, const std::string& name)
       : config_(std::move(config)),
         owner_(owner),
@@ -75,13 +77,16 @@ class GpuDrip {
 
   // ---- Python, before the drips start ----
 
-  // The scratch tensors, once, before any row's sources (set_row). Throws on an empty or repeated call.
-  void set_scratch(std::vector<ScratchEntry> entries) {
+  // The scratch tensors and the scratch table (device memory, kScratchSlots zeroed u64 words the post reads), once,
+  // before any row's sources (set_row). Throws on an empty or repeated call.
+  void set_scratch(std::vector<ScratchEntry> entries, uint64_t table) {
     if (scratch_ready_.load(std::memory_order_acquire)) throw std::runtime_error("the drip scratch is already set");
     if (entries.empty()) throw std::runtime_error("the drip scratch needs at least one tensor");
+    if (table == 0 || table % 8 != 0) throw std::runtime_error("the drip's scratch table must be an aligned address");
     for (const ScratchEntry& e : entries)
       if (e.address == 0 || e.bytes <= 0) throw std::runtime_error("a drip scratch tensor of no bytes");
     scratch_ = std::move(entries);
+    table_ = table;
     scratch_ready_.store(true, std::memory_order_release);
   }
 
@@ -127,8 +132,8 @@ class GpuDrip {
   }
 
   // A service thread, checking a kKindHitScratch lane: whether `slot` holds `expert`'s row of `row` for some post
-  // that may have read its word. True from just before the word is published until every record that could have read
-  // it was handled (release_quarantined), so a lane the device typed from the word always finds it.
+  // that may have read its word. True from just before the word's store is queued until every record that could have
+  // read it was handled (release_quarantined), so a lane the device typed from the word always finds it.
   bool holds(int32_t slot, int64_t row, int32_t expert) const {
     return slot >= 0 && slot < config_.slots && row >= 0 && row < rows_ && expert >= 0 && expert < experts_ &&
            ident_[slot].load(std::memory_order_acquire) == ident(row, expert);
@@ -148,31 +153,40 @@ class GpuDrip {
   // ---- The copy thread ----
 
   // One step between the copy engine's own polls: follows the posted records, admits picks, frees quarantined
-  // slots, polls the chunk in flight, and issues the next chunk when `demand_idle` (no demand copy queued or still
-  // copying). Returns whether anything changed.
+  // slots, polls the drip's mark in flight, queues a table store if one is due, else issues the next chunk when
+  // `demand_idle` (no demand copy queued or still copying) and no device pull is pending (pull_pending). One drip mark
+  // at most is in flight. Returns whether anything changed.
   bool step(CopyBackend& backend, bool demand_idle) {
     bool progressed = scan();
     progressed |= take_offers();
     progressed |= admit_candidates();
     progressed |= release_quarantined();
-    if (chunk_slot_ >= 0) progressed |= poll_chunk(backend);
-    if (chunk_slot_ < 0 && demand_idle && !held_.load(std::memory_order_acquire)) progressed |= issue_chunk(backend);
-    return progressed;
+    if (op_slot_ >= 0) progressed |= poll_op(backend);
+    if (op_slot_ >= 0) return progressed;
+    if (issue_table_store(backend)) return true;
+    if (!demand_idle || held_.load(std::memory_order_acquire)) return progressed;
+    if (pull_pending()) {
+      count_pause();
+      return progressed;
+    }
+    return issue_chunk(backend) || progressed;
   }
 
-  // A chunk is in flight: the copy thread keeps polling, and its backend stays up until it lands.
+  // A drip mark is in flight: the copy thread keeps polling, and its backend stays up until it lands.
   bool busy() const {
-    return chunk_slot_ >= 0;
+    return op_slot_ >= 0;
   }
 
  private:
   static constexpr size_t kAwaiting = Wire::kDemandRecords;
   static constexpr size_t kOffers = 64;  // arbitrary: tests offer a handful
   static constexpr uint64_t kHeld = 1ull << 63;
+  enum : uint8_t { kOpChunk = 0, kOpPublish = 1, kOpClear = 2 };
 
   struct Slot {
     uint8_t state = kFree;
-    bool abandoned = false;  // dropped while its chunk was in flight: freed when the chunk completes
+    bool abandoned = false;      // dropped while its chunk was in flight: freed when the chunk completes
+    bool target_posted = false;  // its target posted while publishing: cleared once the store landed
     int32_t row = -1;
     int32_t expert = -1;
     int32_t ram_slot = -1;
@@ -181,7 +195,7 @@ class GpuDrip {
     uint64_t order = 0;       // admission order: the oldest filling slot copies first
     size_t entry = 0;         // the next byte to issue: scratch tensor `entry`, at `offset`
     int64_t offset = 0;
-    uint32_t retire_head = 0;  // the demand head read after the word was cleared
+    uint32_t retire_head = 0;  // the demand head read after the cleared word landed
   };
   struct RowSource {
     std::vector<uint64_t> src;  // per scratch tensor, the row's RAM slab of it
@@ -201,8 +215,8 @@ class GpuDrip {
   static uint64_t ident(int64_t row, int32_t expert) {
     return kHeld | static_cast<uint64_t>(row) << 16 | static_cast<uint32_t>(expert);
   }
-  uint8_t* table_word(int s) const {
-    return lease_ + Wire::kScratch + 8 * static_cast<int64_t>(s);
+  uint64_t table_word(int s) const {
+    return table_ + 8 * static_cast<uint64_t>(s);
   }
   int64_t at(const Slot& slot) const {
     return static_cast<int64_t>(slot.row) * experts_ + slot.expert;
@@ -218,8 +232,9 @@ class GpuDrip {
     owner_->template copy_count<K>(n);
   }
 
-  // Reads the posted records' rows since the last step: a record of a filling or published slot's target posts its
-  // drip's end. A lapped or torn record loses the rows it hid, so every drip is dropped (lose_all).
+  // Reads the posted records since the last step: a record of a filling or published slot's target ends its drip,
+  // and a record with lanes the device pulls over the link opens a pull window (pull_pending). A lapped or torn record
+  // loses what it hid, so every drip is dropped (lose_all).
   bool scan() {
     const uint32_t head = load_acquire(page_ + Wire::kDemandHead);
     if (!scanning_) {
@@ -229,40 +244,55 @@ class GpuDrip {
     }
     if (head == 0 || !reached(head, scan_)) return false;
     if (head - scan_ >= Wire::kDemandRecords - 2) {
-      lose_all();
+      lose_all(head);
       scan_ = skip_zero(head + 1u);
       return true;
     }
     while (reached(head, scan_)) {
       const uint8_t* record = page_ + record_offset(Wire::kDemandRing, Wire::kDemandRecords, scan_);
       uint16_t row = 0;
-      if (!read_row(record, scan_, &row)) {
-        lose_all();
+      bool pulls = false;
+      if (!read_head(record, scan_, &row, &pulls)) {
+        lose_all(head);
         scan_ = skip_zero(head + 1u);
         return true;
       }
-      posted(scan_, row);
+      posted(scan_, row, pulls);
       scan_ = skip_zero(scan_ + 1u);
     }
     return true;
   }
 
-  // The row of the record `seq`, as a seqlock read of its first word pair; false when it was overwritten.
-  static bool read_row(const uint8_t* record, uint32_t seq, uint16_t* row) {
+  // The row of record `seq`, and whether a lane of it is one the device pulls from host memory over the link (C1's
+  // HIT_SM, S's MISS_GPU), as a seqlock read of its head; false when it was overwritten.
+  static bool read_head(const uint8_t* record, uint32_t seq, uint16_t* row, bool* pulls) {
     if (load_acquire(record + Wire::kRecSeq) != seq) return false;
     *row = __atomic_load_n(reinterpret_cast<const uint16_t*>(record + Wire::kRecRow), __ATOMIC_RELAXED);
+    const uint8_t counts = __atomic_load_n(record + Wire::kRecCounts, __ATOMIC_RELAXED);
+    uint32_t kinds[Wire::kKindWords];
+    for (int w = 0; w < Wire::kKindWords; ++w)
+      kinds[w] = __atomic_load_n(reinterpret_cast<const uint32_t*>(record + Wire::kRecKinds) + w, __ATOMIC_RELAXED);
     std::atomic_thread_fence(std::memory_order_acquire);
-    return load_acquire(record + Wire::kRecSeq) == seq;
+    if (load_acquire(record + Wire::kRecSeq) != seq) return false;
+    const int lanes = std::min<int>(Wire::kPackedCounts ? (counts & 0xF) : counts, Wire::kLanes);
+    *pulls = false;
+    for (int j = 0; j < lanes; ++j) {
+      const uint32_t kind = kinds[j / 8] >> (4 * (j % 8)) & 0xFu;
+      *pulls |= kind == Wire::kKindHitSm || kind == Wire::kKindMissGpu;
+    }
+    return true;
   }
 
-  void posted(uint32_t seq, int64_t row) {
+  void posted(uint32_t seq, int64_t row, bool pulls) {
+    // A later post means every earlier chain ended: only this record's pulls can still be pending.
+    pull_open_ = pulls;
+    pull_seq_ = seq;
     if (row >= rows_) return;  // a malformed record: the service fails it
     last_posted_[row] = seq;
     for (int s = 0; s < config_.slots; ++s) {
       Slot& slot = slots_[s];
       if (slot.row != row) continue;
-      if (slot.state == kFilling && !slot.abandoned) abandon(s, kWhyTargetPosted);
-      else if (slot.state == kPublished) retire(s);
+      end_drip(s, kWhyTargetPosted);
     }
     if (config_.candidates != nullptr && row < static_cast<int64_t>(config_.target.size()) && config_.target[row] >= 0) {
       if (awaiting_.size() == kAwaiting) awaiting_.erase(awaiting_.begin());
@@ -270,37 +300,58 @@ class GpuDrip {
     }
   }
 
-  void lose_all() {
-    for (int s = 0; s < config_.slots; ++s) {
-      if (slots_[s].state == kFilling && !slots_[s].abandoned) abandon(s, kWhyLapped);
-      else if (slots_[s].state == kPublished) retire(s);
+  // The device's pulls of the last posted record may still be running: S and C1 read host memory over the link until
+  // the chain's copy wait, which closes the copy gate for the record only after S completed (stream order). So the
+  // window closes when the gate names the record, or when a later record posts; a record whose chain never closes the
+  // gate (no copy-engine or CPU lane) holds it until then.
+  bool pull_pending() {
+    if (!pull_open_) return false;
+    const uint32_t gate = channel::gate<TargetChannel>(lease_);
+    if ((gate >> Wire::kLeaseGateSeqShift & Wire::kLeaseGateSeqMask) == (pull_seq_ & Wire::kLeaseGateSeqMask)) {
+      pull_open_ = false;
+      return false;
     }
-    awaiting_.clear();
+    return true;
   }
 
-  // Drops a filling slot: at once, or when its chunk in flight lands (poll_chunk), since the DMA still writes it.
+  // drip_paused: once per pull window that held back a chunk ready to go.
+  void count_pause() {
+    if (paused_seq_ == pull_seq_) return;
+    for (int s = 0; s < config_.slots; ++s) {
+      if (slots_[s].state == kFilling && !slots_[s].abandoned) {
+        paused_seq_ = pull_seq_;
+        count<kDripPaused>();
+        return;
+      }
+    }
+  }
+
+  void lose_all(uint32_t /*head*/) {
+    for (int s = 0; s < config_.slots; ++s)
+      end_drip(s, kWhyLapped);
+    awaiting_.clear();
+    pull_open_ = false;
+  }
+
+  // The target posted (or the records were lost): a filling slot is abandoned, a published one cleared, a publishing
+  // one cleared once its store landed.
+  void end_drip(int s, int why) {
+    Slot& slot = slots_[s];
+    if (slot.state == kFilling && !slot.abandoned) abandon(s, why);
+    else if (slot.state == kPublished) slot.state = kClearing;
+    else if (slot.state == kPublishing) slot.target_posted = true;
+  }
+
+  // Drops a filling slot: at once, or when its chunk in flight lands (poll_op), since the DMA still writes it.
   void abandon(int s, [[maybe_unused]] int why) {
     Slot& slot = slots_[s];
     count<kDripAbandoned>();
     if constexpr (Build::kMetrics) trace_.emit("drip_abandon", slot.row, 0, slot.source_seq, -1, why, s, slot.expert);
-    if (chunk_slot_ == s) {
+    if (op_slot_ == s) {
       slot.abandoned = true;
     } else {
       slot = Slot{};
     }
-  }
-
-  // Clears a published word. A post that read it before the clear can still be in its chain (only the post after
-  // the next one is known to start after this one's chain ended), so the slot stays the drip's until every record up
-  // to the head read here plus one was handled (release_quarantined). The seq_cst fence makes the cleared word visible
-  // to the device before the head is read.
-  void retire(int s) {
-    Slot& slot = slots_[s];
-    store_release64(table_word(s), 0);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    slot.retire_head = load_acquire(page_ + Wire::kDemandHead);
-    slot.state = kRetiring;
-    if constexpr (Build::kMetrics) trace_.emit("drip_retire", slot.row, 0, slot.retire_head, -1, slot.expert, s);
   }
 
   // A retiring slot is free once the service handled record retire_head + 2: its post started after retire_head + 1's
@@ -427,6 +478,32 @@ class GpuDrip {
     return -1;
   }
 
+  // Queues the store of a publishing slot's word, or of a clearing slot's 0, behind everything on the copy stream.
+  // Eight bytes: not held back by demand transfers or pulls.
+  bool issue_table_store(CopyBackend& backend) {
+    for (int s = 0; s < config_.slots; ++s) {
+      Slot& slot = slots_[s];
+      if (slot.state != kPublishing && slot.state != kClearing) continue;
+      uint64_t word = 0;
+      if (slot.state == kPublishing) {
+        tag_ = tag_ == UINT32_MAX ? 1 : tag_ + 1;
+        word = static_cast<uint64_t>(tag_) << 32 | static_cast<uint64_t>(slot.row & 0xFFFF) << 16 |
+               static_cast<uint32_t>(slot.expert & 0xFFFF);
+      }
+      if (const int r = backend.write64(table_word(s), word))
+        fail_stop("GPU drip: a scratch-table store failed to issue: " + std::to_string(r));
+      mark(backend, s, slot.state == kPublishing ? kOpPublish : kOpClear);
+      return true;
+    }
+    return false;
+  }
+
+  void mark(CopyBackend& backend, int s, uint8_t op) {
+    if (const int r = backend.mark(&token_)) fail_stop("GPU drip: a mark failed: " + std::to_string(r));
+    op_slot_ = s;
+    op_ = op;
+  }
+
   // Issues the oldest filling slot's next chunk: up to chunk_bytes over its tensors, then one mark. Its first chunk
   // re-checks the source first.
   bool issue_chunk(CopyBackend& backend) {
@@ -458,55 +535,68 @@ class GpuDrip {
         slot.offset = 0;
       }
     }
-    if (const int r = backend.mark(&token_)) fail_stop("GPU drip: a scratch copy's mark failed: " + std::to_string(r));
-    chunk_slot_ = s;
+    mark(backend, s, kOpChunk);
     return true;
   }
 
-  bool poll_chunk(CopyBackend& backend) {
+  bool poll_op(CopyBackend& backend) {
     const int state = backend.query(token_);
     if (state == CopyBackend::kPending) return false;
     if (state != CopyBackend::kDone) fail_stop("GPU drip: a scratch copy failed: " + std::to_string(state));
-    const int s = chunk_slot_;
-    chunk_slot_ = -1;
+    const int s = op_slot_;
+    op_slot_ = -1;
     Slot& slot = slots_[s];
-    if (slot.abandoned) {
-      slot = Slot{};
-      return true;
+    switch (op_) {
+      case kOpChunk:
+        if (slot.abandoned) {
+          slot = Slot{};
+        } else if (slot.entry == scratch_.size()) {
+          land(s);
+        }
+        break;
+      case kOpPublish:
+        slot.state = slot.target_posted ? kClearing : kPublished;
+        if constexpr (Build::kMetrics) trace_.emit("drip_land", slot.row, 0, slot.source_seq, -1, slot.expert, s, tag_);
+        break;
+      default:
+        retire(s);
     }
-    if (slot.entry == scratch_.size()) land(s);
     return true;
   }
 
-  // Every chunk of slot s landed: publishes its word if the source never changed during the copy. The completion
-  // word the backend polled orders the DMA's writes before this; the word's release orders them, and ident_, before
-  // any post that reads it.
+  // Every chunk of slot s landed: queues its word's store if the source never changed during the copy. ident_ is set
+  // first, so the service finds the slot for any record whose post saw the word.
   void land(int s) {
     Slot& slot = slots_[s];
     if (!source_unchanged(slot)) {
       abandon(s, kWhySourceChanged);
       return;
     }
-    tag_ = tag_ == UINT32_MAX ? 1 : tag_ + 1;
     ident_[s].store(ident(slot.row, slot.expert), std::memory_order_release);
-    store_release64(
-        table_word(s),
-        static_cast<uint64_t>(tag_) << 32 | static_cast<uint64_t>(slot.row & 0xFFFF) << 16 |
-            static_cast<uint32_t>(slot.expert & 0xFFFF));
-    slot.state = kPublished;
+    slot.state = kPublishing;
     count<kDripLanded>();
-    if constexpr (Build::kMetrics) trace_.emit("drip_land", slot.row, 0, slot.source_seq, -1, slot.expert, s, tag_);
+  }
+
+  // The slot's cleared word has landed, so a post starting from now reads 0. A post that read the word before can
+  // still be in its chain (only the post after the next one is known to start after this one's chain ended), so the
+  // slot stays the drip's until every record up to the head read here plus one was handled (release_quarantined).
+  void retire(int s) {
+    Slot& slot = slots_[s];
+    slot.retire_head = load_acquire(page_ + Wire::kDemandHead);
+    slot.state = kRetiring;
+    if constexpr (Build::kMetrics) trace_.emit("drip_retire", slot.row, 0, slot.retire_head, -1, slot.expert, s);
   }
 
   const DripConfig config_;
   Owner* const owner_;
   const uint8_t* const page_;
-  uint8_t* const lease_;
+  const uint8_t* const lease_;
   const int32_t* const map_;
   const std::atomic<uint32_t>* const gen_;
   const int64_t rows_;
   const int64_t experts_;
   std::vector<ScratchEntry> scratch_;  // written once by set_scratch before scratch_ready_'s release
+  uint64_t table_ = 0;                 // likewise
   std::atomic<bool> scratch_ready_{false};
   std::vector<RowSource> sources_;
   std::array<std::atomic<uint64_t>, Wire::kScratchSlots> ident_{};  // the service threads' view (holds)
@@ -518,9 +608,13 @@ class GpuDrip {
   std::vector<uint32_t> last_posted_;  // per row, its last posted record's seq (0: none seen)
   std::vector<Awaiting> awaiting_;     // scored records whose candidate slots are not read yet
   bool scanning_ = false;
-  uint32_t scan_ = 0;      // the next seq whose row scan() reads
-  int chunk_slot_ = -1;    // the slot whose chunk is in flight
-  int64_t token_ = 0;      // that chunk's mark
+  uint32_t scan_ = 0;       // the next seq whose head scan() reads
+  bool pull_open_ = false;  // the last posted record, pull_seq_, has device pulls that may still run
+  uint32_t pull_seq_ = 0;
+  uint32_t paused_seq_ = 0;  // the pull window drip_paused last counted
+  int op_slot_ = -1;         // the slot whose drip mark is in flight (-1: none), its kind, and the mark
+  uint8_t op_ = kOpChunk;
+  int64_t token_ = 0;
   uint64_t order_ = 0;
   uint32_t tag_ = 0;
   [[no_unique_address]] JobTrace<Build::kMetrics> trace_;

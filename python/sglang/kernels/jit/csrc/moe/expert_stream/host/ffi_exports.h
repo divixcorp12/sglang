@@ -415,8 +415,9 @@ struct HostExports {
     find(handle)->enable_gpu_drip(std::move(config));
   }
 
-  // entries: int64 [n, 2] of {scratch tensor address, bytes of one row}, one per copy-table entry in its order.
-  static void set_drip_scratch(int64_t handle, TensorView entries) {
+  // entries: int64 [n, 2] of {scratch tensor address, bytes of one row}, one per copy-table entry in its order; table:
+  // the scratch table's address (Wire::kScratchSlots zeroed u64 words the post reads, device memory in serving).
+  static void set_drip_scratch(int64_t handle, TensorView entries, int64_t table) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named(
@@ -425,7 +426,7 @@ struct HostExports {
     std::vector<expert_stream::ScratchEntry> list;
     for (int64_t i = 0; i < entries.size(0); ++i)
       list.push_back(expert_stream::ScratchEntry{static_cast<uint64_t>(e[2 * i]), e[2 * i + 1]});
-    find(handle)->set_drip_scratch(std::move(list));
+    find(handle)->set_drip_scratch(std::move(list), static_cast<uint64_t>(table));
   }
 
   // A slab table and a layer's scalars as the ExpertLayer make_layer takes (set_cpu_layer, the test export kernel_layer):

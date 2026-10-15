@@ -44,7 +44,8 @@ class Rig:
             self.scratch = {
                 n: torch.zeros((slots,) + tuple(slab.shape[1:]), dtype=slab.dtype) for n, slab in self.slabs.items()
             }
-            self.host.set_drip_scratch(list(self.scratch.values()))
+            self.table = torch.zeros(32, dtype=torch.int64)
+            self.host.set_drip_scratch(list(self.scratch.values()), self.table)
             # The copy thread writes through these addresses until host.stop(): the rig keeps them.
             self.dst = {
                 n: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for n, slab in self.slabs.items()
@@ -63,9 +64,12 @@ class Rig:
             raise
 
     def load(self, experts):
-        """Make ``experts`` resident in row ROW through a plain (uncaptured) request of misses."""
+        """Make ``experts`` resident in row ROW through a plain (uncaptured) request of misses, then post a lane-less
+        record: its post shows the misses' stream (a device pull the drip waits for) ended."""
         req = self.sim.post(ROW, experts)
         assert self.host.pump() == 1 and self.sim.wait_served(req)
+        self.sim.post(0, [])
+        assert self.host.pump() == 1
 
     def state(self, slot=0):
         return self.host.drip_slots()[slot]
@@ -154,6 +158,38 @@ def test_a_drip_is_issued_only_after_the_demand_copy_before_it_completed(tmp_pat
         assert _until(lambda: rig.host.copy_engine_marked() >= 2)
         rig.host.copy_engine_release(-1)
         assert _until(lambda: rig.state()["state"] == "published")
+    finally:
+        rig.host.stop()
+
+
+def test_the_drip_issues_nothing_while_a_records_device_pulls_may_still_run(tmp_path):
+    """A posted record with GPU misses opens a pull window: its stream kernel reads their pieces from host memory over
+    the link until its copy wait runs. No drip chunk is issued in the window (counted once in drip_paused); it closes
+    when the copy gate names the record (the copy wait ran after the stream), or when a later record posts. Mutation:
+    step() ignoring pull_pending -- red on the mark counts."""
+    rig = Rig(tmp_path)
+    try:
+        rig.load([3, 2])
+        rig.host.copy_engine_release(-1)
+        pulling = rig.sim.post(ROW, [4, 5])
+        assert pulling.kinds == [LaneKind.MISS_GPU] * 2
+        rig.host.drip_offer(ROW, [3])
+        assert _until(lambda: rig.state(0)["state"] == "filling" and rig.host.counters()["drip_paused"] == 1)
+        time.sleep(0.1)
+        assert rig.host.copy_engine_marked() == 0, "a drip chunk was issued while a stream could still pull"
+        rig.sim.close_copy_gate(pulling)  # the record's copy wait ran, so its stream had ended
+        assert _until(lambda: rig.state(0)["state"] == "published")
+        rig.sim.open_copy_gate(pulling)
+
+        marked = rig.host.copy_engine_marked()
+        rig.sim.post(0, [1])  # a GPU miss whose chain never closes the gate
+        rig.host.drip_offer(ROW, [2])
+        assert _until(lambda: rig.state(1)["state"] == "filling" and rig.host.counters()["drip_paused"] == 2)
+        time.sleep(0.1)
+        assert rig.host.copy_engine_marked() == marked, "a drip chunk was issued while a stream could still pull"
+        rig.sim.post(0, [])  # a later post: the miss record's chain had ended
+        assert _until(lambda: rig.state(1)["state"] == "published")
+        assert rig.host.counters()["drip_paused"] == 2
     finally:
         rig.host.stop()
 
@@ -255,7 +291,8 @@ def test_a_scratch_lane_the_drip_does_not_hold_fails_stop(tmp_path):
         host.enable_copy_engine(-1)
         host.enable_gpu_drip(1, picks=1, chunk_bytes=4096)
         slabs = list(s.slabs[1].values())
-        host.set_drip_scratch([torch.zeros((1,) + tuple(x.shape[1:]), dtype=x.dtype) for x in slabs])
+        table = torch.zeros(32, dtype=torch.int64)
+        host.set_drip_scratch([torch.zeros((1,) + tuple(x.shape[1:]), dtype=x.dtype) for x in slabs], table)
         dst = [torch.zeros((6,) + tuple(x.shape[1:]), dtype=x.dtype) for x in slabs]
         table = [[x.data_ptr(), d.data_ptr(), x[0].numel() * x.element_size()] for x, d in zip(slabs, dst)]
         host.set_copy_table(1, torch.tensor(table, dtype=torch.int64), 6)

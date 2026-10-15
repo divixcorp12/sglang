@@ -31,8 +31,11 @@ def _drip_chain(tmp_path, drip_slots=2):
 
 
 def _resident(c, experts, row):
-    c.plan(experts, row)
-    c.gather(row)
+    """Reads ``experts`` into ``row``'s tier with an eager gather, then posts a lane-less one: the drip issues nothing
+    until a later post (or the copy gate) shows the misses' stream ended."""
+    for plan in (experts, []):
+        c.plan(plan, row)
+        c.gather(row)
     torch.cuda.synchronize()
     assert c.handled(), c.host.counters()
 

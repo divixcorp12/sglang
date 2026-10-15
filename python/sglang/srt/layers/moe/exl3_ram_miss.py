@@ -37,6 +37,7 @@ from sglang.kernels.ops.moe.expert_cache_transfer import (
 )
 from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    DRIP_TABLE_SLOTS,
     ExpertStreamDevice,
     ExpertStreamHost,
     device_stamps_enabled,
@@ -856,6 +857,7 @@ class Exl3RamMissService:
         # allocates; None when off.
         self._drip: Optional[tuple[int, int]] = None
         self._drip_scratch: Optional[list[torch.Tensor]] = None
+        self._drip_table: Optional[torch.Tensor] = None  # the scratch table, device memory (attach)
         self._row_backends: dict[int, object] = {}
         self._rows: dict[int, int] = {}
         self._manager = None
@@ -1499,7 +1501,7 @@ class Exl3RamMissService:
             self._drip_scratch = [
                 torch.empty((slots,) + tuple(d.shape[1:]), dtype=d.dtype, device=d.device) for d in destinations
             ]
-            self.host.set_drip_scratch(self._drip_scratch)
+            self.host.set_drip_scratch(self._drip_scratch, self._drip_table)
         shapes = [(tuple(d.shape[1:]), d.dtype) for d in destinations]
         if shapes != [(tuple(s.shape[1:]), s.dtype) for s in self._drip_scratch]:
             raise ValueError(f"exl3 RAM miss GPU drip: row {row}'s destinations {shapes} differ from the scratch's")
@@ -1632,7 +1634,8 @@ class Exl3RamMissService:
                     self.device_side.enable_spec_head(head)
             if self._drip is not None:
                 slots, picks = self._drip
-                self.device_side.enable_gpu_drip(slots, picks=picks)
+                self._drip_table = torch.zeros(DRIP_TABLE_SLOTS, dtype=torch.int64, device=cache.device)
+                self.device_side.enable_gpu_drip(slots, table=self._drip_table, picks=picks)
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was
             # dropped (after_host_use), so the snapshot is the source.

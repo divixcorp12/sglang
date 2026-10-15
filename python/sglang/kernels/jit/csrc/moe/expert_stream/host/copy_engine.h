@@ -74,6 +74,9 @@ class CopyBackend {
   virtual std::string init() = 0;
   /// Queues one copy after every earlier one; 0 or an error code.
   virtual int issue(uint64_t dst, uint64_t src, int64_t bytes) = 0;
+  /// Queues one atomic u64 store of `value` to device address `dst`, after every earlier copy has landed (the GPU
+  /// drip's scratch-table words); 0 or an error code.
+  virtual int write64(uint64_t dst, uint64_t value) = 0;
   /// Marks the point after every copy issued so far and stores its token; 0 or an error code.
   virtual int mark(int64_t* token) = 0;
   /// kDone, kPending, or an error code (negative for the host backend).
@@ -126,6 +129,7 @@ class CudaCopyBackend : public CopyBackend {
     get(cu_mem_host_device_ptr_, "cuMemHostGetDevicePointer_v2");
     get(cu_mem_free_host_, "cuMemFreeHost");
     get(cu_write_value32_, "cuStreamWriteValue32_v2");
+    get(cu_write_value64_, "cuStreamWriteValue64_v2");
     get(cu_wait_value32_, "cuStreamWaitValue32_v2");
     if (!missing.empty()) return "libcuda.so.1 lacks " + missing + ", which the copy engine needs";
     if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
@@ -147,6 +151,11 @@ class CudaCopyBackend : public CopyBackend {
 
   int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
     return cu_memcpy_async_(dst, src, static_cast<size_t>(bytes), stream_);
+  }
+
+  /// Default flags: the write executes after the stream's prior work and fences that work's memory before it.
+  int write64(uint64_t dst, uint64_t value) override {
+    return cu_write_value64_(stream_, dst, value, 0);
   }
 
   /// The token is the job's sequence number, written into the completion word after the job's copies.
@@ -272,6 +281,7 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_mem_host_device_ptr_)(uint64_t*, void*, unsigned) = nullptr;
   int (*cu_mem_free_host_)(void*) = nullptr;
   int (*cu_write_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
+  int (*cu_write_value64_)(void*, uint64_t, uint64_t, unsigned) = nullptr;
   int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 

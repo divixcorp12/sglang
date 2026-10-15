@@ -290,7 +290,8 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
         out["kind"], out["slot"], torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"], no_i32, 0, no_i32, 1, 16, 0,
         torch.zeros(1, dtype=torch.int32, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"),
-        0, torch.zeros(w.lanes, dtype=torch.int64, device="cuda"), torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
+        0, torch.zeros(ops.DRIP_TABLE_SLOTS, dtype=torch.int64, device="cuda"),
+        torch.zeros(w.lanes, dtype=torch.int64, device="cuda"), torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"), 0,
     )
     torch.cuda.synchronize()
@@ -330,9 +331,10 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
         staging, dtype=torch.int16
     )
     scratch_slots = 0 if scratch_words is None else len(scratch_words)
+    scratch_table = torch.zeros(ops.DRIP_TABLE_SLOTS, dtype=torch.int64, device="cuda")
     if scratch_slots:
         block[w.copy_armed : w.copy_armed + 4].view(torch.int32)[0] = 1
-        block[w.scratch : w.scratch + 8 * scratch_slots].view(torch.int64)[:] = torch.tensor(
+        scratch_table[:scratch_slots] = torch.tensor(
             [x - (1 << 64) if x >= 1 << 63 else x for x in scratch_words], dtype=torch.int64
         )
     if split is not None:
@@ -366,7 +368,7 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
         0, int(cpu_on), 0, 0, 3, out["kind"], out["slot"], out["node"], torch.zeros(1, dtype=torch.int32, **cuda),
         torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 1, 32, 0,
         torch.zeros(1, dtype=torch.int32, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
-        scratch_slots, scratch_rows, scratch_dst, scratch_go, 0,
+        scratch_slots, scratch_table, scratch_rows, scratch_dst, scratch_go, 0,
     )
     torch.cuda.synchronize()
     del cpu_buf

@@ -95,7 +95,8 @@ class Chain:
                                        device="cuda")
                         for n in self.names
                     }
-                    self.host.set_drip_scratch([self.scratch[n] for n in self.names])
+                    self.drip_table = torch.zeros(32, dtype=torch.int64, device="cuda")
+                    self.host.set_drip_scratch([self.scratch[n] for n in self.names], self.drip_table)
                 for row in range(layers):
                     self.host.set_copy_table(row, self.segments[row].table, dst_rows, sm_mask=sm_mask)
             if start:
@@ -111,7 +112,7 @@ class Chain:
                 for row in range(layers):
                     self.dev.set_row_copy(row, dst_rows)
             if drip_slots:
-                self.dev.enable_gpu_drip(drip_slots)
+                self.dev.enable_gpu_drip(drip_slots, table=self.drip_table)
             host_row_map = torch.full((experts,), -1, dtype=torch.int32, device="cuda")
             self.backends = {
                 row: Exl3RamMissRowBackend(

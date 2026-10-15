@@ -255,15 +255,16 @@ GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[GPU_DRIP] = "0"
 # The promote and pool-serve fixed-split arm with the T3 scorer's best RAM-resident, not VRAM-hot experts of layer +2
-# dripped into VRAM scratch at the offline replay's settings (12 slots, 4 picks per scored record, its horizon 2); its
-# reference is that arm, so the A/B reads the drip alone.
+# dripped into VRAM scratch: the replay's 4 picks per scored record at its horizon 2, 24 slots (~320 MB; 12 left
+# 2396 picks without a slot in the 2026-10-14 capture) and 256 KiB chunks (~19 us of link a pull or post can wait
+# behind); its reference is that arm, so the A/B reads the drip alone.
 GPU_DRIP_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-gpudrip"
 ARMS[GPU_DRIP_ARM] = (
     {
         **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
-        GPU_DRIP: "12",
+        GPU_DRIP: "24",
         "SGLANG_DSV41_GPU_DRIP_PICKS": "4",
-        "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "1024",
+        "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "256",
     },
     True,
 )
@@ -340,6 +341,7 @@ RAM_KEYS = (
     "drip_used",
     "drip_abandoned",
     "drip_no_slot",
+    "drip_paused",
 )
 
 
