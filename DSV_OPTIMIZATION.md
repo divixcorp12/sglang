@@ -168,9 +168,27 @@ no regression.
   chunk and 1.75 GiB at 4096 over flashinfer, so DSpark's prefill peak sits 4,808 MiB above init. The DSpark arms
   therefore run `DSPARK_MEM_FRACTION_STATIC=0.78`, `DSPARK_HOT_GPU_MB=10840` (12040 before) — the "1.2 GB".
   Owner TODO option C: chunk the merge over tokens, bit-identical.
-- Task: confirm the cause, build the chunked merge (env-gated off, exact-equality GPU test), measure peaks (4096
-  warm-up, 30k prompt) on/off, derive the largest hot cache that keeps KV at exactly 381,184 tokens with a margin like
-  today's 508 MiB (computed, not guessed), add the arm, ask for a slot, run ON only vs splitmodel-stream-mem.
+- **Cause confirmed** (H=64, D=512, TP1): `flash_mla_sparse_decode_triton` holds `out` and `out_extra` (bf16, 256
+  MiB each at 4096 tokens). `_merge_partial_attn` then holds 3 fp32 copies at its peak (1536 MiB): 2048 MiB in total
+  vs flashinfer's 256, i.e. +1.75 GiB at 4096. `_apply_attn_sink` has the same peak on its own, and layers 0 and 1
+  have only the sink. Layer-major prefill doesn't apply to DSpark (`SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0`).
+- **Built** (branch `prefill-merge-chunk` on `split-model` 1ddfaae39e: `618ef2682e`, `22beb490ed`, `7a2dd5cc4b`,
+  `b475901dfd`): `SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB` (0 = off). Tokens per chunk = budget //
+  (3·H·D·4), so 128 MiB gives 341 tokens. Merge and sink write each token chunk in place, and decode is untouched.
+  GPU test: torch.equal on out and lse through the real kernel at 4096 / 2065 / 171 tokens, budgets 64 MiB and 1
+  MiB; 50 passed. The mutant that drops the last partial chunk is caught (9 failed), then reverted to green.
+  `test_flash_mla_backends.py` has 2 pre-existing failures (identical at base).
+- **Peaks** (startup warm-up sets the peak; a 30k prompt adds <= 2 MiB):
+  - budget 0: 31885 of 32607 MiB, 4337 above init.
+  - budget 128: 30679, 3120 above init (frees 1217 MiB).
+  - `-mergechunk` arm (hot 12040 = 948 slots, KV pinned 381,184): 31977 peak, 630 MiB free, no OOM.
+- **Launch:** `SGLANG_MOE_HOT_GPU_MB=12040`, budget 128, `--max-total-tokens 381184`, fraction 0.8256 computed by
+  `fraction_keeping_kv()` with a 0.12 GiB launch-jitter margin. Unpinned KV floats between launches (339,712 in
+  the OFF sample, 377k-403k in the probes), hence the pin.
+- **Next:**
+  - ON arm on top of the HiCache-on-node-1 arm, against arm A (65.9). Runs after arm C.
+  - Then find the remaining 3120 MiB above init, the path from 12040 toward ~15000 MiB.
+  - Watch item: HiCache host pools scale with the device KV, so they grow ~12% on node 1.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
