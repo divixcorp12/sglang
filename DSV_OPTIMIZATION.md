@@ -73,7 +73,9 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   - **Replay (breakdown base):** saving unchanged (+16.94 ms/verify untraced, as greedy); inverted node-records
     25.4% -> 13.9% (40.5 -> 17.9 pairs/verify); copy-lane next-verify reuse 0.396 -> 0.399 (table 0.402). Better
     than slack 1 (20.9%, +16.75). The remaining inversions are between lanes with different token counts.
-    CPU tests 124 passed; GPU parity run queued after arm C. No serving run yet.
+    CPU tests 124 passed. GPU parity (`test/manual/dsv41/test_exl3_lease_kernels_cuda.py`, at 7e77a55ba2): 52
+    passed; the mutant with the device tiebreak disabled fails 5 of 10 split-model tests, and reverting restores green.
+    No serving run yet.
 
 ### 3.3 Startup calibration of the split-model constants — branch `split-model-calib` (`7171570959`), NOT merged
 
