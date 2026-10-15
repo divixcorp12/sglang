@@ -470,7 +470,8 @@ def _split_model_case(rng, lanes, nodes, *, copy_ce=True, count=None, hit_rate=0
     for _ in range(nodes):
         words += [rng.choice([-1, 0, 2]) * step, rng.randint(0, 5) * step, rng.randint(0, 5) * step,
                   rng.randint(0, 4) * step, rng.randint(0, 3) * step]
-    words += [rng.randint(1, 15) * step, rng.randint(0, 10) * step, rng.randint(0, 20) * step]
+    words += [rng.randint(1, 15) * step, rng.randint(0, 10) * step, rng.randint(0, 20) * step,
+              rng.choice([0, rng.randint(1, 15) * step]), rng.randint(0, 5) * step]  # stream_lane (0: off), _base
     return w, planned, ram, forced_from, dst, routes, words
 
 

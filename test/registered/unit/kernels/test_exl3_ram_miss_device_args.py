@@ -431,7 +431,7 @@ def test_the_split_model_reaches_the_post_before_use_pdl_with_room_for_its_count
         off._kernels = lambda: recorder
         _post(off, _args())
         assert recorder.calls[0][1][-2].numel() == 0 and off.split_model_stats() is None
-        words = list(range(1, 5 * nodes + 4))
+        words = list(range(1, 5 * nodes + 6))
         with pytest.raises(ValueError, match="cost words"):
             _device(nodes=nodes, split_model=words[:-1])
         on = _device(nodes=nodes, split_model=words)
@@ -464,7 +464,7 @@ def test_the_service_builds_its_device_side_with_the_split_model_words():
     with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True), \
             envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=2"):
         got = words(stub)
-        assert len(got) == 13 and got[10] == 2_000_000
+        assert len(got) == 15 and got[10] == 2_000_000
         assert words(SimpleNamespace(cpu_experts=None, wire=stub.wire)) is None
 
 

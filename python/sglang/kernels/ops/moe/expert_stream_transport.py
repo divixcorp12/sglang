@@ -3401,7 +3401,7 @@ class ExpertStreamDevice:
         self.miss_cut, self.miss_cut_max = int(miss_cut), int(miss_cut_max)
         # The split model's cost words (ram_slot_map.split_model_words) and its counters, or empty: the split and the
         # miss cut.
-        costs = 5 * self.wire.nodes + 3
+        costs = 5 * self.wire.nodes + 5
         if split_model is not None and len(split_model) != costs:
             raise ValueError(f"the split model has {costs} cost words for {self.wire.nodes} nodes, got {len(split_model)}")
         # The counters (ram_slot_map.split_model_stats_words): records, then per node to_cpu and to_copy.
@@ -4062,7 +4062,7 @@ class ExpertStreamDevice:
         the lanes it put on the CPU that the table would not (``to_cpu``) and took off the CPU (``to_copy``)."""
         if self.split_model.numel() == 0:
             return None
-        words = self.split_model[5 * self.wire.nodes + 3 :].cpu().tolist()
+        words = self.split_model[5 * self.wire.nodes + 5 :].cpu().tolist()
         return {
             "records": words[0],
             "to_cpu": words[1::2],

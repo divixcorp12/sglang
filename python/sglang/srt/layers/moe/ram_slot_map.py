@@ -34,9 +34,13 @@ def split_miss_cut(cut: int, cut_max: int, *, cpu_experts: bool) -> tuple[int, i
 # The model-based split's per-node cost words (ns): a CPU hit job of k experts and p (token, expert) pairs costs
 # hit_a + hit_b * k + hit_c * p, a CPU miss of t tokens miss_a + miss_c * t.
 SPLIT_MODEL_NODE_KEYS = ("hit_a", "hit_b", "hit_c", "miss_a", "miss_c")
-SPLIT_MODEL_KEYS = ("copy_lane", "first_byte", "per_expert")
+SPLIT_MODEL_KEYS = ("copy_lane", "first_byte", "per_expert", "stream_lane", "stream_base")
 # Fits on cores-ab-20261014/pin01-r2's CPU jobs (analysis/dsv41-drive/dspark/split_replay.py), scaled by 0.93 to the
-# untraced cost per lane, in ms; miss i (1-based) of a node lands first_byte + per_expert * i after the post.
+# untraced cost per lane, in ms; miss i (1-based) of a node lands first_byte + per_expert * i after the post. With m
+# GPU-streamed misses in the record, the GPU's stream kernel (S) ends at stream_base + first_byte + per_expert * m +
+# stream_lane * copy lanes: its pulls share the link with the copy engine. stream_lane is the fit on pin01-r2,
+# splitmodel, splitmodel-r2 and split-ab A2/B1 (S grows 0.3-1.4 ms per added copy lane between runs, 0.44-1.04 within
+# one; node-independent); 0 drops the stream side.
 SPLIT_MODEL_DEFAULTS_MS = {
     "hit_a": (0.016, -0.050),
     "hit_b": (0.154, 0.179),
@@ -46,6 +50,8 @@ SPLIT_MODEL_DEFAULTS_MS = {
     "copy_lane": 1.05,
     "first_byte": 0.8,
     "per_expert": 1.6,
+    "stream_lane": 0.65,
+    "stream_base": 0.0,
 }
 
 
@@ -110,13 +116,16 @@ def model_cpu_lanes(
     copyable: Sequence[bool],
     words: Sequence[int],
     nodes: int,
+    streamed: int = 0,
 ) -> list[bool]:
     """The model-based split's unforced CPU lanes, in integer ns as the device computes them.
 
     Each node's CPU starts with its forced hits (and, as CPU lanes, eligible lanes the copy engine cannot take); its
     forced misses follow the hit job. The copyable eligible hits, heaviest-token first (ties: plan order), each go to
-    their node's CPU when that node would finish no later than the copy engine's FIFO (one copy_lane a lane, both nodes
-    sharing it) would with the lane, else to the copy engine."""
+    their node's CPU when that node would finish no later than the copy side would with the lane, else to the copy
+    engine. The copy side is the copy engine's FIFO (one copy_lane a lane, both nodes sharing it) and, with `streamed`
+    GPU-streamed misses and stream_lane > 0, the stream kernel: stream_base + first_byte + per_expert * streamed +
+    stream_lane * copy lanes."""
     k, pairs = [0] * nodes, [0] * nodes
     misses = [[] for _ in range(nodes)]
     cpu = [False] * len(node_of)
@@ -136,17 +145,22 @@ def model_cpu_lanes(
                 if hit[j]:
                     k[node] += 1
                     pairs[node] += tokens[j]
-    copy_lane = words[5 * nodes]
-    copy = 0
+    copy_lane, first_byte, per_expert, stream_lane, stream_base = words[5 * nodes : 5 * nodes + 5]
+    stream0 = stream_base + first_byte + per_expert * streamed
+    copy, lanes = 0, 0
     for j in sorted(candidates, key=lambda j: (-tokens[j], j)):
         node = node_of[j]
         t = model_node_finish(words, node, k[node] + 1, pairs[node] + tokens[j], misses[node], nodes)
-        if t <= copy + copy_lane:
+        side = copy + copy_lane
+        if streamed > 0 and stream_lane > 0:
+            side = max(side, stream0 + stream_lane * (lanes + 1))
+        if t <= side:
             cpu[j] = True
             k[node] += 1
             pairs[node] += tokens[j]
         else:
             copy += copy_lane
+            lanes += 1
     return cpu
 
 
@@ -257,7 +271,10 @@ def type_lanes(
         node_of = [home(e) for e in experts]
         copyable = [True if dst_ok is None else bool(dst_ok[j]) for j in range(len(experts))]
         forced = [j >= forced_from for j in range(len(experts))]
-        model = model_cpu_lanes(node_of, tokens, hit, eligible, forced, copyable, split_model, nodes)
+        # GPU-streamed misses (MISS_GPU): unforced, unscratched misses the CPU does not take.
+        streamed = sum(1 for j in range(len(experts))
+                       if not forced[j] and not scratched[j] and not hit[j] and not eligible[j])
+        model = model_cpu_lanes(node_of, tokens, hit, eligible, forced, copyable, split_model, nodes, streamed)
         cpu = [forced[j] or model[j] for j in range(len(experts))]
         if model_stats is not None and any(eligible):
             model_stats[0] += 1
