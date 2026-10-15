@@ -249,6 +249,17 @@ FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
 for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
+# Both fixed-split with node 1's CPU expert team on 13 physical cores instead of 10: 32-34 are the node's cores no
+# server, RAM, spec or driver thread uses (arm_env.DRIVER_CORES 28-31). Node 0 is stated as derived (6-15), so the
+# THREADS cap of 13 changes node 1 alone; its A is the arm without the suffix's cores13.
+ARMS[PROMOTE_POOL_SERVE_ARM + "-cores13" + FIXED_SPLIT_SUFFIX] = (
+    {
+        **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
+        "SGLANG_DSV41_CPU_EXPERTS_THREADS": "13",
+        "SGLANG_EXPERT_NUMA_CORES": "0:ram=17,cpu=6-15;1:ram=35,cpu=18-27,32-34",
+    },
+    True,
+)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
