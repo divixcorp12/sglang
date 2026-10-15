@@ -169,7 +169,10 @@ kswapd1 ran, and 1.8 GiB was swapped out in decode. Team threads still took 0 ma
 
 **Lesson for every run:** evict leftover file cache before launch, without root (posix_fadvise DONTNEED over the
 model, draft, row-image and Engram files). Log per-node free memory, and wait if node 1 lacks room for the HiCache
-pools. The sampler now records /proc/diskstats. The model shards are on sdb3 (SATA root volume), which fits arm A's
+pools. Committed as `analysis/dsv41-drive/dspark/prelaunch_evict.py`, with `memsample.py` (numa_maps, diskstats) and
+`memsum.py`, in `f5fb51875b` on `split-model`. The node-1 floor = HiCache pools + "rest" + margin. "Rest" comes from
+the arm's previous memsample (`--previous`) or falls back to arm A's 51.24 GiB, and the source used is logged.
+Eviction drops the cache of shared model files for everyone, so it runs only when no other server is up. The sampler now records /proc/diskstats. The model shards are on sdb3 (SATA root volume), which fits arm A's
 first-shard stall. Open: ~280 GiB read per NVMe mirror partition during C's decode. Not yet known whether that is
 the server's own reads or an overlapping reader.
 
