@@ -30,9 +30,14 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+from sglang.kernels.ops.moe.expert_cache_transfer import (
+    copy_expert_row_segments_gpu,
+    device_copy_grid_blocks,
+    expert_row_segments,
+)
 from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    DRIP_TABLE_SLOTS,
     ExpertStreamDevice,
     ExpertStreamHost,
     device_stamps_enabled,
@@ -550,8 +555,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
     One gather posts a linear chain of kernels in one stream (see
     ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "The chain"): the post kernel, which
     types the lanes from the device's slot map; C1, which copies the compacted
-    ``HIT_SM`` lanes; S, which copies the misses piece by piece; the copy wait (CW); a
-    stream wait; and the copy check (CC).
+    ``HIT_SM`` lanes; with the GPU drip, C1s, which copies the ``HIT_SCRATCH`` lanes
+    from the drip's VRAM scratch; S, which copies the misses piece by piece; the copy
+    wait (CW); a stream wait; and the copy check (CC).
 
     ``routes`` holds the layer's routed experts (the protect set); ``_apply_graph``
     copies them in before each gather. ``planned`` pads the plan's expert ids to at
@@ -627,6 +633,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.spec_score = None
         # SGLANG_DSV41_RESIDENCY_CAPTURE: a ResidencyHook set by Exl3RamMissService.attach; None is the uncaptured post.
         self.residency_hook = None
+        # SGLANG_DSV41_GPU_DRIP_SLOTS: C1s's segments, from the drip's scratch slots to this row's destinations (set by
+        # Exl3RamMissService.attach); None: no C1s.
+        self.drip_segments = None
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -711,6 +720,15 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         copy_expert_row_segments_gpu(
             self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1
         )
+        if self.drip_segments is not None:
+            # C1s: the HIT_SCRATCH lanes, from the GPU drip's scratch slots (LEASE_PROTOCOL.md, "The GPU drip").
+            copy_expert_row_segments_gpu(
+                self.drip_segments,
+                side.scratch_rows_1,
+                side.scratch_dst_1,
+                side.scratch_go_1,
+                grid_blocks=device_copy_grid_blocks(self.drip_segments.table.device),
+            )
         side.stream(
             self.row,
             self.planned,
@@ -835,6 +853,11 @@ class Exl3RamMissService:
         # The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu), set at start; its per-row table is built as rows attach.
         self._spec_gpu = None
         self._spec_hot: dict[int, tuple] = {}
+        # SGLANG_DSV41_GPU_DRIP_SLOTS: (slots, picks) once enabled at start, and the scratch tensors the first attach
+        # allocates; None when off.
+        self._drip: Optional[tuple[int, int]] = None
+        self._drip_scratch: Optional[list[torch.Tensor]] = None
+        self._drip_table: Optional[torch.Tensor] = None  # the scratch table, device memory (attach)
         self._row_backends: dict[int, object] = {}
         self._rows: dict[int, int] = {}
         self._manager = None
@@ -1176,6 +1199,8 @@ class Exl3RamMissService:
                 if spec_share
                 else None
             )
+            if cfg.gpu_drip_slots:
+                self._enable_gpu_drip(cfg, host, spec_gpu, copy_engine=copy_engine)
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -1438,6 +1463,50 @@ class Exl3RamMissService:
         )
         return result
 
+    def _enable_gpu_drip(self, cfg: Dsv41Config, host, spec_gpu, *, copy_engine: bool) -> None:
+        """SGLANG_DSV41_GPU_DRIP_SLOTS (host/gpu_drip.h): the copy thread drips the GPU scorer's picks of RAM-resident
+        experts into VRAM scratch slots, allocated at the first attach. Before the service thread starts."""
+        if not copy_engine:
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_DSV41_GPU_DRIP_SLOTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE, which copies "
+                "the drips"
+            )
+        if spec_gpu is None:
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_DSV41_GPU_DRIP_SLOTS needs SGLANG_DSV41_RAM_PREFETCH with "
+                "SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu, whose scoring picks the drips"
+            )
+        host.enable_gpu_drip(
+            cfg.gpu_drip_slots,
+            picks=cfg.gpu_drip_picks,
+            chunk_bytes=cfg.gpu_drip_chunk_kb * 1024,
+            targets=spec_gpu.picked.targets[:, 0].tolist(),
+            candidates=spec_gpu.candidates,
+        )
+        self._drip = (cfg.gpu_drip_slots, cfg.gpu_drip_picks)
+        logger.info(
+            "exl3 RAM miss GPU drip: %d scratch slots, %d picks per scored record, %d KiB chunks",
+            cfg.gpu_drip_slots,
+            cfg.gpu_drip_picks,
+            cfg.gpu_drip_chunk_kb,
+        )
+
+    def _drip_segments(self, row: int, segments):
+        """C1s's segments for ``row``: from the drip's scratch tensors to the row's destinations. The first row
+        allocates the scratch, ``slots`` rows of each destination's row shape, and registers it with the host; every
+        later row must have the same shapes, since the slots serve every row."""
+        slots, _ = self._drip
+        destinations = [destination for _, destination in segments.pairs]
+        if self._drip_scratch is None:
+            self._drip_scratch = [
+                torch.empty((slots,) + tuple(d.shape[1:]), dtype=d.dtype, device=d.device) for d in destinations
+            ]
+            self.host.set_drip_scratch(self._drip_scratch, self._drip_table)
+        shapes = [(tuple(d.shape[1:]), d.dtype) for d in destinations]
+        if shapes != [(tuple(s.shape[1:]), s.dtype) for s in self._drip_scratch]:
+            raise ValueError(f"exl3 RAM miss GPU drip: row {row}'s destinations {shapes} differ from the scratch's")
+        return expert_row_segments(list(zip(self._drip_scratch, destinations)))
+
     def before_host_use(self) -> None:
         """Begin eager pinned-tier use: drain queued device work, then pause the thread.
 
@@ -1563,6 +1632,10 @@ class Exl3RamMissService:
                         spec.learned_head, device=cache.device, top_k=spec.picked.top_k, picks=spec.per_layer
                     )
                     self.device_side.enable_spec_head(head)
+            if self._drip is not None:
+                slots, picks = self._drip
+                self._drip_table = torch.zeros(DRIP_TABLE_SLOTS, dtype=torch.int64, device=cache.device)
+                self.device_side.enable_gpu_drip(slots, table=self._drip_table, picks=picks)
             # The device's map starts empty: every row the tier maps now reaches it as
             # one bulk of entries, taken paused. The bulk list before this point was
             # dropped (after_host_use), so the snapshot is the source.
@@ -1674,6 +1747,9 @@ class Exl3RamMissService:
             dst_rows = min(
                 int(destination.shape[0]) for _, destination in segments.pairs
             )
+            if self._drip is not None:
+                # The scratch is registered before the row's copy table, which names the drip's sources.
+                streamer.row_backend.drip_segments = self._drip_segments(row, segments)
             self.host.set_copy_table(row, segments.table, dst_rows, sm_mask=sm_mask)
             self.device_side.set_row_copy(row, dst_rows)
 

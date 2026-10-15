@@ -201,9 +201,12 @@ void copy_expert_row_segments_gpu(
     tvm::ffi::TensorView segments,
     tvm::ffi::TensorView source_rows,
     tvm::ffi::TensorView destination_slots,
-    tvm::ffi::TensorView count) {
+    tvm::ffi::TensorView count,
+    int64_t grid_blocks) {
   const auto device = host::LaunchKernel::resolve_device(segments.device());
-  host::LaunchKernel(kExpertTransferGridSize, kExpertTransferBlockSize, device)(
+  // A pull over PCIe needs few blocks in flight; a device-to-device copy passes a wide grid to reach HBM speed.
+  const int64_t grid = grid_blocks > 0 ? grid_blocks : kExpertTransferGridSize;
+  host::LaunchKernel(static_cast<uint32_t>(grid), kExpertTransferBlockSize, device)(
       copy_expert_row_segments_gpu_kernel,
       static_cast<const int64_t*>(segments.data_ptr()),
       static_cast<int64_t>(segments.size(0)),

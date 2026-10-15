@@ -262,9 +262,156 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
 #endif
 }
 
+// Arguments of the GPU drip's select kernel (host/gpu_drip.h), a __grid_constant__ a captured graph freezes.
+struct SpecDripParams {
+  const float* scores;       // [rows, experts]: a score per expert per row, higher is better; the rows' max ranks
+  int64_t rows;              // 0: no scores for this record, count 0
+  int64_t experts;
+  const int64_t* hot_slots;  // the target layer's VRAM slots' experts (-1 empty), hot_capacity of them
+  int64_t hot_capacity;
+  const int32_t* ram_slot;   // the target layer's row of the device map: >= 0 mapped in RAM
+  int64_t picks;             // 1..SpecCandidates::kMaxDrips
+  const int32_t* state;      // the post's state words: kPosted is the record's seq
+  uint8_t* candidates;       // the pinned candidate page
+};
+
+// The GPU drip's picks, one block of kSelectThreads: the `picks` best experts mapped in RAM and not VRAM-hot by their
+// best score over the rows (ties to the lower id, NaN below all), published after the candidates under their own seq:
+// seq 0, a release fence, the count and experts, then the seq with a release.
+__global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3_gpu_drip_select_kernel(
+    const __grid_constant__ SpecDripParams p) {
+  using namespace device::expert_stream;
+  using Cand = ::sglang::expert_stream::wire::SpecCandidates;
+  constexpr int kWarps = kSelectThreads / 32;
+  __shared__ uint8_t eligible[kSelectMaxExperts];
+  __shared__ float key[kSelectMaxExperts];
+  __shared__ float warp_top[kWarps];
+  __shared__ int32_t warp_id[kWarps];
+  __shared__ int32_t pick[Cand::kMaxDrips];
+  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+  for (int64_t e = tid; e < p.experts; e += blockDim.x) {
+    eligible[e] = p.ram_slot[e] >= 0 ? 1 : 0;
+    float best = neg_inf();
+    for (int64_t r = 0; r < p.rows; ++r) {
+      const float s = p.scores[r * p.experts + e];
+      if (s > best) best = s;  // a NaN never wins
+    }
+    key[e] = best;
+  }
+  __syncthreads();
+  for (int64_t s = tid; s < p.hot_capacity; s += blockDim.x) {
+    const int64_t e = p.hot_slots[s];
+    if (e >= 0 && e < p.experts) eligible[e] = 0;
+  }
+  __syncthreads();
+  const int64_t picks = p.rows > 0 ? p.picks : 0;
+  for (int64_t k = 0; k < picks; ++k) {  // uniform, so every thread reaches each __syncthreads
+    float top = neg_inf();
+    int32_t id = 0x7FFFFFFF;
+    for (int64_t e = tid; e < p.experts; e += blockDim.x) {
+      if (eligible[e] && ranks_above(key[e], static_cast<int32_t>(e), top, id)) {
+        top = key[e];
+        id = static_cast<int32_t>(e);
+      }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      const float other = __shfl_xor_sync(0xFFFFFFFFu, top, offset);
+      const int32_t other_id = __shfl_xor_sync(0xFFFFFFFFu, id, offset);
+      if (ranks_above(other, other_id, top, id)) {
+        top = other;
+        id = other_id;
+      }
+    }
+    if (lane == 0) {
+      warp_top[warp] = top;
+      warp_id[warp] = id;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      for (int w = 1; w < kWarps; ++w)
+        if (ranks_above(warp_top[w], warp_id[w], warp_top[0], warp_id[0])) {
+          warp_top[0] = warp_top[w];
+          warp_id[0] = warp_id[w];
+        }
+      pick[k] = warp_id[0];
+      if (warp_id[0] != 0x7FFFFFFF) eligible[warp_id[0]] = 0;
+    }
+    __syncthreads();
+  }
+  if (tid != 0) return;
+  int count = 0;
+  while (count < picks && pick[count] != 0x7FFFFFFF) ++count;
+  const uint32_t seq = static_cast<uint32_t>(p.state[kPosted]);
+  uint8_t* const slot = p.candidates + static_cast<int64_t>((seq - 1u) % Cand::kCandRecords) * Cand::kCandStride;
+  st_relaxed_sys<uint32_t>(slot + Cand::kCandDripSeq, 0u);
+  cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
+  st_relaxed_sys<uint32_t>(slot + Cand::kCandDripCount, static_cast<uint32_t>(count));
+  for (int c = 0; c < Cand::kMaxDrips; c += 2) {
+    const uint32_t lo = c < count ? static_cast<uint32_t>(pick[c]) : 0xFFFFu;
+    const uint32_t hi = c + 1 < count ? static_cast<uint32_t>(pick[c + 1]) : 0xFFFFu;
+    st_relaxed_sys<uint32_t>(slot + Cand::kCandDripExperts + 2 * c, lo | hi << 16);
+  }
+  st_release_sys(slot + Cand::kCandDripSeq, seq);  // orders the picks before their seq
+}
+
 /// \brief Checked host launchers for the GPU scorer's kernels: score, then select, on the stream of the tensors'
 /// device and without PDL, so each starts after the post before it completed.
 struct SpecScoreKernel {
+  /// Launches the GPU drip's select kernel; see SpecDripParams. `scores` fp32 [rows_max, experts] with 0 <= rows <=
+  /// rows_max, `ram_slot` the device map bank's [map rows, experts] and `target` its row, `candidates_address` the
+  /// pinned candidate page's address.
+  static void drip(
+      tvm::ffi::TensorView scores,
+      int64_t rows,
+      tvm::ffi::TensorView hot_slots,
+      int64_t hot_capacity,
+      tvm::ffi::TensorView ram_slot,
+      int64_t target,
+      int64_t picks,
+      tvm::ffi::TensorView state,
+      int64_t candidates_address) {
+    using namespace host;
+    using namespace device::expert_stream;
+    using Cand = ::sglang::expert_stream::wire::SpecCandidates;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto E_ = SymbolicSize{"experts"};
+    auto M_ = SymbolicSize{"rows_max"};
+    auto Rows_ = SymbolicSize{"map_rows"};
+    expert_stream::verify_named(
+        "scores", TensorMatcher({M_, E_}).with_dtype<fp32_t>().with_device<kDLCUDA>(device), scores);
+    expert_stream::verify_named(
+        "hot_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), hot_slots);
+    expert_stream::verify_named(
+        "ram_slot", TensorMatcher({Rows_, E_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
+    expert_stream::verify_named(
+        "state", TensorMatcher({kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    const int64_t experts = E_.unwrap();
+    RuntimeCheck(scores.is_contiguous(), "scores: must be contiguous");
+    RuntimeCheck(experts <= kSelectMaxExperts, "experts: the drip select holds at most ", kSelectMaxExperts);
+    RuntimeCheck(experts <= 0xFFFF, "experts: the drip picks are u16");
+    RuntimeCheck(rows >= 0 && rows <= M_.unwrap(), "rows: 0..scores' rows");
+    RuntimeCheck(picks >= 1 && picks <= Cand::kMaxDrips, "picks: 1..", Cand::kMaxDrips);
+    RuntimeCheck(hot_capacity >= 0 && hot_capacity <= hot_slots.size(0), "hot_capacity: at most hot_slots' size");
+    RuntimeCheck(target >= 0 && target < Rows_.unwrap(), "target: outside the map bank");
+    RuntimeCheck(
+        candidates_address != 0 && candidates_address % 128 == 0, "candidates: a nonzero 128-byte aligned address");
+    const auto params = SpecDripParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .rows = rows,
+        .experts = experts,
+        .hot_slots = static_cast<const int64_t*>(hot_slots.data_ptr()),
+        .hot_capacity = hot_capacity,
+        .ram_slot = static_cast<const int32_t*>(ram_slot.data_ptr()) + target * experts,
+        .picks = picks,
+        .state = static_cast<const int32_t*>(state.data_ptr()),
+        .candidates = reinterpret_cast<uint8_t*>(candidates_address),
+    };
+    const auto stream = LaunchKernel::resolve_device(scores.device());
+    LaunchKernel(dim3(1), dim3(kSelectThreads), stream)(exl3_gpu_drip_select_kernel, params);
+  }
+
   /// Launches the score kernel; see SpecScoreParams. `x` bf16 [tokens, hidden], `w` bf16 or fp32 [experts, hidden],
   /// `bias` fp32 [experts], `scores` fp32 [tokens_max, experts] with 1 <= tokens <= tokens_max.
   static void score(

@@ -40,6 +40,24 @@ def test_cpu_tail_hits_only_and_with_misses():
     assert kinds == [LaneKind.HIT_COPY, LaneKind.MISS_CPU, LaneKind.HIT_CPU, LaneKind.MISS_CPU]
 
 
+def test_a_landed_drip_leaves_the_split_and_takes_no_staging_slot_but_never_without_host_lanes():
+    """The GPU drip's lane: scratched, hit 3 is HIT_SCRATCH at its scratch slot and the CPU split reads n = 1 (the
+    other hit) instead of 2, and the scratched miss 4 leaves the staging slot to miss 2. An eager or unarmed post never
+    reads the table; a forced lane is the CPU's whatever the table holds."""
+    ram = [-1] * 10
+    ram[1], ram[3] = 21, 23
+    staging = [50, 51, 52] + [-1] * 5
+    scratch = [-1, -1, 7, 6]
+    kinds, slots = _type([1, 2, 3, 4], ram, staging, cpu_on=True, scratch=scratch)  # n = 1, split[1] = 1: lane 0
+    assert kinds == [LaneKind.HIT_CPU, LaneKind.MISS_GPU, LaneKind.HIT_SCRATCH, LaneKind.HIT_SCRATCH]
+    assert slots == [21, 50, 7, 6]
+    for armed in ({"captured": False}, {"copy_armed": False}):
+        kinds, _ = _type([1, 2, 3, 4], ram, staging, scratch=scratch, **armed)
+        assert LaneKind.HIT_SCRATCH not in kinds
+    kinds, _ = _type([1, 2, 3, 4], ram, staging, cpu_on=True, scratch=scratch, forced_from=3)
+    assert kinds[2:] == [LaneKind.HIT_SCRATCH, LaneKind.MISS_CPU]
+
+
 def test_eager_or_unarmed_posts_use_sm_and_no_cpu():
     for captured, armed in ((False, True), (True, False)):
         kinds, _ = _type([0, 1], [7, -1], [3] + [-1] * 7, captured=captured, copy_armed=armed,

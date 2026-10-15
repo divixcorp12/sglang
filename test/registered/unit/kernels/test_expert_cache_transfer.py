@@ -75,10 +75,14 @@ def test_copy_expert_rows_gpu_copies_every_byte_for_any_row_count(rows, row_byte
     assert not copied[untouched].any()
 
 
+@pytest.mark.parametrize("wide", [False, True])
 @pytest.mark.parametrize("rows", [1, 7, 2100])
-def test_copy_expert_row_segments_gpu_copies_every_segment(rows):
+def test_copy_expert_row_segments_gpu_copies_every_segment(rows, wide):
+    """The wide grid (the drip's device-to-device copy) splits each row over hundreds of warps
+    instead of a few; every byte must still land exactly once."""
     from sglang.kernels.ops.moe.expert_cache_transfer import (
         copy_expert_row_segments_gpu,
+        device_copy_grid_blocks,
         expert_row_segments,
     )
 
@@ -111,6 +115,7 @@ def test_copy_expert_row_segments_gpu_copies_every_segment(rows):
         picked_rows.to(device="cuda", dtype=torch.int64),
         picked_slots.to(device="cuda", dtype=torch.int32),
         torch.tensor([rows], dtype=torch.int32, device="cuda"),
+        grid_blocks=device_copy_grid_blocks(torch.device("cuda", 0)) if wide else 0,
     )
     torch.cuda.synchronize()
 

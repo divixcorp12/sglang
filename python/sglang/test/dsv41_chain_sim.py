@@ -111,6 +111,21 @@ class ChainSim:
         w = self.wire
         return sum((_i32(self.block, w.split + n * w.split_stride, w.lanes + 1).tolist() for n in range(w.nodes)), [])
 
+    def scratch_words(self) -> list[int]:
+        """The GPU drip's scratch table (the host's drip_table), a u64 per slot (0 or tag << 32 | row << 16 |
+        expert); all 0 without one."""
+        table = self.host.drip_table
+        if table is None:
+            return [0] * self.wire.scratch_slots
+        return [x & 0xFFFFFFFFFFFFFFFF for x in table.tolist()]
+
+    def scratch_slots(self, row: int, experts: Sequence[int]) -> list[int]:
+        """match_scratch: per expert, the slot whose word names (row, expert) with a nonzero tag, else -1."""
+        words = self.scratch_words()
+        return [
+            next((s for s, x in enumerate(words) if x >> 32 and x & 0xFFFFFFFF == (row << 16 | e)), -1) for e in experts
+        ]
+
     def piece_word(self, req: SimRequest, lane: int) -> int:
         w = self.wire
         return self.read_u64(w.piece_mask + (req.idx * w.lanes + lane) * w.piece_mask_line_bytes)
@@ -177,12 +192,14 @@ class ChainSim:
         forced_from: Optional[int] = None,
         miss_cut: int = 0,
         miss_cut_max: int = 3,
+        drip: bool = False,
     ) -> SimRequest:
         """The post kernel: apply the row's pending delta, type the lanes from the replica, then the hot record, the
         record and demand_head. ``kinds``/``slots`` override the typing and ``chain`` the map-chain number (a malformed post); ``hot`` is the VRAM hot
         set the hot record carries, ``hot_seq`` the seq it names (a stale record).
         ``forced_from`` types the lanes from it on as spill does, and ``miss_cut``/``miss_cut_max`` trim the split as
-        SGLANG_DSV41_CPU_SPLIT_MISS_CUT/_MAX do (type_lanes)."""
+        SGLANG_DSV41_CPU_SPLIT_MISS_CUT/_MAX do (type_lanes). ``drip``: the post reads the GPU drip's scratch table
+        (a device with drip slots)."""
         experts = tuple(int(e) for e in experts)
         if experts and not self.apply_pending(row):
             raise AssertionError(f"row {row}: the host has not published delta {self.replica.map_chain[row]}")
@@ -192,6 +209,7 @@ class ChainSim:
                 lanes=self.wire.lanes, nodes=self.wire.nodes, captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
                 cpu_misses=cpu_misses, cpu_ok=cpu_ok, ce_ok=ce_ok,
                 forced_from=forced_from, miss_cut=miss_cut, miss_cut_max=miss_cut_max,
+                scratch=self.scratch_slots(row, experts) if drip else None,
             )
         else:
             # Raw ints, not LaneKind: a malformed post may name a kind the device never writes.

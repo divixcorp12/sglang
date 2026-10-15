@@ -86,6 +86,7 @@ struct LeaseLayout {
   static constexpr uint32_t kKindHitCpu = 3;
   static constexpr uint32_t kKindMissGpu = 4;
   static constexpr uint32_t kKindMissCpu = 5;
+  static constexpr uint32_t kKindHitScratch = 6;  // a landed GPU drip (host/gpu_drip.h): C1s copies it from VRAM
   static constexpr int64_t kHotHeaderBytes = 8;
   static constexpr int64_t kHotAlignment = 64;
   static constexpr uint32_t kHotRecords = kDemandRecords;
@@ -108,6 +109,10 @@ struct LeaseLayout {
   static constexpr int64_t kSplit = kCopyArmed + 128;  // i32[kNodes][kSplitStride / 4]: CPU lanes per n eligible lanes
   static constexpr int64_t kSplitStride = wire_round_up(4 * (kLanes + 1), 16);  // a node's table, in 16-byte loads
   static constexpr int64_t kLeaseBlockBytes = wire_round_up(kSplit + kNodes * kSplitStride, kLeaseBlockAlign);
+  // The GPU drip's scratch table (host/gpu_drip.h) is device memory, not this block: u64[kScratchSlots], 0 while the
+  // slot holds nothing a post may use, else tag << 32 | row << 16 | expert with a nonzero tag, written by the copy
+  // stream after the slot's bytes.
+  static constexpr int kScratchSlots = 32;
 
   // ---- Map delta block: one record per row after the completion block ----
   static constexpr int64_t kDeltaBase = kLeaseBlockBytes;

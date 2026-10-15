@@ -289,7 +289,29 @@ struct LanePlan {
   const int32_t* dst;
   int64_t count;
   int64_t forced_from;
+  const int32_t* scratch = nullptr;  // [Wire::kLanes]: the lane's landed GPU drip slot (match_scratch), -1 for none
 };
+
+// The GPU drip (host/gpu_drip.h): out[j] is the scratch slot among the table's first `slots` whose word names (row,
+// planned[j]), else -1. The table is device memory the copy stream writes after the slot's bytes (a fenced stream
+// write), so a word seen here has its bytes in device memory before C1s, a later kernel, reads them. Each word is one
+// atomic u64 load; no load crosses the link.
+SGL_DEVICE void match_scratch(
+    const uint64_t* table, int64_t slots, int64_t row, const int64_t* planned, int64_t count,
+    int32_t (&out)[Wire::kLanes]) {
+  uint64_t word[Wire::kScratchSlots];
+#pragma unroll
+  for (int s = 0; s < Wire::kScratchSlots; ++s)
+    word[s] = s < slots ? ld_relaxed_sys<uint64_t>(table + s) : 0;
+#pragma unroll
+  for (int j = 0; j < Wire::kLanes; ++j) {
+    out[j] = -1;
+    if (j >= count) continue;
+    const uint64_t want = (static_cast<uint64_t>(row) & 0xFFFFu) << 16 | (static_cast<uint64_t>(planned[j]) & 0xFFFFu);
+    for (int s = 0; s < Wire::kScratchSlots; ++s)
+      if ((word[s] >> 32) != 0 && (word[s] & 0xFFFFFFFFull) == want) out[j] = s;
+  }
+}
 
 // Everything besides the map that decides a lane's kind, loaded before type_lanes runs.
 struct LanePolicy {
@@ -338,6 +360,8 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kNodes][Wi
 // staging slot on its node (live misses <= victim lanes = staging per node: an assert), a split entry above its n.
 // With policy.miss_cut > 0, a node with 1..policy.miss_cut_max forced misses (forced lanes that are not RAM hits)
 // takes policy.miss_cut fewer of its split's lanes, at least 0; forced lanes stay CPU lanes.
+// With host lanes, an unforced lane with a plan.scratch slot is kKindHitScratch at that slot: no staging slot, not
+// eligible, so its node's split reads one lane fewer.
 // Returns false where the reference raises LaneOverflow: forced lanes with no host lanes or no CPU layer; `out` is then
 // partial. Reads no host memory; the caller loads the split table into the policy.
 SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
@@ -362,6 +386,7 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     ram[j] = j < plan.count ? map.ram_slot[expert[j]] : -1;
   bool hit[Wire::kLanes];
   bool eligible[Wire::kLanes];
+  bool scratched[Wire::kLanes];
   int m[Wire::kNodes] = {};
   int n[Wire::kNodes] = {};
   int forced_misses[Wire::kNodes] = {};
@@ -374,6 +399,13 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     const int node = Wire::home(expert[j]);
     const bool forced = j >= plan.forced_from;
     out.node[j] = node;
+    scratched[j] = !forced && policy.host_lanes && plan.scratch != nullptr && plan.scratch[j] >= 0 && dst[j] >= 0;
+    if (scratched[j]) {
+      out.slot[j] = plan.scratch[j];
+      hit[j] = false;
+      eligible[j] = false;
+      continue;
+    }
     hit[j] = ram[j] >= 0;
     if (hit[j]) {
       if (static_cast<uint32_t>(ram[j]) >= map.row_capacity) __trap();
@@ -404,7 +436,9 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     const bool cpu = forced || (take[node] > 0 && eligible[j]);
     if (cpu && !forced) --take[node];
     uint8_t kind;
-    if (cpu) {
+    if (scratched[j]) {
+      kind = Wire::kKindHitScratch;
+    } else if (cpu) {
       kind = hit[j] ? Wire::kKindHitCpu : Wire::kKindMissCpu;
     } else if (hit[j]) {
       kind = copy_ok && dst[j] >= 0 && dst[j] < policy.dst_rows ? Wire::kKindHitCopy : Wire::kKindHitSm;

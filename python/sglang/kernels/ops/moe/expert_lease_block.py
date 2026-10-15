@@ -116,6 +116,10 @@ class WireLayout:
     def split_stride(self) -> int:
         return _round_up(4 * (self.lanes + 1), 16)
 
+    # The GPU drip's scratch table (host/gpu_drip.h), in device memory: a u64 per slot, 0 or tag << 32 | row << 16 |
+    # expert.
+    scratch_slots = 32
+
     @property
     def lease_block_bytes(self) -> int:
         return _round_up(self.split + self.nodes * self.split_stride, self.block_align)
@@ -159,7 +163,8 @@ class WireLayout:
             "kLeasePieceSource": self.piece_source, "kLeaseCopyDone": self.copy_done, "kLeaseCopyDoneBytes": self.copy_done_bytes,
             "kLeaseCopyGate": self.copy_gate, "kLeaseGateClosed": GATE["closed"], "kLeaseGateOpen": GATE["open"],
             "kLeaseGateSeqShift": GATE_SEQ_SHIFT, "kLeaseGateSeqMask": GATE_SEQ_MASK, "kCopyArmed": self.copy_armed,
-            "kSplit": self.split, "kSplitStride": self.split_stride, "kLeaseBlockBytes": self.lease_block_bytes,
+            "kSplit": self.split, "kSplitStride": self.split_stride, "kKindHitScratch": int(LaneKind.HIT_SCRATCH),
+            "kScratchSlots": self.scratch_slots, "kLeaseBlockBytes": self.lease_block_bytes,
             "kDeltaBase": self.lease_block_bytes, "kDeltaTag": d["tag"], "kDeltaCount": d["count"],
             "kDeltaStaging": d["staging"], "kDeltaEntries": d["entries"],
             "kDeltaMaxEntries": self.delta_max_entries, "kDeltaStride": self.delta_stride, "home7": self.home(7),

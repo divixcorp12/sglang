@@ -74,6 +74,9 @@ class CopyBackend {
   virtual std::string init() = 0;
   /// Queues one copy after every earlier one; 0 or an error code.
   virtual int issue(uint64_t dst, uint64_t src, int64_t bytes) = 0;
+  /// Queues one atomic u64 store of `value` to device address `dst`, after every earlier copy has landed (the GPU
+  /// drip's scratch-table words); 0 or an error code.
+  virtual int write64(uint64_t dst, uint64_t value) = 0;
   /// Marks the point after every copy issued so far and stores its token; 0 or an error code.
   virtual int mark(int64_t* token) = 0;
   /// kDone, kPending, or an error code (negative for the host backend).
@@ -126,6 +129,7 @@ class CudaCopyBackend : public CopyBackend {
     get(cu_mem_host_device_ptr_, "cuMemHostGetDevicePointer_v2");
     get(cu_mem_free_host_, "cuMemFreeHost");
     get(cu_write_value32_, "cuStreamWriteValue32_v2");
+    get(cu_write_value64_, "cuStreamWriteValue64_v2");
     get(cu_wait_value32_, "cuStreamWaitValue32_v2");
     if (!missing.empty()) return "libcuda.so.1 lacks " + missing + ", which the copy engine needs";
     if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
@@ -147,6 +151,11 @@ class CudaCopyBackend : public CopyBackend {
 
   int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
     return cu_memcpy_async_(dst, src, static_cast<size_t>(bytes), stream_);
+  }
+
+  /// Default flags: the write executes after the stream's prior work and fences that work's memory before it.
+  int write64(uint64_t dst, uint64_t value) override {
+    return cu_write_value64_(stream_, dst, value, 0);
   }
 
   /// The token is the job's sequence number, written into the completion word after the job's copies.
@@ -272,6 +281,7 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_mem_host_device_ptr_)(uint64_t*, void*, unsigned) = nullptr;
   int (*cu_mem_free_host_)(void*) = nullptr;
   int (*cu_write_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
+  int (*cu_write_value64_)(void*, uint64_t, uint64_t, unsigned) = nullptr;
   int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
@@ -290,7 +300,12 @@ static_assert(
 ///   void copy_completed(const CopyJob&)   copies and CPU jobs done: publish CopyDone and open the gate;
 ///   void copy_failed(const CopyJob&, int)  completion cannot be established: fail stop (also called on the
 ///                                          submitting thread for a ring overflow);
-///   owner->template copy_count<K>(n)       the copy thread's counters.
+///   owner->template copy_count<K>(n)       the copy thread's counters;
+///   bool drip_on(), drip_busy()            the GPU drip (gpu_drip.h) is enabled; it has a chunk in flight;
+///   bool drip_step(backend, demand_idle)   one step of the drip, which issues a chunk only when demand_idle.
+///
+/// The GPU drip's copies go on the same stream after demand copies only: a step may issue only while no demand job is
+/// queued and the last one's DMA has completed, one chunk at a time, so a demand copy waits behind at most one chunk.
 ///
 /// Each group's service thread pushes to its own SPSC ring and rings the doorbell; submit() takes no lock and never
 /// blocks, and makes a syscall only to wake a sleeping copy thread. The copy thread polls the rings and its in-flight
@@ -434,6 +449,7 @@ class CopyEngine {
  private:
   static constexpr int kRingOverflow = -1000;
   static constexpr int64_t kDestructorDrainNs = 5'000'000'000;
+  static constexpr int64_t kDripPollNs = 100'000;  // arbitrary: an idle copy thread's wake-up with the drip on
   using Queue = FixedDeque<CopyJob, kCopyRing>;
 
   struct Table {
@@ -485,18 +501,35 @@ class CopyEngine {
       const bool stopping = stop_.load(std::memory_order_acquire);
       bool progressed = issue_submitted(in_flight);
       progressed |= retire_completed(in_flight);
+      const bool drip = owner_->drip_on();
+      if (drip) progressed |= owner_->drip_step(*backend_, !stopping && broken_ == 0 && rings_empty() && dma_idle());
+      const bool drip_busy = drip && owner_->drip_busy();
       // The drain deadline is read only once a stop was asked for: never while serving.
-      if (stopping && (in_flight.empty() || now_ns() > drain_deadline_.load(std::memory_order_relaxed))) break;
+      if (stopping &&
+          ((in_flight.empty() && !drip_busy) || now_ns() > drain_deadline_.load(std::memory_order_relaxed)))
+        break;
       if (progressed) {
         idle = 0;
-      } else if (!in_flight.empty() || ++idle < spin_iters_) {
+      } else if (!in_flight.empty() || drip_busy || ++idle < spin_iters_) {
         _mm_pause();
       } else {
-        doorbell_.sleep_unless([this] { return !rings_empty() || stop_.load(std::memory_order_acquire); });
+        const auto ready = [this] { return !rings_empty() || stop_.load(std::memory_order_acquire); };
+        // The drip follows the demand head, which nothing rings: it wakes to poll it.
+        if (drip)
+          doorbell_.sleep_unless(ready, kDripPollNs);
+        else
+          doorbell_.sleep_unless(ready);
         idle = 0;
       }
     }
-    backend_->shutdown(in_flight.empty() && broken_ == 0);
+    backend_->shutdown(in_flight.empty() && !(owner_->drip_on() && owner_->drip_busy()) && broken_ == 0);
+  }
+
+  /// True once the last demand job's copies completed (its mark reached): the drip may issue.
+  bool dma_idle() {
+    if (last_dma_done_) return true;
+    if (backend_->query(last_dma_token_) == CopyBackend::kDone) last_dma_done_ = true;
+    return last_dma_done_;
   }
 
   /// Pops every group's submitted jobs and issues them; whether any came.
@@ -657,6 +690,8 @@ class CopyEngine {
       return 0;
     }
     const int r = backend_->mark(&job.token);
+    last_dma_token_ = job.token;
+    last_dma_done_ = false;
     if constexpr (Build::kMetrics)
       trace_.emit("copy_issue", job.row, job.gen, job.cpu_seq, job.group, bytes, job.count - std::popcount(job.cpu_mask), job.token);
     if constexpr (Build::kMetrics) {
@@ -720,6 +755,8 @@ class CopyEngine {
   std::atomic<bool> stop_{false};
   std::atomic<int64_t> drain_deadline_{0};  // written by stop() before its release of stop_
   int broken_ = 0;                          // copy thread only: the first backend error
+  int64_t last_dma_token_ = kNoToken;       // copy thread only: the last demand job's mark, and whether it completed
+  bool last_dma_done_ = true;
   [[no_unique_address]] std::conditional_t<Build::kFaults, Ballast, NoBallast> ballast_;
 };
 

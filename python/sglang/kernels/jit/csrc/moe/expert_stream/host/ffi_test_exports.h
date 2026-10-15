@@ -11,7 +11,8 @@
 //              read_rows_idle: one speculative read under IdleRoots;
 //              read_rows_two_span: a read's first-span signal
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
-//              trace_clock_reads, spec_place, spec_pump, hold_row, inject_spec, inject_demand_load
+//              trace_clock_reads, spec_place, spec_pump, hold_row, inject_spec, inject_demand_load, drip_offer,
+//              drip_hold, drip_view
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
@@ -1734,6 +1735,45 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (RamTier::drip_offer): `experts` int64 [n] offered to the GPU drip for `row`, as a scored record's picks.
+  // InstrBuild only.
+  static void drip_offer(int64_t handle, int64_t row, TensorView experts) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)row, (void)experts;
+      test_only("drip_offer");
+    } else {
+      using namespace host;
+      auto cpu = SymbolicDevice{};
+      expert_stream::verify_named(
+          "experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+      const auto* e = static_cast<const int64_t*>(experts.data_ptr());
+      std::vector<int32_t> ids;
+      for (int64_t i = 0; i < experts.size(0); ++i)
+        ids.push_back(static_cast<int32_t>(std::clamp<int64_t>(e[i], -1, INT32_MAX)));
+      find(handle)->drip_offer(row, ids);
+    }
+  }
+
+  // Test only (RamTier::drip_hold): while held the GPU drip issues no chunk. InstrBuild only.
+  static void drip_hold(int64_t handle, int64_t on) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)on;
+      test_only("drip_hold");
+    } else {
+      find(handle)->drip_hold(on != 0);
+    }
+  }
+
+  // Test only (RamTier::drip_view): `out` int64 [Wire::kScratchSlots, 4], per scratch slot {state, row, expert, RAM
+  // slot}, read racily from the copy thread's state.
+  static void drip_view(int64_t handle, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "out", TensorMatcher({Wire::kScratchSlots, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    find(handle)->drip_view(static_cast<int64_t*>(out.data_ptr()));
+  }
+
   // Test only (RamTier::hold_row): a helper thread holds group `group`'s row lock of `row` until a call without `hold`.
   static void hold_row(int64_t handle, int64_t row, int64_t group, int64_t hold) {
     if constexpr (!Build::kFaults) {
@@ -1911,6 +1951,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_place, Exports::spec_place);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_pump, Exports::spec_pump);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_hold_row, Exports::hold_row);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_drip_offer, Exports::drip_offer);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_drip_hold, Exports::drip_hold);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_drip_view, Exports::drip_view);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_spec, Exports::inject_spec);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_demand_load, Exports::inject_demand_load);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \

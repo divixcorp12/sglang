@@ -92,12 +92,14 @@ def test_the_seqlock_writers_fences_are_two_releases():
     # The channel's begin_record (write_record's), the hot bitmap record, the GPU scorer's candidate slot and the learned
     # head's candidate slot (its record and its empty record): seq 0, a release fence, the payload, then the seq with a
     # release store.
-    # The device reads no seqlock (the delta block's tag is one acquire), so it has no acquire fence.
+    # The GPU drip's picks are a third seqlock writer (spec_score.cuh, after the candidates'). The device reads no
+    # seqlock (the delta block's tag is one acquire), so it has no acquire fence.
     assert [(name, code) for name, _, code in matches(r"atomic_thread_fence")] == [
         ("lease_channel.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("spec_head_tail.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("spec_head_tail.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+        ("spec_score.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("spec_score.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
     ]
 

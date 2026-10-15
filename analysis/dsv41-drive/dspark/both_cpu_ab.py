@@ -270,6 +270,32 @@ for _overrides_of_arm, _ in ARMS.values():
 # so the A/B reads the gate alone; it takes the driver's fixed split as its reference does.
 TOP_PROB_GATE_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-confgate"
 ARMS[TOP_PROB_GATE_ARM] = ({**ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0], TOP_PROB_GATE: "0.4"}, True)
+# The GPU drip (host/gpu_drip.h) is off in every arm but the drip one, pinned so a shell that exports it cannot carry it
+# into one.
+GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[GPU_DRIP] = "0"
+# The promote and pool-serve fixed-split arm with the T3 scorer's best RAM-resident, not VRAM-hot experts of layer +2
+# dripped into VRAM scratch: the replay's 4 picks per scored record at its horizon 2, 24 slots (~320 MB; 12 left
+# 2396 picks without a slot in the 2026-10-14 capture) and 256 KiB chunks (~19 us of link a pull or post can wait
+# behind); its reference is that arm, so the A/B reads the drip alone.
+GPU_DRIP_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-gpudrip"
+ARMS[GPU_DRIP_ARM] = (
+    {
+        **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
+        GPU_DRIP: "24",
+        "SGLANG_DSV41_GPU_DRIP_PICKS": "4",
+        "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "256",
+    },
+    True,
+)
+# The drip arm moving about half the bytes: the top 2 picks (4 used about 48% of landed rows) in 64 KiB chunks
+# (about 5 us of link a pull or post can wait behind); same reference.
+GPU_DRIP_LEAN_ARM = GPU_DRIP_ARM + "-c64p2"
+ARMS[GPU_DRIP_LEAN_ARM] = (
+    {**ARMS[GPU_DRIP_ARM][0], "SGLANG_DSV41_GPU_DRIP_PICKS": "2", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "64"},
+    True,
+)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -311,6 +337,8 @@ REFERENCE = {
     PROMOTE_POOL_SERVE_ARM: PROMOTE_ON_ARM,
     PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX,
     TOP_PROB_GATE_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
+    GPU_DRIP_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
+    GPU_DRIP_LEAN_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
@@ -338,6 +366,14 @@ RAM_KEYS = (
     "spec_publish_backstop",
     "spec_promote_row_busy",
     "spec_pool_served",
+    "drip_issued",
+    "drip_landed",
+    "drip_used",
+    "drip_abandoned",
+    "drip_no_slot",
+    "drip_paused",
+    "drip_skipped_bytes",
+    "drip_late",
 )
 
 
@@ -351,7 +387,7 @@ TWO_STAGE_OFF = {
 
 
 def _takes_fixed_split(arm: str) -> bool:
-    return arm.endswith(FIXED_SPLIT_SUFFIX) or arm == TOP_PROB_GATE_ARM
+    return FIXED_SPLIT_SUFFIX in arm  # a -fixedsplit arm or one built on it (-confgate, -gpudrip)
 
 
 def _overrides(arm: str, out: str) -> dict:

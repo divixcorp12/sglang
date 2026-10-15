@@ -86,6 +86,14 @@ struct PostParams {
   int64_t spill;
   int32_t* overflow_flag;
   int64_t* gather_overflow;
+  // The GPU drip (host/gpu_drip.h): with scratch_slots > 0 a captured armed post matches its lanes against the first
+  // scratch_slots words of scratch_table (device memory), and C1s copies the kKindHitScratch lanes it compacts into
+  // scratch_rows_1, scratch_dst_1 and scratch_go_1 (written by every post with scratch_slots > 0, 0 when none).
+  int64_t scratch_slots;
+  const uint64_t* scratch_table;
+  int64_t* scratch_rows_1;
+  int32_t* scratch_dst_1;
+  int32_t* scratch_go_1;
 };
 
 // Element dtypes of the CPU experts' staged input and routing weights (PostParams).
@@ -170,6 +178,9 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       if (pending) d = load_map_delta(delta);
       // Ordered after the tag's acquire; issued while the delta's loads are in flight.
       policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + Wire::kCopyArmed) == 1u;
+      int32_t scratch[Wire::kLanes];
+      const bool drip = p.scratch_slots > 0 && policy.host_lanes;
+      if (drip) match_scratch(p.scratch_table, p.scratch_slots, p.row, p.planned, count, scratch);
       if (pending) apply_map_delta(d, map);
       // Spill: DIRECT gives the lanes past its victims destination -1 (GpuResidencyUpdater.gather_destinations), and
       // the live lanes are a prefix.
@@ -181,7 +192,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
             break;
           }
       if (!type_lanes(
-              LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count, .forced_from = live},
+              LanePlan{
+                  .planned = p.planned,
+                  .dst = p.dst_slots,
+                  .count = count,
+                  .forced_from = live,
+                  .scratch = drip ? scratch : nullptr},
               map,
               policy,
               typed)) {
@@ -193,7 +209,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
         *p.overflow_flag = 1;
         *p.gather_overflow += 1;
         type_lanes(
-            LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = live, .forced_from = live}, map, policy, typed);
+            LanePlan{
+                .planned = p.planned,
+                .dst = p.dst_slots,
+                .count = live,
+                .forced_from = live,
+                .scratch = drip ? scratch : nullptr},
+            map,
+            policy,
+            typed);
       }
       for (int64_t j = 0; j < count; ++j)
         any_cpu |= is_cpu_kind(typed.kind[j]) ? 1 : 0;
@@ -236,6 +260,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   bool any_miss = false;
   int64_t go = 0;
+  int64_t go_scratch = 0;
   float weight[Wire::kLanes];
   for (int64_t j = 0; j < Wire::kLanes; ++j) {
     const bool used = j < count;
@@ -248,6 +273,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       p.host_rows_1[go] = static_cast<int64_t>(typed.slot[j]);
       p.dst_slots_1[go] = p.dst_slots[j];
       ++go;
+    }
+    if (typed.kind[j] == Wire::kKindHitScratch) {
+      p.scratch_rows_1[go_scratch] = static_cast<int64_t>(typed.slot[j]);
+      p.scratch_dst_1[go_scratch] = p.dst_slots[j];
+      ++go_scratch;
     }
     // The lane expert's routing weight summed over the routes that name it (one route at batch size 1), and for a
     // multi-token row each token's own weight and the mask of tokens that route it. 0 when CPU experts are off.
@@ -270,6 +300,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     }
   }
   p.go_1[0] = static_cast<int32_t>(go);
+  if (p.scratch_slots > 0) p.scratch_go_1[0] = static_cast<int32_t>(go_scratch);
   uint64_t chain = 0;
   if (any_miss) {
     p.map_chain[p.row] += 1;  // the host publishes this chain's delta under this number
@@ -404,6 +435,11 @@ struct LeaseProtocolKernel {
       int64_t spill,
       tvm::ffi::TensorView overflow_flag,
       tvm::ffi::TensorView gather_overflow,
+      int64_t scratch_slots,
+      tvm::ffi::TensorView scratch_table,
+      tvm::ffi::TensorView scratch_rows_1,
+      tvm::ffi::TensorView scratch_dst_1,
+      tvm::ffi::TensorView scratch_go_1,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -469,6 +505,21 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
         "host_rows_1", TensorMatcher({Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
+    RuntimeCheck(
+        scratch_slots >= 0 && scratch_slots <= Wire::kScratchSlots,
+        "scratch_slots: the scratch table holds 0..", Wire::kScratchSlots, " slots");
+    expert_stream::verify_named(
+        "scratch_table",
+        TensorMatcher({Wire::kScratchSlots}).with_dtype<int64_t>().with_device<kDLCUDA>(device),
+        scratch_table);
+    expert_stream::verify_named(
+        "scratch_rows_1",
+        TensorMatcher({Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device),
+        scratch_rows_1);
+    expert_stream::verify_named(
+        "scratch_dst_1", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), scratch_dst_1);
+    expert_stream::verify_named(
+        "scratch_go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), scratch_go_1);
     RuntimeCheck(experts > 0, "experts: must be positive");
     // CPU experts: cpu_x is the layer's input rows [tokens, hidden] (empty when off), cpu_weights the routes' weights.
     auto cpu_dtype = [](tvm::ffi::TensorView t) -> int64_t {
@@ -569,6 +620,11 @@ struct LeaseProtocolKernel {
         .spill = spill,
         .overflow_flag = spill != 0 ? static_cast<int32_t*>(overflow_flag.data_ptr()) : nullptr,
         .gather_overflow = spill != 0 ? static_cast<int64_t*>(gather_overflow.data_ptr()) : nullptr,
+        .scratch_slots = scratch_slots,
+        .scratch_table = static_cast<const uint64_t*>(scratch_table.data_ptr()),
+        .scratch_rows_1 = static_cast<int64_t*>(scratch_rows_1.data_ptr()),
+        .scratch_dst_1 = static_cast<int32_t*>(scratch_dst_1.data_ptr()),
+        .scratch_go_1 = static_cast<int32_t*>(scratch_go_1.data_ptr()),
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(

@@ -24,6 +24,7 @@
 #include "../spec_candidates.h"
 #include "copy_engine.h"
 #include "drive_load.h"
+#include "gpu_drip.h"
 #include "host_copy_backend.h"
 #include "numa_distributor.h"
 #include "ram_prefetch.h"
@@ -96,8 +97,10 @@ class RamTier {
   using CpuExpertEngine = BasicCpuExpertEngine<typename Source::BuildType>;
   using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
   using Engine = CopyEngine<Build, RamTier>;
+  using Drip = GpuDrip<Build, RamTier>;
   using Group = NumaGroup<Source>;
-  // The copy thread's callbacks are copy_completed and copy_failed; it also reads stats_ for its latency max.
+  // The copy thread's callbacks are copy_completed, copy_failed and the drip's (drip_step); it also reads stats_ for
+  // its latency max.
   friend Engine;
 
   RamTier(
@@ -304,10 +307,10 @@ class RamTier {
     return true;
   }
 
-  // True when the record has a lane of the group's node that the device waits on: anything but an SM hit.
+  // True when the record has a lane of the group's node that the device waits on: any lane it does not copy itself.
   static bool has_host_lane(const Group& group, const Request& request) {
     for (const Lane& lane : request.lanes)
-      if (lane.kind != Wire::kKindHitSm && Wire::home(lane.expert) == group.index) return true;
+      if (!device_copied(lane.kind) && Wire::home(lane.expert) == group.index) return true;
     return false;
   }
 
@@ -681,6 +684,8 @@ class RamTier {
               entries[3 * i + 2],
               (sm_mask >> i & 1) != 0});
     }
+    // The drip copies every entry, SM ones included: C1s has no small-copy split.
+    if (drip_owner_ != nullptr) drip_owner_->set_row(row, table);
     copy_engine_->set_table(row, std::move(table), dst_rows);
   }
 
@@ -691,6 +696,60 @@ class RamTier {
       throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_armed_.store(on, std::memory_order_release);
     store_release(lease_ + Wire::kCopyArmed, on ? 1u : 0u);
+  }
+
+  bool copy_armed() const {
+    return copy_armed_.load(std::memory_order_acquire);
+  }
+
+  // ---- The GPU drip (gpu_drip.h; analysis/dsv41-drive/LEASE_PROTOCOL.md, "The GPU drip") ----
+
+  // Starts the drip on the copy thread. Needs the copy engine, and runs before the service thread starts: from here on
+  // every mirror change bumps the generation the drip checks a source row by (publish_mirror). The scratch
+  // (set_drip_scratch) must come before any copy table, which names a row's sources.
+  void enable_gpu_drip(DripConfig config) {
+    const std::string prefix = error_prefix<Layout>() + "GPU drip: ";
+    if (threaded_.load()) throw std::runtime_error(prefix + "enable it before the service thread starts");
+    if (copy_engine_ == nullptr) throw std::runtime_error(prefix + "it copies on the copy engine, which is not enabled");
+    if (drip_owner_ != nullptr) throw std::runtime_error(prefix + "already enabled");
+    if (config.slots < 1 || config.slots > Wire::kScratchSlots)
+      throw std::runtime_error(prefix + "1.." + std::to_string(Wire::kScratchSlots) + " scratch slots");
+    if (config.picks < 1 || config.picks > SpecCandidates::kMaxDrips)
+      throw std::runtime_error(prefix + "1.." + std::to_string(SpecCandidates::kMaxDrips) + " picks per record");
+    if (config.chunk_bytes < 1) throw std::runtime_error(prefix + "the chunk must be positive");
+    if (!config.target.empty() && static_cast<int64_t>(config.target.size()) != layers_)
+      throw std::runtime_error(prefix + "one target per row");
+    for (const int32_t t : config.target)
+      if (t < -1 || t >= layers_) throw std::runtime_error(prefix + "a target row out of range");
+    if (config.candidates != nullptr && config.target.empty())
+      throw std::runtime_error(prefix + "the candidate page needs the targets");
+    drip_gen_ = std::make_unique<std::atomic<uint32_t>[]>(static_cast<size_t>(layers_ * experts_));
+    drip_owner_ = std::make_unique<Drip>(
+        std::move(config), this, page_, lease_, map_, drip_gen_.get(), layers_, experts_,
+        std::string(Layout::kName) + "-drip");
+    drip_.store(drip_owner_.get(), std::memory_order_release);
+  }
+
+  // The drip's scratch tensors, one per copy-table entry in its order: {address, bytes of one row}, and its scratch
+  // table's address (device memory, Wire::kScratchSlots zeroed u64 words). Once.
+  void set_drip_scratch(std::vector<ScratchEntry> entries, uint64_t table) {
+    if (drip_owner_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the GPU drip is not enabled");
+    drip_owner_->set_scratch(std::move(entries), table);
+  }
+
+  // Test hooks (the exports refuse them in ProdBuild): picks offered as a scored record's; holding the chunks back;
+  // the slots' {state, row, expert, RAM slot}.
+  void drip_offer(int64_t row, std::span<const int32_t> experts) {
+    if (drip_owner_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the GPU drip is not enabled");
+    drip_owner_->offer(row, experts);
+  }
+  void drip_hold(bool on) {
+    if (drip_owner_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the GPU drip is not enabled");
+    drip_owner_->hold(on);
+  }
+  void drip_view(int64_t* out) const {
+    if (drip_owner_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the GPU drip is not enabled");
+    drip_owner_->view(out);
   }
 
   // ---- CPU experts ----
@@ -1856,8 +1915,16 @@ class RamTier {
   }
 
   // Updates the host mirror (mapping()) only, for a change the device learns from a record's delta.
+  //
+  // With the GPU drip, also bumps the entry's generation after the store, and fences before any caller can rewrite a
+  // RAM slot it unmapped here: a drip that read the old mapping then sees a new generation once its copy completed
+  // (GpuDrip::source_unchanged), had the rewrite begun under it.
   void publish_mirror(int64_t row, int64_t expert, int32_t slot) {
     __atomic_store_n(map_ + row * experts_ + expert, slot, __ATOMIC_RELEASE);
+    if (drip_gen_ != nullptr) {
+      drip_gen_[row * experts_ + expert].fetch_add(1, std::memory_order_release);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
   }
 
   // Records an eager path's change: the mirror, and the bulk delta the device applies before the next forward.
@@ -2151,6 +2218,17 @@ class RamTier {
             "lane " + std::to_string(j) + " (expert " + std::to_string(lane.expert) + ", slot " +
                 std::to_string(lane.slot) + ")" + why);
       };
+      if (lane.kind == Wire::kKindHitScratch) {
+        // A landed GPU drip: C1s copies it from its scratch slot, which holds this row's expert until every record
+        // that could have read its word is handled (GpuDrip::holds).
+        const Drip* drip = drip_.load(std::memory_order_acquire);
+        if (!host_lanes || drip == nullptr || !drip->holds(lane.slot, request.row, lane.expert))
+          fail(": a scratch lane whose drip slot does not hold the expert");
+        count<kDripUsed>(group);
+        if constexpr (Build::kMetrics)
+          group.trace.emit("drip_use", request.row, request.gen, request.seq, group.index, lane.expert, lane.slot);
+        continue;
+      }
       if (is_miss(lane.kind)) {
         if (lane.slot < 0) {
           // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim or swaps
@@ -3393,6 +3471,21 @@ class RamTier {
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
   std::unique_ptr<Engine> copy_engine_;
   std::atomic<bool> copy_armed_{false};
+  // The GPU drip, when enabled (before the service thread starts): per [row, expert] the mirror's change count, and
+  // the drip the copy thread steps (drip_, published once drip_owner_ is complete).
+  std::unique_ptr<std::atomic<uint32_t>[]> drip_gen_;
+  std::unique_ptr<Drip> drip_owner_;
+  std::atomic<Drip*> drip_{nullptr};
+  // The copy thread's side of the drip (CopyEngine::run).
+  bool drip_on() const {
+    return drip_.load(std::memory_order_acquire) != nullptr;
+  }
+  bool drip_step(CopyBackend& backend, bool demand_idle) {
+    return drip_.load(std::memory_order_acquire)->step(backend, demand_idle);
+  }
+  bool drip_busy() const {
+    return drip_.load(std::memory_order_acquire)->busy();
+  }
   int64_t copy_wait_timeout_ns_ = 0;  // set with the copy engine, before any thread reads it
   std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new
   // The eager paths' map changes, {row, expert, slot}: the owner's, taken by take_bulk_delta. Grows only on those
