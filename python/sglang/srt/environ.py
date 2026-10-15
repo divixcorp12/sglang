@@ -1020,6 +1020,9 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # NUMA node the mmap host KV pools (mmap_allocator.alloc_mmap) are bound to before their pages are touched;
+    # unset: first touch places them, on the allocating thread's node.
+    SGLANG_HICACHE_HOST_NUMA_NODE = EnvInt(None)
     # Device bytes one page_first host pool may spend on its write-back staging buffer; fewer pages, more chunks.
     SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB = EnvInt(32)
     # Device memory reserved out of the KV budget for HiCache allocations made after the pool is sized.
@@ -1860,6 +1863,9 @@ class Envs:
     # Capture layer-1 Engram lookup as a CUDA host node backed by a shared native
     # row cache and an io_uring worker. Disabled unless explicitly requested.
     SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING = EnvBool(False)
+    # Size in GiB of that native row cache (shared by every Engram layer). 0 keeps no rows: every lookup reads its
+    # rows through io_uring.
+    SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB = EnvFloat(5.0)
     # With the above, capture the decode lookup as a device post kernel and a device
     # wait kernel served by a polling thread instead of a host node; the decode graph
     # then has no host nodes, which is asserted at capture.
