@@ -95,10 +95,26 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   MADV_POPULATE_WRITE, logged per pool; move_pages test) and `SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB` (default 5 =
   the old hard-coded `5 << 30`; 0 = no cache, bit-identical rows; hit/miss logged per 60 s and at exit). 52 + 66 tests
   passed.
-- **In flight (`cores-ab-20261014/run_hicache_ab.sh`), ON only vs splitmodel-stream-mem (65.9):**
-  - A `...-mem-hicache1`: HiCache pools on node 1. Watch item: node 1 drops to ~3-4 GiB free.
-  - B `...-hicache1-engram0`: A plus Engram native cache 0 (does the 5 GB cache earn its keep?).
-  - C: A plus `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995` (section 3.6).
+- **Measured (`cores-ab-20261014/run_hicache_ab.sh`), ON only vs splitmodel-stream-mem (65.9):**
+
+  | run | ms/token | median verify | mean verify | wait | stream | tokens |
+  |---|---|---|---|---|---|---|
+  | A: ON-mem + HiCache on node 1 | 65.9 | 254.5 | 272.5 | 139.9 | 42.9 | 491 |
+  | B: A + Engram native cache 0 | 69.2 | 249.7 | 270.6 | 147.0 | 42.4 | 509 |
+
+  - **A fixes node-0 memory:** load swap-out 1,263 pages (~5 MB) against 3.0 M (11.6 GiB) for ON-mem; node 0 stayed
+    above its low watermark (load min 35,422 pages vs low 34,934); team-thread major faults 0. HiCache Shmem moved to
+    node 1 (numa_maps `/dev/zero (deleted) [bind:1]` 11.5 GiB). Node 1 is now the tighter node in decode (0.5-1.7 GiB
+    free) but never neared its low watermark; kswapd1 idle. Scheduler per node 77.9 / 64.0 GiB (was 84.3 / 52.2).
+    Throughput unchanged, as expected (headroom, not compute). Load took 6:19 vs 3:19-4:12 elsewhere; cause being
+    checked.
+  - **Engram cache:** first served hit rate. Arm A per 60 s window rises ~0.10 -> 0.29 through decode (run total
+    0.087 incl. prefill warm-up; 831k accesses). B (cache 0) was +3.3 ms/token and wait +7.1 ms/verify, though median
+    verify was -4.8 ms and B's sessions flipped to 509 tokens: one run cannot size it. **Decision: keep the Engram
+    cache at 5 GiB.**
+  - Found: `--weight-loader-drop-cache-after-load` does not reach the DSpark draft loader (4-5.6 GiB of draft
+    shard cache at ready). Fix in progress.
+  - C: A plus `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995` (section 3.6): did not run with A/B; running next.
 - **Not done (root, owner's):** `kernel.numa_balancing=0`; IRQ 239 (`eno1-tx-0`) off core 14 (a team0 core);
   optionally `swapoff -a && swapon -a`; possibly revert `compaction_proactiveness` to 20 (was set to 100).
 
