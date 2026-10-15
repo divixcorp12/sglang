@@ -383,12 +383,14 @@ def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
 
 # Prefill peaks by prefill_peak_probe.py (/mnt/nvme1/prefill-merge/peaks, 4096- and 30k-token prompts; the arms' longest
 # prompt is ~7.7k characters, and the peak is set by the startup warm-up, which the 30k prompt exceeds by 2 MiB): the
-# OFF -mem arm peaks 4337 MiB above init, 3120 with the merge chunked (1217 MiB freed). m3-mergechunk, chunked with the
-# KV pool pinned at 381,184 and 948 hot slots (12040 MiB), left 630 MiB free at its peak, after 29.34 GiB free before
-# loading. With the pool pinned, every hot slot comes out of that free memory one for one.
-PROBE_HOT_SLOTS = 948
-PROBE_FREE_AT_PEAK_MIB = 630
-PROBE_PRE_LOAD_GIB = 29.34
+# OFF -mem arm peaks 4337 MiB above init, 3120 with the merge chunked (1217 MiB freed). The capture of this arm itself
+# (cores-ab-20261014/splitmodel-stream-mem-hicache1-mergechunk, spec_margin_capture.py, KV pinned at 381,184, 956 hot
+# slots) left 134 MiB of nvidia-smi memory.free at its peak (the 4096-token warm-up), after 29.37 GiB free before
+# loading. memory.free is the basis of PEAK_MARGIN_MIB; the probes' first "left" figures were total - used, 404 MiB
+# higher (the driver's reserve). With the pool pinned, every hot slot comes out of that free memory one for one.
+PROBE_HOT_SLOTS = 956
+PROBE_FREE_AT_PEAK_MIB = 134
+PROBE_PRE_LOAD_GIB = 29.37
 # The lowest free-before-load seen (mem-budget/L2): a launch that low leaves that much less at the peak.
 MIN_PRE_LOAD_GIB = 29.33
 # The margin the DSpark arms keep today over their 4096-token warm-up (arm_env, at DSPARK_MEM_FRACTION_STATIC).

@@ -4,8 +4,10 @@ nvidia-smi every 100 ms.
 Starts an arm of both_cpu_ab.py the way spec_margin_capture.py does (its argv, server flags and env), with extra
 ``--env K=V`` overrides on top, and sends each prompt as fresh random token ids (no radix-cache reuse) through
 /generate with one output token. Writes ``peaks.json``: the KV pool and init headroom from server.log, the used
-memory when healthy, and per prompt the peak used memory and what that leaves of the card. The sampled figure is the
-driver's (allocator reserve and CUDA context included), which is what an OOM is measured against.
+memory when healthy, per prompt the peak used memory and what it leaves free, and the same over the whole run (the
+startup warm-up sets the peak). The sampled figure is the driver's (allocator reserve and CUDA context included), and
+"free" is nvidia-smi's memory.free: used + free is 32,203 MiB on the 5090, not its 32,607 total (the driver keeps
+404 MiB), and memory.free is the basis of arm_env's 508 MiB margin.
 
 Locks: rowimg-disk.lock, then cc-gpu.lock, through run_locks.take.
 
@@ -43,23 +45,24 @@ LOG_PATTERNS = {
 
 
 class Sampler(threading.Thread):
-    """nvidia-smi's used/total memory every 100 ms into a CSV, kept in memory as (monotonic time, used MiB)."""
+    """nvidia-smi's used/free memory every 100 ms into a CSV, kept in memory as (monotonic time, used MiB); usable_mib
+    is used + free."""
 
     def __init__(self, path: str):
         super().__init__(daemon=True)
-        self.path, self.samples, self.total_mib = path, [], None
+        self.path, self.samples, self.usable_mib = path, [], None
         self.proc = subprocess.Popen(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits", "-lms", "100"],
+            ["nvidia-smi", "--query-gpu=memory.used,memory.free", "--format=csv,noheader,nounits", "-lms", "100"],
             stdout=subprocess.PIPE, text=True,
         )
 
     def run(self):
         with open(self.path, "w") as f:
             for line in self.proc.stdout:
-                used, total = (int(x) for x in line.split(","))
-                self.total_mib = total
+                used, free = (int(x) for x in line.split(","))
+                self.usable_mib = used + free
                 self.samples.append((time.monotonic(), used))
-                f.write(f"{time.time():.3f},{used},{total}\n")
+                f.write(f"{time.time():.3f},{used},{free}\n")
 
     def peak(self, start: float, end: float) -> int:
         return max(used for t, used in self.samples if start <= t <= end)
@@ -141,13 +144,15 @@ def main() -> int:
                 time.sleep(1)
                 peak = sampler.peak(start, end + 1)
                 result["prompts"].append({"tokens": n, "ok": ok, "seconds": end - start, "peak_used_mib": peak,
-                                          "left_mib": sampler.total_mib - peak})
+                                          "free_mib": sampler.usable_mib - peak})
                 print(json.dumps(result["prompts"][-1]), flush=True)
             rc = 0 if all(r["ok"] is True for r in result["prompts"]) else 1
         finally:
             stop_server(server)
             sampler.stop()
-    result["total_mib"] = sampler.total_mib
+    result["usable_mib"] = sampler.usable_mib
+    result["run_peak_used_mib"] = max(used for _, used in sampler.samples)
+    result["run_free_mib"] = sampler.usable_mib - result["run_peak_used_mib"]
     result.update(_from_log(log_path))
     with open(os.path.join(a.out_dir, "peaks.json"), "w") as f:
         json.dump(result, f, indent=1)
