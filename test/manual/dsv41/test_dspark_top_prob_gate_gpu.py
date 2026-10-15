@@ -80,6 +80,30 @@ def test_the_static_epilogue_stops_the_accept_at_the_gates_cut():
     assert (correct_len, bonus, commit_len, out_tokens) == (5, 11, 6, drafts + [11])
 
 
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_the_one_kernel_dead_row_masking_matches_its_torch_definition(id_dtype):
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows, mask_dead_rows_for_graph
+
+    generator = torch.Generator(device="cpu").manual_seed(5)
+    ids = torch.randint(0, 384, (TOKENS, TOP_K), generator=generator).to(id_dtype)
+    weights = torch.rand((TOKENS, TOP_K), generator=generator)
+    x = torch.randn((TOKENS, 7168), generator=generator).to(torch.bfloat16)
+    for live in (1, 3, TOKENS):
+        got_routes, want_routes = torch.full((64,), 7, dtype=torch.long, device="cuda"), torch.full((64,), 7)
+        dead_cuda, dead_cpu = VerifyDeadRows(max_rows=TOKENS, device="cuda"), VerifyDeadRows(max_rows=TOKENS, device="cpu")
+        dead_cuda.set_live_rows(torch.tensor([live], device="cuda"))
+        dead_cpu.set_live_rows(torch.tensor([live]))
+        got = mask_dead_rows_for_graph(
+            topk_ids=ids.cuda(), topk_weights=weights.cuda(), dead=dead_cuda.dead, routes=got_routes, x=x.cuda()
+        )
+        want = mask_dead_rows_for_graph(
+            topk_ids=ids, topk_weights=weights, dead=dead_cpu.dead, routes=want_routes, x=x
+        )
+        for g, w in zip(got, want):
+            assert g.dtype == w.dtype and torch.equal(g.cpu(), w), live
+        assert torch.equal(got_routes.cpu(), want_routes), live
+
+
 @pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
 def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
     from sglang.srt.environ import envs
@@ -88,7 +112,7 @@ def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
-    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows, mask_dead_routes
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
     from sglang.test.dsv41_ram_miss_fixtures import service_row_images
@@ -133,10 +157,7 @@ def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
 
             def gated_apply():
                 # What Exl3MoEMethod.apply runs for a layer that verify_dead_rows reached.
-                masked_ids, masked_weights = mask_dead_routes(topk_ids=ids, topk_weights=weights, dead=dead_rows.dead)
-                return Exl3MoEMethod._apply_graph(
-                    layer, streamer, x, masked_weights, masked_ids, ACT_LIMIT, dead=dead_rows.dead
-                )
+                return Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT, dead=dead_rows.dead)
 
             gated_apply()
             graph = torch.cuda.CUDAGraph()
