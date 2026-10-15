@@ -22,7 +22,7 @@ std::string members() {
   P(kKindHitCpu); P(kKindMissGpu); P(kKindMissCpu); P(kHotHeaderBytes); P(kHotAlignment); P(kHotRecords);
   P(kLeaseBlockAlign); P(kLeasePieceMask); P(kLeasePieceMaskLineBytes); P(kLeasePieceSource); P(kLeaseCopyDone); P(kLeaseCopyDoneBytes);
   P(kLeaseCopyGate); P(kLeaseGateClosed); P(kLeaseGateOpen); P(kLeaseGateSeqShift); P(kLeaseGateSeqMask);
-  P(kCopyArmed); P(kSplit); P(kSplitStride); P(kLeaseBlockBytes); P(kDeltaBase); P(kDeltaTag); P(kDeltaCount);
+  P(kCopyArmed); P(kSplit); P(kSplitStride); P(kKindHitScratch); P(kScratch); P(kScratchSlots); P(kLeaseBlockBytes); P(kDeltaBase); P(kDeltaTag); P(kDeltaCount);
   P(kDeltaStaging); P(kDeltaEntries); P(kDeltaMaxEntries); P(kDeltaStride);
 #undef P
   put("home7", L::home(7));

@@ -50,7 +50,8 @@ def test_the_counter_summary_carries_the_promotion_counters(tmp_path):
             "spec_promote_no_victim", "spec_promote_victim_routed", "spec_promote_used",
             "spec_promote_reading", "spec_publish_backstop", "spec_promote_row_busy", "spec_pool_served",
             "spec_skip_landed_gpu",
-            "spec_skip_landed_cpu", "spec_skip_reading_gpu", "spec_skip_reading_cpu")
+            "spec_skip_landed_cpu", "spec_skip_reading_gpu", "spec_skip_reading_cpu",
+            "drip_issued", "drip_landed", "drip_used", "drip_abandoned", "drip_no_slot")
     log = tmp_path / "server.log"
     log.write_text("exl3 RAM miss thread counters " + json.dumps({k: i + 1 for i, k in enumerate(keys)}) + "\n")
     s = cap.counter_summary(str(log))

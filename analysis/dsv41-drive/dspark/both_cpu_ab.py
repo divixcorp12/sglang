@@ -249,6 +249,24 @@ FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
 for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
+# The GPU drip (host/gpu_drip.h) is off in every arm but the drip one, pinned so a shell that exports it cannot carry it
+# into one.
+GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[GPU_DRIP] = "0"
+# The promote and pool-serve fixed-split arm with the T3 scorer's best RAM-resident, not VRAM-hot experts of layer +2
+# dripped into VRAM scratch at the offline replay's settings (12 slots, 4 picks per scored record, its horizon 2); its
+# reference is that arm, so the A/B reads the drip alone.
+GPU_DRIP_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-gpudrip"
+ARMS[GPU_DRIP_ARM] = (
+    {
+        **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
+        GPU_DRIP: "12",
+        "SGLANG_DSV41_GPU_DRIP_PICKS": "4",
+        "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "1024",
+    },
+    True,
+)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -289,6 +307,7 @@ REFERENCE = {
     POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_OFF_ARM + FIXED_SPLIT_SUFFIX,
     PROMOTE_POOL_SERVE_ARM: PROMOTE_ON_ARM,
     PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX: PROMOTE_ON_ARM + FIXED_SPLIT_SUFFIX,
+    GPU_DRIP_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
 }
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
@@ -316,6 +335,11 @@ RAM_KEYS = (
     "spec_publish_backstop",
     "spec_promote_row_busy",
     "spec_pool_served",
+    "drip_issued",
+    "drip_landed",
+    "drip_used",
+    "drip_abandoned",
+    "drip_no_slot",
 )
 
 
@@ -331,7 +355,7 @@ TWO_STAGE_OFF = {
 def _overrides(arm: str, out: str) -> dict:
     overrides, _ = ARMS[arm]
     passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
-    if arm.endswith(FIXED_SPLIT_SUFFIX) and os.environ.get(FIXED_SPLIT_VAR):
+    if FIXED_SPLIT_SUFFIX in arm and os.environ.get(FIXED_SPLIT_VAR):  # a -fixedsplit arm or one built on it
         passed[FIXED_SPLIT_VAR] = os.environ[FIXED_SPLIT_VAR]
     return {
         **TWO_STAGE_OFF, **overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")
@@ -579,7 +603,7 @@ def main():
     sessions = ",".join(str(int(i)) for i in a.sessions.split(","))
     out = os.path.abspath(a.out)
     arms = a.arms or list(ARMS)
-    if not os.environ.get(FIXED_SPLIT_VAR) and any(arm.endswith(FIXED_SPLIT_SUFFIX) for arm in arms):
+    if not os.environ.get(FIXED_SPLIT_VAR) and any(FIXED_SPLIT_SUFFIX in arm for arm in arms):
         sys.exit(f"a {FIXED_SPLIT_SUFFIX} arm needs {FIXED_SPLIT_VAR} set to the off capture's split table")
     if a.baseline:
         references = {REFERENCE[arm] for arm in arms if arm in REFERENCE}

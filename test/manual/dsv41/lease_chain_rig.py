@@ -42,11 +42,12 @@ class Chain:
         self, tmp_path, *, capacity=CAPACITY, staging=STAGING, mirror_weights=None, timeout_ms=2000, lease_pdl=False,
         copy_engine=False, sm_small_copies=False, copy_wait_ms=2000, start=True, variant="instr", hit_copy="ce",
         cpu_misses=False, gpu_hot=False, lanes=8, experts=EXPERTS, top_k=TOP_K, dst_rows=DST_ROWS, miss_cut=0,
-        miss_cut_max=3, layers=LAYERS, spec_share=0,
+        miss_cut_max=3, layers=LAYERS, spec_share=0, drip_slots=0, drip_chunk_bytes=1 << 20,
     ):
         """``lanes`` is the build's lane count; ``top_k`` is each row's plan width and ``dst_rows`` its destination
         rows (both at least the widest plan the test posts); ``layers`` is the number of streamed rows;
-        ``spec_share`` the speculative pool's entries per row and group (0: no pool)."""
+        ``spec_share`` the speculative pool's entries per row and group (0: no pool); ``drip_slots`` the GPU drip's
+        scratch slots (0: off; needs ``copy_engine``), fed by ``host.drip_offer``."""
         self.lanes, self.experts, self.top_k, self.dst_rows = lanes, experts, top_k, dst_rows
         self.layers = layers
         wire = wire_layout(lanes)
@@ -84,8 +85,17 @@ class Chain:
                 for row in range(layers)
             }
             sm_mask = sm_copy_mask(self.names) if sm_small_copies else 0
+            self.scratch = None
             if copy_engine:
                 self.host.enable_copy_engine(torch.cuda.current_device(), wait_timeout_ms=copy_wait_ms)
+                if drip_slots:
+                    self.host.enable_gpu_drip(drip_slots, picks=4, chunk_bytes=drip_chunk_bytes)
+                    self.scratch = {
+                        n: torch.zeros((drip_slots,) + self.specs[n].row_shape, dtype=self.specs[n].dtype,
+                                       device="cuda")
+                        for n in self.names
+                    }
+                    self.host.set_drip_scratch([self.scratch[n] for n in self.names])
                 for row in range(layers):
                     self.host.set_copy_table(row, self.segments[row].table, dst_rows, sm_mask=sm_mask)
             if start:
@@ -100,6 +110,8 @@ class Chain:
             if copy_engine:
                 for row in range(layers):
                     self.dev.set_row_copy(row, dst_rows)
+            if drip_slots:
+                self.dev.enable_gpu_drip(drip_slots)
             host_row_map = torch.full((experts,), -1, dtype=torch.int32, device="cuda")
             self.backends = {
                 row: Exl3RamMissRowBackend(
@@ -110,6 +122,11 @@ class Chain:
                 )
                 for row in range(layers)
             }
+            if drip_slots:
+                for row in range(layers):
+                    self.backends[row].drip_segments = expert_row_segments(
+                        [(self.scratch[n], self.dest[row][n]) for n in self.names]
+                    )
         except BaseException:
             self.close()
             raise
@@ -154,6 +171,8 @@ class Chain:
         if before_c1 is not None:
             before_c1()
         copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        if backend.drip_segments is not None:
+            copy_expert_row_segments_gpu(backend.drip_segments, dev.scratch_rows_1, dev.scratch_dst_1, dev.scratch_go_1)
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
         if before_cw is not None:
             before_cw()

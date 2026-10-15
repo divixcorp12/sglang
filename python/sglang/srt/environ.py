@@ -2085,6 +2085,17 @@ class Envs:
     # Path of a folded learned L+2 head file (analysis/dsv41-drive/prefetch-replay/l2_head_export.py) that replaces
     # the native candidate select. Unset or empty means the native select.
     SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD = EnvStr(None)
+    # GPU drip (host/gpu_drip.h): this many VRAM scratch slots, one expert row each (~13 MB at DSV4.1's EXL3 rows),
+    # which the copy engine fills from pinned RAM, while no demand copy is pending, with experts the GPU scorer
+    # predicts for its target layer; that layer's post copies a landed one from VRAM instead of computing it on the
+    # CPU or copying it on demand. 0 is off. Needs SGLANG_DSV41_RAM_PREFETCH with the GPU scorer, whose target
+    # (SGLANG_DSV41_RAM_PREFETCH_HORIZON) is the drip's, and the copy engine.
+    SGLANG_DSV41_GPU_DRIP_SLOTS = EnvInt(0)
+    # Drips per scored record: the target layer's best-scored experts that are mapped in RAM and not VRAM-hot (1 to 8).
+    SGLANG_DSV41_GPU_DRIP_PICKS = EnvInt(4)
+    # The most one drip copy submission carries, in KiB: a demand copy issued meanwhile waits behind at most this.
+    # Arbitrary; ~75 us at the slot's 13.7 GB/s.
+    SGLANG_DSV41_GPU_DRIP_CHUNK_KB = EnvInt(1024)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

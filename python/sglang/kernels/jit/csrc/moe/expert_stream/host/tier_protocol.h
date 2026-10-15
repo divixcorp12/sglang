@@ -97,6 +97,14 @@ enum Counter : int {
   // ... the scorer's records scored and their scoring time in ns (metrics).
   kSpecScored,
   kSpecScoreNs,
+  // The GPU drip (gpu_drip.h): drips whose first chunk was issued, landed and published, lanes typed kKindHitScratch
+  // that the service checked, drips dropped before publishing (target posted, source changed, ring lapped, paused),
+  // and picks dropped for want of a free scratch slot.
+  kDripIssued,
+  kDripLanded,
+  kDripUsed,
+  kDripAbandoned,
+  kDripNoSlot,
   kCounterCount,
 };
 
@@ -137,6 +145,11 @@ constexpr bool is_core_counter(int k) {
     case kSpecPublishBackstop:
     case kSpecPromoteRowBusy:
     case kSpecPoolServed:
+    case kDripIssued:
+    case kDripLanded:
+    case kDripUsed:
+    case kDripAbandoned:
+    case kDripNoSlot:
       return true;
     default:
       return false;
@@ -197,6 +210,12 @@ inline bool is_miss(uint8_t kind) {
   return kind == Wire::kKindMissGpu || kind == Wire::kKindMissCpu;
 }
 
+// A lane the device's own kernels copy (C1 from RAM, C1s from a GPU drip's scratch slot): nothing on the device waits
+// for the host on it.
+inline bool device_copied(uint8_t kind) {
+  return kind == Wire::kKindHitSm || kind == Wire::kKindHitScratch;
+}
+
 // One demand record, as the service thread reads it. Fixed-size, so reading one allocates nothing.
 struct Request {
   uint32_t seq = 0;
@@ -207,11 +226,11 @@ struct Request {
   FixedVec<int32_t, Wire::kLanes> protect;
   FixedVec<Lane, Wire::kLanes> lanes;
   const uint8_t* hot_bitmap = nullptr;  // GPU hot mode: RamTier::hot_scratch_, valid until the next record read
-  // True when a lane needs the service itself or is one the device waits for: anything but an SM hit. The device
-  // waits on such a record, so it cannot lap the ring.
+  // True when a lane needs the service itself or is one the device waits for: any lane the device does not copy
+  // itself. The device waits on such a record, so it cannot lap the ring.
   bool host_work() const {
     for (const Lane& lane : lanes)
-      if (lane.kind != Wire::kKindHitSm) return true;
+      if (!device_copied(lane.kind)) return true;
     return false;
   }
 };
@@ -255,7 +274,7 @@ inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request*
   const auto kind_of = [&](int j) { return (kinds[j / 8] >> (4 * (j % 8))) & 0xFu; };
   bool bad_kind = false;
   for (int j = 0; j < count; ++j)
-    bad_kind |= kind_of(j) < Wire::kKindHitCopy || kind_of(j) > Wire::kKindMissCpu;
+    bad_kind |= kind_of(j) < Wire::kKindHitCopy || kind_of(j) > Wire::kKindHitScratch;
   if (bad_kind) return RecordRead::kMalformed;
   request->seq = expected;
   request->gen = static_cast<uint64_t>(epoch) << 32 | expected;

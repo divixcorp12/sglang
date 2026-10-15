@@ -1384,6 +1384,12 @@ CAND_ENTRIES = 8
 CAND_ENTRY_BYTES = 8
 CAND_PAGE_BYTES = CAND_RECORDS * CAND_STRIDE
 CAND_FLAG_OVERSIZE = 1
+# The GPU drip's picks after the candidates, under their own seq word: u32 seq at CAND_DRIP_SEQ, u16 count at
+# CAND_DRIP_COUNT, CAND_MAX_DRIPS u16 experts at CAND_DRIP_EXPERTS (SpecCandidates::kCandDrip*, kMaxDrips).
+CAND_MAX_DRIPS = 8
+CAND_DRIP_SEQ = 72
+CAND_DRIP_COUNT = 76
+CAND_DRIP_EXPERTS = 80
 
 
 def new_candidate_page(*, pin: bool) -> torch.Tensor:
@@ -1475,6 +1481,12 @@ COUNTERS = (
     "spec_skip_reading_cpu",
     "spec_scored",
     "spec_score_ns",
+    # GPU drip.
+    "drip_issued",
+    "drip_landed",
+    "drip_used",
+    "drip_abandoned",
+    "drip_no_slot",
 )
 
 # The counters a production host keeps: the shutdown line's served, rows and errors,
@@ -1517,11 +1529,18 @@ CORE_COUNTERS = (
     "spec_publish_backstop",
     "spec_promote_row_busy",
     "spec_pool_served",
+    "drip_issued",
+    "drip_landed",
+    "drip_used",
+    "drip_abandoned",
+    "drip_no_slot",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
 # A speculative pool entry's states (host/ram_prefetch.h kPoolEmpty, kPoolReading, kPoolLanded, kPoolSwapped).
 SPEC_POOL_STATES = ("empty", "reading", "landed", "swapped")
+# A GPU drip scratch slot's states (host/gpu_drip.h kFree, kFilling, kPublished, kRetiring).
+DRIP_STATES = ("free", "filling", "published", "retiring")
 
 
 def seqlock_stress(
@@ -1874,6 +1893,9 @@ class ExpertStreamHost:
         self.threaded = False
         # set_cpu_layer's specs' tensors, kept alive while the host's layers read them.
         self._cpu_layer_keep: dict[int, tuple] = {}
+        # The GPU drip's candidate page and scratch tensors (enable_gpu_drip, set_drip_scratch), read by address.
+        self.drip_candidates: Optional[torch.Tensor] = None
+        self.drip_scratch: tuple = ()
         # Allocated here when the caller passes none.
         if lease_block is None:
             lease_block = expert_lease_block.new_lease_block(
@@ -2412,6 +2434,65 @@ class ExpertStreamHost:
         """
         self._module.expert_stream_arm_copy_engine(self.handle, int(bool(on)))
 
+    def enable_gpu_drip(
+        self,
+        slots: int,
+        *,
+        picks: int,
+        chunk_bytes: int,
+        targets: Optional[Sequence[int]] = None,
+        candidates: Optional[torch.Tensor] = None,
+    ) -> None:
+        """The GPU drip (host/gpu_drip.h): the copy thread copies up to ``picks`` RAM-resident experts per scored record
+        into ``slots`` VRAM scratch slots, ``chunk_bytes`` per copy-engine mark, while no demand copy is pending.
+        ``targets`` (per source row its target row, -1 none) and ``candidates`` (the GPU scorer's page) feed it the
+        scorer's drip picks; without them only ``drip_offer`` does. After the copy engine, before the service thread
+        starts; ``set_drip_scratch`` before any copy table."""
+        if candidates is not None and targets is None:
+            raise ValueError("the candidate page needs the targets")
+        if candidates is not None and (
+            candidates.dtype != torch.uint8 or candidates.device.type != "cpu" or not candidates.is_contiguous()
+        ):
+            raise ValueError("candidates must be a contiguous host uint8 tensor (new_candidate_page)")
+        self._module.expert_stream_enable_gpu_drip(
+            self.handle,
+            int(slots),
+            int(picks),
+            int(chunk_bytes),
+            torch.tensor([int(t) for t in targets] if targets is not None else [], dtype=torch.int64),
+            candidates if candidates is not None else torch.empty(0, dtype=torch.uint8),
+        )
+        # The page is read through its address: keep it alive with the host.
+        self.drip_candidates = candidates
+
+    def set_drip_scratch(self, scratch: Sequence[torch.Tensor]) -> None:
+        """The drip's scratch tensors, one per copy-table entry in its order, each ``[slots, ...]`` rows of that
+        entry's row bytes. The caller keeps them alive while the host runs."""
+        entries = torch.tensor(
+            [[int(t.data_ptr()), t.numel() // t.shape[0] * t.element_size()] for t in scratch], dtype=torch.int64
+        ).reshape(-1, 2)
+        self._module.expert_stream_set_drip_scratch(self.handle, entries)
+        self.drip_scratch = tuple(scratch)
+
+    def drip_offer(self, row: int, experts: Sequence[int]) -> None:
+        """Test only: offer ``experts`` to the drip for ``row`` as a scored record's picks. Instrumented build only."""
+        _refuse_test_only("drip_offer", self.variant)
+        self._check(row)
+        self._module.expert_stream_drip_offer(self.handle, int(row), torch.tensor(list(experts), dtype=torch.int64))
+
+    def drip_hold(self, on: bool = True) -> None:
+        """Test only: while held the drip issues no copy, so admitted drips stay unlanded. Instrumented build only."""
+        _refuse_test_only("drip_hold", self.variant)
+        self._module.expert_stream_drip_hold(self.handle, int(bool(on)))
+
+    def drip_slots(self) -> list[dict]:
+        """Test only: each scratch slot's {state, row, expert, ram_slot}, read racily (state: DRIP_STATES)."""
+        out = torch.zeros((expert_lease_block.WireLayout.scratch_slots, 4), dtype=torch.int64)
+        self._module.expert_stream_drip_view(self.handle, out)
+        return [
+            {"state": DRIP_STATES[s], "row": r, "expert": e, "ram_slot": m} for s, r, e, m in out.tolist()
+        ]
+
     def enable_cpu_experts(
         self,
         kernel: int,
@@ -2926,6 +3007,7 @@ _ROW_COPY_METHODS = {
 _SPEC_METHODS = {
     "expert_stream_spec_score": "score",
     "expert_stream_spec_select": "select",
+    "expert_stream_spec_drip": "drip",
 }
 _RESIDENCY_METHODS = {
     "expert_stream_residency_snapshot": "snapshot",
@@ -3046,6 +3128,37 @@ def run_spec_select(
         state,
         int(candidates.data_ptr()),
     )
+
+
+def run_spec_drip(
+    scores, rows, *, hot_slots, hot_capacity, ram_slot, target, picks, state, candidates, module=None
+) -> None:
+    """The GPU drip's select kernel (spec_score.cuh): the ``picks`` experts of ``ram_slot[target]`` mapped in RAM
+    and not in ``hot_slots[:hot_capacity]``, by their best score over ``scores``' first ``rows`` rows (fp32
+    [rows_max, experts]), published under their own seq after the candidates of ``state``'s posted record in the
+    pinned ``candidates`` page; count 0 when ``rows`` is 0."""
+    (module or _device_module()).expert_stream_spec_drip(
+        scores,
+        int(rows),
+        hot_slots,
+        int(hot_capacity),
+        ram_slot,
+        int(target),
+        int(picks),
+        state,
+        int(candidates.data_ptr()),
+    )
+
+
+def read_drip_picks(page: torch.Tensor, seq: int) -> Optional[list[int]]:
+    """Record ``seq``'s drip picks as the host reads them, or None while their seq word names another record; read
+    while no kernel writes."""
+    off = candidate_offset(seq)
+    raw = bytes(page[off + CAND_DRIP_SEQ : off + CAND_DRIP_EXPERTS + 2 * CAND_MAX_DRIPS].tolist())
+    word, count = struct.unpack_from("<IH", raw)
+    if word != seq & 0xFFFFFFFF:
+        return None
+    return list(struct.unpack_from(f"<{min(count, CAND_MAX_DRIPS)}H", raw, CAND_DRIP_EXPERTS - CAND_DRIP_SEQ))
 
 
 def run_residency_snapshot(ram_slot, targets, valid, out_masks, out_valid, out_stamp, *, module=None) -> None:
@@ -3334,6 +3447,13 @@ class ExpertStreamDevice:
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
         self.host_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
         self.dst_slots_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
+        # The GPU drip (enable_gpu_drip): the scratch slots the post reads, the picks spec_score publishes, and C1s's
+        # compacted HIT_SCRATCH lanes.
+        self.drip_slots = 0
+        self.drip_picks = 0
+        self.scratch_go_1 = torch.zeros(1, dtype=torch.int32, device=device)
+        self.scratch_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
+        self.scratch_dst_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
         # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none; a wide wire
         # appends the masks' high halves.
         self.ce_mask = torch.zeros(self.wire.ce_mask_words, dtype=torch.int32, device=device)
@@ -3443,6 +3563,20 @@ class ExpertStreamDevice:
         self.map_bank["dst_rows"][row] = int(dst_rows)
         self.map_bank["ce_ok"][row] = 1
 
+    def enable_gpu_drip(self, slots: int, *, picks: int = 0) -> None:
+        """The GPU drip (host/gpu_drip.h, the host's ``enable_gpu_drip``): every captured armed post from now on reads
+        the scratch table's first ``slots`` words and types a lane whose (row, expert) one names HIT_SCRATCH, for C1s
+        (``scratch_rows_1``, ``scratch_dst_1``, ``scratch_go_1``). ``picks`` > 0 (needs ``enable_spec_scorer``): each
+        ``spec_score`` also publishes that many drip picks of its target layer. Before any graph captures a post."""
+        if not 1 <= slots <= expert_lease_block.WireLayout.scratch_slots:
+            raise ValueError(f"the scratch table holds 1..{expert_lease_block.WireLayout.scratch_slots} slots, not {slots}")
+        if not 0 <= picks <= CAND_MAX_DRIPS:
+            raise ValueError(f"the drip publishes 0..{CAND_MAX_DRIPS} picks a record, not {picks}")
+        if picks and self._spec is None:
+            raise RuntimeError("drip picks come from the GPU scorer: enable_spec_scorer first")
+        self.drip_slots = int(slots)
+        self.drip_picks = int(picks)
+
     def set_row_cpu(self, row: int) -> None:
         """Record that the row's CPU layer is registered.
 
@@ -3533,7 +3667,8 @@ class ExpertStreamDevice:
             torch.cuda.current_stream(self.spec_stream.device).wait_stream(self.spec_stream)
             self._spec_forked = False
 
-    def _spec_head_launch(self, entry, x, tokens: int, module, routes, route_weights) -> None:
+    def _spec_head_launch(self, entry, x, tokens: int, module, routes, route_weights) -> bool:
+        """Launches the learned head's serving chain; returns whether its block scores are this record's."""
         # Lazy: spec_head imports this module, and the production path must not load it.
         from sglang.kernels.ops.moe import spec_head
 
@@ -3568,11 +3703,36 @@ class ExpertStreamDevice:
             candidates=self.spec_candidates,
             picks=head.picks,
         )
+        return in_range
 
     def _spec_launch(self, entry, x, tokens: int, module, *, routes=None, route_weights=None) -> None:
         if self.spec_head is not None:
-            self._spec_head_launch(entry, x, tokens, module, routes, route_weights)
+            in_range = self._spec_head_launch(entry, x, tokens, module, routes, route_weights)
+            if self.drip_picks:
+                # The head's block scores, one row; stale when the head published its empty record.
+                scores = self.spec_head.workspace.block_scores.view(1, -1)
+                self._spec_drip_launch(entry, scores, 1 if in_range else 0, module)
             return
+        self._spec_select_launch(entry, x, tokens, module)
+        if self.drip_picks:
+            rows = tokens if 1 <= tokens <= self.cpu_tokens_max else 0
+            self._spec_drip_launch(entry, self.spec_scores, rows, module)
+
+    def _spec_drip_launch(self, entry, scores, rows: int, module) -> None:
+        run_spec_drip(
+            scores,
+            rows,
+            hot_slots=entry.hot_slots,
+            hot_capacity=entry.hot_capacity,
+            ram_slot=self.map_bank["ram_slot"],
+            target=entry.target,
+            picks=self.drip_picks,
+            state=self.state,
+            candidates=self.spec_candidates,
+            module=module,
+        )
+
+    def _spec_select_launch(self, entry, x, tokens: int, module) -> None:
         top_k, per_token, top_k_only = self._spec
         if 1 <= tokens <= self.cpu_tokens_max:
             run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
@@ -3763,6 +3923,10 @@ class ExpertStreamDevice:
             spill_on,
             overflow_flag,
             gather_overflow,
+            self.drip_slots,
+            self.scratch_rows_1,
+            self.scratch_dst_1,
+            self.scratch_go_1,
             int(self.lease_pdl),
         )
 

@@ -17,6 +17,7 @@ class LaneKind(IntEnum):
     HIT_CPU = 3
     MISS_GPU = 4
     MISS_CPU = 5
+    HIT_SCRATCH = 6
 
 
 class LaneOverflow(ValueError):
@@ -49,6 +50,7 @@ def type_lanes(
     forced_from: Optional[int] = None,
     miss_cut: int = 0,
     miss_cut_max: int = 3,
+    scratch: Optional[Sequence[int]] = None,
 ) -> tuple[list[LaneKind], list[int]]:
     """Each lane's kind and source slot: its RAM slot for a hit, the next staging slot of its home node for a miss.
 
@@ -64,15 +66,27 @@ def type_lanes(
 
     Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX): a forced CPU miss runs on its node's CPU behind the record's
     CPU-hit job, so a node with 1..``miss_cut_max`` forced misses takes ``miss_cut`` fewer of its split's lanes (at
-    least 0). Forced lanes stay CPU lanes; ``miss_cut`` 0 is the typing without the cut."""
+    least 0). Forced lanes stay CPU lanes; ``miss_cut`` 0 is the typing without the cut.
+
+    GPU drip (host/gpu_drip.h): ``scratch[j]`` is the scratch slot whose published word names lane j's expert for this
+    row, else -1. With host lanes, an unforced lane with a scratch slot is HIT_SCRATCH at that slot, before any RAM
+    lookup: it takes no staging slot and is not eligible, so the split sees one lane fewer."""
     if len(experts) > lanes:
         raise ValueError(f"a request has at most {lanes} lanes, got {len(experts)}")
     if len(set(experts)) != len(experts):
         raise ValueError(f"a request names an expert twice: {list(experts)}")
     forced_from = len(experts) if forced_from is None else forced_from
+    host_lanes = captured and copy_armed
+    scratched = [
+        host_lanes and scratch is not None and j < forced_from and scratch[j] >= 0 for j in range(len(experts))
+    ]
     home = wire_layout(lanes, nodes).home
     slots, hit, taken = [], [], [0] * nodes
     for j, e in enumerate(experts):
+        if scratched[j]:
+            slots.append(scratch[j])
+            hit.append(False)
+            continue
         s = ram_slot[e]
         if s >= 0:
             slots.append(s)
@@ -89,11 +103,12 @@ def type_lanes(
         slots.append(staging[node * lanes + m])
         hit.append(False)
         taken[node] += 1
-    host_lanes = captured and copy_armed
     can_cpu = host_lanes and cpu_on and cpu_ok
     if forced_from < len(experts) and not can_cpu:
         raise LaneOverflow(f"lanes {forced_from}.. found no victim and cannot be CPU lanes")
-    eligible = [j < forced_from and can_cpu and (h or cpu_misses) for j, h in enumerate(hit)]
+    eligible = [
+        j < forced_from and can_cpu and not scratched[j] and (h or cpu_misses) for j, h in enumerate(hit)
+    ]
     take = [0] * nodes
     for node in range(nodes):
         n = sum(1 for e, ok in zip(experts, eligible) if ok and home(e) == node)
@@ -110,7 +125,9 @@ def type_lanes(
     copy_ok = host_lanes and hit_copy == "ce" and ce_ok
     kinds = []
     for j, (h, c) in enumerate(zip(hit, cpu)):
-        if c:
+        if scratched[j]:
+            kinds.append(LaneKind.HIT_SCRATCH)
+        elif c:
             kinds.append(LaneKind.HIT_CPU if h else LaneKind.MISS_CPU)
         elif h:
             dst = True if dst_ok is None else dst_ok[j]

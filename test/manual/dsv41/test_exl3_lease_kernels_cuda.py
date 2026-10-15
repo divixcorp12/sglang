@@ -289,7 +289,9 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
         zeros_u8, zeros_u8.clone(), torch.zeros(1, dtype=torch.int32, device="cuda"), row_capacity, 0, 0, 0, 0, 3,
         out["kind"], out["slot"], torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"], no_i32, 0, no_i32, 1, 16, 0,
-        torch.zeros(1, dtype=torch.int32, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"), 0,
+        torch.zeros(1, dtype=torch.int32, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"),
+        0, torch.zeros(w.lanes, dtype=torch.int64, device="cuda"), torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"), 0,
     )
     torch.cuda.synchronize()
     record = page[w.demand_ring : w.demand_ring + w.record_bytes].clone()
@@ -312,9 +314,12 @@ def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
 
 
 
-def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, cpu_on=False):
+def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, cpu_on=False, scratch_words=None,
+              scratch_out=None):
     """One post of the node-aware device build over one row: ``ram`` its slot map, ``staging`` node-major, ``split``
-    node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes."""
+    node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes.
+    ``scratch_words``: the GPU drip's scratch table (u64 per slot), written to the block and read by the post as that
+    many slots; ``scratch_out`` (a list) then receives C1s's compacted (rows, dst slots, count)."""
     w = lease.wire_layout(lanes, nodes)
     count, experts = len(planned), len(ram)
     page = ops.new_page(pin=True, wire=w)
@@ -324,6 +329,12 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
     block[delta + w.delta_fields["staging"] :][: 2 * nodes * w.lanes].view(torch.int16)[:] = torch.tensor(
         staging, dtype=torch.int16
     )
+    scratch_slots = 0 if scratch_words is None else len(scratch_words)
+    if scratch_slots:
+        block[w.copy_armed : w.copy_armed + 4].view(torch.int32)[0] = 1
+        block[w.scratch : w.scratch + 8 * scratch_slots].view(torch.int64)[:] = torch.tensor(
+            [x - (1 << 64) if x >= 1 << 63 else x for x in scratch_words], dtype=torch.int64
+        )
     if split is not None:
         block[w.copy_armed : w.copy_armed + 4].view(torch.int32)[0] = 1
         for node in range(nodes):
@@ -342,6 +353,9 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
                     torch.ones(count, dtype=torch.float32, **cuda))
     else:
         cpu_buf, cpu_args = None, (no_i32, 0, no_i32)
+    scratch_rows = torch.full((w.lanes,), -7, dtype=torch.int64, **cuda)
+    scratch_dst = torch.full((w.lanes,), -7, dtype=torch.int32, **cuda)
+    scratch_go = torch.full((1,), -7, dtype=torch.int32, **cuda)
     ops._device_module("exl3", lanes, nodes).expert_stream_post(
         page, torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, **cuda), planned_t,
         torch.tensor([count], dtype=torch.int32, **cuda), planned_t.clone(), 0, experts, int(block.data_ptr()),
@@ -351,10 +365,14 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
         zeros_u8, torch.ones(1, dtype=torch.uint8, **cuda), torch.full((1,), w.lanes, dtype=torch.int32, **cuda), 64,
         0, int(cpu_on), 0, 0, 3, out["kind"], out["slot"], out["node"], torch.zeros(1, dtype=torch.int32, **cuda),
         torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 1, 32, 0,
-        torch.zeros(1, dtype=torch.int32, **cuda), torch.zeros(1, dtype=torch.int64, **cuda), 0,
+        torch.zeros(1, dtype=torch.int32, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
+        scratch_slots, scratch_rows, scratch_dst, scratch_go, 0,
     )
     torch.cuda.synchronize()
     del cpu_buf
+    if scratch_out is not None:
+        go = int(scratch_go[0])
+        scratch_out.append((scratch_rows[:go].tolist(), scratch_dst[:go].tolist(), go))
     return [out[n][:count].tolist() for n in ("kind", "slot", "node")]
 
 
@@ -391,6 +409,46 @@ def test_the_split_is_per_node_and_a_zero_split_keeps_a_node_off_the_cpu():
                          cpu_on=True, cpu_misses=False, nodes=nodes)
     assert kinds == [int(k) for k in want] == [int(LaneKind.HIT_SM), int(LaneKind.HIT_SM), int(LaneKind.HIT_CPU),
                                                int(LaneKind.HIT_SM), int(LaneKind.HIT_CPU), int(LaneKind.HIT_SM)]
+
+
+def _scratch_word(tag, row, expert):
+    """A scratch-table word as host/gpu_drip.h publishes it."""
+    return tag << 32 | row << 16 | expert
+
+
+@pytest.mark.parametrize("lanes, nodes", [(8, 1), (40, 2)])
+def test_a_landed_drip_is_typed_hit_scratch_and_leaves_the_split(lanes, nodes):
+    """The GPU drip: the CUDA post's typing equals type_lanes(scratch=...) on random plans whose experts are partly
+    published in the scratch table, with every eligible lane the CPU's (split[n] = n), so a scratched RAM hit both
+    leaves its node's n and is HIT_SCRATCH; C1s's compaction lists exactly those lanes. A word of another row, or one
+    with tag 0, names nothing. Mutations: match_scratch ignoring the row or the tag, or type_lanes leaving a scratched
+    lane eligible -- red on the kinds."""
+    w = lease.wire_layout(lanes, nodes)
+    rng = random.Random(lanes * 10 + nodes)
+    experts = 4 * lanes
+    split = [n for _ in range(nodes) for n in range(w.lanes + 1)]
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    for _ in range(20):
+        count = rng.randint(1, lanes)
+        planned = rng.sample(range(experts), count)
+        ram = [rng.randrange(64) if rng.random() < 0.6 else -1 for _ in range(experts)]
+        chosen = rng.sample(planned, min(count, rng.randint(0, 6)))
+        decoys = [e for e in planned if e not in chosen][:2]
+        words = [_scratch_word(rng.randrange(1, 1 << 32), 0, e) for e in chosen]
+        words += [_scratch_word(5, 1, e) for e in decoys[:1]] + [_scratch_word(0, 0, e) for e in decoys[1:]]
+        rng.shuffle(words)
+        scratch = [next((s for s, x in enumerate(words) if x >> 32 and x & 0xFFFFFFFF == e), -1) for e in planned]
+        compacted = []
+        kinds, slots, _ = _raw_post(lanes, nodes, planned, ram, staging, split=split, captured=True, cpu_on=True,
+                                    scratch_words=words or [0], scratch_out=compacted)
+        want_kinds, want_slots = type_lanes(
+            planned, ram, staging, split, lanes=w.lanes, captured=True, copy_armed=True, hit_copy="sm", cpu_on=True,
+            cpu_misses=False, nodes=nodes, scratch=scratch,
+        )
+        assert (kinds, slots) == ([int(k) for k in want_kinds], want_slots)
+        scratched = [j for j, k in enumerate(want_kinds) if k == LaneKind.HIT_SCRATCH]
+        assert len(scratched) == len(chosen)
+        assert compacted == [([scratch[j] for j in scratched], scratched, len(scratched))]
 
 
 _NODE_TRAP_SCRIPT = """

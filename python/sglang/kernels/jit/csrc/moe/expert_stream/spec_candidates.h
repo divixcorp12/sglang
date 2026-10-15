@@ -24,6 +24,14 @@ struct SpecCandidates {
   static constexpr int64_t kCandRank = 2;    // u8: the pick's position in the token that gave its best margin
   static constexpr int64_t kCandMargin = 4;  // f32: that token's score for it less its top_k-th
   static constexpr int64_t kCandPayloadBytes = kCandEntries + kMaxCandidates * kCandEntryBytes;
+  // The GPU drip's picks (host/gpu_drip.h), after the candidates under a seqlock of their own (the drip select kernel
+  // in spec_score.cuh runs after the scorer's): u32 seq, u16 count, then up to kMaxDrips u16 experts, the target
+  // layer's experts mapped in RAM and not VRAM-hot, best score first.
+  static constexpr int kMaxDrips = 8;
+  static constexpr int64_t kCandDripSeq = kCandPayloadBytes;
+  static constexpr int64_t kCandDripCount = kCandDripSeq + 4;
+  static constexpr int64_t kCandDripExperts = kCandDripCount + 4;
+  static constexpr int64_t kCandDripEnd = kCandDripExperts + 2 * kMaxDrips;
   static constexpr int64_t kCandStride = 128;
   static constexpr int64_t kCandPageBytes = kCandRecords * kCandStride;
   static constexpr uint32_t kCandFlagOversize = 1;  // the record's tokens are outside 1..tokens_max: count 0
@@ -37,5 +45,7 @@ struct SpecCandidates {
 static_assert(SpecCandidates::kCandRecords == Wire::kDemandRecords, "one slot per demand record of the ring");
 static_assert(SpecCandidates::kCandPayloadBytes == 72 && SpecCandidates::kCandPayloadBytes <= SpecCandidates::kCandStride,
               "a slot's payload fits its stride");
+static_assert(SpecCandidates::kCandDripSeq % 4 == 0 && SpecCandidates::kCandDripEnd <= SpecCandidates::kCandStride,
+              "the drip picks fit the slot after the candidates");
 
 }  // namespace sglang::expert_stream::wire

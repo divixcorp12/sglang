@@ -125,7 +125,7 @@ alignment is refused at the post's launch.
 
 Lane kinds: `HIT_COPY`=1 (the copy thread's DMA; CopyDone), `HIT_SM`=2 (C1; stream order), `HIT_CPU`=3 (the CPU from the
 RAM slot; CopyDone), `MISS_GPU`=4 (NVMe into staging, then S; PieceMask), `MISS_CPU`=5 (NVMe into staging, then the
-CPU; CopyDone).
+CPU; CopyDone), `HIT_SCRATCH`=6 (a GPU drip's scratch slot, then C1s; stream order; see "The GPU drip").
 
 **Completion block** (20480 B, `kLeaseBlockBytes`, 4096-aligned), then the delta block. `CopyDone` and the gate are
 the target's lease channel (["The lease channel"](#the-lease-channel)):
@@ -137,6 +137,7 @@ the target's lease channel (["The lease channel"](#the-lease-channel)):
 | 16512 | the gate | CW closes, copy thread or CW opens |
 | 16640 | `kCopyArmed` u32: 1 once the service armed its copy engine | host |
 | 16768 | `kSplit` i32[9]: CPU lanes per n eligible lanes | host (`store_split`, at start and on retune) |
+| 16896 | `kScratch` u64[32]: the GPU drip's scratch table | copy thread (`host/gpu_drip.h`) |
 | 20480 + 256 row | the row's delta: `tag` u64 @0, `count` u32 @8, `staging` i16[8] @16, 16 `{i16 expert, i16 slot}` entries @32 | host |
 
 `lease_block_bytes(rows, wire) = wire.lease_block_bytes + round_up(rows * wire.delta_stride, 4096)`; at 8 lanes that is
@@ -269,6 +270,50 @@ untargeted rows publish immediately) change step 3:
   is busy it leaves that group's entries landed and counts each in `spec_promote_row_busy`.
 - **Trace.** Each deferred write emits `delta_publish` (row, chain, trigger 0 immediate, 1 row r-1's serve, 2 backstop,
   3 flush; promoted count).
+
+## The GPU drip
+
+`SGLANG_DSV41_GPU_DRIP_SLOTS` (default 0, off; `host/gpu_drip.h`). The copy thread copies experts the GPU scorer
+predicts for its target layer (`SGLANG_DSV41_RAM_PREFETCH_HORIZON` ahead) from their pinned RAM rows into a few VRAM
+scratch slots while no demand copy is pending. A landed slot's word in the scratch table (`Wire::kScratch`, a u64 per
+slot: 0, or `tag << 32 | row << 16 | expert`) makes the target's post type that lane `HIT_SCRATCH` (6), and C1s, a
+second launch of C1's kernel from the scratch tensors to the row's destinations, copies it in stream order after C1.
+The lane takes no staging slot and is not eligible, so its node's split reads one lane fewer.
+
+- **Picks.** After the scorer's kernels, the drip select kernel (`spec_score.cuh`) publishes the target row's
+  `SGLANG_DSV41_GPU_DRIP_PICKS` best experts that are mapped in the device map and not VRAM-hot (native scorer: best
+  gate score over the record's tokens; learned head: its block score) after the record's candidates, under a seq word
+  of its own (`SpecCandidates::kCandDripSeq`). The copy thread reads every posted record's row (a seqlock read of its
+  first words) and, for a source row, that slot. A pick is admitted only if its expert is still mapped in the host
+  mirror, no slot holds it, a free slot exists (else `drip_no_slot`), and the target row has not posted since the
+  source record.
+- **Source rows.** A drip copies from a RAM slot the service may evict meanwhile. Every mirror change bumps a per
+  `[row, expert]` generation after the store, then fences, before the caller can rewrite the slot it unmapped
+  (`RamTier::publish_mirror`). The drip reads the generation, then the mapping, at admission, re-checks both before its
+  first chunk, and publishes only if the generation is unchanged after its last chunk completed: a RAM slot is
+  rewritten only after its expert is unmapped, so an unchanged generation proves the copy read the expert's bytes.
+- **Priority.** One chunk of at most `SGLANG_DSV41_GPU_DRIP_CHUNK_KB` (one mark) is in flight at a time, issued only
+  while no demand job is queued and the last demand job's DMA has completed. Drip and demand copies share the copy
+  stream, so a demand copy issued meanwhile waits behind at most one chunk. SM-driven demand traffic (C1, S) shares the
+  link with at most that one chunk too.
+- **Publish.** After the last chunk's mark completed (the completion word orders the DMA's writes) and the source
+  check, the copy thread sets the slot's identity for the service, then stores the word with a release. The post loads
+  the first `slots` words as atomic u64s, then an acquire fence, before its lanes are typed; C1s reads the scratch in a
+  later kernel. A drip never published is never typed.
+- **Release.** A record of the target row (scanned by the copy thread) clears a published word, then a `seq_cst`
+  fence, then reads the demand head H. A post that read the word before the clear is at most H + 1, and post H + 2
+  starts only after H + 1's chain (C1s included) ended, so the slot is reused only once the service handled record
+  H + 2 (`handled_through`), which also checked every lane that could name it. A filling drip whose target posts first
+  is abandoned (freed when a chunk in flight lands). A lapped or torn record hides rows: every drip is abandoned and
+  every published word cleared.
+- **Check.** The service checks each `HIT_SCRATCH` lane: a captured record with host lanes, and the slot's identity
+  (published or retiring) is the lane's row and expert (`GpuDrip::holds`), else a fail-stop. It counts `drip_used`.
+  `HIT_SCRATCH` is device-copied like `HIT_SM`: nothing waits on the host for it, so such a record may lap.
+- **Counters.** `drip_issued` (first chunk), `drip_landed` (published), `drip_used`, `drip_abandoned`,
+  `drip_no_slot`; InstrBuild events `drip_admit`, `drip_issue`, `drip_land`, `drip_abandon`, `drip_retire` (the copy
+  thread's `<layout>-drip` job trace) and `drip_use` (the service's).
+- **Outputs.** A scratch lane's destination bytes equal a copied lane's. A lane the drip moves off the CPU is computed
+  on the GPU instead, so a step's sums can differ from the drip-off run's in the last bits, as any split change does.
 
 ## Deltas and the bulk delta
 

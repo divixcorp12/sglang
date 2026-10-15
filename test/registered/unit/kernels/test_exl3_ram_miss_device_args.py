@@ -477,9 +477,18 @@ def test_the_candidate_page_layout_is_the_python_mirror():
         "kCandMargin": 4,
         "kCandStride": ram_miss.CAND_STRIDE,
         "kCandFlagOversize": ram_miss.CAND_FLAG_OVERSIZE,
+        "kMaxDrips": ram_miss.CAND_MAX_DRIPS,
     }
     assert {k: found.get(k) for k in want} == want
     assert ram_miss.CAND_PAGE_BYTES == ram_miss.CAND_RECORDS * ram_miss.CAND_STRIDE == 2048
+    # The GPU drip's picks follow the candidates (host/gpu_drip.h reads them, the drip test fixture writes them).
+    for line in (
+        "kCandDripSeq = kCandPayloadBytes;", "kCandDripCount = kCandDripSeq + 4;", "kCandDripExperts = kCandDripCount + 4;"
+    ):
+        assert line in text, line
+    assert ram_miss.CAND_DRIP_SEQ == ram_miss.CAND_ENTRIES + ram_miss.CAND_MAX * ram_miss.CAND_ENTRY_BYTES
+    assert ram_miss.CAND_DRIP_COUNT == ram_miss.CAND_DRIP_SEQ + 4
+    assert ram_miss.CAND_DRIP_EXPERTS == ram_miss.CAND_DRIP_COUNT + 4
 
 
 def test_the_spec_kernels_bounds_are_the_python_mirror():

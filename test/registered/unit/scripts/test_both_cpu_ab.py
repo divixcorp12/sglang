@@ -385,9 +385,11 @@ PROMOTE_OFF = f"{PROMOTE_ON}-off"
 POOL_SERVE = "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE"
 POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-poolserve"
 PROMOTE_POOL_SERVE_ARM = f"{PROMOTE_ON}-poolserve"
+GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
+GPU_DRIP_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-gpudrip"
 PROMOTE_PAIR_ARMS = (
     PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
-    f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit",
+    f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit", GPU_DRIP_ARM,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -593,6 +595,27 @@ def test_the_fixed_split_option_adds_the_table_and_calibration_off_to_both_arms_
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), f"{PROMOTE_ON}-fixedsplit"])
     with pytest.raises(SystemExit, match=SPLIT):
         ab.main()
+
+
+def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_drip_alone(monkeypatch):
+    """Every other arm pins the drip off against a shell's slots; the drip arm adds the replay's settings to the arm it
+    is compared with and takes the fixed split table as that arm does. Mutant: an arm inherits the shell's slots, the
+    drip arm changes another knob or is compared with the wrong arm, or it loses the split table -- red."""
+    ab = _ab()
+    monkeypatch.setenv(GPU_DRIP, "7")
+    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    for arm in ab.ARMS:
+        want = "12" if arm == GPU_DRIP_ARM else "0"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[GPU_DRIP] == want, arm
+    base = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
+    drip, plain = ab.ARMS[GPU_DRIP_ARM][0], ab.ARMS[base][0]
+    knobs = {GPU_DRIP: "12", "SGLANG_DSV41_GPU_DRIP_PICKS": "4", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "1024"}
+    assert {k: drip[k] for k in knobs} == knobs and plain[GPU_DRIP] == "0"
+    assert {k: v for k, v in drip.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
+    assert ab.ARMS[GPU_DRIP_ARM][1] is True and ab.REFERENCE[GPU_DRIP_ARM] == base
+    assert ab._overrides(GPU_DRIP_ARM, "/out")[SPLIT] == "0:3,1:5"
+    assert {"drip_issued", "drip_landed", "drip_used", "drip_abandoned"} <= set(ab.RAM_KEYS)
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

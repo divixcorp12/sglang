@@ -387,6 +387,47 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
+  // The GPU drip (RamTier::enable_gpu_drip). `targets` int64 [rows], per source row the row its scored candidates are
+  // for (-1: none), or [0]; `candidates` the GPU scorer's pinned candidate page (SpecCandidates::kCandPageBytes), or
+  // [0]: picks only from the test hook. The caller keeps the page alive.
+  static void enable_gpu_drip(
+      int64_t handle, int64_t slots, int64_t picks, int64_t chunk_bytes, TensorView targets, TensorView candidates) {
+    using namespace host;
+    using Cand = expert_stream::wire::SpecCandidates;
+    auto cpu = SymbolicDevice{};
+    auto host_page = SymbolicDevice{};
+    expert_stream::verify_named("targets", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), targets);
+    expert_stream::verify_named(
+        "candidates",
+        TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_page),
+        candidates);
+    if (candidates.size(0) != 0 && candidates.size(0) != Cand::kCandPageBytes)
+      throw std::runtime_error(
+          error_prefix<Layout>() + "GPU drip: the candidate page has " + std::to_string(Cand::kCandPageBytes) + " bytes");
+    expert_stream::DripConfig config;
+    config.slots = static_cast<int>(std::clamp<int64_t>(slots, 0, Wire::kScratchSlots + 1));
+    config.picks = static_cast<int>(std::clamp<int64_t>(picks, 0, Cand::kMaxDrips + 1));
+    config.chunk_bytes = chunk_bytes;
+    const auto* t = static_cast<const int64_t*>(targets.data_ptr());
+    for (int64_t row = 0; row < targets.size(0); ++row)
+      config.target.push_back(static_cast<int32_t>(std::clamp<int64_t>(t[row], -2, INT32_MAX)));
+    config.candidates = candidates.size(0) != 0 ? static_cast<const uint8_t*>(candidates.data_ptr()) : nullptr;
+    find(handle)->enable_gpu_drip(std::move(config));
+  }
+
+  // entries: int64 [n, 2] of {scratch tensor address, bytes of one row}, one per copy-table entry in its order.
+  static void set_drip_scratch(int64_t handle, TensorView entries) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "entries", TensorMatcher({-1, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), entries);
+    const auto* e = static_cast<const int64_t*>(entries.data_ptr());
+    std::vector<expert_stream::ScratchEntry> list;
+    for (int64_t i = 0; i < entries.size(0); ++i)
+      list.push_back(expert_stream::ScratchEntry{static_cast<uint64_t>(e[2 * i]), e[2 * i + 1]});
+    find(handle)->set_drip_scratch(std::move(list));
+  }
+
   // A slab table and a layer's scalars as the ExpertLayer make_layer takes (set_cpu_layer, the test export kernel_layer):
   // `slabs` int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab),
   // n <= kMaxSlabs.
@@ -1178,6 +1219,8 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_copy_engine, Exports::enable_copy_engine);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_arm_copy_engine, Exports::arm_copy_engine);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_gpu_drip, Exports::enable_gpu_drip);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_drip_scratch, Exports::set_drip_scratch);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);             \

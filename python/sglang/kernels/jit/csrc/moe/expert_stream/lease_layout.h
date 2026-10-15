@@ -86,6 +86,7 @@ struct LeaseLayout {
   static constexpr uint32_t kKindHitCpu = 3;
   static constexpr uint32_t kKindMissGpu = 4;
   static constexpr uint32_t kKindMissCpu = 5;
+  static constexpr uint32_t kKindHitScratch = 6;  // a landed GPU drip (host/gpu_drip.h): C1s copies it from VRAM
   static constexpr int64_t kHotHeaderBytes = 8;
   static constexpr int64_t kHotAlignment = 64;
   static constexpr uint32_t kHotRecords = kDemandRecords;
@@ -107,7 +108,11 @@ struct LeaseLayout {
   static constexpr int64_t kCopyArmed = kLeaseCopyGate + 128;  // u32
   static constexpr int64_t kSplit = kCopyArmed + 128;  // i32[kNodes][kSplitStride / 4]: CPU lanes per n eligible lanes
   static constexpr int64_t kSplitStride = wire_round_up(4 * (kLanes + 1), 16);  // a node's table, in 16-byte loads
-  static constexpr int64_t kLeaseBlockBytes = wire_round_up(kSplit + kNodes * kSplitStride, kLeaseBlockAlign);
+  // u64[kScratchSlots], the GPU drip's scratch table (host/gpu_drip.h): 0 while the slot holds nothing a post may use,
+  // else tag << 32 | row << 16 | expert with a nonzero tag. It fits the split table's last page at the built widths.
+  static constexpr int64_t kScratch = wire_round_up(kSplit + kNodes * kSplitStride, 128);
+  static constexpr int kScratchSlots = 32;
+  static constexpr int64_t kLeaseBlockBytes = wire_round_up(kScratch + 8 * kScratchSlots, kLeaseBlockAlign);
 
   // ---- Map delta block: one record per row after the completion block ----
   static constexpr int64_t kDeltaBase = kLeaseBlockBytes;
@@ -120,7 +125,8 @@ struct LeaseLayout {
   static_assert(kRecEpoch % 16 == 0 && kRecProtect % 16 == 0 && kRecLaneExpert % 16 == 0 && kRecLaneSlot % 16 == 0 &&
                     kRecLaneDst % 16 == 0 && kRecLaneWeight % 16 == 0 && kRecordBytes % 16 == 0,
                 "the record's 16-byte stores are aligned");
-  static_assert(kSplit + kNodes * kSplitStride <= kLeaseBlockBytes, "completion block");
+  static_assert(kSplit + kNodes * kSplitStride <= kScratch && kScratch + 8 * kScratchSlots <= kLeaseBlockBytes,
+                "completion block");
   static_assert(kLeaseBlockBytes % kLeaseBlockAlign == 0, "the block is whole pages");
   static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");
 };
@@ -139,6 +145,7 @@ static_assert(TargetChannel::kDoneBytes == Wire::kLeaseCopyDoneBytes && Wire::kR
 using V2 = LeaseLayout<8, 1>;
 static_assert(V2::kRecordBytes == 128 && V2::kPageBytes == 2176 && V2::kRecLaneWeight == 96, "v2 request page");
 static_assert(V2::kLeaseCopyDone == 0x4000 && V2::kSplit == 16768 && V2::kLeaseBlockBytes == 20480, "v2 block");
+static_assert(LeaseLayout<40, 2>::kLeaseBlockBytes == 86016, "the scratch table leaves the served build's block alone");
 static_assert(V2::kDeltaEntries == 32 && V2::kDeltaMaxEntries == 16 && V2::kDeltaStride == 256, "v2 delta");
 static_assert(LeaseLayout<8, 2>::home(7) == 1 && V2::home(7) == 0, "home is expert % nodes");
 static_assert(Wire::kSplit % 16 == 0 && Wire::kRecProtect % 16 == 0 && Wire::kRecordBytes % 128 == 0, "alignment");

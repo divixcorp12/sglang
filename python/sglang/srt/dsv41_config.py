@@ -91,6 +91,9 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     torch_prefill_indexer_score_budget_mb: int
     fused_wo_a: bool
     ram_prefetch_learned_head: Optional[str] = None
+    gpu_drip_slots: int = 0
+    gpu_drip_picks: int = 4
+    gpu_drip_chunk_kb: int = 1024
 
     @classmethod
     def from_envs(cls) -> Dsv41Config:
@@ -166,4 +169,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             torch_prefill_indexer_score_budget_mb=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB.get(),
             fused_wo_a=envs.SGLANG_DSV41_FUSED_WO_A.get(),
             ram_prefetch_learned_head=envs.SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD.get(),
+            gpu_drip_slots=envs.SGLANG_DSV41_GPU_DRIP_SLOTS.get(),
+            gpu_drip_picks=envs.SGLANG_DSV41_GPU_DRIP_PICKS.get(),
+            gpu_drip_chunk_kb=envs.SGLANG_DSV41_GPU_DRIP_CHUNK_KB.get(),
         )
