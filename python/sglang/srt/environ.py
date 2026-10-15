@@ -1524,6 +1524,11 @@ class Envs:
     # deployment that expects a pre-seeded cache fails loudly at startup
     # rather than silently eating a cold compile.
     SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
+    # A compiler launcher (e.g. `ccache`) put in front of every JIT compile, not
+    # the link. None = unset = compile directly. It is left out of the build key,
+    # since it does not change what is built; configure the launcher itself
+    # through its own environment (CCACHE_DIR, ...).
+    SGLANG_JIT_COMPILER_LAUNCHER = EnvStr(None)
     # Ask the device compiler for per-kernel resource usage (registers, spills,
     # shared memory) and log it at INFO. Changes the build flags, so it compiles
     # into its own cache entry and leaves the normal one alone -- but that entry
