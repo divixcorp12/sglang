@@ -393,7 +393,8 @@ PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
 PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
 PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
 PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
-PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0")
+PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -774,7 +775,7 @@ def test_the_hicache_and_engram_arms_add_their_knob_alone(monkeypatch):
     for arm in ab.ARMS:
         overrides = ab._overrides(arm, "/out")
         assert overrides["SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"] == ("0" if arm == engram0 else "5"), arm
-        assert ("SGLANG_HICACHE_HOST_NUMA_NODE" in ab.ARMS[arm][0]) == (arm in (hicache, engram0)), arm
+        assert ("SGLANG_HICACHE_HOST_NUMA_NODE" in ab.ARMS[arm][0]) == (arm in PIN01_HICACHE_ARMS), arm
     base, h, e = (ab.ARMS[a][0] for a in (PIN01_SPLIT_MODEL_MEM_ARM, hicache, engram0))
     assert {k: v for k, v in h.items() if k != "SGLANG_HICACHE_HOST_NUMA_NODE"} == base
     assert h["SGLANG_HICACHE_HOST_NUMA_NODE"] == "1"
@@ -782,6 +783,20 @@ def test_the_hicache_and_engram_arms_add_their_knob_alone(monkeypatch):
         {k: v for k, v in h.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"}
     assert ab.server_flags(hicache) == ab.server_flags(engram0) == ("--weight-loader-drop-cache-after-load",)
     assert ab.REFERENCE[hicache] == PIN01_SPLIT_MODEL_MEM_ARM and ab.REFERENCE[engram0] == hicache
+
+
+def test_the_decay_arm_is_arm_a_with_the_hot_decay_alone(monkeypatch):
+    """-decay995 is -hicache1 with SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995; every other arm states 0.98 against a
+    shell's. Mutant: another arm inherits the shell's decay, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY", "0.9")
+    decay, arm_a = PIN01_HICACHE_ARMS[2], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"] == ("0.995" if arm == decay else "0.98")
+    d, a = ab.ARMS[decay][0], ab.ARMS[arm_a][0]
+    assert {k: v for k, v in d.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"} == \
+        {k: v for k, v in a.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"}
+    assert ab.REFERENCE[decay] == arm_a and ab.server_flags(decay) == ("--weight-loader-drop-cache-after-load",)
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

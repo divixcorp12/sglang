@@ -338,12 +338,18 @@ for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
 # native Engram row cache off (5 GiB). The node is an EnvInt with no valid "unset" value, so only these arms name it.
 HICACHE_NODE = "SGLANG_HICACHE_HOST_NUMA_NODE"
 ENGRAM_NATIVE_GIB = "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"
+HOT_DECAY = "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[ENGRAM_NATIVE_GIB] = "5"
+    _overrides_of_arm[HOT_DECAY] = "0.98"
 PIN01_SPLIT_MODEL_HICACHE1_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-hicache1"
 ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0], HICACHE_NODE: "1"}, True)
 PIN01_SPLIT_MODEL_ENGRAM0_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-engram0"
 ARMS[PIN01_SPLIT_MODEL_ENGRAM0_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], ENGRAM_NATIVE_GIB: "0"}, True)
+# The hot cache's insert-on-miss decay at 0.995 (every other arm 0.98, the default): the cache-tiers replay puts it at
+# +5.5 VRAM hits a verify, so the routed-pair hit rate is the evidence and ms/token only a regression check.
+PIN01_SPLIT_MODEL_DECAY_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-decay995"
+ARMS[PIN01_SPLIT_MODEL_DECAY_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], HOT_DECAY: "0.995"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -394,6 +400,7 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_DECAY_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
 }
 
 
