@@ -391,6 +391,9 @@ GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
 PIN01_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-pin01"
 PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
 PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
+PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
+PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
+MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
 FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
@@ -405,6 +408,8 @@ PROMOTE_PAIR_ARMS = (
     PIN01_ARM,
     PIN01_GPU01_ARM,
     PIN01_SPLIT_MODEL_ARM,
+    PIN01_MEM_ARM,
+    PIN01_SPLIT_MODEL_MEM_ARM,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -686,7 +691,8 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM)
+            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
+                                                               PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM)
                                               else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
@@ -721,11 +727,36 @@ def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins
     monkeypatch.setenv(SPLIT_MODEL_COSTS, "copy_lane=9")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[SPLIT_MODEL] == ("1" if arm == PIN01_SPLIT_MODEL_ARM else "0"), arm
+            assert overrides[SPLIT_MODEL] == ("1" if arm in (PIN01_SPLIT_MODEL_ARM, PIN01_SPLIT_MODEL_MEM_ARM)
+                                              else "0"), arm
             assert overrides[SPLIT_MODEL_COSTS] == "", arm
     model, pin = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0], ab.ARMS[PIN01_ARM][0]
     assert {k: v for k, v in model.items() if k != SPLIT_MODEL} == {k: v for k, v in pin.items() if k != SPLIT_MODEL}
     assert ab.REFERENCE[PIN01_SPLIT_MODEL_ARM] == PIN01_ARM and ab.ARMS[PIN01_SPLIT_MODEL_ARM][1] is True
+
+
+def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
+    """-mem is its arm with the scheduler's mlockall and --weight-loader-drop-cache-after-load, nothing else; every
+    other arm pins the mlock off against a shell's and adds no server flag; the capture and the timed run both append
+    the arm's flags. The ON -mem arm is compared with the OFF -mem arm. Mutant: a -mem arm changes another knob, the
+    flag is not appended, or an arm inherits the shell's mlock -- red."""
+    ab = _ab()
+    monkeypatch.setenv(MLOCK, "1")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[MLOCK] == ("1" if arm.endswith("-mem") else "0"), arm
+        assert ab.server_flags(arm) == (("--weight-loader-drop-cache-after-load",) if arm.endswith("-mem") else ())
+    for base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
+        mem, plain = ab.ARMS[base + "-mem"][0], ab.ARMS[base][0]
+        assert {k: v for k, v in mem.items() if k != MLOCK} == {k: v for k, v in plain.items() if k != MLOCK}
+        assert ab.ARMS[base + "-mem"][1] is True
+    assert ab.REFERENCE[PIN01_MEM_ARM] == PIN01_ARM and ab.REFERENCE[PIN01_SPLIT_MODEL_MEM_ARM] == PIN01_MEM_ARM
+    capture = open(os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "spec_margin_capture.py")).read()
+    assert "*both_cpu_ab.server_flags(a.arm)]" in capture
+    seen = {}
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, cwd: seen.update(env) or type("R", (), {"returncode": 0}))
+    ab.run_timed(PIN01_MEM_ARM, "/out")
+    assert seen["DSV41_EXTRA_SERVER_ARGS"].endswith("--weight-loader-drop-cache-after-load")
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

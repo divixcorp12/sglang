@@ -837,6 +837,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Lock the scheduler process's memory against swap once the scheduler is built (model loaded, graphs captured):
+    # mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT), so touched pages stay resident without faulting anything in
+    # (sglang/srt/utils/memory_lock.py). Needs RLIMIT_MEMLOCK unlimited; a failure is logged, not raised.
+    SGLANG_ENABLE_SCHEDULER_MLOCK = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

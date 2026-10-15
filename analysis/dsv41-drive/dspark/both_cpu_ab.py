@@ -303,11 +303,14 @@ SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
 # The model-based split (and its cost overrides) likewise: off in every arm but -splitmodel.
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
+# The scheduler's mlockall, off in every arm but the -mem ones.
+MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[FULL_LAYERS] = ""
     _overrides_of_arm[SPLIT_LAYERS] = ""
     _overrides_of_arm[SPLIT_MODEL] = "0"
     _overrides_of_arm[SPLIT_MODEL_COSTS] = ""
+    _overrides_of_arm[MLOCK] = "0"
 # Layers 0 and 1 read 6.6 and 4.5 experts a verify from NVMe, which the L+2 prefetch cannot reach
 # (ram-prefetch/breakdown-20261015). Each full layer takes 204 rows a node (192 homed experts, 8 staging, 2 pool, 2
 # seam), 5182 MiB a node for the pair; the other 7:6 remainder buys the 7966 rows layers 2-39 hold today (210/209).
@@ -325,6 +328,12 @@ ARMS[PIN01_GPU01_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_LAYERS: f"0:{PIN01_SPLIT_L
 # token-weighted greedy, +17 ms a verify on breakdown-20261015/base at untraced CPU costs), at its default costs.
 PIN01_SPLIT_MODEL_ARM = PIN01_ARM + "-splitmodel"
 ARMS[PIN01_SPLIT_MODEL_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_MODEL: "1"}, True)
+# Node-0 headroom (cores-ab-20261014/splitmodel-stream swapped node 0 in load and decode): -mem adds the scheduler's
+# mlockall and drops each safetensors shard's page cache after loading it (server_flags), and nothing else.
+MEM_SUFFIX = "-mem"
+MEM_SERVER_FLAGS = ("--weight-loader-drop-cache-after-load",)
+for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
+    ARMS[_base + MEM_SUFFIX] = ({**ARMS[_base][0], MLOCK: "1"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -371,7 +380,14 @@ REFERENCE = {
     PIN01_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
     PIN01_GPU01_ARM: PIN01_ARM,
     PIN01_SPLIT_MODEL_ARM: PIN01_ARM,
+    PIN01_ARM + MEM_SUFFIX: PIN01_ARM,
+    PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
 }
+
+
+def server_flags(arm: str) -> tuple[str, ...]:
+    """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop."""
+    return MEM_SERVER_FLAGS if arm.endswith(MEM_SUFFIX) else ()
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
@@ -447,7 +463,7 @@ def run_timed(arm: str, out: str, sessions: str = DEFAULT_SESSIONS) -> int:
     env = os.environ | {
         "DSV41_RUN_ROOT": out,
         "DSV41_SESSION_INDICES": sessions,
-        "DSV41_EXTRA_SERVER_ARGS": shlex.join(arm_env.DSPARK_ARGV) if dspark else "",
+        "DSV41_EXTRA_SERVER_ARGS": shlex.join((*(arm_env.DSPARK_ARGV if dspark else ()), *server_flags(arm))),
         "DSV41_HEALTH_TIMEOUT_S": str(_health_timeout_s(dspark)),
     }
     if dspark:
