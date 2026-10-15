@@ -28,7 +28,7 @@ def test_a_verify_keeps_the_prefix_of_drafts_whose_running_product_clears_the_th
             [0.9, 0.5, 0.95, 1.0, 1.0],  # products 0.9 0.45 0.4275 ...: all kept
             [0.9, 0.4, 1.0, 1.0, 1.0],  # 0.36 < 0.4 at draft 2
             [0.3, 1.0, 1.0, 1.0, 1.0],  # the anchor alone
-            [0.5, 0.8, 1.0, 1.0, 1.0],  # exactly 0.4 at draft 2 is kept
+            [0.5, 0.8, 0.9, 1.0, 1.0],  # exactly 0.4 at draft 2 is kept, 0.36 at draft 3 is not
             [0.9, NAN, 1.0, 1.0, 1.0],  # a NaN probability ends the prefix
             # 0.99 * 0.4 < 0.4 at draft 2, then a top probability above 1 (rounding) lifts the product back over the
             # threshold: the cut stays at draft 2.
