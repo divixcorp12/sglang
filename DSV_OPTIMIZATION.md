@@ -189,6 +189,16 @@ no regression.
   - ON arm on top of the HiCache-on-node-1 arm, against arm A (65.9). Runs after arm C.
   - Then find the remaining 3120 MiB above init, the path from 12040 toward ~15000 MiB.
   - Watch item: HiCache host pools scale with the device KV, so they grow ~12% on node 1.
+- **Hot-cache size from measured headroom** (`hot_mb_for_margin`, `2ece3a6d1d`): 630 MiB free at peak with 948
+  slots, minus 10 MiB for the worst free-before-load seen, leaves 111.8 MiB over the 508 MiB margin, i.e. 8 slots.
+  So **12140 MiB (956 slots)**, fraction 0.8290, KV pinned 381,184. This is the ON arm queued after arm C
+  (`run_mergechunk.sh`).
+- **Why not ~15000 yet:** the 3120 MiB that remains above init comes from the startup warm-up shapes (1 ... 4096
+  tokens). First cut from the nvidia-smi timeline:
+  - ~810 MiB: persistent MoE expert staging (w13 540 + w2 270 MiB, 64 rows), allocated on the first prefill.
+  - ~780 MiB: the 257- and 400-token prefills plus copy-engine arming.
+  - ~1.5 GB: the 2048, 2049 and 4096 prefills.
+  An allocator-history probe (`1c258a85ea`) will attribute it exactly after the A/B.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
