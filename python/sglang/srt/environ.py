@@ -2038,6 +2038,9 @@ class Envs:
     SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL = EnvBool(False)
     # Its costs, overriding the defaults (ram_slot_map.SPLIT_MODEL_DEFAULTS_MS): name[.node]=ms pairs, comma-separated.
     SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS = EnvStr("")
+    # With it, among a node's lanes the model prices alike (same tokens) the CPU takes the lowest residency keys, so
+    # the copy engine, whose lanes become VRAM residents, gets the highest. Off until a served A/B decides.
+    SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK = EnvBool(False)
     # Experiment: a two-stage CPU miss. The reader fetches a CPU-computed miss's w13 prefix across the mirror roots
     # before its w2 suffix, and the CPU job starts once w13 has landed: it runs the gate/up GEMVs while w2 is still being
     # read and waits for w2 before anything reads it. Needs SGLANG_DSV41_CPU_EXPERTS. Off until a served A/B decides.

@@ -337,9 +337,13 @@ struct LanePolicy {
 // stream_lane, stream_base (ns), then the counters: records typed by the model, and per node the lanes it put on the
 // CPU that the table would not and the lanes it took off the CPU (ram_slot_map.split_model_words,
 // split_model_stats_words).
-constexpr int kSplitModelCosts = 5 * Wire::kNodes + 5;
+// The last cost word is flags: kSplitModelResidencyTiebreak.
+constexpr int kSplitModelCosts = 5 * Wire::kNodes + 6;
 constexpr int kSplitModelStats = 1 + 2 * Wire::kNodes;
-constexpr int kSplitModelWords = 7 * Wire::kNodes + 6;  // kSplitModelCosts + kSplitModelStats
+constexpr int kSplitModelWords = 7 * Wire::kNodes + 7;  // kSplitModelCosts + kSplitModelStats
+// SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK: among a node's candidates with the same tokens (the model prices
+// them alike), the CPU takes the highest plan indexes (lowest residency keys) and the copy engine the rest.
+constexpr int64_t kSplitModelResidencyTiebreak = 1;
 static_assert(kSplitModelWords == kSplitModelCosts + kSplitModelStats, "split model words");
 
 // ram_slot_map.model_node_finish: node's predicted CPU end (ns) for a hit job of k experts and `pairs` (token, expert)
@@ -401,6 +405,9 @@ SGL_DEVICE void model_cpu_lanes(
       }
     }
   }
+  bool pool[Wire::kLanes];  // the candidates, kept for the residency tiebreak
+  for (int j = 0; j < Wire::kLanes; ++j)
+    pool[j] = candidate[j];
   const int64_t copy_lane = words[5 * Wire::kNodes];
   const int64_t stream_lane = words[5 * Wire::kNodes + 3];
   const int64_t stream0 = words[5 * Wire::kNodes + 4] + words[5 * Wire::kNodes + 1] + words[5 * Wire::kNodes + 2] * streamed;
@@ -429,6 +436,23 @@ SGL_DEVICE void model_cpu_lanes(
       ++lanes;
     }
   }
+  if ((words[5 * Wire::kNodes + 5] & kSplitModelResidencyTiebreak) == 0) return;
+  // Lanes of one node with the same tokens cost the model the same, so the greedy's count of them on the CPU stands
+  // and only which ones moves: the CPU takes the highest plan indexes (plan order is residency key, highest first).
+  bool tied[Wire::kLanes];
+  for (int j = 0; j < Wire::kLanes; ++j) {
+    tied[j] = false;
+    if (j >= plan.count || !pool[j]) continue;
+    int on_cpu = 0, above = 0;
+    for (int i = 0; i < plan.count; ++i)
+      if (pool[i] && node_of[i] == node_of[j] && plan.tokens[i] == plan.tokens[j]) {
+        on_cpu += cpu[i] ? 1 : 0;
+        above += i > j ? 1 : 0;
+      }
+    tied[j] = above < on_cpu;
+  }
+  for (int j = 0; j < Wire::kLanes; ++j)
+    if (j < plan.count && pool[j]) cpu[j] = tied[j];
 }
 
 // Loads every node's Wire::kSplit table in whole 16-byte loads; words past a table are dropped.
