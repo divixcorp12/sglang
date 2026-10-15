@@ -381,17 +381,38 @@ def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
     return f"{-(-round((off + (hot + kv + jitter) / pre_load) * 1e6) // 100) / 1e4:.4f}"
 
 
-# The splitmodel -mem arm with the merge chunked under MERGE_CHUNK_MB, spent on the hot cache (arm_env's TODO at
-# DSPARK_MEM_FRACTION_STATIC); the KV pool is pinned. Measured by prefill_peak_probe.py (/mnt/nvme1/prefill-merge/peaks,
-# 4096- and 30k-token prompts; the peak is set at startup, the 30k prompt adds 2 MiB): the OFF arm peaks 4337 MiB above
-# init, 3120 chunked (1217 MiB freed), and this arm (at 0.8229, KV 381,184, hot 12040) leaves 630 MiB free at its peak.
+# Prefill peaks by prefill_peak_probe.py (/mnt/nvme1/prefill-merge/peaks, 4096- and 30k-token prompts; the arms' longest
+# prompt is ~7.7k characters, and the peak is set by the startup warm-up, which the 30k prompt exceeds by 2 MiB): the
+# OFF -mem arm peaks 4337 MiB above init, 3120 with the merge chunked (1217 MiB freed). m3-mergechunk, chunked with the
+# KV pool pinned at 381,184 and 948 hot slots (12040 MiB), left 630 MiB free at its peak, after 29.34 GiB free before
+# loading. With the pool pinned, every hot slot comes out of that free memory one for one.
+PROBE_HOT_SLOTS = 948
+PROBE_FREE_AT_PEAK_MIB = 630
+PROBE_PRE_LOAD_GIB = 29.34
+# The lowest free-before-load seen (mem-budget/L2): a launch that low leaves that much less at the peak.
+MIN_PRE_LOAD_GIB = 29.33
+# The margin the DSpark arms keep today over their 4096-token warm-up (arm_env, at DSPARK_MEM_FRACTION_STATIC).
+PEAK_MARGIN_MIB = 508
+
+
+def hot_mb_for_margin(margin_mib: int = PEAK_MARGIN_MIB) -> int:
+    """The largest SGLANG_MOE_HOT_GPU_MB whose slots leave margin_mib free at the measured chunked prefill peak, at the
+    lowest free-before-load seen, with the pool pinned: the probe's slots plus the whole slots the spare buys."""
+    worst_free = PROBE_FREE_AT_PEAK_MIB * 2**20 - (PROBE_PRE_LOAD_GIB - MIN_PRE_LOAD_GIB) * 2**30
+    slots = PROBE_HOT_SLOTS + int((worst_free - margin_mib * 2**20) // HOT_SLOT_BYTES)
+    return -(-slots * HOT_SLOT_BYTES // 2**20)  # rounded up: the cache takes floor(MiB / slot) slots
+
+
+# The splitmodel -mem-hicache1 arm (HiCache host pools on node 1) with the merge chunked under MERGE_CHUNK_MB and the
+# freed prefill headroom spent on the hot cache (arm_env's TODO at DSPARK_MEM_FRACTION_STATIC); the KV pool is pinned
+# (the HiCache host pools scale with it, so they are ~12% larger than its reference's).
 MERGE_CHUNK_MB = 128
-MERGE_HOT_GPU_MB = 12040
+MERGE_HOT_GPU_MB = hot_mb_for_margin()
 MERGE_KV_TOKENS = 381184
-MERGE_CHUNK_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-mergechunk"
+MERGE_CHUNK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-mergechunk"
 ARMS[MERGE_CHUNK_ARM] = (
     {
-        **ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0],
+        **ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0],
         MERGE_BUDGET: str(MERGE_CHUNK_MB),
         "SGLANG_MOE_HOT_GPU_MB": str(MERGE_HOT_GPU_MB),
     },
@@ -449,7 +470,7 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
     PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
-    MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
+    MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
 }
 
 
