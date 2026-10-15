@@ -159,6 +159,8 @@ def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_a
     """SGLANG_MOE_PINNED_HOST_FULL_LAYERS: the host keeps a row's staging slot out of assign, so a tier of exactly
     the expert count cannot map them all and start refuses it; one slot more maps every expert at attach, and a layer
     not listed is not filled. Mutations: the check ignoring staging, or attach skipping the fill -- red."""
+    # The device side's map apply is a CUDA kernel; the host's map is what is under test.
+    monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, entries: None)
     with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
         for service, streamers in _built_tiers(tmp_path, monkeypatch, [EXPERTS + extra, CAPACITY]):
             if refused:
@@ -175,7 +177,7 @@ def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_a
 def test_full_layer_room_is_every_homed_expert_past_staging_and_pool():
     """Each group keeps min(width, slots - 1) staging and the pool share, and must still hold the experts homed on it
     (expert % groups): 384 experts on 2 groups need 192 + 8 + 2 slots each."""
-    ranges = [(0, 202), (202, 403)]
+    ranges = [(0, 202), (202, 404)]
     assert module.full_layer_shortfall(ranges, staging_width=8, share=2, experts=384) == []
     assert module.full_layer_shortfall([(0, 201), (201, 403)], staging_width=8, share=2, experts=384) == [(0, 191, 192)]
     assert module.full_layer_shortfall([(0, 6)], staging_width=1, share=0, experts=6) == [(0, 5, 6)]
