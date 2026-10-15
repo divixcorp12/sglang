@@ -338,7 +338,8 @@ struct LanePolicy {
 // and the lanes it took off the CPU (ram_slot_map.split_model_words, split_model_stats_words).
 constexpr int kSplitModelCosts = 5 * Wire::kNodes + 3;
 constexpr int kSplitModelStats = 1 + 2 * Wire::kNodes;
-constexpr int kSplitModelWords = kSplitModelCosts + kSplitModelStats;
+constexpr int kSplitModelWords = 7 * Wire::kNodes + 4;  // kSplitModelCosts + kSplitModelStats
+static_assert(kSplitModelWords == kSplitModelCosts + kSplitModelStats, "split model words");
 
 // ram_slot_map.model_node_finish: node's predicted CPU end (ns) for a hit job of k experts and `pairs` (token, expert)
 // pairs, then its `misses` forced misses of miss_tokens[0..misses) tokens, miss i landing at first_byte + per_expert*i.
