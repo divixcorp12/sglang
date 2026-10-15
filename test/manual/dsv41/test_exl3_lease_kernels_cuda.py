@@ -293,7 +293,7 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
         0, torch.zeros(ops.DRIP_TABLE_SLOTS, dtype=torch.int64, device="cuda"),
         torch.zeros(w.lanes, dtype=torch.int64, device="cuda"), torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"),
-        torch.full((1, w.nodes * (w.lanes + 1)), -1, dtype=torch.int32, device="cuda"), 0,
+        torch.full((1, w.nodes * (w.lanes + 1)), -1, dtype=torch.int32, device="cuda"), no_i64, 0,
     )
     torch.cuda.synchronize()
     record = page[w.demand_ring : w.demand_ring + w.record_bytes].clone()
@@ -317,12 +317,17 @@ def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
 
 
 def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, cpu_on=False, scratch_words=None,
-              scratch_out=None, row_split=None):
+              scratch_out=None, row_split=None, copy_ce=False, dst=None, spill=False, routes=None, miss_cut=0,
+              split_model=None):
     """One post of the node-aware device build over one row: ``ram`` its slot map, ``staging`` node-major, ``split``
     node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes.
     ``row_split``: the row's own node-major table (SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS), else -1 (the block's).
     ``scratch_words``: the GPU drip's scratch table (u64 per slot), written to the block and read by the post as that
-    many slots; ``scratch_out`` (a list) then receives C1s's compacted (rows, dst slots, count)."""
+    many slots; ``scratch_out`` (a list) then receives C1s's compacted (rows, dst slots, count).
+    ``copy_ce``: the copy engine may take hits (hit_copy ce, the row's copy table set, w.lanes destination rows);
+    ``dst`` the lanes' destination slots (default 0..count-1), with ``spill`` making -1 a forced lane; ``routes`` the
+    record's routes (default the planned experts once each); ``miss_cut`` the split miss cut (bound 3);
+    ``split_model`` the split model's cost words, whose counters are then appended to the result."""
     w = lease.wire_layout(lanes, nodes)
     count, experts = len(planned), len(ram)
     page = ops.new_page(pin=True, wire=w)
@@ -360,27 +365,38 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
     scratch_rows = torch.full((w.lanes,), -7, dtype=torch.int64, **cuda)
     scratch_dst = torch.full((w.lanes,), -7, dtype=torch.int32, **cuda)
     scratch_go = torch.full((1,), -7, dtype=torch.int32, **cuda)
+    model = no_i64
+    if split_model is not None:
+        model = torch.tensor(list(split_model) + [0] * (1 + 2 * nodes), dtype=torch.int64, **cuda)
+    count_t = torch.tensor([count], dtype=torch.int32, **cuda)
     ops._device_module("exl3", lanes, nodes).expert_stream_post(
-        page, torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, **cuda), planned_t,
-        torch.tensor([count], dtype=torch.int32, **cuda), planned_t.clone(), 0, experts, int(block.data_ptr()),
-        5_000_000_000, 0, 0, no_i64, 0, torch.arange(count, dtype=torch.int32, **cuda), int(captured),
+        page, torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, **cuda), planned_t, count_t,
+        planned_t.clone() if routes is None else torch.tensor(routes, dtype=torch.int64, **cuda), 0, experts,
+        int(block.data_ptr()), 5_000_000_000, 0, 0, no_i64, 0,
+        torch.tensor(list(range(count)) if dst is None else dst, dtype=torch.int32, **cuda), int(captured),
         torch.tensor([ram], dtype=torch.int32, **cuda), torch.full((1, nodes * w.lanes), -1, dtype=torch.int32, **cuda),
         torch.ones(1, dtype=torch.int64, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
-        zeros_u8, torch.ones(1, dtype=torch.uint8, **cuda), torch.full((1,), w.lanes, dtype=torch.int32, **cuda), 64,
-        0, int(cpu_on), 0, 0, 3, out["kind"], out["slot"], out["node"], torch.zeros(1, dtype=torch.int32, **cuda),
-        torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 1, 32, 0,
+        torch.ones(1, dtype=torch.uint8, **cuda) if copy_ce else zeros_u8, torch.ones(1, dtype=torch.uint8, **cuda),
+        torch.full((1,), w.lanes, dtype=torch.int32, **cuda), 64,
+        int(copy_ce), int(cpu_on), 0, miss_cut, 3, out["kind"], out["slot"], out["node"],
+        torch.zeros(1, dtype=torch.int32, **cuda),
+        torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 1, 32, int(spill),
         torch.zeros(1, dtype=torch.int32, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
         scratch_slots, scratch_table, scratch_rows, scratch_dst, scratch_go,
         torch.tensor([row_split if row_split is not None else [-1] * (nodes * (w.lanes + 1))], dtype=torch.int32,
                      **cuda),
-        0,
+        model, 0,
     )
     torch.cuda.synchronize()
     del cpu_buf
     if scratch_out is not None:
         go = int(scratch_go[0])
         scratch_out.append((scratch_rows[:go].tolist(), scratch_dst[:go].tolist(), go))
-    return [out[n][:count].tolist() for n in ("kind", "slot", "node")]
+    count = int(count_t[0])
+    result = [out[n][:count].tolist() for n in ("kind", "slot", "node")]
+    if split_model is not None:
+        result.append(model[len(split_model) :].tolist())
+    return result
 
 
 @pytest.mark.parametrize("lanes", [8, 16, 32, 40])
@@ -435,6 +451,109 @@ def test_a_row_split_replaces_the_lease_split_for_its_row_only():
                              hit_copy="sm", cpu_on=True, cpu_misses=False, nodes=nodes)
         assert kinds == [int(k) for k in want]
     assert kinds.count(int(LaneKind.HIT_CPU)) == 6
+
+
+def _split_model_case(rng, lanes, nodes, *, copy_ce=True, count=None, hit_rate=0.6, forced=None, coarse=True):
+    """A random record for the split model: plan, slot map, destinations (some out of range), routes naming each
+    planned expert 1-4 times plus unplanned ones, a spill point, and cost words on a coarse grid so ties happen."""
+    w = lease.wire_layout(lanes, nodes)
+    experts = 4 * w.lanes
+    count = rng.randint(1, w.lanes) if count is None else count
+    planned = rng.sample(range(experts), count)
+    ram = [rng.randrange(64) if rng.random() < hit_rate else -1 for _ in range(experts)]
+    forced_from = rng.randint(0, count) if forced is None else forced
+    dst = [(w.lanes if rng.random() < 0.15 else j) if j < forced_from else -1 for j in range(count)]
+    routes = [e for e in planned for _ in range(rng.randint(1, 4))] + rng.sample(range(experts), 3)
+    rng.shuffle(routes)
+    step = 100 if coarse else 1
+    words = []
+    for _ in range(nodes):
+        words += [rng.choice([-1, 0, 2]) * step, rng.randint(0, 5) * step, rng.randint(0, 5) * step,
+                  rng.randint(0, 4) * step, rng.randint(0, 3) * step]
+    words += [rng.randint(1, 15) * step, rng.randint(0, 10) * step, rng.randint(0, 20) * step]
+    return w, planned, ram, forced_from, dst, routes, words
+
+
+def _split_model_want(w, planned, ram, staging, split, forced_from, dst, routes, words, copy_ce):
+    stats = [0] * (1 + 2 * w.nodes)
+    kinds, slots = type_lanes(
+        planned, ram, staging, split, lanes=w.lanes, captured=True, copy_armed=True, hit_copy="ce" if copy_ce else "sm",
+        cpu_on=True, cpu_misses=False, ce_ok=copy_ce, dst_ok=[0 <= d < w.lanes for d in dst], nodes=w.nodes,
+        forced_from=forced_from, miss_cut=1, miss_cut_max=3, split_model=words,
+        tokens=[routes.count(e) for e in planned], model_stats=stats)
+    return [int(k) for k in kinds], slots, stats
+
+
+@pytest.mark.parametrize("lanes, nodes", [(8, 1), (8, 2), (16, 2), (40, 2)])
+def test_the_split_model_types_lanes_like_the_reference(lanes, nodes):
+    """Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): 300 random records -- hits, NVMe misses, forced lanes from a
+    spill point, destinations past the row's, routes naming experts 1-4 times, cost words on a grid that makes ties --
+    type kind for kind and slot for slot as ram_slot_map.type_lanes(split_model=...), counters included; with the
+    copy engine off the table and the miss cut type them. Mutations: ties broken last-lane first, a forced miss's
+    landing counted from 0, the copy FIFO per node, a non-copyable hit offered to the copy engine -- red."""
+    rng = random.Random(1000 * lanes + nodes)
+    w = lease.wire_layout(lanes, nodes)
+    split = [max(0, (2 * n) // 3) for _ in range(nodes) for n in range(w.lanes + 1)]
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    moved = 0
+    for i in range(300):
+        copy_ce = i % 10 != 0
+        _, planned, ram, forced_from, dst, routes, words = _split_model_case(rng, lanes, nodes)
+        kinds, slots, _, stats = _raw_post(
+            lanes, nodes, planned, ram, staging, split=split, captured=True, cpu_on=True, copy_ce=copy_ce, dst=dst,
+            spill=True, routes=routes, miss_cut=1, split_model=words)
+        want = _split_model_want(w, planned, ram, staging, split, forced_from, dst, routes, words, copy_ce)
+        assert (kinds, slots, stats) == want, (planned, ram, forced_from, dst, routes, words, copy_ce)
+        moved += sum(stats[1:])
+    assert moved > 0
+
+
+# (count, hit rate, forced_from as a fraction of count or None, copy engine): no eligible hit, all forced, copy off,
+# every lane hits, one lane.
+SPLIT_MODEL_EDGES = [(6, 0.0, None, True), (6, 1.0, 0, True), (6, 1.0, None, False), (8, 1.0, 1.0, True),
+                     (1, 1.0, 1.0, True)]
+
+
+@pytest.mark.parametrize("count, hit_rate, forced, copy_ce", SPLIT_MODEL_EDGES)
+def test_the_split_model_edges_type_lanes_like_the_reference(count, hit_rate, forced, copy_ce):
+    """The split model at its edges, 2 nodes: no eligible hit (counters stay 0), every lane forced (all CPU), the copy
+    engine off (the table and cut type the lanes, counters stay 0), every lane an unforced hit, one lane."""
+    lanes, nodes = 8, 2
+    w = lease.wire_layout(lanes, nodes)
+    rng = random.Random(count * 7 + int(10 * hit_rate))
+    split = [max(0, (2 * n) // 3) for _ in range(nodes) for n in range(w.lanes + 1)]
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    for _ in range(20):
+        _, planned, ram, forced_from, dst, routes, words = _split_model_case(
+            rng, lanes, nodes, count=count, hit_rate=hit_rate,
+            forced=None if forced is None else int(forced * count))
+        kinds, slots, _, stats = _raw_post(
+            lanes, nodes, planned, ram, staging, split=split, captured=True, cpu_on=True, copy_ce=copy_ce, dst=dst,
+            spill=True, routes=routes, miss_cut=1, split_model=words)
+        want = _split_model_want(w, planned, ram, staging, split, forced_from, dst, routes, words, copy_ce)
+        assert (kinds, slots, stats) == want
+        if hit_rate == 0.0 or not copy_ce:
+            assert stats == [0] * (1 + 2 * nodes)
+        if forced_from == 0:
+            assert all(k in (int(LaneKind.HIT_CPU), int(LaneKind.MISS_CPU)) for k in kinds)
+
+
+def test_the_split_model_off_types_lanes_as_the_table():
+    """An empty split-model tensor is the table and the miss cut, bit for bit, on the same random records."""
+    lanes, nodes = 16, 2
+    w = lease.wire_layout(lanes, nodes)
+    rng = random.Random(5)
+    split = [max(0, (2 * n) // 3) for _ in range(nodes) for n in range(w.lanes + 1)]
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    for _ in range(100):
+        _, planned, ram, forced_from, dst, routes, _ = _split_model_case(rng, lanes, nodes)
+        kinds, slots, _ = _raw_post(lanes, nodes, planned, ram, staging, split=split, captured=True, cpu_on=True,
+                                    copy_ce=True, dst=dst, spill=True, routes=routes, miss_cut=1)
+        want, want_slots = type_lanes(
+            planned, ram, staging, split, lanes=w.lanes, captured=True, copy_armed=True, hit_copy="ce", cpu_on=True,
+            cpu_misses=False, dst_ok=[0 <= d < w.lanes for d in dst], nodes=nodes, forced_from=forced_from,
+            miss_cut=1, miss_cut_max=3)
+        assert (kinds, slots) == ([int(k) for k in want], want_slots)
 
 
 def _scratch_word(tag, row, expert):

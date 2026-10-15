@@ -97,6 +97,9 @@ struct PostParams {
   // SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: [rows, Wire::kNodes * (Wire::kLanes + 1)] (device memory), a row's own
   // split per node, read in place of the lease's Wire::kSplit tables; -1 at a row's first word: the lease's.
   const int32_t* row_split;
+  // Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): kSplitModelWords int64 words in device memory (LanePolicy::
+  // split_model), whose counters the post advances; nullptr: the split and the miss cut type the CPU's lanes.
+  int64_t* split_model;
 };
 
 // Element dtypes of the CPU experts' staged input and routing weights (PostParams).
@@ -170,7 +173,18 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .dst_rows = p.dst_rows[p.row],
           .miss_cut = static_cast<int32_t>(p.miss_cut),
           .miss_cut_max = static_cast<int32_t>(p.miss_cut_max),
+          .split_model = p.split_model,
       };
+      // The split model's token counts: the routes that name each lane's expert.
+      int32_t tokens[Wire::kLanes];
+      if (p.split_model != nullptr) {
+        for (int j = 0; j < Wire::kLanes; ++j) {
+          tokens[j] = 0;
+          if (j >= count) continue;
+          for (int64_t r = 0; r < p.route_count; ++r)
+            tokens[j] += p.routes[r] == p.planned[j] ? 1 : 0;
+        }
+      }
       // Loaded before the tag spin: the host stores split relaxed at any time, ordered by nothing (set_cpu_split in
       // host/ram_tier.h). Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes
       // never indexes it.
@@ -209,7 +223,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
                   .dst = p.dst_slots,
                   .count = count,
                   .forced_from = live,
-                  .scratch = drip ? scratch : nullptr},
+                  .scratch = drip ? scratch : nullptr,
+                  .tokens = p.split_model != nullptr ? tokens : nullptr},
               map,
               policy,
               typed)) {
@@ -226,7 +241,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
                 .dst = p.dst_slots,
                 .count = live,
                 .forced_from = live,
-                .scratch = drip ? scratch : nullptr},
+                .scratch = drip ? scratch : nullptr,
+                .tokens = p.split_model != nullptr ? tokens : nullptr},
             map,
             policy,
             typed);
@@ -453,6 +469,7 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView scratch_dst_1,
       tvm::ffi::TensorView scratch_go_1,
       tvm::ffi::TensorView row_split,
+      tvm::ffi::TensorView split_model,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -510,6 +527,11 @@ struct LeaseProtocolKernel {
         "row_split",
         TensorMatcher({Rows_, Wire::kNodes * (Wire::kLanes + 1)}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
         row_split);
+    expert_stream::verify_named(
+        "split_model", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), split_model);
+    RuntimeCheck(
+        split_model.size(0) == 0 || split_model.size(0) == device::expert_stream::kSplitModelWords,
+        "split_model: empty (off) or ", device::expert_stream::kSplitModelWords, " words");
     RuntimeCheck(row >= 0 && row < Rows_.unwrap(), "row: outside the map bank");
     for (auto [name, t] :
          {std::pair{"lane_kind", lane_kind},
@@ -643,6 +665,7 @@ struct LeaseProtocolKernel {
         .scratch_dst_1 = static_cast<int32_t*>(scratch_dst_1.data_ptr()),
         .scratch_go_1 = static_cast<int32_t*>(scratch_go_1.data_ptr()),
         .row_split = static_cast<const int32_t*>(row_split.data_ptr()),
+        .split_model = split_model.size(0) > 0 ? static_cast<int64_t*>(split_model.data_ptr()) : nullptr,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(

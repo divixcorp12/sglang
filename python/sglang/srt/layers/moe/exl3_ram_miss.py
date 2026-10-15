@@ -20,6 +20,7 @@ The pieces, in file order:
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import threading
@@ -64,7 +65,7 @@ from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.layers.moe.expert_stream import pinned_full_layers
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
-from sglang.srt.layers.moe.ram_slot_map import split_miss_cut
+from sglang.srt.layers.moe.ram_slot_map import split_miss_cut, split_model_words
 
 logger = logging.getLogger(__name__)
 # NVTX ranges around the eager host-use pause's stream sync and thread pause.
@@ -1699,6 +1700,7 @@ class Exl3RamMissService:
                 miss_cut_max=miss_cut_max,
                 lanes=self.lanes,
                 nodes=self.wire.nodes,
+                split_model=self._split_model_words(),
             )
             if device_stamps_enabled():
                 self.device_side.enable_device_stamps()
@@ -2239,6 +2241,26 @@ class Exl3RamMissService:
         except Exception as error:  # noqa: BLE001 - a diagnostic must not change the shutdown's outcome
             logger.warning("exl3 RAM miss: reading the DSpark draft's counters failed: %r", error)
 
+    def _split_model_words(self) -> Optional[list[int]]:
+        """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL's cost words for the device, or None when it is off or there is no CPU
+        split to replace."""
+        if not envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get() or self.cpu_experts is None:
+            return None
+        words = split_model_words(self.wire.nodes, envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get())
+        logger.info("exl3 RAM miss split model on: cost words (ns) %s", words)
+        return words
+
+    def _log_split_model_stats(self) -> None:
+        """The split model's device counters (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL), after the GPU barrier; nothing when
+        it is off. A failure is logged, not raised."""
+        try:
+            stats = self.device_side.split_model_stats()
+        except Exception as error:  # noqa: BLE001 - a diagnostic must not change the shutdown's outcome
+            logger.warning("exl3 RAM miss: reading the split model's counters failed: %r", error)
+            return
+        if stats is not None:
+            logger.info("exl3 RAM miss split model: %s", json.dumps(stats))
+
     def _dump_device_stamps(self) -> None:
         """Write the chain's device stamps beside the job trace, as ``<prefix>.<pid>.device-stamps.jsonl``. A failure is
         logged, not raised: it must not turn an orderly shutdown into a quarantine."""
@@ -2292,6 +2314,7 @@ class Exl3RamMissService:
                     )
                 if uncertain is None and self.device_side is not None:
                     self._dump_device_stamps()
+                    self._log_split_model_stats()
                 self.host.close_admission()
                 if uncertain is None and self._stages_traced:
                     # host.stop() closes its native handle, so freeze the reader between

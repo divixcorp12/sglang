@@ -390,6 +390,9 @@ GPU_DRIP_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-gpudrip"
 GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
 PIN01_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-pin01"
 PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
+PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
+SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
+SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
 FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
 SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
 PROMOTE_PAIR_ARMS = (
@@ -682,7 +685,8 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM) else ""), arm
+            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM)
+                                              else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
     pin, plain, gpu = ab.ARMS[PIN01_ARM][0], ab.ARMS[reference][0], ab.ARMS[PIN01_GPU01_ARM][0]
@@ -704,6 +708,23 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
         fixed = [0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 13, 14, 15, 15, 16, 17, 17, 18, 19, 19,
                  20, 21, 21, 22, 23, 23, 24, 24, 25, 26, 26]
         assert len(split) == len(fixed) and all(a <= b for a, b in zip(split, fixed))  # only lanes to the link
+
+
+def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins_it_off(monkeypatch):
+    """-splitmodel is pin01 with SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL=1 at the default costs, compared with pin01; every
+    other arm states the model off and its costs empty against a shell's. The fixed split stays: the model replaces it
+    on the device only where the copy engine can take hits. Mutant: the arm changes another knob, an arm inherits the
+    shell's flag or costs, or the arm is compared with the wrong one -- red."""
+    ab = _ab()
+    monkeypatch.setenv(SPLIT_MODEL, "1")
+    monkeypatch.setenv(SPLIT_MODEL_COSTS, "copy_lane=9")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[SPLIT_MODEL] == ("1" if arm == PIN01_SPLIT_MODEL_ARM else "0"), arm
+            assert overrides[SPLIT_MODEL_COSTS] == "", arm
+    model, pin = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0], ab.ARMS[PIN01_ARM][0]
+    assert {k: v for k, v in model.items() if k != SPLIT_MODEL} == {k: v for k, v in pin.items() if k != SPLIT_MODEL}
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_ARM] == PIN01_ARM and ab.ARMS[PIN01_SPLIT_MODEL_ARM][1] is True
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

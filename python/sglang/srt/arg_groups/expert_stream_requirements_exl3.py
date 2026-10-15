@@ -323,6 +323,7 @@ def _check_slot_map() -> None:
     ``SGLANG_DSV41_RAM_HIT_COPY`` types how the post copies RAM hits;
     ``SGLANG_DSV41_CPU_EXPERTS_MISSES`` lets the CPU take NVMe misses;
     ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` trim the CPU's split on nodes with forced misses;
+    ``SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL`` (and ``_COSTS``) replaces the split and the cut with the cost model;
     ``SGLANG_DSV41_CPU_TWO_STAGE`` overlaps a CPU miss's gate/up GEMVs with its w2 read.
     """
     hit_copy = envs.SGLANG_DSV41_RAM_HIT_COPY.get()
@@ -346,6 +347,19 @@ def _check_slot_map() -> None:
     if cut.is_set() and cut.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Without CPU experts there is no split to cut: an explicitly set cut is a launch typo (the default is on).
         raise ValueError("SGLANG_DSV41_CPU_SPLIT_MISS_CUT needs SGLANG_DSV41_CPU_EXPERTS=1")
+    if envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get():
+        # The model splits RAM hits between the CPU and the copy engine; it does not price CPU-computed NVMe misses.
+        if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+            raise ValueError("SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL needs SGLANG_DSV41_CPU_EXPERTS=1")
+        if hit_copy != "ce":
+            raise ValueError("SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL needs SGLANG_DSV41_RAM_HIT_COPY=ce")
+        if envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get():
+            raise ValueError("SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL refuses SGLANG_DSV41_CPU_EXPERTS_MISSES=1")
+        from sglang.srt.layers.moe.ram_slot_map import split_model_words
+
+        split_model_words(2, envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get())
+    elif envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get().strip():
+        raise ValueError("SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS needs SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL=1")
     if envs.SGLANG_DSV41_CPU_TWO_STAGE.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Without CPU experts there is no CPU miss to split: a set flag is a launch typo.
         raise ValueError("SGLANG_DSV41_CPU_TWO_STAGE needs SGLANG_DSV41_CPU_EXPERTS=1")
