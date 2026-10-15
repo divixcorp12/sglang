@@ -208,6 +208,26 @@ the server's own reads or an overlapping reader.
   - ~780 MiB: the 257- and 400-token prefills plus copy-engine arming.
   - ~1.5 GB: the 2048, 2049 and 4096 prefills.
   An allocator-history probe (`1c258a85ea`) will attribute it exactly after the A/B.
+- **ON run at 12140 MiB / 956 slots** (`splitmodel-stream-mem-hicache1-mergechunk`, vs arm A):
+  - Result: 66.4 vs 65.9 ms/token, step median 241.1 vs 251.3, tokens per verify 3.46 vs 3.56. No gain detectable on
+    one sample.
+  - Confounded by swapping: 2.05 GiB swapped out in decode (A: ~0). The run started with 26 GiB of buff/cache (A: 16),
+    and node 1's low watermark was boosted (62211 vs 36099 pages; watermark_boost_factor 15000; min_free_kbytes 90112
+    is the THP-recommended value). It ran before the pre-launch eviction step existed.
+  - HiCache pools grew only 0.29 GB with the KV pin (A ran at KV 367,872). Unpinned, this fraction would have given KV
+    460,288.
+- **Headroom correction:** the probes measured total − used. On this card used + free = 32,203 MiB (the driver
+  keeps 404 MiB), and arm_env's 508 MiB margin is nvidia-smi memory.free. On that basis:
+
+  | run | memory.free at the warm-up peak (MiB) |
+  |---|---|
+  | fix off | 318 (already below 508) |
+  | chunked | 1524 |
+  | 948 slots | 226 |
+  | 956 slots | 134, no OOM |
+
+  Re-derived (`918b3560fe`): 923 slots = **11721 MiB**, fraction 0.8150, KV 381,184. That is +70 slots over 10840,
+  not +103. Derived, not yet run; on hold until the 3120 MiB attribution is in.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
