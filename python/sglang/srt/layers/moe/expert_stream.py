@@ -29,7 +29,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from operator import index
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, Mapping, Sequence, Tuple
 
 import torch
 import triton
@@ -49,6 +49,7 @@ from sglang.srt.layers.moe.expert_format import (
     resolve_row_source_kind,
 )
 from sglang.srt.layers.moe.expert_host_tier import (
+    HeldBackSlots,
     PinnedGatherResult,
     PinnedRowFills,
     PinnedSlotLRU,
@@ -232,7 +233,8 @@ class ExpertPinnedHostCache:
         row_fills: PinnedRowFills | None = None,
     ):
         capacity = index(capacity)
-        if not 0 <= capacity <= streamer.num_experts:
+        # Past the expert count only for a table that holds slots back: the extra slots are what it holds.
+        if capacity < 0 or (capacity > streamer.num_experts and not isinstance(slot_table, HeldBackSlots)):
             raise ValueError("pinned host cache capacity must be within expert count")
         self.streamer = streamer
         self.capacity = capacity
@@ -807,12 +809,107 @@ def _placement_report(placement: Placement, caches) -> dict | None:
     }
 
 
+# A slot across a NUMA seam belongs to no group (host_numa.slot_nodes). Each slab's node change rounds to 2 MiB, so a
+# group loses at most one slot at its seam while every big slab's row is over 2 MiB; the second slot is margin.
+_FULL_LAYER_SEAM_SLOTS = 2
+
+
+def pinned_full_layers() -> tuple[int, ...]:
+    """SGLANG_MOE_PINNED_HOST_FULL_LAYERS as sorted layer ids; raises ValueError for a malformed or repeated id."""
+    raw = envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.get()
+    try:
+        ids = [int(value) for value in raw]
+    except ValueError:
+        raise ValueError(f"SGLANG_MOE_PINNED_HOST_FULL_LAYERS lists layer ids, got {','.join(raw)!r}") from None
+    if len(set(ids)) != len(ids) or any(layer_id < 0 for layer_id in ids):
+        raise ValueError(f"SGLANG_MOE_PINNED_HOST_FULL_LAYERS lists distinct nonnegative layer ids, got {ids}")
+    return tuple(sorted(ids))
+
+
+def full_layer_group_rows(num_experts: int, *, groups: int, held_back: int) -> list[int]:
+    """Slots per NUMA group of a tier that maps every expert at once.
+
+    Group g holds the experts homed on it (expert % groups, as the RAM-miss wire homes them), plus the slots its
+    table holds back, plus the seam margin when there are several groups.
+    """
+    seam = _FULL_LAYER_SEAM_SLOTS if groups > 1 else 0
+    return [len(range(g, num_experts, groups)) + held_back + seam for g in range(groups)]
+
+
+def _buy_full_layers(
+    full: Mapping[int, tuple[list[int], int]], *, budget_bytes: int, placement: Placement
+) -> tuple[dict[int, Placement], int, Placement]:
+    """Buy each full layer's group rows out of the budget, group g's rows on the placement's g-th node.
+
+    ``full`` maps a layer id to (rows per group, bytes per row). Returns each full layer's own placement (empty when
+    the tier is unplaced), and the budget and placement left for the other layers. Raises ValueError when the
+    budget, or a node's share of it, cannot buy them.
+    """
+    used = [0] * max(len(placement), 1)
+    placements = {}
+    for layer_id, (rows, row_bytes) in full.items():
+        for group, count in enumerate(rows):
+            used[group] += count * row_bytes
+        placements[layer_id] = tuple((node, count * row_bytes) for (node, _), count in zip(placement, rows))
+    if not placement:
+        if used[0] > budget_bytes:
+            raise ValueError(
+                f"SGLANG_MOE_PINNED_HOST_FULL_LAYERS needs {used[0] >> 20} MiB but SGLANG_MOE_PINNED_HOST_MB is "
+                f"{budget_bytes >> 20} MiB: raise the budget or list fewer layers"
+            )
+        return placements, budget_bytes - used[0], ()
+    short = [
+        f"node {node} needs {used[group] >> 20} MiB of its {nbytes >> 20} MiB"
+        for group, (node, nbytes) in enumerate(placement)
+        if used[group] > nbytes
+    ]
+    if short:
+        raise ValueError(
+            "SGLANG_MOE_PINNED_HOST_FULL_LAYERS does not fit SGLANG_MOE_PINNED_HOST_NUMA_MB: "
+            + "; ".join(short)
+            + ": raise those nodes' MiB or list fewer layers"
+        )
+    rest = tuple((node, nbytes - used[group]) for group, (node, nbytes) in enumerate(placement))
+    return placements, budget_bytes - sum(used), rest
+
+
+def _round_robin_capacities(streamers: Mapping[int, ExpertStreamer], budget_bytes: int) -> dict[int, int]:
+    """Rows per layer: one complete expert row at a time, round-robin in ascending layer id, until the budget or the
+    layer's expert count runs out."""
+    capacities = {layer_id: 0 for layer_id in streamers}
+    remaining = budget_bytes
+    progress = True
+    while progress:
+        progress = False
+        for layer_id in sorted(streamers):
+            streamer = streamers[layer_id]
+            if capacities[layer_id] >= streamer.num_experts:
+                continue
+            if streamer.host_bytes_per_expert > remaining:
+                continue
+            capacities[layer_id] += 1
+            remaining -= streamer.host_bytes_per_expert
+            progress = True
+    return capacities
+
+
+def _tier_options(streamer: ExpertStreamer) -> Mapping:
+    return pinned_tier_options_of(streamer.format, streamer.layer)
+
+
+def _held_back(options: Mapping) -> int:
+    """Slots per NUMA group the layer's slot table holds back (HeldBackSlots); 0 for any other table."""
+    table = options.get("slot_table")
+    return table.held_back_per_group() if isinstance(table, HeldBackSlots) else 0
+
+
 class ExpertPinnedHostCacheManager:
     """Splits one global pinned-host byte budget across a model's streamed layers.
 
-    Capacity is handed out one complete expert row at a time, round-robin over the
-    layers in ascending layer id, so every layer's tier grows evenly until the budget
-    or the layer's expert count runs out.
+    The layers in ``SGLANG_MOE_PINNED_HOST_FULL_LAYERS`` are bought first, each with a slot for every expert per NUMA
+    group plus what its table holds back. The rest of the budget is handed out one complete expert row at a time,
+    round-robin over the other layers in ascending layer id, so every layer's tier grows evenly until the budget or
+    the layer's expert count runs out.
     """
 
     @classmethod
@@ -841,53 +938,61 @@ class ExpertPinnedHostCacheManager:
         if not streamers:
             return None
         placement = pinned_host_placement(budget_bytes)
-        capacities = {layer_id: 0 for layer_id in streamers}
-        remaining = budget_bytes
-        progress = True
-        while progress:
-            progress = False
-            for layer_id in sorted(streamers):
-                streamer = streamers[layer_id]
-                if capacities[layer_id] >= streamer.num_experts:
-                    continue
-                if streamer.host_bytes_per_expert > remaining:
-                    continue
-                capacities[layer_id] += 1
-                remaining -= streamer.host_bytes_per_expert
-                progress = True
+        full = pinned_full_layers()
+        unknown = sorted(set(full) - set(streamers))
+        if unknown:
+            raise ValueError(
+                f"SGLANG_MOE_PINNED_HOST_FULL_LAYERS names layers {unknown}, which are not streamed layers "
+                f"{sorted(streamers)}"
+            )
+        # The format supplies tier options such as an is_pinned filter; the dense
+        # format supplies none. A full layer's are read first: its table says what it holds back.
+        options = {layer_id: _tier_options(streamers[layer_id]) for layer_id in full}
+        full_rows = {
+            layer_id: full_layer_group_rows(
+                streamers[layer_id].num_experts,
+                groups=len(placement) or 1,
+                held_back=_held_back(options[layer_id]),
+            )
+            for layer_id in full
+        }
+        placements, rest_budget, rest_placement = _buy_full_layers(
+            {layer_id: (rows, streamers[layer_id].host_bytes_per_expert) for layer_id, rows in full_rows.items()},
+            budget_bytes=budget_bytes,
+            placement=placement,
+        )
+        capacities = _round_robin_capacities(
+            {layer_id: s for layer_id, s in streamers.items() if layer_id not in full}, rest_budget
+        )
+        capacities.update({layer_id: sum(rows) for layer_id, rows in full_rows.items()})
         if not any(capacities.values()):
             return None
         manager = cls()
-        # The format supplies tier options such as an is_pinned filter; the dense
-        # format supplies none.
-        manager.caches = {
-            layer_id: ExpertPinnedHostCache(
+        manager.caches = {}
+        for layer_id in sorted(capacities):
+            if not capacities[layer_id]:
+                continue
+            layer_placement = placements.get(layer_id, rest_placement)
+            manager.caches[layer_id] = ExpertPinnedHostCache(
                 streamers[layer_id],
-                capacity,
+                capacities[layer_id],
                 # Only when set, so an unplaced tier takes the constructor default.
-                **({"placement": placement} if placement else {}),
-                **pinned_tier_options_of(
-                    streamers[layer_id].format, streamers[layer_id].layer
-                ),
+                **({"placement": layer_placement} if layer_placement else {}),
+                **(options[layer_id] if layer_id in options else _tier_options(streamers[layer_id])),
             )
-            for layer_id, capacity in capacities.items()
-            if capacity
-        }
         manager.streamers = streamers
         manager.requested_bytes = budget_bytes
-        logger.info(
-            "Pinned host expert cache startup %s",
-            json.dumps(
-                {
-                    "requested_bytes": budget_bytes,
-                    "residency_bytes": manager.residency_bytes,
-                    "rows": sum(cache.capacity for cache in manager.caches.values()),
-                    "layers": len(manager.caches),
-                    "numa": _placement_report(placement, manager.caches.values()),
-                },
-                sort_keys=True,
-            ),
-        )
+        report = {
+            "requested_bytes": budget_bytes,
+            "residency_bytes": manager.residency_bytes,
+            "rows": sum(cache.capacity for cache in manager.caches.values()),
+            "layers": len(manager.caches),
+            "numa": _placement_report(placement, manager.caches.values()),
+        }
+        if full:
+            report["full_layers"] = list(full)
+            report["rows_per_layer"] = {str(layer_id): cache.capacity for layer_id, cache in manager.caches.items()}
+        logger.info("Pinned host expert cache startup %s", json.dumps(report, sort_keys=True))
         return manager
 
     @property

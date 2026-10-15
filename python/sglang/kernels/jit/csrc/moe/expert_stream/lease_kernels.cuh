@@ -94,6 +94,9 @@ struct PostParams {
   int64_t* scratch_rows_1;
   int32_t* scratch_dst_1;
   int32_t* scratch_go_1;
+  // SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: [rows, Wire::kNodes * (Wire::kLanes + 1)] (device memory), a row's own
+  // split per node, read in place of the lease's Wire::kSplit tables; -1 at a row's first word: the lease's.
+  const int32_t* row_split;
 };
 
 // Element dtypes of the CPU experts' staged input and routing weights (PostParams).
@@ -171,7 +174,16 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       // Loaded before the tag spin: the host stores split relaxed at any time, ordered by nothing (set_cpu_split in
       // host/ram_tier.h). Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes
       // never indexes it.
-      if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) load_split(p.lease + Wire::kSplit, policy.split);
+      if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) {
+        const int32_t* own = p.row_split + p.row * (Wire::kNodes * (Wire::kLanes + 1));
+        if (own[0] >= 0) {
+          for (int node = 0; node < Wire::kNodes; ++node)
+            for (int n = 0; n <= Wire::kLanes; ++n)
+              policy.split[node][n] = own[node * (Wire::kLanes + 1) + n];
+        } else {
+          load_split(p.lease + Wire::kSplit, policy.split);
+        }
+      }
       const uint8_t* delta = p.lease + Wire::kDeltaBase + p.row * Wire::kDeltaStride;
       const bool pending = await_map_delta(delta, map, deadline);
       MapDelta d;
@@ -440,6 +452,7 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView scratch_rows_1,
       tvm::ffi::TensorView scratch_dst_1,
       tvm::ffi::TensorView scratch_go_1,
+      tvm::ffi::TensorView row_split,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -493,6 +506,10 @@ struct LeaseProtocolKernel {
         "cpu_ok", TensorMatcher({Rows_}).with_dtype<uint8_t>().with_device<kDLCUDA>(device), cpu_ok);
     expert_stream::verify_named(
         "dst_rows", TensorMatcher({Rows_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_rows);
+    expert_stream::verify_named(
+        "row_split",
+        TensorMatcher({Rows_, Wire::kNodes * (Wire::kLanes + 1)}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        row_split);
     RuntimeCheck(row >= 0 && row < Rows_.unwrap(), "row: outside the map bank");
     for (auto [name, t] :
          {std::pair{"lane_kind", lane_kind},
@@ -625,6 +642,7 @@ struct LeaseProtocolKernel {
         .scratch_rows_1 = static_cast<int64_t*>(scratch_rows_1.data_ptr()),
         .scratch_dst_1 = static_cast<int32_t*>(scratch_dst_1.data_ptr()),
         .scratch_go_1 = static_cast<int32_t*>(scratch_go_1.data_ptr()),
+        .row_split = static_cast<const int32_t*>(row_split.data_ptr()),
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(

@@ -40,6 +40,7 @@ def test_defaults_match_the_env_declarations():
         cpu_experts_cores="",
         cpu_experts_threads=0,
         cpu_experts_split="",
+        cpu_experts_split_layers="",
         cpu_experts_cpu_ms=0.52,
         cpu_experts_link_ms=1.0,
         cpu_experts_handoff_ms=0.02,

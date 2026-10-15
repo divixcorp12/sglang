@@ -3452,6 +3452,10 @@ class ExpertStreamDevice:
         self._row_capacity_tensor = torch.tensor(
             self._row_capacities, dtype=torch.int32, device=device
         )
+        # Per row, node-major: its own split (set_row_split), or -1 first: the lease's.
+        self.row_split = torch.full(
+            (layers, self.wire.nodes * (self.wire.lanes + 1)), -1, dtype=torch.int32, device=device
+        )
         # The post's outputs: each lane's kind, source slot (S and CW read them) and home
         # node (CW reads it), and C1's compacted SM hits, in one order.
         self.lane_kind = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
@@ -3594,6 +3598,14 @@ class ExpertStreamDevice:
             raise RuntimeError("drip picks come from the GPU scorer: enable_spec_scorer first")
         self.drip_slots = int(slots)
         self.drip_picks = int(picks)
+
+    def set_row_split(self, row: int, split: Sequence[int]) -> None:
+        """Give the row its own split, ``split[n]`` CPU lanes of ``n`` eligible on every node, in place of the lease's
+        tables (which calibration and the retune write). Before any graph captures a post of the row."""
+        self._check_row(row)
+        if len(split) != self.wire.lanes + 1 or any(not 0 <= k <= n for n, k in enumerate(split)):
+            raise ValueError(f"a row split lists {self.wire.lanes + 1} counts with 0 <= split[n] <= n, got {list(split)}")
+        self.row_split[row] = torch.tensor(list(split) * self.wire.nodes, dtype=torch.int32)
 
     def set_row_cpu(self, row: int) -> None:
         """Record that the row's CPU layer is registered.
@@ -3946,6 +3958,7 @@ class ExpertStreamDevice:
             self.scratch_rows_1,
             self.scratch_dst_1,
             self.scratch_go_1,
+            self.row_split,
             int(self.lease_pdl),
         )
 

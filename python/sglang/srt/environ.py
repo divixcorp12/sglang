@@ -388,6 +388,10 @@ class Envs:
     # in that proportion, and startup refuses a node without the memory. Empty keeps
     # first-touch placement.
     SGLANG_MOE_PINNED_HOST_NUMA_MB = EnvStr("")
+    # Layer ids whose every expert stays in the pinned host tier ("0,1"): each is bought first, per node, with the
+    # slots its tier's reader holds back on top, and filled at start; the rest of the budget is split as without.
+    # Empty: no layer is held whole.
+    SGLANG_MOE_PINNED_HOST_FULL_LAYERS = EnvTuple(tuple())
     SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
     SGLANG_MOE_HOT_GPU_MB = EnvInt(0)
     SGLANG_MOE_HOT_SEED = EnvStr("")
@@ -1991,6 +1995,10 @@ class Envs:
     # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
     # computes k*(n) from the three costs below (policy.split_table).
     SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")
+    # Per-layer tables replacing the group's split on every node of the listed layers: "LAYERS:TABLE;LAYERS:TABLE",
+    # e.g. "0:0,0,0,1,...;1:0,0,1,..." or "0,1:0,0,1,...", each TABLE shaped as SGLANG_DSV41_CPU_EXPERTS_SPLIT.
+    # Calibration and the retune never change them. Empty: every layer uses its group's table.
+    SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS = EnvStr("")
     # ms per expert on the CPU pool, per resident row over the link, and per layer handoff. Defaults are P0's native
     # resid+b128 build at 12 node-1 threads and the measured link (plan 2026-09-29-dsv41-cpu-experts, P0 results).
     SGLANG_DSV41_CPU_EXPERTS_CPU_MS = EnvFloat(0.52)

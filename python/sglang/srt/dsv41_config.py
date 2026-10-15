@@ -49,6 +49,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     cpu_experts_cores: str
     cpu_experts_threads: int
     cpu_experts_split: str
+    cpu_experts_split_layers: str
     cpu_experts_cpu_ms: float
     cpu_experts_link_ms: float
     cpu_experts_handoff_ms: float
@@ -129,6 +130,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             cpu_experts_cores=envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get(),
             cpu_experts_threads=envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.get(),
             cpu_experts_split=envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get(),
+            cpu_experts_split_layers=envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.get(),
             cpu_experts_cpu_ms=envs.SGLANG_DSV41_CPU_EXPERTS_CPU_MS.get(),
             cpu_experts_link_ms=envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(),
             cpu_experts_handoff_ms=envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get(),
