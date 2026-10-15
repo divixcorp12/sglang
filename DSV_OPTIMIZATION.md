@@ -168,6 +168,28 @@ F123 L+2 heads, Track B in `RAM_PREFETCH_PREDICTOR_HANDOFF.md`); (2) score no-le
 choice; report; (3) a learned head only if a clear gap to the +68-hit oracle remains. Gather-time signals already
 tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hits.
 
+**Step (2) result:**
+- **Reframing:** a prediction of v+1 made from the draft's state after verify v arrives too late to choose v's lanes,
+  and it is redundant at v+1 (the hazard check already keeps routed residents). The useful predictor runs at verify
+  v's own gather: which of v's misses and residents recur at v+1. Draft-state heads could only drive a pull (a
+  next-verify drip).
+- **Data:** no capture pairs draft hidden states with next-verify routes. Aligned and sufficient for a gather-time
+  head: C2 `router.{ids,w,x}.bin` (818 forwards x 40 layers x 6 tokens, top-6 ids, gate weights, 5120-d gate inputs,
+  2.0 GB) and the B0 corpus `/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012` (6,412 verify forwards, 16 GB). No new
+  capture needed.
+- **Baselines (C2 held-out, k = ~112 GPU lanes/verify):**
+  - "Recurs next verify" precision / recall among the k first-ranked misses: actual 0.396 / 0.266; today's score
+    0.444 / 0.299; feature table (token count, earliest position, acceptance odds from draft top_prob, prior score,
+    gate weight) 0.501 / 0.337; oracle 0.817 / 0.549.
+  - Replay hits/verify: score-k 385.9, table-k 390.3 (+4.4), next1-k oracle 431.6 (+45.7, ~4.5 ms/token), belady-k
+    460.5.
+  - Position and acceptance odds carry the table (position-0 misses recur 6-15%, later positions 25-48%).
+  - Baselines close ~10% of the gap. The missing signal is expert identity in context, which only the gate inputs
+    carry.
+- **Step (3) approved and running:** a per-layer head P(miss recurs at v+1 | PCA64 of the routing tokens' gate
+  inputs, position / odds features, per-(layer, expert) bias). Trained CPU-only on B0, held-out C2. Estimated serving
+  cost ~2.5 MFLOP per layer, similar to the spec_score kernels. No integration until the precision is in.
+
 ### 3.9 Graded miss cut — branch `misscut-replay` (`5014aaff0a`, `23c09c180c`, `f2e2e0c80b`, `760736c33b`, `7d105fabfe`), NOT merged
 
 The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
