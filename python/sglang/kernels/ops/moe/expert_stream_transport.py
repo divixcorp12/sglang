@@ -1656,11 +1656,12 @@ def kernel_forward(
     threads: int,
     cores: Sequence[int] = (),
     accumulate: bool = False,
+    store_first: bool = False,
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> tuple[int, str]:
     """One forward of :func:`kernel_layer`'s ``layer`` over ``rows`` token rows (x ``[rows, H]``, slots and weights
-    ``[rows, k]``).
+    ``[rows, k]``). ``store_first`` is ForwardCall::store_first: an overwrite stores each token's first sum.
 
     Returns (0, "") or the kernel's refusal: (2, why) for a bad call, (1, why) for a failure; ``out`` is untouched
     then. Pins the calling thread to ``cores[0]``. Both builds.
@@ -1676,6 +1677,7 @@ def kernel_forward(
             int(threads),
             torch.tensor(list(cores), dtype=torch.int64),
             int(bool(accumulate)),
+            int(bool(store_first)),
         )
     )
     # The message is this thread's (a thread-local in the module), read on the same thread.
@@ -2519,6 +2521,7 @@ class ExpertStreamHost:
         keep_warm_us: int = 0,
         two_stage: bool = False,
         two_stage_weights=None,
+        store_out: bool = False,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
@@ -2538,7 +2541,9 @@ class ExpertStreamHost:
         (``SGLANG_DSV41_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
         its job once w13 has landed: the gate/up GEMVs run while w2 is still being read.
         ``two_stage_weights`` (w13's, w2's, each one weight per mirror root or None for the
-        mirror's shares) divides those two spans over the roots.
+        mirror's shares) divides those two spans over the roots. ``store_out``
+        (``SGLANG_DSV41_CPU_EXPERTS_STORE_OUT``) leaves a job's overwrite of its token rows to
+        the kernel, which stores each token's first sum, instead of zeroing the rows first.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -2582,6 +2587,7 @@ class ExpertStreamHost:
             int(threads),
             int(keep_warm_us * 1e3),
             int(bool(two_stage)),
+            int(bool(store_out)),
             *(
                 torch.tensor(list(w) if w is not None else [], dtype=torch.float64)
                 for w in (two_stage_weights or (None, None))

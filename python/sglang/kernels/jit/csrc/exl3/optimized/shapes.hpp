@@ -17,6 +17,7 @@ struct Chunk
     int m;
     int token[MAX_M];
     float weight[MAX_M];
+    unsigned first = 0;  // bit r: row r is token[r]'s first write of the call (ForwardCtx::store_first)
 };
 
 struct GenericShape

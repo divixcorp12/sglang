@@ -1412,9 +1412,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // cores int64 [n] (empty: unpinned). The shapes are checked against the layer, so a short x or out is refused here
   // rather than read or written past its end. Returns 0, 2 for std::invalid_argument, 1 for any other exception, its
   // message in kernel_error().
+  // `store_first`: ForwardCall::store_first.
   static int64_t kernel_forward(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
-                                int64_t threads, TensorView cores, int64_t accumulate) {
-    return forward_layer(id, x, slots, weights, out, threads, cores, accumulate, nullptr, nullptr);
+                                int64_t threads, TensorView cores, int64_t accumulate, int64_t store_first) {
+    return forward_layer(id, x, slots, weights, out, threads, cores, accumulate, nullptr, nullptr, store_first != 0);
   }
 
   // Test only: kernel_forward as a two-stage CPU miss runs it, ForwardCall::stage_two set. A helper thread sleeps
@@ -1471,7 +1472,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // kernel_forward's forward, with ForwardCall::stage_two set to `stage_two(ctx)` (null: one stage).
   static int64_t forward_layer(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
                                int64_t threads, TensorView cores, int64_t accumulate, void (*stage_two)(void*),
-                               void* ctx) {
+                               void* ctx, bool store_first = false) {
     KernelLayer entry;
     {
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
@@ -1509,6 +1510,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     call.cores = on;
     call.stage_two = stage_two;
     call.stage_two_ctx = ctx;
+    call.store_first = store_first;
     kernel_error_text().clear();
     try {
       layer.kernel->check(layer, call);

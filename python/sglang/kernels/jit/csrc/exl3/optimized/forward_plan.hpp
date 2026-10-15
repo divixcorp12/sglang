@@ -198,6 +198,11 @@ struct ForwardCtx
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
+    // Overwrite by store (ForwardCall::store_first): no zeroing up front; Accumulate stores each token's first sum
+    // (Chunk::first) and zeroes the `unrouted` tokens' rows, each worker its own columns.
+    bool store_first;
+    const int* unrouted;
+    int n_unrouted;
     void (*stage_two)(void*);  // ForwardCall::stage_two: worker 0 calls it between GateUp and Middle (null: never)
     void* stage_two_ctx;
     std::vector<Chunk> chunks;
@@ -384,6 +389,8 @@ struct ForwardArena
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
     std::vector<int> down_tiles_done;
     std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
+    std::vector<uint8_t> written;                      // store_first: per token, whether a chunk row writes it
+    std::vector<int> unrouted;                         // store_first: the tokens no chunk row writes
     // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
     std::vector<Chunk> chunks;
 
@@ -517,7 +524,7 @@ private:
         [[maybe_unused]] double phase_us[6]{};
         team.run([&](int worker, int n) {
             trace.worker_start(worker);
-            if (ctx.zero_out && worker == 0)
+            if (ctx.zero_out && !ctx.store_first && worker == 0)
                 std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
@@ -652,10 +659,23 @@ private:
                     float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
                     const float* src = d + static_cast<size_t>(r) * H;
                     const float w = ch.weight[r];
-                    for (int col = c0; col < c1; ++col)
-                        dst[col] += w * src[col];
+                    if (c.store_first && (ch.first >> r & 1u)) {
+                        // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler
+                        // cannot see keeps the add (and its contraction) under -Ofast, so the bits match.
+                        float zero = 0.0f;
+                        asm("" : "+x"(zero));
+                        for (int col = c0; col < c1; ++col)
+                            dst[col] = w * src[col] + zero;
+                    } else {
+                        for (int col = c0; col < c1; ++col)
+                            dst[col] += w * src[col];
+                    }
                 }
             }
+            if (c.store_first)
+                for (int i = 0; i < c.n_unrouted; ++i)
+                    std::fill(c.out + static_cast<size_t>(c.unrouted[i]) * H + c0,
+                              c.out + static_cast<size_t>(c.unrouted[i]) * H + c1, 0.0f);
         }
     }
 };
@@ -726,6 +746,25 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
             ch.weight[ch.m] = half_to_float(at::Half(c.weights[routes[i].second]));
         }
         ctx.chunks.push_back(ch);
+    }
+    // A token's first write is the first of its rows in Accumulate's order (chunk, then row); the rest add to it.
+    ctx.store_first = ctx.zero_out && c.store_first;
+    ctx.unrouted = nullptr;
+    ctx.n_unrouted = 0;
+    if (ctx.store_first) {
+        auto& written = ar.written;
+        written.assign(static_cast<size_t>(c.rows), 0);
+        for (Chunk& ch : ctx.chunks)
+            for (int r = 0; r < ch.m; ++r)
+                if (!written[ch.token[r]]) {
+                    written[ch.token[r]] = 1;
+                    ch.first |= 1u << r;
+                }
+        ar.unrouted.clear();
+        for (int t = 0; t < c.rows; ++t)
+            if (!written[t]) ar.unrouted.push_back(t);
+        ctx.unrouted = ar.unrouted.data();
+        ctx.n_unrouted = static_cast<int>(ar.unrouted.size());
     }
     if (ctx.chunks.empty()) {
         if (ctx.stage_two) ctx.stage_two(ctx.stage_two_ctx);

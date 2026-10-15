@@ -473,7 +473,8 @@ struct HostExports {
   // its team in register work for `keep_warm_ns` after each job and in PAUSE after that, until the next submit.
   // `two_stage` (SGLANG_DSV41_CPU_TWO_STAGE) sends each CPU miss once its first stage landed (CpuJob::staged), its
   // row's w13 and w2 divided over the mirror roots by `w13_weights` and `w2_weights` (float64 [roots], or [0]: the
-  // mirror's shares).
+  // mirror's shares). `store_out` (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT) leaves a job's overwrite to the kernel
+  // (ForwardCall::store_first) instead of zeroing the job's token rows first.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,
@@ -488,6 +489,7 @@ struct HostExports {
       int64_t threads,
       int64_t keep_warm_ns,
       int64_t two_stage,
+      int64_t store_out,
       TensorView w13_weights,
       TensorView w2_weights) {
     using namespace host;
@@ -534,6 +536,7 @@ struct HostExports {
     if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
     config.keep_warm_ns = keep_warm_ns;
     config.two_stage = two_stage != 0;
+    config.store_out = store_out != 0;
     for (int span = 0; span < 2; ++span) {
       const TensorView& w = span == 0 ? w13_weights : w2_weights;
       expert_stream::verify_named(
