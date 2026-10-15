@@ -393,6 +393,7 @@ PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
 PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
 PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
 PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
+PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -410,6 +411,7 @@ PROMOTE_PAIR_ARMS = (
     PIN01_SPLIT_MODEL_ARM,
     PIN01_MEM_ARM,
     PIN01_SPLIT_MODEL_MEM_ARM,
+    *PIN01_HICACHE_ARMS,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -692,7 +694,8 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
-                                                               PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM)
+                                                               PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                               *PIN01_HICACHE_ARMS)
                                               else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
@@ -727,7 +730,8 @@ def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins
     monkeypatch.setenv(SPLIT_MODEL_COSTS, "copy_lane=9")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[SPLIT_MODEL] == ("1" if arm in (PIN01_SPLIT_MODEL_ARM, PIN01_SPLIT_MODEL_MEM_ARM)
+            assert overrides[SPLIT_MODEL] == ("1" if arm in (PIN01_SPLIT_MODEL_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                             *PIN01_HICACHE_ARMS)
                                               else "0"), arm
             assert overrides[SPLIT_MODEL_COSTS] == "", arm
     model, pin = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0], ab.ARMS[PIN01_ARM][0]
@@ -743,9 +747,10 @@ def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
     ab = _ab()
     monkeypatch.setenv(MLOCK, "1")
     for arm in ab.ARMS:
+        mem = "-mem-" in arm + "-"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[MLOCK] == ("1" if arm.endswith("-mem") else "0"), arm
-        assert ab.server_flags(arm) == (("--weight-loader-drop-cache-after-load",) if arm.endswith("-mem") else ())
+            assert overrides[MLOCK] == ("1" if mem else "0"), arm
+        assert ab.server_flags(arm) == (("--weight-loader-drop-cache-after-load",) if mem else ())
     for base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
         mem, plain = ab.ARMS[base + "-mem"][0], ab.ARMS[base][0]
         assert {k: v for k, v in mem.items() if k != MLOCK} == {k: v for k, v in plain.items() if k != MLOCK}
@@ -757,6 +762,26 @@ def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
     monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, cwd: seen.update(env) or type("R", (), {"returncode": 0}))
     ab.run_timed(PIN01_MEM_ARM, "/out")
     assert seen["DSV41_EXTRA_SERVER_ARGS"].endswith("--weight-loader-drop-cache-after-load")
+
+
+def test_the_hicache_and_engram_arms_add_their_knob_alone(monkeypatch):
+    """-hicache1 is the ON -mem arm with the HiCache host pools on node 1, -engram0 that with the native Engram cache
+    at 0; every other arm states the Engram cache at its default 5 against a shell's, and no other arm names the node.
+    Both keep the -mem server flag. Mutant: an arm changes another knob or loses the cache drop -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB", "0")
+    hicache, engram0 = PIN01_SPLIT_MODEL_MEM_ARM + "-hicache1", PIN01_SPLIT_MODEL_MEM_ARM + "-hicache1-engram0"
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        assert overrides["SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"] == ("0" if arm == engram0 else "5"), arm
+        assert ("SGLANG_HICACHE_HOST_NUMA_NODE" in ab.ARMS[arm][0]) == (arm in (hicache, engram0)), arm
+    base, h, e = (ab.ARMS[a][0] for a in (PIN01_SPLIT_MODEL_MEM_ARM, hicache, engram0))
+    assert {k: v for k, v in h.items() if k != "SGLANG_HICACHE_HOST_NUMA_NODE"} == base
+    assert h["SGLANG_HICACHE_HOST_NUMA_NODE"] == "1"
+    assert {k: v for k, v in e.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"} == \
+        {k: v for k, v in h.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"}
+    assert ab.server_flags(hicache) == ab.server_flags(engram0) == ("--weight-loader-drop-cache-after-load",)
+    assert ab.REFERENCE[hicache] == PIN01_SPLIT_MODEL_MEM_ARM and ab.REFERENCE[engram0] == hicache
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

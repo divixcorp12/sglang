@@ -334,6 +334,16 @@ MEM_SUFFIX = "-mem"
 MEM_SERVER_FLAGS = ("--weight-loader-drop-cache-after-load",)
 for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
     ARMS[_base + MEM_SUFFIX] = ({**ARMS[_base][0], MLOCK: "1"}, True)
+# Node-0 headroom, step 2: the HiCache host KV pools (12.1 GB, node 0 by first touch) bound to node 1, then also the
+# native Engram row cache off (5 GiB). The node is an EnvInt with no valid "unset" value, so only these arms name it.
+HICACHE_NODE = "SGLANG_HICACHE_HOST_NUMA_NODE"
+ENGRAM_NATIVE_GIB = "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[ENGRAM_NATIVE_GIB] = "5"
+PIN01_SPLIT_MODEL_HICACHE1_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-hicache1"
+ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0], HICACHE_NODE: "1"}, True)
+PIN01_SPLIT_MODEL_ENGRAM0_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-engram0"
+ARMS[PIN01_SPLIT_MODEL_ENGRAM0_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], ENGRAM_NATIVE_GIB: "0"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -382,12 +392,17 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_ARM: PIN01_ARM,
     PIN01_ARM + MEM_SUFFIX: PIN01_ARM,
     PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
+    PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
+    PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
 }
 
 
 def server_flags(arm: str) -> tuple[str, ...]:
-    """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop."""
-    return MEM_SERVER_FLAGS if arm.endswith(MEM_SUFFIX) else ()
+    """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop, for
+    the -mem arms and those built on them."""
+    return MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ()
+
+
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
