@@ -101,6 +101,24 @@ sweep", "Served share-64 A/B"). Scripts, all in `analysis/dsv41-drive/dspark/`:
   - **used +19% to +29%: FAIL.** The excess is entirely forced-CPU takes of landed rows: 2,022 modelled against
     1,390 in the capture. GPU pool serves and takes of still-reading rows match.
 - **Not run:** no arm comparison yet. Reported to team-lead with the options.
+- **Rule 6 fixed in T** (`b923247e4a`). It now promotes at the target row's delta claim: serving row R promotes
+  R + 1's landed rows (publish_due -> promote_landed). Stage 0 still passes: T -9.5% / -9.1%, delta -8.8%;
+  `stage0-rule6.json`.
+  - Modelled at every serve, the claim over-promotes by 10-17% and under-counts uses (-21 to -23%). The code skips
+    the claim when there is no delta, or while a read is still in flight.
+- **Option (a)** (`df64cbf056`): promotions from the capture's own `delta_publish` claims, plus the code's drop path
+  (reclaim the oldest landed entry, else drop the read).
+  - used: -3% / -1% / +1%. Within the gate.
+  - pool-served: -16% / -13% / -14%. **Fails.**
+  - promoted: -12% to -14%.
+  - The likely cause is T's cold under-prediction, which pool serves and promotions both inherit.
+- **Outcome: (c).** The prefetch arm comparison is not resolvable offline at this fidelity.
+- **No out-of-sample capture exists.** The native-L+2 runs (`l2-ab-20261012`, `l2-t3-quick-20261013`) kept no job
+  trace or route log, and ab-64 has no router capture. Older-code reference only: native/T3 spec_used per landed read
+  0.349 / 0.472.
+- **To make it resolvable:**
+  - a T fix for the cold under-prediction;
+  - captures with traces of a native-L+2 arm and a prefetch-off arm on the current recipe.
 
 ### Next (team-lead's plan)
 
