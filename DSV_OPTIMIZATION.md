@@ -256,6 +256,41 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
       - only if needed, a read-only GPU clock/PCIe sampler riding along on runs already queued.
 
       Goal: make one pair resolve ~2 ms/token.
+    - **Interim result: the variance is the estimator plus SPCC read stalls. Clocks and PCIe are not involved.**
+      Outputs: `ram-prefetch/stream-variance-20261015/`.
+      - "Stream" is the NVMe read latency of GPU-miss rows. Per layer, stream / svc read time has a median of
+        0.99-1.03. Clocks, PCIe, pinned-pool NUMA/THP and launch jitter don't show up in it.
+      - **Estimator flaw:** step_budget/ab_compare skip 8 verifies, which leaves 8-14 warm-up/health verifies of
+        75-125 ms each. A median over 8 prompts also has a CI of about ±7-8 ms/verify.
+        - Serving-only stream means: A 47.2, A' 48.0, A'' 48.8. A' to A'' is +0.8, not +5.3 ms/verify.
+        - ab_compare's ms/token numerator includes warm-up steps, but its denominator counts only serving tokens.
+      - **SPCC stalls:** nvme3n1 = `/mnt/nvme4`, DRAM-less/HMB, 89% full.
+        - Episodes last 20-60 s. Read await goes from ~7 ms to 25-61 ms, and throughput falls to 0.5-0.6 GB/s.
+        - The Samsungs are capped at the same rate, because every row waits for its SPCC third.
+        - Seen in A'', C, D and -refine; not in A', mergechunk or mergechunk-r2.
+        - Shutdown root-1 `demand_busy` flags them: 99-127 s against 87.7-88.5 s clean.
+        - A stall in serving decode makes that prompt's ms/stream-layer 1.5-3x (D prompt 1: 515 vs 233 ms/verify).
+      - **"Identical" pairs re-scored**, dropping prompts with ms/stream-layer above 1.3x the run median:
+
+        | pair | all prompts | stalled prompts dropped |
+        |---|---|---|
+        | base vs base-r2 | +6.5 | -0.2 |
+        | A' vs D | +11.9 | -0.5 |
+        | drip3 vs drip4 | +11.6 | +0.1 |
+        | pin01 vs pin01-r2 | -5.4 | +2.7 |
+        | A' vs A'' | +2.2 | +2.2 |
+
+        - With stalls removed, identical pairs differ by SD ≈1.6 ms/token, max 2.8.
+        - **The tiebreak (D) and drip4 losses were stall artifacts.**
+        - The residual (±0.4 layers/verify from text and residency) is about ±2 ms/verify.
+      - `-refine` vs A': ms/token +0.1. Stream is 7 ms/verify lower (fewer stream layers, 4.0 ms/layer), offset by
+        wait.
+      - **Root needed (owner):** `sudo nvme smart-log /dev/nvme3` before and after a run that stalls.
+        - If the thermal counters rise, the drive is throttling.
+        - If not, it is GC/SLC on a full DRAM-less drive, and the lever is fstrim or freeing space.
+        - The only writer to that drive is Ray's `/mnt/nvme4/ray_tmp`, at about 2 writes/s.
+      - Next: a stall-aware compare tool, used to re-score the recent pairs, and the cost and frequency of stalls in
+        decode (whether this also hurts production).
   - Resolved: the ~7 GiB read from sdb3 at launch is the DSpark draft, read cold each launch because it is evicted
     and dropped (~20 s at ~470 MB/s). The target load is warm.
 - **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
