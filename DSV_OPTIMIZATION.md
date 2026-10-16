@@ -804,7 +804,24 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - **prefill-merge replaced by `prefill-merge-2`** (owner request, context nearly full). Handoff:
         `PREFILL_MERGE_HANDOFF.md` on `prefill-merge-chunk` (`594d8aaf8b`).
         - calib3 is in flight (pid 1948706, outputs in `/mnt/nvme1/prefill-merge/calib3/`).
-        - The new agent's first job is the calib3 report. The combined
+        - The new agent's first job is the calib3 report.
+      - **calib3 crashed at startup** (2026-10-16 00:33:58):
+        - The GPU tests had passed (66 passed).
+        - The crash was `cuMemCreate(local): CUDA_ERROR_OUT_OF_MEMORY` in the grow path (`set_backed_rows`).
+        - The KV pin held at 381,184.
+        - **Cause:** grow was sized from free memory measured *before* the capture-estimate verify run (1,482 MiB),
+          and that run then took about 400 MiB more (1,482 -> 1,082).
+        - It planned +83 slots (1,054 MiB) and mapped 35 layers before running out.
+        - The calibration summary was logged only after grow, so the crash swallowed it.
+        - The agent's monitor missed the crash: `cut` block-buffered the ssh pipe.
+        - **Fixes approved:**
+          1. Size from free memory measured last: after all runs, synchronize and `empty_cache`, then price slots
+             by granule-rounded bytes.
+          2. Grow per layer with a free-memory guard; on a short check or an OOM, unmap the partial layer, keep the
+             rest and log the shortfall. Never crash. Fault-injection tests come first.
+          3. Log the summary before `set_hot_capacity`.
+          4. The capture estimate counts reserve growth and the free-memory drop, not just the allocated peak.
+        - Next: calib4, the same combined smoke. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
