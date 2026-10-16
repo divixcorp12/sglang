@@ -98,8 +98,35 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
 - Owner requirement: "All the offsets and values should be calculated at server startup via a calibration routine."
 - Extends `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION`: CPU grid {1,2,4} experts x {1,2,6} tokens fitting a/b/c per
   team; copy lane per node; stream coupling with 1/2/4 copy lanes; NVMe landing; live refinement (retune), clamps,
-  logging, fallback to the table. Status: validation (short server start logging constants, no A/B); offline fits
-  sent for comparison. **Pending report.**
+  logging, fallback to the table. Commits `7171570959`, `fe0daed0c4`. **Done and validated on the real model; no
+  A/B yet.**
+- Runs at copy-engine arming in the paused calibration window (+1.09 s, inside the first request).
+  - **CPU:** per-team hit jobs {1,2,4} experts x {1,2,6} tokens and miss jobs, least-squares a/b/c.
+  - **Copy lane:** DMA through a private backend.
+  - **Landing:** O_DIRECT reads through the node's reader.
+  - **Stream coupling:** a new `calibration_pull` kernel started behind 0/1/2/4 copy lanes.
+- **Guardrails:** each constant is clamped to `RANGES_MS`. A non-finite or far-out value fails the calibration, and
+  the model then stays off (device sentinel copy_lane < 0, so the table types the lanes). It never falls back to
+  constants. `SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS` overrides named costs.
+- **Live refinement:** `SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES` (0 = off) refits the CPU costs from seqlocked
+  per-job moments, moving 25% of the way each time. Untested on a live server.
+- **Calibrated vs offline (ms):**
+
+  | constant | calibrated | offline |
+  |---|---|---|
+  | hit team0 a/b/c | 0.182 / 0.163 / 0.246 | 0.016 / 0.154 / 0.395 |
+  | hit team1 a/b/c | -0.124 / 0.278 / 0.267 | -0.050 / 0.179 / 0.390 |
+  | miss team0 a/c | 0.215 / 0.238 | 0.331 / 0.193 |
+  | miss team1 a/c | 0.229 / 0.224 | 0.291 / 0.245 |
+  | copy_lane | 0.968 | 1.05 |
+  | landing | 0.264 + 1.574·i | 0.8 + 1.6·i |
+  | stream | 0.135 + 0.906/lane | 0 + 0.65/lane |
+
+  Totals agree at the served shape. first_byte is biased ~0.5 ms low, because the startup read misses the RAM
+  thread's pickup.
+- Tests: 111 + 80 CPU passed, 13 GPU passed.
+- Next: an A/B with calibration + refinement against the fixed-cost split model; and the mirror-weight startup
+  probe (`SGLANG_DSV41_ENABLE_MIRROR_WEIGHT_CALIBRATION`, approved), from read-amp's nvme3 finding.
 
 ### 3.4 Node-0 memory pressure — branch `split-model`
 
