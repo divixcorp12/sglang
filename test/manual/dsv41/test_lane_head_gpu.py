@@ -178,6 +178,7 @@ def test_a_captured_launch_replays_with_new_inputs(tmp_path):
         routed = {int(e) for e in ids[~dead.view(-1)].reshape(-1).tolist()}
         assert _compare(dev.keys[1], keys_ref, p_ref, routed) <= 1e-3
     assert int(dev.verify_ct[1]) == 6 and int(dev.verify_ct[0]) == 0
+    assert dev.gather_ct.tolist() == [0, 7]  # the warm-up and six replays; reset does not clear it
 
 
 @pytest.mark.skipif(not (cpu.C2_DATA / "c2").is_dir() or not cpu.C2_HEAD.is_dir(), reason="the C2 head data is on divix01")

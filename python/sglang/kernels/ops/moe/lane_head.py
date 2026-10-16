@@ -53,13 +53,14 @@ def lane_head_keys(
     score: torch.Tensor,
     last: torch.Tensor,
     verify_ct: torch.Tensor,
+    gather_ct: torch.Tensor,
     z_partial: torch.Tensor,
     decay_pow: torch.Tensor,
     keys: torch.Tensor,
     odds: float,
 ) -> None:
     """Write ``keys[e]`` for every expert the live rows of ``topk_ids`` route, then advance ``score``, ``last`` and
-    ``verify_ct``, on the current stream. ``dead`` (bool, a row per token, or None) marks a verify's dead rows;
+    ``verify_ct`` and count the gather in ``gather_ct``, on the current stream. ``dead`` (bool, a row per token, or None) marks a verify's dead rows;
     ``expert_to_slot`` (int64 [experts], -1 nonresident) gives the resident feature; ``odds`` is the draft-odds
     feature's training value (lane_head.LaneHeadMeta.odds). Tensor invariants are checked in the C++ launcher."""
     module = _jit_lane_head_module(topk_ids.dtype, topk_weights.dtype, pca_proj.dtype)
@@ -82,6 +83,7 @@ def lane_head_keys(
         score,
         last,
         verify_ct,
+        gather_ct,
         z_partial,
         decay_pow,
         keys,

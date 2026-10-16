@@ -145,7 +145,7 @@ def lane_head_device_bytes(meta: LaneHeadMeta) -> int:
     ) + proj_bytes * layers * hidden * rank
     state = (
         layers * experts * (8 + 4 + 4)  # keys, score, last
-        + layers * 4  # verify_ct
+        + layers * (4 + 8)  # verify_ct, gather_ct
         + PCA_SPLITS * MAX_TOKENS * rank * 4  # z partials
         + (MAX_TOKENS + 1) * 4  # decay powers
     )
@@ -391,6 +391,8 @@ class LaneHead:
         self.score = torch.zeros((layers, experts), dtype=torch.float32, device=self.device)
         self.last = torch.full((layers, experts), -1, dtype=torch.int32, device=self.device)
         self.verify_ct = torch.zeros(layers, dtype=torch.int32, device=self.device)
+        # Gathers that wrote keys, per layer, over the launch (never reset): the metrics trace's proof the head ran.
+        self.gather_ct = torch.zeros(layers, dtype=torch.int64, device=self.device)
         # One scratch for every layer: the gathers run in order on one stream.
         self.z_partial = torch.zeros((PCA_SPLITS, MAX_TOKENS, rank), dtype=torch.float32, device=self.device)
         self.decay_pow = torch.tensor(
@@ -444,6 +446,7 @@ class LaneHead:
             self.score[row],
             self.last[row],
             self.verify_ct[row : row + 1],
+            self.gather_ct[row : row + 1],
             self.z_partial,
             self.decay_pow,
             self.keys[row],

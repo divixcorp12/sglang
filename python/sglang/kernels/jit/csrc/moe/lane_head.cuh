@@ -107,6 +107,7 @@ __global__ __launch_bounds__(kLaneHeadKeyThreads) void lane_head_keys_kernel(
     fp32_t* __restrict__ score,
     int32_t* __restrict__ last,
     int32_t* __restrict__ verify_ct,
+    int64_t* __restrict__ gather_ct,
     const fp32_t* __restrict__ decay_pow,
     int64_t* __restrict__ keys,
     int32_t tokens,
@@ -196,7 +197,10 @@ __global__ __launch_bounds__(kLaneHeadKeyThreads) void lane_head_keys_kernel(
     score[tid] = score[tid] * decay_pow[live_count] + static_cast<fp32_t>(c);
     if (c > 0) last[tid] = t;
   }
-  if (tid == 0) verify_ct[0] = t + 1;
+  if (tid == 0) {
+    verify_ct[0] = t + 1;
+    gather_ct[0] += 1;
+  }
 }
 
 /**
@@ -226,6 +230,7 @@ void lane_head_keys(
     tvm::ffi::TensorView score,
     tvm::ffi::TensorView last,
     tvm::ffi::TensorView verify_ct,
+    tvm::ffi::TensorView gather_ct,
     tvm::ffi::TensorView z_partial,
     tvm::ffi::TensorView decay_pow,
     tvm::ffi::TensorView keys,
@@ -248,6 +253,7 @@ void lane_head_keys(
   TensorMatcher({experts}).with_dtype<int64_t>().with_device(dev).verify(expert_to_slot).verify(keys);
   TensorMatcher({experts}).with_dtype<int32_t>().with_device(dev).verify(last);
   TensorMatcher({1}).with_dtype<int32_t>().with_device(dev).verify(verify_ct);
+  TensorMatcher({1}).with_dtype<int64_t>().with_device(dev).verify(gather_ct);
   TensorMatcher({splits, max_tokens, rank}).with_dtype<fp32_t>().with_device(dev).verify(z_partial);
   TensorMatcher({decay_len}).with_dtype<fp32_t>().with_device(dev).verify(decay_pow);
   const int64_t n_tokens = tokens.unwrap(), k = top_k.unwrap(), h = hidden.unwrap(), r = rank.unwrap();
@@ -303,6 +309,7 @@ void lane_head_keys(
       static_cast<fp32_t*>(score.data_ptr()),
       static_cast<int32_t*>(last.data_ptr()),
       static_cast<int32_t*>(verify_ct.data_ptr()),
+      static_cast<int64_t*>(gather_ct.data_ptr()),
       static_cast<const fp32_t*>(decay_pow.data_ptr()),
       static_cast<int64_t*>(keys.data_ptr()),
       static_cast<int32_t>(n_tokens),

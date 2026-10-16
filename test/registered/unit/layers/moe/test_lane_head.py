@@ -247,7 +247,7 @@ def test_device_bytes_are_what_the_device_head_allocates(nvh, tmp_path):
         allocated = sum(t.numel() * t.element_size() for t in device_head.weights.values()) + sum(
             t.numel() * t.element_size()
             for t in (device_head.keys, device_head.score, device_head.last, device_head.verify_ct,
-                      device_head.z_partial, device_head.decay_pow)
+                      device_head.gather_ct, device_head.z_partial, device_head.decay_pow)
         )
         assert lh.lane_head_device_bytes(lh.read_lane_head_meta(str(tmp_path / f"lane-{dtype}.safetensors"))) == allocated
         assert device_head.device_bytes == allocated

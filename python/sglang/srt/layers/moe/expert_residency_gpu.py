@@ -610,6 +610,8 @@ class GpuResidencyUpdater:
         }
         for name, counter in self.insertion_counters().items():
             snapshot[name] = counter.cpu().tolist()
+        if self.lane_head is not None:
+            snapshot["lane_head_gathers"] = self.lane_head.gather_ct.cpu().tolist()
         return snapshot
 
     def insertion_counters(self) -> dict[str, torch.Tensor]:
