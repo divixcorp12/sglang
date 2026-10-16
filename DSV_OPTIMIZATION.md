@@ -801,8 +801,10 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
         - 150 CPU tests passed.
         - **calib3:** GPU tests, then the expseg smoke with calibration (grow), A1 (indexer 32), A2+A3 and the
           logger. Started 2026-10-16.
-      - **prefill-merge is being replaced by a fresh agent** (owner request, context nearly full). Its handoff goes
-        to `PREFILL_MERGE_HANDOFF.md` on its branch. The combined
+      - **prefill-merge replaced by `prefill-merge-2`** (owner request, context nearly full). Handoff:
+        `PREFILL_MERGE_HANDOFF.md` on `prefill-merge-chunk` (`594d8aaf8b`).
+        - calib3 is in flight (pid 1948706, outputs in `/mnt/nvme1/prefill-merge/calib3/`).
+        - The new agent's first job is the calib3 report. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
