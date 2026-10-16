@@ -186,7 +186,7 @@ class TestInclusiveHotSlotLimit(unittest.TestCase):
 class _FakeHotCache:
     """Stands in for ExpertHotCache, which needs CUDA, in the manager's selection."""
 
-    def __init__(self, streamer, capacity, scratch_rows=0):
+    def __init__(self, streamer, capacity, scratch_rows=0, upper_capacity=None):
         self.streamer = streamer
         self.capacity = capacity
         self.device = torch.device("cpu")
