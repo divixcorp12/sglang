@@ -1158,6 +1158,20 @@ class ExpertHotCacheManager:
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
+        # The lane head's device bytes come out of the hot-cache budget before the cache is sized, so the recipe's
+        # SGLANG_MOE_HOT_GPU_MB stays the whole VRAM the two take together and the calibration sees the head.
+        lane_head_path = envs.SGLANG_OPT_LANE_HEAD_PATH.get() or None
+        lane_head_bytes = 0
+        if lane_head_path:
+            from sglang.srt.layers.moe.lane_head import lane_head_device_bytes, read_lane_head_meta
+
+            lane_head_bytes = lane_head_device_bytes(read_lane_head_meta(lane_head_path))
+            if lane_head_bytes >= budget_bytes:
+                raise ValueError(
+                    f"SGLANG_OPT_LANE_HEAD_PATH: the head's {lane_head_bytes} device bytes leave no hot cache budget "
+                    f"of {budget_bytes}"
+                )
+            budget_bytes -= lane_head_bytes
         update_prefill_tokens = index(update_prefill_tokens)
         update_decode_forwards = index(update_decode_forwards)
         decay_tokens = index(decay_tokens)
@@ -1526,6 +1540,24 @@ class ExpertHotCacheManager:
                 fused_insert=fused_insert,
             )
         devices = {cache.device for cache in manager.caches.values()}
+        manager.lane_head = None
+        if lane_head_path:
+            from sglang.srt.layers.moe.lane_head import LaneHead, read_lane_head_file
+
+            updater = manager.gpu_residency
+            if updater is None or not updater.insert_direct:
+                raise ValueError(
+                    "SGLANG_OPT_LANE_HEAD_PATH needs DIRECT residency (SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): the head keys the miss lanes its gathers insert"
+                )
+            head_file = read_lane_head_file(
+                lane_head_path,
+                layer_ids=list(updater.layer_ids),
+                experts=updater.num_experts,
+            )
+            manager.lane_head = LaneHead(head_file, updater.device)
+            updater.lane_head = manager.lane_head
+            logger.info(manager.lane_head.describe())
         logger.info(
             "Expert hot cache startup %s",
             json.dumps(
@@ -1543,6 +1575,7 @@ class ExpertHotCacheManager:
                         cache.scratch_bytes for cache in manager.caches.values()
                     ),
                     "prefetch_pull_bytes": manager.prefetch_pull_bytes,
+                    "lane_head_bytes": lane_head_bytes,
                     "layers": len(manager.caches),
                     "cuda_allocated_bytes": sum(
                         torch.cuda.memory_allocated(device) for device in devices

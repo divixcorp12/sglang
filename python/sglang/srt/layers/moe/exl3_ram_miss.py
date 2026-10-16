@@ -1676,7 +1676,15 @@ class Exl3RamMissService:
             # first, and the CPU lanes are the tail, so the lanes worth inserting are
             # the ones copied.
             direct = manager.gpu_residency
-            streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
+            lane_head = getattr(manager, "lane_head", None)
+            if lane_head is not None:
+                # SGLANG_OPT_LANE_HEAD_PATH: the head writes this layer's keys at each gather, before the plan.
+                from sglang.srt.layers.moe.lane_head import LaneHeadGather
+
+                streamer._plan_miss_keys = lane_head.keys[streamer.residency_row]
+                streamer.lane_head_hook = LaneHeadGather(lane_head, direct, streamer.residency_row, streamer)
+            else:
+                streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
         if self.device_side is None:
             miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
                                                     envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),

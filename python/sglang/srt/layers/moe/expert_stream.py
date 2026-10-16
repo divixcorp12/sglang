@@ -1531,6 +1531,9 @@ class ExpertStreamer:
         # int64 [num_experts]: the fused plan sorts its miss lanes by it, highest
         # first (CPU experts). None: off.
         self._plan_miss_keys = None
+        # lane_head.LaneHeadGather when SGLANG_OPT_LANE_HEAD_PATH is set: writes _plan_miss_keys at each gather,
+        # right before the fused plan reads them. None: the keys are the residency ranking's.
+        self.lane_head_hook = None
         self._graph_fused_slots_scratch = (
             torch.empty(max_rows, dtype=torch.int32, device=device)
             if self._fused_plan_enabled
@@ -1625,6 +1628,8 @@ class ExpertStreamer:
                 if self.residency_policy is not None
                 else None
             )
+            if self.lane_head_hook is not None:
+                self.lane_head_hook(topk_ids)
             remap = plan_graph_routes_fused(
                 flat,
                 expert_to_slot,

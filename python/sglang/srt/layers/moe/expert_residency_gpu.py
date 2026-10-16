@@ -235,6 +235,8 @@ class GpuResidencyUpdater:
         self.insert_active = None
         self.victims = None
         self.miss_keys = None
+        # A lane_head.LaneHead when SGLANG_OPT_LANE_HEAD_PATH is set (expert_hot_cache.from_model installs it).
+        self.lane_head = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -658,6 +660,9 @@ class GpuResidencyUpdater:
                 )
             )
         routed = self.route_counts > 0 if self.insert_on_miss else None
+        if self.lane_head is not None and routed is not None:
+            # The lane head's age feature: the forward each expert was last routed in, per layer.
+            self.lane_head.record_routed(gate, routed, self.forwards, phase == _PREFILL_PHASE)
         decay = self.decay_table.index_select(
             0, self.tokens.clamp(max=self.decay_table_tokens)
         )
