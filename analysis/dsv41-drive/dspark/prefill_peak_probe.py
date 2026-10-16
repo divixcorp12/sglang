@@ -124,8 +124,12 @@ def main() -> int:
                                       stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
         rc = 1
         try:
-            if not _healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
-                return 1
+            deadline = time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S
+            # Poll in short slices so a server that died at startup releases the locks now, not at the deadline.
+            while not _healthy(PORT, min(deadline, time.monotonic() + 30)):
+                if server.poll() is not None or time.monotonic() >= deadline:
+                    print(f"server not healthy (exit {server.poll()}); see {log_path}", flush=True)
+                    return 1
             time.sleep(5)
             result["healthy_used_mib"] = sampler.samples[-1][1]
             for i, n in enumerate(int(x) for x in a.prompt_tokens.split(",")):
