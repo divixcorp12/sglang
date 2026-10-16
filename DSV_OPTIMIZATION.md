@@ -1299,6 +1299,25 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
               - Build gate: at least 30 fewer CPU lanes/verify, no more NVMe GPU lanes, and at most 0.5 ms/verify
                 of added GPU time.
               - The B-vs-A choice waits for the replay.
+            - **Replay result: no arm passes the build gate. Not built.** (`drip_hot_replay.py` `1a6debfd22`,
+              importing lane-tier's validated tier `3d331c9189`; write-up `DRIP_HOT_DESIGN.md` section 7
+              `b0858bff92`; `/mnt/nvme1/drip-hot-replay/arms-drip-h3.json`)
+              - Validation gate: lanes typed the same as the capture 99.67% (drip) / 99.97% (base); lane mix
+                within 2%. One fitted parameter: a 1.4 ms drip_land observation lag.
+              - Per verify against today's drip; ms/verify at 0.07 / 0.28 per CPU-RAM lane (negative = saving):
+
+                | arm | CPU lanes (net of warm returns) | NVMe GPU lanes | ms/verify | gate |
+                |---|---|---|---|---|
+                | B, window not extended | -14.0 | -2.77 | -3.1 / -6.7 | fails CPU (needs -30) |
+                | B, window extended | -44.3 | +9.06 | +17.1 / +9.7 | fails NVMe |
+                | A, 2 picks | -11.7 | +5.44 | +10.6 / +9.3 | fails both; -9.5 hits |
+                | C, one spare | +0.9 | +2.97 | +5.8 / +6.6 | fails both |
+
+              - Only B without extension gains: 0.8-1.8 ms/token, inside served noise, and +4.0 / -0.2 ms/verify
+                if every released victim returned cold. Extending the window repeats the lane-head failure (freed
+                lanes take NVMe-cold misses onto the GPU stream).
+              - The prefill-aware tier raised NVMe-cold returns from ~0.01 to 0.4-1.7 per verify. That moved every
+                arm 1.5-4 ms/verify worse than the first, prefill-blind run.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
