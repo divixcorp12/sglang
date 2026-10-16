@@ -106,9 +106,10 @@ class SplitModelCosts:
             key: getattr(self, key) for key in SPLIT_MODEL_KEYS
         }
 
-    def words(self, overrides: str = "") -> list[int]:
-        """The device's cost words (ns), the costs ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS) names replaced."""
-        return split_model_words(self.nodes, overrides, base=self.base())
+    def words(self, overrides: str = "", residency_tiebreak: bool = False) -> list[int]:
+        """The device's cost words (ns) and flags word, the costs ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS)
+        names replaced."""
+        return split_model_words(self.nodes, overrides, base=self.base(), residency_tiebreak=residency_tiebreak)
 
     def line(self) -> str:
         """One compact log line, ms."""

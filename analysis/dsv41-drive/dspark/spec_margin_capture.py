@@ -131,7 +131,7 @@ def main() -> int:
     env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
     if a.draft_top_prob:
         env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")
-    argv = arm_env.ServerArgs(port=PORT, dspark=True).argv()
+    argv = [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(a.arm)]
     with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(a.out_dir, "server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,

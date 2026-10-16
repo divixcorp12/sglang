@@ -128,7 +128,8 @@ def test_words_overrides_and_the_line():
     words = TRUE.words()
     assert words == split_model_words(2, base=TRUE.base())
     assert words[:5] == [20_000, 150_000, 400_000, 330_000, 190_000] and words[10:] == [
-        1_050_000, 800_000, 1_600_000, 650_000, 100_000]
+        1_050_000, 800_000, 1_600_000, 650_000, 100_000, 0]  # the flags word last
+    assert TRUE.words(residency_tiebreak=True)[-1] == 1
     assert calib.costs_from_words(words, 2) == TRUE
     over = calib.apply_overrides(TRUE, "hit_c.1=0.5,copy_lane=1.3")
     assert over.hit_c == [0.4, 0.5] and over.copy_lane == 1.3 and over.hit_b == TRUE.hit_b
@@ -262,6 +263,7 @@ def _service_stub(nodes=2, fail=None):
         _split_model_refiner=None,
     )
     stub._split_model_moments = lambda: Exl3RamMissService._split_model_moments(stub)
+    stub._publish_split_model = lambda costs: Exl3RamMissService._publish_split_model(stub, costs)
     return stub, published, Exl3RamMissService
 
 
@@ -311,6 +313,10 @@ def test_the_service_refines_and_publishes_and_a_failure_stops_the_refinement():
     stub._split_model_refiner = SimpleNamespace(refine=lambda m: TRUE, refines=1)
     cls._refine_split_model(stub)
     assert published == [TRUE.words()]
+    with envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.override(True):
+        cls._refine_split_model(stub)  # the flags word carries the tiebreak through every publish
+    assert published[-1] == TRUE.words(residency_tiebreak=True) and published[-1][-1] == 1
+    del published[1:]
 
     def broken(m):
         raise ValueError("bad window")

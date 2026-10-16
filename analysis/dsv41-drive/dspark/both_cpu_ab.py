@@ -303,11 +303,14 @@ SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
 # The model-based split (and its cost overrides) likewise: off in every arm but -splitmodel.
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
+# The scheduler's mlockall, off in every arm but the -mem ones.
+MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[FULL_LAYERS] = ""
     _overrides_of_arm[SPLIT_LAYERS] = ""
     _overrides_of_arm[SPLIT_MODEL] = "0"
     _overrides_of_arm[SPLIT_MODEL_COSTS] = ""
+    _overrides_of_arm[MLOCK] = "0"
 # Layers 0 and 1 read 6.6 and 4.5 experts a verify from NVMe, which the L+2 prefetch cannot reach
 # (ram-prefetch/breakdown-20261015). Each full layer takes 204 rows a node (192 homed experts, 8 staging, 2 pool, 2
 # seam), 5182 MiB a node for the pair; the other 7:6 remainder buys the 7966 rows layers 2-39 hold today (210/209).
@@ -325,9 +328,38 @@ ARMS[PIN01_GPU01_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_LAYERS: f"0:{PIN01_SPLIT_L
 # token-weighted greedy, +17 ms a verify on breakdown-20261015/base at untraced CPU costs), at its default costs.
 PIN01_SPLIT_MODEL_ARM = PIN01_ARM + "-splitmodel"
 ARMS[PIN01_SPLIT_MODEL_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_MODEL: "1"}, True)
-# Since split-model-calib the model's costs are calibrated at startup. -fixedcosts names every cost, the 2026-10-15
-# offline fits (ram_slot_map.SPLIT_MODEL_FIXTURE_MS), so it runs uncalibrated as -splitmodel first served; -refine is
-# the calibrated model with the live refinement of its CPU costs, compared with -fixedcosts.
+# Node-0 headroom (cores-ab-20261014/splitmodel-stream swapped node 0 in load and decode): -mem adds the scheduler's
+# mlockall and drops each safetensors shard's page cache after loading it (server_flags), and nothing else.
+MEM_SUFFIX = "-mem"
+MEM_SERVER_FLAGS = ("--weight-loader-drop-cache-after-load",)
+for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
+    ARMS[_base + MEM_SUFFIX] = ({**ARMS[_base][0], MLOCK: "1"}, True)
+# Node-0 headroom, step 2: the HiCache host KV pools (12.1 GB, node 0 by first touch) bound to node 1, then also the
+# native Engram row cache off (5 GiB). The node is an EnvInt with no valid "unset" value, so only these arms name it.
+HICACHE_NODE = "SGLANG_HICACHE_HOST_NUMA_NODE"
+ENGRAM_NATIVE_GIB = "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"
+HOT_DECAY = "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"
+RESIDENCY_TIEBREAK = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[ENGRAM_NATIVE_GIB] = "5"
+    _overrides_of_arm[HOT_DECAY] = "0.98"
+    _overrides_of_arm[RESIDENCY_TIEBREAK] = "0"
+PIN01_SPLIT_MODEL_HICACHE1_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-hicache1"
+ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0], HICACHE_NODE: "1"}, True)
+PIN01_SPLIT_MODEL_ENGRAM0_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-engram0"
+ARMS[PIN01_SPLIT_MODEL_ENGRAM0_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], ENGRAM_NATIVE_GIB: "0"}, True)
+# The hot cache's insert-on-miss decay at 0.995 (every other arm 0.98, the default): the cache-tiers replay puts it at
+# +5.5 VRAM hits a verify, so the routed-pair hit rate is the evidence and ms/token only a regression check.
+PIN01_SPLIT_MODEL_DECAY_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-decay995"
+ARMS[PIN01_SPLIT_MODEL_DECAY_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], HOT_DECAY: "0.995"}, True)
+# The split model's residency tiebreak (equal-token lanes of a node: the CPU takes the lowest residency keys): the
+# breakdown-base replay gives the same saving with 56% fewer inverted pairs; compared with -hicache1.
+PIN01_SPLIT_MODEL_TIEBREAK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-tiebreak"
+ARMS[PIN01_SPLIT_MODEL_TIEBREAK_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], RESIDENCY_TIEBREAK: "1"}, True)
+# Since split-model-calib the model's costs are calibrated at startup, so every arm above with the model on now runs
+# calibrated. -fixedcosts names every cost, the 2026-10-15 offline fits (ram_slot_map.SPLIT_MODEL_FIXTURE_MS), so it
+# skips the calibration and types as -hicache1 did before it; -refine is the calibrated model with the live refinement
+# of its CPU costs, compared with -fixedcosts.
 SPLIT_MODEL_REFINE = "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES"
 SPLIT_MODEL_FIXED_COSTS = (
     "hit_a.0=0.016,hit_a.1=-0.050,hit_b.0=0.154,hit_b.1=0.179,hit_c.0=0.395,hit_c.1=0.390,"
@@ -337,12 +369,14 @@ SPLIT_MODEL_FIXED_COSTS = (
 REFINE_BATCHES = "50"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[SPLIT_MODEL_REFINE] = "0"
-PIN01_SPLIT_MODEL_FIXED_COSTS_ARM = PIN01_SPLIT_MODEL_ARM + "-fixedcosts"
+PIN01_SPLIT_MODEL_FIXED_COSTS_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-fixedcosts"
 ARMS[PIN01_SPLIT_MODEL_FIXED_COSTS_ARM] = (
-    {**ARMS[PIN01_SPLIT_MODEL_ARM][0], SPLIT_MODEL_COSTS: SPLIT_MODEL_FIXED_COSTS}, True
+    {**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], SPLIT_MODEL_COSTS: SPLIT_MODEL_FIXED_COSTS}, True
 )
-PIN01_SPLIT_MODEL_REFINE_ARM = PIN01_SPLIT_MODEL_ARM + "-refine"
-ARMS[PIN01_SPLIT_MODEL_REFINE_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM][0], SPLIT_MODEL_REFINE: REFINE_BATCHES}, True)
+PIN01_SPLIT_MODEL_REFINE_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-refine"
+ARMS[PIN01_SPLIT_MODEL_REFINE_ARM] = (
+    {**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], SPLIT_MODEL_REFINE: REFINE_BATCHES}, True
+)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -389,9 +423,23 @@ REFERENCE = {
     PIN01_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
     PIN01_GPU01_ARM: PIN01_ARM,
     PIN01_SPLIT_MODEL_ARM: PIN01_ARM,
-    PIN01_SPLIT_MODEL_FIXED_COSTS_ARM: PIN01_ARM,
+    PIN01_ARM + MEM_SUFFIX: PIN01_ARM,
+    PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
+    PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
+    PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_DECAY_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_TIEBREAK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_FIXED_COSTS_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     PIN01_SPLIT_MODEL_REFINE_ARM: PIN01_SPLIT_MODEL_FIXED_COSTS_ARM,
 }
+
+
+def server_flags(arm: str) -> tuple[str, ...]:
+    """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop, for
+    the -mem arms and those built on them."""
+    return MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ()
+
+
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
@@ -467,7 +515,7 @@ def run_timed(arm: str, out: str, sessions: str = DEFAULT_SESSIONS) -> int:
     env = os.environ | {
         "DSV41_RUN_ROOT": out,
         "DSV41_SESSION_INDICES": sessions,
-        "DSV41_EXTRA_SERVER_ARGS": shlex.join(arm_env.DSPARK_ARGV) if dspark else "",
+        "DSV41_EXTRA_SERVER_ARGS": shlex.join((*(arm_env.DSPARK_ARGV if dspark else ()), *server_flags(arm))),
         "DSV41_HEALTH_TIMEOUT_S": str(_health_timeout_s(dspark)),
     }
     if dspark:

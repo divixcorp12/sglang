@@ -368,6 +368,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.memory_lock import maybe_lock_process_memory
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -6215,6 +6216,7 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+        maybe_lock_process_memory(logger)
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

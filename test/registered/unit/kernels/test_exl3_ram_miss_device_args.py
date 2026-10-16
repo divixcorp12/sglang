@@ -431,7 +431,7 @@ def test_the_split_model_reaches_the_post_before_use_pdl_with_room_for_its_count
         off._kernels = lambda: recorder
         _post(off, _args())
         assert recorder.calls[0][1][-2].numel() == 0 and off.split_model_stats() is None
-        words = list(range(1, 5 * nodes + 6))
+        words = list(range(1, 5 * nodes + 7))
         with pytest.raises(ValueError, match="cost words"):
             _device(nodes=nodes, split_model=words[:-1])
         on = _device(nodes=nodes, split_model=words)
@@ -456,15 +456,15 @@ def test_set_split_model_costs_replaces_the_cost_words_and_keeps_the_counters():
         dev = _device(nodes=nodes, split_model=split_model_off_words(nodes))
         bank = dev.split_model
         assert dev.split_model_costs() == split_model_off_words(nodes)
-        bank[5 * nodes + 5 :] = 7
-        words = list(range(100, 100 + 5 * nodes + 5))
+        bank[5 * nodes + 6 :] = 7
+        words = list(range(100, 100 + 5 * nodes + 6))
         dev.set_split_model_costs(words)
         assert dev.split_model is bank and bank.tolist() == words + [7] * (1 + 2 * nodes)
         assert dev.split_model_costs() == words
         with pytest.raises(ValueError, match="cost words"):
             dev.set_split_model_costs(words[:-1])
     with pytest.raises(ValueError, match="off"):
-        _device().set_split_model_costs([0] * 10)
+        _device().set_split_model_costs([0] * 11)
 
 
 def test_the_service_builds_its_device_side_with_the_split_model_words():
@@ -486,7 +486,7 @@ def test_the_service_builds_its_device_side_with_the_split_model_words():
     with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True), \
             envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=2"):
         got = words(stub)
-        assert len(got) == 15 and got[10] < 0 and not any(got[:10] + got[11:])
+        assert len(got) == 16 and got[10] < 0 and not any(got[:10] + got[11:])
         assert words(SimpleNamespace(cpu_experts=None, wire=stub.wire)) is None
 
 

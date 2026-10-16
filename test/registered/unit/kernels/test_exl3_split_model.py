@@ -22,15 +22,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # One node: hit job a + b*k + c*pairs, miss ma + mc*tokens; copy_lane, first_byte, per_expert.
-ONE = [0, 1000, 0, 0, 500] + [1500, 1000, 1000, 0, 0]  # no stream side
+ONE = [0, 1000, 0, 0, 500] + [1500, 1000, 1000, 0, 0, 0]  # no stream side, no flags
 
 
 def test_the_fixture_words_are_the_untraced_fits_in_ns_node_by_node():
     words = split_model_words(2)
-    assert len(words) == 5 * 2 + 5
+    assert len(words) == 5 * 2 + 6
     assert words[:5] == [16_000, 154_000, 395_000, 331_000, 193_000]
     assert words[5:10] == [-50_000, 179_000, 390_000, 291_000, 245_000]
-    assert words[10:] == [1_050_000, 800_000, 1_600_000, 650_000, 0]
+    assert words[10:] == [1_050_000, 800_000, 1_600_000, 650_000, 0, 0]
+    assert split_model_words(2, residency_tiebreak=True)[-1] == 1
     assert split_model_words(1)[:5] == words[:5] and split_model_words(3)[10:15] == words[5:10]
     assert split_model_stats_words(2) == 5
 
@@ -69,12 +70,12 @@ def test_the_greedy_balances_the_cpu_against_the_copy_fifo():
 
 
 def test_the_greedy_takes_the_heaviest_first_and_breaks_ties_by_plan_order():
-    words = [0, 0, 1000, 0, 0] + [2500, 0, 0, 0, 0]  # 1 us a (token, expert) pair
+    words = [0, 0, 1000, 0, 0] + [2500, 0, 0, 0, 0, 0]  # 1 us a (token, expert) pair
     # Lane 1 (3 tokens) first: CPU 3000 > 2500 -> copy; then lanes 0 and 2 (1 token each, plan order): CPU 1000 and
     # 2000 <= 5000.
     assert _greedy([1, 3, 1], words=words) == [True, False, True]
     # A tie at the copy FIFO goes to the CPU (finish <= copy): one 1-token lane at 1000 vs a 1000-ns copy lane.
-    assert _greedy([1], words=[0, 0, 1000, 0, 0, 1000, 0, 0, 0, 0]) == [True]
+    assert _greedy([1], words=[0, 0, 1000, 0, 0, 1000, 0, 0, 0, 0, 0]) == [True]
 
 
 def test_forced_hits_and_uncopyable_hits_load_the_cpu_before_the_greedy():
@@ -95,14 +96,14 @@ def test_a_forced_miss_after_the_hit_job_sets_the_cpus_floor():
 
 
 def test_both_nodes_share_one_copy_fifo():
-    words = [0, 1000, 0, 0, 0] * 2 + [1500, 0, 0, 0, 0]
+    words = [0, 1000, 0, 0, 0] * 2 + [1500, 0, 0, 0, 0, 0]
     # Each node alone would put lanes 0 and 2 of its own on the CPU; together the shared FIFO fills: plan order
     # 0 (node 0, CPU 1000), 1 (node 1, CPU 1000), 2 (node 0, 2000 > 1500 -> copy), 3 (node 1, 2000 <= 3000 -> CPU).
     got = _greedy([1, 1, 1, 1], node_of=[0, 1, 0, 1], words=words, nodes=2)
     assert got == [True, True, False, True]
 
 
-STREAM = [0, 1000, 0, 0, 0] + [1500, 1000, 1000, 2000, 0]  # the stream kernel: 2 us a copy lane past 2 us
+STREAM = [0, 1000, 0, 0, 0] + [1500, 1000, 1000, 2000, 0, 0]  # the stream kernel: 2 us a copy lane past 2 us
 
 
 def test_the_stream_side_charges_copy_lanes_only_with_streamed_misses():
@@ -112,7 +113,7 @@ def test_the_stream_side_charges_copy_lanes_only_with_streamed_misses():
     n = 3
     got = model_cpu_lanes([0] * n, [1] * n, [True] * n, [True] * n, [False] * n, [True] * n, STREAM, 1, streamed=1)
     assert got == [True, True, True]
-    off = STREAM[:8] + [0, 0]  # stream_lane 0: no stream side even with a streamed miss
+    off = STREAM[:8] + [0, 0, 0]  # stream_lane 0: no stream side even with a streamed miss
     got = model_cpu_lanes([0] * n, [1] * n, [True] * n, [True] * n, [False] * n, [True] * n, off, 1, streamed=1)
     assert got == [True, False, True]
 
@@ -124,6 +125,28 @@ def test_type_lanes_counts_an_unforced_miss_as_streamed():
     # The same miss forced is the CPU's, not streamed: the copy side is the FIFO alone.
     kinds, _ = _typing([0, 1, 2, 20], ram, forced_from=3, split_model=STREAM, tokens=[1] * 4)
     assert kinds[3] == LaneKind.MISS_CPU and kinds[:3].count(LaneKind.HIT_CPU) < 3
+
+
+def test_the_residency_tiebreak_gives_the_copy_engine_the_highest_keys_among_equal_tokens():
+    # Without it, one-token lanes split CPU, copy, CPU in plan order: the CPU holds lane 0, the highest key. With it the
+    # count stays (2 on the CPU) but the CPU takes the lowest keys, lanes 1 and 2, and the copy engine lane 0.
+    off = _greedy([1, 1, 1])
+    tied = _greedy([1, 1, 1], words=ONE[:-1] + [1])
+    assert off == [True, False, True] and tied == [False, True, True]
+
+
+def test_the_tiebreak_moves_lanes_only_within_a_node_and_a_token_count():
+    words = [0, 1000, 0, 0, 0] * 2 + [1500, 0, 0, 0, 0, 1]
+    tokens, node_of = [2, 1, 1, 2, 1, 1], [0, 0, 1, 0, 0, 1]
+    plain = _greedy(tokens, node_of=node_of, words=words[:-1] + [0], nodes=2)
+    tied = _greedy(tokens, node_of=node_of, words=words, nodes=2)
+    for node in (0, 1):
+        for tok in (1, 2):
+            group = [j for j in range(6) if node_of[j] == node and tokens[j] == tok]
+            assert sum(plain[j] for j in group) == sum(tied[j] for j in group)
+            on = [j for j in group if tied[j]]
+            off = [j for j in group if not tied[j]]
+            assert all(c > x for c in on for x in off)  # every CPU lane below every copy lane in residency key
 
 
 def test_ineligible_lanes_are_never_the_models():
@@ -233,7 +256,7 @@ def test_off_words_type_lanes_as_the_table_and_count_nothing():
     from sglang.srt.layers.moe.ram_slot_map import SPLIT_MODEL_OFF, split_model_off_words, split_model_on
 
     off = split_model_off_words(1)
-    assert len(off) == 10 and off[5] == SPLIT_MODEL_OFF < 0 and not split_model_on(off, 1)
+    assert len(off) == 11 and off[5] == SPLIT_MODEL_OFF < 0 and not split_model_on(off, 1)
     assert split_model_on(ONE, 1) and not split_model_on(None, 1)
     rng = random.Random(9)
     for _ in range(200):

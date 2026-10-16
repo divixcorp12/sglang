@@ -58,6 +58,9 @@ SPLIT_MODEL_FIXTURE_MS = {
 # A copy_lane word below 0 turns the model off on the device: the split table and the miss cut type the CPU's lanes.
 # The service publishes it until its calibration has run, and keeps it when the calibration fails.
 SPLIT_MODEL_OFF = -1
+# The flags word's residency tiebreak (lease_device.cuh kSplitModelResidencyTiebreak): among a node's candidates with
+# the same tokens, which the model prices alike, the CPU takes the lowest residency keys and the copy engine the rest.
+SPLIT_MODEL_RESIDENCY_TIEBREAK = 1
 
 
 def split_model_overrides(overrides: str, nodes: int) -> tuple[dict, dict]:
@@ -93,8 +96,10 @@ def split_model_overrides_complete(overrides: str, nodes: int) -> bool:
     return len(per_node) == len(SPLIT_MODEL_NODE_KEYS) * nodes and len(shared) == len(SPLIT_MODEL_KEYS)
 
 
-def split_model_words(nodes: int, overrides: str = "", base: Optional[dict] = None) -> list[int]:
-    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``.
+def split_model_words(nodes: int, overrides: str = "", base: Optional[dict] = None,
+                      residency_tiebreak: bool = False) -> list[int]:
+    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``, then
+    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK).
 
     ``base`` maps each key to ms, a per-node key to one value per node (node n past them takes the last's): the
     calibrated costs in service (split_model_calibration.SplitModelCosts.base), the fixture costs when omitted, which
@@ -112,12 +117,12 @@ def split_model_words(nodes: int, overrides: str = "", base: Optional[dict] = No
     ns = lambda ms: int(round(ms * 1_000_000))
     return [ns(costs[key]) for costs in per_node for key in SPLIT_MODEL_NODE_KEYS] + [
         ns(shared[key]) for key in SPLIT_MODEL_KEYS
-    ]
+    ] + [SPLIT_MODEL_RESIDENCY_TIEBREAK if residency_tiebreak else 0]
 
 
 def split_model_off_words(nodes: int) -> list[int]:
     """Cost words the device reads as the model off (SPLIT_MODEL_OFF in copy_lane): the split table types the lanes."""
-    words = [0] * (5 * nodes + 5)
+    words = [0] * (5 * nodes + 6)
     words[5 * nodes] = SPLIT_MODEL_OFF
     return words
 
@@ -199,6 +204,16 @@ def model_cpu_lanes(
         else:
             copy += copy_lane
             lanes += 1
+    if words[5 * nodes + 5] & SPLIT_MODEL_RESIDENCY_TIEBREAK:
+        # A node's candidates with the same tokens cost the model the same: keep how many of them the CPU takes, and
+        # give it the highest plan indexes (plan order is residency key, highest first).
+        groups: dict = {}
+        for j in candidates:
+            groups.setdefault((node_of[j], tokens[j]), []).append(j)
+        for members in groups.values():
+            on_cpu = sum(cpu[j] for j in members)
+            for rank, j in enumerate(sorted(members, reverse=True)):
+                cpu[j] = rank < on_cpu
     return cpu
 
 
