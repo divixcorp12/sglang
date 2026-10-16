@@ -180,7 +180,7 @@ def set_hot_capacity(
     except RetireRefused as error:
         if strict:
             raise
-        logger.error(
+        logger.warning(
             "hot cache capacity: the holders disagree after the resize (%s); setting every layer back to its "
             "capacity before it and starting at the configured size",
             error,
