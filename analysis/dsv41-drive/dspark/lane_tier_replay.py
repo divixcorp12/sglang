@@ -387,6 +387,9 @@ def within(x: float, target: float, rel: float) -> bool:
 
 def gate(off_dir: str, on_dir: str, rows: int) -> dict:
     off, on = Run(off_dir), Run(on_dir)
+    # serve_compare's pair verdict: prompts with no flag in either run
+    both = [a and b for a, b in zip(off.clean, on.clean)]
+    off.clean, on.clean = list(both), list(both)
     layers = max(r.row for r in off.records) + 1
     prices = Prices(off)
     m_off, m_on = per_verify(off), per_verify(on)
@@ -434,7 +437,48 @@ def gate(off_dir: str, on_dir: str, rows: int) -> dict:
                        within(e_on["wait"] - e_off["wait"], dm["wait"], 0.25)],
     }
     res["passed"] = {part: all(v[-1] for v in res[part].values()) for part in ("P", "T", "E")}
+    res["diagnosis"] = diagnose(off, on, prices, rows, layers)
     return res
+
+
+def diagnose(off: Run, on: Run, prices: Prices, rows: int, layers: int) -> dict:
+    """Where the gate's parts miss: the same prices fit on ON (does a cost move between runs?), the wait error by a
+    record's GPU NVMe lanes, and the tier replay's misclassified GPU lanes by the verify's place after its prefill."""
+    out = {"prices_fit_on_on": Prices(on).describe()}
+    for name, run in (("off", off), ("on", on)):
+        by = collections.defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0.0])
+        for r in run.serving():
+            s, w = prices.record(r)
+            b = by[min(r.gpu_nvme + r.gpu_pool, 4)]
+            b[0] += 1
+            b[1] += r.wait
+            b[2] += w
+            b[3] += r.stream
+            b[4] += s
+        out[f"wait_by_gpu_miss_lanes_{name}"] = {k: {"records": v[0], "wait_ms": round(v[1] / v[0], 2),
+                                                     "pred_wait_ms": round(v[2] / v[0], 2),
+                                                     "stream_ms": round(v[3] / v[0], 2),
+                                                     "pred_stream_ms": round(v[4] / v[0], 2)}
+                                                 for k, v in sorted(by.items())}
+        # the tier replay against the trace, lane by lane, by verifies since the request's first verify
+        header, log = route_log(run.dir)
+        off_i = align(run, log)
+        pred, _ = tier_replay(run, rows, layers)
+        by_vr = {(r.verify, r.row): r for r in run.records}
+        first = {}
+        for v in range(len(run.verifies)):
+            p = run.prompt_of[v]
+            first.setdefault(p, v)
+        acc = collections.defaultdict(collections.Counter)
+        for (v, L), r in by_vr.items():
+            if run.prompt_of[v] < 0 or r.seq not in pred:
+                continue
+            age = min(v - first[run.prompt_of[v]], 8)
+            acc[age]["obs"] += r.gpu_nvme
+            acc[age]["pred"] += pred[r.seq][0]
+            acc[age]["records"] += 1
+        out[f"tier_by_verify_after_prefill_{name}"] = {k: dict(v) for k, v in sorted(acc.items())}
+    return out
 
 
 def main() -> int:
