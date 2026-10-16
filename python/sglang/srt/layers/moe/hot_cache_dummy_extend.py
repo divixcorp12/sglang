@@ -15,6 +15,34 @@ from typing import Callable
 import torch
 
 
+def dummy_verify_forward(model_runner) -> Callable[[], None]:
+    """A callable that runs graph capture's own dummy forward (TARGET_VERIFY on a speculative target, one request)
+    eagerly: BaseRunner._dummy_run reads nothing but ``self.model_runner``, so it runs on a stand-in. Its peak
+    transient estimates what the captured graph's private pool will hold. Afterwards, ``forget_graph_path_state``
+    drops what a graph-path forward builds lazily from the hot cache's pre-retire capacity."""
+    from types import SimpleNamespace
+
+    from sglang.srt.model_executor.runner.base_runner import BaseRunner
+
+    runner = SimpleNamespace(model_runner=model_runner)
+    per_req = model_runner.decode_num_tokens_per_req()
+    buffers = BaseRunner._alloc_dummy_decode_buffers(
+        runner, 1, num_tokens_per_req=per_req, allocate_logits_buffer=False
+    )
+    return lambda: BaseRunner._dummy_run(runner, 1, buffers=buffers)
+
+
+def forget_graph_path_state(model) -> int:
+    """Delete the per-layer Exl3FusedMoE an eager graph-path forward caches (its slot pointer tables span the hot
+    cache's capacity at the time); the first real graph-path forward rebuilds it. Returns how many it dropped."""
+    dropped = 0
+    for module in model.modules():
+        if hasattr(module, "_exl3_fused_moe"):
+            del module._exl3_fused_moe
+            dropped += 1
+    return dropped
+
+
 def dummy_extend_forward(model_runner, tokens: int) -> Callable[[], None]:
     """A callable that runs the dummy EXTEND forward of ``tokens`` tokens; built once, run as often as needed."""
     from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len, set_is_extend_in_batch

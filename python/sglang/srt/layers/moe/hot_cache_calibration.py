@@ -75,6 +75,11 @@ def calibration_routes(topk_ids: torch.Tensor, streamer) -> torch.Tensor:
     """``topk_ids`` unchanged outside the calibration; inside it, ``resident_routes`` over the streamer's RAM tier."""
     if not calibrating():
         return topk_ids
+    hot = getattr(streamer, "hot_cache", None)
+    if hot is not None and topk_ids.numel() <= getattr(streamer, "graph_gather_rows", 0):
+        # The capture estimate's verify-sized forward takes the graph-gather path, whose misses insert into the hot
+        # cache: route it onto the VRAM residents instead, so every row is a hit.
+        return resident_routes(topk_ids, hot.slot_to_expert)
     tier = getattr(streamer, "pinned_host_cache", None)
     if tier is None:
         raise RuntimeError("hot cache calibration needs the pinned RAM tier to route onto")
@@ -96,6 +101,9 @@ class Calibration:
     reserved_before: int
     runs: tuple
     slot_bytes: int
+    # Graph capture's dummy verify forward, run eagerly: its allocated peak above what it started with, which the
+    # captured graph's pool will hold once capture runs after the retire.
+    capture_estimate: int = 0
 
     @property
     def nontorch_growth(self) -> int:
@@ -112,8 +120,13 @@ class Calibration:
         return max(0, r1.reserved_peak - r1.allocated_peak, r2.reserved_peak - r1.reserved_after)
 
     @property
+    def required(self) -> int:
+        """Free memory the prefill peak must leave before capture: the margin plus what capture will take."""
+        return self.margin + self.capture_estimate
+
+    @property
     def slots_to_retire(self) -> int:
-        short = self.margin - self.lowest_free
+        short = self.required - self.lowest_free
         return max(0, math.ceil(short / self.slot_bytes)) if short > 0 else 0
 
     def summary(self) -> dict:
@@ -125,6 +138,8 @@ class Calibration:
             "nontorch_growth_mib": round(self.nontorch_growth / MIB, 1),
             "lowest_free_mib": round(self.lowest_free / MIB, 1),
             "margin_mib": round(self.margin / MIB, 1),
+            "capture_estimate_mib": round(self.capture_estimate / MIB, 1),
+            "required_mib": round(self.required / MIB, 1),
             "slots_to_retire": self.slots_to_retire,
         }
 
@@ -163,15 +178,22 @@ def _measure(fn, device) -> RunPeak:
     )
 
 
-def calibrate(run_prefill, *, tokens: int, slot_bytes: int, device) -> Calibration:
-    """Two measured runs of ``run_prefill`` (the dummy EXTEND forward), allocator cache emptied first."""
+def calibrate(run_prefill, *, tokens: int, slot_bytes: int, device, run_verify=None) -> Calibration:
+    """Two measured runs of ``run_prefill`` (the dummy EXTEND forward), allocator cache emptied first, then one of
+    ``run_verify`` (capture's dummy forward) for the capture estimate."""
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     free_before = torch.cuda.mem_get_info(device)[0]
     reserved_before = torch.cuda.memory_reserved(device)
+    capture_estimate = 0
     with calibration_context():
         runs = (_measure(run_prefill, device), _measure(run_prefill, device))
-    return Calibration(tokens, free_before, reserved_before, runs, slot_bytes)
+        if run_verify is not None:
+            torch.cuda.synchronize(device)
+            allocated = torch.cuda.memory_allocated(device)
+            peak = _measure(run_verify, device)
+            capture_estimate = max(0, peak.allocated_peak - allocated)
+    return Calibration(tokens, free_before, reserved_before, runs, slot_bytes, capture_estimate)
 
 
 class KvPinMissed(RuntimeError):
@@ -202,7 +224,11 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
     if manager is None or not manager.caches:
         logger.info("hot cache calibration: no hot cache, nothing to size")
         return None
-    from sglang.srt.layers.moe.hot_cache_dummy_extend import dummy_extend_forward
+    from sglang.srt.layers.moe.hot_cache_dummy_extend import (
+        dummy_extend_forward,
+        dummy_verify_forward,
+        forget_graph_path_state,
+    )
     from sglang.srt.layers.moe.hot_cache_retire import retire_hot_slots
     from sglang.srt.runtime_context import get_schedule
 
@@ -213,7 +239,11 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
     cache = next(iter(manager.caches.values()))
     device = cache.device
     run = dummy_extend_forward(model_runner, tokens)
-    calibration = calibrate(run, tokens=tokens, slot_bytes=cache.bytes_per_expert, device=device)
+    verify = dummy_verify_forward(model_runner) if model_runner.spec_algorithm.is_speculative() else None
+    calibration = calibrate(
+        run, tokens=tokens, slot_bytes=cache.bytes_per_expert, device=device, run_verify=verify
+    )
+    forget_graph_path_state(model_runner.model)
     floor = 2 * getattr(manager.gpu_residency, "victim_lanes", 0)
     capacity = {layer: c.capacity for layer, c in manager.caches.items()}
     keep = plan_keep(capacity, calibration.slots_to_retire, floor)

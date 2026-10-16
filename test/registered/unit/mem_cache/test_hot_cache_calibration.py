@@ -46,6 +46,38 @@ def test_trim_only_retires_just_enough_slots():
     assert tight.lowest_free == 380 * M and tight.slots_to_retire == 2  # ceil(20 / 13)
 
 
+def test_the_capture_estimate_is_part_of_what_the_prefill_must_leave():
+    c = _cal()
+    with_capture = hc.Calibration(c.tokens, c.free_before, c.reserved_before, c.runs, c.slot_bytes, 2200 * M)
+    assert with_capture.required == (400 + 2200) * M  # margin + capture
+    assert with_capture.slots_to_retire == 10  # ceil((2600 - 2480) / 13)
+    assert with_capture.summary()["capture_estimate_mib"] == 2200
+
+
+def test_a_verify_sized_route_set_goes_to_vram_residents_inside_calibration():
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8]])  # 6 routes <= 36 graph rows
+    streamer = SimpleNamespace(
+        hot_cache=SimpleNamespace(slot_to_expert=[20, 21, 22, 23, 24, 25, 26, -1]),
+        graph_gather_rows=36,
+        pinned_host_cache=SimpleNamespace(slot_to_expert=list(range(100, 140))),
+    )
+    with hc.calibration_context():
+        verify = hc.calibration_routes(ids, streamer)
+        prefill = hc.calibration_routes(torch.arange(4096 * 6).reshape(4096, 6) % 200, streamer)
+    assert set(verify.reshape(-1).tolist()) <= set(range(20, 27))  # hot residents: every row a hit
+    assert set(prefill.reshape(-1).tolist()) <= set(range(100, 140))  # RAM residents: no admissions
+
+
+def test_forget_graph_path_state_drops_the_cached_fused_moe():
+    from sglang.srt.layers.moe.hot_cache_dummy_extend import forget_graph_path_state
+
+    layers = [torch.nn.Module() for _ in range(3)]
+    layers[0]._exl3_fused_moe, layers[2]._exl3_fused_moe = object(), object()
+    model = torch.nn.ModuleList(layers)
+    assert forget_graph_path_state(model) == 2
+    assert not any(hasattr(m, "_exl3_fused_moe") for m in layers)
+
+
 def test_plan_keep_takes_from_the_fullest_layer_and_keeps_the_floor():
     # 27 -> 26 first, then the 26s from the lowest layer id.
     assert hc.plan_keep({0: 26, 1: 27, 2: 26}, 3, 16) == {0: 25, 1: 25, 2: 26}
