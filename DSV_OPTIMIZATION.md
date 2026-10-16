@@ -1313,6 +1313,11 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             - TTFT estimate: share 64 -0.45 to -0.94 s; share 16 +0.27 to +0.46 s. This omits lost prefetch overlap.
             - **Conflict:** served share 64 in 2026-09 (section 27.9, pre-DSpark) gave only S -3 ms/step, and TTFT
               +0.5 to +1.2 s. Small shares sit furthest from what T validated.
+            - **Size scaling (`5aef9a0836`):** the gain is flat from share 8 to 32, halves at 64 (~0.33x usable
+              rows), and is mostly gone by 128 (~0.6x). With the tier scaled to 0.5x there is no gain; at 0.75x and
+              1.25x the knee stays at ~0.15x. TTFT rises below the knee (share 8: +0.5 to +0.75 s on the A/B).
+              Candidate startup rule: **share ≈ 0.15 x usable RAM rows per layer** (~28 at 190). The capture's own
+              prices agree in sign everywhere (1.1-1.9x the magnitude).
             - **Approved:** one served A/B pair of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64, no code) on
               `-mergechunk-expseg`, with the route log, predictions written down first. If it matches the model's
               direction: a share-size knob with a startup calibration rule (64 is hard-coded today).
