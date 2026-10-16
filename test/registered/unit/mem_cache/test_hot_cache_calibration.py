@@ -94,6 +94,55 @@ def test_off_returns_none_without_reading_the_runner():
     hc.require_hot_cache_headroom("after capture", None)  # no calibration: no check
 
 
+def test_resident_routes_keep_the_shape_and_distinct_count_and_use_only_residents():
+    real = torch.tensor([[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11], [0, 1, 2, 3, 4, 5]])  # 12 distinct
+    residents = [-1, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, -1]
+    out = hc.resident_routes(real, residents)
+    assert out.shape == real.shape and out.dtype == real.dtype
+    assert set(out.reshape(-1).tolist()) <= set(range(40, 54)) and torch.unique(out).numel() == 12
+    assert all(len(set(row)) == 6 for row in out.tolist())  # each token's top-k distinct
+    with pytest.raises(RuntimeError, match="cannot fill a top-6"):
+        hc.resident_routes(real, [1, 2, 3, -1])
+
+
+def test_calibration_routes_change_nothing_outside_the_context():
+    ids = torch.tensor([[3, 4]])
+    tier = SimpleNamespace(slot_to_expert=[7, 8, 9])
+    assert hc.calibration_routes(ids, SimpleNamespace(pinned_host_cache=tier)) is ids
+    with hc.calibration_context():
+        assert set(hc.calibration_routes(ids, SimpleNamespace(pinned_host_cache=tier)).tolist()[0]) <= {7, 8, 9}
+
+
+def test_compare_flags_a_real_peak_above_the_calibration_by_more_than_the_margin():
+    c = _cal()  # run 1 reserved peak 2500, allocated 2100, margin 400
+    ok = hc.compare_with_real(c, 2200 * M, 2800 * M)
+    assert ok["delta_reserved_mib"] == 300 and not ok["exceeds"]
+    bad = hc.compare_with_real(c, 2200 * M, 3000 * M)
+    assert bad["exceeds"] and bad["delta_allocated_mib"] == 100
+
+
+def test_the_watch_measures_only_the_first_full_size_extend_then_removes_itself(monkeypatch):
+    calls = []
+
+    class Runner:
+        def forward(self, fb):
+            calls.append(fb.extend_num_tokens)
+            return "out"
+
+    runner = Runner()
+    result = hc.CalibrationResult(_cal(), {0: 20})
+    for name, value in (("synchronize", None), ("reset_peak_memory_stats", None)):
+        monkeypatch.setattr(torch.cuda, name, lambda *a, **k: value)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a: 2200 * M)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *a: 2600 * M)
+    hc.watch_first_full_prefill(runner, result)
+    extend = lambda n: SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: True), extend_num_tokens=n)
+    assert runner.forward(extend(16)) == "out" and "forward" in vars(runner)  # not the calibrated size
+    assert runner.forward(extend(4096)) == "out" and "forward" not in vars(runner)  # measured, then removed
+    assert result.extra["first_real_prefill"]["delta_reserved_mib"] == 100
+    assert calls == [16, 4096]
+
+
 def test_headroom_check_raises_below_the_margin(monkeypatch):
     result = hc.CalibrationResult(_cal(), {0: 20})
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (500 * M, 32000 * M))

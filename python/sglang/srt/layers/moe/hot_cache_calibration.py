@@ -55,6 +55,32 @@ def calibration_context() -> Iterator[None]:
         _CALIBRATING.reset(token)
 
 
+def resident_routes(topk_ids: torch.Tensor, residents) -> torch.Tensor:
+    """The calibration's routes for one MoE layer: the real router's tokens x top-k shape and distinct-expert count
+    (measured from ``topk_ids``, capped by the residents), drawn round-robin from ``residents`` (experts already in
+    the layer's RAM tier), so the prefill reads nothing into the tier. Each token's top-k stay distinct whenever the
+    pool holds at least top-k experts."""
+    flat = topk_ids.reshape(-1)
+    distinct = int(torch.unique(flat[flat >= 0]).numel())
+    pool = [int(e) for e in residents if int(e) >= 0][: max(distinct, topk_ids.shape[-1])]
+    if len(pool) < topk_ids.shape[-1]:
+        raise RuntimeError(
+            f"hot cache calibration: {len(pool)} RAM-resident experts cannot fill a top-{topk_ids.shape[-1]} route"
+        )
+    picks = torch.arange(flat.numel(), device=topk_ids.device) % len(pool)
+    return torch.tensor(pool, dtype=topk_ids.dtype, device=topk_ids.device)[picks].reshape(topk_ids.shape)
+
+
+def calibration_routes(topk_ids: torch.Tensor, streamer) -> torch.Tensor:
+    """``topk_ids`` unchanged outside the calibration; inside it, ``resident_routes`` over the streamer's RAM tier."""
+    if not calibrating():
+        return topk_ids
+    tier = getattr(streamer, "pinned_host_cache", None)
+    if tier is None:
+        raise RuntimeError("hot cache calibration needs the pinned RAM tier to route onto")
+    return resident_routes(topk_ids, tier.slot_to_expert)
+
+
 @dataclass(frozen=True)
 class RunPeak:
     reserved_peak: int
@@ -180,7 +206,57 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
         sum(capacity.values()),
         sum(keep.values()),
     )
-    return CalibrationResult(calibration, keep, retired)
+    result = CalibrationResult(calibration, keep, retired)
+    watch_first_full_prefill(model_runner, result)
+    return result
+
+
+def compare_with_real(calibration: Calibration, real_allocated_peak: int, real_reserved_peak: int) -> dict:
+    """The real full-size prefill's peaks against the calibration's run 1; ``exceeds`` when the real reserve peak is
+    above the calibrated one by more than the margin (the forced routing's approximation did not hold)."""
+    r1 = calibration.runs[0]
+    delta_reserved = real_reserved_peak - r1.reserved_peak
+    return {
+        "calibration_allocated_peak_mib": round(r1.allocated_peak / MIB, 1),
+        "calibration_reserved_peak_mib": round(r1.reserved_peak / MIB, 1),
+        "real_allocated_peak_mib": round(real_allocated_peak / MIB, 1),
+        "real_reserved_peak_mib": round(real_reserved_peak / MIB, 1),
+        "delta_allocated_mib": round((real_allocated_peak - r1.allocated_peak) / MIB, 1),
+        "delta_reserved_mib": round(delta_reserved / MIB, 1),
+        "margin_mib": round(calibration.margin / MIB, 1),
+        "exceeds": delta_reserved > calibration.margin,
+    }
+
+
+def watch_first_full_prefill(model_runner, result: CalibrationResult) -> None:
+    """One-shot: measure the first real EXTEND forward of the calibrated size (the HTTP warm-up's) and log its peaks
+    beside the calibration's, loudly when it exceeds them by more than the margin; then remove itself. The wrapper is
+    an instance attribute on the runner's ``forward``, gone after that forward."""
+    original = model_runner.forward
+    tokens = result.calibration.tokens
+
+    def measured_forward(forward_batch, *args, **kwargs):
+        mode = getattr(forward_batch, "forward_mode", None)
+        if mode is None or not mode.is_extend() or getattr(forward_batch, "extend_num_tokens", None) != tokens:
+            return original(forward_batch, *args, **kwargs)
+        del model_runner.forward  # restore the class method before anything else can re-enter
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        out = original(forward_batch, *args, **kwargs)
+        torch.cuda.synchronize()
+        report = compare_with_real(
+            result.calibration, torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+        )
+        (logger.error if report["exceeds"] else logger.info)(
+            "hot cache calibration vs the first real %d-token prefill: %s%s",
+            tokens,
+            report,
+            " -- the real prefill exceeds the calibration by more than the margin" if report["exceeds"] else "",
+        )
+        result.extra["first_real_prefill"] = report
+        return out
+
+    model_runner.forward = measured_forward
 
 
 class HotCacheHeadroomShort(RuntimeError):
