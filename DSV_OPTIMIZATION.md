@@ -200,8 +200,15 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   - Arm A's 6:19 load was not HiCache (pools took 6 s, as elsewhere): target shard 1 of 40 took 2:21 with no memory
     pressure, most likely storage contention. The sampler now records /proc/diskstats.
   - C: A plus `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995` (section 3.6): did not run with A/B; running next.
-- **Not done (root, owner's):** `kernel.numa_balancing=0`; IRQ 239 (`eno1-tx-0`) off core 14 (a team0 core);
-  optionally `swapoff -a && swapon -a`; possibly revert `compaction_proactiveness` to 20 (was set to 100).
+- **Box settings changed by the owner (2026-10-15 ~19:50 CDT):**
+  - `kernel.numa_balancing=0`, persisted in `/etc/sysctl.d/90-dsv41.conf`.
+  - `IRQBALANCE_BANNED_CPULIST=0-63` in `/etc/sysconfig/irqbalance`, so the eno1 IRQs 239-243 now sit on 64-71
+    (they were on 14, 3, 9, 36, 5). NVMe per-CPU queue IRQs stay kernel-managed per core, as expected.
+  - `compaction_proactiveness` is back at 20.
+  - The owner's `swapoff -a` was OOM-killed mid-way by prefill-merge's run 3; swap stays active, ~3.1 GB used.
+  - **Every run before this used the old settings.** A'' (A' rerun) is the new baseline and also measures the change.
+- **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
+  The 3120 MiB attribution moves to a standalone single-layer probe.
 
 ### 3.5 VRAM hot cache review — branch `cache-tiers` (`4d81ad411f`, `a4c674a2b9`)
 
