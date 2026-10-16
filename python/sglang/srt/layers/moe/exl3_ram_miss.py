@@ -2246,7 +2246,8 @@ class Exl3RamMissService:
         split to replace."""
         if not envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get() or self.cpu_experts is None:
             return None
-        words = split_model_words(self.wire.nodes, envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get())
+        words = split_model_words(self.wire.nodes, envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get(),
+                                  residency_tiebreak=envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.get())
         logger.info("exl3 RAM miss split model on: cost words (ns) %s", words)
         return words
 

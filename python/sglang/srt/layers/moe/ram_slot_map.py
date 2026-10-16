@@ -53,10 +53,14 @@ SPLIT_MODEL_DEFAULTS_MS = {
     "stream_lane": 0.65,
     "stream_base": 0.0,
 }
+# The flags word's residency tiebreak (lease_device.cuh kSplitModelResidencyTiebreak): among a node's candidates with
+# the same tokens, which the model prices alike, the CPU takes the lowest residency keys and the copy engine the rest.
+SPLIT_MODEL_RESIDENCY_TIEBREAK = 1
 
 
-def split_model_words(nodes: int, overrides: str = "") -> list[int]:
-    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``.
+def split_model_words(nodes: int, overrides: str = "", residency_tiebreak: bool = False) -> list[int]:
+    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``, then
+    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK).
 
     ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS) is ``name=ms`` pairs, comma-separated; a per-node name takes
     ``.node`` (``hit_c.1=0.4``), and without it sets every node. Node n past the defaults' nodes takes the last's."""
@@ -86,7 +90,7 @@ def split_model_words(nodes: int, overrides: str = "") -> list[int]:
     ns = lambda ms: int(round(ms * 1_000_000))
     return [ns(costs[key]) for costs in per_node for key in SPLIT_MODEL_NODE_KEYS] + [
         ns(shared[key]) for key in SPLIT_MODEL_KEYS
-    ]
+    ] + [SPLIT_MODEL_RESIDENCY_TIEBREAK if residency_tiebreak else 0]
 
 
 def split_model_stats_words(nodes: int) -> int:
@@ -161,6 +165,16 @@ def model_cpu_lanes(
         else:
             copy += copy_lane
             lanes += 1
+    if words[5 * nodes + 5] & SPLIT_MODEL_RESIDENCY_TIEBREAK:
+        # A node's candidates with the same tokens cost the model the same: keep how many of them the CPU takes, and
+        # give it the highest plan indexes (plan order is residency key, highest first).
+        groups: dict = {}
+        for j in candidates:
+            groups.setdefault((node_of[j], tokens[j]), []).append(j)
+        for members in groups.values():
+            on_cpu = sum(cpu[j] for j in members)
+            for rank, j in enumerate(sorted(members, reverse=True)):
+                cpu[j] = rank < on_cpu
     return cpu
 
 
