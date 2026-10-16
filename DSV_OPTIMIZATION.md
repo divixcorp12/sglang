@@ -1222,9 +1222,29 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             - **Next (approved, offline):** a shared-drive pricing term; tier rules read from the code with
               citations; spec_land landings. No new capture. If the missing prefill routing still fails T, the
               lane stops and the capture goes to the owner.
+          - **Gate run 2 (`814cd3684b`, `/mnt/nvme1/lane-tier-replay/gate-5.*`): P passes; T and E fail on
+            untraced prefill evictions. Lane stopped.**
+            - P with shared-drive terms: Δstream +52.6 vs +51.7, Δwait -54.2 vs -46.9 (15%), layers exact.
+              Coefficients (OFF, ms ± bootstrap SD):
+              - stream: NVMe-cold GPU lane 1.47±0.07, pool-served lane 0.65±0.08, copy lane 0.75±0.02;
+              - CPU jobs: a RAM-hit job 0.099/lane + 0.439/route, a forced-miss job 0.29 + 0.261/route;
+              - a forced miss lands at 2.11 + 1.76 per CPU miss in plan order + 1.09 per GPU NVMe lane in the
+                record (the shared drives).
+            - T: NVMe-cold GPU lanes per verify are predicted 9.9 / 14.1 against 15.1 / 33.2 observed. 56-59%
+              of the cold GPU lanes left RAM during a prefill, which emits no event; another 16-20% were never
+              seen before. Prefill admissions displace an unbounded number of decode rows when no prefill share
+              is set (ram_tier.h:399, :456, :1982, :2038).
+            - The tier rules read from the code (9 rules, file:line) are in the TIER_RULES block of
+              `lane_tier_replay.py`. VRAM-hot experts keep their RAM row (ram_tier.h:2126). The tier is split per
+              node (~103/87 usable rows per layer). Promotion victims are untraced.
+            - **To continue:** a served capture with prefill route logging (or a prefill admission event) plus
+              the decode route log. **Owner's call.** Separately, prefill evicting decode rows looks like a lever
+              in its own right (a prefill share for the RAM tier).
           - **Owner question (2026-10-16):** consolidate the GPU drip into the hot cache (land drips in victim
             slots and commit residency) before more predictor work, since both pick RAM-resident experts for VRAM.
             The drip was off in both lane-head A/B arms (`drip_issued` 0), so that result is not confounded.
+            **Approved:** agent `drip-hot` (opus), branch `drip-hot` off `ram-prefetch-pool-serve`. A design note
+            comes first; no code or GPU runs before review.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
