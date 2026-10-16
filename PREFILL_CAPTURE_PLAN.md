@@ -17,8 +17,12 @@
   - Predicted decode gains: -5 to -14 ms/verify at the existing 64, and -11 to -25 at shares of 8-32.
   - The gain is flat up to about 0.15 × usable RAM rows per layer, and is mostly gone at 0.6 ×.
   - TTFT is uncertain: this model gives -0.5 to -0.9 s at 64; section 27.9 measured +0.5 to +1.2 s.
-- **Next:** one served A/B of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64), approved; results below once run.
-  No size knob or startup rule until it agrees with the model's direction.
+- **Served share-64 A/B (2026-10-16, `/mnt/nvme1/share64-ab-20261016`): it wins, in the model's direction.**
+  - ms/token -3.46 (95% CI -4.91 .. -1.55), on 6 pair-clean prompts.
+  - Stream + wait -13.5 ms/verify, against -5.4 predicted. It came through the stream (-12.4), not the wait.
+  - NVMe-cold GPU lanes 16.7 → 11.4; forced CPU misses 64.7 → 57.7.
+  - TTFT -0.48 s per prompt, against -0.45 predicted. Section 27.9's +0.5 to +1.2 s did not reproduce.
+  - No STALL, no PREFILL-STALL, no OOM. Full table in `LANE_TIER_REPLAY_HANDOFF.md` section 4.
 
 ## Served share-64 A/B: predictions, written before the run (2026-10-16)
 

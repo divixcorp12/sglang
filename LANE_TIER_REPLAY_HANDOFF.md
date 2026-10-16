@@ -1,9 +1,90 @@
 # Lane tier replay (step 1 of the lane head's next version): handoff, 2026-10-16
 
-Written for a reader with no context. Branch `lane-tier-replay` (off `lane-head` `eb1a14c8c0`). Script:
-`analysis/dsv41-drive/dspark/lane_tier_replay.py`. Offline only; no GPU, no new capture. **Status: stopped at the
-gate.** P passes, T and E fail. The cause of T's failure is the prefill admissions, which the trace does not record.
-Waiting on team-lead and the owner: whether to take a capture with prefill route logging.
+Written for a reader with no context. Branch `lane-tier-replay` (off `lane-head` `eb1a14c8c0`).
+
+## Update, 2026-10-16 afternoon: T passes; lane keys evaluated; prefill share 64 served and it wins
+
+Detail is in `PREFILL_CAPTURE_PLAN.md` (outcome at the top; sections "Stage 0 result", "Evaluation", "Prefill-share
+sweep", "Served share-64 A/B"). Scripts, all in `analysis/dsv41-drive/dspark/`:
+- `lane_tier_replay.py`: T, P, E and `gate --prefill`; rule 10 and the share model in `eager_admit`; `on_gather` for
+  other replays (drip-hot uses it).
+- `lane_eval.py`: the lane-key arms, the share sweep (`--shares`, `--rows-scale`).
+- `share_ab_report.py`: the served A/B report.
+
+### 1. T passes (stage 0, offline, no capture)
+
+- **The data was already there.** The route log's eager lines (no `kind`, phase `extend`) carry every prefill's
+  per-layer routes. T now simulates their admissions by rule 10 in `TIER_RULES`:
+  - the layer's VRAM misses are claimed in ascending order, with all of its routes protected, until the first claim
+    finds no victim;
+  - the rest are admitted in 64-row chunks, with fallback.
+- **The route log's `ram_miss` counts demand reads only, not the prefetch's claims.** `_fill_rows` records rows;
+  `prefetch_rows` does not (`expert_stream.py:479`, `:552`, `:2431`).
+- **Gate, at the same tolerances:**
+  - reads within 0.1-6.3% on all 16 prompts;
+  - T -8.7% (OFF), -7.9% (ON), -7.2% on the delta;
+  - lane precision and recall 0.94-0.96 and 0.86-0.88;
+  - E: -1.8% (stream), +13% (wait). P unchanged.
+- The capture with prefill events (section 1 of the plan) was **not needed**.
+
+### 2. Lane keys on C2 and base (offline)
+
+- **Which prices to read.** Prices fit on each capture fail the served-head check: they put the head at -2.4 ms/verify,
+  where served it is about 0. The A/B OFF prices pass it (+0.3 / +0.6 at 0.77 ms), so those are the ones to read.
+- **Why P alone misleads.** P makes moving a cold lane onto the GPU look free, because its CPU path is critical in
+  96-99% of records. The A/B measured +0.26 ms per moved lane.
+- **The best head arm** is the owner's form (a tier-agnostic P(recur) × the time saved for the live tier) with that
+  served cold cost (`product-emp`): -2.3 to -3.1 ms/verify net at 0.77 ms.
+- **Option (a) is not justified.** Its oracle ceiling is only 1.2-1.6 ms/verify better than product-emp.
+- **The VRAM-only oracle** is worth 4-5 ms/verify.
+
+### 3. Prefill-share sweep (offline)
+
+- **Predicted decode gains.** Share 16-32: -10 to -25 ms/verify. Share 64: -5 to -14. A/B arms, base and C2; A/B
+  prices.
+- **Size.** The gain is flat up to about 0.15 × usable RAM rows per layer, halves at about 0.33 ×, and is mostly gone
+  by about 0.6 × (`--rows-scale` 0.5-1.25).
+- **With the head arm.** The share and product-emp add up.
+
+### 4. Served share-64 A/B (`/mnt/nvme1/share64-ab-20261016`)
+
+- **Setup.** One pair, OFF first, 14:06-14:23. The code is `wt-lane-head-ab` (d269f7aa90's code). The resolved env
+  differs only in `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1`.
+- **Attempts.** The first attempt was aborted in prelaunch: another project held node 1 at 26 GiB free. Its log is
+  `run_ab.aborted-1.log`.
+
+| | predicted (committed `760ade9919`) | measured (pair-clean, 6 prompts) |
+|---|---|---|
+| serve_compare ms/token | | **-3.46, 95% CI -4.91 .. -1.55** (all 8: -3.58, -7.96 .. +0.51) |
+| stream + wait per verify | -5.4 (-6.8 with the residual) | **-13.5** (stream -12.4, wait -1.1); wall per verify -13.7 |
+| by position 0-4 / 5-14 / 15+ | -5.6 / -5.5 / -4.7 | -18.6 / -12.6 / -6.3 |
+| NVMe-cold GPU lanes per verify | 13.76 → 10.17 | 16.73 → 11.35 |
+| forced CPU misses per verify | 64.4 → 61.6 | 64.7 → 57.7 |
+| prefill demand reads per prompt | 2,796 → 2,464 | 2,863 → 2,457 (mean of 8) |
+| TTFT per prompt | -0.45 s | **-0.48 s** (all 8; clean 6: -0.43); +0.21 to -1.06 per prompt |
+
+- **Rows read.** Service `rows_read` 10,975 → 9,120.
+- **Prefetch rows stopped by the share.** Modeled, not logged: 1,291 → 1,090 claims per prompt. The model's demand
+  reads on the ON capture are 2,448, against 2,457 measured.
+- **Run health.**
+  - Flags: no STALL; CPUSLOW on OFF prompt 4 and ON prompt 2 (swap ×17).
+  - Prefill-window nvme3n1 await 7.2-8.8 ms on every prompt, so no PREFILL-STALL.
+  - No OOM. Lowest free memory 642 / 598 MiB.
+- **Reading.** The direction matches the model. The gain is about 2.5× what was predicted, and it came through the
+  stream, not the wait.
+  - TTFT improved, as the model said, where section 27.9 (older arms) had measured +0.5 to +1.2 s.
+  - T under-predicted the OFF cold lanes again: 14.4 modeled on this capture's OFF, against 16.7 measured.
+
+### Next (team-lead's plan)
+
+- The size knob (`PREFILL_SHARE_ROWS` as a startup-calibrated value, about 0.15 × usable rows per layer by the sweep).
+- Then a served check of a smaller share.
+- product-emp needs a startup measurement of the cold-lane cost.
+
+---
+
+**Original status (before the update above):** stopped at the gate. P passed; T and E failed. The cause of T's failure
+was the prefill admissions, which the trace does not record. The rest of this file is that earlier handoff.
 
 ## Why
 
