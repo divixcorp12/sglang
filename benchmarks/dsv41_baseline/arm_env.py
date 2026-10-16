@@ -391,7 +391,8 @@ def prod_dspark_env() -> dict[str, str]:
         # (DSV41_REFERENCE.md 33.14-33.37; promote "converts, does not add", 33.37). Shipped because every stacked
         # served win was measured with it on (-mergechunk, -expseg2, share64-ab-20261016), and the offline comparison
         # could not be resolved (LANE_TIER_REPLAY_HANDOFF.md): owner decision, 2026-10-16. Its 2 pool slots a group
-        # are in the usable rows the prefill share is sized from (64 = 64/187 x 187 on this layout).
+        # are in the usable rows the prefill share is sized from (64 = 64/187 x 187 on this layout). Production only, not
+        # base_env(): it was never measured without DSpark, and every DSpark arm states its prefetch keys itself.
         "SGLANG_DSV41_RAM_PREFETCH": "1",
         "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu",
         "SGLANG_DSV41_RAM_PREFETCH_HORIZON": "2",
