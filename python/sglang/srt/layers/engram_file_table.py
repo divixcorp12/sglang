@@ -197,6 +197,12 @@ class EngramFileTable:
 
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
         assert_not_capturing("EngramFileTable.lookup")
+        from sglang.srt.layers.moe.hot_cache_calibration import calibrating
+
+        if calibrating():
+            # The startup hot-cache calibration's dummy prefill: every lookup would insert into the shared row
+            # cache, so it gets zero rows of the same shape instead (no read, no insert).
+            return torch.zeros(*indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device)
         flat = indices.reshape(-1).cpu().numpy()
         if self._native_store is not None:
             rows = self._native_store.lookup(flat.astype(np.int64), self._tag)
