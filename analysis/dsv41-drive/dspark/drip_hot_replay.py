@@ -61,6 +61,12 @@ ADOPT_LAUNCH_MS = 0.004  # one bookkeeping launch per layer
 # lane_tier_replay's fit on the lane-head A/B (team-lead message 2026-10-16): an NVMe-cold GPU lane's stream, and the
 # delay it puts on a CPU miss's landing.
 NVME_GPU_MS, NVME_ON_CPU_MISS_MS = 1.47, 1.09
+# The other kinds' marginal ms per lane: lane_cost_fit on this capture (cache-tiers-20261015/drip.lanecost.txt) for the
+# CPU's NVMe and pool lanes and the DMA, lane_tier_replay's fit for a pool-served GPU lane. A CPU-RAM lane is priced at
+# both brackets (CPU_RAM_MS), the drip3 empirical marginal and the fit.
+LANE_MS = {"cpu_nvme": 1.06, "cpu_pool": 0.50, "dma": 0.0, "sm": 0.87, "pool": 0.65,
+           "nvme_gpu": NVME_GPU_MS + NVME_ON_CPU_MISS_MS}
+CPU_RAM_MS = (0.07, 0.28)
 
 
 # ---- the capture ------------------------------------------------------------------------------------------------------
@@ -434,10 +440,12 @@ def arms(cap: Capture, horizon: int) -> dict:
         cold = ret.get("cold", 0) / nv
         net_cpu = d_cpu + warm  # a RAM-warm return comes back as a lane: counted as a CPU lane (the bound)
         priced = {}
-        for name, per_lane in (("cpu_0.07", 0.07), ("cpu_0.28", 0.28)):
-            priced[name] = round(
-                d_cpu * per_lane + warm * per_lane + cold * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS)
-                + d_nvme * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS) + gpu_ms, 2)
+        other = sum((m[k] - t[k]) * ms for k, ms in LANE_MS.items())
+        for per_lane in CPU_RAM_MS:
+            # a RAM-warm return is priced as a CPU-RAM lane, an NVMe-cold one as an NVMe GPU lane
+            priced[f"cpu_ram_{per_lane}"] = round(
+                (m["cpu_ram"] - t["cpu_ram"] + warm) * per_lane + other
+                + cold * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS) + gpu_ms, 2)
         out["arms"][a] = {
             "per_verify": {k: round(v, 2) for k, v in m.items()},
             "delta_cpu_lanes": round(d_cpu, 2),
