@@ -438,10 +438,11 @@ def align(run: Run, log: list[dict]) -> int:
 
 
 def promote_fraction(d: str) -> float:
-    """The share of landed pool rows the run promoted (counters.json: spec_promoted_early / spec_landed)."""
+    """The share of landed pool rows the run promoted into the map (counters.json: spec_promoted_early + spec_promoted,
+    over spec_landed)."""
     with open(os.path.join(d, "counters.json")) as f:
         c = json.load(f)
-    return c.get("spec_promoted_early", 0) / max(1, c.get("spec_landed", 1))
+    return (c.get("spec_promoted_early", 0) + c.get("spec_promoted", 0)) / max(1, c.get("spec_landed", 1))
 
 
 def _hash01(*xs: int) -> float:
@@ -478,13 +479,13 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
     for _, e in _events(glob.glob(os.path.join(run.dir, "events.*.exl3-tier*.jsonl")), {"evict"}):
         if e["seq"] not in replayed and rules:
             timeline.append((e["ns"], 0, "evict", (e["row"], e["group"], e["a"], e["c"])))
-    lands = collections.defaultdict(list)  # (row, verify index after landing) -> experts
     if rules:
-        begins = [b for b, _ in run.verifies]
+        # rule 6: each landed pool row is promoted when its row's delta is claimed, just after it lands, at the run's
+        # measured promotion rate (the rest stay in the pool: still reading, no delta, row busy)
         for _, e in _events(glob.glob(os.path.join(run.dir, "events.*.exl3-spec*.jsonl")), {"spec_land"}):
-            k = bisect.bisect_right(begins, e["ns"])
-            lands[(e["row"], k)].append((e["a"], e["ns"]))
-            lands[(e["row"], k - 1)].append((e["a"], e["ns"]))
+            if _hash01(e["row"], e["a"], e["ns"] & 0xFFFFFFFF) < p_promote:
+                timeline.append((e["ns"], 0, "promote", (e["row"], e["a"])))
+    last_hot = collections.defaultdict(set)
     timeline.sort(key=lambda t: (t[0], t[1]))
     pred: dict[int, tuple[int, int]] = {}
     stats = collections.Counter()
@@ -495,6 +496,14 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
             row, g, old, new = payload
             if row < layers and row not in full:
                 tiers[row][g].apply_eviction(old, new, tick)
+            continue
+        if kind == "promote":
+            row, e = payload
+            if row < layers and row not in full:
+                t = tiers[row][e % nodes]
+                before = t.has(e)
+                t.promote(e, last_hot[row])
+                stats["sim_promotions"] += not before and t.has(e)
             continue
         v, i, L = payload
         cur = log[i]
@@ -520,6 +529,7 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
                 stats["obs_gpu_lanes"] += r.gpu_nvme + r.gpu_pool + r.dma
                 stats["pred_cold_misses"] += len(cold_pred)
                 stats["obs_nvme_reads"] += len(set(r.evict_in))
+        last_hot[L] = hot
         if L in full:
             continue
         protected = hot | routed
@@ -529,12 +539,6 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
                 t.stamp[e] = tick
         for e in sorted(misses, key=lambda x: x not in cold_pred):  # rule 5: every miss is cached
             tiers[L][e % nodes].insert(e, tick, protected)
-        if rules and r is not None:
-            for e, land_ns in lands.get((L, v), []):  # rule 6: landed pool rows, before this gather, unused by it
-                if land_ns <= ns and e not in routed and _hash01(v, L, e) < p_promote:
-                    before = tiers[L][e % nodes].has(e)
-                    tiers[L][e % nodes].promote(e, hot)
-                    stats["sim_promotions"] += not before and tiers[L][e % nodes].has(e)
     stats["align_offset"] = off
     stats["promote_fraction"] = round(p_promote, 3)
     stats["capacities"] = {L: [t.capacity for t in tiers[L]] for L in (2, 39)}
