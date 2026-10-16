@@ -683,6 +683,16 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - 8 CPU tests. The census test parses the real classes' source for `*capacity*` attributes. The mutant that
         skips `policy.capacity` is caught.
       - Not yet tested on a real manager; that comes with the step-3 GPU smoke.
+    - **Step 3 findings and decisions:**
+      - `_dummy_run` forces TARGET_VERIFY on a speculative runner, and its graph runners don't exist until capture.
+        So the calibration module builds its own one-sequence EXTEND ForwardBatch, mirroring `_dummy_run`'s extend
+        branch, with no base_runner change.
+      - The prefill MoE admits every RAM-tier miss into the pinned tier; there is no staging-only path.
+      - **Decision: route calibration tokens round-robin to experts already resident in the RAM tier,** with the
+        real route count and about the real distinct-expert count. No admissions, no NVMe reads.
+      - The approximation is checked: the post-capture check logs the calibration peak beside the real warm-up
+        4096-token peak, and flags a gap larger than the fragmentation term.
+      - The Engram and route-recording skips are calibration-context checks.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
