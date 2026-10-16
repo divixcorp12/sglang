@@ -92,6 +92,18 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
       - The job-trace split matches A within 0.5% (CPU hit lanes 318.3 vs 320.0, DMA 116.2 vs 115.9).
     - What remains is the draft drop-cache fix or run noise. Arm A' (A at D's code, tiebreak off) is the new OFF
       sample.
+    - **A'** (`splitmodel-stream-mem-hicache1-r2`, `ccb87893fa`, warm target load):
+
+      | run | ms/token | median verify | mean verify | wait | stream | VRAM hit |
+      |---|---|---|---|---|---|---|
+      | A' | 66.8 | 241.8 | 269.7 | 141.4 | 41.3 | 0.514 |
+
+      - A' reproduces A, so the draft drop-cache fix costs nothing.
+      - D vs A': stream +9.2, wait +4.3, mean verify +50 ms. Lane mix, VRAM hit and decode memory are all the same.
+      - Stream has swung this much between identical runs before (drip4 55 vs 42).
+    - **Decision: tiebreak parked, off.** It is built and tested but showed no VRAM benefit. D's +9 ms stream is
+      unexplained and one-sample; no repeat was run.
+    - Open: A' read 7.35 GiB from sdb3 in an 11 s load window, which is too much for SATA. Which file was it?
 
 ### 3.3 Startup calibration of the split-model constants — branch `split-model-calib` (`7171570959`), NOT merged
 
