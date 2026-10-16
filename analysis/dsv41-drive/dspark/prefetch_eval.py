@@ -135,11 +135,15 @@ def load_reads(run: ltr.Run, d: str):
     lands = {}
     uses = collections.defaultdict(dict)
     serve = {}
+    claims = []
     for path, e in ltr._events(glob.glob(os.path.join(d, "events.*.exl3-spec*.jsonl")) +
                                glob.glob(os.path.join(d, "events.*.exl3-tier*.jsonl")),
-                               {"spec_submit", "spec_land", "spec_use", "pool_point", "svc_record"}):
+                               {"spec_submit", "spec_land", "spec_use", "pool_point", "svc_record", "delta_publish"}):
         k = e["event"]
-        if k == "svc_record":
+        if k == "delta_publish":
+            # a claimed delta of `row` (publish_pending, ram_tier.h:2886): c = the rows its promote_landed promoted
+            claims.append((e["ns"], e["row"], e["c"]))
+        elif k == "svc_record":
             # a = the serve's duration: its start is when the service looked at the pool
             start = e["ns"] - e["a"]
             serve[e["seq"]] = min(serve.get(e["seq"], start), start)
@@ -155,11 +159,11 @@ def load_reads(run: ltr.Run, d: str):
     for seq, xs in subs.items():
         xs.sort()
         reads[seq] = [(row, a, ns, lands.get((seq, row, a))) for _, row, a, ns in xs]
-    return reads, uses, serve
+    return reads, uses, serve, sorted(claims)
 
 
 def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, scorer: GateScorer | None,
-             predict_routed: int, reads, uses, serve) -> dict:
+             predict_routed: int, reads, uses, serve, claims) -> dict:
     d = run.dir
     header, log = ltr.route_log(d)
     off = ltr.align(run, log)
@@ -184,6 +188,9 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
     eager = ltr.eager_lines(d)
     for k, line in enumerate(eager):
         timeline.append((int(line["t"] * 1e9) - 1, 0, "eager", k))
+    for ns_c, row, promoted in claims:
+        # rule 6 (option (a)): the capture's own claims, at their times; assumed unchanged by the pick policy
+        timeline.append((ns_c, 1, "claim", (row, promoted)))
     timeline.sort(key=lambda t: (t[0], t[1]))
 
     clean_v = {v for v in range(len(run.verifies)) if run.prompt_of[v] >= 0 and run.clean[run.prompt_of[v]]}
@@ -196,6 +203,7 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
     out = collections.Counter()
     tick = 0
     pools = ltr.PoolRows(pool_share)  # landed rows waiting for their row's claim (rule 6)
+    promoted_marks = collections.defaultdict(set)  # rows a claim promoted, until their row's next record
     reading = []  # heap of reads in flight: (land ns, submit ns, target row, expert)
 
     def flush(t: int) -> None:
@@ -217,6 +225,14 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
                 if on:
                     out["prefill_claims"] += claims
                     out["prefill_demand"] += demand
+            continue
+        if kind == "claim":
+            row, observed = payload
+            out["claims"] += 1
+            out["obs_claim_promoted"] += observed
+            if row < layers and row not in full:
+                out["promoted"] += pools.claim(row, tiers[row], last_hot[row])
+                promoted_marks[row].update(pools.last_promoted)
             continue
         if kind == "evict":
             row, g, old, new = payload
@@ -264,6 +280,13 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
                     gpu_pred = set(sorted(miss_pred, key=lambda e: (-score[T][e], e))[:k])
                     picks = [e for e in eligible if e in routed_pred and e not in gpu_pred][:n]
             for (row, a, sub, land), e in zip(obs, picks):
+                # The drop path: a read takes a free pool entry, else reclaims the oldest landed one (its row is lost
+                # unused), else is dropped (ram_tier.h:2675-2681).
+                n_reading = sum(1 for x in reading if x[2] == T and x[3] % NODES == e % NODES)
+                fate = pools.make_room(T, e % NODES, n_reading)
+                out[f"pool_{fate}"] += 1
+                if fate == "full":
+                    continue
                 out["issued"] += 1
                 if land is not None:
                     out["landed"] += 1
@@ -303,13 +326,13 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
             out["obs_pool_served"] += sum(1 for x in obs_u.values() if x == "gpu")
         # The record serves its pool: a routed row leaves it (served, taken or a hit); a taken read in flight is the
         # forced miss's own read now.
+        # covered: the misses the prefetch turned from NVMe reads into pool uses or, promoted ahead, RAM hits
+        out["covered"] += len(used) + len(promoted_marks[L] & misses & warm)
+        promoted_marks[L].clear()
         pools.consume(L, u)
         if used & in_flight:
             reading[:] = [x for x in reading if not (x[2] == L and x[3] in used)]
             heapq.heapify(reading)
-        # Serving row L claims row L + 1's delta: its landed rows are promoted (rule 6).
-        if L + 1 < layers and L + 1 not in full:
-            out["promoted"] += pools.claim(L + 1, tiers[L + 1], last_hot[L + 1])
         if v in clean_v:
             s0, w0 = price(P, nv, po, dma, teams, 0)
             s1, w1 = price(P, nv, po, dma, teams, flying)
@@ -341,7 +364,8 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
     prompts = max(1, len(set(x["forward_pass_id"] for x in eager if x["phase"] == "extend")))
     out["wasted"] = out["landed"] - out["used"]
     res.update({k: out[k] for k in ("issued", "landed", "used", "pool_served", "wasted", "promoted",
-                                    "obs_used", "obs_pool_served", "used_cpu_landed", "used_cpu_reading")})
+                                    "obs_used", "obs_pool_served", "used_cpu_landed", "used_cpu_reading", "claims",
+                                    "obs_claim_promoted", "pool_room", "pool_reclaimed", "pool_full", "covered")})
     res["prefill_claims_per_prefill"] = out["prefill_claims"] / prompts
     res["prefill_demand_per_prefill"] = out["prefill_demand"] / prompts
     res["verifies"] = out["verifies"]
@@ -363,7 +387,7 @@ def main() -> int:
     run = ltr.Run(a.capture)
     P = ltr.Prices(ltr.Run(a.prices_from) if a.prices_from else run)
     layers = max(r.row for r in run.records) + 1
-    reads, uses, serve = load_reads(run, a.capture)
+    reads, uses, serve, claims = load_reads(run, a.capture)
     with open(os.path.join(a.capture, "counters.json")) as f:
         counters = json.load(f)
     res = {"capture": a.capture, "share": a.share, "counters": {k: counters.get(k) for k in (
@@ -376,7 +400,8 @@ def main() -> int:
         r0 = log[len(log) // 2]["router"]
         res["gate_self_check"] = round(float(np.mean([scorer.self_check(r0, L) for L in (2, 10, 20, 30)])), 3)
     for arm in a.arms.split(","):
-        res["arms"][arm] = evaluate(run, P, arm, layers, a.share, scorer, a.predict_routed, reads, uses, serve)
+        res["arms"][arm] = evaluate(run, P, arm, layers, a.share, scorer, a.predict_routed, reads, uses, serve,
+                                    claims)
         print(arm, json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in res["arms"][arm].items()
                                if not isinstance(v, dict)}), flush=True)
     if a.validate and "today" in res["arms"]:

@@ -407,6 +407,18 @@ class PoolRows:
             g.popitem(last=False)
         g[e] = True
 
+    def make_room(self, row: int, group: int, reading: int) -> str:
+        """A read's entry (spec_read, claimable_locked, ram_tier.h:2675): with ``reading`` entries of the group still
+        reading, a free entry ("room"), else the oldest landed one, whose row is lost ("reclaimed"); with every entry
+        reading, the read is dropped ("full")."""
+        g = self._groups(row)[group]
+        if len(g) + reading < self.share:
+            return "room"
+        if g:
+            g.popitem(last=False)
+            return "reclaimed"
+        return "full"
+
     def held(self, row: int) -> set:
         return {e for g in self._groups(row) for e in g}
 
@@ -418,6 +430,7 @@ class PoolRows:
     def claim(self, row: int, tier: list, hot: set) -> int:
         """promote_landed for ``row``: every landed entry not mapped takes an LRU victim and its stamp. Returns how many."""
         promoted = 0
+        self.last_promoted = []
         for g in self._groups(row):
             for e in list(g):
                 del g[e]
@@ -425,7 +438,9 @@ class PoolRows:
                 if t.has(e):
                     continue
                 t.promote(e, hot)
-                promoted += t.has(e)
+                if t.has(e):
+                    promoted += 1
+                    self.last_promoted.append(e)
         return promoted
 
 
