@@ -975,6 +975,18 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               doesn't move ms/token. Its value is automation and safety, not speed. Next: release the 168 MiB
               residue (~+13 slots), write the final handoff, and wrap up the lane. (c) and (d) (wq_b) are
               deferred.
+          - **calib11b** (`abaae5fdd0`): **final calibration design passes.**
+            - The warm second trial estimates capture at **100 MiB against the real 98 (2%)**. Cold minus warm is
+              612 MiB of state that persists for the process, now counted once, in F.
+            - Peak free 552 ≥ margin 508.5. Slots 1,035 → **1,056 (+21)**. KV pinned, 0 OOM.
+            - Startup +24 s against calib7.
+            - calib11 crashed in the diagnostic module walk, and the "failure never fails the launch" path worked
+              on the GPU: it started at 1,035 with 900 free.
+            - Open: the warm residue of 36 MiB, the 114 MiB still unattributed (walk fix `a75bb27afb` not
+              GPU-run), and the decode-only STALL flag in serve_compare.
+            - Handoff: `PREFILL_MERGE_HANDOFF.md` on `prefill-merge-chunk` at `25d8c3e679`. 200 passed / 56 skipped
+              at `a75bb27afb`. **Lane idle.** It is the owner's decision whether to merge it; every flag is off by
+              default.
             - Follow-up checks:
               - ON's 2x-slow prefills (prompts 3 and 4, 30 s against 15 s) sit inside an nvme3n1 (SPCC) stall
                 during prefill: read await 47-52 ms against the ~9 ms baseline. OFF has the same thing on
