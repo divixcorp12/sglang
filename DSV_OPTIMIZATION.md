@@ -1208,6 +1208,23 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             - Gate: it must first reproduce the A/B's stream +51.7 / wait -46.9 ms/verify. If it does, it evaluates
               the RAM-warm cap (b), the current head, and an oracle on held-out data, net of the head's cost.
             - Retraining with a RAM-tier feature (a) comes only if (b) gains but leaves a gap; CPU only.
+          - **Gate run 1 FAILED** (`lane-tier-replay` `53247e1632`, `/mnt/nvme1/lane-tier-replay/gate-2.*`):
+            - The trace facts hold exactly on both arms: a record streams iff it has a GPU lane from NVMe, and
+              the experts it inserts are exactly its GPU lanes.
+            - **P (pricing):** stream passes (Δ +53.8 vs +51.7; layers exact). Δwait is predicted -66.9 against
+              -46.9 measured, a fail. The model treats the GPU stream and the CPU's forced-miss reads as
+              independent, but they share the drives. On ON the costs rise: a forced miss costs 2.96 + 3.40
+              ms/expert (OFF 2.49 + 1.89) and an NVMe GPU lane 2.37 ms (OFF 1.83).
+            - **T (RAM-tier LRU, 170 rows/layer):** fails. NVMe GPU lanes per verify are predicted 12.2 / 17.4
+              against 15.1 / 33.2 observed. The model omits prefill routing, the L+2 landings, per-node capacity,
+              and possibly the rule on whether VRAM-hot experts keep their RAM row.
+            - **E:** fails, Δstream +19.8.
+            - **Next (approved, offline):** a shared-drive pricing term; tier rules read from the code with
+              citations; spec_land landings. No new capture. If the missing prefill routing still fails T, the
+              lane stops and the capture goes to the owner.
+          - **Owner question (2026-10-16):** consolidate the GPU drip into the hot cache (land drips in victim
+            slots and commit residency) before more predictor work, since both pick RAM-resident experts for VRAM.
+            The drip was off in both lane-head A/B arms (`drip_issued` 0), so that result is not confounded.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
