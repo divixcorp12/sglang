@@ -662,8 +662,13 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
   - **(C) step 1 pushed** (`bf68f4ca52`, flag off): `layers/moe/hot_cache_vmm.py` `VmmHotCacheBacking`, with one VA
     reservation per tensor in 2 MiB granules. `release_tail(keep_rows)` unmaps whole granules past the kept rows.
     - 23 CPU tests passed.
-    - GPU test `test/manual/dsv41/test_hot_cache_vmm_gpu.py`: kept addresses and contents, free memory rising by
-      the released bytes, coexistence with expandable_segments. Running now.
+    - GPU test `test/manual/dsv41/test_hot_cache_vmm_gpu.py`: **2 passed, EXIT=0** (10 s). Kept addresses and
+      contents hold, free memory rises by the released bytes, and it coexists with expandable_segments (0 alloc
+      retries).
+    - **Headroom left at expseg2:** 15 slots at that launch, but only 4 at the lowest free-before-load seen (the
+      static jitter allowance costs 143 MiB). So (C) is worth about 4-15 slots per launch.
+    - **The bigger lever is the 1,459 MiB live prefill transient (~115 slots):** attention 903 MiB plus 556 MiB held
+      across layers. A scoping note on bit-identical cuts comes after step 2.
     - Next: step 2 (retire through one capacity authority).
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
