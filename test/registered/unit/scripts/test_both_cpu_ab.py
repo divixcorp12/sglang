@@ -1103,16 +1103,18 @@ def test_every_arm_but_spcc13_pins_the_span_weights_unset_against_an_exported_sh
             assert (overrides[SPAN[0]], overrides[SPAN[1]]) == want, arm
 
 
-def test_prod_is_the_best_served_arm_without_its_prefetch_and_with_both_startup_calibrations():
-    # MERGE_PLAN_1016.md: production = -mergechunk-expseg (the best served arm) less the pending RAM prefetch, with the
-    # table and hot-cache calibrations on (owner rule); every other key the arm states is at its library default.
+def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_checksummed_head():
+    # MERGE_PLAN_1016.md: production = -mergechunk-expseg (the best served arm, prefetch on: owner, 2026-10-16) with the
+    # table and hot-cache calibrations on (owner rule) and the prefetch head's production copy; every other key the arm
+    # states is at its library default.
     ab = _ab()
     arm_env = ab.arm_env
     arm = ab.MERGE_CHUNK_EXPSEG_ARM
     best, prod = arm_env.arm_env(ab.ARMS[arm][0]), arm_env.prod_env()
     differs = {k: (best.get(k), prod.get(k)) for k in set(best) | set(prod) if best.get(k) != prod.get(k)}
-    prefetch = {k for k in differs if k.startswith("SGLANG_DSV41_RAM_PREFETCH")}
-    assert best["SGLANG_DSV41_RAM_PREFETCH"] == "1" and all(prod.get(k) is None for k in prefetch)
+    head = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
+    assert differs.pop(head) == (ab.T3_HEAD, arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD)
+    prefetch = set()
     stated_defaults = {
         "SGLANG_DSPARK_TOP_PROB_GATE": "0",
         "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS": "",

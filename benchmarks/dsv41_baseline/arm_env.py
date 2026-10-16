@@ -32,6 +32,8 @@ from `hf_config.model_type == "deepseek_v41"`, independent of either flag).
 
 from __future__ import annotations
 
+import os
+
 import msgspec
 
 NVFP4_WORK = "/data/models/slang/nvfp4-work"
@@ -299,6 +301,11 @@ PROD_FLOOR_WAIT_MIN = 10
 PROD_PRELAUNCH_SKIP_EVICT_PORTS = (30032,)
 # Where a refusal looks for the page cache that fills node 1.
 PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4", "/data/models")
+# The RAM prefetch's learned L+2 T3 head (prod_dspark_env), a read-only production copy of the file the best arm
+# served (nvfp4-work/ram-prefetch/l2-t3-head/t3-f109-calib-b075.safetensors). launch_prod.sh refuses to start unless the
+# file is there with this SHA256 (check_prod_assets).
+PROD_RAM_PREFETCH_LEARNED_HEAD = "/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors"
+PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309"
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:
@@ -340,9 +347,8 @@ def prod_dspark_env() -> dict[str, str]:
     calibrations on. The arms state each of these themselves, so they stay out of dspark_env(), which every arm builds
     on. Evidence is DSV_OPTIMIZATION.md (DO) and DSV41_REFERENCE.md; "pair" means one served A/B pair.
 
-    Pending, not set here: the RAM prefetch family (SGLANG_DSV41_RAM_PREFETCH and its keys; no clean served win, REF
-    33.14-33.37; waits on lane-tier's offline comparison) and SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM (needs an A/B on
-    the copy engine and the graphed verify)."""
+    Pending, not set here: SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM (needs an A/B on the copy engine and the graphed
+    verify) and SGLANG_OPT_LANE_HEAD_PATH (held)."""
     return {
         # Whole layers 0 and 1 in the pinned tier, in a tier grown to hold them: 70.5 vs 76.2 ms/token, layers 0+1
         # 20.5 -> 13.0 ms a verify (DO 3.1; the OFF run was stall-flagged).
@@ -378,7 +384,50 @@ def prod_dspark_env() -> dict[str, str]:
         # with: per-chunk kernels off and the indexer budget at base_env's 128, as the best arm ran.
         "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": "1",
         "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS": "0",
+        # The NVMe-to-RAM prefetch exactly as the best arm served it (share64-ab-20261016 resolved-env "on"): GPU
+        # scorer on layer L's hidden state for layer L+2 through the learned T3 head, 2 reads a layer, 1 a token,
+        # speculative reads only to an idle drive (2 pieces in flight, spread, 4 ms deadline), 2 pool slots a group,
+        # landed rows promoted into the tier map and GPU misses served from the pool. No clean served win of its own
+        # (DSV41_REFERENCE.md 33.14-33.37; promote "converts, does not add", 33.37). Shipped because every stacked
+        # served win was measured with it on (-mergechunk, -expseg2, share64-ab-20261016), and the offline comparison
+        # could not be resolved (LANE_TIER_REPLAY_HANDOFF.md): owner decision, 2026-10-16. Its 2 pool slots a group
+        # are in the usable rows the prefill share is sized from (64 = 64/187 x 187 on this layout).
+        "SGLANG_DSV41_RAM_PREFETCH": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu",
+        "SGLANG_DSV41_RAM_PREFETCH_HORIZON": "2",
+        "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": PROD_RAM_PREFETCH_LEARNED_HEAD,
+        "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "2",
+        "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
+        "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
+        "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
+        "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "2",
+        "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
+        "SGLANG_DSV41_RAM_PREFETCH_PROMOTE": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE": "1",
+        "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",  # the older GPU-side expert prefetch stays off (base_env's, stated)
     }
+
+
+def check_prod_assets(head: str = PROD_RAM_PREFETCH_LEARNED_HEAD,
+                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) -> str:
+    """launch_prod.sh's asset check: the prefetch head production loads exists and hashes to the pinned SHA256.
+    Returns a line saying so; raises SystemExit with the reason otherwise."""
+    import hashlib
+
+    if not os.path.isfile(head):
+        raise SystemExit(f"not starting production: the RAM prefetch head {head} is missing "
+                         f"(arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD; expected sha256 {sha256})")
+    digest = hashlib.sha256()
+    with open(head, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != sha256:
+        raise SystemExit(f"not starting production: the RAM prefetch head {head} has sha256 {digest.hexdigest()}, "
+                         f"not the pinned {sha256} (arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256)")
+    return f"prefetch head verified: {head} sha256 {sha256}"
 
 
 def prod_env() -> dict[str, str]:

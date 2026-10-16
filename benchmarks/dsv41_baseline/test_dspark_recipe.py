@@ -57,8 +57,7 @@ def test_prod_env_carries_the_best_arms_settings_and_both_startup_calibrations()
 
 def test_prod_leaves_the_pending_and_held_flags_off():
     env = arm_env.prod_env()
-    # The RAM prefetch waits on lane-tier's offline comparison; the side stream on its own A/B; the lane head is held.
-    assert not any(k.startswith("SGLANG_DSV41_RAM_PREFETCH") for k in env)
+    # The side stream waits on its own A/B; the lane head is held; the rest measured neutral or not served.
     for held in ("SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM", "SGLANG_OPT_LANE_HEAD_PATH", "SGLANG_DSV41_GPU_DRIP_SLOTS",
                  "SGLANG_DSPARK_TOP_PROB_GATE", "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK",
                  "SGLANG_DSV41_CPU_EXPERTS_STORE_OUT", "SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL",
@@ -66,6 +65,53 @@ def test_prod_leaves_the_pending_and_held_flags_off():
         assert held not in env, held
     # Measurement only: the instrumented build's traces and the hot cache's metrics file.
     assert not any("TRACE" in k for k in env) and "SGLANG_MOE_HOT_METRICS_FILE" not in env
+
+
+# The best arm's prefetch keys, from divix01:/mnt/nvme1/share64-ab-20261016/resolved-env.json "on" (its head was
+# nvfp4-work/ram-prefetch/l2-t3-head/t3-f109-calib-b075.safetensors, production's is the checksummed copy).
+SERVED_PREFETCH = {
+    "SGLANG_DSV41_RAM_PREFETCH": "1",
+    "SGLANG_DSV41_RAM_PREFETCH_HORIZON": "2",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "1",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "2",
+    "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "1",
+    "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
+    "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "2",
+    "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
+    "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE": "1",
+    "SGLANG_DSV41_RAM_PREFETCH_PROMOTE": "1",
+    "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu",
+    "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
+    "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
+    "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
+}
+
+
+def test_prod_serves_the_best_arms_prefetch_with_the_checksummed_head():
+    env = arm_env.prod_env()
+    prefetch = {k: v for k, v in env.items() if k.startswith("SGLANG_DSV41_RAM_PREFETCH")}
+    head = prefetch.pop("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD")
+    assert {**prefetch, "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": env["SGLANG_MOE_PREFETCH_MAX_CANDIDATES"]} == SERVED_PREFETCH
+    assert head == arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD
+    assert head.startswith("/data/models/slang/prod-assets/") and len(arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) == 64
+    # The arms keep their own: dspark_env() states no prefetch.
+    assert not any(k.startswith("SGLANG_DSV41_RAM_PREFETCH") for k in arm_env.dspark_env())
+
+
+def test_check_prod_assets_accepts_the_pinned_digest_and_refuses_any_other(tmp_path):
+    import hashlib
+
+    import pytest
+
+    head = tmp_path / "head.safetensors"
+    head.write_bytes(b"weights")
+    sha = hashlib.sha256(b"weights").hexdigest()
+    assert arm_env.check_prod_assets(str(head), sha) == f"prefetch head verified: {head} sha256 {sha}"
+    with pytest.raises(SystemExit, match="not the pinned"):
+        arm_env.check_prod_assets(str(head), "0" * 64)
+    with pytest.raises(SystemExit, match="is missing"):
+        arm_env.check_prod_assets(str(tmp_path / "none"), sha)
 
 
 def test_prod_argv_carries_its_memory_and_the_arms_keep_theirs():

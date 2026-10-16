@@ -4,6 +4,7 @@ Every test points the script at a port and a lock file of its own (LAUNCH_PROD_P
 on divix01 while production serves on 7867 cannot touch it. Linux only (pgrep, flock, /proc).
 """
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -30,8 +31,17 @@ def _stand_in(port, *, ignore_term=False):
     raise AssertionError("the stand-in never took its command line")
 
 
+def _head(tmp_path, content=b"a stand-in prefetch head", name="head.safetensors"):
+    """A head file and its sha256, for LAUNCH_PROD_HEAD / LAUNCH_PROD_HEAD_SHA256."""
+    path = tmp_path / name
+    path.write_bytes(content)
+    return path, hashlib.sha256(content).hexdigest()
+
+
 def _run(tmp_path, *args, **env):
-    full = dict(os.environ, LAUNCH_PROD_PORT=str(PORT), LAUNCH_PROD_GPU_LOCK=str(tmp_path / "gpu.lock"))
+    head, sha = _head(tmp_path, name="default-head.safetensors")  # every run checks a head; tests may name another
+    full = dict(os.environ, LAUNCH_PROD_PORT=str(PORT), LAUNCH_PROD_GPU_LOCK=str(tmp_path / "gpu.lock"),
+                LAUNCH_PROD_HEAD=str(head), LAUNCH_PROD_HEAD_SHA256=sha)
     full.update({k: str(v) for k, v in env.items()})
     return subprocess.run(["bash", SCRIPT, *args], env=full, capture_output=True, text=True, timeout=120)
 
@@ -162,6 +172,37 @@ def test_a_dry_run_start_below_the_floor_names_the_nodes_the_floor_and_the_page_
     assert "WARNING node 0 has 70.0 GiB free" in r.stderr  # under PROD_NODE0_WARN_GIB: a warning, not a refusal
     assert str(tmp_path / "holders" / "big-model") in r.stderr
     assert "drop_caches" in r.stderr
+
+
+def test_a_dry_run_start_verifies_the_prefetch_heads_checksum(tmp_path):
+    head, sha = _head(tmp_path, b"the head production loads")
+    r = _run(tmp_path, "start", DRY_RUN=1, LAUNCH_PROD_HEAD=head, LAUNCH_PROD_HEAD_SHA256=sha,
+             **_floor_env(tmp_path, 86.0, 84.0))
+    assert r.returncode == 0, r.stderr
+    assert f"prefetch head verified: {head} sha256 {sha}" in r.stdout
+
+
+def test_a_start_refuses_a_prefetch_head_that_does_not_match_or_is_missing(tmp_path):
+    head, sha = _head(tmp_path, b"the head production loads")
+    wrong = hashlib.sha256(b"another head").hexdigest()
+    # Dry runs only: a real start that got past a broken check would launch production.
+    for cmd in ("start", "restart"):
+        (tmp_path / cmd).mkdir()
+        r = _run(tmp_path, cmd, DRY_RUN=1, LAUNCH_PROD_HEAD=head, LAUNCH_PROD_HEAD_SHA256=wrong,
+                 **_floor_env(tmp_path / cmd, 86.0, 84.0))
+        assert r.returncode == 1, (cmd, r.stdout, r.stderr)
+        assert f"has sha256 {sha}, not the pinned {wrong}" in r.stderr
+        assert "prelaunch:" not in r.stdout  # refused before the memory floor
+    r = _run(tmp_path, "start", DRY_RUN=1, LAUNCH_PROD_HEAD=tmp_path / "missing.safetensors",
+             LAUNCH_PROD_HEAD_SHA256=sha)
+    assert r.returncode == 1 and "is missing" in r.stderr
+    # The real start runs the same check_assets before anything else (test_the_real_start_checks_the_assets_...).
+
+
+def test_the_real_start_checks_the_assets_before_the_lock():
+    text = open(SCRIPT).read()
+    lock = text.index('exec 9>"$gpu_lock"')
+    assert text.rindex("check_assets || exit 1", 0, lock) > text.index('if [ "$dry" = 1 ]; then\n    echo "checkout')
 
 
 def test_the_floor_check_runs_under_the_lock_and_before_the_server_starts():

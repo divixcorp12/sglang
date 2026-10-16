@@ -104,6 +104,23 @@ print(" ".join(map(str, out)))
     "$py" "$repo/analysis/dsv41-drive/dspark/prelaunch_evict.py" --log "$log" $args "$@"
 }
 
+# The files prod_env() names that are not in this checkout: the RAM prefetch's learned head must exist and hash to
+# arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 (arm_env.check_prod_assets); otherwise nothing starts.
+# LAUNCH_PROD_HEAD and LAUNCH_PROD_HEAD_SHA256 exist for test_launch_prod.py.
+check_assets() {
+    PYTHONPATH="$here" "$py" -c '
+import os
+import arm_env
+
+kw = {}
+if os.environ.get("LAUNCH_PROD_HEAD"):
+    kw["head"] = os.environ["LAUNCH_PROD_HEAD"]
+if os.environ.get("LAUNCH_PROD_HEAD_SHA256"):
+    kw["sha256"] = os.environ["LAUNCH_PROD_HEAD_SHA256"]
+print(arm_env.check_prod_assets(**kw))
+'
+}
+
 if [ "$cmd" = stop ]; then
     stop_server
     exit
@@ -114,6 +131,7 @@ if [ "$cmd" = restart ]; then
     if [ "$dry" = 1 ]; then
         stop_server
         echo "would start production, log $log_dir/server.log"
+        check_assets || exit 1
         dry_log=$(mktemp)
         prelaunch "$dry_log" --dry-run || true
         rm -f "$dry_log"
@@ -145,11 +163,14 @@ for k, v in sorted(arm_env.prod_env().items()):
     print(f"env {k}={v}")
 print("argv:", " ".join(arm_env.ServerArgs.prod().argv()))
 '
+    check_assets || exit 1
     dry_log=$(mktemp)
     prelaunch "$dry_log" --dry-run || true
     rm -f "$dry_log"
     exit 0
 fi
+
+check_assets || exit 1
 
 exec 9>"$gpu_lock"
 flock --nonblock 9 || { echo "cc-gpu.lock is held by another GPU job; not starting production" >&2; exit 1; }
