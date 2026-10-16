@@ -286,6 +286,17 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
   - ~780 MiB: the 257- and 400-token prefills plus copy-engine arming.
   - ~1.5 GB: the 2048, 2049 and 4096 prefills.
   An allocator-history probe (`1c258a85ea`) will attribute it exactly after the A/B.
+- **Allocator-probe attempts:**
+  - Run 1, on the `-mergechunk` arm with mlockall: the allocator-snapshot dump got the scheduler host-OOM-killed
+    (MEMORY_POLICY nodemask=0, anon-rss 127 GiB).
+  - **Finding: under mlockall the `-mem` arms leave node 0 with only ~0.14 GiB free**, so any extra node-0
+    allocation risks an OOM kill.
+  - Run 2: the pinned tier was cut to 20 GiB, and startup refused it (layer 0 needs 66 node-0 slots). The probe then
+    held both locks for 18 min; fixed in `4bada59bd0`.
+  - Run 3 (dspark-both, default tier, no mlockall, one 4096-token prompt) is queued after A', with a node-0 free check
+    before the dump.
+  - Offline so far: the torch prefill indexer is already capped at 128 MB (~384 MiB transient). The 810 MiB of MoE
+    staging is persistent.
 - **ON run at 12140 MiB / 956 slots** (`splitmodel-stream-mem-hicache1-mergechunk`, vs arm A):
   - Result: 66.4 vs 65.9 ms/token, step median 241.1 vs 251.3, tokens per verify 3.46 vs 3.56. No gain detectable on
     one sample.
