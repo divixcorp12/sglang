@@ -589,6 +589,23 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - Step 1 is a map of the capacity-dependent init and a reorder proposal, before any code. `model_runner.py`
         stays a hook call at most.
       - The expandable_segments smoke still runs first.
+    - **Map (step 1) found a blocker for rebuilding:**
+      - The native copy engine's `set_table` is set-once per row (`copy_engine.h:368`), and it holds hot-cache
+        addresses from `from_model`.
+      - There is no teardown for the manager, updater or recorder, and RAM-miss service shutdown is one-way.
+      - Hook point: `scheduler.init_model_worker`, between attention-backend init and `init_all_cuda_graphs`.
+    - **Decision (team-lead): design (C), VMM tail-release**, flag `SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP`
+      (off).
+      - Hot-cache tensors are allocated at an upper-bound capacity on CUDA VMM (2 MiB pages).
+      - At the hook, a calibration EXTEND at `--chunked-prefill-size` runs twice through the graph runner's
+        `_dummy_run`. The second run measures fragmentation in-launch.
+      - Then tail slots are retired: evicted, marked retired, capacity lowered everywhere through one authority,
+        pages unmapped. All before capture and copy-engine arming.
+      - Base addresses stay valid, so the copy table, segment tables and pointer tables don't change.
+      - The margin is checked again after capture and after the warm-up peak (refuse healthy if short).
+      - No-state guards: no route recording, recorder, inserts, pinned-tier admissions or Engram cache.
+      - Rejected: (A) deferred construction (it starts the RAM-miss service before plan_graph_gather), and a full
+        rebuild (it needs a native set_table replace and teardown).
   - **expandable_segments smoke** (`splitmodel-stream-mem-hicache1-mergechunk-expseg`, 2026-10-15 22:55-23:03),
     read from the log:
     - **Peak used 30,163 MiB, 2,040 MiB free** (482-598 before).
