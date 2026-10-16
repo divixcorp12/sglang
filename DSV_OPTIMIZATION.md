@@ -1064,6 +1064,19 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
         - (d) v2.
       - **Decision:** (a) first, built only if the replay recovers ≥ 5 misses/verify; also replay it with 20
         landings in place of 40. (b) to (d) wait until (a) has a served A/B.
+      - **(a) refuted and dropped** (`c2.ramprefetch-victims.txt`):
+        - Speculative-first eviction comes out at 52.9 misses/verify (+2.5, worse): a landing counts as
+          unrouted until its target layer runs, so it gets evicted before use.
+        - Stale-first comes out at 49.9 (−0.5).
+        - **The "13.5 induced by churn" claim is retracted.** `promote_landed` already stamps a landing with
+          its victim's old recency, so unused landings are already the first to be evicted. The
+          18.2-against-4.7 gap is a calibration ambiguity in the replay's ideal LRU.
+        - Of the misses prefetch covers, 70% are experts not routed in the last 9+ verifies: genuinely cold
+          rows. Only ~3.6 misses/verify could ever be helped by an eviction rule.
+        - The 20-landing variant can't be measured from this capture, because spec_land has no pick index.
+        - The lever for L+2 prefetch is prediction precision, not the RAM tier.
+      - **Next: (b) v1 gather-time integration**, flag off by default, with a design note before code.
+        (c) and (d) stay held.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
