@@ -202,8 +202,10 @@ def clamp_costs(costs: SplitModelCosts) -> tuple[SplitModelCosts, list]:
             raise SplitModelCalibrationError(f"{name} = {value} ms is outside any sane range ({lo}..{hi} ms)")
         if lo <= value <= hi:
             return value
-        clamped.append(f"{name} {value:.3f}->{min(max(value, lo), hi):.3f}")
-        return min(max(value, lo), hi)
+        bounded = min(max(value, lo), hi)
+        if abs(value - bounded) >= 5e-4:  # a fit's rounding past a bound (-0.0001 ms) is not worth a log entry
+            clamped.append(f"{name} {value:.3f}->{bounded:.3f}")
+        return bounded
 
     per_node = {
         key: [one(f"{key}.{n}", v) for n, v in enumerate(getattr(costs, key))] for key in SPLIT_MODEL_NODE_KEYS
