@@ -1094,6 +1094,16 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
         - +28.5 MB VRAM in total (PCA 26.2 MB), subtracted from the hot budget in `from_model` and logged.
         - Cost estimate 5-10 µs/layer, to be measured past L2.
         - The A/B reports VRAM hits per verify, CPU-lane time and gate→plan time alongside ms/token.
+      - **Lane-head agent restarted** (opus, fresh context, 2026-10-16). It builds on the WIP `8191a92d3b`.
+        - Its review found two bugs: dead rows were counted as routes, and the odds check fails on the real file.
+        - **Fixed training/serving skew:** training used a per-request score (starting at 0, verify-only,
+          0.98^live decay) and a per-request age. Serving's `insert_scores` includes prefill counts and never
+          resets: ~30 after a 2k prefill where training saw 0. The head now keeps its own state, updated in
+          training's exact order and reset at each prefill.
+        - Draft odds: training fed the constant 1.0; serving feeds the stored training value.
+        - A launch with the flag on is refused if the top-prob gate is on, or if the insert decay differs from
+          training.
+        - Kept independent of `prefill-merge-chunk`. A test with both flags on comes after both land.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
