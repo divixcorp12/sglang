@@ -378,7 +378,26 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
   | 956 slots | 134, no OOM |
 
   Re-derived (`918b3560fe`): 923 slots = **11721 MiB**, fraction 0.8150, KV 381,184. That is +70 slots over 10840,
-  not +103. Derived, not yet run; on hold until the 3120 MiB attribution is in.
+  not +103.
+- **11721 MiB run** (`splitmodel-stream-mem-hicache1-mergechunk-r2`, 2026-10-15 20:17-20:24, one sample):
+
+  | run | ms/token | tok/verify | median step | fwd wall | gate wait | misses/fwd | covered |
+  |---|---|---|---|---|---|---|---|
+  | A | 65.9 | 3.56 | 251.3 | 243.7 | 191.5 | 77.8 | 16.5 |
+  | A'' | 70.9 | 3.52 | 248.4 | 240.3 | 187.7 | 74.6 | 15.4 |
+  | mergechunk-r2 | **63.9** | 3.56 | 235.0 | 229.0 | 177.0 | 76.8 | 16.5 |
+
+  - **Safety: clean.**
+    - GPU: peak 31,605 MiB used, 598 MiB free (margin 508), no OOM, 923 slots, KV 381,184.
+    - Node 0: low point 0.72 GiB in decode, 0.24 GiB at load (just above the boosted watermark).
+    - Swap: out 7.5 MiB at load, 75 pages in decode. Swap used stayed flat at about 2.9 GiB carried over from before
+      the run.
+  - **Speed: unresolved.**
+    - Faster than A'' by 7.0 ms/token, with forward and gate wait each about 11 ms lower.
+    - But misses/forward did not fall (76.8 vs 74.6), so the extra slots don't explain it.
+    - Within the 65.9-70.9 spread between identical runs.
+    - Treat as a safety pass, not a speed result.
+  - Text diverges only at the known-unstable points (ETR, DISCA); the merge itself is bit-tested.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
