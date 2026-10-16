@@ -10,7 +10,13 @@ import json
 
 import pytest
 
-from sglang.kernels.ops.moe.expert_stream_transport import read_rows_drive_load
+from sglang.kernels.ops.moe.expert_stream_transport import (
+    DRIVE_FIELDS,
+    DRIVE_SLOTS,
+    DRIVE_TAIL_FIELDS,
+    decode_drive_load,
+    read_rows_drive_load,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 from sglang.test.dsv41_ram_prefetch_fixtures import load, prefetch_rig
@@ -54,6 +60,18 @@ def rows_exact(s, row, experts, slots):
                for name in oracle for i, slot in enumerate(slots))
 
 
+def test_the_snapshot_layout_appends_the_tail_after_every_root():
+    """The original fields keep their word offsets (3 + q * 11 + k), so a parser of the 47-word layout reads the same
+    values; the tail follows all four roots, field-major, and decodes into each root's dict."""
+    assert len(DRIVE_FIELDS) == 11 and DRIVE_TAIL_FIELDS == ("fill_bytes",)
+    words = list(range(3 + DRIVE_SLOTS * (len(DRIVE_FIELDS) + len(DRIVE_TAIL_FIELDS))))
+    words[2] = 3
+    got = decode_drive_load(words)
+    for q, root in enumerate(got["roots"]):
+        assert [root[name] for name in DRIVE_FIELDS] == words[3 + q * 11 : 3 + (q + 1) * 11]
+        assert root["fill_bytes"] == words[3 + DRIVE_SLOTS * 11 + q]
+
+
 @pytest.mark.parametrize("piece_stream", [False, True])
 def test_a_demand_read_counts_its_bytes_per_root_and_returns_idle(setup, piece_stream):
     experts, slots = [0, 3, 5], [0, 1, 2]
@@ -63,7 +81,7 @@ def test_a_demand_read_counts_its_bytes_per_root_and_returns_idle(setup, piece_s
     assert len(after["roots"]) == ROOTS and idle(after), after
     want = expected_bytes(setup.tables, ROW, experts)
     assert all(want) and landed(after, "demand") == want, (landed(after, "demand"), want)
-    assert landed(after, "spec") == [0] * ROOTS
+    assert landed(after, "spec") == [0] * ROOTS and landed(after, "fill") == [0] * ROOTS
     for root in after["roots"]:
         assert root["demand_busy_ns"] > 0 and root["spec_busy_ns"] == 0 and root["overlap_ns"] == 0, root
         assert root["demand_busy_ns"] <= after["elapsed_ns"], root
@@ -182,6 +200,8 @@ def test_every_group_of_the_tier_counts_into_its_one_load(tmp_path, nodes):
         assert idle(after)
         assert sum(landed(after, "demand")) == _row_bytes(tables, 0, experts), after
         assert sum(landed(after, "spec")) == 0
+        assert sum(landed(after, "fill")) == 0  # the service's misses are demand, never fill
+        assert rig.host.counters()["eager_evictions"] == 0
         rig.host.spec_place(1, 3)
         pooled = rig.host.drive_load()
         assert idle(pooled)
@@ -201,4 +221,6 @@ def test_stop_logs_the_drive_load_line(tmp_path, capfd):
     assert len(lines) == 1, lines
     logged = json.loads(lines[0][len("exl3 RAM miss drive load "):])
     assert [root["demand_bytes"] for root in logged["roots"]] == [root["demand_bytes"] for root in want["roots"]]
+    # The tail fields decode into each root's dict after the original ones, which keep their order.
+    assert list(logged["roots"][0])[:11] == list(DRIVE_FIELDS) and "fill_bytes" in logged["roots"][0]
     assert idle(logged) and logged["elapsed_ns"] >= want["elapsed_ns"]

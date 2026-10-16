@@ -116,7 +116,10 @@ class ExpertGatherStats:
     backing tensors, whether their source device is CPU or CUDA. ``routed_rows`` and
     ``routed_miss_rows`` count routes with multiplicity; ``unique_miss_rows`` counts
     the distinct missed experts actually gathered. The ``host_read_*`` fields sum the
-    row sources' ``RowReadStats`` for the gather.
+    row sources' ``RowReadStats`` for the gather. ``host_fill_rows`` counts the rows
+    ``prefill_fills`` read for the gather before it ran (SGLANG_DSV41_ENABLE_PREFILL_FILLS):
+    the gather then finds them in the pinned tier, so they are among its
+    ``pinned_host_hit_rows``, not its ``pinned_host_miss_rows`` or ``host_read_rows``.
 
     The stats are constructed positionally, so new fields must be trailing and
     defaulted.
@@ -143,6 +146,7 @@ class ExpertGatherStats:
     host_read_split_bytes: int = 0
     host_read_ns: int = 0
     host_split_ns: int = 0
+    host_fill_rows: int = 0
 
 
 def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
@@ -1267,6 +1271,8 @@ class ExpertStreamer:
         # Row-source reads outside eager gathers (promotions, seeding, direct calls).
         self.background_read_stats = RowReadStats()
         self._gather_read_stats: RowReadStats | None = None
+        # Rows prefill_fills claimed for the layer, not yet in a gather's host_fill_rows.
+        self._pending_fill_rows = 0
         self.bytes_per_expert = sum(spec.row_bytes for spec in self.specs)
         self.host_bytes_per_expert = sum(
             spec.row_bytes for spec in self.specs if spec.residence == "host"
@@ -2138,13 +2144,15 @@ class ExpertStreamer:
             else:
                 experts = ids.tolist()
                 hot_slots = [-1] * len(experts)
-            cache.prefetch_rows(
+            # The layer's first gather reports the claimed rows as its host_fill_rows.
+            self._pending_fill_rows = cache.prefetch_rows(
                 sorted(expert for expert, slot in zip(experts, hot_slots) if slot < 0),
                 protected=experts,
             )
             try:
                 yield
             finally:
+                self._pending_fill_rows = 0
                 cache.finish_fills()
 
     def _plan_eager_routes(
@@ -2443,6 +2451,11 @@ class ExpertStreamer:
                 host_read_split_bytes=read.split_bytes,
                 host_read_ns=read.read_ns,
                 host_split_ns=read.split_ns,
+            )
+        fill_rows, self._pending_fill_rows = self._pending_fill_rows, 0
+        if fill_rows:
+            self.last_gather_stats = replace(
+                self.last_gather_stats, host_fill_rows=fill_rows
             )
         return result
 

@@ -361,6 +361,7 @@ class TestGatherReadStats(unittest.TestCase):
                 "host_read_split_bytes",
                 "host_read_ns",
                 "host_split_ns",
+                "host_fill_rows",
             ],
         )
         self.assertEqual(ExpertGatherStats(1, 2).host_read_rows, 0)
@@ -446,8 +447,9 @@ class TestGatherReadStats(unittest.TestCase):
             host_split_ns=1,
         )
         _add_host_read_counters(counters, stats)
-        _add_host_read_counters(counters, stats)
+        _add_host_read_counters(counters, dataclasses.replace(stats, host_fill_rows=5))
         _add_host_read_counters(counters, SimpleNamespace())
+        self.assertEqual(counters.host_fill_rows, 5)
         self.assertEqual(
             (
                 counters.host_read_rows,

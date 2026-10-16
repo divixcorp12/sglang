@@ -110,6 +110,9 @@ enum Counter : int {
   // ... the bytes an abandoned drip never copied, and scored picks dropped because their target had posted already.
   kDripSkippedBytes,
   kDripLate,
+  // Rows an eager admission evicted (assign and fill_begin, for prefill gathers, hot-cache promotions and full layers),
+  // counted in kEvictions too: a group's evictions minus these are its service's.
+  kEagerEvictions,
   kCounterCount,
 };
 
@@ -158,6 +161,7 @@ constexpr bool is_core_counter(int k) {
     case kDripPaused:
     case kDripSkippedBytes:
     case kDripLate:
+    case kEagerEvictions:
       return true;
     default:
       return false;

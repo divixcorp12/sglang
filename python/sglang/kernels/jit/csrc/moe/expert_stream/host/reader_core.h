@@ -204,6 +204,12 @@ class ReaderCore {
     kind_ = kind;
   }
 
+  // Whether the next read()s are a fill (drive_load.h): their landed bytes also count as fill bytes. RamTier::run_fill
+  // sets it for its one read and clears it. Call it on an idle reader.
+  void set_fill(bool fill) {
+    fill_ = fill;
+  }
+
   // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (design 2026-10-09-dsv41-drive-aware-reads, change (3)): `caps`, one positive
   // in-flight cap per mirror root, turns the dynamic root choice on (choose_root); empty turns it off, and the reader
   // then reads every sub-read from its own root, as before. Piece streaming only (set it first). Builds the mirror file
@@ -1704,6 +1710,7 @@ class ReaderCore {
     g.done += res;
     d.done += res;
     load_->landed(DriveLoad::root_of(d.read->file, t_.parts), kind_, res);
+    if (fill_) load_->fill_landed(DriveLoad::root_of(d.read->file, t_.parts), res);
     if (eof) {
       d.expected -= g.expected - g.done;
       g.expected = g.done;
@@ -2111,6 +2118,7 @@ class ReaderCore {
   DriveLoad own_load_;
   DriveLoad* load_ = &own_load_;
   int kind_ = kDemandRead;
+  bool fill_ = false;
   int64_t clock_ = 0;
   Share mine_[kMaxDrives][2] = {};
   // The dynamic root choice (set_mirror_caps): on or off, each root's in-flight cap, and the mirror file map,
