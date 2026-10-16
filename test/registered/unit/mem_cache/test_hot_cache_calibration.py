@@ -35,9 +35,10 @@ def test_lowest_free_counts_the_reserve_peak_and_non_torch_growth():
     assert c.lowest_free == (4000 - 1500 - 20) * M
 
 
-def test_margin_is_the_allocator_gap_or_the_repeat_growth():
+def test_margin_is_the_allocator_gap_at_the_highest_run_or_the_repeat_growth():
     assert _cal().margin == 400 * M  # P1 - A1
-    assert _cal(p2=3100).margin == 600 * M  # run 2 grew 600 past run 1's reserve
+    assert _cal(p2=3100).margin == 1000 * M  # run 2 is highest: its gap 3100 - 2100 (> its 600 of growth)
+    assert _cal(a1=2490, p2=2700).margin == 210 * M  # gap 2700 - 2490 = 210 > growth 2700 - 2500 = 200
 
 
 def test_trim_only_retires_just_enough_slots():
@@ -190,7 +191,8 @@ def test_compare_flags_a_real_peak_above_the_calibration_by_more_than_the_margin
     ok = hc.compare_with_real(c, 2200 * M, 2800 * M)
     assert ok["delta_reserved_mib"] == 300 and not ok["exceeds"]
     bad = hc.compare_with_real(c, 2200 * M, 3000 * M)
-    assert bad["exceeds"] and bad["delta_allocated_mib"] == 100
+    assert bad["exceeds"] and bad["delta_reserved_mib"] == 500
+    assert "delta_transient_mib" not in bad  # no entry allocations given: absolute peaks only
 
 
 def test_the_watch_measures_only_the_first_full_size_extend_then_removes_itself(monkeypatch):
