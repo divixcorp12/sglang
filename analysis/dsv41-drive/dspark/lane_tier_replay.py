@@ -532,7 +532,9 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
         if rules and r is not None:
             for e, land_ns in lands.get((L, v), []):  # rule 6: landed pool rows, before this gather, unused by it
                 if land_ns <= ns and e not in routed and _hash01(v, L, e) < p_promote:
+                    before = tiers[L][e % nodes].has(e)
                     tiers[L][e % nodes].promote(e, hot)
+                    stats["sim_promotions"] += not before and tiers[L][e % nodes].has(e)
     stats["align_offset"] = off
     stats["promote_fraction"] = round(p_promote, 3)
     stats["capacities"] = {L: [t.capacity for t in tiers[L]] for L in (2, 39)}
