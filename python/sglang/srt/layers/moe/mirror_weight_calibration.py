@@ -222,7 +222,10 @@ def probed_weights(roots: Sequence[str], probe: Optional[Callable] = None) -> tu
         logger.info(
             "mirror weight calibration in %.2f s, row bursts of %d x %d KiB a root, %d rounds: %s -> weights %s%s",
             time.monotonic() - began, PIECES, chunk // 1024, len(rates),
-            ", ".join(f"{root} {gb:.2f} GB/s" for root, gb in zip(key, means)),
+            ", ".join(
+                f"{root} {gb:.2f} GB/s (rounds {'/'.join(f'{r[i] / 1e9:.2f}' for r in rates)})"
+                for i, (root, gb) in enumerate(zip(key, means))
+            ),
             ":".join(f"{w:g}" for w in weights),
             f" (clamped to {WEIGHT_RANGE[0]:g}..{WEIGHT_RANGE[1]:g} of the mean: roots {clamped})" if clamped else "",
         )

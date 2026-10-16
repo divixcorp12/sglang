@@ -143,7 +143,8 @@ def test_probed_weights_are_computed_once_and_logged(caplog):
         first = mw.probed_weights(("/a", "/b"), probe=probe)
         assert mw.probed_weights(("/a", "/b"), probe=probe) == first
     assert len(calls) == 1 and first == (1.3333, 0.6667)
-    assert "/a 2.00 GB/s, /b 1.00 GB/s -> weights 1.3333:0.6667" in caplog.text
+    assert "/a 2.00 GB/s (rounds 2.00/2.00/2.00), /b 1.00 GB/s (rounds 1.00/1.00/1.00) -> weights 1.3333:0.6667" in \
+        caplog.text
 
 
 def test_explicit_weights_win_and_the_flag_is_off_by_default(tmp_path, monkeypatch):
