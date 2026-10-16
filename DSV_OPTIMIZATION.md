@@ -828,7 +828,12 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
           - The capture estimate is the max of the allocated-peak and reserve-peak deltas.
           - 72 CPU tests passed, including fault injection: OOM on the first layer, OOM part-way, guard trip,
             rollback, and end to end. The three mutants (no rollback, no guard, unsettled sizing) are each caught.
-        - calib4 (the same combined smoke) started 2026-10-16. The combined
+        - **calib4 refused at startup** (2026-10-16 01:04:13): `KvPinMissed`, KV 372,480 against the 381,184 pin.
+          - This is the refusal working as designed, but it is the same shortfall as the first smoke, so fix B did
+            not recover it.
+          - Suspect: buffers sized to the upper bound since grow (residency banks, upload buffers, transfer plan),
+            or the VA reservation itself.
+          - The diagnosis with numbers is pending. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
