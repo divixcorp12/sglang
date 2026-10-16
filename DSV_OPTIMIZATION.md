@@ -246,6 +246,16 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
       in time.
   - **Measurement limit:** the stream lane moves 5-9 ms per verify between runs with identical split, VRAM and
     lanes (A vs A', A' vs D, A' vs A''). A single pair cannot resolve effects below ~5 ms/token.
+    - **Owner decision (2026-10-15):** investigate the stream-lane variance. The interleaved in-server A/B harness
+      is not wanted.
+    - Agent `stream-variance` (branch `stream-variance`, outputs `ram-prefetch/stream-variance-20261015/`) starts
+      offline:
+      - decompose stream ms/verify into bytes x rate per run, prompt and window;
+      - check the candidates: clocks/power, PCIe link, pinned-pool NUMA/THP, concurrent DMA, text divergence,
+        hot-cache contents;
+      - only if needed, a read-only GPU clock/PCIe sampler riding along on runs already queued.
+
+      Goal: make one pair resolve ~2 ms/token.
   - Resolved: the ~7 GiB read from sdb3 at launch is the DSpark draft, read cold each launch because it is evicted
     and dropped (~20 s at ~470 MB/s). The target load is warm.
 - **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
