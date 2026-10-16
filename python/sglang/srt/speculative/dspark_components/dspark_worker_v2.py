@@ -24,6 +24,9 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.prefill_cache_release import (
+    maybe_install as maybe_install_larger_prefill_release,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -500,6 +503,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # SGLANG_DEBUG_PREFILL_PEAK_LOG: wraps the prefill's calls once, here; off, nothing is wrapped.
         maybe_install_prefill_peak_log(self)
+        # SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL, likewise; outside the log, so its "before" follows the release.
+        maybe_install_larger_prefill_release(self)
 
     def _init_top_prob_gate(self) -> VerifyDeadRows:
         """Refuse a launch the top-probability gate cannot serve, and point the target's EXL3 MoE at its dead rows."""

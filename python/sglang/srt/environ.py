@@ -1392,6 +1392,10 @@ class Envs:
     # independently, so chunking them under the cap gives bitwise the same output.
     # 0 keeps the one-pass merge.
     SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB = EnvInt(0)
+    # Release the CUDA caching allocator's unused segments (torch.cuda.empty_cache) before a DSpark prefill larger than
+    # any before it, so the startup warm-up's growing shapes do not strand reserve sized for the smaller ones (1.9 GB
+    # above the live peak, /mnt/nvme1/prefill-merge/peaklog). Allocator-only: no math changes.
+    SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL = EnvBool(False)
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
