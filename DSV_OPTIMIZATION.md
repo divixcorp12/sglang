@@ -585,9 +585,22 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
     - **Peak used 30,163 MiB, 2,040 MiB free** (482-598 before).
     - Reserved peak 26,730 (28,242 before); allocated peak 26,292.
     - Graphs captured, 0 OOM lines.
-    - **That recovers ~1.5 GB, about 115 slots.** The agent's speed check is pending.
-    - Next: the same arm with the hot cache grown into the freed memory, A/B against mergechunk-r2 via
-      serve_compare.
+    - **That recovers ~1.5 GB, about 115 slots.** The reserve gap at the peak falls from 1,879 to 438 MiB. The
+      2049-token prefill now adds 0 (was +260) and the 4096-token prefill +822 (was +1,480). Init headroom is 4.59
+      GB, against 3.91-4.07.
+    - **Speed (serve_compare vs mergechunk-r2):**
+      - Clean prompts (6/8): **-0.26 ms/token (CI -0.39..-0.02), so no cost.**
+      - All prompts: +17.1. Prompts 0 and 1 were hit by an SPCC stall (22:59:33-23:01:00, await 30-62 ms; root 1
+        busy 135.8 s against ~86 s).
+    - **Node-0 pressure during load, worse than r2:**
+      - Zone free fell to 0.04 GiB, below the low watermark. 410 MiB was swapped out and kswapd0 ran 132 ticks.
+      - The teams took 10 major faults each, against 0.
+      - Scheduler VmLck is 715 GiB against 389: expandable segments' VA reservations count as locked VMAs under
+        mlockall ONFAULT. That should not use RAM in itself, but it is not yet isolated from launch-to-launch
+        variation.
+    - Next: the same arm with the hot cache grown into the freed memory (2-3 slots of extra headroom), A/B against
+      mergechunk-r2 via serve_compare. It doubles as the node-0 repeat, with VmPTE/VmLck and per-node page tables
+      sampled, and aborts below the min watermark.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
