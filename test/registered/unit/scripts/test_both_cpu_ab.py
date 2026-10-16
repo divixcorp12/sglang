@@ -394,7 +394,8 @@ PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
 PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
 PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
-                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak")
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -751,7 +752,8 @@ def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
         mem = "-mem-" in arm + "-"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[MLOCK] == ("1" if mem else "0"), arm
-        assert ab.server_flags(arm) == (("--weight-loader-drop-cache-after-load",) if mem else ())
+        drop = ("--weight-loader-drop-cache-after-load",) if mem else ()
+        assert ab.server_flags(arm) == drop + ab.ARM_MEMORY_FLAGS.get(arm, ()), arm
     for base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
         mem, plain = ab.ARMS[base + "-mem"][0], ab.ARMS[base][0]
         assert {k: v for k, v in mem.items() if k != MLOCK} == {k: v for k, v in plain.items() if k != MLOCK}
@@ -812,6 +814,43 @@ def test_the_tiebreak_arm_is_arm_a_with_the_tiebreak_alone(monkeypatch):
     key = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
     assert {k: v for k, v in t.items() if k != key} == {k: v for k, v in a.items() if k != key}
     assert ab.REFERENCE[tiebreak] == arm_a and ab.server_flags(tiebreak) == ("--weight-loader-drop-cache-after-load",)
+
+
+def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alone(monkeypatch):
+    """-mergechunk is -hicache1 with the triton merge budget and a hot cache sized by hot_mb_for_margin, launched with
+    its own fraction and the KV pool pinned; every other arm states the budget 0 against a shell's and adds no memory
+    flag. Mutant: another arm inherits the shell's budget, the arm changes another knob, or the pin is dropped -- red."""
+    ab = _ab()
+    budget = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
+    monkeypatch.setenv(budget, "64")
+    merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")[budget] == (str(ab.MERGE_CHUNK_MB) if arm == merge else "0"), arm
+        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm == merge), arm
+    m, a = ab.ARMS[merge][0], ab.ARMS[arm_a][0]
+    knobs = (budget, "SGLANG_MOE_HOT_GPU_MB")
+    assert {k: v for k, v in m.items() if k not in knobs} == {k: v for k, v in a.items() if k not in knobs}
+    assert m["SGLANG_MOE_HOT_GPU_MB"] == str(ab.hot_mb_for_margin())
+    flags = ab.server_flags(merge)
+    assert flags[0] == "--weight-loader-drop-cache-after-load"
+    assert flags[flags.index("--max-total-tokens") + 1] == str(ab.MERGE_KV_TOKENS)
+    fraction = flags[flags.index("--mem-fraction-static") + 1]
+    assert fraction == ab.fraction_keeping_kv(ab.hot_mb_for_margin(), ab.MERGE_KV_TOKENS)
+    assert ab.REFERENCE[merge] == arm_a
+
+
+def test_hot_mb_for_margin_buys_whole_slots_of_the_measured_spare():
+    """At the probe's own free memory and margin the arm keeps the probe's slots; each slot of extra margin costs one
+    slot, and the MiB it returns floors back to that slot count."""
+    ab = _ab()
+    slot = ab.HOT_SLOT_BYTES
+    for margin in (0, 93, 94, 200, 508):
+        mb = ab.hot_mb_for_margin(margin)
+        slots = mb * 2**20 // slot
+        assert -(-slots * slot // 2**20) == mb
+        worst = ab.PROBE_FREE_AT_PEAK_MIB * 2**20 - (ab.PROBE_PRE_LOAD_GIB - ab.MIN_PRE_LOAD_GIB) * 2**30
+        assert slots == ab.PROBE_HOT_SLOTS + int((worst - margin * 2**20) // slot)
+        assert worst - (slots - ab.PROBE_HOT_SLOTS) * slot >= margin * 2**20
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
