@@ -462,6 +462,20 @@ ARMS[MERGE_CHUNK_EXPSEG_ARM] = (
     },
     True,
 )
+# -expseg with the startup hot-cache calibration (trial capture, warm-up replay, grow/trim from measured free memory)
+# and the bit-identical prefill transient cuts: A1 indexer score budget 32, A2 per-chunk FlashMLA kernels with A3
+# merge budget 32. Its fraction and KV pin are -expseg's; the calibration sizes the hot cache from there.
+MERGE_CHUNK_EXPSEG_CALIB_ARM = MERGE_CHUNK_EXPSEG_ARM + "-calib"
+ARMS[MERGE_CHUNK_EXPSEG_CALIB_ARM] = (
+    {
+        **ARMS[MERGE_CHUNK_EXPSEG_ARM][0],
+        "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": "1",
+        "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS": "1",
+        MERGE_BUDGET: "32",
+        "SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB": "32",
+    },
+    True,
+)
 # An arm's own --mem-fraction-static and KV pool, appended to its argv (the last --mem-fraction-static wins).
 ARM_MEMORY_FLAGS = {
     arm: (
@@ -470,7 +484,11 @@ ARM_MEMORY_FLAGS = {
         "--max-total-tokens",
         str(MERGE_KV_TOKENS),
     )
-    for arm, hot_mb in ((MERGE_CHUNK_ARM, MERGE_HOT_GPU_MB), (MERGE_CHUNK_EXPSEG_ARM, EXPSEG_HOT_GPU_MB))
+    for arm, hot_mb in (
+        (MERGE_CHUNK_ARM, MERGE_HOT_GPU_MB),
+        (MERGE_CHUNK_EXPSEG_ARM, EXPSEG_HOT_GPU_MB),
+        (MERGE_CHUNK_EXPSEG_CALIB_ARM, EXPSEG_HOT_GPU_MB),
+    )
 }
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
@@ -519,6 +537,7 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_TIEBREAK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     MERGE_CHUNK_EXPSEG_ARM: MERGE_CHUNK_ARM,
+    MERGE_CHUNK_EXPSEG_CALIB_ARM: MERGE_CHUNK_EXPSEG_ARM,
 }
 
 
