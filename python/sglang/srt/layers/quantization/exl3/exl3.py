@@ -740,11 +740,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             Exl3RamMissService.get().cpu_experts.register(backend.row, float(swiglu_limit))
             # The post stages x and the lanes' weights for the CPU expert thread (Exl3RamMissRowBackend.post).
             backend.cpu_input = (cpu_x, topk_weights)
+            # The lane head (SGLANG_OPT_LANE_HEAD_PATH) counts live rows only; a dead row repeats row 0's routes.
+            backend.verify_dead = dead
         try:
             remap, _ = streamer.gather(topk_ids)
         finally:
             if cpu_experts:
                 backend.cpu_input = None
+                backend.verify_dead = None
         if isinstance(backend, Exl3RamMissRowBackend) and backend.route_log is not None:
             if backend.route_log.router is not None:
                 # After the gather: its post ran the layer's route_log.record, which row 0 used to take the slot.

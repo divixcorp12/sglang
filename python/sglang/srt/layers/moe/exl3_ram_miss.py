@@ -658,6 +658,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             )
         self.cpu_experts = cpu_experts
         self.cpu_input = None
+        # A verify's dead rows ([max_rows, 1] bool) next to cpu_input, for the lane head; None when all rows are live.
+        self.verify_dead = None
         self.spill = None  # DIRECT's (overflow flag, this layer's counter) under spill; set by Exl3RamMissService.attach
         self.streamer_of = streamer_of
         self._delivered: Optional[torch.Tensor] = None
@@ -1683,12 +1685,25 @@ class Exl3RamMissService:
                 f"({width} miss lanes) per call but the service requests at most {self.lanes} lanes"
             )
         cache = streamer.hot_cache
+        if self.cpu_experts is None and getattr(manager, "lane_head", None) is not None:
+            raise ValueError(
+                "SGLANG_OPT_LANE_HEAD_PATH orders the CPU experts' miss lanes; this launch has no CPU experts "
+                "(SGLANG_DSV41_CPU_EXPERTS)"
+            )
         if self.cpu_experts is not None:
             # The fused plan sorts this layer's miss lanes by residency key, highest
             # first, and the CPU lanes are the tail, so the lanes worth inserting are
             # the ones copied.
             direct = manager.gpu_residency
-            streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
+            lane_head = getattr(manager, "lane_head", None)
+            if lane_head is not None:
+                # SGLANG_OPT_LANE_HEAD_PATH: the head writes this layer's keys at each gather, before the plan.
+                from sglang.srt.layers.moe.lane_head import LaneHeadGather
+
+                streamer._plan_miss_keys = lane_head.keys[streamer.residency_row]
+                streamer.lane_head_hook = LaneHeadGather(lane_head, direct, streamer.residency_row, streamer)
+            else:
+                streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
         if self.device_side is None:
             miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
                                                     envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),

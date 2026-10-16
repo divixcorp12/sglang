@@ -237,6 +237,9 @@ class GpuResidencyUpdater:
         self.insert_active = None
         self.victims = None
         self.miss_keys = None
+        # A lane_head.LaneHead when SGLANG_OPT_LANE_HEAD_PATH is set (expert_hot_cache.from_model installs it). Its
+        # per-request state restarts at every prefill and after capture.
+        self.lane_head = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -555,6 +558,9 @@ class GpuResidencyUpdater:
         """
         if kind is ForwardKind.DRAFT:
             return
+        if kind is ForwardKind.PREFILL and self.lane_head is not None:
+            # A request starts: the head's score and age features count its verifies only, as in training.
+            self.lane_head.reset()
         if graph_served:
             self.host_pending = False
             if kind is not ForwardKind.DECODE and kind is not ForwardKind.VERIFY:
@@ -578,6 +584,9 @@ class GpuResidencyUpdater:
         self.boundary_pending.fill_(False)
         self.host_pending = False
         self.enabled.fill_(True)
+        if self.lane_head is not None:
+            # Warm-up and capture gathers ran the head on dummy routes.
+            self.lane_head.reset()
         if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(False)
         if self.insert_direct:
@@ -603,6 +612,8 @@ class GpuResidencyUpdater:
         }
         for name, counter in self.insertion_counters().items():
             snapshot[name] = counter.cpu().tolist()
+        if self.lane_head is not None:
+            snapshot["lane_head_gathers"] = self.lane_head.gather_ct.cpu().tolist()
         return snapshot
 
     def insertion_counters(self) -> dict[str, torch.Tensor]:

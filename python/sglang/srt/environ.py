@@ -2153,6 +2153,13 @@ class Envs:
     # Path of a folded learned L+2 head file (analysis/dsv41-drive/prefetch-replay/l2_head_export.py) that replaces
     # the native candidate select. Unset or empty means the native select.
     SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD = EnvStr(None)
+    # Path of a lane-head file (analysis/dsv41-drive/dspark/export_lane_head.py): a per-layer head run at each
+    # graph gather, between the router and the fused route plan, that keys the miss lanes by how likely each routed
+    # expert is to be routed again by the next verify, so the GPU copies (and the VRAM hot cache keeps) those and the
+    # CPU computes the rest. Unset or empty keeps the residency-ranking key. Needs DIRECT residency, CPU experts and
+    # the fused plan; its device bytes (~29 MB with a bf16 PCA) come out of SGLANG_MOE_HOT_GPU_MB before the cache is
+    # sized. A missing or mismatched file is a ValueError at startup.
+    SGLANG_OPT_LANE_HEAD_PATH = EnvStr(None)
     # GPU drip (host/gpu_drip.h): this many VRAM scratch slots, one expert row each (~13 MB at DSV4.1's EXL3 rows),
     # which the copy engine fills from pinned RAM, while no demand copy is pending, with experts the GPU scorer
     # predicts for its target layer; that layer's post copies a landed one from VRAM instead of computing it on the
