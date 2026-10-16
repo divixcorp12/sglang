@@ -9,7 +9,7 @@ import pytest
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.ram_slot_map import (
-    SPLIT_MODEL_DEFAULTS_MS,
+    SPLIT_MODEL_FIXTURE_MS,
     LaneKind,
     model_cpu_lanes,
     model_node_finish,
@@ -25,7 +25,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 ONE = [0, 1000, 0, 0, 500] + [1500, 1000, 1000, 0, 0, 0]  # no stream side, no flags
 
 
-def test_the_default_words_are_the_untraced_fits_in_ns_node_by_node():
+def test_the_fixture_words_are_the_untraced_fits_in_ns_node_by_node():
     words = split_model_words(2)
     assert len(words) == 5 * 2 + 6
     assert words[:5] == [16_000, 154_000, 395_000, 331_000, 193_000]
@@ -243,8 +243,26 @@ def test_the_gate_accepts_the_split_model_and_refuses_costs_without_it():
                 _check_slot_map()
 
 
-def test_the_defaults_cover_every_key():
+def test_the_fixture_costs_cover_every_key():
     from sglang.srt.layers.moe.ram_slot_map import SPLIT_MODEL_KEYS, SPLIT_MODEL_NODE_KEYS
 
-    assert set(SPLIT_MODEL_DEFAULTS_MS) == set(SPLIT_MODEL_NODE_KEYS + SPLIT_MODEL_KEYS)
+    assert set(SPLIT_MODEL_FIXTURE_MS) == set(SPLIT_MODEL_NODE_KEYS + SPLIT_MODEL_KEYS)
     assert not envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get()  # off by default
+
+
+def test_off_words_type_lanes_as_the_table_and_count_nothing():
+    """split_model_off_words (copy_lane SPLIT_MODEL_OFF): the device and the reference keep the table's typing, as with
+    no words, and count nothing; any copy_lane >= 0 is on. Mutation: split_model_on ignoring copy_lane -- red."""
+    from sglang.srt.layers.moe.ram_slot_map import SPLIT_MODEL_OFF, split_model_off_words, split_model_on
+
+    off = split_model_off_words(1)
+    assert len(off) == 11 and off[5] == SPLIT_MODEL_OFF < 0 and not split_model_on(off, 1)
+    assert split_model_on(ONE, 1) and not split_model_on(None, 1)
+    rng = random.Random(9)
+    for _ in range(200):
+        experts = rng.sample(range(32), rng.randint(1, 8))
+        ram = [rng.randrange(16) if rng.random() < 0.6 else -1 for _ in range(32)]
+        forced_from = rng.randint(0, len(experts))
+        stats = [0, 0, 0]
+        got = _typing(experts, ram, forced_from=forced_from, split_model=off, tokens=[2] * len(experts), stats=stats)
+        assert got == _typing(experts, ram, forced_from=forced_from) and stats == [0, 0, 0]

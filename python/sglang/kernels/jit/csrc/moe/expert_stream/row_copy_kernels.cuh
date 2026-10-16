@@ -233,6 +233,18 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   }
 }
 
+// The split model's startup calibration (split_model_calibration.py): S's host pulls without its lease. Copies the
+// `count` ranges of `table` ({source, destination, bytes} int64 triples in device memory, the sources pinned host rows
+// read through UVA) with S's grid and S's copy, each block its slice of every range, so the link sees the reads S makes
+// for a landed miss. Nothing waits on a piece mask: every source is already in host memory.
+__global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3_ram_miss_calibration_pull_kernel(
+    const int64_t* table, int64_t count) {
+  using namespace device::expert_stream;
+  for (int64_t i = 0; i < count; ++i)
+    stream_copy_slice(
+        reinterpret_cast<const uint8_t*>(table[3 * i]), reinterpret_cast<uint8_t*>(table[3 * i + 1]), table[3 * i + 2]);
+}
+
 // CW's SM read: copies `bytes` of the pinned slot into the destination with the whole block, four 16-byte units in
 // flight per thread. Uses ld.global.cv as S does, never .nc on host bytes.
 SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) {
@@ -423,6 +435,19 @@ struct RowCopyKernel {
     RuntimeCheck(r == cudaSuccess, "set_device_stamps: cudaMemcpyToSymbol failed: ", cudaGetErrorString(r));
   }
 #endif
+
+  /// Launches the split model calibration's pull (exl3_ram_miss_calibration_pull_kernel) on the current stream:
+  /// `table` is int64 [n, 3] {source, destination, bytes} in device memory, every source a UVA-readable host address.
+  static void calibration_pull(tvm::ffi::TensorView table) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    expert_stream::verify_named(
+        "table", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device), table);
+    const auto stream = LaunchKernel::resolve_device(table.device());
+    LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream)(
+        exl3_ram_miss_calibration_pull_kernel, static_cast<const int64_t*>(table.data_ptr()), table.size(0));
+  }
 
   /// Launches S. Argument meanings follow StreamParams; `segments` is the copy table ({src, dst, row bytes} per
   /// entry), `segment_map` and `piece_runs` the reader's piece geometry (host/ffi_exports.h, piece_runs).

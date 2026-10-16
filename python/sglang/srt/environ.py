@@ -2057,12 +2057,19 @@ class Envs:
     SGLANG_DSV41_CPU_SPLIT_MISS_CUT = EnvInt(1)
     # The most forced misses on a node for which the cut applies.
     SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX = EnvInt(3)
-    # Experiment: a model-based split. The post picks each record's CPU hits from per-team cost constants, each lane's
-    # tokens, the forced lanes and a miss landing estimate (ram_slot_map.model_cpu_lanes) in place of the split table and
-    # the miss cut. Needs SGLANG_DSV41_CPU_EXPERTS and the copy engine (RAM_HIT_COPY=ce). Off until a served A/B decides.
+    # Experiment: a model-based split. The post picks each record's CPU hits from per-team costs, each lane's tokens, the
+    # forced lanes and a miss landing estimate (ram_slot_map.model_cpu_lanes) in place of the split table and the miss
+    # cut. Its costs are measured on the loaded model when the copy engine arms (split_model_calibration.py), whatever
+    # SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION says, with SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS runs a cell; if
+    # that fails the split table types the lanes. Needs SGLANG_DSV41_CPU_EXPERTS and the copy engine (RAM_HIT_COPY=ce).
+    # Off until a served A/B decides.
     SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL = EnvBool(False)
-    # Its costs, overriding the defaults (ram_slot_map.SPLIT_MODEL_DEFAULTS_MS): name[.node]=ms pairs, comma-separated.
+    # Experiments only: costs replacing the calibrated ones, name[.node]=ms pairs, comma-separated
+    # (ram_slot_map.split_model_overrides). Naming every cost of every node skips the calibration.
     SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS = EnvStr("")
+    # Batches between live refinements of the split model's CPU costs from the CPU jobs served (SplitModelRefiner in
+    # split_model_calibration.py); 0 keeps the calibrated costs. Off by default.
+    SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES = EnvInt(0)
     # With it, among a node's lanes the model prices alike (same tokens) the CPU takes the lowest residency keys, so
     # the copy engine, whose lanes become VRAM residents, gets the highest. Off until a served A/B decides.
     SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK = EnvBool(False)

@@ -65,7 +65,12 @@ from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.layers.moe.expert_stream import pinned_full_layers
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
-from sglang.srt.layers.moe.ram_slot_map import split_miss_cut, split_model_words
+from sglang.srt.layers.moe.ram_slot_map import (
+    split_miss_cut,
+    split_model_off_words,
+    split_model_overrides_complete,
+    split_model_words,
+)
 
 logger = logging.getLogger(__name__)
 # NVTX ranges around the eager host-use pause's stream sync and thread pause.
@@ -919,6 +924,11 @@ class Exl3RamMissService:
         self._cpu_retune_batches = 0
         self._cpu_batches = 0
         self._cpu_log_batches = 0
+        # SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL: the live refinement of its calibrated costs, None until the calibration
+        # published them (or when the model is off), and SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES' count.
+        self._split_model_refiner = None
+        self._split_model_refine_batches = 0
+        self._split_model_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
@@ -1340,6 +1350,7 @@ class Exl3RamMissService:
         self.cpu_experts = cpu_experts
         self._layer_splits = layer_splits
         self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
+        self._split_model_refine_batches = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES.get()
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
         self.lease_pdl = cfg.enable_lease_pdl
         self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
@@ -1949,6 +1960,11 @@ class Exl3RamMissService:
             if self._cpu_batches >= self._cpu_retune_batches:
                 self._cpu_batches = 0
                 self.cpu_experts.retune()
+        if self._split_model_refiner is not None and self._split_model_refine_batches > 0:
+            self._split_model_batches += 1
+            if self._split_model_batches >= self._split_model_refine_batches:
+                self._split_model_batches = 0
+                self._refine_split_model()
         if self.cpu_experts is not None:
             self._cpu_log_batches += 1
             if self._cpu_log_batches >= CPU_STATS_LOG_BATCHES:
@@ -2014,8 +2030,70 @@ class Exl3RamMissService:
         self.before_host_use()
         try:
             self.cpu_experts.calibrate(torch.cuda.current_device())
+            self._calibrate_split_model()
         finally:
             self.after_host_use()
+
+    def _calibrate_split_model(self) -> None:
+        """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL: measure its costs on the loaded model and publish them
+        (split_model_calibration.py), in _calibrate_cpu_split's paused window. Runs whenever the model is on, whatever
+        SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION and SGLANG_DSV41_CPU_EXPERTS_SPLIT say, and not when
+        SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS names every cost. A failure warns and leaves the model off (its words'
+        SPLIT_MODEL_OFF): the split table types the CPU's lanes."""
+        from sglang.srt.layers.moe import split_model_calibration as calib
+
+        if self.device_side is None or self.device_side.split_model.numel() == 0:
+            return
+        overrides = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get()
+        if split_model_overrides_complete(overrides, self.wire.nodes):
+            costs = calib.costs_from_words(split_model_words(self.wire.nodes, overrides), self.wire.nodes)
+            logger.info("exl3 RAM miss split model: every cost from SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS, not calibrated: "
+                        "%s", costs.line())
+        else:
+            services = self.cpu_experts.services
+            before = [self.host.cpu_stats(s.group) for s in services]
+            try:
+                costs, clamped, seconds = calib.calibrate(
+                    self.host, services, self.device_side,
+                    device=torch.cuda.current_device() if torch.cuda.is_available() else -1,
+                    reps=envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.get(), staging_width=self.staging_width(),
+                )
+            except (calib.SplitModelCalibrationError, RuntimeError, torch.cuda.OutOfMemoryError) as error:
+                logger.warning("exl3 RAM miss split model calibration failed (%s): the model stays off and the split "
+                               "table types the CPU's lanes", error)
+                return
+            finally:
+                for service, stats in zip(services, before):
+                    service.exclude_calibration_stats(stats)
+            costs = calib.apply_overrides(costs, overrides)
+            logger.info("exl3 RAM miss split model calibrated in %.2f s%s%s: %s", seconds,
+                        f", clamped {', '.join(clamped)}" if clamped else "",
+                        ", with SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS" if overrides.strip() else "", costs.line())
+        self._publish_split_model(costs)
+        self._split_model_refiner = calib.SplitModelRefiner(costs, self._split_model_moments(), overrides)
+
+    def _publish_split_model(self, costs) -> None:
+        """Write ``costs`` (SplitModelCosts) and the flags word (SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK) to the
+        device."""
+        tiebreak = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.get()
+        self.device_side.set_split_model_costs(costs.words(residency_tiebreak=tiebreak))
+
+    def _split_model_moments(self) -> list:
+        """Every node's CPU fit moments (cpu_experts.h fit_moments), in node order."""
+        return [self.host.cpu_fit_moments(s.group) for s in self.cpu_experts.services]
+
+    def _refine_split_model(self) -> None:
+        """SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES: refit the CPU costs from the jobs served since the last refit and
+        publish them (SplitModelRefiner). A failure is logged and stops the refinement; the published costs stay."""
+        refiner = self._split_model_refiner
+        try:
+            costs = refiner.refine(self._split_model_moments())
+            if costs is not None:
+                self._publish_split_model(costs)
+                logger.info("exl3 RAM miss split model refined (%d): %s", refiner.refines, costs.line())
+        except Exception as error:  # noqa: BLE001 - a refit must not stop serving
+            logger.warning("exl3 RAM miss split model refinement failed (%r); keeping the published costs", error)
+            self._split_model_refiner = None
 
     def _copy_engine_module_load_guard(self, load):
         """Wrap a module loader (Triton's ``load_binary``, tvm-ffi's ``load_module``).
@@ -2242,14 +2320,13 @@ class Exl3RamMissService:
             logger.warning("exl3 RAM miss: reading the DSpark draft's counters failed: %r", error)
 
     def _split_model_words(self) -> Optional[list[int]]:
-        """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL's cost words for the device, or None when it is off or there is no CPU
-        split to replace."""
+        """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL's first cost words for the device, or None when it is off or there is no
+        CPU split to replace. They hold the model off (split_model_off_words) until _calibrate_split_model publishes its
+        costs, as the copy engine arms; before that the device types no CPU lane anyway."""
         if not envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get() or self.cpu_experts is None:
             return None
-        words = split_model_words(self.wire.nodes, envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get(),
-                                  residency_tiebreak=envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.get())
-        logger.info("exl3 RAM miss split model on: cost words (ns) %s", words)
-        return words
+        logger.info("exl3 RAM miss split model on: its costs are calibrated when the copy engine arms")
+        return split_model_off_words(self.wire.nodes)
 
     def _log_split_model_stats(self) -> None:
         """The split model's device counters (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL), after the GPU barrier; nothing when

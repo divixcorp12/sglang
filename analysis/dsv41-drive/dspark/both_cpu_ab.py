@@ -356,6 +356,27 @@ ARMS[PIN01_SPLIT_MODEL_DECAY_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0],
 # breakdown-base replay gives the same saving with 56% fewer inverted pairs; compared with -hicache1.
 PIN01_SPLIT_MODEL_TIEBREAK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-tiebreak"
 ARMS[PIN01_SPLIT_MODEL_TIEBREAK_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], RESIDENCY_TIEBREAK: "1"}, True)
+# Since split-model-calib the model's costs are calibrated at startup, so every arm above with the model on now runs
+# calibrated. -fixedcosts names every cost, the 2026-10-15 offline fits (ram_slot_map.SPLIT_MODEL_FIXTURE_MS), so it
+# skips the calibration and types as -hicache1 did before it; -refine is the calibrated model with the live refinement
+# of its CPU costs, compared with -fixedcosts.
+SPLIT_MODEL_REFINE = "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES"
+SPLIT_MODEL_FIXED_COSTS = (
+    "hit_a.0=0.016,hit_a.1=-0.050,hit_b.0=0.154,hit_b.1=0.179,hit_c.0=0.395,hit_c.1=0.390,"
+    "miss_a.0=0.331,miss_a.1=0.291,miss_c.0=0.193,miss_c.1=0.245,"
+    "copy_lane=1.05,first_byte=0.8,per_expert=1.6,stream_lane=0.65,stream_base=0"
+)
+REFINE_BATCHES = "50"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[SPLIT_MODEL_REFINE] = "0"
+PIN01_SPLIT_MODEL_FIXED_COSTS_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-fixedcosts"
+ARMS[PIN01_SPLIT_MODEL_FIXED_COSTS_ARM] = (
+    {**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], SPLIT_MODEL_COSTS: SPLIT_MODEL_FIXED_COSTS}, True
+)
+PIN01_SPLIT_MODEL_REFINE_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-refine"
+ARMS[PIN01_SPLIT_MODEL_REFINE_ARM] = (
+    {**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], SPLIT_MODEL_REFINE: REFINE_BATCHES}, True
+)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -539,6 +560,8 @@ REFERENCE = {
     MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     MERGE_CHUNK_EXPSEG_ARM: MERGE_CHUNK_ARM,
     MERGE_CHUNK_EXPSEG_CALIB_ARM: MERGE_CHUNK_EXPSEG_ARM,
+    PIN01_SPLIT_MODEL_FIXED_COSTS_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_REFINE_ARM: PIN01_SPLIT_MODEL_FIXED_COSTS_ARM,
 }
 
 

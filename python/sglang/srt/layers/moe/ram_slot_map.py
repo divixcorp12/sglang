@@ -35,13 +35,15 @@ def split_miss_cut(cut: int, cut_max: int, *, cpu_experts: bool) -> tuple[int, i
 # hit_a + hit_b * k + hit_c * p, a CPU miss of t tokens miss_a + miss_c * t.
 SPLIT_MODEL_NODE_KEYS = ("hit_a", "hit_b", "hit_c", "miss_a", "miss_c")
 SPLIT_MODEL_KEYS = ("copy_lane", "first_byte", "per_expert", "stream_lane", "stream_base")
-# Fits on cores-ab-20261014/pin01-r2's CPU jobs (analysis/dsv41-drive/dspark/split_replay.py), scaled by 0.93 to the
-# untraced cost per lane, in ms; miss i (1-based) of a node lands first_byte + per_expert * i after the post. With m
-# GPU-streamed misses in the record, the GPU's stream kernel (S) ends at stream_base + first_byte + per_expert * m +
-# stream_lane * copy lanes: its pulls share the link with the copy engine. stream_lane is the fit on pin01-r2,
-# splitmodel, splitmodel-r2 and split-ab A2/B1 (S grows 0.3-1.4 ms per added copy lane between runs, 0.44-1.04 within
-# one; node-independent); 0 drops the stream side.
-SPLIT_MODEL_DEFAULTS_MS = {
+# Fixture costs in ms, for unit tests and synthetic fixtures only: a served model takes its costs from the startup
+# calibration (split_model_calibration.py), never from here. They are the 2026-10-15 offline fits on
+# cores-ab-20261014/pin01-r2's CPU jobs (analysis/dsv41-drive/dspark/split_replay.py), scaled by 0.93 to the untraced
+# cost per lane; miss i (1-based) of a node lands first_byte + per_expert * i after the post. With m GPU-streamed misses
+# in the record, the GPU's stream kernel (S) ends at stream_base + first_byte + per_expert * m + stream_lane * copy
+# lanes: its pulls share the link with the copy engine. stream_lane is the fit on pin01-r2, splitmodel, splitmodel-r2
+# and split-ab A2/B1 (S grows 0.3-1.4 ms per added copy lane between runs, 0.44-1.04 within one; node-independent); 0
+# drops the stream side.
+SPLIT_MODEL_FIXTURE_MS = {
     "hit_a": (0.016, -0.050),
     "hit_b": (0.154, 0.179),
     "hit_c": (0.395, 0.390),
@@ -53,22 +55,20 @@ SPLIT_MODEL_DEFAULTS_MS = {
     "stream_lane": 0.65,
     "stream_base": 0.0,
 }
+# A copy_lane word below 0 turns the model off on the device: the split table and the miss cut type the CPU's lanes.
+# The service publishes it until its calibration has run, and keeps it when the calibration fails.
+SPLIT_MODEL_OFF = -1
 # The flags word's residency tiebreak (lease_device.cuh kSplitModelResidencyTiebreak): among a node's candidates with
 # the same tokens, which the model prices alike, the CPU takes the lowest residency keys and the copy engine the rest.
 SPLIT_MODEL_RESIDENCY_TIEBREAK = 1
 
 
-def split_model_words(nodes: int, overrides: str = "", residency_tiebreak: bool = False) -> list[int]:
-    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``, then
-    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK).
+def split_model_overrides(overrides: str, nodes: int) -> tuple[dict, dict]:
+    """``SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS`` parsed: ({(key, node): ms} for per-node costs, {key: ms} for shared ones).
 
-    ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS) is ``name=ms`` pairs, comma-separated; a per-node name takes
-    ``.node`` (``hit_c.1=0.4``), and without it sets every node. Node n past the defaults' nodes takes the last's."""
-    per_node = [
-        {key: SPLIT_MODEL_DEFAULTS_MS[key][min(n, len(SPLIT_MODEL_DEFAULTS_MS[key]) - 1)] for key in SPLIT_MODEL_NODE_KEYS}
-        for n in range(nodes)
-    ]
-    shared = {key: SPLIT_MODEL_DEFAULTS_MS[key] for key in SPLIT_MODEL_KEYS}
+    ``overrides`` is ``name=ms`` pairs, comma-separated; a per-node name takes ``.node`` (``hit_c.1=0.4``), and without
+    it sets every node. Raises ValueError for a pair it cannot read."""
+    per_node, shared = {}, {}
     for item in filter(None, (x.strip() for x in overrides.split(","))):
         name, sep, value = item.partition("=")
         key, _, node = name.strip().partition(".")
@@ -83,14 +83,53 @@ def split_model_words(nodes: int, overrides: str = "", residency_tiebreak: bool 
         elif node:
             if not node.isdigit() or int(node) >= nodes:
                 raise ValueError(f"split model costs: {item!r} names a node outside 0..{nodes - 1}")
-            per_node[int(node)][key] = ms
+            per_node[(key, int(node))] = ms
         else:
-            for costs in per_node:
-                costs[key] = ms
+            for n in range(nodes):
+                per_node[(key, n)] = ms
+    return per_node, shared
+
+
+def split_model_overrides_complete(overrides: str, nodes: int) -> bool:
+    """Whether ``overrides`` names every cost of every node, so the model needs no calibration."""
+    per_node, shared = split_model_overrides(overrides, nodes)
+    return len(per_node) == len(SPLIT_MODEL_NODE_KEYS) * nodes and len(shared) == len(SPLIT_MODEL_KEYS)
+
+
+def split_model_words(nodes: int, overrides: str = "", base: Optional[dict] = None,
+                      residency_tiebreak: bool = False) -> list[int]:
+    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``, then
+    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK).
+
+    ``base`` maps each key to ms, a per-node key to one value per node (node n past them takes the last's): the
+    calibrated costs in service (split_model_calibration.SplitModelCosts.base), the fixture costs when omitted, which
+    only tests and synthetic fixtures do. ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS, split_model_overrides)
+    replace the costs they name."""
+    base = SPLIT_MODEL_FIXTURE_MS if base is None else base
+    per_node = [
+        {key: base[key][min(n, len(base[key]) - 1)] for key in SPLIT_MODEL_NODE_KEYS} for n in range(nodes)
+    ]
+    shared = {key: base[key] for key in SPLIT_MODEL_KEYS}
+    node_overrides, shared_overrides = split_model_overrides(overrides, nodes)
+    for (key, n), ms in node_overrides.items():
+        per_node[n][key] = ms
+    shared.update(shared_overrides)
     ns = lambda ms: int(round(ms * 1_000_000))
     return [ns(costs[key]) for costs in per_node for key in SPLIT_MODEL_NODE_KEYS] + [
         ns(shared[key]) for key in SPLIT_MODEL_KEYS
     ] + [SPLIT_MODEL_RESIDENCY_TIEBREAK if residency_tiebreak else 0]
+
+
+def split_model_off_words(nodes: int) -> list[int]:
+    """Cost words the device reads as the model off (SPLIT_MODEL_OFF in copy_lane): the split table types the lanes."""
+    words = [0] * (5 * nodes + 6)
+    words[5 * nodes] = SPLIT_MODEL_OFF
+    return words
+
+
+def split_model_on(words: Optional[Sequence[int]], nodes: int) -> bool:
+    """Whether cost words type lanes by the model: present, and their copy_lane not SPLIT_MODEL_OFF."""
+    return words is not None and len(words) > 5 * nodes and words[5 * nodes] >= 0
 
 
 def split_model_stats_words(nodes: int) -> int:
@@ -224,7 +263,8 @@ def type_lanes(
 
     Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): with ``split_model`` (split_model_words) and the copy engine able
     to take hits, model_cpu_lanes picks the unforced CPU lanes in place of the split and the miss cut, from each lane's
-    ``tokens`` (the routes that name its expert). ``model_stats`` (split_model_stats_words long) counts what the device
+    ``tokens`` (the routes that name its expert); words whose copy_lane is SPLIT_MODEL_OFF keep the table's typing, and
+    count nothing. ``model_stats`` (split_model_stats_words long) counts what the device
     counts: records with an eligible lane, then per node the lanes moved onto and off the CPU against the table."""
     if split_model is not None and (tokens is None or len(tokens) != len(experts)):
         raise ValueError("the split model needs each lane's tokens")
@@ -281,7 +321,7 @@ def type_lanes(
             take[node] -= 1
     copy_ok = host_lanes and hit_copy == "ce" and ce_ok
     cpu = [j >= forced_from or table[j] for j in range(len(experts))]
-    if split_model is not None and copy_ok:
+    if split_model_on(split_model, nodes) and copy_ok:
         node_of = [home(e) for e in experts]
         copyable = [True if dst_ok is None else bool(dst_ok[j]) for j in range(len(experts))]
         forced = [j >= forced_from for j in range(len(experts))]

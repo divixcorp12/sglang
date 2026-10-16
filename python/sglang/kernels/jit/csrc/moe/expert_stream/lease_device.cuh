@@ -558,8 +558,11 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
       take[node] = take[node] > policy.miss_cut ? take[node] - policy.miss_cut : 0;
   }
   const bool copy_ok = policy.host_lanes && policy.hit_copy_ce && policy.ce_ok;
-  // The split model replaces the table's choice (and its miss cut) when the copy engine can take hits.
-  const bool model = policy.split_model != nullptr && copy_ok;
+  // The split model replaces the table's choice (and its miss cut) when the copy engine can take hits, unless its
+  // copy_lane word is below 0 (ram_slot_map.SPLIT_MODEL_OFF: not calibrated yet, or calibration failed). The host
+  // rewrites the cost words in stream order (calibration, refinement); a record typed across a rewrite may read some
+  // words of each set, every one a valid cost.
+  const bool model = policy.split_model != nullptr && copy_ok && policy.split_model[5 * Wire::kNodes] >= 0;
   bool model_cpu[Wire::kLanes];
   if (model) {
     if (plan.tokens == nullptr) __trap();  // the reference raises ValueError: the model needs each lane's tokens

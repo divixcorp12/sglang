@@ -1123,6 +1123,13 @@ def calibration_shape(lanes: int = 8) -> tuple[int, int]:
     return (n + 2, n + 1)
 
 
+# The split model calibration's cell kinds (split_calibration.h kSplitCell*): a CPU hit job, a CPU miss job, a DMA, an
+# NVMe read.
+SPLIT_CELL_HIT, SPLIT_CELL_MISS, SPLIT_CELL_COPY, SPLIT_CELL_LANDING = 1, 2, 3, 4
+# The CPU engine's fit moments per output part (cpu_experts.h kCpuFitMoments), in order.
+CPU_FIT_MOMENTS = ("n", "k", "p", "kk", "kp", "pp", "y", "ky", "py")
+
+
 # The C++ ``kPieces``: pieces per row, and the most sub-reads a row issues under piece
 # streaming.
 STAGE_PIECES = 8
@@ -2680,6 +2687,45 @@ class ExpertStreamHost:
         )
         return out
 
+    def cpu_fit_moments(self, group: int = 0) -> list[list[int]]:
+        """Group ``group``'s CPU fit moments since start (cpu_experts.h fit_moments), hit jobs then miss jobs, each
+        ``CPU_FIT_MOMENTS`` sums over its unstaged target jobs: jobs, k, pairs, k*k, k*pairs, pairs*pairs, ns, k*ns,
+        pairs*ns."""
+        out = torch.zeros((2, len(CPU_FIT_MOMENTS)), dtype=torch.int64)
+        self._module.expert_stream_cpu_fit_moments(self.handle, int(group), out)
+        return out.tolist()
+
+    def calibrate_split_model(
+        self,
+        rows: Sequence[int],
+        cells: Sequence[Sequence[int]],
+        *,
+        device: int,
+        reps: int,
+        scratch: Optional[torch.Tensor],
+        timeout_s: float = 1.0,
+        group: int = 0,
+    ) -> list[float]:
+        """Run the split model's startup cells on group ``group`` (split_calibration.h): each cell ``(kind, a, b)`` of
+        ``SPLIT_CELL_*``, mean ms over ``reps`` runs after a warm-up, rotating over ``rows`` (registered CPU rows) and
+        the group's slots. ``scratch`` holds the widest copy cell's experts on ``device`` (-1: the test backend), or is
+        None without copy cells. The caller owns the tier and has not armed the copy engine. Raises RuntimeError on
+        failure."""
+        out = torch.zeros(len(cells), dtype=torch.float64)
+        self._module.expert_stream_calibrate_split_model(
+            self.handle,
+            int(group),
+            torch.tensor(list(rows), dtype=torch.int64),
+            torch.tensor([list(c) for c in cells], dtype=torch.int64).reshape(-1, 3),
+            int(device),
+            int(reps),
+            0 if scratch is None else scratch.data_ptr(),
+            0 if scratch is None else scratch.numel() * scratch.element_size(),
+            int(timeout_s * 1e9),
+            out,
+        )
+        return out.tolist()
+
     def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
         """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset.
 
@@ -3016,6 +3062,7 @@ _LEASE_METHODS = {
 _ROW_COPY_METHODS = {
     "expert_stream_lease_stream": "lease_stream",
     "expert_stream_lease_copy_wait": "lease_copy_wait",
+    "expert_stream_calibration_pull": "calibration_pull",
 }
 _SPEC_METHODS = {
     "expert_stream_spec_score": "score",
@@ -4056,6 +4103,33 @@ class ExpertStreamDevice:
             self.cpu_lanes if self.cpu_x_rows is not None else self._no_cpu,
             int(self.lease_pdl),
         )
+
+    def calibration_pull(self, table: torch.Tensor) -> None:
+        """The split model calibration's stand-in for S's host pulls (exl3_ram_miss_calibration_pull_kernel), on the
+        current stream: ``table`` is int64 ``[n, 3]`` {source, destination, bytes} on this device, each source a pinned
+        host address."""
+        self._kernels().expert_stream_calibration_pull(table)
+
+    def set_split_model_costs(self, words: Sequence[int]) -> None:
+        """Replace the split model's cost words (ram_slot_map.split_model_words, or split_model_off_words) in place,
+        leaving its counters. The copy is queued on the current stream from pinned memory, so a captured post reads
+        the new words from its next replay on; the host does not wait for it."""
+        costs = 5 * self.wire.nodes + 6  # the costs and the flags word
+        if self.split_model.numel() == 0:
+            raise ValueError("the split model is off: the post has no cost words to replace")
+        if len(words) != costs:
+            raise ValueError(f"the split model has {costs} cost words for {self.wire.nodes} nodes, got {len(words)}")
+        src = torch.tensor(list(words), dtype=torch.int64)
+        if self.split_model.is_cuda:
+            # The caching host allocator keeps the pinned block until the copy that reads it has run.
+            src = src.pin_memory()
+        self.split_model[:costs].copy_(src, non_blocking=True)
+
+    def split_model_costs(self) -> Optional[list[int]]:
+        """The split model's cost words as the device holds them (a device-to-host copy), or None when it is off."""
+        if self.split_model.numel() == 0:
+            return None
+        return self.split_model[: 5 * self.wire.nodes + 6].cpu().tolist()
 
     def split_model_stats(self) -> Optional[dict]:
         """The split model's counters (a device-to-host copy), or None when it is off: records it typed, and per node

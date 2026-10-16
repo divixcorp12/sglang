@@ -154,4 +154,84 @@ inline void calibrate_split(const BasicCalibrationSetup<Build>& s, double* out) 
       out[(1 + n) * kCalibCols + k] = calibration_mean_ms(s, k, n - k);
 }
 
+// The split model's startup calibration (python/sglang/srt/layers/moe/split_model_calibration.py): the cells its fits
+// read, each the mean ms of `reps` runs after one discarded warm-up. A cell is an int64 triple {kind, a, b}:
+//   kSplitCellHit      a CPU hit job (part 0) of a lanes, each routed by b of the row's tokens
+//   kSplitCellMiss     a CPU miss job (part 1) of a lanes (1 in service), each routed by b tokens
+//   kSplitCellCopy     the DMA of a experts, alone
+//   kSplitCellLanding  a read of a experts' rows from NVMe through the group's reader, until the last lands
+// CPU and DMA runs rotate over the rows and the group's slots so successive runs read other memory: an expert's bytes
+// (MiB) do not stay in L3 across runs, as in decode, where a layer's experts are cold when its record arrives.
+constexpr int64_t kSplitCellHit = 1;
+constexpr int64_t kSplitCellMiss = 2;
+constexpr int64_t kSplitCellCopy = 3;
+constexpr int64_t kSplitCellLanding = 4;
+
+// The rotation of a split model run: run `r` of a cell of `k` lanes uses row rows[r % rows] and k consecutive slots of
+// the group's range of it, which starts at lo[r % rows], at a stride that walks the first `slots` before it repeats.
+struct SplitRotation {
+  std::vector<int64_t> rows;
+  std::vector<int64_t> lo;
+  int64_t slots = 0;
+  int64_t run = 0;
+
+  size_t index() const {
+    return static_cast<size_t>(run % static_cast<int64_t>(rows.size()));
+  }
+  int64_t row() const {
+    return rows[index()];
+  }
+  int64_t first_slot(int k) const {
+    return lo[index()] + (run * k) % std::max<int64_t>(slots - k + 1, 1);
+  }
+};
+
+// One CPU job of k lanes on rows[run]'s slots from first_slot(k), output part `part`, each lane routed by `per_lane`
+// tokens of the row's s.tokens (CpuExpertEngine::write_calibration_table); the ns from submit until done is observed.
+template <BuildPolicy Build>
+inline int64_t split_model_cpu_run(const BasicCalibrationSetup<Build>& s, const SplitRotation& rot, int k, int part,
+                                   int per_lane) {
+  const int64_t row = rot.row();
+  s.cpu->write_calibration_table(row, s.tokens, per_lane);
+  CpuJob job;
+  job.row = row;
+  job.part = part;
+  job.k = k;
+  job.per_token = s.tokens > 1;
+  const int64_t first = rot.first_slot(k);
+  for (int i = 0; i < k; ++i) {
+    job.slots[i] = static_cast<int32_t>(first + i);
+    job.weights[i] = 1.0f;
+    job.lanes[i] = i;
+  }
+  const int64_t start = now_ns();
+  job.seq = s.cpu->claim(1);
+  if (!s.cpu->submit(job)) throw std::runtime_error("calibration: the CPU expert ring is full");
+  while (!s.cpu->done(job.seq)) {
+    if (now_ns() - start > s.timeout_ns)
+      throw std::runtime_error(
+          "calibration: a CPU job did not finish within " + std::to_string(s.timeout_ns / 1'000'000) + " ms");
+    _mm_pause();
+  }
+  return now_ns() - start;
+}
+
+// The DMA of m experts from the group's slots at first_slot(m), into the scratch; the ns until it is observed done.
+template <BuildPolicy Build>
+inline int64_t split_model_copy_run(BasicCalibrationSetup<Build> s, const SplitRotation& rot, int m) {
+  s.first_slot = rot.first_slot(m);
+  return calibration_run(s, 0, m);
+}
+
+// The mean ms of reps runs of `run(rotation)` after one discarded warm-up, the rotation advancing every run.
+template <class Run>
+inline double split_model_mean_ms(SplitRotation& rot, int reps, Run&& run) {
+  run(rot);
+  ++rot.run;
+  int64_t sum = 0;
+  for (int r = 0; r < reps; ++r, ++rot.run)
+    sum += run(rot);
+  return static_cast<double>(sum) / 1e6 / reps;
+}
+
 }  // namespace sglang::expert_stream
