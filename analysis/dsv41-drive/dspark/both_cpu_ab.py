@@ -409,11 +409,19 @@ MIN_PRE_LOAD_GIB = 29.33
 PEAK_MARGIN_MIB = 508
 
 
-def hot_mb_for_margin(margin_mib: int = PEAK_MARGIN_MIB) -> int:
-    """The largest SGLANG_MOE_HOT_GPU_MB whose slots leave margin_mib free at the measured chunked prefill peak, at the
-    lowest free-before-load seen, with the pool pinned: the probe's slots plus the whole slots the spare buys."""
-    worst_free = PROBE_FREE_AT_PEAK_MIB * 2**20 - (PROBE_PRE_LOAD_GIB - MIN_PRE_LOAD_GIB) * 2**30
-    slots = PROBE_HOT_SLOTS + int((worst_free - margin_mib * 2**20) // HOT_SLOT_BYTES)
+def hot_mb_for_margin(
+    margin_mib: int = PEAK_MARGIN_MIB,
+    *,
+    probe_slots: int = PROBE_HOT_SLOTS,
+    probe_free_mib: int = PROBE_FREE_AT_PEAK_MIB,
+    probe_pre_load_gib: float = PROBE_PRE_LOAD_GIB,
+    held_back_slots: int = 0,
+) -> int:
+    """The largest SGLANG_MOE_HOT_GPU_MB whose slots leave margin_mib free at a measured prefill peak (a probe run's
+    slots, memory.free and free-before-load), at the lowest free-before-load seen, with the pool pinned: the probe's
+    slots plus the whole slots the spare buys, less held_back_slots."""
+    worst_free = probe_free_mib * 2**20 - (probe_pre_load_gib - MIN_PRE_LOAD_GIB) * 2**30
+    slots = probe_slots + int((worst_free - margin_mib * 2**20) // HOT_SLOT_BYTES) - held_back_slots
     return -(-slots * HOT_SLOT_BYTES // 2**20)  # rounded up: the cache takes floor(MiB / slot) slots
 
 
@@ -432,14 +440,37 @@ ARMS[MERGE_CHUNK_ARM] = (
     },
     True,
 )
+# The caching allocator on expandable segments, off (unset) in every arm but -expseg. Its smoke
+# (cores-ab-20261014/splitmodel-stream-mem-hicache1-mergechunk-expseg, 923 slots) left 2,040 MiB memory.free at the
+# warm-up peak after 29.39 GiB free before loading, against 482-598 without it: reserve 26,730 MiB against an
+# allocated peak of 26,292 (1,879 MiB of stranded reserve became 438).
+ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[ALLOC_CONF] = ""
+# -expseg spends that on the hot cache by hot_mb_for_margin from the smoke, holding back 3 slots against a node-0
+# squeeze during load (the smoke's node 0 fell below its low watermark loading): 1035 slots.
+EXPSEG_HELD_BACK_SLOTS = 3
+EXPSEG_HOT_GPU_MB = hot_mb_for_margin(
+    probe_slots=923, probe_free_mib=2040, probe_pre_load_gib=29.39, held_back_slots=EXPSEG_HELD_BACK_SLOTS
+)
+MERGE_CHUNK_EXPSEG_ARM = MERGE_CHUNK_ARM + "-expseg"
+ARMS[MERGE_CHUNK_EXPSEG_ARM] = (
+    {
+        **ARMS[MERGE_CHUNK_ARM][0],
+        ALLOC_CONF: "expandable_segments:True",
+        "SGLANG_MOE_HOT_GPU_MB": str(EXPSEG_HOT_GPU_MB),
+    },
+    True,
+)
 # An arm's own --mem-fraction-static and KV pool, appended to its argv (the last --mem-fraction-static wins).
 ARM_MEMORY_FLAGS = {
-    MERGE_CHUNK_ARM: (
+    arm: (
         "--mem-fraction-static",
-        fraction_keeping_kv(MERGE_HOT_GPU_MB, MERGE_KV_TOKENS),
+        fraction_keeping_kv(hot_mb, MERGE_KV_TOKENS),
         "--max-total-tokens",
         str(MERGE_KV_TOKENS),
-    ),
+    )
+    for arm, hot_mb in ((MERGE_CHUNK_ARM, MERGE_HOT_GPU_MB), (MERGE_CHUNK_EXPSEG_ARM, EXPSEG_HOT_GPU_MB))
 }
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
@@ -487,6 +518,7 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_DECAY_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     PIN01_SPLIT_MODEL_TIEBREAK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    MERGE_CHUNK_EXPSEG_ARM: MERGE_CHUNK_ARM,
 }
 
 

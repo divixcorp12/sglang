@@ -395,7 +395,8 @@ PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
 PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
-                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk")
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -824,9 +825,10 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
     budget = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
     monkeypatch.setenv(budget, "64")
     merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
+    merges = (merge, PIN01_HICACHE_ARMS[5])  # -mergechunk and -mergechunk-expseg
     for arm in ab.ARMS:
-        assert ab._overrides(arm, "/out")[budget] == (str(ab.MERGE_CHUNK_MB) if arm == merge else "0"), arm
-        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm == merge), arm
+        assert ab._overrides(arm, "/out")[budget] == (str(ab.MERGE_CHUNK_MB) if arm in merges else "0"), arm
+        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm in merges), arm
     m, a = ab.ARMS[merge][0], ab.ARMS[arm_a][0]
     knobs = (budget, "SGLANG_MOE_HOT_GPU_MB")
     assert {k: v for k, v in m.items() if k not in knobs} == {k: v for k, v in a.items() if k not in knobs}
@@ -837,6 +839,26 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
     fraction = flags[flags.index("--mem-fraction-static") + 1]
     assert fraction == ab.fraction_keeping_kv(ab.hot_mb_for_margin(), ab.MERGE_KV_TOKENS)
     assert ab.REFERENCE[merge] == arm_a
+
+
+def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_alone(monkeypatch):
+    """-expseg is -mergechunk with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and a hot cache sized from its smoke
+    (923 slots, 2,040 MiB free, 29.39 GiB) less 3 held-back slots: 1035 slots, KV still pinned; every other arm states the
+    allocator config empty against a shell's. Mutant: another arm inherits the shell's config, or the size moves -- red."""
+    ab = _ab()
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
+    expseg, merge = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[4]
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["PYTORCH_CUDA_ALLOC_CONF"] == (
+            "expandable_segments:True" if arm == expseg else ""), arm
+    e, m = ab.ARMS[expseg][0], ab.ARMS[merge][0]
+    knobs = ("PYTORCH_CUDA_ALLOC_CONF", "SGLANG_MOE_HOT_GPU_MB")
+    assert {k: v for k, v in e.items() if k not in knobs} == {k: v for k, v in m.items() if k not in knobs}
+    assert int(e["SGLANG_MOE_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 1035
+    flags = ab.server_flags(expseg)
+    assert flags[flags.index("--max-total-tokens") + 1] == "381184"
+    assert flags[flags.index("--mem-fraction-static") + 1] == ab.fraction_keeping_kv(ab.EXPSEG_HOT_GPU_MB, 381184)
+    assert ab.REFERENCE[expseg] == merge
 
 
 def test_hot_mb_for_margin_buys_whole_slots_of_the_measured_spare():

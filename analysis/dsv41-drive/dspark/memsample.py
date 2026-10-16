@@ -32,7 +32,8 @@ def node_meminfo(n):
     d = {}
     for line in open(f"/sys/devices/system/node/node{n}/meminfo"):
         parts = line.split()
-        if parts[2].rstrip(":") in ("MemFree", "FilePages", "AnonPages", "Shmem", "Mlocked", "Unevictable"):
+        if parts[2].rstrip(":") in ("MemFree", "FilePages", "AnonPages", "Shmem", "Mlocked", "Unevictable",
+                                    "PageTables"):
             d[parts[2].rstrip(":")] = int(parts[3])
     return d
 
@@ -116,7 +117,10 @@ def find_scheduler():
 
 def scheduler_state(pid):
     try:
-        lck = next((int(l.split()[1]) for l in open(f"/proc/{pid}/status") if l.startswith("VmLck:")), None)
+        # VmPTE/VmSize alongside VmLck: under mlockall, expandable_segments' CUDA VA reservations show up as locked VMAs.
+        vm = {l.split(":")[0]: int(l.split()[1]) for l in open(f"/proc/{pid}/status")
+              if l.split(":")[0] in ("VmLck", "VmPTE", "VmSize", "VmRSS")}
+        lck = vm.get("VmLck")
         teams = {}
         for task in glob.glob(f"/proc/{pid}/task/*"):
             comm = open(f"{task}/comm").read().strip()
@@ -126,7 +130,8 @@ def scheduler_state(pid):
                 t["threads"] += 1
                 t["minflt"] += int(s[7])
                 t["majflt"] += int(s[9])
-        return {"pid": pid, "vmlck_kb": lck, "teams": teams}
+        return {"pid": pid, "vmlck_kb": lck, "vmpte_kb": vm.get("VmPTE"), "vmsize_kb": vm.get("VmSize"),
+                "vmrss_kb": vm.get("VmRSS"), "teams": teams}
     except OSError:
         return None
 
