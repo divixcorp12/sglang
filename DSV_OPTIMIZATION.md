@@ -1137,6 +1137,13 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
         - A launch with the flag on is refused if the top-prob gate is on, or if the insert decay differs from
           training.
         - Kept independent of `prefill-merge-chunk`. A test with both flags on comes after both land.
+        - **CPU tests pass** (`450c83d007`): `test_lane_head.py` 16 passed.
+          - Held-out C2 (16 verifies × 40 layers): features bit-identical to training's extraction, max |dP|
+            1.8e-7, 120/120 lane orders identical with the fp32 PCA (bf16: 119/120, |dP| 2.8e-4).
+          - Flag-off: the affected registered files fail the same set at base and on the branch (GPU-only tests).
+          - The key is now P's fp32 bit pattern: the fixed-point key rounded small P to 0 and reordered lanes.
+          - GPU tests and the microbenchmark are approved. PCA precision is chosen by microbenchmark (fp32 unless
+            it costs more than 0.1 ms/verify).
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
