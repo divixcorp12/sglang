@@ -527,6 +527,31 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
     - Fix (`e0aa95a7c7`): draft odds is a constant feature in B0, so it is zeroed rather than standardized. Without
       this, C2 precision collapsed to 0.32.
     - Next: replay `--pred` for head-k hits/verify against score-k 385.9, table-k 390.3 and next1-k 431.6.
+  - **Head v1 replay (held-out, hits/verify; 0.37 ms/hit traced):**
+
+    | capture | head-k | table-k | score-k (today) | next1-k oracle |
+    |---|---|---|---|---|
+    | C2 | **397.8** | 390.3 | 385.9 | 431.6 |
+    | base | **373.9** | 362.9 | 360.7 | 405.4 |
+
+    - Over today's score: +11.9 / +13.2 hits, about +4.4-4.9 ms/verify or ~1.2-1.4 ms/token. That is a clear,
+      consistent gain, but modest; it sits at the edge of the stall-free noise (SD 1.6 ms/token).
+    - All of the gain comes from lane choice; the head doesn't touch victims.
+    - Inserts fall to 116.8/verify from 121.7 (wasted 41% vs 44%), so no extra link traffic.
+    - The open gap to the k-oracle is 34 hits (~3.4 ms/token): what v2 would chase. **The owner's condition is met,
+      so the v2 plan goes ahead.**
+    - Artifacts: `head/B`, `{c2,base}.replay-headB.*`, on `cache-tiers` through `e0aa95a7c7`.
+  - **NVMe prefetch question, premise check (C2):**
+    - After L+2 T3 prefetch, 33.5 unique NVMe demand misses per verify remain.
+    - Of those, only 0.7% were routed in the previous verify: a forced miss lands in pinned RAM, so an expert
+      routed at v is a RAM hit at v+1 by construction.
+    - **The v1 head and table-k score only experts routed at v, so they can't help prefetch (≤1%).** That needs a
+      384-way next-verify predictor over unrouted experts: the v2 output shape. The no-learning analogue is the
+      gate's near-miss ranks 7-12.
+    - **Side finding:** 18.9% of NVMe misses are rows routed 2-8 verifies earlier and since evicted from the RAM
+      tier. That fits the 40 prefetch landings/verify (26 unused) churning the LRU faster than demand does.
+    - Next (CPU): a RAM-tier LRU replay validated against measured misses, then the oracle bound at 20/40/80
+      rows/verify, a near-miss gate baseline, timing, wasted reads and the RAM-capacity effect of today's prefetch.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
