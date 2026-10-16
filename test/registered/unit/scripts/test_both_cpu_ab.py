@@ -391,8 +391,12 @@ GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
 PIN01_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-pin01"
 PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
 PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
+PIN01_SPLIT_MODEL_FIXED_COSTS_ARM = f"{PIN01_SPLIT_MODEL_ARM}-fixedcosts"
+PIN01_SPLIT_MODEL_REFINE_ARM = f"{PIN01_SPLIT_MODEL_ARM}-refine"
+SPLIT_MODEL_ARMS = (PIN01_SPLIT_MODEL_ARM, PIN01_SPLIT_MODEL_FIXED_COSTS_ARM, PIN01_SPLIT_MODEL_REFINE_ARM)
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
+SPLIT_MODEL_REFINE = "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES"
 FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
 SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
 PROMOTE_PAIR_ARMS = (
@@ -404,7 +408,7 @@ PROMOTE_PAIR_ARMS = (
     GPU_DRIP_LEAN_ARM,
     PIN01_ARM,
     PIN01_GPU01_ARM,
-    PIN01_SPLIT_MODEL_ARM,
+    *SPLIT_MODEL_ARMS,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -686,7 +690,7 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM)
+            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, *SPLIT_MODEL_ARMS)
                                               else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
@@ -719,13 +723,35 @@ def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins
     ab = _ab()
     monkeypatch.setenv(SPLIT_MODEL, "1")
     monkeypatch.setenv(SPLIT_MODEL_COSTS, "copy_lane=9")
+    monkeypatch.setenv(SPLIT_MODEL_REFINE, "7")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[SPLIT_MODEL] == ("1" if arm == PIN01_SPLIT_MODEL_ARM else "0"), arm
-            assert overrides[SPLIT_MODEL_COSTS] == "", arm
+            assert overrides[SPLIT_MODEL] == ("1" if arm in SPLIT_MODEL_ARMS else "0"), arm
+            assert overrides[SPLIT_MODEL_COSTS] == (ab.SPLIT_MODEL_FIXED_COSTS if arm == PIN01_SPLIT_MODEL_FIXED_COSTS_ARM
+                                                    else ""), arm
+            assert overrides[SPLIT_MODEL_REFINE] == ("50" if arm == PIN01_SPLIT_MODEL_REFINE_ARM else "0"), arm
     model, pin = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0], ab.ARMS[PIN01_ARM][0]
     assert {k: v for k, v in model.items() if k != SPLIT_MODEL} == {k: v for k, v in pin.items() if k != SPLIT_MODEL}
     assert ab.REFERENCE[PIN01_SPLIT_MODEL_ARM] == PIN01_ARM and ab.ARMS[PIN01_SPLIT_MODEL_ARM][1] is True
+
+
+def test_the_fixed_cost_and_refine_arms_differ_from_the_split_model_arm_in_one_knob_each():
+    """-fixedcosts names every cost (the offline fits), so it skips the calibration; -refine is the calibrated model with
+    the live refinement, compared with -fixedcosts. Mutant: the fixed costs miss a key, or -refine is compared with
+    the calibrated arm -- red."""
+    from sglang.srt.layers.moe.ram_slot_map import SPLIT_MODEL_FIXTURE_MS, split_model_overrides_complete, \
+        split_model_words
+
+    ab = _ab()
+    model = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0]
+    for arm, key in ((PIN01_SPLIT_MODEL_FIXED_COSTS_ARM, SPLIT_MODEL_COSTS), (PIN01_SPLIT_MODEL_REFINE_ARM,
+                                                                            SPLIT_MODEL_REFINE)):
+        other = ab.ARMS[arm][0]
+        assert {k: v for k, v in other.items() if k != key} == {k: v for k, v in model.items() if k != key}, arm
+    assert split_model_overrides_complete(ab.SPLIT_MODEL_FIXED_COSTS, 2)
+    assert split_model_words(2, ab.SPLIT_MODEL_FIXED_COSTS) == split_model_words(2, base=SPLIT_MODEL_FIXTURE_MS)
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_REFINE_ARM] == PIN01_SPLIT_MODEL_FIXED_COSTS_ARM
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_FIXED_COSTS_ARM] == PIN01_ARM
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
