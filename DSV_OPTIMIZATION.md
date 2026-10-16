@@ -454,7 +454,25 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
       Its timing was already marked confounded.
     - Fixed: `CUDA_VISIBLE_DEVICES=""` is now set before torch import, in both the script and the runner.
     - **Rule:** any offline torch job sets `CUDA_VISIBLE_DEVICES=""`.
-  - Training (variants B then A), C2/base report and the replay with `--pred` are running CPU-only.
+  - **Interim (precision only; hit replay pending):** head B on held-out data, scored at k = the capture's GPU-lane
+    count.
+
+    | predictor | C2 precision / recall | base |
+    |---|---|---|
+    | head B | **0.595 / 0.378** | 0.614 / 0.393 |
+    | table | 0.471 / 0.299 | |
+    | today's score key | 0.408 / 0.259 | |
+    | capture | 0.420 / 0.267 | |
+    | oracle | 0.851 / 0.541 | |
+
+    - It closes about a third of the table-to-oracle precision gap.
+    - Log loss on C2 misses: 0.544 for the head vs 0.610 for the table.
+    - Variant A, without the per-expert PCA direction, reaches 0.557, so that term matters.
+    - Training: 31 s on 4 threads.
+    - Per layer: 384 biases, 17 dense weights, 64 + 384x64 weights, and a 5120x64 PCA.
+    - Fix (`e0aa95a7c7`): draft odds is a constant feature in B0, so it is zeroed rather than standardized. Without
+      this, C2 precision collapsed to 0.32.
+    - Next: replay `--pred` for head-k hits/verify against score-k 385.9, table-k 390.3 and next1-k 431.6.
 
 ### 3.9 Graded miss cut — branch `misscut-replay` (`5014aaff0a`, `23c09c180c`, `f2e2e0c80b`, `760736c33b`, `7d105fabfe`), NOT merged
 
