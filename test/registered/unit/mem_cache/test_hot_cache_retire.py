@@ -337,6 +337,48 @@ def test_the_guard_reads_free_memory_per_layer_and_stops_at_the_first_short_one(
     assert manager.caches[7].vmm_backing.grow_calls == 0
 
 
+def _calibrate_on_fakes(monkeypatch, manager, service):
+    """maybe_calibrate_hot_cache on the fake world: measured values given, the forwards and the trial stubbed."""
+    from sglang.srt import runtime_context
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import hot_cache_calibration as hc
+    from sglang.srt.layers.moe import hot_cache_dummy_extend as hde
+    from sglang.srt.layers.moe import hot_cache_trial_capture as tct
+
+    M = 1 << 20
+    monkeypatch.setattr(hr, "_service", lambda: service)
+    run = hc.RunPeak(2500 * M, 2100 * M, 2500 * M, 2480 * M)
+    cal = hc.Calibration(4096, 4000 * M, 1000 * M, (run, run), 1 * M, 0, 1000 * M)
+    monkeypatch.setattr(hc, "calibrate", lambda *a, **k: cal)
+    monkeypatch.setattr(hc, "settle", lambda c, d: hc.replace(c, free_final=2420 * M, reserved_final=1000 * M))
+    monkeypatch.setattr(hde, "dummy_extend_forward", lambda runner, tokens: None)
+    monkeypatch.setattr(hde, "forget_graph_path_state", lambda model: 0)
+    monkeypatch.setattr(hc, "log_grow_bound", lambda *a: None)  # reads real streamers
+    monkeypatch.setattr(tct, "trial_capture", lambda *a: None)  # its own tests cover it
+    monkeypatch.setattr(
+        runtime_context, "get_schedule", lambda: SimpleNamespace(max_total_tokens=None, chunked_prefill_size=4096)
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (3000 * M, 32000 * M))
+    runner = SimpleNamespace(
+        expert_hot_cache_manager=manager, max_total_num_tokens=None, model=None, forward=lambda *a, **k: None,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+    )
+    with envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.override(True):
+        return hc.maybe_calibrate_hot_cache(runner)
+
+
+def test_calibration_does_not_resize_a_hot_cache_the_real_capture_would_not_expect(monkeypatch, caplog):
+    """After the trial capture the updater must still be disabled and every holder agree; otherwise no resize."""
+    manager, updater, service, *_ = _world(upper=26)
+    updater.enabled.fill_(True)  # e.g. a trial that went through the enabling capture path
+    before = _all_holders(manager, updater, service)
+    with caplog.at_level("WARNING"):
+        result = _calibrate_on_fakes(monkeypatch, manager, service)
+    assert result.retire is None and result.keep == {3: C, 7: C} and "residency updater is enabled" in result.extra["unsettled"]
+    assert _all_holders(manager, updater, service) == before
+    assert any("not resizing" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
 def test_calibration_survives_a_grow_oom_and_reports_the_slots_it_got(monkeypatch):
     """The launch path on fakes: the hook plans a grow, the mapping fails part-way, and it returns."""
     from sglang.srt import runtime_context
@@ -355,6 +397,9 @@ def test_calibration_survives_a_grow_oom_and_reports_the_slots_it_got(monkeypatc
     monkeypatch.setattr(hde, "dummy_extend_forward", lambda runner, tokens: None)
     monkeypatch.setattr(hde, "forget_graph_path_state", lambda model: 0)
     monkeypatch.setattr(hc, "log_grow_bound", lambda *a: None)  # reads real streamers
+    from sglang.srt.layers.moe import hot_cache_trial_capture as tct
+
+    monkeypatch.setattr(tct, "trial_capture", lambda *a: None)  # its own tests cover it
     monkeypatch.setattr(
         runtime_context, "get_schedule", lambda: SimpleNamespace(max_total_tokens=None, chunked_prefill_size=4096)
     )

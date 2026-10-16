@@ -278,6 +278,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._draft_sampler_built = False
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -644,7 +645,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # block eagerly from the graph's hidden states instead. Apart
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
-                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                # Built and hooked once: the startup hot-cache calibration's trial capture
+                # (SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP) calls this before the real one,
+                # which must reuse the same sampler and hook, not capture a second pair.
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get() and not self._draft_sampler_built:
+                    self._draft_sampler_built = True
                     self._draft_sampler = self._maybe_build_draft_sampler(
                         available_memory_gb=available_mem
                     )

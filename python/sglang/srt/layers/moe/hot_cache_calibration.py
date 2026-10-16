@@ -471,11 +471,12 @@ def check_kv_pin(*, pinned: Optional[int], sized: Optional[int]) -> None:
         )
 
 
-def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
+def maybe_calibrate_hot_cache(model_runner, draft_worker=None) -> Optional[CalibrationResult]:
     """The scheduler's pre-capture hook. Off (the default) it returns None and touches nothing.
 
     Takes the live ModelRunner: the dummy forward needs its model, attention backend and pools, which are not
-    narrowable to plain values (large-class-style 1.6). It reads them and returns a result; it writes nothing back."""
+    narrowable to plain values (large-class-style 1.6). It reads them and returns a result; it writes nothing back.
+    ``draft_worker`` (the speculative worker) is captured in the trial capture beside the target."""
     from sglang.srt.environ import envs
 
     if not envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get():
@@ -489,7 +490,8 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
         dummy_verify_forward,
         forget_graph_path_state,
     )
-    from sglang.srt.layers.moe.hot_cache_retire import set_hot_capacity
+    from sglang.srt.layers.moe.hot_cache_retire import census_error, set_hot_capacity
+    from sglang.srt.layers.moe.hot_cache_trial_capture import reset_trial_routes, trial_capture
     from sglang.srt.runtime_context import get_schedule
 
     check_kv_pin(
@@ -498,13 +500,35 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
     tokens = int(get_schedule().chunked_prefill_size or get_schedule().max_prefill_tokens)
     cache = next(iter(manager.caches.values()))
     device = cache.device
+    # The exact capture cost, before anything is sized: capture for real into a private pool, then tear it down.
+    trial = trial_capture(model_runner, draft_worker)
+    if trial is not None:
+        reset_trial_routes(manager)
+        forget_graph_path_state(model_runner.model)
+        logger.info("hot cache trial capture: %s", trial.summary())
     run = dummy_extend_forward(model_runner, tokens)
     verify = dummy_verify_forward(model_runner) if model_runner.spec_algorithm.is_speculative() else None
     calibration = calibrate(
         run, tokens=tokens, slot_bytes=cache.bytes_per_expert, device=device, run_verify=verify
     )
     forget_graph_path_state(model_runner.model)
+    if trial is not None:  # the larger of the measured trial and the eager estimate
+        calibration = replace(calibration, capture_estimate=max(trial.estimate, calibration.capture_estimate))
     calibration = settle(calibration, device)
+    # The real capture expects the hot cache as startup left it: the residency updater still disabled and every
+    # capacity holder agreeing. Otherwise nothing is resized and the launch goes on at the configured size.
+    unsettled = census_error(manager)
+    if unsettled is not None:
+        logger.warning(
+            "hot cache calibration: the hot cache is not in the state the real capture expects (%s); not resizing, "
+            "starting at the configured %d slots",
+            unsettled,
+            sum(c.capacity for c in manager.caches.values()),
+        )
+        result = CalibrationResult(calibration, {l: c.capacity for l, c in manager.caches.items()}, None,
+                                   {"trial": trial, "unsettled": unsettled})
+        watch_first_full_prefill(model_runner, result)
+        return result
     floor = 2 * getattr(manager.gpu_residency, "victim_lanes", 0)
     capacity = {layer: c.capacity for layer, c in manager.caches.items()}
     upper = {
@@ -544,7 +568,7 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
         free_after_resize / MIB,
         calibration.keep_free / MIB,
     )
-    result = CalibrationResult(calibration, keep, retired, {"free_after_resize": free_after_resize})
+    result = CalibrationResult(calibration, keep, retired, {"free_after_resize": free_after_resize, "trial": trial})
     watch_first_full_prefill(model_runner, result)
     return result
 

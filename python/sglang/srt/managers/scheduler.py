@@ -1147,7 +1147,9 @@ class Scheduler(
 
         self.init_all_attention_backends()
         # SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP: size the hot cache from a measured prefill before capture.
-        self.hot_cache_calibration = maybe_calibrate_hot_cache(self.tp_worker.model_runner)
+        self.hot_cache_calibration = maybe_calibrate_hot_cache(
+            self.tp_worker.model_runner, draft_worker=self.draft_worker
+        )
         self.init_all_cuda_graphs()
         require_hot_cache_headroom("after capture", self.hot_cache_calibration)
 

@@ -75,6 +75,20 @@ def _service():
     return Exl3RamMissService._instance
 
 
+def census_error(manager, *, service: Any = "auto") -> Optional[str]:
+    """Why the hot cache is not in a resizable, consistent state (the residency updater enabled, an armed copy
+    engine, a capacity holder disagreeing with its layer's capacity), or None when it is."""
+    service = _service() if service == "auto" else service
+    try:
+        check_retire_allowed(manager, service)
+        _check_capacity_holders(
+            manager, manager.gpu_residency, service, {layer: c.capacity for layer, c in manager.caches.items()}
+        )
+    except RetireRefused as error:
+        return str(error)
+    return None
+
+
 def check_retire_allowed(manager, service) -> None:
     """Refuse once anything froze the slot count: a captured graph or an armed copy engine."""
     updater = getattr(manager, "gpu_residency", None)
@@ -324,7 +338,7 @@ def _check_capacity_holders(manager, updater, service, kept) -> None:
         urow = updater.layer_ids.index(layer_id)
         if int(updater.capacity[urow]) != k or int(updater.slot_valid[urow].sum()) != k:
             raise RetireRefused(f"layer {layer_id}: updater capacity/slot_valid disagree with {k}")
-        if owners["row_planner"] is not None and owners["row_planner"].scratch_base != k:
+        if owners.get("row_planner") is not None and owners["row_planner"].scratch_base != k:
             raise RetireRefused(f"layer {layer_id}: row_planner.scratch_base is not {k}")
     # A row's SpecScoreRow scores the prefetch for its *target* row (the L+2 scorer), so it carries that row's hot
     # capacity, not its own layer's; and a resized target changes the score of a row that was not resized itself.
