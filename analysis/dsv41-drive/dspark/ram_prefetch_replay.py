@@ -132,11 +132,14 @@ class Capture:
 class RamTier:
     """One layer's pinned slots: LRU with VRAM-hot and in-flight protection."""
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, victim: str = "lru"):
         self.capacity = capacity
+        self.victim = victim
         self.stamp = {}  # expert -> last use tick
+        self.speculative = set()  # rows that arrived by prefetch and were not routed since
         self.tick = 0
         self.evictions = 0
+        self.spec_evictions = 0
 
     def has(self, e: int) -> bool:
         return e in self.stamp
@@ -144,9 +147,11 @@ class RamTier:
     def touch(self, e: int) -> None:
         self.tick += 1
         self.stamp[e] = self.tick
+        self.speculative.discard(e)
 
-    def insert(self, e: int, protected: set) -> bool:
-        """Insert e, evicting the LRU unprotected row when full. False when nothing could be evicted."""
+    def insert(self, e: int, protected: set, speculative: bool = False) -> bool:
+        """Insert e, evicting a row when full: ``lru`` the least recently used unprotected row; ``specfirst`` the
+        least recently landed never-routed prefetch row when one exists, else LRU. False when nothing could go."""
         if e in self.stamp:
             self.touch(e)
             return True
@@ -154,18 +159,24 @@ class RamTier:
             cands = [(t, r) for r, t in self.stamp.items() if r not in protected]
             if not cands:
                 return False
-            _, victim = min(cands)
+            spec = [(t, r) for t, r in cands if r in self.speculative] if self.victim == "specfirst" else []
+            _, victim = min(spec) if spec else min(cands)
+            if victim in self.speculative:
+                self.spec_evictions += 1
             del self.stamp[victim]
+            self.speculative.discard(victim)
             self.evictions += 1
         self.touch(e)
+        if speculative:
+            self.speculative.add(e)
         return True
 
 
 def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: int, ms_per_row: float, ms_per_layer: float,
-           scores: list | None, recur_p: dict | None = None) -> dict:
+           scores: list | None, recur_p: dict | None = None, victim: str = "lru") -> dict:
     """Run the tier over the verifies; ``policy`` in (none, oracle, nearmiss, recur); ``mode`` alone|ontop."""
     L = cap.layers
-    tiers = [RamTier(rows_per_layer) for _ in range(L)]
+    tiers = [RamTier(rows_per_layer, victim) for _ in range(L)]
     out = collections.Counter()
     pending = []  # (land_ns, layer, expert, for_verify)
     for v in range(cap.n):
@@ -188,7 +199,7 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
             hot = cap.hot(v, Lx)
             routed = cap.routes(v, Lx)
             for e in landed_now[Lx]:
-                tiers[Lx].insert(e, hot | routed)
+                tiers[Lx].insert(e, hot | routed, speculative=True)
                 if counted:
                     out["reads_landed"] += 1
                     if e in routed:
@@ -198,7 +209,7 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
             if mode == "ontop":
                 # the existing prefetch's landings, as captured, enter the tier during this verify
                 for e in cap.landed[v][Lx]:
-                    tiers[Lx].insert(e, hot | routed)
+                    tiers[Lx].insert(e, hot | routed, speculative=True)
             # demand: every routed expert that is not a VRAM hit touches RAM
             for e in routed:
                 if e in hot:
@@ -216,7 +227,7 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
         # late rows still land eventually (within this verify) and stay in the tier
         for land_ns, Lx, e, fv in pending:
             if land_ns <= cap.end[v]:
-                tiers[Lx].insert(e, cap.hot(v, Lx) | cap.routes(v, Lx))
+                tiers[Lx].insert(e, cap.hot(v, Lx) | cap.routes(v, Lx), speculative=True)
                 if counted:
                     out["reads_landed"] += 1
                     out["wasted"] += 1
@@ -261,6 +272,7 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
     nv = cap.n - cap.skip
     res = {k: out[k] / nv for k in out}
     res["evictions_per_verify"] = sum(t.evictions for t in tiers) / nv
+    res["speculative_evictions_per_verify"] = sum(t.spec_evictions for t in tiers) / nv
     return res
 
 
@@ -274,6 +286,7 @@ def main() -> int:
     ap.add_argument("--budgets", default="20,40,80")
     ap.add_argument("--ms-per-row", type=float, default=2.3)
     ap.add_argument("--ms-per-layer", type=float, default=5.5)
+    ap.add_argument("--victims", default="lru,specfirst", help="tier victim rules to replay the policies under")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
     cap = Capture(args.capture, args.skip)
@@ -319,18 +332,26 @@ def main() -> int:
                     total += len(captured)
     print(f"gate self-check: {match / max(1, total):.3f} of the captured per-token top-6 reproduced by the recomputed gate",
           flush=True)
-    results = {"measured": measured, "calibration": calib, "rows_per_layer": rows, "none": {"alone": alone0, "ontop": ontop0}, "policies": {}}
+    # the tier's victim rule: today's LRU, or never-routed prefetch landings first
+    spec0 = replay(cap, "none", "ontop", 0, rows, args.ms_per_row, args.ms_per_layer, None, victim="specfirst")
+    print(f"victim rule specfirst, no new policy: RAM misses/verify {spec0['ram_misses']:.1f} (lru {ontop0['ram_misses']:.1f}, "
+          f"alone {alone0['ram_misses']:.1f}); speculative evictions {spec0['speculative_evictions_per_verify']:.1f} of "
+          f"{spec0['evictions_per_verify']:.1f}", flush=True)
+    results = {"measured": measured, "calibration": calib, "rows_per_layer": rows,
+               "none": {"alone": alone0, "ontop": ontop0, "ontop_specfirst": spec0}, "policies": {}}
     base = {"alone": alone0["ram_misses"], "ontop": ontop0["ram_misses"]}
-    for policy in ("oracle", "nearmiss", "recur"):
-        for mode in ("ontop", "alone"):
-            for budget in (int(x) for x in args.budgets.split(",")):
-                r = replay(cap, policy, mode, budget, rows, args.ms_per_row, args.ms_per_layer, scores)
-                r["misses_saved"] = base[mode] - r["ram_misses"]
-                r["gib_per_verify"] = r.get("reads_landed", 0) * 13271040 / 2**30
-                results["policies"][f"{policy}-{mode}-{budget}"] = r
-                print(f"  {policy:9s} {mode:6s} budget {budget:3d}: reads {r.get('reads_issued', 0):5.1f}/verify, useful "
-                      f"{r.get('useful', 0):5.1f}, wasted {r.get('wasted', 0):5.1f}, late {r.get('late', 0):4.1f}; RAM misses "
-                      f"{r['ram_misses']:5.1f} (saved {r['misses_saved']:+5.1f} vs {base[mode]:.1f}); candidates {r.get('candidates', 0):.0f}", flush=True)
+    for victim in args.victims.split(","):
+        for policy in ("oracle", "nearmiss", "recur"):
+            for mode in ("ontop", "alone"):
+                for budget in (int(x) for x in args.budgets.split(",")):
+                    r = replay(cap, policy, mode, budget, rows, args.ms_per_row, args.ms_per_layer, scores, victim=victim)
+                    r["misses_saved"] = base[mode] - r["ram_misses"]
+                    r["gib_per_verify"] = r.get("reads_landed", 0) * 13271040 / 2**30
+                    results["policies"][f"{policy}-{mode}-{budget}-{victim}"] = r
+                    print(f"  {victim:9s} {policy:9s} {mode:6s} budget {budget:3d}: reads {r.get('reads_issued', 0):5.1f}/verify, useful "
+                          f"{r.get('useful', 0):5.1f}, wasted {r.get('wasted', 0):5.1f}, late {r.get('late', 0):4.1f}; RAM misses "
+                          f"{r['ram_misses']:5.1f} (saved {r['misses_saved']:+5.1f} vs lru-none {base[mode]:.1f}); candidates "
+                          f"{r.get('candidates', 0):.0f}", flush=True)
     if args.json:
         with open(args.json, "w") as f:
             json.dump(results, f, indent=1)
