@@ -408,8 +408,17 @@ vs real 41.1%: read deltas, not absolutes.
   H2D; budgeted/conditional/lazy variants 0-3 hits or worse); per-layer slot allocation; acceptance-aware bypass
   (rejected-only routes recur 42% vs 26% for accepted); cutting layer 0/1 slots under pin01; changing the RAM tier's
   protection of VRAM-hot rows (11.3 GB; evicted VRAM experts recur within 8 verifies 58%).
-- **GPU drip explained:** drips land in scratch, not residency, so a used drip misses again next verify (measured
-  neutral, 69.9 vs 69.3). If kept: land drips in a victim slot and commit residency.
+- ~~**GPU drip explained:** drips land in scratch, not residency, so a used drip misses again next verify (measured
+  neutral, 69.9 vs 69.3). If kept: land drips in a victim slot and commit residency.~~
+  **Retracted 2026-10-16 (drip-hot, `263c26de0a`, checked against the code):**
+  - A lane is typed HIT_SCRATCH only when it has a victim destination (`lease_device.cuh:402`, `dst[j] >= 0`).
+  - C1s copies the scratch row into that victim (`lease_kernels.cuh:289`), and the DIRECT commit skips only CPU
+    lanes (`direct_gather.cuh:202`), so a used drip is committed to residency.
+  - Measured: 50% of landed drips are resident one verify after their target, matching used/landed of 49%.
+  - **Why it was neutral:** drips replaced DMA and CPU-RAM lanes (wait -2.1 ms/verify, about 0.07 ms per CPU-RAM
+    lane removed), not the critical path, which is the CPU's NVMe reads for forced misses.
+  - **Where it wastes work:** 81% of landed drips are routed at their target, but only 49% are used; the rest fall
+    past the spill's 8 victim lanes.
 
 ### 3.6 Hot-cache decay 0.995 — arm C: no detectable gain
 
@@ -1259,6 +1268,21 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             The drip was off in both lane-head A/B arms (`drip_issued` 0), so that result is not confounded.
             **Approved:** agent `drip-hot` (opus), branch `drip-hot` off `ram-prefetch-pool-serve`. A design note
             comes first; no code or GPU runs before review.
+            - **Design note `DRIP_HOT_DESIGN.md` (`263c26de0a`):** the premise is corrected; used drips already
+              enter residency (section 3.5, retracted). Two designs:
+              - **B, adopt at the gather (recommended):** at the target layer, after routing is known, a landed and
+                routed drip is copied into a hazard-checked shortlist victim and committed, so the planner sees a
+                hit. Nothing is evicted before routing, and the scratch stays.
+              - **A, land straight into a victim:** evicts before routing is known: about 11 hits/verify lost at 2
+                picks, 23 at 4. Freeing the scratch is worth about +4.5 hits.
+              - Expected gain about 41 fewer CPU lanes/verify: ~0.75 ms/token at the measured 0.07 ms/lane, ~3 at
+                the fit's 0.28. Flag `SGLANG_DSV41_ENABLE_GPU_DRIP_ADOPT`.
+            - **Approved next (offline):** a replay of today's drip, B, A and a per-layer-spare variant on the drip
+              capture plus C2.
+              - Validation gate: the capture's lane mix within 5%.
+              - Build gate: at least 30 fewer CPU lanes/verify, no more NVMe GPU lanes, and at most 0.5 ms/verify
+                of added GPU time.
+              - The B-vs-A choice waits for the replay.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
