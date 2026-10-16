@@ -299,8 +299,14 @@ def build_model(rank: int, variant: str):
     return Head()
 
 
+def constant_safe(fs: np.ndarray) -> np.ndarray:
+    """A feature constant in training (such as the draft odds where no draft-top-prob was captured) is zeroed, not
+    scaled by its ~0 deviation: an evaluation capture that does vary it would otherwise explode the logits."""
+    return np.where(fs < 1e-4, 1e9, fs).astype(np.float32)
+
+
 def standardize(train_f: np.ndarray, train_z: np.ndarray):
-    fm, fs = train_f.mean(0), train_f.std(0) + 1e-6
+    fm, fs = train_f.mean(0), constant_safe(train_f.std(0) + 1e-6)
     zs = train_z.std(0) + 1e-6
     return fm, fs, zs
 
@@ -386,7 +392,7 @@ def load_layer_model(head_dir: str, layer: int, rank: int, variant: str):
     model = build_model(rank, variant)
     model.load_state_dict({k[len("state_"):]: torch.from_numpy(a[k]) for k in a.files if k.startswith("state_")})
     model.eval()
-    return model, a["fm"], a["fs"], a["zs"]
+    return model, a["fm"], constant_safe(a["fs"]), a["zs"]
 
 
 def predict_split(data: str, head: str, split: str) -> dict:
