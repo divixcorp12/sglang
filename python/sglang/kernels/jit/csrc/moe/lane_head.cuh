@@ -23,6 +23,7 @@ constexpr int kLaneHeadRanksPerBlock = 16;
 constexpr int kLaneHeadKeyThreads = 512;   // >= experts and >= routes
 constexpr int kLaneHeadMaxTokens = 16;     // lane_head.MAX_TOKENS
 constexpr int kLaneHeadMaxRoutes = 64;     // lane_head.MAX_ROUTES
+constexpr int kLaneHeadMaxRank = 128;
 
 SGL_DEVICE fp32_t lane_head_f32(fp32_t v) {
   return v;
@@ -120,7 +121,13 @@ __global__ __launch_bounds__(kLaneHeadKeyThreads) void lane_head_keys_kernel(
   __shared__ int32_t s_cnt[kLaneHeadKeyThreads];
   __shared__ bool s_live_row[kLaneHeadMaxTokens];
   __shared__ int32_t s_live;
+  __shared__ int32_t s_ids[kLaneHeadMaxRoutes];  // -1: not a live route
+  __shared__ fp32_t s_w[kLaneHeadMaxRoutes];
+  __shared__ fp32_t s_z[kLaneHeadMaxTokens * kLaneHeadMaxRank];  // standardized z = PCA(x) / z_scale
   const int32_t tid = static_cast<int32_t>(threadIdx.x);
+  const int32_t lane = tid % static_cast<int32_t>(device::kWarpThreads);
+  const int32_t warp = tid / static_cast<int32_t>(device::kWarpThreads);
+  constexpr int32_t kWarps = kLaneHeadKeyThreads / static_cast<int32_t>(device::kWarpThreads);
   const int32_t routes = tokens * top_k;
   const int32_t t = verify_ct[0];
   if (tid < experts) s_cnt[tid] = 0;
@@ -134,27 +141,54 @@ __global__ __launch_bounds__(kLaneHeadKeyThreads) void lane_head_keys_kernel(
     s_live_row[tid] = live;
     if (live) atomicAdd(&s_live, 1);
   }
+  // Sum the PCA kernel's splits once per (token, rank), in split order, and standardize.
+  for (int32_t i = tid; i < tokens * rank; i += kLaneHeadKeyThreads) {
+    const int32_t tok = i / rank, r = i % rank;
+    fp32_t z = 0.0f;
+    for (int32_t s = 0; s < splits; ++s) z += partial[(static_cast<int64_t>(s) * max_tokens + tok) * rank + r];
+    s_z[tok * rank + r] = z / z_scale[r];
+  }
   __syncthreads();
-  const int32_t live_count = s_live;
   if (tid < routes) {
     const int64_t e = static_cast<int64_t>(topk_ids[tid]);
-    bool first = s_live_row[tid / top_k] && e >= 0 && e < experts;
-    for (int32_t j = 0; first && j < tid; ++j)
-      if (s_live_row[j / top_k] && static_cast<int64_t>(topk_ids[j]) == e) first = false;
-    if (first) {
+    const bool valid = s_live_row[tid / top_k] && e >= 0 && e < experts;
+    s_ids[tid] = valid ? static_cast<int32_t>(e) : -1;
+    s_w[tid] = static_cast<fp32_t>(topk_weights[tid]);
+  }
+  __syncthreads();
+  const int32_t live_count = s_live;
+  // One warp per route: lane 0 decides whether it is its expert's first live route and gathers the expert's
+  // routes; the warp shares the two rank-length dot products.
+  for (int32_t j = warp; j < routes; j += kWarps) {
+    const int32_t e = s_ids[j];
+    if (e < 0) continue;
+    bool first = true;
+    for (int32_t i = lane; i < j; i += static_cast<int32_t>(device::kWarpThreads)) first &= s_ids[i] != e;
+    if (!__all_sync(0xffffffffu, first)) continue;
+    {
       int32_t cnt = 0;
-      int32_t best_tok = tid / top_k;
-      fp32_t best_w = static_cast<fp32_t>(topk_weights[tid]);
-      for (int32_t j = tid; j < routes; ++j) {
-        if (!s_live_row[j / top_k] || static_cast<int64_t>(topk_ids[j]) != e) continue;
+      int32_t best_tok = j / top_k;
+      fp32_t best_w = s_w[j];
+      for (int32_t i = j; i < routes; ++i) {
+        if (s_ids[i] != e) continue;
         ++cnt;
-        const fp32_t w = static_cast<fp32_t>(topk_weights[j]);
-        if (w > best_w) {
-          best_w = w;
-          best_tok = j / top_k;
+        if (s_w[i] > best_w) {
+          best_w = s_w[i];
+          best_tok = i / top_k;
         }
       }
-      const int32_t first_pos = tid / top_k;
+      fp32_t zdot = 0.0f;
+      fp32_t udot = 0.0f;
+      const fp32_t* zrow = s_z + best_tok * rank;
+      const fp32_t* urow = expert_u + static_cast<int64_t>(e) * rank;
+      for (int32_t r = lane; r < rank; r += static_cast<int32_t>(device::kWarpThreads)) {
+        zdot += zrow[r] * z_w[r];
+        udot += urow[r] * zrow[r];
+      }
+      zdot = device::warp::reduce_sum(zdot);
+      udot = device::warp::reduce_sum(udot);
+      if (lane != 0) continue;
+      const int32_t first_pos = j / top_k;
       const fp32_t sc = score[e];
       const int32_t prev = last[e];
       fp32_t f[kLaneHeadFeatures];
@@ -173,16 +207,6 @@ __global__ __launch_bounds__(kLaneHeadKeyThreads) void lane_head_keys_kernel(
       fp32_t dense = 0.0f;
 #pragma unroll
       for (int i = 0; i < kLaneHeadFeatures; ++i) dense += (f[i] - feature_mean[i]) / feature_scale[i] * dense_w[i];
-      fp32_t zdot = 0.0f;
-      fp32_t udot = 0.0f;
-      const fp32_t* urow = expert_u + e * rank;
-      for (int32_t r = 0; r < rank; ++r) {
-        fp32_t z = 0.0f;
-        for (int32_t s = 0; s < splits; ++s) z += partial[(static_cast<int64_t>(s) * max_tokens + best_tok) * rank + r];
-        const fp32_t zs = z / z_scale[r];
-        zdot += zs * z_w[r];
-        udot += urow[r] * zs;
-      }
       const fp32_t logit = expert_bias[e] + (dense + dense_b[0]) + zdot + udot;
       const fp32_t p = 1.0f / (1.0f + expf(-logit));
       // P >= 0 orders like its bit pattern (residency_rank_keys' shape); ties go to the lower expert id.
@@ -265,8 +289,8 @@ void lane_head_keys(
   RuntimeCheck(n_tokens * k <= kLaneHeadMaxRoutes, "lane head: ", n_tokens * k, " routes, at most ", kLaneHeadMaxRoutes);
   RuntimeCheck(decay_len.unwrap() > n_max_tokens, "lane head: decay powers for ", decay_len.unwrap() - 1,
                " live tokens, the scratch holds ", n_max_tokens);
-  RuntimeCheck(r % kLaneHeadRanksPerBlock == 0 && r > 0, "lane head: rank ", r, " must be a multiple of ",
-               kLaneHeadRanksPerBlock);
+  RuntimeCheck(r % kLaneHeadRanksPerBlock == 0 && r > 0 && r <= kLaneHeadMaxRank, "lane head: rank ", r,
+               " must be a multiple of ", kLaneHeadRanksPerBlock, " up to ", kLaneHeadMaxRank);
   RuntimeCheck(n_experts <= kLaneHeadKeyThreads, "lane head: ", n_experts, " experts, at most ", kLaneHeadKeyThreads);
   RuntimeCheck(n_splits >= 1 && n_splits <= h, "lane head: ", n_splits, " PCA splits over hidden ", h);
   const bool* dead_ptr = nullptr;

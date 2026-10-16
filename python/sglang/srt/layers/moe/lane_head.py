@@ -198,8 +198,8 @@ def read_lane_head_file(
         raise ValueError(
             f"lane head file {path!r}: pca_proj is {tensors['pca_proj'].dtype}, the metadata says {meta.pca_proj_dtype}"
         )
-    if rank % 16 != 0 or rank < 16:
-        raise ValueError(f"lane head file {path!r}: rank {rank} must be a positive multiple of 16")
+    if rank % 16 != 0 or not 16 <= rank <= 128:
+        raise ValueError(f"lane head file {path!r}: rank {rank} must be a multiple of 16 in [16, 128]")
     if experts_f > 512:
         raise ValueError(f"lane head file {path!r}: {experts_f} experts, the key kernel takes at most 512")
     if not (tensors["feature_scale"] > 0).all() or not (tensors["z_scale"] > 0).all():
