@@ -385,9 +385,14 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - Compile flags identical (GCC 15 `-Ofast -march=native` via `exl3/ext.py`). One expert x one token: 0.41-0.47 ms in
   the bench vs ~0.57 median in the server; shared tokens +0.23 ms server vs +0.15 bench. The 6-row output memset costs
   19/38 us per job.
-- In flight: remove per-job output-row zeroing (store-on-first-write, else zero unwritten rows only, else AVX-512 NT
-  stores + sfence), env-gated off (`SGLANG_DSV41_CPU_EXPERTS_STORE_OUT`), bit-identical test. Unit tests running; then
-  a box slot to measure.
+- **Store-on-first-write built** (`SGLANG_DSV41_CPU_EXPERTS_STORE_OUT`, off).
+  - With the flag on, the kernel stores `w*src + zero` on each token's first write, with `zero` behind an asm
+    barrier so -Ofast keeps the bits identical (including -0). Later writes add.
+  - Only rows of unrouted tokens are zeroed, and the engine memset is skipped. NVFP4 already overwrites every row.
+  - Unit tests: 165 passed.
+  - Queued after run3 and the mirror validation: the bit-identical CPU test (11 cases x threads 1/4/10) and a bench
+    on the real engine's 6-token jobs. Expected gain is 20-40 us per job, under 1 ms per verify, so bench only
+    unless it shows more.
 - Other suspects, not yet tested: NUMA balancing on (TLB IPIs near prefill), IRQ 239 on core 14, swap (now addressed
   by `-mem`). Proposed benches: numa_balancing A/B, perf clock check, busy-socket bench.
 - Facts: no CPU core copies expert weights to the GPU (copy engine = `cuMemcpyAsync` DMA; stream kernel and drip are
