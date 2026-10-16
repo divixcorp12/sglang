@@ -2376,6 +2376,10 @@ class RamTier {
     for (size_t j = 0; j < request.lanes.size(); ++j) {
       const Lane& lane = request.lanes[j];
       if (Wire::home(lane.expert) != group.index) continue;  // another group's lane
+      // a = the expert, b = its kind | 256 when spilled (no VRAM destination), c = its lane: expert_breakdown.py.
+      if constexpr (Build::kMetrics)
+        group.trace.emit("lane_kind", request.row, request.gen, request.seq, group.index, lane.expert,
+                         static_cast<int64_t>(lane.kind) | (lane.dst < 0 ? 256 : 0), static_cast<int64_t>(j));
       const auto fail = [&](const char* why) {  // the message is built only to fail: the hot path allocates nothing
         fail_record(
             request,
@@ -3573,7 +3577,8 @@ class RamTier {
 
   // svc_record: a = the record's service ns, b = the idle ns since the group's previous record ended (-1 for its
   // first), c = ns inside read_rows (which includes the side work its drain loop runs). svc_side: a = ns submitting
-  // CPU jobs, also inside the read when its loop ran them; b = 0, since no pool row is copied.
+  // CPU jobs, also inside the read when its loop ran them; b = 0, since no pool row is copied. svc_routed: a = the
+  // routed experts the group homes, b = all routed experts, c = all lanes; a routed expert with no lane is VRAM-hot.
   void trace_svc(Group& group, const Request& request, int64_t start)
     requires(Build::kMetrics)
   {
@@ -3582,6 +3587,12 @@ class RamTier {
     const int64_t idle = svc.last_end > 0 ? start - svc.last_end : -1;
     group.trace.emit("svc_record", request.row, request.gen, request.seq, group.index, end - start, idle, svc.read_ns);
     group.trace.emit("svc_side", request.row, request.gen, request.seq, group.index, svc.cpu_ns, 0, 0);
+    int64_t own = 0;
+    for (int32_t expert : request.protect)
+      own += Wire::home(expert) == group.index;
+    group.trace.emit(
+        "svc_routed", request.row, request.gen, request.seq, group.index, own,
+        static_cast<int64_t>(request.protect.size()), static_cast<int64_t>(request.lanes.size()));
     svc.last_end = end;
   }
 

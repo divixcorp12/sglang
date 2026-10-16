@@ -8,8 +8,9 @@ import json
 import math
 import struct
 
+from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_prefetch_fixtures import LOGITS, enable, forced, load, prefetch_rig, trigger
+from sglang.test.dsv41_ram_prefetch_fixtures import LOGITS, _served, enable, forced, load, prefetch_rig, trigger
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -131,6 +132,36 @@ def _tier_events(tmp_path, kinds):
     files = list(tmp_path.glob("jobs.*.exl3-tier0.*.jsonl"))
     assert len(files) == 1
     return [e for e in map(json.loads, files[0].read_text().splitlines()[1:-1]) if e["event"] in kinds]
+
+
+def test_each_lane_leaves_its_kind_and_each_record_its_routed_and_lane_counts(tmp_path, monkeypatch):
+    """lane_kind: a = the expert, b = its kind | 256 when spilled (destination -1), c = its lane. svc_routed, also for a
+    lane-less record: a = the group's routed experts, b = all routed, c = all lanes, so expert 0 (routed, no lane) is
+    VRAM-hot. Mutants: report the slot as b, drop the spill bit, or skip svc_routed on a lane-less record -- red."""
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    (tmp_path / "rig").mkdir()
+    rig = prefetch_rig(tmp_path / "rig", capacity=9, share=1)  # room for the two misses' victims
+    try:
+        first = load(rig, 1, [4])
+        req = rig.sim.post(
+            1, [4, 2, 5], protect=[0, 4, 2, 5], dst=[0, 1, -1], captured=True, cpu_on=True, cpu_misses=True,
+            forced_from=2,
+        )
+        _served(rig, req)
+        touch = rig.sim.post(1, [], protect=[0])
+        assert rig.host.pump() == 1 and rig.sim.wait_handled(touch)
+    finally:
+        rig.host.stop()
+    events = _tier_events(tmp_path, {"lane_kind", "svc_routed"})
+    lanes = sorted((e["seq"], e["a"], e["b"], e["c"]) for e in events if e["event"] == "lane_kind")
+    assert lanes == [
+        (first.seq, 4, LaneKind.MISS_GPU, 0),
+        (req.seq, 2, LaneKind.MISS_CPU, 1),
+        (req.seq, 4, LaneKind.HIT_CPU, 0),
+        (req.seq, 5, LaneKind.MISS_CPU | 256, 2),
+    ]
+    routed = sorted((e["seq"], e["row"], e["a"], e["b"], e["c"]) for e in events if e["event"] == "svc_routed")
+    assert routed == [(first.seq, 1, 1, 1, 1), (req.seq, 1, 4, 4, 3), (touch.seq, 1, 1, 1, 0)]
 
 
 def _read_record(rig):
