@@ -744,6 +744,24 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       4. B1 if A0 confirms the double copy.
       - A4 is skipped unless the others fall well short; that would be an owner call.
     - The served check pairs the cuts with the calibration flag, so the freed memory goes to the hot cache.
+    - **A0 measured** (`/mnt/nvme1/prefill-merge/a0`, `1d0e669e7f`, expseg config, KV 381,184, 662 MiB free, 0 OOM):
+      layer 2 at 4096 tokens.
+      - q (wq_b output) holds 256 MiB. wq_b's own transient is +522.
+      - **The attention peak, +633 over q, is in the FlashMLA core:** out 256 + out_extra 256 + the 128 merge
+        chunk. Layer 1 is +330.
+      - Not at the peak: wo_b +200, MoE +431, hc_post +160 at the layer end.
+      - **A1 (indexer) does not touch the peak; dropped.**
+      - **A2 with A3 inside: about -370 MiB (~29 slots)** before wq_b's transient becomes the peak. The next target
+        is wq_b's extra 266 MiB temporary.
+      - The 556 MiB held across layers is still unresolved: the hc_pre path didn't fire. A wrapper goes into the next
+        instrumented smoke.
+    - **Calibration fixes pushed** (`863ad432ba`):
+      - The post-capture check now projects from the reserved peak.
+      - VMM backing only for tensors of 64 MiB or more.
+      - KV below `--max-total-tokens` is refused.
+      - 45 CPU tests passed.
+    - Next: A2 code plus its torch.equal GPU test, the TARGET_VERIFY capture estimate, then one combined GPU slot
+      (VMM test rerun, A2 test, step-3 smoke rerun).
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
