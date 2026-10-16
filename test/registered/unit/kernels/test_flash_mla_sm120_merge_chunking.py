@@ -147,6 +147,53 @@ def test_kernel_output_is_bitwise_unchunked(extra, tokens, budget_mb):
     assert torch.equal(got_lse, ref_lse)
 
 
+CHUNK_KERNELS = envs.SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS
+
+
+def test_kernel_chunk_tokens_from_budget():
+    # Per token: two bf16 partials and three fp32 merge copies of 64 x 512 = 1 MiB a token.
+    assert tmod.kernel_chunk_tokens(64, 512, 32) == 32
+    assert tmod.kernel_chunk_tokens(64, 512, 128) == 128
+    assert tmod.kernel_chunk_tokens(64, 512, 0) == 1
+
+
+@SM120
+@pytest.mark.parametrize("extra", [True, False])
+@pytest.mark.parametrize("tokens", [4096, 2048 + 17, 171])
+@pytest.mark.parametrize("budget_mb", [32, 1])
+def test_chunked_kernels_are_bitwise_unchunked(extra, tokens, budget_mb):
+    run = _call(tokens, extra, sink=True)
+    run()  # autotune once
+    with BUDGET.override(0), CHUNK_KERNELS.override(False):
+        ref_out, ref_lse = run()
+    with BUDGET.override(budget_mb), CHUNK_KERNELS.override(True):
+        assert tmod.kernel_chunk_tokens(64, tmod._D, budget_mb) < tokens
+        got_out, got_lse = run()
+    assert torch.equal(got_out, ref_out)
+    assert torch.equal(got_lse, ref_lse)
+
+
+@SM120
+def test_chunked_kernels_hold_one_full_output():
+    """With the kernels chunked, only the final bf16 output (and its LSE) is full size; the partials and merge
+    temporaries stay within the budget."""
+    tokens, heads, budget_mb = 4096, 64, 32
+    bf16_out = tokens * heads * tmod._D * 2
+    run = _call(tokens, extra=True, sink=True)
+    run()
+    with BUDGET.override(budget_mb), CHUNK_KERNELS.override(True):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out = run()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        del out
+    assert peak <= bf16_out + (budget_mb << 20) + (32 << 20), peak
+    print(f"peak with chunked kernels at {budget_mb} MiB: {peak / 2**20:.0f} MiB")
+
+
 @SM120
 def test_budget_bounds_the_merge_peak():
     """At 4096 tokens the one-pass merge holds the two bf16 partials plus 3 fp32 copies

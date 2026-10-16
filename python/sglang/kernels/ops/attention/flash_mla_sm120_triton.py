@@ -367,6 +367,49 @@ def merge_chunk_tokens(num_heads: int, head_dim_v: int, budget_mb: int) -> int:
     return max(1, (budget_mb << 20) // per_token)
 
 
+# Per token of a kernel chunk: the SWA and extra partial outputs (bf16, 2 bytes each) plus the merge's fp32 copies.
+_KERNEL_CHUNK_BYTES_PER_ELEMENT = 2 + 2 + 4 * _MERGE_FP32_COPIES
+
+
+def kernel_chunk_tokens(num_heads: int, head_dim: int, budget_mb: int) -> int:
+    """Tokens per kernel chunk whose partial outputs and merge temporaries fit in budget_mb MiB (>= 1)."""
+    per_token = _KERNEL_CHUNK_BYTES_PER_ELEMENT * num_heads * head_dim
+    return max(1, (budget_mb << 20) // per_token)
+
+
+def _sparse_decode_chunked(
+    q, k_cache, indices, topk_length, attn_sink, softmax_scale,
+    extra_k_cache, extra_indices, extra_topk_length, chunk_tokens,
+):
+    """flash_mla_sparse_decode_triton over token chunks: per chunk the SWA and extra kernels, the merge and the sink,
+    written into one [B, 1, H, D] output. Every kernel program is one (token, head) and every merge op is elementwise
+    per token, and the autotune key is the top-k, not the token count, so each chunk computes exactly what the whole
+    call would for its tokens."""
+    B, _, H, D = q.shape
+    out = torch.empty(B, 1, H, D, dtype=torch.bfloat16, device=q.device)
+    lse = torch.empty(B, 1, H, dtype=torch.float32, device=q.device)
+    has_extra = extra_k_cache is not None and extra_indices is not None
+    for start in range(0, B, chunk_tokens):
+        end = min(start + chunk_tokens, B)
+        part = slice(start, end)
+        o, l = _run_triton_sparse_decode(
+            q[part], k_cache, indices[part],
+            topk_length[part] if topk_length is not None else None, softmax_scale,
+        )
+        if has_extra:
+            o_extra, l_extra = _run_triton_sparse_decode(
+                q[part], extra_k_cache, extra_indices[part],
+                extra_topk_length[part] if extra_topk_length is not None else None, softmax_scale,
+            )
+            o, l = _merge_partial_attn(o, l, o_extra, l_extra)
+            del o_extra, l_extra
+        if attn_sink is not None:
+            o, l = _apply_attn_sink(o, l, attn_sink)
+        out[part].copy_(o)
+        lse[part].copy_(l)
+    return out, lse.permute(0, 2, 1)
+
+
 def _merge_and_sink_chunked(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -419,6 +462,17 @@ def flash_mla_sparse_decode_triton(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    # A prefill chunk holds both partial outputs at full size before the merge; with the kernel chunking flag and
+    # a budget, run the kernels, merge and sink per token chunk into one output instead (bitwise the same).
+    budget_mb = envs.SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB.get()
+    if budget_mb > 0 and envs.SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS.get():
+        chunk_tokens = kernel_chunk_tokens(q.shape[2], q.shape[3], budget_mb)
+        if q.shape[0] > chunk_tokens:
+            return _sparse_decode_chunked(
+                q, k_cache, indices, topk_length, attn_sink, softmax_scale,
+                extra_k_cache, extra_indices, extra_topk_length, chunk_tokens,
+            )
 
     # Process main cache (SWA)
     out, lse = _run_triton_sparse_decode(

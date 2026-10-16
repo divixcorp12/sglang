@@ -1392,6 +1392,9 @@ class Envs:
     # independently, so chunking them under the cap gives bitwise the same output.
     # 0 keeps the one-pass merge.
     SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB = EnvInt(0)
+    # With the merge budget set, also run the triton backend's SWA and extra kernels per token chunk (sized by the
+    # same budget), so the two full-size partial outputs never exist; bitwise the same output.
+    SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS = EnvBool(False)
     # Release the CUDA caching allocator's unused segments (torch.cuda.empty_cache) before a DSpark prefill larger than
     # any before it, so the startup warm-up's growing shapes do not strand reserve sized for the smaller ones (1.9 GB
     # above the live peak, /mnt/nvme1/prefill-merge/peaklog). Allocator-only: no math changes.
