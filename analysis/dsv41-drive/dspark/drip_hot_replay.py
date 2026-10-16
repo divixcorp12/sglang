@@ -457,13 +457,36 @@ def arms(cap: Capture, horizon: int) -> dict:
     return out
 
 
+def capacities(d: str, layers: int) -> tuple[dict[int, int], float, int, list[int]]:
+    """lane_tier_replay.numa_capacities, or for a server log whose startup line predates ``rows_per_layer`` (the
+    breakdown captures), its total ``rows`` spread over the layers as evenly as the tier does (210/209 at 8386)."""
+    try:
+        return ltr.numa_capacities(d)
+    except KeyError:
+        pass
+    total, frac, share = 0, 0.5, 0
+    with open(os.path.join(d, "server.log"), errors="replace") as f:
+        for line in f:
+            if "Pinned host expert cache startup" in line:
+                info = json.loads(line[line.index("{"):])
+                total = int(info["rows"])
+                b = info["numa"]["bound_bytes"]
+                frac = int(b["0"]) / (int(b["0"]) + int(b["1"]))
+            elif "RAM prefetch share" in line:
+                share = int(line.split("RAM prefetch share")[1].split(",")[0])
+    if not total:
+        raise ValueError(f"{d}: no pinned-tier startup line")
+    rows = {L: total // layers + (L < total % layers) for L in range(layers)}
+    return rows, frac, share, []
+
+
 def tier_returns(cap: Capture, released: list[tuple[int, int, int]], horizon: int) -> dict:
     """Drive lane_tier_replay's NodeTier (TIER_RULES 1-6, 9; no prefill admissions, rule 8) over the route lines with
     the released residents unpinned from their release until they are routed again or ``horizon`` lines pass, and
     classify each return (routed again inside the horizon, while the capture kept it resident) as RAM-warm or
     NVMe-cold."""
-    rows, frac, share, full = ltr.numa_capacities(cap.dir)
     layers = len(cap.lines[0]["routes"])
+    rows, frac, share, full = capacities(cap.dir, layers)
     tiers = [ltr.layer_tiers(rows.get(L, 210), frac, share) for L in range(layers)]
     p_promote = ltr.promote_fraction(cap.dir)
     lines = cap.lines
