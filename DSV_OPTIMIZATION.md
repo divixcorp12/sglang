@@ -961,6 +961,20 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
             - Decision: keep 232 and run the served A/B against expseg2 now. Its main purpose is to check the
               margin under load, with GPU free memory sampled every 1 s. Release the residue holders later, with
               a per-holder diagnostic.
+          - **Served A/B (e)** (2026-10-16 03:03-03:20, `prefill-merge-ab-20261016/`, `c6d3128a40`, logger off):
+            `-mergechunk-expseg` (OFF, 1,035 slots) against `-expseg-calib` (ON: calibration + A1/A2/A3, 1,046
+            slots).
+            - **serve_compare, 5 of 8 clean prompts: +0.62 ms/token, CI −1.88..+2.60. No cost and no gain.**
+              Stall-flagged: OFF prompt 0; ON prompts 2 and 5.
+            - VRAM verify hit rate 43.72% against 43.69%: +11 slots (~1%) is invisible.
+            - **Margin held under serving.** Min free over the whole run was OFF 580, ON 624 (margin 508.5).
+              Serving never went below the warm-up minimum: the allocator keeps the warm-up reserve.
+            - Node 0 min free during load: OFF 230 MiB, ON 135 MiB (watermark 43). 0 OOM in both.
+            - Long-prompt prefill cost can't be measured from this prompt set (548-1,406 tokens, NVMe-dominated).
+            - **Verdict:** calibration is safe and free, but with today's numbers it buys only ~+11 slots, which
+              doesn't move ms/token. Its value is automation and safety, not speed. Next: release the 168 MiB
+              residue (~+13 slots), write the final handoff, and wrap up the lane. (c) and (d) (wq_b) are
+              deferred.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
