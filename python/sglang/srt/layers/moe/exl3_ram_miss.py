@@ -583,12 +583,13 @@ def usable_rows(ranges, *, staging_width: int, share: int) -> int:
     return sum(max(0, hi - lo - min(staging_width, hi - lo - 1) - share) for lo, hi in ranges)
 
 
-def prefill_share_rows(usable: list[int], fraction: float = PREFILL_SHARE_FRACTION) -> int:
-    """The prefill share for rows of ``usable`` mapped slots each: ``fraction`` of the smallest, at least 1. The host
-    keeps one share for every layer (set_prefill_share), so the smallest row decides."""
+def prefill_share_rows(usable: list[int], fraction: Optional[float] = None) -> int:
+    """The prefill share for rows of ``usable`` mapped slots each: ``fraction`` (default PREFILL_SHARE_FRACTION) of
+    the smallest, at least 1. The host keeps one share for every layer (set_prefill_share), so the smallest row
+    decides."""
     if not usable:
         raise ValueError("exl3 RAM miss: the prefill share needs at least one row that admits")
-    return max(1, round(fraction * min(usable)))
+    return max(1, round((PREFILL_SHARE_FRACTION if fraction is None else fraction) * min(usable)))
 
 
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
