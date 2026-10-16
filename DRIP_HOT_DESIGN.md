@@ -46,11 +46,13 @@ divix01:`/data/models/slang/nvfp4-work/ram-prefetch/`.
    - On measured numbers that costs about 11 hits/verify at 2 picks and about 23 at 4 picks.
    - Returning the scratch VRAM (24 slots) is worth about +4.5. So B is the better first build.
    - A is specified in 2.9 in case the owner still wants it, and the replay (section 3) scores both.
-6. **Expected gain is small.** B removes about 26 forced CPU lanes per verify (the routed but spilled landings),
-   plus about 15 from the victim lanes it frees.
-   - At the drip3 marginal (0.07 ms/lane) that is about 3 ms/verify, or 0.75 ms/token: below the 1.6 ms/token noise
+6. **Expected gain is small.** B removes about 26 forced CPU lanes per verify, the routed landings that spill
+   today. Extending the lanes' victim window would free about 15 more, but that is off by default (2.2, 2.10): the
+   freed lanes risk NVMe-cold rows at 1.47 + 1.09 ms each.
+   - At the drip3 marginal (0.07 ms/lane) that is about 2 ms/verify, or 0.5 ms/token: below the 1.6 ms/token noise
      of a served pair.
-   - At the fit's marginal (0.28 ms/lane) it is about 11 ms/verify, or 3 ms/token.
+   - At lane-tier-replay's CPU RAM-hit job cost (0.099 per lane + 0.439 per route, at least 0.54 per lane) it is up
+     to about 14 ms/verify, or about 3.6 ms/token, if those jobs are on the critical path.
    - The consolidation does not touch the critical path, which is NVMe-cold forced misses.
    - The offline replay gate (section 3) should decide whether to build at all.
 
@@ -180,10 +182,11 @@ before `plan_graph_routes_fused`, captured.
 2. **Choose victims.** Run the hazard test of `direct_gather_destinations` against this forward's route slots. Take,
    in shortlist order, the usable entries: valid, and no route reads their slot. Adopted drip i takes usable entry i.
    - Mark the taken columns invalid.
-   - Under spill, validate the next ranked columns past `victim_lanes`, one per adoption, so the lanes still find
-     `victim_lanes` victims.
-   - This needs `victim_ranked`, the pre-truncation `ranked.values < never` mask. `_rank_victims` keeps it only when
-     the flag is on.
+   - By default the lanes' window is not extended (2.2), so the lanes find `victim_lanes - k` victims, the GPU-lane
+     count today's scratch lanes leave.
+   - With `..._ADOPT_EXTEND`, under spill, the kernel validates the next ranked columns past `victim_lanes`, one per
+     adoption. That needs `victim_ranked`, the pre-truncation `ranked.values < never` mask, which `_rank_victims`
+     keeps only when the knob is on.
 3. **Copy.** Write `{scratch slot to victim slot}` pairs into `scratch_rows_1 / scratch_dst_1 / scratch_go_1` and
    launch C1s's `copy_expert_row_segments_gpu(drip_segments, ...)` (today at `MOE/exl3_ram_miss.py:753-759`) here, in
    place of in the chain.
@@ -202,9 +205,18 @@ It uses the same ranking as insert-on-miss: the boundary's shortlist with the ga
 the head of the usable shortlist and the lanes take the entries after them, so the slots evicted in a verify are
 still the lowest-ranked ones. This only changes who gets which.
 
-- **Capacity floor.** Spill needs `capacity >= 2 * victim_lanes` (`MOE/expert_residency_gpu.py:403-409`). This mode
-  adds up to `picks` adoptions per layer, so it needs `capacity >= 2 * victim_lanes + picks`. That is 16 + 4 = 20
-  against today's 21-22 slots per layer; the gate checks it.
+- **Capacity floor.** Spill needs `capacity >= 2 * victim_lanes` (`MOE/expert_residency_gpu.py:403-409`). With the
+  extension knob on, up to `picks` adoptions per layer come on top, so it needs `capacity >= 2 * victim_lanes +
+  picks`: 16 + 4 = 20 against today's 21-22 slots per layer. The gate checks whichever floor applies.
+
+**Default: no extension (revised after the RAM-tier rules, 2.10).** Adoptions take columns from the lanes' own
+`victim_lanes` window and do not extend it. The lanes then keep the GPU-lane count today's drip arm has, since a
+scratch lane also used one of the V.
+- The gain is then only the routed landings that today spill to the CPU.
+- No extra miss is pulled into the GPU prefix, where it could be NVMe-cold.
+- Extending the window is a knob (`..._ADOPT_EXTEND`). The replay decides it, priced with the costs in 2.10.
+- Without extension the floor is unchanged (`capacity >= 2 * victim_lanes`), because adoptions use at most the V
+  columns the lanes would have used.
 
 ### 2.3 Commit and visibility
 
@@ -302,6 +314,53 @@ The scratch goes away (24 x 13.27 MB = 318 MB back to the hot budget).
      `MOE/expert_stream.py:2457-2460`, and the prefill boundary at `MOE/expert_residency_gpu.py:679-692` look
      clean, but this is unverified.
 
+### 2.10 RAM-tier interplay (TIER_RULES from `lane-tier-replay` 814cd3684b)
+
+These rules come from the TIER_RULES block of `analysis/dsv41-drive/dspark/lane_tier_replay.py`. I re-checked each
+citation on this base (`fd5dfa5bef`); the lines match.
+
+- **VRAM-hot experts keep their RAM row.** `take_victim_locked` skips `tier.hot` (`ES/host/ram_tier.h:2126`).
+  - The hot set has a fixed size (one per VRAM slot), so an adoption swaps which RAM rows are pinned: the adopted
+    expert's row becomes pinned and the VRAM victim's row is released at the row's next post (`apply_gpu_hot`,
+    592-598). An adoption costs no extra RAM row; it trades the victim's protection for the drip's.
+  - The victim is the one at risk. Once unpinned, it ages out of RAM by LRU and, if it recurs, returns NVMe-cold.
+    This is what every lane insert does today; B adds about 26 such swaps per verify.
+  - Design A also unpins its victims early: a `LOADING` slot has `slot_to_expert` = -1, so it is not hot.
+- **Routed RAM experts are restamped every record**, VRAM hits included (`stamp_routed_locked`, 2090; via
+  `collect_wanted_locked`, 2188). A shortlist-head victim was not routed in the last verify, so its RAM stamp is
+  older than any recently routed row's. It is among the likelier RAM evictions once unpinned. The replay must model
+  this (section 3).
+- **Per-node tier**, `home = e % nodes` (`ES/lease_layout.h:52`): about 103 usable rows per layer on node 0 and 87
+  on node 1. The drip's RAM source is its home node's slab, so no change.
+- **Every demand miss is cached in RAM** (`reserve_victims_locked`, 2998). Prefetch pool rows serve GPU lanes
+  (2369) or forced CPU misses (2419). About 50% of landed rows are promoted unused, inheriting their victim's stamp
+  (2919, 2960).
+  - Drip picks need the device map's `ram_slot >= 0` (`ES/spec_score.cuh:293`) and the host mirror at admission
+    (`gpu_drip.h:456-459`). A pool row not yet promoted is never a drip source.
+- **Prefill admissions displace any number of decode rows** when no prefill share is set, and emit no event
+  (`assign` 399, `fill_begin` 456, `take_admit_slot_locked` 1982, `take_slot_locked` 2038).
+  - After a prefill, fewer of a row's experts are RAM-mapped, so the drip has fewer eligible picks. A pick is never
+    cold: the RAM-mapped requirement and the generation check (`gpu_drip.h:226-229`) see to that.
+  - The risk is on the lane side. In the lane-head A/B, 56-59% of NVMe-cold GPU lanes had left RAM through a
+    prefill.
+  - That is why 2.2 now defaults to not extending the lanes' window: a lane freed by an adoption would most likely
+    be filled after a prefill by exactly such a row.
+- **Only decode demand misses emit `evict`** (`trace_evict` 2141). Promotion victims are untraced (2949). The
+  replay's RAM model cannot observe promotion evictions directly and must use lane-tier-replay's reconstruction.
+- **Measured costs** (lane-tier-replay fit on the lane-head A/B, ms). These replace the flat 0.07/0.28 brackets in
+  sections 0 and 3 for pricing:
+  - An NVMe-cold GPU lane adds 1.47 to stream, and each one delays a CPU miss's landing by 1.09.
+  - A pool-served GPU lane adds 0.65; a copy lane on the link, 0.75.
+  - A CPU RAM-hit job costs 0.099 per lane plus 0.439 per route; a forced-miss job, 0.29 per lane plus 0.261 per
+    route.
+- **What the costs imply.**
+  - A spilled, routed landing that B turns into a hit removes a lane from a CPU RAM-hit job: 0.099 plus 0.439 per
+    route it carries. That is at least 0.54 ms where that job is on the critical path, and nothing where it is not.
+  - Extending the window would add up to 1.47 + 1.09 ms for each freed lane that lands on an NVMe-cold row. That
+    outweighs the saving, so the window stays unextended unless the replay shows the freed lanes are mostly RAM-warm.
+  - The 0.75 ms cost of a link copy lane confirms the link is not free. Today's drip moved as many bytes as demand,
+    which section 4 already gates.
+
 **Rejected, design C: a per-layer spare row, swapped in at the gather.** No eviction happens before routing, but 40
 spare rows cost 531 MB (more than the scratch) and cap the drip at one landing per layer per verify. The replay
 scores it anyway.
@@ -357,12 +416,20 @@ built on cache-tiers' `vram_cache_replay.py`.
   - `base` as the no-drip reference.
   - C2 for victim statistics.
   - Optionally, C2 with picks re-scored offline from `router.x.bin` and the target layer's gate weights.
-- **Arms.** Today (scratch lanes), B, B with unrouted adoption, A (picks 1-4, a theta sweep), and C (1-2 spares).
+- **RAM tier.** Use lane-tier-replay's TIER_RULES model (2.10) to classify each lane as VRAM, RAM-warm, pool or
+  NVMe-cold. Above all, it must follow the VRAM victims B releases, which become evictable from RAM once unpinned.
+  If that model has not passed its own gate, report results with RAM state taken from the capture's lane kinds, and
+  say so.
+- **Arms.** Today (scratch lanes); B without and with the window extension; B with unrouted adoption; A (picks 1-4,
+  a theta sweep); and C (1-2 spares).
 - **Outputs per verify.**
   - VRAM hits; lanes by kind (DMA, NVMe GPU, CPU-RAM, CPU-NVMe; forced vs split); inserts, evictions and lost hits
     (victims routed in the same verify).
   - Device-to-device copies; link MB.
-  - Priced two ways: the lane-cost fit, and the drip3 empirical marginal (about 0.07 ms per CPU-RAM lane).
+  - Priced two ways:
+    - The lane-tier-replay costs (2.10): CPU RAM-hit job 0.099/lane + 0.439/route; forced miss 0.29 + 0.261;
+      NVMe-cold GPU lane +1.47 stream and +1.09 on a CPU miss's landing; pool lane 0.65; link copy lane 0.75.
+    - The drip3 empirical marginal (about 0.07 ms per CPU-RAM lane), as the conservative bound.
 - **Validation gate.** "Today" must reproduce the drip capture's per-verify kinds within 5%: VRAM 358.5, scratch
   44.1, DMA 71.8, CPU-RAM 299.2, spilled 277. Removing drips must reproduce `base`: 348.9 / 95.3 / 329.0. If not,
   stop and report.
@@ -406,7 +473,8 @@ built on cache-tiers' `vram_cache_replay.py`.
   - It needs `SGLANG_DSV41_GPU_DRIP_SLOTS > 0` and the drip's existing prerequisites: the copy engine, and RAM
     prefetch with the GPU scorer (`MOE/exl3_ram_miss.py:1554-1562`).
   - It needs `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2` and `SGLANG_DSV41_ENABLE_LAYER_FUSION`.
-  - It needs every layer's capacity to be at least `2 * victim_lanes + picks`, and names the short layer.
+  - With `..._ADOPT_EXTEND`, it needs every layer's capacity to be at least `2 * victim_lanes + picks`, and names
+    the short layer.
   - The gate test asserts the resolved requirements are EXL3, per the run-protocol rule.
 - **Counters.**
   - Device, per layer, through `insertion_counters()` so they reach the async residency snapshot: `drip_adopted`,
@@ -441,7 +509,7 @@ built on cache-tiers' `vram_cache_replay.py`.
 
 ## 6. Risks and open questions
 
-1. **Small gain.** 0.75-3 ms/token per the two pricings, and the low end is the one with served evidence. The
+1. **Small gain.** About 0.5-3.6 ms/token per the two pricings, and the low end is the one with served evidence. The
    critical path, NVMe-cold forced misses, is outside the drip's reach. The replay may say not to build. That is a
    valid outcome and should be read as one.
 2. **Owner intent.** B keeps a scratch, while the approval named landing in victim slots. This needs an explicit
@@ -453,5 +521,10 @@ built on cache-tiers' `vram_cache_replay.py`.
 5. **Alignment noise.** About 7% (section 1.3), from a 131-verify capture. The precision-by-pick figures should be
    re-checked on a second drip capture if one exists.
 6. **Design A's eager-path audit** (2.9) and its pre-route loss. The replay's lost-hit count is the deciding number.
-7. **Lane-tier-replay.** If `lane-tier-replay` passes its gate, its shared-drive and RAM-tier pricing should replace
-   the flat 0.07/0.28 ms brackets in section 3.
+7. **Lane-tier-replay's validity.** The 2.10 costs and TIER_RULES come from a model whose gate had not passed when
+   this was written. The drip-hot replay takes them as given and reports which of its conclusions depend on them.
+8. **Released VRAM victims.** Each adoption unpins its VRAM victim's RAM row (2.10). A victim that recurs after
+   aging out of RAM returns NVMe-cold, at 1.47 + 1.09 ms. Rank-0..3 victims recur within three verifies 26-39% of
+   the time, so the replay must count these returns. They are the hidden cost of every extra insert.
+9. **After a prefill** fewer drip picks are eligible, since prefill admissions displace decode rows without bound
+   and without an event. The A/B should report drip admits per verify against position after a prefill.
