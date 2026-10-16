@@ -140,10 +140,10 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
     d = run.dir
     header, log = ltr.route_log(d)
     off = ltr.align(run, log)
-    rows, frac, share, full = ltr.numa_capacities(d)
+    rows, frac, pool_share, full = ltr.numa_capacities(d)
     full = set(full)
     p_promote = ltr.promote_fraction(d)
-    tiers = [ltr.layer_tiers(rows.get(L, 210), frac, share) for L in range(layers)]
+    tiers = [ltr.layer_tiers(rows.get(L, 210), frac, pool_share) for L in range(layers)]
     cap = header["hot_capacity"]
     by_vr = {(r.verify, r.row): r for r in run.records}
     replayed = {r.seq for r in run.records}
