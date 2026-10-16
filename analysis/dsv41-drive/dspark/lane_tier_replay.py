@@ -546,13 +546,16 @@ def _hash01(*xs: int) -> float:
     return (h >> 11) / float(1 << 53)
 
 
-def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None = None) -> tuple[dict, dict]:
+def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None = None,
+                on_gather=None) -> tuple[dict, dict]:
     """Drive the RAM tier through the run (TIER_RULES; ``rules`` False is the first gate's plain LRU of 170 rows) and
     classify each record's GPU lanes (the experts it inserted into VRAM: its unforced lanes) as NVMe-cold, pool-served
     or RAM-warm. Outside the replayed verifies (prefill, warm-up, eager forwards) the trace's own evictions are applied,
     since the lane key does not touch them. With ``prefill`` (stage 0), every eager route-log line also admits by rule
     10, its VRAM-hot set taken from the graph verify before it ("prev") or after it ("next"); the per-line counts are
-    in stats["eager"]. Returns per record seq the predicted (gpu_nvme, gpu_pool) and counts."""
+    in stats["eager"]. ``on_gather(v, L, tier, routed, hot, record)`` is called at each replayed gather (verify window
+    v, layer L) before the gather updates the tier: ``tier[e % 2].has(e)`` is "expert e of row L is in RAM now";
+    ``record`` is the trace's Record or None. Returns per record seq the predicted (gpu_nvme, gpu_pool) and counts."""
     header, log = route_log(run.dir)
     off = align(run, log)
     rows, frac, share, full = numa_capacities(run.dir)
@@ -630,6 +633,8 @@ def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None =
         misses = routed - hot
         r = by_vr.get((v, L))
         cold_pred = set() if L in full else {e for e in misses if not tiers[L][e % nodes].has(e)}
+        if on_gather is not None:
+            on_gather(v, L, tiers[L], routed, hot, r)
         if r is not None and nxt is not None:
             inserted = (set(nxt["hot"][L]) - hot) & misses
             pool = set(r.pool)
