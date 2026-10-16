@@ -9,7 +9,12 @@ number.
 Locks: rowimg-disk.lock, then cc-gpu.lock (the protocol's order), taken here through run_locks.take, which also accepts
 them held by an outer `flock`; the server runs under taskset on SERVER_CORES.
 
+With --long-prompt PATH, long_prompt.py replaces logprob_probe.py: one streaming request of that prompt, thinking on,
+cancelled --decode-seconds after its first token (after --ttft-repeats short ones for TTFT samples), on the same
+collectors; long_compare.py reads the result.
+
 Usage: spec_margin_capture.py OUT_DIR [--arm ARM] [--no-verify-split] [--prompts 8] [--max-tokens 128] [--top-k-only] [--scorer cpu|gpu]
+       spec_margin_capture.py OUT_DIR [--arm ARM] --long-prompt PATH [--decode-seconds 300] [--ttft-repeats 0]
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ import both_cpu_ab  # noqa: E402
 PORT = 30032
 DISK_LOCK = "/data/models/slang/nvfp4-work/rowimg-disk.lock"
 PROBE = os.path.join(REPO, "scripts", "expert_prediction", "prefetch", "logprob_probe.py")
+LONG_PROMPT = os.path.join(HERE, "long_prompt.py")
+# The job trace keeps its first CAPACITY events per file and drops the rest. A verify costs the copy engine's file ~410
+# (share28-ab-20261016) at ~270 ms per instrumented verify, so 300 s of decode needs ~460k: the default 524288 would
+# cut the window's end, and this (the trace's maximum) covers about 600 s.
+LONG_TRACE_CAPACITY = "1048576"
 
 
 def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: str = "dspark-both-prefetch",
@@ -116,7 +126,17 @@ def _healthy(port: int, deadline: float) -> bool:
     return False
 
 
-def main() -> int:
+def client_argv(a: argparse.Namespace) -> list[str]:
+    """The serving client: logprob_probe.py over the A/B's sessions, or long_prompt.py with --long-prompt."""
+    if a.long_prompt:
+        return [arm_env.PYTHON, LONG_PROMPT, "--port", str(PORT), "--prompt", os.path.abspath(a.long_prompt),
+                "--decode-seconds", str(a.decode_seconds), "--ttft-repeats", str(a.ttft_repeats),
+                "--out-dir", a.out_dir]
+    return [arm_env.PYTHON, PROBE, "--port", str(PORT), "--sessions", both_cpu_ab.SESSIONS, "--prompts", str(a.prompts),
+            "--max-tokens", str(a.max_tokens), "--top-logprobs", "1", "--out", os.path.join(a.out_dir, "probe.json")]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("out_dir")
     p.add_argument("--prompts", type=int, default=8)
@@ -129,9 +149,28 @@ def main() -> int:
     p.add_argument("--draft-top-prob", action="store_true",
                    help="also log the draft's per-position top probability each verify (draft-top-prob.*.jsonl); "
                         "one extra draft LM-head pass per verify, so compare timings only against runs with it on")
-    a = p.parse_args()
+    p.add_argument("--long-prompt", metavar="PATH",
+                   help="serve this prompt once, streaming with thinking on, instead of the probe's sessions")
+    p.add_argument("--decode-seconds", type=float, default=300.0,
+                   help="with --long-prompt: cancel the request this long after its first streamed token")
+    p.add_argument("--ttft-repeats", type=int, default=0,
+                   help="with --long-prompt: first send it this many times with 20 s of decode, for TTFT samples")
+    a = p.parse_args(argv)
+    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats):
+        p.error("--decode-seconds and --ttft-repeats need --long-prompt")
+    if a.long_prompt and not os.path.isfile(a.long_prompt):
+        p.error(f"--long-prompt {a.long_prompt}: no such file")
+    if a.decode_seconds <= 0 or a.ttft_repeats < 0:
+        p.error("--decode-seconds must be positive and --ttft-repeats non-negative")
+    return a
+
+
+def main() -> int:
+    a = parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
     env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    if a.long_prompt:
+        env["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] = LONG_TRACE_CAPACITY
     if a.draft_top_prob:
         env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")
     argv = [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(a.arm)]
@@ -143,11 +182,7 @@ def main() -> int:
         try:
             if not _healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
                 return 1
-            rc = subprocess.run(
-                ["taskset", "-c", arm_env.DRIVER_CORES, arm_env.PYTHON, PROBE, "--port", str(PORT),
-                 "--sessions", both_cpu_ab.SESSIONS, "--prompts", str(a.prompts), "--max-tokens", str(a.max_tokens),
-                 "--top-logprobs", "1", "--out", os.path.join(a.out_dir, "probe.json")], cwd=REPO,
-            ).returncode
+            rc = subprocess.run(["taskset", "-c", arm_env.DRIVER_CORES, *client_argv(a)], cwd=REPO).returncode
         finally:
             stop_server(server)
     if rc != 0:
