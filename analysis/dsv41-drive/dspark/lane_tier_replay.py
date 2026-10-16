@@ -360,25 +360,35 @@ class NodeTier:
 #     group e % nodes (lease_layout.h:52 home; :148 static_assert "home is expert % nodes"). A victim is taken only in
 #     the miss's own group range (ram_tier.h:2114 take_victim_locked, loop over own.lo..own.hi).
 #  2. Each group range first gives min(8, range - 1) staging slots (ram_tier.h:1044 reserve_staging, k = the victim
-#     lanes, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES=8) and then `share` speculative pool slots
+#     lanes under spill, srt/layers/moe/exl3_ram_miss.py:975 plan_staging_width and :1001 staging_width,
+#     SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES=8) and then `share` speculative pool slots
 #     (ram_tier.h:1084 reserve_spec_pool; "RAM prefetch share 2" in the server log); neither ever holds a mapped row.
 #  3. Victim: a free slot first, else the least recently stamped READY slot whose expert is not VRAM-hot (the record's
 #     hot bitmap, ram_tier.h:594 apply_gpu_hot), not routed by the record (`wanted`) and not filling
 #     (ram_tier.h:2120-2128). So a VRAM-resident expert that holds a RAM row keeps it while it is hot; there is no
 #     rule that frees it. With no victim the miss is read into staging but not cached (ram_tier.h:2110-2113).
-#  4. Recency: every routed expert of a record that the group holds is restamped (ram_tier.h:2100 touch_request over
-#     request.protect, the record's routed experts), VRAM hits included; a demand miss restamps its new slot.
+#  4. Recency: every routed expert of a record that the group holds is restamped, VRAM hits included
+#     (ram_tier.h:2188 collect_wanted_locked over request.protect, the record's routed experts; ram_tier.h:2100
+#     touch_request for a record with no lanes; ram_tier.h:2090 stamp_routed_locked); a demand miss restamps its new
+#     slot. The stamp is a per-group tick, one per stamp.
 #  5. Every demand miss is cached, GPU lane or CPU lane alike: forced CPU misses first, then the other misses, each
 #     taking a victim (ram_tier.h:2998 reserve_victims_locked). The lane's kind decides who computes it, not whether
 #     the row enters RAM.
 #  6. Prefetch: an L+2 read lands in a pool slot (kSpec), not in the map. A demand miss can be served from it: a GPU
-#     lane streams from the pool slot (ram_tier.h:3017 point_pooled_locked) and a forced CPU miss takes it over
-#     (take_pooled_locked); either way the row is cached as rule 5. An unused landed row may be promoted into the map
+#     lane streams from the pool slot (ram_tier.h:2369 point_pooled_locked, called at :3040) and a forced CPU miss
+#     takes it over (ram_tier.h:2419 take_pooled_locked, called at :3020); either way the row is cached as rule 5. An unused landed row may be promoted into the map
 #     when its row's delta is claimed (ram_tier.h:2919 promote_landed): it takes an LRU victim (no record protection)
-#     and inherits the victim's stamp (ram_tier.h:2959), so it is the next to go unless routed. Promotion is skipped
+#     and inherits the victim's stamp (ram_tier.h:2960), so it is the next to go unless routed. Promotion is skipped
 #     when the row's lock is busy, the read is still in flight, or the delta has no room (spec_promote_* counters).
 #  7. Full layers (SGLANG_MOE_PINNED_HOST_FULL_LAYERS) map every expert and never miss.
-TIER_RULES = 7
+#  8. Prefill (SGLANG_DSV41_ENABLE_PREFILL_FILLS=1) admits rows from the Python side with the service paused
+#     (ram_tier.h:399 assign, :456 fill_begin): take_admit_slot_locked (ram_tier.h:1982) gives a free slot, else
+#     take_slot_locked's LRU READY slot that is not VRAM-hot, protected or filling (ram_tier.h:2038). With
+#     no prefill share set (the A/B sets none) nothing bounds how many decode rows one prefill displaces. These
+#     admissions and their victims emit no event: the trace cannot show them.
+#  9. A promotion's victim is not traced either (promote_landed calls take_victim_locked with count_eviction false and
+#     no trace_evict, ram_tier.h:2949). Only decode demand misses emit `evict` (ram_tier.h:2141 trace_evict).
+TIER_RULES = 9
 
 
 def numa_capacities(d: str) -> tuple[dict[int, int], float, int, list[int]]:
