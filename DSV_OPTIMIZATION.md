@@ -561,12 +561,20 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
     - Growth from init to the warm-up peak is stable per arm: 3,522-3,573 MiB across 3 launches.
     - The jitter is in init headroom: 164 MiB between two 923-slot launches. Free-before-load explains only part
       of it.
-    - **Approved: design (a), trim-only, default-off flag.**
-      - Allocate the hot cache at an upper bound, run the warm-up, then release tail slots so the free memory at
-        the warm-up peak stays at or above the margin.
-      - The margin itself is derived from the measured jitter.
-      - First: check whether graphs, lease tables, the RAM tier or the copy engine fix the slot count or pointers
-        at capture time.
+    - Design (a), trimming after the warm-up, **is not possible.**
+      - Startup order: host tier -> RAM-miss service -> hot cache -> KV pinned -> both graphs captured ->
+        warm-up -> copy engine armed.
+      - Capture bakes in the hot-cache tensor addresses, the scratch-row positions, the residency tables and the
+        RAM-miss lease tables.
+      - So a trim that frees memory would need a recapture; masking slots frees nothing.
+    - **Owner decision: (a′), calibrate before graph capture on every launch,** behind a default-off flag.
+      - After KV pinning, call empty_cache, then run one dummy extend at the largest chunk (derived from config).
+      - Measure the lowest free memory and the reserved peak, then size the hot cache and the tables depending on
+        it before capture. The margin comes from measured values.
+      - The forward must leave no route, residency, KV or Engram state behind.
+      - Step 1 is a map of the capacity-dependent init and a reorder proposal, before any code. `model_runner.py`
+        stays a hook call at most.
+      - The expandable_segments smoke still runs first.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
