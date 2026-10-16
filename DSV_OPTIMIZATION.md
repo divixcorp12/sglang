@@ -1490,6 +1490,16 @@ master's `prod_env()` at `a7cce264fe`.
 | prefill share | (on since `a7cce264fe`) | -3.46 ms/token (3.8) | done; startup size under test |
 | prefetch stack | `RAM_PREFETCH` + horizon 2, T3 head file, cap 2, pool serve, promote, idle2 | no clean served win (DSV41_REFERENCE 33.14-33.37; promote "converts, does not add") | pending lane-tier's offline comparison; the head file lives outside the repo |
 
+**Parked on master, OFF, and we are coming back to both (owner decision 2026-10-16):**
+- **Lane head** (`lane-head`, handoff `LANE_HEAD_HANDOFF.md`, `SGLANG_OPT_LANE_HEAD_PATH` unset). It is the
+  foundation for the product-emp ranking: P(recur) x the time saved at the expert's live tier, -0.6 to -0.9
+  ms/token offline (3.8). Next: measure the cold-lane cost at startup, build the ranking, then the fused kernel and a
+  served A/B.
+- **Lane-tier replay** (`lane-tier-replay`, handoffs `LANE_TIER_REPLAY_HANDOFF.md` and `PREFILL_CAPTURE_PLAN.md`).
+  The validated RAM-tier simulator and the lane/share evaluation tools. Next: the offline prefetch comparison, then
+  the product-emp evaluation.
+- The `drip-hot` design note and replay are merged too, so the verdict stays on record (not built).
+
 **Found missing in the review:**
 - `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1`: -1.16 ms/token, 8/8 sessions (2026-09-27), left "for the owner" in
   DSV41_REFERENCE 33.22. It was measured before the copy engine, was never re-measured, and is in no arm. It needs a
