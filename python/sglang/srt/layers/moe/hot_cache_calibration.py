@@ -93,6 +93,9 @@ class RunPeak:
     allocated_peak: int
     reserved_after: int
     free_after: int
+    # torch allocated when the run started: after earlier runs' persistent allocations (the MoE staging buffers the
+    # first prefill makes), so peak less this is the run's own transient.
+    allocated_in: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -214,7 +217,7 @@ class Calibration:
             "tokens": self.tokens,
             "free_before_mib": round(self.free_before / MIB, 1),
             "reserved_before_mib": round(self.reserved_before / MIB, 1),
-            "runs": [{k: round(v / MIB, 1) for k, v in vars(r).items()} for r in self.runs],
+            "runs": [{k: round(v / MIB, 1) for k, v in vars(r).items() if v is not None} for r in self.runs],
             "nontorch_growth_mib": round(self.nontorch_growth / MIB, 1),
         }
         if self.verify is not None:
@@ -372,6 +375,7 @@ class CalibrationResult:
 def _measure(fn, device) -> RunPeak:
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
+    allocated_in = torch.cuda.memory_allocated(device)
     fn()
     torch.cuda.synchronize(device)
     return RunPeak(
@@ -379,6 +383,7 @@ def _measure(fn, device) -> RunPeak:
         allocated_peak=torch.cuda.max_memory_allocated(device),
         reserved_after=torch.cuda.memory_reserved(device),
         free_after=torch.cuda.mem_get_info(device)[0],
+        allocated_in=allocated_in,
     )
 
 
@@ -574,9 +579,12 @@ def compare_with_real(
         "margin_mib": round(calibration.margin / MIB, 1),
         "exceeds": delta_reserved > calibration.margin,
     }
-    if real_allocated_in is not None and calibration.allocated_before is not None:
+    # The run's own entry, not the calibration's: the first run allocates the persistent MoE staging (~813 MiB),
+    # which a later real prefill already holds at its entry.
+    cal_in = peak.allocated_in if peak.allocated_in is not None else calibration.allocated_before
+    if real_allocated_in is not None and cal_in is not None:
         real_t = real_allocated_peak - real_allocated_in
-        cal_t = peak.allocated_peak - calibration.allocated_before
+        cal_t = peak.allocated_peak - cal_in
         report.update(
             calibration_transient_mib=round(cal_t / MIB, 1),
             real_transient_mib=round(real_t / MIB, 1),
@@ -585,10 +593,38 @@ def compare_with_real(
     return report
 
 
+@contextlib.contextmanager
+def folded_peaks() -> Iterator[dict]:
+    """The allocator's allocated and reserved peaks over the block, kept across any ``reset_peak_memory_stats`` called
+    inside it: the reset is wrapped for the block's duration to fold the peak so far before it clears it. The dict
+    holds the result after the block."""
+    peaks = {"allocated": 0, "reserved": 0}
+    reset = torch.cuda.reset_peak_memory_stats
+
+    def fold():
+        peaks["allocated"] = max(peaks["allocated"], torch.cuda.max_memory_allocated())
+        peaks["reserved"] = max(peaks["reserved"], torch.cuda.max_memory_reserved())
+
+    def folding_reset(*args, **kwargs):
+        fold()
+        return reset(*args, **kwargs)
+
+    torch.cuda.reset_peak_memory_stats = folding_reset
+    try:
+        yield peaks
+        fold()
+    finally:
+        torch.cuda.reset_peak_memory_stats = reset
+
+
 def watch_first_full_prefill(model_runner, result: CalibrationResult) -> None:
     """One-shot: measure the first real EXTEND forward of the calibrated size (the HTTP warm-up's) and log its peaks
     beside the calibration's, loudly when it exceeds them by more than the margin; then remove itself. The wrapper is
-    an instance attribute on the runner's ``forward``, gone after that forward."""
+    an instance attribute on the runner's ``forward``, gone after that forward.
+
+    It is the target forward, the same model call the calibration runs (a DSpark prefill wraps it with the draft's
+    KV injection, which the calibration does not run). Peaks are folded across any reset made inside it: the prefill
+    peak logger resets them at every call it wraps, which left calib6's watch reading only the logits tail."""
     original = model_runner.forward
     tokens = result.calibration.tokens
 
@@ -600,13 +636,11 @@ def watch_first_full_prefill(model_runner, result: CalibrationResult) -> None:
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         allocated_in = torch.cuda.memory_allocated()
-        out = original(forward_batch, *args, **kwargs)
-        torch.cuda.synchronize()
+        with folded_peaks() as peaks:
+            out = original(forward_batch, *args, **kwargs)
+            torch.cuda.synchronize()
         report = compare_with_real(
-            result.calibration,
-            torch.cuda.max_memory_allocated(),
-            torch.cuda.max_memory_reserved(),
-            real_allocated_in=allocated_in,
+            result.calibration, peaks["allocated"], peaks["reserved"], real_allocated_in=allocated_in
         )
         (logger.error if report["exceeds"] else logger.info)(
             "hot cache calibration vs the first real %d-token prefill: %s%s",

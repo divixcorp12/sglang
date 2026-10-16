@@ -112,6 +112,32 @@ def test_compare_uses_transients_when_both_entries_are_known():
     assert r["delta_transient_mib"] == 100 and r["delta_reserved_mib"] == 100
 
 
+def test_the_calibration_transient_starts_at_the_peak_runs_own_entry():
+    """calib6: run 1 allocated the 813 MiB MoE staging, so measured from the calibration's start the transient read
+    1,954 MiB against the real prefill's 1,147; from the peak run's own entry it is the run's transient."""
+    first = hc.RunPeak(13934 * M, 13758 * M, 13934 * M, 0, allocated_in=12145 * M)
+    peak = hc.RunPeak(14674 * M, 14100 * M, 14674 * M, 0, allocated_in=12958 * M)
+    c = hc.Calibration(4096, 4000 * M, 12242 * M, (first, peak), 13 * M, 0, 12145 * M)
+    r = hc.compare_with_real(c, 14275 * M, 14768 * M, real_allocated_in=13129 * M)
+    assert r["calibration_transient_mib"] == 14100 - 12958 and r["real_transient_mib"] == 14275 - 13129
+    assert r["delta_transient_mib"] == 4
+
+
+def test_folded_peaks_survive_a_reset_inside_the_block(monkeypatch):
+    """The prefill peak logger resets the peaks at every call it wraps; the watch must still see the whole peak."""
+    state = {"now": 1000, "max": 1000}
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a: state["max"] * M)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *a: state["max"] * M)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *a: state.update(max=state["now"]))
+    plain = torch.cuda.reset_peak_memory_stats
+    with hc.folded_peaks() as peaks:
+        state.update(max=3000)  # the layers' peak
+        torch.cuda.reset_peak_memory_stats()  # a nested wrapper resets
+        state.update(max=1500)  # the logits tail
+    assert peaks == {"allocated": 3000 * M, "reserved": 3000 * M}
+    assert torch.cuda.reset_peak_memory_stats is plain  # restored
+
+
 def test_plan_capacity_grows_the_emptiest_layers_up_to_their_bound():
     # 20 -> 21 -> 22, then the 22s tie and the lower layer id takes the third.
     assert hc.plan_capacity({0: 20, 1: 22}, 3, 16, {0: 30, 1: 30}) == {0: 23, 1: 22}
