@@ -1474,6 +1474,35 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - In-server interleaved A/B harness for noise (offered; owner chose other work).
 - RAM prefetch `promote_landed`: ~42 rows land and ~20 are used per verify; a RAM-tier precision concern.
 
+## 4a. Consolidation review (2026-10-16, before the merge to master)
+
+The owner asked for everything valuable from October 14-16 to be merged into master and enabled in production.
+Agent `merge-clean` (opus) writes `MERGE_PLAN_1016.md` first; the prefetch flags wait for lane-tier's offline
+prefetch comparison. Below is the best arm's env (`/mnt/nvme1/share64-ab-20261016/resolved-env.json`, "on") against
+master's `prod_env()` at `a7cce264fe`.
+
+| item | flags beyond prod | evidence | proposal |
+|---|---|---|---|
+| merge chunking + expandable segments + bigger hot cache + KV pin | `MERGE_BUDGET_MB=128`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `HOT_GPU_MB` 13144 (prod 10840), argv `--mem-fraction-static 0.8623 --max-total-tokens 381184` | -2.0 (CI -3.7..-0.6) then -1.79 (CI -4.51..-0.64) ms/token, stacked ~-3.8 (3.7) | enable; size the hot cache by startup calibration (owner rule) |
+| pin01 | `PINNED_HOST_FULL_LAYERS=0,1`, pinned MB 111530 / NUMA 59656:51874 | 70.5 vs 76.2, layers 0+1 20.5 -> 13.0 ms/verify (3.1) | enable |
+| split model | `ENABLE_CPU_SPLIT_MODEL=1` | -2.9%, one pair, matched by replay (3.2) | enable, with startup calibration on and refinement off (3.3) |
+| -mem | `SCHEDULER_MLOCK=1`, `HICACHE_HOST_NUMA_NODE=1`, `--weight-loader-drop-cache-after-load` | node-0 swap and faults fixed; speed neutral (3.4) | enable |
+| prefill share | (on since `a7cce264fe`) | -3.46 ms/token (3.8) | done; startup size under test |
+| prefetch stack | `RAM_PREFETCH` + horizon 2, T3 head file, cap 2, pool serve, promote, idle2 | no clean served win (DSV41_REFERENCE 33.14-33.37; promote "converts, does not add") | pending lane-tier's offline comparison; the head file lives outside the repo |
+
+**Found missing in the review:**
+- `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1`: -1.16 ms/token, 8/8 sessions (2026-09-27), left "for the owner" in
+  DSV41_REFERENCE 33.22. It was measured before the copy engine, was never re-measured, and is in no arm. It needs a
+  compatibility check and an A/B before it is enabled.
+- **Production launch has no memory floor.** The arms need node 1 to have 64.91 GiB free (`prelaunch_evict`), and
+  `launch_prod.sh` neither evicts nor checks. Other projects' page cache (mimo-reap: 26.6 GiB free today) would
+  starve HiCache on node 1 and the bigger pinned tier.
+- The confidence gate's only served loss (77.9 vs 69.3) came from a stall-flagged run; it was never re-scored. It stays
+  off.
+- The SPCC fix (fstrim, moving mimo-reap/mimi-v26-pro) is still pending. Its tax is ~1.9 ms/token on average (3.4).
+- Staying off, as measured: lane head, drip/drip-hot, tiebreak, decay 0.995, refinement, mirror weights. cpu-out-rows
+  (bit-identical, ~10-25 us/job) and graded miss-cut (~0.5-1 ms/token, replay only) are unserved.
+
 ## 5. Box rules for anyone continuing
 
 `.claude/rules/divix01-run-protocol.md` applies: push, then a fresh divix01 worktree; `PYTHONPATH=$PWD/python` and
