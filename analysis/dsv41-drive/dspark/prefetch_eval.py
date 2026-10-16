@@ -9,7 +9,9 @@ prefetch does not move the lane key) and the RAM tier driven by them:
   use: a landed row the target record (v, T) routes, on a VRAM miss whose row is not in RAM, is used: on a GPU lane it
     is pool-served (no NVMe stream), on a CPU lane it is taken by the forced miss (a RAM-warm CPU lane); either way the
     row is mapped (rule 5);
-  waste: a landed row not used is promoted into the map at the run's measured promotion rate (rule 6), else dropped;
+  promotion: serving layer R's record promotes layer R + 1's landed rows into the map (rule 6), so a row landing before
+    T - 1 is served is a RAM hit at T rather than a pool use; one landing later waits for T's use or the next claim;
+  waste: a landed row never used (its promotion is counted; whether a later record hits it is in the tier replay);
   drive time: each read in flight at a record adds one NVMe lane to the record's shared-drive landing term (P's
     miss_land.per_record_gpu_nvme_lane), the cost P measured for a GPU NVMe lane's read beside a CPU miss.
 Prefill admissions follow rule 10 with the share at ``--share`` rows.
@@ -34,6 +36,7 @@ from __future__ import annotations
 import argparse
 import collections
 import glob
+import heapq
 import json
 import os
 import struct
@@ -162,7 +165,6 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
     off = ltr.align(run, log)
     rows, frac, pool_share, full = ltr.numa_capacities(d)
     full = set(full)
-    p_promote = ltr.promote_fraction(d)
     tiers = [ltr.layer_tiers(rows.get(L, 210), frac, pool_share) for L in range(layers)]
     by_vr = {(r.verify, r.row): r for r in run.records}
     by_seq = {r.seq: r for r in run.records}
@@ -191,17 +193,20 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
     owned = [set() for _ in range(layers)]
     last_hot = [set() for _ in range(layers)]
     score = [collections.defaultdict(float) for _ in range(layers)]
-    pool = collections.defaultdict(dict)  # (v, target row) -> {expert: land ns}
-    inflight = []  # (submit ns, land ns) of reads not yet landed
     out = collections.Counter()
     tick = 0
-    pending = []  # promotions due: (ns, row, expert)
+    pools = ltr.PoolRows(pool_share)  # landed rows waiting for their row's claim (rule 6)
+    reading = []  # heap of reads in flight: (land ns, submit ns, target row, expert)
+
+    def flush(t: int) -> None:
+        while reading and reading[0][0] <= t:
+            _, _, row, e = heapq.heappop(reading)
+            if row not in full:
+                pools.land(row, e)
+
     for ns, _, kind, payload in timeline:
         tick += 1
-        while pending and pending[0][0] <= ns:
-            _, row, e = pending.pop(0)
-            if row not in full:
-                tiers[row][e % NODES].promote(e, last_hot[row])
+        flush(ns)
         if kind == "eager":
             line = eager[payload]
             L = line["layer"]
@@ -246,8 +251,9 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
                 hot_t = set(cur["hot"][T])
                 s = scorer.scores(cur["router"], L, T)
                 order = [int(e) for e in np.argsort(-s)]
+                held = pools.held(T) | {x[3] for x in reading if x[2] == T}
                 eligible = [e for e in order if e not in hot_t and (T in full or not tiers[T][e % NODES].has(e))
-                            and e not in pool[(v, T)]]
+                            and e not in held]
                 if arm == "native":
                     picks = eligible[:n]
                 else:  # cpu: predicted routed misses the plan would not give a GPU lane
@@ -261,22 +267,20 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
                 out["issued"] += 1
                 if land is not None:
                     out["landed"] += 1
-                    pool[(v, T)][e] = (sub, land)
-                    inflight.append((sub, land))
+                    heapq.heappush(reading, (land, sub, T, e))
         # This record's pool when the service serves it (svc_record's start, else the post): a GPU lane is pointed at
         # a landed row (point_pooled_locked); a forced CPU miss also takes a row still reading, waiting for it
-        # (take_pooled_locked, ram_tier.h:2419).
+        # (take_pooled_locked, ram_tier.h:2419). Rows landed before layer L - 1 was served were promoted (rule 6).
         start = serve.get(r.seq, ns) if r is not None else ns
-        entries = pool.pop((v, L), {})
-        landed_by = {e for e, (sub, land) in entries.items() if land <= start}
-        reading = {e for e, (sub, land) in entries.items() if sub <= start < land}
-        pooled = landed_by | reading
+        flush(start)
+        landed_by = pools.held(L)
+        in_flight = {x[3] for x in reading if x[2] == L and x[1] <= start}
         if L in full:
             warm = set(misses)
         else:
             warm = {e for e in misses if tier[e % NODES].has(e)}
         cold = misses - warm
-        used = (cold & landed_by) | ((cold - inserted) & reading)
+        used = (cold & landed_by) | ((cold - inserted) & in_flight)
         nv = sum(1 for e in inserted if e not in warm and e not in used)
         po = sum(1 for e in inserted if e in used)
         dma = sum(1 for e in inserted if e in warm)
@@ -288,21 +292,24 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
                 t[1] += cnt[e]
             else:
                 t[2].append(cnt[e])
-        flying = sum(1 for sub, land in inflight if sub <= ns < land)
-        inflight = [(sub, land) for sub, land in inflight if land > ns]
+        flying = sum(1 for x in reading if x[1] <= ns)
         out["used"] += len(used)
         out["pool_served"] += po
         out["used_cpu_landed"] += len((cold - inserted) & landed_by)
-        out["used_cpu_reading"] += len((cold - inserted) & reading - landed_by)
+        out["used_cpu_reading"] += len((cold - inserted) & in_flight - landed_by)
         if r is not None and r.seq in uses:
             obs_u = uses[r.seq]
             out["obs_used"] += len(obs_u)
             out["obs_pool_served"] += sum(1 for x in obs_u.values() if x == "gpu")
-        for e in set(entries) - used:
-            out["unused_landed"] += 1
-            if ltr._hash01(L, e, ns & 0xFFFFFFFF) < p_promote:
-                pending.append((ns, L, e))
-                out["promoted"] += 1
+        # The record serves its pool: a routed row leaves it (served, taken or a hit); a taken read in flight is the
+        # forced miss's own read now.
+        pools.consume(L, u)
+        if used & in_flight:
+            reading[:] = [x for x in reading if not (x[2] == L and x[3] in used)]
+            heapq.heapify(reading)
+        # Serving row L claims row L + 1's delta: its landed rows are promoted (rule 6).
+        if L + 1 < layers and L + 1 not in full:
+            out["promoted"] += pools.claim(L + 1, tiers[L + 1], last_hot[L + 1])
         if v in clean_v:
             s0, w0 = price(P, nv, po, dma, teams, 0)
             s1, w1 = price(P, nv, po, dma, teams, flying)
@@ -332,7 +339,8 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
         res[key] = out[key] / nvf
         res[f"{key}_by_position"] = {b: out[f"{key}@{b}"] / max(1, out[f"verifies@{b}"]) for b in ("0-4", "5-14", "15+")}
     prompts = max(1, len(set(x["forward_pass_id"] for x in eager if x["phase"] == "extend")))
-    res.update({k: out[k] for k in ("issued", "landed", "used", "pool_served", "unused_landed", "promoted",
+    out["wasted"] = out["landed"] - out["used"]
+    res.update({k: out[k] for k in ("issued", "landed", "used", "pool_served", "wasted", "promoted",
                                     "obs_used", "obs_pool_served", "used_cpu_landed", "used_cpu_reading")})
     res["prefill_claims_per_prefill"] = out["prefill_claims"] / prompts
     res["prefill_demand_per_prefill"] = out["prefill_demand"] / prompts

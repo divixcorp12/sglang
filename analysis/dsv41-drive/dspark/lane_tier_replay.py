@@ -407,6 +407,9 @@ class PoolRows:
             g.popitem(last=False)
         g[e] = True
 
+    def held(self, row: int) -> set:
+        return {e for g in self._groups(row) for e in g}
+
     def consume(self, row: int, routed: set) -> None:
         for g in self._groups(row):
             for e in [x for x in g if x in routed]:
