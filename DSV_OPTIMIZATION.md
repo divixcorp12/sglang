@@ -522,6 +522,27 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
     - Within the 65.9-70.9 spread between identical runs.
     - Treat as a safety pass, not a speed result.
   - Text diverges only at the known-unstable points (ETR, DISCA); the merge itself is bit-tested.
+  - **Re-scored with serve_compare: -2.0 ms/token vs A (CI -3.7..-0.6), the only clean gain so far.**
+- **Peak logger run** (2026-10-15 22:35-22:44, `-mergechunk` arm at 11721 MiB, `wt-prefill-merge-dev` at
+  `7951fc18eb`; report `prefill_peak_report.py` at `3c1fc23778`; artifacts `/mnt/nvme1/prefill-merge/peaklog/`):
+  - **Most of the warm-up spike is caching-allocator reserve, not live tensors.**
+    - Reserved grows 24,766 -> 28,242 MiB across the warm-up shapes. The growth per shape: 400 tokens +136, 2048
+      +784, 2049 +260 (pure fragmentation: the allocated peak is unchanged), 4096 +1,480. Later prompts add 0.
+    - The allocated peak is 26,363, at the 4096-token prefill.
+    - Of the ~3.1-3.5 GB above init:
+      - 813 MiB is persistent MoE staging;
+      - ~1,459 MiB is the live prefill transient;
+      - **~1,879 MiB is reserve backing no live tensor.** Up to ~140 more hot slots if recovered (estimate).
+  - Live transient at 4096: attention 903 MiB per compressed layer (600 on L0/L1) and MoE 431. About 556 MiB
+    stays live across the layer loop (residual/mHC streams and aux capture).
+  - GPU: peak 31,721 used, **482 MiB free, below the 508 margin.** Free-before-load was 29.33 GiB (the minimum
+    seen). No OOM, but `hot_mb_for_margin`'s 0.04 GiB jitter allowance is too small.
+  - SPCC: no stall in the window. Read await had a median of 8.6 ms and a max of 13.4.
+  - **Next (approved):**
+    - A smoke run with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and the logger on, queued after
+      split-calib. A compatibility check comes first: graphs, copy engine, IPC, mapped host memory.
+    - Offline: largest-shape-first warm-up or `empty_cache` between shapes, behind a default-off flag.
+    - A proposal for deriving the margin jitter from startup measurements, not a constant.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
