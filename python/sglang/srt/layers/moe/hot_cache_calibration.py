@@ -471,12 +471,23 @@ def check_kv_pin(*, pinned: Optional[int], sized: Optional[int]) -> None:
         )
 
 
-def maybe_calibrate_hot_cache(model_runner, draft_worker=None) -> Optional[CalibrationResult]:
+class CalibrationUnrecoverable(RuntimeError):
+    """A calibration failure that left the hot cache in a state the launch cannot safely continue from."""
+
+
+def maybe_calibrate_hot_cache(model_runner, draft_worker=None, *, strict: bool = False) -> Optional[CalibrationResult]:
     """The scheduler's pre-capture hook. Off (the default) it returns None and touches nothing.
 
     Takes the live ModelRunner: the dummy forward needs its model, attention backend and pools, which are not
     narrowable to plain values (large-class-style 1.6). It reads them and returns a result; it writes nothing back.
-    ``draft_worker`` (the speculative worker) is captured in the trial capture beside the target."""
+    ``draft_worker`` (the speculative worker) is captured in the trial capture beside the target.
+
+    A calibration never fails the launch, with three exceptions that re-raise: the KV pool under its pin (the owner's
+    refusal), a failure during the resize itself (holders may be half-moved; set_hot_capacity already turns a
+    mapping OOM or a holder mismatch into a short result, so anything else there is unexpected), and a failure that
+    leaves the device or the hot cache unusable (a sticky CUDA error, or holders that disagree after the cleanup).
+    Anything else is logged with its traceback, cleaned up (the trial's routes reset, graph-path state dropped) and
+    the launch starts at the configured size. ``strict`` (tests) re-raises everything."""
     from sglang.srt.environ import envs
 
     if not envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get():
@@ -485,6 +496,51 @@ def maybe_calibrate_hot_cache(model_runner, draft_worker=None) -> Optional[Calib
     if manager is None or not manager.caches:
         logger.info("hot cache calibration: no hot cache, nothing to size")
         return None
+    from sglang.srt.runtime_context import get_schedule
+
+    check_kv_pin(
+        pinned=get_schedule().max_total_tokens, sized=getattr(model_runner, "max_total_num_tokens", None)
+    )
+    stage = {"name": "start"}
+    try:
+        return _calibrate_hot_cache(model_runner, draft_worker, manager, stage)
+    except Exception as error:
+        if strict or stage["name"] == "resize":
+            raise
+        logger.error(
+            "hot cache calibration failed during %s; cleaning up and starting at the configured %d slots",
+            stage["name"],
+            sum(c.capacity for c in manager.caches.values()),
+            exc_info=True,
+        )
+        _recover_from_failed_calibration(model_runner, manager, stage, error)
+        return None
+
+
+def _recover_from_failed_calibration(model_runner, manager, stage, error) -> None:
+    """Put the hot cache back as the real capture expects it after a calibration that failed before the resize, or
+    raise CalibrationUnrecoverable when that cannot be established."""
+    from sglang.srt.layers.moe.hot_cache_dummy_extend import forget_graph_path_state
+    from sglang.srt.layers.moe.hot_cache_retire import census_error
+    from sglang.srt.layers.moe.hot_cache_trial_capture import reset_trial_routes
+
+    try:
+        torch.cuda.synchronize()  # a sticky CUDA error surfaces here: nothing on this device can be trusted
+        if stage.get("trial_ran"):
+            reset_trial_routes(manager)
+        forget_graph_path_state(model_runner.model)
+        torch.cuda.empty_cache()
+    except Exception as cleanup_error:
+        raise CalibrationUnrecoverable(f"hot cache calibration cleanup failed after {stage['name']}") from cleanup_error
+    unsettled = census_error(manager)
+    if unsettled is not None:
+        raise CalibrationUnrecoverable(
+            f"hot cache calibration failed during {stage['name']} and left the hot cache inconsistent: {unsettled}"
+        ) from error
+
+
+def _calibrate_hot_cache(model_runner, draft_worker, manager, stage) -> CalibrationResult:
+    """maybe_calibrate_hot_cache's body; ``stage['name']`` follows its progress for the failure handling there."""
     from sglang.srt.layers.moe.hot_cache_dummy_extend import (
         dummy_extend_forward,
         dummy_verify_forward,
@@ -494,14 +550,13 @@ def maybe_calibrate_hot_cache(model_runner, draft_worker=None) -> Optional[Calib
     from sglang.srt.layers.moe.hot_cache_trial_capture import reset_trial_routes, trial_capture
     from sglang.srt.runtime_context import get_schedule
 
-    check_kv_pin(
-        pinned=get_schedule().max_total_tokens, sized=getattr(model_runner, "max_total_num_tokens", None)
-    )
     tokens = int(get_schedule().chunked_prefill_size or get_schedule().max_prefill_tokens)
     cache = next(iter(manager.caches.values()))
     device = cache.device
     # The exact capture cost, before anything is sized: capture for real into a private pool, then tear it down.
+    stage.update(name="trial capture", trial_ran=True)
     trial = trial_capture(model_runner, draft_worker)
+    stage["name"] = "calibration prefills"
     if trial is not None:
         reset_trial_routes(manager)
         forget_graph_path_state(model_runner.model)
@@ -552,6 +607,7 @@ def maybe_calibrate_hot_cache(model_runner, draft_worker=None) -> Optional[Calib
     )
     retired = None
     if keep != capacity:
+        stage["name"] = "resize"
         retired = set_hot_capacity(
             manager,
             keep,
@@ -560,6 +616,7 @@ def maybe_calibrate_hot_cache(model_runner, draft_worker=None) -> Optional[Calib
             strict=False,  # a holder mismatch rolls the resize back; the launch goes on at the configured size
         )
         keep = dict(retired.kept)
+    stage["name"] = "after the resize"
     free_after_resize = torch.cuda.mem_get_info(device)[0]
     logger.info(
         "hot cache calibration: slots %d -> %d, free %.1f MiB after the resize (%.1f must stay free)",

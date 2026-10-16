@@ -128,6 +128,33 @@ def test_compare_uses_transients_when_both_entries_are_known():
     assert r["delta_transient_mib"] == 100 and r["delta_reserved_mib"] == 100
 
 
+def test_the_dummy_prefill_runs_under_no_grad_not_inference_mode(monkeypatch):
+    """calib8: under inference_mode the 1-token prefill's EXL3 cast fusion read a version counter inference tensors
+    lack. Serving and capture run no_grad; the calibration's forward must too."""
+    from sglang.srt import runtime_context
+    from sglang.srt.layers.moe import hot_cache_dummy_extend as hde
+
+    monkeypatch.setattr(runtime_context, "get_parallel", lambda: SimpleNamespace(tp_size=1, pp_size=1, dp_size=1))
+    seen = []
+
+    def forward(input_ids, positions, forward_batch):
+        seen.append((torch.is_inference_mode_enabled(), torch.is_grad_enabled(), input_ids.numel()))
+        input_ids._version  # what EXL3_HALF_INPUT.publish reads; raises on an inference tensor
+
+    runner = SimpleNamespace(
+        device="cpu",
+        model_config=SimpleNamespace(vocab_size=129280),
+        spec_algorithm=None,
+        prepare_dummy_forward_batch=lambda fb: fb,
+        attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+        model=SimpleNamespace(forward=forward),
+    )
+    run = hde.dummy_extend_forward(runner, 8)
+    run(1)
+    run(8)
+    assert seen == [(False, False, 1), (False, False, 8)]
+
+
 def test_the_calibration_transient_starts_at_the_peak_runs_own_entry():
     """calib6: run 1 allocated the 813 MiB MoE staging, so measured from the calibration's start the transient read
     1,954 MiB against the real prefill's 1,147; from the peak run's own entry it is the run's transient."""

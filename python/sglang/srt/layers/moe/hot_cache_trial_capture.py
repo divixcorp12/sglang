@@ -63,6 +63,18 @@ class TrialCapture:
         }
 
 
+def tensor_bytes(obj) -> int:
+    """Bytes of the CUDA tensors an object holds directly in its attributes (or in lists, tuples or dicts there)."""
+    total, seen = 0, set()
+    for value in vars(obj).values() if hasattr(obj, "__dict__") else ():
+        items = value.values() if isinstance(value, dict) else value if isinstance(value, (list, tuple)) else (value,)
+        for item in items:
+            if isinstance(item, torch.Tensor) and item.is_cuda and id(item) not in seen:
+                seen.add(id(item))
+                total += item.numel() * item.element_size()
+    return total
+
+
 def _state(device):
     torch.cuda.synchronize(device)
     return torch.cuda.mem_get_info(device)[0], torch.cuda.memory_reserved(device)
@@ -102,6 +114,12 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
         del target
         if draft_worker is not None:
             draft_worker.init_cuda_graphs()
+            sampler = getattr(draft_worker, "_draft_sampler", None)
+            # Built here now, not at the real capture (which reuses it), so it is in the free memory the grow sees.
+            logger.info(
+                "hot cache trial capture: DSpark draft sampler %s",
+                "not built" if sampler is None else f"built, {tensor_bytes(sampler) / MIB:.1f} MiB of tensors",
+            )
             draft_runners = tuple(draft_worker._draft_model_runners())
             for runner in draft_runners:
                 runners += [runner.decode_cuda_graph_runner, runner.prefill_cuda_graph_runner]

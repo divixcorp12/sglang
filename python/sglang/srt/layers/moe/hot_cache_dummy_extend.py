@@ -102,7 +102,9 @@ def dummy_extend_forward(model_runner, tokens: int) -> Callable[[int], None]:
         set_dp_buffer_len(None, n, False, None)
         set_is_extend_in_batch(True)
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
-            with torch.inference_mode():
+            # no_grad, as serving and capture run: under inference_mode the 1-token prefill's EXL3 cast fusion fails
+            # (EXL3_HALF_INPUT.publish reads the tensor's version counter, which inference tensors lack; calib8).
+            with torch.no_grad():
                 mr.model.forward(input_ids[:n], forward_batch.positions, forward_batch)
 
     return run

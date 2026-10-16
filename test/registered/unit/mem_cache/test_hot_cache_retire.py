@@ -337,7 +337,7 @@ def test_the_guard_reads_free_memory_per_layer_and_stops_at_the_first_short_one(
     assert manager.caches[7].vmm_backing.grow_calls == 0
 
 
-def _calibrate_on_fakes(monkeypatch, manager, service):
+def _calibrate_on_fakes(monkeypatch, manager, service, *, strict=True, calibrate=None):
     """maybe_calibrate_hot_cache on the fake world: measured values given, the forwards and the trial stubbed."""
     from sglang.srt import runtime_context
     from sglang.srt.environ import envs
@@ -349,12 +349,15 @@ def _calibrate_on_fakes(monkeypatch, manager, service):
     monkeypatch.setattr(hr, "_service", lambda: service)
     run = hc.RunPeak(2500 * M, 2100 * M, 2500 * M, 2480 * M)
     cal = hc.Calibration(4096, 4000 * M, 1000 * M, (run, run), 1 * M, 0, 1000 * M)
-    monkeypatch.setattr(hc, "calibrate", lambda *a, **k: cal)
+    monkeypatch.setattr(hc, "calibrate", calibrate or (lambda *a, **k: cal))
     monkeypatch.setattr(hc, "settle", lambda c, d: hc.replace(c, free_final=2420 * M, reserved_final=1000 * M))
     monkeypatch.setattr(hde, "dummy_extend_forward", lambda runner, tokens: None)
     monkeypatch.setattr(hde, "forget_graph_path_state", lambda model: 0)
     monkeypatch.setattr(hc, "log_grow_bound", lambda *a: None)  # reads real streamers
     monkeypatch.setattr(tct, "trial_capture", lambda *a: None)  # its own tests cover it
+    monkeypatch.setattr(tct, "reset_trial_routes", lambda manager: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a: None)
     monkeypatch.setattr(
         runtime_context, "get_schedule", lambda: SimpleNamespace(max_total_tokens=None, chunked_prefill_size=4096)
     )
@@ -364,7 +367,52 @@ def _calibrate_on_fakes(monkeypatch, manager, service):
         spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
     )
     with envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.override(True):
-        return hc.maybe_calibrate_hot_cache(runner)
+        return hc.maybe_calibrate_hot_cache(runner, strict=strict)
+
+
+def _failing_calibrate(*a, **k):
+    raise RuntimeError("Inference tensors do not track version counter")  # calib8's failure
+
+
+def test_a_failed_calibration_is_logged_cleaned_up_and_the_launch_starts_at_the_configured_size(monkeypatch, caplog):
+    manager, updater, service, *_ = _world(upper=26)
+    before = _all_holders(manager, updater, service)
+    with caplog.at_level("ERROR"):
+        result = _calibrate_on_fakes(monkeypatch, manager, service, strict=False, calibrate=_failing_calibrate)
+    assert result is None and _all_holders(manager, updater, service) == before
+    error = [r for r in caplog.records if r.levelname == "ERROR"][-1]
+    assert "failed during calibration prefills" in error.getMessage() and error.exc_info is not None
+
+
+def test_strict_calibration_re_raises(monkeypatch):
+    manager, updater, service, *_ = _world(upper=26)
+    with pytest.raises(RuntimeError, match="version counter"):
+        _calibrate_on_fakes(monkeypatch, manager, service, strict=True, calibrate=_failing_calibrate)
+
+
+def test_a_failure_inside_the_resize_is_re_raised(monkeypatch):
+    """Holders may be half-moved: the launch must not go on."""
+    manager, updater, service, *_ = _world(upper=26)
+
+    def broken(*a, **k):
+        raise ValueError("unexpected failure part-way through the resize")
+
+    monkeypatch.setattr(hr, "set_hot_capacity", broken)
+    with pytest.raises(ValueError, match="part-way"):
+        _calibrate_on_fakes(monkeypatch, manager, service, strict=False)
+
+
+def test_a_failure_that_leaves_the_holders_inconsistent_is_unrecoverable(monkeypatch):
+    from sglang.srt.layers.moe import hot_cache_calibration as hc
+
+    manager, updater, service, *_ = _world(upper=26)
+
+    def spoil_then_fail(*a, **k):
+        manager.residency_policies[3].capacity = 99  # a holder no longer agrees
+        raise RuntimeError("failed after touching state")
+
+    with pytest.raises(hc.CalibrationUnrecoverable, match="policy.capacity is 99"):
+        _calibrate_on_fakes(monkeypatch, manager, service, strict=False, calibrate=spoil_then_fail)
 
 
 def test_calibration_does_not_resize_a_hot_cache_the_real_capture_would_not_expect(monkeypatch, caplog):
@@ -409,7 +457,7 @@ def test_calibration_survives_a_grow_oom_and_reports_the_slots_it_got(monkeypatc
         spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
     )
     with envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.override(True):
-        result = hc.maybe_calibrate_hot_cache(runner)
+        result = hc.maybe_calibrate_hot_cache(runner, strict=True)
     # room = (2420 - 1500 regrow) - 400 margin = 520 MiB at 1 MiB a slot: both layers planned up to their bound 26.
     assert result.retire.short == {7: 6} and result.keep == {3: 26, 7: C}
     assert int(updater.capacity[0]) == 26 and int(updater.capacity[1]) == C
