@@ -768,7 +768,14 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - Chunk = budget / (16 x H x D), so 32 MiB gives 64-token chunks.
       - Expected: about -370 MiB at the attention peak.
       - CPU tests: 20 passed, 56 GPU-skipped.
-      - GPU tests (torch.equal at 4096/2065/171 tokens, budgets 32 and 1 MiB, peak bound) are running now. The combined
+      - **Capture estimate wired** (`4c075ca89c`):
+        - An eager `BaseRunner._dummy_run` TARGET_VERIFY forward, with routes on the VRAM residents, so there are no
+          inserts.
+        - Sizing requires margin + capture estimate. The cached Exl3FusedMoE pointer tables are dropped afterwards.
+        - Draft capture (0.04-0.25 GB) is not estimated; the post-capture check is the backstop.
+        - 77 CPU tests passed.
+      - GPU tests (torch.equal at 4096/2065/171 tokens, budgets 32 and 1 MiB, peak bound) and the combined smoke
+        (calibration + A2 + A3 on expseg) are running together as `calib2`. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
