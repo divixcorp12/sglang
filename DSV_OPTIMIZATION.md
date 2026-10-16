@@ -1301,6 +1301,21 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
               startup calibration would have to measure before product-emp is served.
             - **Next (approved):** the prefill-share sweep with product-emp as the head arm, with a startup rule for
               the share size (today a hard-coded 64 rows, `exl3_ram_miss.py:785`).
+          - **Prefill-share sweep (`f1632ed2d6`, `/mnt/nvme1/lane-tier-replay/sweep/`, A/B prices).** Decode Δ
+            ms/verify against share 0 (A/B OFF / ON / base / C2):
+            - 16: -10.7 / -11.8 / -18.2 / -23.4; 32: -10.4 / -11.6 / -17.7 / -22.1.
+            - 64 (the existing flag): -5.4 / -6.3 / -10.0 / -13.0; 96: -4.0 / -4.8 / -7.5 / -9.1; 128: about -1 to -3.
+            - No admission: -9.5 / -10.1 / -21.3 / -31.6, but on the A/B it is 8.5-11.5 worse in the first 5
+              verifies after a prefill.
+            - Restricting to layers 2-20 is no better, so the share goes on all layers. The gain comes from fewer
+              cold reads (share 16: cold GPU lanes 13.8 -> 9.3 on A/B OFF, 10.7 -> 3.3 on C2).
+            - It adds to product-emp: C2 -28.1 ms/verify before the head's cost.
+            - TTFT estimate: share 64 -0.45 to -0.94 s; share 16 +0.27 to +0.46 s. This omits lost prefetch overlap.
+            - **Conflict:** served share 64 in 2026-09 (section 27.9, pre-DSpark) gave only S -3 ms/step, and TTFT
+              +0.5 to +1.2 s. Small shares sit furthest from what T validated.
+            - **Approved:** one served A/B pair of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64, no code) on
+              `-mergechunk-expseg`, with the route log, predictions written down first. If it matches the model's
+              direction: a share-size knob with a startup calibration rule (64 is hard-coded today).
           - **Owner constraint (2026-10-16): no predictor that must be retrained per RAM size.** The head stays
             tier-agnostic and outputs P(recur). Serving ranks by P(recur) x the time saved for the expert's live
             tier, with tier costs measured at startup. A RAM-tier feature inside the head (a) is a last resort, used
