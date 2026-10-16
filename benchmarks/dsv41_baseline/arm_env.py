@@ -276,6 +276,29 @@ def base_env() -> dict[str, str]:
 # flashinfer is not an alternative: it refuses the 5-token draft capture (`num_tokens > 64`).
 DSPARK_MEM_FRACTION_STATIC = "0.78"
 DSPARK_HOT_GPU_MB = "10840"
+# Production's own DSpark memory sizes since 2026-10-16 (MERGE_PLAN_1016.md). The two above stay the OFF -mem arm's
+# measured init: both_cpu_ab's fraction_keeping_kv and hot_mb_for_margin derive every arm's sizes from them. These are
+# the -mergechunk-expseg arm's (both_cpu_ab.EXPSEG_HOT_GPU_MB, its ARM_MEMORY_FLAGS), the best served DSpark arm: 1,035
+# hot slots, the fraction that keeps the KV pool at the pin, and the pin. With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
+# (prod_dspark_env) the hot cache is the starting point the startup calibration grows or trims from.
+PROD_DSPARK_HOT_GPU_MB = "13144"
+PROD_DSPARK_MEM_FRACTION_STATIC = "0.8623"
+PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
+# The pin01 arms' pinned tier (both_cpu_ab.PIN01_BUDGET): layers 0 and 1 whole, plus the old tier's rows elsewhere.
+PROD_DSPARK_PINNED_HOST_MB = "111530"
+PROD_DSPARK_PINNED_HOST_NUMA_MB = "0:59656,1:51874"
+# launch_prod.sh's pre-launch floor (analysis/dsv41-drive/dspark/prelaunch_evict.py, the arms' logic): node 1 must hold
+# the HiCache host pools of the pinned 381,184-token pool (12.67 GiB, as the share-64 A/B ran it), the rest of the
+# server's node-1 need (arm A's 51.24 GiB) and 1 GiB of margin: 64.91 GiB. Every served -mem arm started with node 0 at
+# 75.4 GiB free or more; below that the start only warns. The wait is bounded so a refusal comes in minutes.
+PROD_NODE1_HICACHE_GIB = 12.67
+PROD_NODE1_MARGIN_GIB = 1.0
+PROD_NODE0_WARN_GIB = 75.0
+PROD_FLOOR_WAIT_MIN = 10
+# Other servers that read the files the pre-launch step evicts: while one listens, production checks without evicting.
+PROD_PRELAUNCH_SKIP_EVICT_PORTS = (30032,)
+# Where a refusal looks for the page cache that fills node 1.
+PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4", "/data/models")
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:
@@ -311,9 +334,57 @@ def dspark_env() -> dict[str, str]:
     }
 
 
+def prod_dspark_env() -> dict[str, str]:
+    """Production's DSpark settings on top of dspark_env() since 2026-10-16 (MERGE_PLAN_1016.md): the best served arm,
+    both_cpu_ab's ...-pin01-splitmodel-mem-hicache1-mergechunk-expseg, without its RAM prefetch and with both startup
+    calibrations on. The arms state each of these themselves, so they stay out of dspark_env(), which every arm builds
+    on. Evidence is DSV_OPTIMIZATION.md (DO) and DSV41_REFERENCE.md; "pair" means one served A/B pair.
+
+    Pending, not set here: the RAM prefetch family (SGLANG_DSV41_RAM_PREFETCH and its keys; no clean served win, REF
+    33.14-33.37; waits on lane-tier's offline comparison) and SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM (needs an A/B on
+    the copy engine and the graphed verify)."""
+    return {
+        # Whole layers 0 and 1 in the pinned tier, in a tier grown to hold them: 70.5 vs 76.2 ms/token, layers 0+1
+        # 20.5 -> 13.0 ms a verify (DO 3.1; the OFF run was stall-flagged).
+        "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": "0,1",
+        "SGLANG_MOE_PINNED_HOST_MB": PROD_DSPARK_PINNED_HOST_MB,
+        "SGLANG_MOE_PINNED_HOST_NUMA_MB": PROD_DSPARK_PINNED_HOST_NUMA_MB,
+        # Each record's CPU/copy split from a cost model: 65.9 vs 67.9 ms/token, wait -9.4 ms a verify (DO 3.2, a pair).
+        # Its costs are measured at startup whenever it is on (split_model_calibration.py; on failure the table types
+        # the lanes), never refined live (owner rule: values calculated at startup; refinement had no gain, DO 3.4).
+        "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL": "1",
+        "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS": "",
+        "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES": "0",
+        # The split table calibrated at startup (the library default, stated): the arms ran it off (-fixedsplit) only to
+        # hold the table fixed between A and B (REF 33.36). With the model on, it types lanes only if the model is off.
+        "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "1",
+        # The miss cut at its library default, stated: what the split model replaces when it is on.
+        "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1",
+        "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3",
+        # mlockall in the scheduler: the CPU expert teams' major faults 11,877 -> 20-250 a run (DO 3.4).
+        "SGLANG_ENABLE_SCHEDULER_MLOCK": "1",
+        # HiCache host pools on node 1: node 0's load-time swap 11.6 GiB -> 5 MB, throughput unchanged (DO 3.4).
+        "SGLANG_HICACHE_HOST_NUMA_NODE": "1",
+        # The triton FlashMLA prefill merge in 128 MiB token chunks, bit-identical, 1,217 MiB of prefill peak freed for
+        # the hot cache: -2.02 ms/token, 95% CI -3.7..-0.6 (DO 3.4 re-score, 3.7).
+        "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB": "128",
+        # The caching allocator on expandable segments: ~1.5 GB of stranded reserve recovered at no cost (-0.26
+        # ms/token, CI -0.39..-0.02), spent on 1,035 hot slots: -1.79 ms/token, CI -4.51..-0.64 (DO 3.7, expseg2).
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "SGLANG_MOE_HOT_GPU_MB": PROD_DSPARK_HOT_GPU_MB,
+        # The hot cache sized at every launch from measured free memory (trial capture, warm-up replay, grow or trim
+        # from PROD_DSPARK_HOT_GPU_MB): owner rule. Served pair neutral, +0.62 ms/token, CI -1.88..+2.60, margin held
+        # under serving (DO 3.7). A failed calibration keeps the configured size. Without the A1/A2 cuts it was served
+        # with: per-chunk kernels off and the indexer budget at base_env's 128, as the best arm ran.
+        "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": "1",
+        "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS": "0",
+    }
+
+
 def prod_env() -> dict[str, str]:
-    """Production's env: the base recipe, with the DSpark mode once PROD_DSPARK is set."""
-    return arm_env(dspark_env()) if PROD_DSPARK else base_env()
+    """Production's env: the base recipe, with the DSpark mode and production's DSpark settings once PROD_DSPARK is
+    set."""
+    return arm_env({**dspark_env(), **prod_dspark_env()}) if PROD_DSPARK else base_env()
 
 
 class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
@@ -327,10 +398,25 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     decode_log_interval: int | None = None
     # the DSpark mode's argv (DSPARK_ARGV); its env is dspark_env()
     dspark: bool = False
+    # Production's DSpark memory (PROD_DSPARK_*), unset for the arms, which append their own (both_cpu_ab.server_flags):
+    # its --mem-fraction-static in place of the mode's, the pinned KV pool, and the loader dropping the shards' page
+    # cache once the model is built (the -mem arms', DO 3.4).
+    mem_fraction_static: str | None = None
+    max_total_tokens: int | None = None
+    drop_cache_after_load: bool = False
 
     @classmethod
     def prod(cls) -> "ServerArgs":
-        return cls(port=PROD_PORT, host=PROD_HOST, dspark=PROD_DSPARK)
+        if not PROD_DSPARK:
+            return cls(port=PROD_PORT, host=PROD_HOST)
+        return cls(
+            port=PROD_PORT,
+            host=PROD_HOST,
+            dspark=True,
+            mem_fraction_static=PROD_DSPARK_MEM_FRACTION_STATIC,
+            max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
+            drop_cache_after_load=True,
+        )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
         """The smoke-validated launch, updated to production's context and cache mode."""
@@ -347,7 +433,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--context-length",
             str(CONTEXT_LENGTH),
             "--mem-fraction-static",
-            DSPARK_MEM_FRACTION_STATIC if self.dspark else str(MEM_FRACTION_STATIC),
+            self.mem_fraction_static or (DSPARK_MEM_FRACTION_STATIC if self.dspark else str(MEM_FRACTION_STATIC)),
             "--chunked-prefill-size",
             str(CHUNKED_PREFILL_SIZE),
             "--max-prefill-tokens",
@@ -393,4 +479,8 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             argv += ["--decode-log-interval", str(self.decode_log_interval)]
         if self.dspark:
             argv += list(DSPARK_ARGV)
+        if self.max_total_tokens is not None:
+            argv += ["--max-total-tokens", str(self.max_total_tokens)]
+        if self.drop_cache_after_load:
+            argv += ["--weight-loader-drop-cache-after-load"]
         return argv
