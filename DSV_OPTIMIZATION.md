@@ -1318,6 +1318,24 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
               1.25x the knee stays at ~0.15x. TTFT rises below the knee (share 8: +0.5 to +0.75 s on the A/B).
               Candidate startup rule: **share ≈ 0.15 x usable RAM rows per layer** (~28 at 190). The capture's own
               prices agree in sign everywhere (1.1-1.9x the magnitude).
+            - **SERVED A/B: share 64 WINS, -3.46 ms/token, CI -4.91..-1.55** (2026-10-16 14:06-14:26,
+              `wt-lane-head-ab` `022acb70b9`, which is `d269f7aa90` plus an analysis script; `-mergechunk-expseg`
+              with vs without `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1`, the only env difference; one pair, OFF first;
+              `/mnt/nvme1/share64-ab-20261016/`; write-up `c0631aba31`). The first attempt was aborted because
+              mimo-reap was running and its page cache held node 1 at 26.6 GiB; it ran after the owner's
+              drop_caches.
+              - Clean prompts (6): wall per verify -13.7 ms (stream -12.4, wait -1.1). All 8: -3.58 ms/token, CI
+                -7.96..+0.51. CPUSLOW on OFF prompt 4 and ON prompt 2; no STALL or PREFILL-STALL.
+              - Predicted against measured: stream+wait -5.4 vs **-13.5** ms/verify. By verify position after the
+                prefill (0-4 / 5-14 / 15+): predicted -5.6 / -5.5 / -4.7, measured -18.6 / -12.6 / -6.3.
+              - NVMe-cold GPU lanes 16.73 -> 11.35 (predicted 13.76 -> 10.17). Forced CPU misses 64.7 -> 57.7.
+                Prefill demand reads 2,863 -> 2,457 per prompt; service rows_read 10,975 -> 9,120.
+              - **TTFT -0.48 s mean** (per prompt +0.21 .. -1.06; predicted -0.45). Section 27.9's +0.5..+1.2 s did
+                not reproduce on today's arms.
+              - No OOM; lowest free GPU memory 642 / 598 MiB.
+              - **Production default: owner's call** (existing flag, no code).
+              - **Next (approved):** a startup-computed share size (usable rows per layer x the sweep's 0.15
+                knee), then one served pair, share-64 vs share-startup (~28).
             - **Approved:** one served A/B pair of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64, no code) on
               `-mergechunk-expseg`, with the route log, predictions written down first. If it matches the model's
               direction: a share-size knob with a startup calibration rule (64 is hard-coded today).
