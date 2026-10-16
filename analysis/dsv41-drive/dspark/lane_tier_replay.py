@@ -646,6 +646,63 @@ def diagnose(off: Run, on: Run, prices: Prices, layers: int) -> dict:
     return out
 
 
+def departures(d: str, layers: int) -> dict:
+    """How each cold GPU lane's row had left RAM, from the trace alone. Decode evictions are traced (``evict``); a
+    promotion's victim (promote_landed calls take_victim_locked without trace_evict, ram_tier.h:2949) and a prefill
+    fill's or eager admission's victim (take_admit_slot_locked / take_slot_locked, ram_tier.h:1982, no event) are not.
+    For each verify record's NVMe-cold GPU lane (expert e of row r read at t): ``traced`` when e's last traced event
+    before t is an eviction; ``untraced_prefill`` when it is an insertion and a non-verify record (a prefill or eager
+    forward) of the row ran between; ``untraced_decode`` when an insertion with no such record between (a promotion's
+    victim, or a verify-time path the trace misses); ``never_seen`` when e has no traced event before t (startup or an
+    earlier prefill fill put it in, or it never was)."""
+    run = Run(d)
+    verify_seqs = {r.seq for r in run.records}
+    hist = collections.defaultdict(list)  # (row, expert) -> [(ns, +1 in / -1 out)]
+    nonverify = collections.defaultdict(list)  # row -> ns of non-verify records
+    for _, e in _events(glob.glob(os.path.join(d, "events.*.exl3-tier*.jsonl")), {"evict", "svc_record"}):
+        if e["event"] == "svc_record":
+            if e["seq"] not in verify_seqs:
+                nonverify[e["row"]].append(e["ns"])
+            continue
+        hist[(e["row"], e["c"])].append((e["ns"], 1))
+        if e["a"] >= 0:
+            hist[(e["row"], e["a"])].append((e["ns"], -1))
+    for v in hist.values():
+        v.sort()
+    for v in nonverify.values():
+        v.sort()
+    first_in = {}
+    out = {"all": collections.Counter(), "clean": collections.Counter()}
+    for _, e in _events(glob.glob(os.path.join(d, "events.*.exl3-tier*.jsonl")), {"evict"}):
+        if e["seq"] not in verify_seqs:
+            continue
+        first_in.setdefault(e["seq"], []).append((e["ns"], e["row"], e["c"]))
+    by_seq = {r.seq: r for r in run.records}
+    for seq, reads in first_in.items():
+        r = by_seq.get(seq)
+        if r is None or run.prompt_of[r.verify] < 0:
+            continue
+        gpu_cold = set(r.evict_in) - set(r.miss_cpu) - set(r.pool)
+        clean = run.clean[run.prompt_of[r.verify]]
+        for ns, row, ex in reads:
+            if ex not in gpu_cold:
+                continue
+            h = [x for x in hist[(row, ex)] if x[0] < ns]
+            if not h:
+                kind = "never_seen"
+            elif h[-1][1] < 0:
+                kind = "traced"
+            else:
+                t_in = h[-1][0]
+                nv = nonverify.get(row, [])
+                k = bisect.bisect_right(nv, t_in)
+                kind = "untraced_prefill" if k < len(nv) and nv[k] < ns else "untraced_decode"
+            out["all"][kind] += 1
+            if clean:
+                out["clean"][kind] += 1
+    return {k: dict(v) for k, v in out.items()}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -654,7 +711,12 @@ def main() -> int:
     g.add_argument("on")
     g.add_argument("--bootstrap", type=int, default=200, help="resamples of verifies for the prices' spread")
     g.add_argument("--json")
+    dp = sub.add_parser("departures")
+    dp.add_argument("runs", nargs="+")
     a = ap.parse_args()
+    if a.cmd == "departures":
+        print(json.dumps({d: departures(d, 40) for d in a.runs}, indent=1))
+        return 0
     res = gate(a.off, a.on, a.bootstrap)
     print(json.dumps(res, indent=1))
     if a.json:
