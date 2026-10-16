@@ -346,6 +346,115 @@ Approved by team-lead; run offline on the existing A/B. Script commit `5508b6538
 - Outputs: `/mnt/nvme1/lane-tier-replay/stage0-prev.json` (the gate), `stage0-{prev,next}-b0.json` and
   `stage0-noprefill-b0.json`.
 
+## Owner constraint for head v1.1 (2026-10-16, via team-lead)
+
+- **No retraining per RAM cache size.** The owner does not want a predictor that must be retrained whenever the RAM
+  cache size changes. Values come from startup calibration, not constants.
+- **So option (a) is the last resort.** Option (a) is a RAM-tier feature inside the learned head.
+- **The preferred form is the product ranking.**
+  - The head stays tier-agnostic and outputs P(recur next verify).
+  - Serving ranks GPU lanes by P(recur) × the time saved for the expert's live tier (VRAM, RAM-warm or NVMe-cold).
+  - The tier costs are measured at server startup.
+  - Option (b) is the hard-cap special case of this form.
+- **The rule for (a).** The evaluation includes the product ranking as an arm. Option (a) is justified only if it
+  beats the product by a clear margin. Its ceiling here is `oracle-emp`, an oracle P under the product's tier costs.
+
+## Evaluation (2026-10-16): lane keys on C2 and base, priced by tier
+
+Script `analysis/dsv41-drive/dspark/lane_eval.py` (`55bec79464`); outputs in `/mnt/nvme1/lane-tier-replay/eval/`
+(`{base,c2}.json`, `{base,c2}.abprices.json`). Offline, cores 56-63.
+
+**What each arm replays.** One joint run per arm:
+- The VRAM cache under today's victim rule. The arm decides which k misses take the GPU lanes, k being the capture's
+  own count per (verify, layer). The resident set is resynchronized after each prefill.
+- The RAM tier (rules 1-10) on the arm's own hot sets and misses.
+- Each lane priced by its tier with P.
+
+The head's P comes from `head/{c2,base}.pred-B.npz`. Base has 121 clean verifies and C2 has 700.
+
+### Validation
+
+- **The capture's own lanes, priced:**
+  - against prices fit on the capture: 244.8 vs measured 231.0 ms/verify (base), 243.4 vs 217.2 (C2);
+  - against prices fit on the A/B OFF: 216.9 (base) and 209.4 (C2).
+  - So the capture's own fit runs 6-12% high, and the A/B prices 3-5% low.
+- **T on these captures:** 12.6-13.3 NVMe-cold GPU lanes/verify predicted, against 14.3-15.0 observed (-12%). Forced
+  CPU misses: 75.9 against 76.2 and 79.2 against 82.0.
+- **The `today` simulation** has about 20 more hits per verify than the capture (382 vs 363). This is
+  vram_cache_replay's known gap. Every net figure below is against `today`.
+
+### The check: the current head should come out at about 0 net
+
+| prices | head, Δ ms/verify before its cost | at 0.77 ms |
+|---|---|---|
+| fit on the capture | -3.1 / -3.2 | -2.4 |
+| fit on the A/B OFF | -0.5 / -0.2 | +0.3 / +0.6 |
+| capture's fit + A/B residual (`_ab`) | -0.3 / -0.2 | +0.4 / +0.6 |
+
+- Figures are base / C2. Served A/B: +0.74 ms/token, 95% CI -3.1 .. +4.0; stream + wait per verify +4.8.
+- **The capture's own fit fails the check.** The A/B prices, and the A/B-residual correction, pass it. So those two
+  views are the ones to read below.
+
+**Why P misses here.**
+- P puts the CPU path on the critical path in 96-99% of records (stream-critical share 0.039 on base, 0.007 on C2).
+  So moving an NVMe-cold lane from the CPU onto the GPU stream looks nearly free to P.
+- The A/B says otherwise. It added 18.12 cold GPU lanes per verify and measured stream + wait +4.76 ms/verify, where P
+  predicted -2.45. That is +0.40 ms per moved lane beyond P, and +0.26 ms per lane in all.
+- P's E check passed at ±25% on stream and on wait separately. Their difference, the net of a cold move, is what an
+  arm that trades one against the other depends on.
+- So any arm that changes the cold GPU lanes a lot is read through that served number.
+
+### Results
+
+Δ ms/verify against `today`. Base / C2.
+
+| arm | hits/verify | cold GPU lanes | A/B prices, before cost | A/B prices, at 0.77 | A/B prices, at 0.40 / 0.32 | own fit + `_ab` | T bias (`_bias`, A/B prices) |
+|---|---|---|---|---|---|---|---|
+| today | 372 / 383 | 11.9 / 10.7 | 0 | 0 | 0 | 0 | 0 |
+| head (v1, served) | 391 / 398 | 19.0 / 18.4 | -0.5 / -0.2 | +0.3 / +0.6 | -0.1 / +0.2 ; -0.2 / +0.2 | -0.3 / -0.2 | +0.3 / +0.7 |
+| capb (option b) | 386 / 394 | 0.5 / 0.6 | -1.4 / -0.9 | -0.6 / -0.1 | -1.0 / -0.5 ; -1.0 / -0.6 | -3.2 / -1.7 | -2.6 / -2.0 |
+| product (P's tier costs) | 354 / 363 | 67 / 66 | +7.2 / +7.1 | +7.9 / +7.8 | | +8.3 / +3.8 | +12.9 / +12.9 |
+| **product-emp** (served cold cost) | 380 / 387 | 0.5 / 0.6 | **-3.9 / -3.1** | **-3.1 / -2.3** | -3.5 / -2.7 ; -3.5 / -2.8 | -5.1 / -3.2 | -5.1 / -4.2 |
+| oracle (next1-k, VRAM only) | 428 / 435 | 11.6 / 11.6 | -4.9 / -4.0 | -4.9 / -4.0 | | -5.7 / -4.5 | -5.0 / -3.9 |
+| oracle-emp (ceiling of (a)) | 401 / 408 | 0.6 / 0.7 | -5.1 / -4.5 | | | -6.6 / -4.9 | -6.3 / -5.6 |
+
+Notes on the table:
+- **product with P's costs fails.** It puts 66 cold lanes on the GPU, because P makes a cold CPU lane cost about 2 ms
+  and a GPU stream lane almost nothing. The A/B contradicts that.
+  - With the capture's own fit and no correction it reads -13.8 / -18.4. That is the failure mode, not a gain.
+  - So the startup-measured tier cost must be the served one: what a moved cold lane does to stream + wait.
+  - The A/B's +0.26 ms/lane is that measurement (`product-emp`).
+- **`_bias`** scales every arm's NVMe-cold GPU lanes by 15.10/13.79, T's under-prediction on the A/B.
+  - It moves the head +0.8 to +0.9 ms worse, because the head adds cold lanes.
+  - It moves capb and product-emp 1.1-1.3 ms better, because they remove them.
+  - The oracle hardly moves.
+  - On these captures T's under-prediction is about 12%, not 8%, so these shifts are a lower bound.
+- **What changes the cold GPU lanes.** Only capb and product-emp take them out (about 0.5/verify, against 11-12 today).
+  They move about 10 forced misses per verify onto the CPU.
+  - capb keeps about 70% of the head's hit gain.
+  - product-emp keeps 30-40%: it gives the warm lanes to the experts with the most CPU routes, and gains its time
+    there.
+
+### What it says
+
+1. **The served head is neutral here too:** about 0 net at 0.77 ms in both credible views. The check passes.
+2. **The owner's form, with the served cold-lane cost (`product-emp`), is the best head arm.**
+   - -2.3 to -3.1 ms/verify net at 0.77 (A/B prices); -2.7 to -3.5 at the fused 0.32-0.40.
+   - It beats the head by about 3 ms/verify, and capb by about 2-2.5 ms.
+   - Its cost: one startup-measured constant per tier, and a tier-agnostic head. No retraining per RAM size.
+3. **Option (a) is not justified.** Its ceiling, an oracle P under the same tier costs (`oracle-emp`), is only
+   1.2-1.6 ms/verify better than product-emp, in every view. A learned (a) would recover part of that, against its retraining
+   constraint. That is not a clear margin.
+4. **The lane-key ceiling is small.** The VRAM-only oracle is worth 4-5 ms/verify. The best realizable arm is at about
+   3 ms/verify before the head's cost.
+5. **The conclusion rests on one served number.** product-emp's advantage comes from keeping cold rows off the GPU,
+   priced by the A/B's +0.26 ms per moved lane (one sample per arm, CI including 0).
+   - Before any served product-emp arm, the cold-move cost should be measured at startup, the way the owner's form
+     needs anyway.
+   - The capture's own P cannot rank these arms.
+
+**Best head arm for the share sweep:** product-emp.
+
 ## Decisions asked of team-lead and the owner
 
 1. **Stage 0 now** (offline, the existing A/B, `taskset -c 56-63`, outputs under `/mnt/nvme1/lane-tier-replay/`). No
