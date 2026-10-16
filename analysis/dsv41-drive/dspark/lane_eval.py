@@ -135,7 +135,7 @@ AB_SERVED_PER_COLD_LANE = 4.76 / 18.12
 
 
 def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, layers: int, share: int = 0,
-             share_layers: set | None = None, no_admit: bool = False) -> dict:
+             share_layers: set | None = None, no_admit: bool = False, rows_scale: float = 1.0) -> dict:
     key = keys["product"]
     d = run.dir
     header, log = ltr.route_log(d)
@@ -143,7 +143,7 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
     rows, frac, pool_share, full = ltr.numa_capacities(d)
     full = set(full)
     p_promote = ltr.promote_fraction(d)
-    tiers = [ltr.layer_tiers(rows.get(L, 210), frac, pool_share) for L in range(layers)]
+    tiers = [ltr.layer_tiers(round(rows.get(L, 210) * rows_scale), frac, pool_share) for L in range(layers)]
     cap = header["hot_capacity"]
     by_vr = {(r.verify, r.row): r for r in run.records}
     replayed = {r.seq for r in run.records}
@@ -351,7 +351,7 @@ def sweep(a) -> int:
             "product-emp": ProductKey(P, w_s, w_c, hit_routes, cold_served=AB_SERVED_PER_COLD_LANE)}
     layers = max(r.row for r in run.records) + 1
     preds = load_preds(a.pred) if a.pred else {}
-    res = {"capture": a.capture, "prices_from": a.prices_from or a.capture, "sweep": {}}
+    res = {"capture": a.capture, "prices_from": a.prices_from or a.capture, "rows_scale": a.rows_scale, "sweep": {}}
     for arm in a.arms.split(","):
         rows = {}
         for spec in a.shares.split(","):
@@ -361,7 +361,7 @@ def sweep(a) -> int:
                 lo, hi = (int(x) for x in span.split("-"))
                 span_set = set(range(lo, hi + 1))
             r = evaluate(run, preds, P, keys, arm, layers, share=0 if size == "none" else int(size),
-                         share_layers=span_set, no_admit=size == "none")
+                         share_layers=span_set, no_admit=size == "none", rows_scale=a.rows_scale)
             rows[spec] = r
         base = rows.get("0") or next(iter(rows.values()))
         pp0 = base["prefill_per_prompt"]
@@ -397,6 +397,8 @@ def main() -> int:
     ap.add_argument("--prices-from", default=None, help="fit P on this run instead of the capture")
     ap.add_argument("--head-ms", default="0.77,0.40,0.32")
     ap.add_argument("--arms", default=",".join(ARMS))
+    ap.add_argument("--rows-scale", type=float, default=1.0,
+                    help="sweep: scale every layer's RAM rows (how the best share moves with the tier's size)")
     ap.add_argument("--shares", default=None,
                     help="prefill-share sweep instead of the arm comparison: sizes per layer, 'none' (no admission), "
                          "and SIZE@LO-HI for a share on those layers only, e.g. 0,16,32,64,96,128,none,64@2-20")
