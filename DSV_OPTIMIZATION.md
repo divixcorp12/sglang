@@ -127,6 +127,19 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
 - Tests: 111 + 80 CPU passed, 13 GPU passed.
 - Next: an A/B with calibration + refinement against the fixed-cost split model; and the mirror-weight startup
   probe (`SGLANG_DSV41_ENABLE_MIRROR_WEIGHT_CALIBRATION`, approved), from read-amp's nvme3 finding.
+- **Mirror-weight probe built** (`mirror-weight-calib` `f828356056`, not yet run).
+  - Runs once per process in `exl3_mirror_config`, before the row tables are built.
+  - Reads 4 O_DIRECT reads in flight per root, all roots at once, one reader-piece-sized sub-read each, 3 rounds
+    of 0.15 s.
+  - Weight = root throughput / mean, clamped to [0.5, 2]. Rounds disagreeing by >25%, a dead root or a missing
+    manifest leave equal shares, with a warning. Explicit weights win.
+  - Expected from read-amp's busy times: ~1.056 : 0.875 : 1.069 (nvme0 : nvme3 : nvme2).
+- **A/B arms** (`f58bd94a44`):
+  - `...-pin01-splitmodel-fixedcosts`: all old offline fits, calibration skipped.
+  - `...-pin01-splitmodel-refine`: calibration + `REFINE_BATCHES=50`.
+  - Plain `...-splitmodel`: calibrated, no refinement.
+  - To be rebased onto the `-mem-hicache1` base, via a merge of split-model.
+- **Box queue:** A' rerun -> prefill run3 -> mirror-probe validation start -> calibration A/B.
 
 ### 3.4 Node-0 memory pressure — branch `split-model`
 
