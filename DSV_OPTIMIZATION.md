@@ -930,6 +930,16 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               - `forget_graph_path_state` after the trial.
               Rejected fallback (A): bake the upper bound into the graphs and trim after capture. That touches
               hot-path kernels and needs a writer audit.
+          - **calib8** (2026-10-16 02:38, `7811f88be2`): crashed at startup in the first replayed shape (1 token).
+            - The dummy extend ran under `torch.inference_mode()`, and the EXL3 cast-fusion M==1 path reads
+              `_version`. Fix: `no_grad`. Earlier runs never had a 1-token shape.
+            - **The trial capture works:** estimate 212 MiB against the real capture's 214 (within 1%). The free
+              drop was 712, of which 500 is outside torch and persistent (first use, already in F). The trial
+              takes 8.0 s.
+            - Open item: 148 MiB of the attention backend's capture metadata stays pinned after the trial
+              teardown. That makes the grow 148 MiB more conservative than needed.
+            - Also requested: any exception during calibration falls back to the configured size, logged at
+              ERROR, instead of killing the launch. Rerun as calib8b.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
