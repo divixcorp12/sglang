@@ -506,6 +506,11 @@ class Envs:
     # Colon-separated relative read shares, one per root of
     # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
     SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
+    # Measure the mirror weights at startup instead (mirror_weight_calibration.py): each root's O_DIRECT read
+    # throughput on its row images, before the tables are built, so every drive gets the same busy time. Applies only
+    # with several roots and SGLANG_MOE_EXPERT_MIRROR_WEIGHTS unset; a failed probe warns and keeps equal shares. Off by
+    # default.
+    SGLANG_DSV41_ENABLE_MIRROR_WEIGHT_CALIBRATION = EnvBool(False)
     # Pick each RAM-miss sub-read's mirror root when it is issued instead of by the
     # static split: a root whose sub-reads in flight reach its cap in
     # SGLANG_MOE_EXPERT_MIRROR_CAPS is skipped, the fewest bytes in flight wins, and

@@ -471,7 +471,9 @@ def two_stage_span_weights() -> tuple[Optional[tuple[float, ...]], Optional[tupl
 def exl3_mirror_config() -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:
     """``(roots, weights)`` from the environment, or None when mirroring is off.
 
-    Raises if weights are set without roots, since they would be silently ignored.
+    With SGLANG_DSV41_ENABLE_MIRROR_WEIGHT_CALIBRATION and no SGLANG_MOE_EXPERT_MIRROR_WEIGHTS, the weights are
+    measured once per process (mirror_weight_calibration.probed_weights), equal when that fails. Raises if weights
+    are set without roots, since they would be silently ignored.
     """
     dirs = envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get()
     weights = envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.get()
@@ -483,6 +485,10 @@ def exl3_mirror_config() -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:
             )
         return None
     roots = parse_mirror_roots(dirs)
+    if len(roots) > 1 and not weights.strip() and envs.SGLANG_DSV41_ENABLE_MIRROR_WEIGHT_CALIBRATION.get():
+        from sglang.srt.layers.moe.mirror_weight_calibration import probed_weights
+
+        return roots, probed_weights(roots)
     return roots, parse_mirror_weights(weights, len(roots))
 
 
