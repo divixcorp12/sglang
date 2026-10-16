@@ -104,7 +104,9 @@ def test_off_wraps_nothing():
     layer = worker.model_runner.model.model.layers[0]
     now = (worker._forward_prefill, worker.model_runner.model.forward, layer.forward, layer.self_attn.forward,
            layer.mlp.forward)
-    assert all(a is b for a, b in zip(now, originals))
+    # Bound methods are new objects on every access: compare the functions under them.
+    assert all(getattr(a, "__func__", a) is getattr(b, "__func__", b) for a, b in zip(now, originals))
+    assert not any(getattr(f, "__prefill_peak_wrapped__", False) for f in now)
     assert worker._kv_injector.inject_target_hidden is injector_fn
     assert "forward" not in vars(layer) and "forward" not in vars(worker.model_runner.model)
 
