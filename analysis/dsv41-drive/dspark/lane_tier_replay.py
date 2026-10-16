@@ -27,7 +27,7 @@ RAM tier (``--tier``): per layer an LRU over ``rows`` slots with the VRAM-hot an
 protected (ram_prefetch_replay.RamTier's rule), touched by every routed expert that is not a VRAM hit, the pool's
 served rows entering as the capture shows them. Its prediction of each lane's tier is checked against the trace's.
 
-Usage: lane_tier_replay.py gate OFF_DIR ON_DIR [--rows 190] [--json OUT]
+Usage: lane_tier_replay.py gate OFF_DIR ON_DIR [--bootstrap 200] [--json OUT]
 """
 
 from __future__ import annotations
@@ -187,32 +187,62 @@ def lstsq(rows: list[list[float]], ys: list[float]) -> np.ndarray:
     return coef
 
 
-def stream_features(r: Record) -> list[float]:
-    m = r.gpu_nvme + r.gpu_pool
-    return [1.0 if m else 0.0, r.gpu_nvme, r.gpu_pool, r.dma if m else 0.0]
+def cpu_misses(r: Record) -> int:
+    return sum(1 for j in r.jobs if j["part"] == 1)
+
+
+def stream_features(r: Record, gpu_nvme: int, gpu_pool: int) -> list[float]:
+    """S's features: whether it runs, its NVMe and pool lanes, the copy lanes sharing the link, and the shared drives:
+    the record's forced CPU misses read while S's NVMe lanes are (each GPU NVMe lane times each CPU miss)."""
+    m = gpu_nvme + gpu_pool
+    on = 1.0 if m else 0.0
+    return [on, gpu_nvme, gpu_pool, r.dma * on, gpu_nvme * cpu_misses(r)]
+
+
+STREAM_NAMES = ("base", "per_nvme_gpu_lane", "per_pool_gpu_lane", "per_copy_lane", "per_nvme_gpu_lane_x_cpu_miss")
+LAND_NAMES = ("first_byte", "per_cpu_miss", "per_record_gpu_nvme_lane")
 
 
 class Prices:
-    """Costs fit on one run's records (all its serving verifies), each in ms."""
+    """Costs fit on one run's serving records, each in ms. The drives are shared: a forced CPU miss lands later for each
+    GPU NVMe lane of its record (``miss_land``'s last term), and S runs longer for each CPU miss read beside its NVMe
+    lanes (``stream``'s last term). ``spread`` is each coefficient's standard deviation over a bootstrap of verifies."""
 
-    def __init__(self, run: Run):
+    def __init__(self, run: Run, bootstrap: int = 0):
         recs = run.serving(clean_only=False)
-        self.stream = lstsq([stream_features(r) for r in recs], [r.stream for r in recs])
+        self._fit(recs)
+        self.spread = {}
+        if bootstrap:
+            by_v = collections.defaultdict(list)
+            for r in recs:
+                by_v[r.verify].append(r)
+            keys = sorted(by_v)
+            rng = np.random.default_rng(0)
+            draws = []
+            for _ in range(bootstrap):
+                sample = [r for k in rng.choice(keys, size=len(keys)) for r in by_v[k]]
+                boot = Prices.__new__(Prices)
+                boot._fit(sample)
+                draws.append(boot._vector())
+            sd = np.std(np.asarray(draws), axis=0)
+            self.spread = dict(zip(self._names(), sd.round(3).tolist()))
+
+    def _fit(self, recs: list[Record]) -> None:
+        self.stream = lstsq([stream_features(r, r.gpu_nvme, r.gpu_pool) for r in recs], [r.stream for r in recs])
         hit = [(j, r) for r in recs for j in r.jobs if j["part"] == 0]
         miss = [(j, r) for r in recs for j in r.jobs if j["part"] == 1]
         self.hit_job = lstsq([[1.0, j["lanes"], j["routes"]] for j, _ in hit], [(j["end"] - j["start"]) / 1e6 for j, _ in hit])
         self.miss_job = lstsq([[1.0, j["routes"]] for j, _ in miss], [(j["end"] - j["start"]) / 1e6 for j, _ in miss])
-        # a forced miss's job starts when its row has landed: start after the post, by its index on the team
+        # a forced miss's job starts when its row has landed: by its index on the team and its record's GPU NVMe lanes
         starts = collections.defaultdict(list)
         for j, r in miss:
-            starts[(r.seq, j["team"])].append((j["start"] - r.post) / 1e6)
+            starts[(r.seq, j["team"])].append(((j["start"] - r.post) / 1e6, r.gpu_nvme))
         xs, ys = [], []
         for v in starts.values():
-            for i, t in enumerate(sorted(v), 1):
-                xs.append([1.0, i])
+            for i, (t, g) in enumerate(sorted(v), 1):
+                xs.append([1.0, i, g])
                 ys.append(t)
-        self.miss_land = lstsq(xs, ys)  # first byte, per expert
-        # the hit job's start after the post
+        self.miss_land = lstsq(xs, ys)
         self.hit_start = statistics.median((j["start"] - r.post) / 1e6 for j, r in hit)
         # stream + wait against max(stream, CPU finish): the offset of the wait's end after the CPU's
         res = []
@@ -222,10 +252,18 @@ class Prices:
                 res.append(r.stream + r.wait - max(r.stream, cpu))
         self.offset = statistics.median(res)
 
-    def team_finish(self, hit_lanes: int, hit_routes: int, miss_routes: list[int]) -> float:
+    def _names(self) -> list[str]:
+        return ([f"stream.{n}" for n in STREAM_NAMES] + ["hit_job.base", "hit_job.per_lane", "hit_job.per_route",
+                "miss_job.base", "miss_job.per_route"] + [f"miss_land.{n}" for n in LAND_NAMES]
+                + ["hit_start", "wait_offset"])
+
+    def _vector(self) -> list[float]:
+        return [*self.stream, *self.hit_job, *self.miss_job, *self.miss_land, self.hit_start, self.offset]
+
+    def team_finish(self, hit_lanes: int, hit_routes: int, miss_routes: list[int], gpu_nvme: int) -> float:
         t = self.hit_start + float(self.hit_job @ [1.0, hit_lanes, hit_routes]) if hit_lanes else 0.0
         for i, routes in enumerate(miss_routes, 1):
-            land = float(self.miss_land @ [1.0, i])
+            land = float(self.miss_land @ [1.0, i, gpu_nvme])
             t = max(t, land) + float(self.miss_job @ [1.0, routes])
         return t
 
@@ -233,8 +271,7 @@ class Prices:
         """(stream, wait) predicted from the record's lane counts; ``gpu_nvme``/``gpu_pool`` override its tiers."""
         nv = r.gpu_nvme if gpu_nvme is None else gpu_nvme
         po = r.gpu_pool if gpu_pool is None else gpu_pool
-        m = nv + po
-        stream = float(self.stream @ [1.0 if m else 0.0, nv, po, r.dma if m else 0.0]) if m else 0.0
+        stream = float(self.stream @ stream_features(r, nv, po)) if nv + po else 0.0
         cpu = 0.0
         for team in (0, 1):
             hits = [j for j in r.jobs if j["team"] == team and j["part"] == 0]
@@ -242,16 +279,13 @@ class Prices:
             lanes = sum(j["lanes"] for j in hits)
             routes = sum(j["routes"] for j in hits)
             if hits or misses:
-                cpu = max(cpu, self.team_finish(lanes, routes, misses))
+                cpu = max(cpu, self.team_finish(lanes, routes, misses, nv))
         wait = max(0.0, max(stream, cpu) + self.offset - stream) if (cpu or stream) else 0.0
         return stream, wait
 
     def describe(self) -> dict:
-        return {"stream_ms": dict(zip(("base", "per_nvme_lane", "per_pool_lane", "per_copy_lane"), self.stream.round(3).tolist())),
-                "hit_job_ms": dict(zip(("base", "per_lane", "per_route"), self.hit_job.round(3).tolist())),
-                "miss_job_ms": dict(zip(("base", "per_route"), self.miss_job.round(3).tolist())),
-                "miss_land_ms": dict(zip(("first_byte", "per_expert"), self.miss_land.round(3).tolist())),
-                "hit_start_ms": round(self.hit_start, 3), "wait_offset_ms": round(self.offset, 3)}
+        out = {n: round(float(v), 3) for n, v in zip(self._names(), self._vector())}
+        return {"ms": out, "bootstrap_sd": self.spread} if self.spread else {"ms": out}
 
 
 def per_verify(run: Run, prices: Prices | None = None, tiers: dict | None = None) -> dict:
@@ -276,27 +310,100 @@ def per_verify(run: Run, prices: Prices | None = None, tiers: dict | None = None
 # ---- RAM tier ----------------------------------------------------------------------------------------------------------
 
 
-class RamTier:
-    """One layer's pinned slots: LRU, protected rows never evicted (ram_prefetch_replay.RamTier, lru)."""
+class NodeTier:
+    """One NUMA group's slots of one row (TIER_RULES 1-4): LRU over its READY slots, VRAM-hot and the record's routed
+    experts never victims, a promoted pool row inheriting its victim's recency."""
 
     def __init__(self, capacity: int):
         self.capacity = capacity
         self.stamp: dict[int, int] = {}
-        self.tick = 0
 
     def has(self, e: int) -> bool:
         return e in self.stamp
 
-    def touch(self, e: int) -> None:
-        self.tick += 1
-        self.stamp[e] = self.tick
+    def _victim(self, protected: set) -> int | None:
+        cands = [(t, x) for x, t in self.stamp.items() if x not in protected]
+        return min(cands)[1] if cands else None
 
-    def insert(self, e: int, protected: set) -> None:
-        if e not in self.stamp and len(self.stamp) >= self.capacity:
-            cands = [(t, x) for x, t in self.stamp.items() if x not in protected]
-            if cands:
-                del self.stamp[min(cands)[1]]
-        self.touch(e)
+    def insert(self, e: int, tick: int, protected: set) -> None:
+        """A demand miss read in: a free slot, else the LRU unprotected victim; none, and it is not cached."""
+        if e in self.stamp:
+            self.stamp[e] = tick
+            return
+        if len(self.stamp) >= self.capacity:
+            victim = self._victim(protected)
+            if victim is None:
+                return
+            del self.stamp[victim]
+        self.stamp[e] = tick
+
+    def promote(self, e: int, protected: set) -> None:
+        """A landed pool row mapped by promote_landed: it takes a victim and that victim's stamp."""
+        if e in self.stamp or not self.stamp:
+            return
+        victim = self._victim(protected)
+        if victim is None:
+            return
+        self.stamp[e] = self.stamp.pop(victim)
+
+    def apply_eviction(self, old: int, new: int, tick: int) -> None:
+        """An eviction the trace recorded (outside the replayed verifies): ``old`` out (-1 a free slot), ``new`` in."""
+        self.stamp.pop(old, None)
+        if len(self.stamp) < self.capacity or new in self.stamp:
+            self.stamp[new] = tick
+
+
+# The RAM tier's rules, from the code the A/B ran (lane-head-ab d269f7aa90; paths under
+# python/sglang/kernels/jit/csrc/moe/expert_stream/host/ unless given):
+#  1. Per NUMA group: a row's slots are split into one contiguous range per node (srt/layers/moe/host_numa.py:300
+#     group_ranges, from where the pinned slabs' pages are bound, host_numa.py:267 slot_nodes), and expert e is served by
+#     group e % nodes (lease_layout.h:52 home; :148 static_assert "home is expert % nodes"). A victim is taken only in
+#     the miss's own group range (ram_tier.h:2114 take_victim_locked, loop over own.lo..own.hi).
+#  2. Each group range first gives min(8, range - 1) staging slots (ram_tier.h:1044 reserve_staging, k = the victim
+#     lanes, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES=8) and then `share` speculative pool slots
+#     (ram_tier.h:1084 reserve_spec_pool; "RAM prefetch share 2" in the server log); neither ever holds a mapped row.
+#  3. Victim: a free slot first, else the least recently stamped READY slot whose expert is not VRAM-hot (the record's
+#     hot bitmap, ram_tier.h:594 apply_gpu_hot), not routed by the record (`wanted`) and not filling
+#     (ram_tier.h:2120-2128). So a VRAM-resident expert that holds a RAM row keeps it while it is hot; there is no
+#     rule that frees it. With no victim the miss is read into staging but not cached (ram_tier.h:2110-2113).
+#  4. Recency: every routed expert of a record that the group holds is restamped (ram_tier.h:2100 touch_request over
+#     request.protect, the record's routed experts), VRAM hits included; a demand miss restamps its new slot.
+#  5. Every demand miss is cached, GPU lane or CPU lane alike: forced CPU misses first, then the other misses, each
+#     taking a victim (ram_tier.h:2998 reserve_victims_locked). The lane's kind decides who computes it, not whether
+#     the row enters RAM.
+#  6. Prefetch: an L+2 read lands in a pool slot (kSpec), not in the map. A demand miss can be served from it: a GPU
+#     lane streams from the pool slot (ram_tier.h:3017 point_pooled_locked) and a forced CPU miss takes it over
+#     (take_pooled_locked); either way the row is cached as rule 5. An unused landed row may be promoted into the map
+#     when its row's delta is claimed (ram_tier.h:2919 promote_landed): it takes an LRU victim (no record protection)
+#     and inherits the victim's stamp (ram_tier.h:2959), so it is the next to go unless routed. Promotion is skipped
+#     when the row's lock is busy, the read is still in flight, or the delta has no room (spec_promote_* counters).
+#  7. Full layers (SGLANG_MOE_PINNED_HOST_FULL_LAYERS) map every expert and never miss.
+TIER_RULES = 7
+
+
+def numa_capacities(d: str) -> tuple[dict[int, int], float, int, list[int]]:
+    """From the server log's pinned-tier startup line: rows per layer, node 0's share of the bound bytes, the pool share,
+    and the full layers."""
+    rows, frac, share, full = {}, 0.5, 0, []
+    with open(os.path.join(d, "server.log"), errors="replace") as f:
+        for line in f:
+            if "Pinned host expert cache startup" in line:
+                info = json.loads(line[line.index("{"):])
+                rows = {int(k): v for k, v in info["rows_per_layer"].items()}
+                b = info["numa"]["bound_bytes"]
+                frac = int(b["0"]) / (int(b["0"]) + int(b["1"]))
+                full = info.get("full_layers", [])
+            elif "RAM prefetch share" in line:
+                share = int(line.split("RAM prefetch share")[1].split(",")[0])
+    return rows, frac, share, full
+
+
+def layer_tiers(rows: int, frac: float, share: int, staging: int = 8) -> list[NodeTier]:
+    r0 = int(round(rows * frac))
+    out = []
+    for r in (r0, rows - r0):
+        out.append(NodeTier(max(0, r - min(staging, r - 1) - share)))
+    return out
 
 
 def route_log(d: str) -> tuple[dict, list[dict]]:
@@ -330,51 +437,105 @@ def align(run: Run, log: list[dict]) -> int:
     return best
 
 
-def tier_replay(run: Run, rows: int, layers: int) -> tuple[dict, dict]:
-    """Drive the tier with the run's own routes and hot sets, and classify each record's GPU lanes (the experts it
-    inserted into VRAM: hot at v+1 minus hot at v, its unforced lanes) as RAM-warm or NVMe-cold. Returns per record
-    seq the predicted (gpu_nvme, gpu_pool) and the agreement counts."""
+def promote_fraction(d: str) -> float:
+    """The share of landed pool rows the run promoted (counters.json: spec_promoted_early / spec_landed)."""
+    with open(os.path.join(d, "counters.json")) as f:
+        c = json.load(f)
+    return c.get("spec_promoted_early", 0) / max(1, c.get("spec_landed", 1))
+
+
+def _hash01(*xs: int) -> float:
+    h = 1469598103934665603
+    for x in xs:
+        h = ((h ^ (x & 0xFFFFFFFF)) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return (h >> 11) / float(1 << 53)
+
+
+def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
+    """Drive the RAM tier through the run (TIER_RULES; ``rules`` False is the first gate's plain LRU of 170 rows) and
+    classify each record's GPU lanes (the experts it inserted into VRAM: its unforced lanes) as NVMe-cold, pool-served
+    or RAM-warm. Outside the replayed verifies (prefill, warm-up, eager forwards) the trace's own evictions are applied,
+    since the lane key does not touch them. Returns per record seq the predicted (gpu_nvme, gpu_pool) and counts."""
     header, log = route_log(run.dir)
     off = align(run, log)
+    rows, frac, share, full = numa_capacities(run.dir)
+    p_promote = promote_fraction(run.dir)
+    nodes = 2
+    tiers = [layer_tiers(rows.get(L, 210), frac, share) if rules else [NodeTier(170 // 2), NodeTier(170 - 170 // 2)]
+             for L in range(layers)]
+    full = set(full)
     by_vr = {(r.verify, r.row): r for r in run.records}
-    tiers = [RamTier(rows) for _ in range(layers)]
-    # full layers (SGLANG_MOE_PINNED_HOST_FULL_LAYERS) hold every expert
-    full = set(header.get("pinned_full_layers") or [0, 1])
-    pred: dict[int, tuple[int, int]] = {}
-    stats = collections.Counter()
+    replayed = {r.seq for r in run.records}
+    timeline = []  # (ns, order, kind, payload)
     for v in range(len(run.verifies)):
         i = v + off
         if not 0 <= i < len(log):
             continue
+        for L in range(layers):
+            r = by_vr.get((v, L))
+            ns = r.post if r is not None else run.verifies[v][0] + L * 5_000_000
+            timeline.append((ns, 1, "gather", (v, i, L)))
+    for _, e in _events(glob.glob(os.path.join(run.dir, "events.*.exl3-tier*.jsonl")), {"evict"}):
+        if e["seq"] not in replayed and rules:
+            timeline.append((e["ns"], 0, "evict", (e["row"], e["group"], e["a"], e["c"])))
+    lands = collections.defaultdict(list)  # (row, verify index after landing) -> experts
+    if rules:
+        begins = [b for b, _ in run.verifies]
+        for _, e in _events(glob.glob(os.path.join(run.dir, "events.*.exl3-spec*.jsonl")), {"spec_land"}):
+            k = bisect.bisect_right(begins, e["ns"])
+            lands[(e["row"], k)].append((e["a"], e["ns"]))
+            lands[(e["row"], k - 1)].append((e["a"], e["ns"]))
+    timeline.sort(key=lambda t: (t[0], t[1]))
+    pred: dict[int, tuple[int, int]] = {}
+    stats = collections.Counter()
+    tick = 0
+    for ns, _, kind, payload in timeline:
+        tick += 1
+        if kind == "evict":
+            row, g, old, new = payload
+            if row < layers and row not in full:
+                tiers[row][g].apply_eviction(old, new, tick)
+            continue
+        v, i, L = payload
         cur = log[i]
         nxt = log[i + 1] if i + 1 < len(log) else None
-        for L in range(layers):
-            routed = {e for e in cur["routes"][L] if e >= 0}
-            hot = set(cur["hot"][L])
-            misses = routed - hot
-            r = by_vr.get((v, L))
-            cold_pred = set() if L in full else {e for e in misses if not tiers[L].has(e)}
-            if r is not None and nxt is not None:
-                inserted = (set(nxt["hot"][L]) - hot) & misses
-                pool = set(r.pool)
-                nv = len((inserted & cold_pred) - pool)
-                po = len(inserted & pool)
-                pred[r.seq] = (nv, po)
-                if run.prompt_of[v] >= 0 and run.clean[run.prompt_of[v]]:
-                    stats["records"] += 1
-                    stats["pred_gpu_nvme"] += nv
-                    stats["obs_gpu_nvme"] += r.gpu_nvme
-                    stats["inserted"] += len(inserted)
-                    stats["obs_gpu_lanes"] += r.gpu_nvme + r.gpu_pool + r.dma
-                    stats["pred_cold_misses"] += len(cold_pred)
-                    stats["obs_nvme_reads"] += len(set(r.evict_in))
-            if L not in full:
-                for e in misses:
-                    if tiers[L].has(e):
-                        tiers[L].touch(e)
-                    else:
-                        tiers[L].insert(e, hot | routed)
+        routed = {e for e in cur["routes"][L] if e >= 0}
+        hot = set(cur["hot"][L])
+        misses = routed - hot
+        r = by_vr.get((v, L))
+        cold_pred = set() if L in full else {e for e in misses if not tiers[L][e % nodes].has(e)}
+        if r is not None and nxt is not None:
+            inserted = (set(nxt["hot"][L]) - hot) & misses
+            pool = set(r.pool)
+            nv = len((inserted & cold_pred) - pool)
+            po = len(inserted & pool)
+            pred[r.seq] = (nv, po)
+            if run.prompt_of[v] >= 0 and run.clean[run.prompt_of[v]]:
+                obs_cold = set(r.evict_in) - set(r.miss_cpu) - pool
+                stats["lane_tp"] += len(obs_cold & ((inserted & cold_pred) - pool))
+                stats["records"] += 1
+                stats["pred_gpu_nvme"] += nv
+                stats["obs_gpu_nvme"] += r.gpu_nvme
+                stats["inserted"] += len(inserted)
+                stats["obs_gpu_lanes"] += r.gpu_nvme + r.gpu_pool + r.dma
+                stats["pred_cold_misses"] += len(cold_pred)
+                stats["obs_nvme_reads"] += len(set(r.evict_in))
+        if L in full:
+            continue
+        protected = hot | routed
+        for e in routed:  # rule 4: the group's held routed experts are restamped, VRAM hits included
+            t = tiers[L][e % nodes]
+            if t.has(e):
+                t.stamp[e] = tick
+        for e in sorted(misses, key=lambda x: x not in cold_pred):  # rule 5: every miss is cached
+            tiers[L][e % nodes].insert(e, tick, protected)
+        if rules and r is not None:
+            for e, land_ns in lands.get((L, v), []):  # rule 6: landed pool rows, before this gather, unused by it
+                if land_ns <= ns and e not in routed and _hash01(v, L, e) < p_promote:
+                    tiers[L][e % nodes].promote(e, hot)
     stats["align_offset"] = off
+    stats["promote_fraction"] = round(p_promote, 3)
+    stats["capacities"] = {L: [t.capacity for t in tiers[L]] for L in (2, 39)}
     return pred, dict(stats)
 
 
@@ -385,13 +546,13 @@ def within(x: float, target: float, rel: float) -> bool:
     return abs(x - target) <= abs(target) * rel
 
 
-def gate(off_dir: str, on_dir: str, rows: int) -> dict:
+def gate(off_dir: str, on_dir: str, bootstrap: int) -> dict:
     off, on = Run(off_dir), Run(on_dir)
     # serve_compare's pair verdict: prompts with no flag in either run
     both = [a and b for a, b in zip(off.clean, on.clean)]
     off.clean, on.clean = list(both), list(both)
     layers = max(r.row for r in off.records) + 1
-    prices = Prices(off)
+    prices = Prices(off, bootstrap)
     m_off, m_on = per_verify(off), per_verify(on)
     p_off, p_on = per_verify(off, prices), per_verify(on, prices)
     res = {"prices_fit_on_off": prices.describe(),
@@ -409,21 +570,25 @@ def gate(off_dir: str, on_dir: str, rows: int) -> dict:
         "off_in_sample_stream": [round(p_off["stream"], 2), round(m_off["stream"], 2), within(p_off["stream"], m_off["stream"], 0.10)],
         "off_in_sample_wait": [round(p_off["wait"], 2), round(m_off["wait"], 2), within(p_off["wait"], m_off["wait"], 0.10)],
     }
-    if not rows:
-        # calibrate the capacity on OFF alone: the replay's NVMe reads per verify against the trace's
-        sweep = {}
-        for cand in range(120, 330, 10):
-            _, s = tier_replay(off, cand, layers)
-            sweep[cand] = s["pred_cold_misses"] / max(1, s["obs_nvme_reads"])
-        rows = min(sweep, key=lambda c: abs(sweep[c] - 1.0))
-        res["tier_calibration"] = {"rows": rows, "pred_over_obs_reads": {k: round(v, 3) for k, v in sweep.items()}}
-    t_off, s_off = tier_replay(off, rows, layers)
-    t_on, s_on = tier_replay(on, rows, layers)
+    t_off, s_off = tier_replay(off, layers)
+    t_on, s_on = tier_replay(on, layers)
     nv_off = s_off["pred_gpu_nvme"] / off.n_verifies()
     nv_on = s_on["pred_gpu_nvme"] / on.n_verifies()
     ob_off = s_off["obs_gpu_nvme"] / off.n_verifies()
     ob_on = s_on["obs_gpu_nvme"] / on.n_verifies()
     res["tier_stats"] = {"off": s_off, "on": s_on}
+    res["tier_error"] = {
+        "off_pct": round(100 * (nv_off - ob_off) / ob_off, 1), "on_pct": round(100 * (nv_on - ob_on) / ob_on, 1),
+        "delta_pct": round(100 * ((nv_on - nv_off) - (ob_on - ob_off)) / (ob_on - ob_off), 1),
+        "lane_precision_off": round(s_off["lane_tp"] / max(1, s_off["pred_gpu_nvme"]), 3),
+        "lane_recall_off": round(s_off["lane_tp"] / max(1, s_off["obs_gpu_nvme"]), 3),
+        "lane_precision_on": round(s_on["lane_tp"] / max(1, s_on["pred_gpu_nvme"]), 3),
+        "lane_recall_on": round(s_on["lane_tp"] / max(1, s_on["obs_gpu_nvme"]), 3),
+    }
+    _, p_off = tier_replay(off, layers, rules=False)
+    _, p_on = tier_replay(on, layers, rules=False)
+    res["plain_lru_170_for_reference"] = {"off": round(p_off["pred_gpu_nvme"] / off.n_verifies(), 2),
+                                          "on": round(p_on["pred_gpu_nvme"] / on.n_verifies(), 2)}
     res["T"] = {
         "gpu_nvme_off": [round(nv_off, 2), round(ob_off, 2), within(nv_off, ob_off, 0.15)],
         "gpu_nvme_on": [round(nv_on, 2), round(ob_on, 2), within(nv_on, ob_on, 0.15)],
@@ -437,11 +602,11 @@ def gate(off_dir: str, on_dir: str, rows: int) -> dict:
                        within(e_on["wait"] - e_off["wait"], dm["wait"], 0.25)],
     }
     res["passed"] = {part: all(v[-1] for v in res[part].values()) for part in ("P", "T", "E")}
-    res["diagnosis"] = diagnose(off, on, prices, rows, layers)
+    res["diagnosis"] = diagnose(off, on, prices, layers)
     return res
 
 
-def diagnose(off: Run, on: Run, prices: Prices, rows: int, layers: int) -> dict:
+def diagnose(off: Run, on: Run, prices: Prices, layers: int) -> dict:
     """Where the gate's parts miss: the same prices fit on ON (does a cost move between runs?), the wait error by a
     record's GPU NVMe lanes, and the tier replay's misclassified GPU lanes by the verify's place after its prefill."""
     out = {"prices_fit_on_on": Prices(on).describe()}
@@ -463,7 +628,7 @@ def diagnose(off: Run, on: Run, prices: Prices, rows: int, layers: int) -> dict:
         # the tier replay against the trace, lane by lane, by verifies since the request's first verify
         header, log = route_log(run.dir)
         off_i = align(run, log)
-        pred, _ = tier_replay(run, rows, layers)
+        pred, _ = tier_replay(run, layers)
         by_vr = {(r.verify, r.row): r for r in run.records}
         first = {}
         for v in range(len(run.verifies)):
@@ -487,10 +652,10 @@ def main() -> int:
     g = sub.add_parser("gate")
     g.add_argument("off")
     g.add_argument("on")
-    g.add_argument("--rows", type=int, default=0, help="RAM rows per layer; 0 calibrates on OFF")
+    g.add_argument("--bootstrap", type=int, default=200, help="resamples of verifies for the prices' spread")
     g.add_argument("--json")
     a = ap.parse_args()
-    res = gate(a.off, a.on, a.rows)
+    res = gate(a.off, a.on, a.bootstrap)
     print(json.dumps(res, indent=1))
     if a.json:
         with open(a.json, "w") as f:
