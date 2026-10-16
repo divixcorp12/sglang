@@ -410,8 +410,8 @@ class TestGatherReadStats(unittest.TestCase):
         created = []
         original = streamer._gather_cached
 
-        def gather_cached(*args):
-            result = original(*args)
+        def gather_cached(*args, **kwargs):
+            result = original(*args, **kwargs)
             created.append(streamer.last_gather_stats)
             return result
 
