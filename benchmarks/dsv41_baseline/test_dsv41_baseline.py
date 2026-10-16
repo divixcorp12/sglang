@@ -1009,10 +1009,17 @@ def test_server_args_binds_loopback_by_default():
 
 def test_prod_server_args_serve_the_prod_mode_on_port_7867_on_all_interfaces():
     prod = arm_env.ServerArgs.prod().argv()
-    arm = arm_env.ServerArgs(port=arm_env.PROD_PORT, dspark=arm_env.PROD_DSPARK).argv()
+    # A benchmark arm on the same port with production's DSpark memory (PROD_DSPARK_*), which arms append themselves.
+    arm = arm_env.ServerArgs(
+        port=arm_env.PROD_PORT,
+        dspark=arm_env.PROD_DSPARK,
+        mem_fraction_static=arm_env.PROD_DSPARK_MEM_FRACTION_STATIC,
+        max_total_tokens=arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS,
+        drop_cache_after_load=True,
+    ).argv()
     assert prod[prod.index("--host") + 1] == "0.0.0.0"
     assert prod[prod.index("--port") + 1] == "7867"
-    # Everything but the bind address matches a benchmark arm on the same port.
+    # Everything but the bind address matches that arm.
     i = prod.index("--host") + 1
     assert prod[:i] + prod[i + 1 :] == arm[:i] + arm[i + 1 :]
 

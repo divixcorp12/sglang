@@ -1176,7 +1176,8 @@ def _copy_engine_service(monkeypatch):
     """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md, "Copy engine")."""
     service = module.Exl3RamMissService()
     service.copy_engine = True
-    service.device_side = SimpleNamespace(copy_engine_captured=True)
+    # No split model (an empty word tensor): the pause calibrates the table alone.
+    service.device_side = SimpleNamespace(copy_engine_captured=True, split_model=torch.empty(0))
     armed = []
     service.host = SimpleNamespace(arm_copy_engine=lambda: armed.append(True))
     syncs = []
