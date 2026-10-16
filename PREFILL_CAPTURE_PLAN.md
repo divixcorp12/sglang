@@ -305,6 +305,47 @@ in RAM and not VRAM-hot"). Its candidate set is the RAM tier this lane models, u
 I will send drip-hot the event schema and stage 0's T-sim rule once team-lead approves this plan, so its replay uses
 the same rule.
 
+## Stage 0 result (2026-10-16): T passes; no capture needed
+
+Approved by team-lead; run offline on the existing A/B. Script commit `5508b65381` (rule 10 in `TIER_RULES`;
+`gate --prefill prev|next`).
+
+**0.1: `ram_miss` excludes the prefetch's claims.**
+- The line's `ram_miss` is `host_read_rows`, the rows `_record_read` adds inside the gather's window
+  (`_gather_eager_rows`, `expert_stream.py:2431`).
+- `_fill_rows` records `rows=len(slots)` (`:479`); `prefetch_rows` records no read; `_wait_fill` records time only
+  (`:552`).
+- So `ram_miss` counts the chunk (demand) admissions only. A prefill's reads are the prefetch claims plus `ram_miss`.
+- Check 0.3 compares the replay's demand admissions with `ram_miss`.
+
+**0.3: reads check, passes.**
+- Per serving prompt, the replay's demand admissions against `ram_miss`: -0.4% to -4.7% (OFF), -0.1% to -6.3% (ON).
+  All 16 are within ±10%.
+- Per-layer correlation 0.999 in both arms.
+- The replay's VRAM misses match the lines' `vram_miss` to within 0.5%, so the hot set is right.
+- The warm-up prefills also agree (for example fpid 29: 2,747 against 2,810).
+- The prefetch claims a further 1,000-1,830 rows per prompt.
+
+**0.4: gate, all parts pass.** Run with `--bootstrap 200 --prefill prev`; P is unchanged from gate-5.
+
+| check | predicted | observed | error | tolerance |
+|---|---|---|---|---|
+| T: NVMe-cold GPU lanes/verify, OFF | 13.79 | 15.10 | -8.7% | ±15% |
+| T: same, ON | 30.61 | 33.22 | -7.9% | ±15% |
+| T: ON - OFF | +16.82 | +18.12 | -7.2% | ±20% |
+| E: Δstream/verify | +50.74 ms | +51.68 ms | -1.8% | ±25% |
+| E: Δwait/verify | -53.19 ms | -46.92 ms | +13.4% | ±25% |
+
+- Lane-level precision and recall: 0.94 / 0.86 (OFF) and 0.96 / 0.88 (ON), against 0.38 / 0.25 and 0.61 / 0.26
+  before.
+- The replay's promotions number 2,441 / 2,259, against the counters' 3,201 (OFF).
+- The remaining under-prediction is about 8%, even across the verify's position after its prefill (age 0: 232 against
+  270 OFF; age 8+: 695 against 780).
+- The hot-set choice (`prev`/`next`) changes nothing at the reported precision.
+- Without `--prefill` the script reproduces gate-5's T (9.94 / 14.07), so the old path is unchanged.
+- Outputs: `/mnt/nvme1/lane-tier-replay/stage0-prev.json` (the gate), `stage0-{prev,next}-b0.json` and
+  `stage0-noprefill-b0.json`.
+
 ## Decisions asked of team-lead and the owner
 
 1. **Stage 0 now** (offline, the existing A/B, `taskset -c 56-63`, outputs under `/mnt/nvme1/lane-tier-replay/`). No
