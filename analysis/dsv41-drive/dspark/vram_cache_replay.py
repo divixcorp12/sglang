@@ -167,8 +167,9 @@ class LayerTrace:
         self.gate_w = [(r.get("gate_w") or [None] * (layer + 1))[layer] for r in recs]
         self.has_gate_w = all(g is not None for g in self.gate_w)
         # an external gather-time predictor (next_verify_head.py predict): expert -> P(routed next verify)
+        # a verify without a successor in its request has no prediction; its lanes fall back to the score key
         self.pred = [((r.get("pred") or {}).get(layer)) for r in recs]
-        self.has_pred = all(p is not None for p in self.pred)
+        self.has_pred = sum(p is not None for p in self.pred) >= 0.8 * max(1, len(recs))
         for r in recs:
             flat = r["routes"][layer]
             ntok = int(r.get("forward_tokens") or 1)
