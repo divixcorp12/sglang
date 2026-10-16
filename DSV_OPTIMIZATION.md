@@ -492,6 +492,18 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
     - Fix (`e0aa95a7c7`): draft odds is a constant feature in B0, so it is zeroed rather than standardized. Without
       this, C2 precision collapsed to 0.32.
     - Next: replay `--pred` for head-k hits/verify against score-k 385.9, table-k 390.3 and next1-k 431.6.
+  - **Owner decisions (2026-10-15):**
+    - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
+      - GPU-trained on the full 5120-dim gate inputs.
+      - Attention across the verify's tokens and layers, plus route history.
+      - Runs once per verify, off the critical path (side stream during the draft).
+    - **Next-verify head as an NVMe-to-RAM prefetch source (offline replay):**
+      - Today every arm runs L+2 T3 prefetch at cap 2. Per forward that leaves 76.8 misses, 16.5 covered and 60.4
+        NVMe demand reads. 35% of landed prefetches are used, and 26% of used ones are still in flight at use.
+      - A verify-ahead prediction (~250 ms of lead time) could read during the draft phase.
+      - The replay measures demand reads caught, alone and on top of L+2, at 0.5x/1x/2x of today's spec-read
+        budget. It also counts wasted reads and RAM-tier eviction effects, with table-k and the next1-k oracle as
+        bounds.
 
 ### 3.9 Graded miss cut — branch `misscut-replay` (`5014aaff0a`, `23c09c180c`, `f2e2e0c80b`, `760736c33b`, `7d105fabfe`), NOT merged
 
