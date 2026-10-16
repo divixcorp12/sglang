@@ -1348,6 +1348,17 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
                   pool serve, prefill-merge-chunk and expseg.
               - **Next (approved):** a startup-computed share size (usable rows per layer x the sweep's 0.15
                 knee), then one served pair, share-64 vs share-startup (~28).
+              - **Result (2026-10-16, `/mnt/nvme1/share28-ab-20261016`): share 28 loses; keep 64.** Startup computed
+                28 = 0.15 x 187 usable rows. Both arms rc 0, no OOM.
+                - Decode ms/token (28 - 64), 6 clean prompts: -1.78, 95% CI -4.53..+0.82, so not significant.
+                - TTFT: +1.58 s per prompt (predicted +0.74). On every prompt, the TTFT cost exceeded the decode
+                  saving (at most 0.45 s). Break-even is about 900 generated tokens per request.
+                - Stream + wait per verify: -7.5 ms (predicted -4.9). Forced CPU misses per verify: -11.7 (predicted
+                  -5.4). Prefill demand reads per prompt: +571 (predicted +537).
+                - Flags: ab-start p3 STALL/PREFILL-STALL, ab-64 p6 CPUSLOW.
+                - 0.15 is the decode-optimal knee, but the wrong default when TTFT counts. The startup rule's fraction
+                  becomes 64/187 (about 0.34) on `prefill-share-size-ps`: it reproduces 64 today and scales with the
+                  tier.
             - **Approved:** one served A/B pair of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64, no code) on
               `-mergechunk-expseg`, with the route log, predictions written down first. If it matches the model's
               direction: a share-size knob with a startup calibration rule (64 is hard-coded today).
@@ -1473,6 +1484,45 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   NUMA move unless arm A leaves node 0 short.
 - In-server interleaved A/B harness for noise (offered; owner chose other work).
 - RAM prefetch `promote_landed`: ~42 rows land and ~20 are used per verify; a RAM-tier precision concern.
+
+## 4a. Consolidation review (2026-10-16, before the merge to master)
+
+The owner asked for everything valuable from October 14-16 to be merged into master and enabled in production.
+Agent `merge-clean` (opus) writes `MERGE_PLAN_1016.md` first; the prefetch flags wait for lane-tier's offline
+prefetch comparison. Below is the best arm's env (`/mnt/nvme1/share64-ab-20261016/resolved-env.json`, "on") against
+master's `prod_env()` at `a7cce264fe`.
+
+| item | flags beyond prod | evidence | proposal |
+|---|---|---|---|
+| merge chunking + expandable segments + bigger hot cache + KV pin | `MERGE_BUDGET_MB=128`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `HOT_GPU_MB` 13144 (prod 10840), argv `--mem-fraction-static 0.8623 --max-total-tokens 381184` | -2.0 (CI -3.7..-0.6) then -1.79 (CI -4.51..-0.64) ms/token, stacked ~-3.8 (3.7) | enable; size the hot cache by startup calibration (owner rule) |
+| pin01 | `PINNED_HOST_FULL_LAYERS=0,1`, pinned MB 111530 / NUMA 59656:51874 | 70.5 vs 76.2, layers 0+1 20.5 -> 13.0 ms/verify (3.1) | enable |
+| split model | `ENABLE_CPU_SPLIT_MODEL=1` | -2.9%, one pair, matched by replay (3.2) | enable, with startup calibration on and refinement off (3.3) |
+| -mem | `SCHEDULER_MLOCK=1`, `HICACHE_HOST_NUMA_NODE=1`, `--weight-loader-drop-cache-after-load` | node-0 swap and faults fixed; speed neutral (3.4) | enable |
+| prefill share | (on since `a7cce264fe`) | -3.46 ms/token (3.8) | done; share 28 lost (TTFT +1.58 s), keep 64; startup fraction 64/187 |
+| prefetch stack | `RAM_PREFETCH` + horizon 2, T3 head file, cap 2, pool serve, promote, idle2 | no clean served win (DSV41_REFERENCE 33.14-33.37; promote "converts, does not add") | **ship ON as tested (owner, 2026-10-16)**: every stacked served win was measured with it on. The offline comparison was not resolvable: today's arm used -3%, but pool-served -13..-16% outside the 10% gate (T's cold under-prediction), and there is no traced out-of-sample capture (`LANE_TIER_REPLAY_HANDOFF.md`). The head is at `/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors` (0444, sha256 `f0d7a1b1...5309`), which launch_prod.sh verifies |
+
+**Parked on master, OFF, and we are coming back to both (owner decision 2026-10-16):**
+- **Lane head** (`lane-head`, handoff `LANE_HEAD_HANDOFF.md`, `SGLANG_OPT_LANE_HEAD_PATH` unset). It is the
+  foundation for the product-emp ranking: P(recur) x the time saved at the expert's live tier, -0.6 to -0.9
+  ms/token offline (3.8). Next: measure the cold-lane cost at startup, build the ranking, then the fused kernel and a
+  served A/B.
+- **Lane-tier replay** (`lane-tier-replay`, handoffs `LANE_TIER_REPLAY_HANDOFF.md` and `PREFILL_CAPTURE_PLAN.md`).
+  The validated RAM-tier simulator and the lane/share evaluation tools. Next: the offline prefetch comparison, then
+  the product-emp evaluation.
+- The `drip-hot` design note and replay are merged too, so the verdict stays on record (not built).
+
+**Found missing in the review:**
+- `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1`: -1.16 ms/token, 8/8 sessions (2026-09-27), left "for the owner" in
+  DSV41_REFERENCE 33.22. It was measured before the copy engine, was never re-measured, and is in no arm. It needs a
+  compatibility check and an A/B before it is enabled.
+- **Production launch has no memory floor.** The arms need node 1 to have 64.91 GiB free (`prelaunch_evict`), and
+  `launch_prod.sh` neither evicts nor checks. Other projects' page cache (mimo-reap: 26.6 GiB free today) would
+  starve HiCache on node 1 and the bigger pinned tier.
+- The confidence gate's only served loss (77.9 vs 69.3) came from a stall-flagged run; it was never re-scored. It stays
+  off.
+- The SPCC fix (fstrim, moving mimo-reap/mimi-v26-pro) is still pending. Its tax is ~1.9 ms/token on average (3.4).
+- Staying off, as measured: lane head, drip/drip-hot, tiebreak, decay 0.995, refinement, mirror weights. cpu-out-rows
+  (bit-identical, ~10-25 us/job) and graded miss-cut (~0.5-1 ms/token, replay only) are unserved.
 
 ## 5. Box rules for anyone continuing
 
