@@ -543,6 +543,30 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       split-calib. A compatibility check comes first: graphs, copy engine, IPC, mapped host memory.
     - Offline: largest-shape-first warm-up or `empty_cache` between shapes, behind a default-off flag.
     - A proposal for deriving the margin jitter from startup measurements, not a constant.
+  - **expandable_segments audit (torch 2.13.0+cu130, TP1): no blocker found.**
+    - Graphs capture into torch's private pool.
+    - Graph-pool borrow is the one risky path (it reads segment layout), and it is off
+      (`SGLANG_ENABLE_GRAPH_POOL_BORROW=False`).
+    - There is no custom allocator or MemPool in this config.
+    - CUDA IPC is only in TP>1 all-reduce.
+    - Host registration is unaffected, and the copy engine uses stable tensor pointers.
+    - Smoke queued: `cores-ab-20261014/run_expseg.sh`, after split-calib.
+  - **Option 2 built, off:** `SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL` (`b9811b4d98`,
+    `mem_cache/prefill_cache_release.py`).
+    - It calls `empty_cache()` before each new high-water prefill size: 11 times across the warm-up, never in
+      serving.
+    - empty_cache was chosen over reordering the warm-up, because a reorder changes route and residency state.
+    - 74 CPU tests passed. The `>` -> `>=` mutant is caught.
+  - **Margin derivation:**
+    - Growth from init to the warm-up peak is stable per arm: 3,522-3,573 MiB across 3 launches.
+    - The jitter is in init headroom: 164 MiB between two 923-slot launches. Free-before-load explains only part
+      of it.
+    - **Approved: design (a), trim-only, default-off flag.**
+      - Allocate the hot cache at an upper bound, run the warm-up, then release tail slots so the free memory at
+        the warm-up peak stays at or above the margin.
+      - The margin itself is derived from the measured jitter.
+      - First: check whether graphs, lease tables, the RAM tier or the copy engine fix the slot count or pointers
+        at capture time.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
