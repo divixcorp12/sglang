@@ -37,9 +37,10 @@ the final merge to master is a fast-forward of `integrate-1016`.
 | `prefill-share-default` | `a7cce264fe` | yes | no | yes | prefill share in `base_env` | `SGLANG_DSV41_ENABLE_PREFILL_SHARE` | -3.46 ms/token, CI -4.91..-1.55 | already in master, enabled |
 | `prefill-share-size`, `-ps` | `4096b28933`, `57e64ed0e1` | no | no | no | startup-sized share (0.15 x usable rows) | `SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS` | under test | **don't merge yet**; `-ps` merges cleanly onto the chain below |
 | `mirror-weight-calib`, `mirror-weight-ab` | `cb77329dd8`, `dce869d0a2` | no | no | no | startup mirror-weight probe (`-calib` also carries split-model-calib) | `SGLANG_DSV41_ENABLE_MIRROR_WEIGHT_CALIBRATION` | +0.04 ms/token, dropped (DO 3.3) | **don't merge** |
-| `lane-head`, `lane-head-ab` | `eb1a14c8c0`, `022acb70b9` | no | yes (code) | no | gather-time learned lane head | `SGLANG_OPT_LANE_HEAD_PATH` | +19.5 hits/verify, ms/token neutral; held | **don't merge** |
-| `lane-tier-replay` | `1cbfdfc7ef` | no | no | no | tier-priced replays, share sweep, share A/B report | — | DO 3.8 | **don't merge**: contains all of `lane-head` |
-| `drip-hot` | `21fe80bc93` | no | no | no | drip-into-hot-cache design + replay | — | fails build gate | **don't merge** |
+| `lane-head` | `eb1a14c8c0` | no | yes (code) | no | gather-time learned lane head | `SGLANG_OPT_LANE_HEAD_PATH` | +19.5 hits/verify, ms/token neutral; held | **merge-off** (owner, 2026-10-16), via `lane-tier-replay`; parked, sect. 9 |
+| `lane-head-ab` | `022acb70b9` | no | = arm | no | lane-head + prefill-merge-chunk, throwaway A/B branch | — | — | **don't merge** |
+| `lane-tier-replay` | `1cbfdfc7ef` | no | no | no | tier-priced replays, share sweep, share A/B report; contains all of `lane-head` | — | DO 3.8 | **merge** (owner, 2026-10-16), analysis only plus lane-head off; parked, sect. 9 |
+| `drip-hot` | `21fe80bc93` | no | no | no | drip-into-hot-cache design + replay | — | fails build gate | **merge** (owner, 2026-10-16): design note and replay only, no serving code |
 | `hx-check/*` | — | | | | hx checker scratch refs | | | ignore |
 
 ## 2. Env the best arm sets beyond today's master `prod_env()`
@@ -95,6 +96,8 @@ Dry runs chained with `git merge-tree --write-tree` (each step on the previous s
 | 5 | `expert-breakdown` `d79f05e077` (optional) | none |
 | 6 | `misscut-replay`, `cache-tiers` (optional, analysis only) | none |
 | 7 | arm_env changes (one commit) | — |
+| 8 | `lane-tier-replay` `1cbfdfc7ef` (brings `lane-head`), owner 2026-10-16 | none textually; the lane head and the startup hot-cache calibration share the hot-cache budget (checked in sect. 9) |
+| 9 | `drip-hot` `21fe80bc93`, owner 2026-10-16 | `analysis/dsv41-drive/dspark/lane_tier_replay.py` add/add: drip-hot carries lane-tier-replay's `3d331c9189` copy (byte-identical); kept lane-tier-replay's tip |
 | later | `prefill-share-size-ps` `57e64ed0e1`, once its A/B is decided | none on top of 1-6 |
 
 Then the integration tests (phase 2), then a fast-forward of `master` on your go.
@@ -216,6 +219,34 @@ cache (e.g. mimo-reap's 620 GB on nvme4) can fill node 1, and then the populate/
 Alternative, if you'd rather not have production evict anything: step 2 alone, a pure refusal check. The operator then
 evicts by hand. I recommend the eviction round, because the files it drops are our own and production is down when it
 runs.
+
+## 9. Parked, coming back
+
+Merged with every flag off (owner, 2026-10-16), so that the work isn't lost. `prod_env()` leaves
+`SGLANG_OPT_LANE_HEAD_PATH` unset, and `test_dspark_recipe.py` pins it.
+
+- **Lane head** (`SGLANG_OPT_LANE_HEAD_PATH`, code from `lane-head` `f4eadc1fa7`): built and served once. It moved
+  +19.5 VRAM hits/verify with no ms/token, because the GPU lanes moved onto NVMe-cold rows (DO 3.8). The handoff is
+  `LANE_HEAD_HANDOFF.md`, section 0 "Next version".
+  - **Next:** rank lanes by product-emp, using a cold-lane cost measured at startup. lane-tier's evaluation put it at
+    ~0.6-0.9 ms/token, with the whole lever's ceiling ~1.4 ms/token.
+  - **Then:** the fused kernel, estimated at 0.32-0.40 ms/verify, but only if the ranking shows a gain above the
+    head's cost.
+  - **Both flags on with the startup hot-cache calibration: consistent by construction, now pinned by a CPU test**
+    (`test/registered/unit/layers/moe/test_lane_head_hot_cache_budget.py`):
+    1. `from_model` takes the head's device bytes (~57.5 MB) out of `SGLANG_MOE_HOT_GPU_MB` before it sizes the
+       cache. A head that leaves no budget is refused.
+    2. The head is allocated at model load, so the calibration's later free-memory measurement includes it.
+    3. The head keys experts, not slots, so `set_hot_capacity`'s census has no capacity of its to miss.
+    4. The head's per-request state, which the calibration's dummy gathers and trial capture touch, is zeroed by
+       `reset_after_capture` and by every prefill.
+    - Not run together on the GPU: that needs a server start, which this work may not do. The first served start
+      with both flags on should check its "lane head active" line and the calibration summary.
+- **Lane-tier replay** (`analysis/dsv41-drive/dspark/lane_tier_replay.py`, `lane_eval.py`, `share_ab_report.py`): the
+  validated RAM-tier simulator (gate T passes with prefill admissions). It is the tool for the pending prefetch
+  comparison (sect. 4). The handoffs are `LANE_TIER_REPLAY_HANDOFF.md` and `PREFILL_CAPTURE_PLAN.md`.
+- **Drip-hot** (`DRIP_HOT_DESIGN.md`, `drip_hot_replay.py`): not built. No arm passes the build gate. The design note
+  records what would change that verdict.
 
 ## 8. Phase 2 test plan (after your go)
 
