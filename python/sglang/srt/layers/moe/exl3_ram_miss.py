@@ -795,12 +795,13 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 # deadlocked (at thresholds of 4 batches and of 1). 16 covers the warm-up; the value
 # beyond that is arbitrary.
 COPY_ENGINE_ARM_DECODES = 16
-# The prefill share's size, as a fraction of a layer's usable RAM rows (prefill_share_rows). The fraction is the knee of
-# the tier-priced share sweep (analysis/dsv41-drive/dspark/lane_eval.py --shares --rows-scale, PREFILL_CAPTURE_PLAN.md
-# "Prefill-share sweep" on lane-tier-replay; outputs /mnt/nvme1/lane-tier-replay/sweep/{aboff,c2}.scale*.json): the
-# decode gain is flat for any share up to ~0.15 of the usable rows, halves at ~0.33 and is mostly gone by ~0.6, at
-# tier sizes of 0.75-1.25x today's; below the knee only the prefill's blocking reads grow.
-PREFILL_SHARE_FRACTION = 0.15
+# The prefill share's size, as a fraction of a layer's usable RAM rows (prefill_share_rows): 64 of the 187 usable rows
+# of the served layout, the share served at 64 rows (/mnt/nvme1/share64-ab-20261016: -3.46 ms/token, TTFT -0.48 s).
+# The tier-priced sweep's decode knee is ~0.15 (lane_eval.py --shares --rows-scale on lane-tier-replay, outputs
+# /mnt/nvme1/lane-tier-replay/sweep/), but served at 0.15 (28 rows, /mnt/nvme1/share28-ab-20261016) it cost +1.58 s of
+# TTFT per prompt for a decode gain within noise (-1.78 ms/token, 95% CI -4.53 .. +0.82): below ~900 generated tokens a
+# request loses, so the larger share stays.
+PREFILL_SHARE_FRACTION = 64 / 187
 # CPU experts log their cumulative counters every this many batches, about twice per
 # 128-token turn at batch 1.
 CPU_STATS_LOG_BATCHES = 64

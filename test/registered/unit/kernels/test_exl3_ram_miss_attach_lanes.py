@@ -491,7 +491,7 @@ def test_the_pool_room_is_checked_per_group_as_the_host_reserves_it(ranges, widt
 @pytest.mark.parametrize(
     "ranges, width, share, usable",
     [
-        ([(0, 113), (113, 210)], 8, 2, 103 + 87),  # the served arms' layout: 190 usable rows a layer
+        ([(0, 113), (113, 210)], 8, 2, 103 + 87),  # two nodes split 113 / 97, staging 8 and pool 2 each
         ([(0, 10), (10, 20)], 7, 0, 3 + 3),  # each group stages 7, not 7 for the row
         ([(0, 3), (3, 20)], 8, 1, 0 + 8),  # a tiny group stages all but one slot and gives none to the pool's excess
         ([(0, 210)], 8, 0, 202),  # one node
@@ -501,15 +501,15 @@ def test_usable_rows_count_each_group_past_its_staging_and_pool(ranges, width, s
     assert module.usable_rows(ranges, staging_width=width, share=share) == usable
 
 
-def test_the_prefill_share_is_the_sweeps_fraction_of_the_smallest_row():
-    """0.15 of 189-190 usable rows is the 28 the served arms get; the smallest row decides (the host keeps one share
-    for every layer), and a share is at least one row. Mutations: the largest row, truncation, no floor of 1."""
-    assert module.PREFILL_SHARE_FRACTION == 0.15
-    assert module.prefill_share_rows([190, 189, 190]) == 28
-    assert module.prefill_share_rows([300, 100]) == 15
-    assert module.prefill_share_rows([197]) == 30  # 29.55 rounds, not truncates
+def test_the_prefill_share_is_the_served_fraction_of_the_smallest_row():
+    """64/187 of the served layout's 187-188 usable rows is the 64 served; the smallest row decides (the host keeps one
+    share for every layer), and a share is at least one row. Mutations: the largest row, truncation, no floor of 1."""
+    assert module.PREFILL_SHARE_FRACTION == 64 / 187
+    assert module.prefill_share_rows([188, 187, 188]) == 64
+    assert module.prefill_share_rows([300, 100]) == 34
+    assert module.prefill_share_rows([189]) == 65  # 64.69 rounds, not truncates
     assert module.prefill_share_rows([190], fraction=0.5) == 95
-    assert module.prefill_share_rows([3]) == 1
+    assert module.prefill_share_rows([1]) == 1
     with pytest.raises(ValueError, match="at least one row"):
         module.prefill_share_rows([])
 
