@@ -169,8 +169,17 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
     - **Validation #2** (2026-10-15 22:46-22:53, `mirror2`): 11 CPU tests passed.
       - Probe in 0.58 s: nvme0 2.80, nvme4 2.13, nvme2 2.67 GB/s, giving weights **1.1052 : 0.8416 : 1.0532**.
       - That is 1.31x, against a target of ~1.21x: much closer than the first probe's 1.7x.
-      - Pending: the stall check over the probe window, then a served A/B against mergechunk-r2 to test whether
-        it equalises root busy times.
+      - **No stall during the probe** (22:50:05-06): read await 0.69 / 0.77 / 0.98 ms, so the SPCC was 1.34x the
+        Samsungs, consistent with 1.31x. All roots passed the 25% round check.
+      - **Adopted for a served A/B as is.** With a served truth of 1.21x, these weights leave the SPCC ~5% less busy
+        than the Samsungs, against ~21% more busy with equal shares.
+      - Caveat: a startup probe can't see the 20-60 s stalls. Static weights can't fix those.
+      - Served A/B: `run_mirrorab.sh` (worktree `wt-mirror-ab`, `a988627f06`, the mergechunk-r2 code plus the probe
+        and per-round logging), arm `...-mergechunk-mirrorcal`, against mergechunk-r2. Started first, ahead of the
+        bigger-cache run.
+- **Refinement verdict (split-calib):** the `-refine` run published only 2 refinements, so it ended about 44% of the
+  way to the served fit: a weak test. Even a fair one is unlikely to beat ~1 ms/token. **Not worth pursuing.**
+  Startup calibration stays useful: it matches the offline fits within noise with no hard-coded constants.
 - **A/B arms** (`f58bd94a44`):
   - `...-pin01-splitmodel-fixedcosts`: all old offline fits, calibration skipped.
   - `...-pin01-splitmodel-refine`: calibration + `REFINE_BATCHES=50`.
