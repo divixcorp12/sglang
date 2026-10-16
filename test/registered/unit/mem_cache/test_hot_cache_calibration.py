@@ -284,6 +284,38 @@ def test_the_calib3_grow_would_have_been_sized_from_memory_the_verify_took():
     assert unsettled.lowest_free - settled.lowest_free == 400 * M
 
 
+def test_proportional_upper_follows_each_layers_headroom_and_never_passes_its_limit():
+    capacity = {0: 26, 1: 26, 2: 26, 3: 30}
+    limit = {0: 344, 1: 146, 2: 26, 3: 31}  # headroom 318, 120, 0, 1
+    upper = hc.proportional_upper(capacity, limit, 100)
+    assert upper[2] == 26 and upper[3] == 31  # no headroom stays put; a tiny one is capped at its limit
+    assert upper[0] - 26 > upper[1] - 26 > 0  # the higher limit gets more
+    assert sum(upper.values()) - sum(capacity.values()) >= 100  # rounded up: the bound covers the budget
+    assert all(upper[l] <= limit[l] for l in limit)
+    assert hc.proportional_upper(capacity, limit, 0) == capacity
+    assert hc.proportional_upper(capacity, limit, 10**6) == limit  # a budget past every limit is the limits
+
+
+def test_the_grow_bound_is_the_non_static_memory_in_slots(monkeypatch):
+    """calib4's launch: 40 layers of ~26 slots, tier limits 146 (344 on two), 0.8623 static on 32,607 MiB."""
+    from sglang.srt import runtime_context
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (29000 * M, 32607 * M))
+    monkeypatch.setattr(runtime_context, "get_schedule", lambda: SimpleNamespace(mem_fraction_static=0.8623))
+    capacity = {l: 26 for l in range(40)}
+    limit = {l: (344 if l < 2 else 146) for l in range(40)}
+    upper = hc.bounded_upper_capacities(capacity, limit, slot_bytes=13_315_584)
+    slots = int(32607 * M * (1 - 0.8623)) // 13_315_584
+    extra = sum(upper.values()) - sum(capacity.values())
+    assert slots <= extra <= slots + 40  # one rounded-up row a layer at most
+    assert sum(upper.values()) < 1500 < sum(limit.values())  # calib4 reserved ~6,200 rows
+    assert upper[0] > upper[2]
+
+
+def test_bound_binds_lists_only_layers_that_wanted_more_than_their_bound():
+    assert hc.bound_binds({0: 30, 1: 28}, {0: 29, 1: 40}) == {0: (30, 29)}
+
+
 def test_plan_grow_prices_slots_in_granules_and_closes_a_layer_that_no_longer_fits():
     G = 2
     mapped = {0: 26, 1: 26}

@@ -119,6 +119,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.moe.hot_cache_calibration import (
     maybe_calibrate_hot_cache,
     require_hot_cache_headroom,
+    startup_memory_probe,
 )
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -1134,7 +1135,8 @@ class Scheduler(
         self.init_tp_model_worker()
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
-        self.maybe_init_draft_worker()
+        with startup_memory_probe("draft load"):  # logs only under SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
+            self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()

@@ -312,6 +312,7 @@ def test_calibration_survives_a_grow_oom_and_reports_the_slots_it_got(monkeypatc
     monkeypatch.setattr(hc, "settle", lambda c, d: hc.replace(c, free_final=2420 * M, reserved_final=1000 * M))
     monkeypatch.setattr(hde, "dummy_extend_forward", lambda runner, tokens: None)
     monkeypatch.setattr(hde, "forget_graph_path_state", lambda model: 0)
+    monkeypatch.setattr(hc, "log_grow_bound", lambda *a: None)  # reads real streamers
     monkeypatch.setattr(
         runtime_context, "get_schedule", lambda: SimpleNamespace(max_total_tokens=None, chunked_prefill_size=4096)
     )

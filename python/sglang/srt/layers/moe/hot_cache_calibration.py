@@ -244,6 +244,71 @@ class Calibration:
         return out
 
 
+def proportional_upper(capacity: Mapping[int, int], limit: Mapping[int, int], extra_rows: int) -> Dict[int, int]:
+    """Each layer's grow bound: ``extra_rows`` spread over the layers in proportion to each one's headroom below its
+    limit (rounded up, never past the limit), so a layer with a higher limit is not starved."""
+    head = {layer: max(0, limit[layer] - c) for layer, c in capacity.items()}
+    total = sum(head.values())
+    if total == 0 or extra_rows <= 0:
+        return dict(capacity)
+    return {layer: c + min(head[layer], -(-extra_rows * head[layer] // total)) for layer, c in capacity.items()}
+
+
+def bounded_upper_capacities(
+    capacity: Mapping[int, int], limit: Mapping[int, int], *, slot_bytes: int
+) -> Dict[int, int]:
+    """The rows each layer's hot cache reserves for a startup grow. A grow can only spend memory the KV pool and the
+    weights leave, which is at most the non-static region, total device memory x (1 - --mem-fraction-static); so
+    the bound is that many slots, spread by ``proportional_upper``. The pinned-tier limit alone (calib3: ~6,200 rows
+    against 1,035 slots) sized the small per-row tensors for slots no launch could back and cost the KV pool ~230 MB."""
+    from sglang.srt.runtime_context import get_schedule
+
+    total = torch.cuda.mem_get_info()[1]
+    fraction = float(get_schedule().mem_fraction_static)
+    budget = int(total * (1 - fraction))
+    upper = proportional_upper(capacity, limit, budget // slot_bytes)
+    extra = sum(upper.values()) - sum(capacity.values())
+    logger.info(
+        "hot cache grow bound: %d slots over %d layers (non-static memory %.1f MiB = %.1f MiB x (1 - %.4f), "
+        "%.2f MiB a slot; the pinned-tier limits allow %d)",
+        extra,
+        len(upper),
+        budget / MIB,
+        total / MIB,
+        fraction,
+        slot_bytes / MIB,
+        sum(max(0, limit[l] - c) for l, c in capacity.items()),
+    )
+    return upper
+
+
+@contextlib.contextmanager
+def startup_memory_probe(stage: str) -> Iterator[None]:
+    """Under SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP, log free device memory and torch allocated/reserved across a
+    startup stage (the draft load), so a change there is attributed to torch or to memory outside it."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get() or not torch.cuda.is_available():
+        yield
+        return
+
+    def state():
+        torch.cuda.synchronize()
+        return torch.cuda.mem_get_info()[0], torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+
+    free0, alloc0, res0 = state()
+    yield
+    free1, alloc1, res1 = state()
+    logger.info(
+        "startup memory %s: free -%.1f MiB, torch allocated +%.1f MiB, reserved +%.1f MiB, outside torch +%.1f MiB",
+        stage,
+        (free0 - free1) / MIB,
+        (alloc1 - alloc0) / MIB,
+        (res1 - res0) / MIB,
+        ((free0 - free1) - (res1 - res0)) / MIB,
+    )
+
+
 def plan_grow(
     capacity: Mapping[int, int], budget: int, upper: Mapping[int, int], cost: Callable[[int, int], int]
 ) -> Dict[int, int]:
@@ -427,6 +492,7 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
         keep = plan_grow(
             capacity, calibration.room, upper, lambda layer, rows: manager.caches[layer].vmm_backing.bytes_to_back(rows)
         )
+        log_grow_bound(manager, capacity, upper, keep, calibration.room)
     else:
         keep = plan_keep(capacity, calibration.slots_to_retire, floor)
     # Logged before the resize, so a failure there still leaves the measurements in the log.
@@ -456,6 +522,37 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
     result = CalibrationResult(calibration, keep, retired)
     watch_first_full_prefill(model_runner, result)
     return result
+
+
+def bound_binds(wanted: Mapping[int, int], upper: Mapping[int, int]) -> Dict[int, tuple]:
+    """Layers whose unbounded plan wanted more than the reserved rows: layer -> (wanted, bound)."""
+    return {layer: (w, upper[layer]) for layer, w in wanted.items() if w > upper[layer]}
+
+
+def log_grow_bound(manager, capacity, upper, keep, room) -> None:
+    """What each layer would have grown to under its pinned-tier limit alone (slot-priced), beside the bound it got,
+    and the torch memory the reserved rows of the small per-row tensors hold."""
+    from sglang.srt.layers.moe.expert_format import inclusive_hot_slot_limit
+
+    tier = {
+        layer: inclusive_hot_slot_limit(c.streamer) or c.streamer.num_experts for layer, c in manager.caches.items()
+    }
+    wanted = plan_grow(
+        capacity, room, tier, lambda layer, rows: max(0, rows - capacity[layer]) * manager.caches[layer].bytes_per_expert
+    )
+    small = 0
+    for c in manager.caches.values():
+        vmm = getattr(c.vmm_backing, "_reservations", {})
+        small += sum(t.numel() * t.element_size() for name, t in c.tensors.items() if name not in vmm)
+    logger.info(
+        "hot cache grow bound: plan +%d slots, unbounded +%d; the bound binds on %d layers %s; "
+        "small per-row tensors on torch %.1f MiB",
+        sum(keep.values()) - sum(capacity.values()),
+        sum(wanted.values()) - sum(capacity.values()),
+        len(bound_binds(wanted, upper)),
+        bound_binds(wanted, upper),
+        small / MIB,
+    )
 
 
 def compare_with_real(

@@ -1519,6 +1519,20 @@ class ExpertHotCacheManager:
         manager._trace_drain_thread: threading.Thread | None = None
         if manager.metrics_path is not None:
             atexit.register(manager.close_telemetry)
+        # The most each layer could hold: its inclusive pinned tier's limit, else every expert. Used only under
+        # SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP, where calibration may grow toward it, bounded there by the memory
+        # a grow could ever have (the small per-row tensors are allocated for every reserved row).
+        upper_capacity = {
+            layer_id: slot_limits[layer_id] or streamers[layer_id].num_experts for layer_id in selected
+        }
+        if envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get() and torch.cuda.is_available():
+            from sglang.srt.layers.moe.hot_cache_calibration import bounded_upper_capacities
+
+            upper_capacity = bounded_upper_capacities(
+                {layer_id: len(expert_ids) for layer_id, expert_ids in selected.items()},
+                upper_capacity,
+                slot_bytes=max(streamer.bytes_per_expert for streamer in streamers.values()),
+            )
         for layer_id, expert_ids in selected.items():
             if expert_ids or gather_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -1527,9 +1541,7 @@ class ExpertHotCacheManager:
                     layer_streamer,
                     len(expert_ids),
                     scratch_rows[layer_id],
-                    # The most this layer could hold (its inclusive pinned tier's limit, else every expert); used
-                    # only under SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP, where calibration may grow toward it.
-                    upper_capacity=slot_limits[layer_id] or layer_streamer.num_experts,
+                    upper_capacity=upper_capacity[layer_id],
                 )
                 cache._owner_manager = manager
                 manager.caches[layer_id] = cache
