@@ -241,6 +241,48 @@ def test_an_unlisted_capacity_attribute_is_refused():
     assert manager.caches[3].capacity == C and int(updater.capacity[0]) == C  # refused before any change
 
 
+def _real_spec_scores(updater, service):
+    """The service's real ``_bind_spec_scores`` (and ``spec_score_rows``) on the fake world: row 0 (layer 3) scores
+    the prefetch for row 1 (layer 7), as the L+2 scorer does; row 1 has no target."""
+    import types
+
+    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+
+    gate = SimpleNamespace(weight=torch.zeros(E, 4), bias=torch.zeros(E))
+    service._spec_gpu = SimpleNamespace(picked=SimpleNamespace(targets=torch.tensor([[1, 0], [-1, 0]]), gates=[gate]))
+    service._spec_hot = {0: (updater.slot_to_expert[0], C), 1: (updater.slot_to_expert[1], C)}
+    service._bind_spec_scores = types.MethodType(Exl3RamMissService._bind_spec_scores, service)
+    service._bind_spec_scores()
+    assert service._row_backends[0].spec_score.target == 1 and service._row_backends[1].spec_score is None
+
+
+def test_a_rows_spec_score_carries_its_target_layers_capacity_through_a_grow():
+    """calib5: layer 25 grew to 27 while its L+2 target stayed at 26, and the census compared the score's 26 with
+    layer 25's own 27. The score is right; the check must read the target's capacity."""
+    manager, updater, service, *_ = _world(upper=26)
+    _real_spec_scores(updater, service)
+    hr.set_hot_capacity(manager, {3: 24}, service=service)  # the source layer grows, its target does not
+    assert service._row_backends[0].spec_score.hot_capacity == C
+    hr.set_hot_capacity(manager, {7: 25}, service=service)  # the target grows: the source's score follows
+    assert service._row_backends[0].spec_score.hot_capacity == 25
+
+
+def test_a_spec_score_left_stale_by_a_grow_is_refused_in_strict_mode_and_rolled_back_otherwise():
+    manager, updater, service, *_ = _world(upper=26)
+    _real_spec_scores(updater, service)
+    before = _all_holders(manager, updater, service)
+    service._bind_spec_scores = lambda: None  # the rebind is lost: layer 3's score keeps layer 7's old 20
+    with pytest.raises(hr.RetireRefused, match="spec_score.hot_capacity is 20, not its target layer 7's 25"):
+        hr.set_hot_capacity(manager, {7: 25}, service=service)
+    manager, updater, service, *_ = _world(upper=26)
+    _real_spec_scores(updater, service)
+    service._bind_spec_scores = lambda: None
+    result = hr.set_hot_capacity(manager, {3: 24, 7: 25}, service=service, strict=False)
+    assert result.kept == {3: C, 7: C} and result.short == {3: 4, 7: 5} and result.short_reason.startswith("rolled")
+    assert _all_holders(manager, updater, service) == before
+    assert all(manager.caches[layer].vmm_backing.backed_rows == C for layer in (3, 7))
+
+
 def _grow_all(manager, service, **kwargs):
     return hr.set_hot_capacity(manager, {3: 24, 7: 24}, service=service, **kwargs)
 

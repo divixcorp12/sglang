@@ -510,6 +510,7 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
             keep,
             free_memory=lambda: torch.cuda.mem_get_info(device)[0],
             keep_free=calibration.keep_free,
+            strict=False,  # a holder mismatch rolls the resize back; the launch goes on at the configured size
         )
         keep = dict(retired.kept)
     logger.info(

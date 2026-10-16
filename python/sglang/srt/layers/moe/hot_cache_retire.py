@@ -108,6 +108,7 @@ def set_hot_capacity(
     service: Any = "auto",
     free_memory: Optional[Callable[[], int]] = None,
     keep_free: int = 0,
+    strict: bool = True,
 ) -> RetireResult:
     """Set each listed layer's hot capacity to ``keep[layer]`` slots, lower or higher. Lowering evicts the retired
     slots and then releases their memory; raising maps the memory for the new slots first and then adds them FREE
@@ -117,7 +118,12 @@ def set_hot_capacity(
     Growing never fails the call. Layer by layer, with ``free_memory`` given, a layer grows only while
     ``free_memory()`` less its mapping cost stays at or above ``keep_free``; a device out-of-memory while mapping
     rolls that layer's mapping back. Either way growing stops there: the layers already grown keep their slots, the
-    rest keep their capacity, every holder agrees, and ``RetireResult.short`` records what was not added."""
+    rest keep their capacity, every holder agrees, and ``RetireResult.short`` records what was not added.
+
+    After the resize every holder is checked against the kept capacities. ``strict`` (the default) raises on a
+    disagreement; otherwise (the startup calibration) every listed layer is set back to its capacity before the
+    call, the error is logged, and the result reports the whole change as short, so the launch goes on at the
+    configured size."""
     service = _service() if service == "auto" else service
     check_retire_allowed(manager, service)
     updater = manager.gpu_residency
@@ -132,6 +138,7 @@ def set_hot_capacity(
             raise RetireRefused(f"layer {layer_id}: keep {k} below twice the graph-gather victim lanes ({floor})")
         if k > updater.max_capacity:
             raise RetireRefused(f"layer {layer_id}: keep {k} beyond the residency bank's {updater.max_capacity} slots")
+    before = {layer_id: manager.caches[layer_id].capacity for layer_id in keep}
     kept, retired, evicted, freed = {}, {}, {}, 0
     short, short_reason = {}, ""
     for layer_id, k in keep.items():
@@ -168,7 +175,25 @@ def set_hot_capacity(
     for layer_id, (k, c) in retired.items():
         if k < c:
             freed += manager.caches[layer_id].vmm_backing.release_tail(k)
-    _check_capacity_holders(manager, updater, service, kept)
+    try:
+        _check_capacity_holders(manager, updater, service, kept)
+    except RetireRefused as error:
+        if strict:
+            raise
+        logger.error(
+            "hot cache capacity: the holders disagree after the resize (%s); setting every layer back to its "
+            "capacity before it and starting at the configured size",
+            error,
+        )
+        back = set_hot_capacity(manager, before, service=service)
+        return RetireResult(
+            back.kept,
+            {layer_id: (c, c) for layer_id, c in back.kept.items()},
+            evicted,
+            freed + back.freed_bytes,
+            {layer_id: keep[layer_id] - c for layer_id, c in before.items() if keep[layer_id] != c},
+            f"rolled back: {error}",
+        )
     logger.info(
         "hot cache capacity: %d -> %d slots over %d layers (%d retired, %d added), %d experts evicted, %+.1f MiB",
         sum(c for _, c in retired.values()),
@@ -301,6 +326,24 @@ def _check_capacity_holders(manager, updater, service, kept) -> None:
             raise RetireRefused(f"layer {layer_id}: updater capacity/slot_valid disagree with {k}")
         if owners["row_planner"] is not None and owners["row_planner"].scratch_base != k:
             raise RetireRefused(f"layer {layer_id}: row_planner.scratch_base is not {k}")
-        spec = getattr(owners.get("row_backend"), "spec_score", None)
-        if spec is not None and int(spec.hot_capacity) != k:
-            raise RetireRefused(f"layer {layer_id}: spec_score.hot_capacity is {spec.hot_capacity}, not {k}")
+    # A row's SpecScoreRow scores the prefetch for its *target* row (the L+2 scorer), so it carries that row's hot
+    # capacity, not its own layer's; and a resized target changes the score of a row that was not resized itself.
+    for layer_id in manager.caches if service is not None else ():
+        backend = service._row_backends.get(service.row_of(layer_id))
+        spec = getattr(backend, "spec_score", None)
+        if spec is not None:
+            target = _layer_of_row(manager, service, spec.target)
+            want = manager.caches[target].capacity if target is not None else None
+            if want is not None and int(spec.hot_capacity) != int(want):
+                raise RetireRefused(
+                    f"layer {layer_id}: spec_score.hot_capacity is {spec.hot_capacity}, not its target layer "
+                    f"{target}'s {want}"
+                )
+
+
+def _layer_of_row(manager, service, row: int) -> Optional[int]:
+    """The hot-cached layer whose RAM-miss service row is ``row``."""
+    for layer_id in manager.caches:
+        if service.row_of(layer_id) == row:
+            return layer_id
+    return None
