@@ -99,15 +99,6 @@ def test_drop_capture_metadata_leaves_other_backends_alone():
     assert tc.drop_capture_metadata(backend) == 3
 
 
-def test_tensor_bytes_follows_nested_attributes_and_counts_a_storage_once():
-    shared = torch.zeros(256, dtype=torch.float32)  # 1 KiB
-    inner = SimpleNamespace(table=shared, view=shared[:10], extra=[torch.zeros(128, dtype=torch.float16)])
-    sampler = SimpleNamespace(head=SimpleNamespace(state={"inner": inner}), again=shared)
-    assert tc.tensor_bytes(sampler, cuda_only=False) == 1024 + 256
-    assert tc.tensor_bytes(sampler) == 0  # CPU tensors are not device memory
-    assert tc.tensor_bytes(sampler, depth=1, cuda_only=False) == 1024  # only the top-level tensor
-
-
 def test_forward_hooks_skip_the_trial(world, monkeypatch):
     from sglang.srt import runtime_context
 

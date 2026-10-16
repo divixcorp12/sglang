@@ -76,35 +76,6 @@ def drop_capture_metadata(attn_backend) -> int:
     return dropped
 
 
-def tensor_bytes(obj, depth: int = 5, cuda_only: bool = True) -> int:
-    """Bytes of the (CUDA) tensors reachable from an object through its attributes, lists, tuples and dicts, up to
-    ``depth`` levels; each storage counted once."""
-    seen_objects, storages = set(), {}
-
-    def walk(value, level):
-        if isinstance(value, torch.Tensor):
-            if value.is_cuda or not cuda_only:
-                storage = value.untyped_storage()
-                storages[storage.data_ptr()] = storage.nbytes()
-            return
-        if level >= depth or id(value) in seen_objects:
-            return
-        seen_objects.add(id(value))
-        if isinstance(value, dict):
-            children = value.values()
-        elif isinstance(value, (list, tuple)):
-            children = value
-        elif hasattr(value, "__dict__") and not isinstance(value, type):
-            children = vars(value).values()
-        else:
-            return
-        for child in children:
-            walk(child, level + 1)
-
-    walk(obj, 0)
-    return sum(storages.values())
-
-
 def _state(device):
     torch.cuda.synchronize(device)
     return torch.cuda.mem_get_info(device)[0], torch.cuda.memory_reserved(device)
@@ -146,10 +117,7 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
             draft_worker.init_cuda_graphs()
             sampler = getattr(draft_worker, "_draft_sampler", None)
             # Built here now, not at the real capture (which reuses it), so it is in the free memory the grow sees.
-            logger.info(
-                "hot cache trial capture: DSpark draft sampler %s",
-                "not built" if sampler is None else f"built, {tensor_bytes(sampler) / MIB:.1f} MiB of tensors",
-            )
+            logger.info("hot cache trial capture: DSpark draft sampler %s", "not built" if sampler is None else "built")
             draft_runners = tuple(draft_worker._draft_model_runners())
             for runner in draft_runners:
                 runners += [runner.decode_cuda_graph_runner, runner.prefill_cuda_graph_runner]
