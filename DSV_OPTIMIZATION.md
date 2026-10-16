@@ -76,6 +76,19 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
     CPU tests 124 passed. GPU parity (`test/manual/dsv41/test_exl3_lease_kernels_cuda.py`, at 7e77a55ba2): 52
     passed; the mutant with the device tiebreak disabled fails 5 of 10 split-model tests, and reverting restores green.
     No serving run yet.
+  - **Arm D** (`splitmodel-stream-mem-tiebreak`, worktree at `f9cf8b5cd0`, which also carries the draft
+    drop-cache fix), vs arm A:
+
+    | run | ms/token | median verify | mean verify | wait | stream | VRAM hit (layers 2+) |
+    |---|---|---|---|---|---|---|
+    | A | 65.9 | 254.5 | 272.5 | 139.9 | 42.9 | 0.512 |
+    | D | 75.4 | 268.9 | 320.2 | 145.7 | 50.5 | 0.515 |
+
+    - The VRAM hit rate didn't move.
+    - **Suspicious:** rule counters fell far more than a reorder allows. to_cpu went 2440/2158 -> 1856/1655 and
+      to_copy 3820/3645 -> 3187/3195, on similar record counts, while stream rose 7.6 ms.
+    - Being checked offline before any rerun: does the serving path's cost-word packing (5N+6 with the flags word)
+      match what the device reads?
 
 ### 3.3 Startup calibration of the split-model constants — branch `split-model-calib` (`7171570959`), NOT merged
 
@@ -173,8 +186,16 @@ pools. Committed as `analysis/dsv41-drive/dspark/prelaunch_evict.py`, with `mems
 `memsum.py`, in `f5fb51875b` on `split-model`. The node-1 floor = HiCache pools + "rest" + margin. "Rest" comes from
 the arm's previous memsample (`--previous`) or falls back to arm A's 51.24 GiB, and the source used is logged.
 Eviction drops the cache of shared model files for everyone, so it runs only when no other server is up. The sampler now records /proc/diskstats. The model shards are on sdb3 (SATA root volume), which fits arm A's
-first-shard stall. Open: ~280 GiB read per NVMe mirror partition during C's decode. Not yet known whether that is
-the server's own reads or an overlapping reader.
+first-shard stall.
+
+**Cold target load:** the target's ~9 GiB of non-expert weights come from sdb3 (SATA) at ~55 MB/s when not
+cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now left out of the eviction list.
+
+**Read amplification (open, agent `read-amp`):** on a clean, idle-box run (arm D), the three NVMe mirror
+partitions read ~895 GiB (831 GiB in 262 s of decode, ~3.2 GB/s). The server's own counters account for 209 GiB
+(rows_read 10,858 + spec_landed 6,008, x 13.3 MB), so the disks read ~4.3x more. Even a full row read from all
+three mirrors would leave ~1.4x unexplained. Arm C showed the same. The agent is breaking the bytes down by phase,
+device and consumer before proposing a fix.
 
 ### 3.7 Prefill VRAM spike / hot-cache capacity — agent `prefill-merge`, branch `prefill-merge-chunk` (not pushed yet)
 
