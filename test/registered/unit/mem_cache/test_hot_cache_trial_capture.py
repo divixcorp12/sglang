@@ -108,6 +108,29 @@ def test_residue_blocks_are_charged_to_the_holder_whose_tensor_starts_inside_the
                     "unattributed": 64}
 
 
+def test_holder_of_folds_layer_indices_and_drops_module_plumbing():
+    path = "model._modules['model']._modules['layers']._modules['12']._modules['self_attn'].indexer_ws"
+    assert tc.holder_of(path) == "model['model']['layers'][*]['self_attn'].indexer_ws"
+    assert tc.holder_of("draft0.attn_backend.bufs[3]") == "draft0.attn_backend.bufs[*]"
+
+
+def _trial(free_drop, persistent, residue, nontorch=0):
+    return tc.TrialCapture(free_drop * M, (free_drop - nontorch) * M, persistent * M, residue * M, 1.0)
+
+
+def test_the_capture_estimate_is_the_warm_trial_never_below_the_cold_one_less_its_residue():
+    """calib10's cold trial: 212 drop, 148 MiB residue the real capture reuses (cold less residue 64); a warm trial
+    of ~100 then measures the real capture directly."""
+    from sglang.srt.layers.moe import hot_cache_calibration as hc
+
+    cold, warm = _trial(212, 148, 148), _trial(100, 2, 2)
+    assert hc.capture_estimate_of([cold, warm], 0) == 100 * M
+    assert hc.capture_estimate_of([cold, _trial(40, 0, 0)], 0) == 64 * M  # the warm one reads low: keep 64
+    assert hc.capture_estimate_of([cold, warm], 150 * M) == 150 * M  # never below the eager estimate
+    assert hc.capture_estimate_of([cold], 0) == 212 * M  # one trial: its own estimate
+    assert hc.capture_estimate_of([], 30 * M) == 30 * M
+
+
 def test_live_blocks_reads_only_allocated_blocks(monkeypatch):
     snapshot = [{"blocks": [{"address": 10, "size": 4, "state": "active_allocated"},
                             {"address": 14, "size": 8, "state": "inactive"}]}, {"blocks": []}]

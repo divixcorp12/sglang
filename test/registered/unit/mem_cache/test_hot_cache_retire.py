@@ -354,7 +354,7 @@ def _calibrate_on_fakes(monkeypatch, manager, service, *, strict=True, calibrate
     monkeypatch.setattr(hde, "dummy_extend_forward", lambda runner, tokens: None)
     monkeypatch.setattr(hde, "forget_graph_path_state", lambda model: 0)
     monkeypatch.setattr(hc, "log_grow_bound", lambda *a: None)  # reads real streamers
-    monkeypatch.setattr(tct, "trial_capture", lambda *a: None)  # its own tests cover it
+    monkeypatch.setattr(tct, "trial_capture", lambda *a, **k: None)  # its own tests cover it
     monkeypatch.setattr(tct, "reset_trial_routes", lambda manager: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a: None)
@@ -447,7 +447,7 @@ def test_calibration_survives_a_grow_oom_and_reports_the_slots_it_got(monkeypatc
     monkeypatch.setattr(hc, "log_grow_bound", lambda *a: None)  # reads real streamers
     from sglang.srt.layers.moe import hot_cache_trial_capture as tct
 
-    monkeypatch.setattr(tct, "trial_capture", lambda *a: None)  # its own tests cover it
+    monkeypatch.setattr(tct, "trial_capture", lambda *a, **k: None)  # its own tests cover it
     monkeypatch.setattr(
         runtime_context, "get_schedule", lambda: SimpleNamespace(max_total_tokens=None, chunked_prefill_size=4096)
     )

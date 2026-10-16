@@ -542,6 +542,30 @@ def _recover_from_failed_calibration(model_runner, manager, stage, error) -> Non
         ) from error
 
 
+def capture_estimate_of(trials, eager: int) -> int:
+    """The capture estimate from the trial captures: the warm trial's cost, never below the cold one's less the
+    persistent state it left (which the real capture reuses), nor below the eager verify estimate. With one trial
+    (the warm one skipped), that trial's own estimate."""
+    trials = [t for t in trials if t is not None]
+    if not trials:
+        return eager
+    if len(trials) == 1:
+        return max(trials[0].estimate, eager)
+    cold, warm = trials[0], trials[-1]
+    cold_less_residue = max(0, cold.estimate - cold.residue_torch)
+    estimate = max(warm.estimate, cold_less_residue, eager)
+    logger.info(
+        "hot cache capture estimate %.1f MiB: warm trial %.1f, cold %.1f less its residue %.1f = %.1f, eager %.1f",
+        estimate / MIB,
+        warm.estimate / MIB,
+        cold.estimate / MIB,
+        cold.residue_torch / MIB,
+        cold_less_residue / MIB,
+        eager / MIB,
+    )
+    return estimate
+
+
 def _calibrate_hot_cache(model_runner, draft_worker, manager, stage) -> CalibrationResult:
     """maybe_calibrate_hot_cache's body; ``stage['name']`` follows its progress for the failure handling there."""
     from sglang.srt.layers.moe.hot_cache_dummy_extend import (
@@ -556,22 +580,29 @@ def _calibrate_hot_cache(model_runner, draft_worker, manager, stage) -> Calibrat
     tokens = int(get_schedule().chunked_prefill_size or get_schedule().max_prefill_tokens)
     cache = next(iter(manager.caches.values()))
     device = cache.device
-    # The exact capture cost, before anything is sized: capture for real into a private pool, then tear it down.
+    # The exact capture cost, before anything is sized: capture for real into a private pool, then tear it down; twice.
+    # The cold first trial creates the persistent capture state (per-layer state built on the first graph-path forward,
+    # the shared input buffers: calib10's 135 MiB), which the real capture would reuse; the warm second one then costs
+    # what the real capture will. Free memory is measured after both, so that state is counted once, in F.
     stage.update(name="trial capture", trial_ran=True)
-    trial = trial_capture(model_runner, draft_worker)
-    stage["name"] = "calibration prefills"
-    if trial is not None:
+    trials = []
+    for label in ("cold", "warm"):
+        trials.append(trial_capture(model_runner, draft_worker, label=label))
+        if trials[-1] is None:
+            break
         reset_trial_routes(manager)
         forget_graph_path_state(model_runner.model)
-        logger.info("hot cache trial capture: %s", trial.summary())
+        logger.info("hot cache trial capture (%s): %s", label, trials[-1].summary())
+    trial = trials[-1] if trials and trials[-1] is not None else None
+    stage["name"] = "calibration prefills"
     run = dummy_extend_forward(model_runner, tokens)
     verify = dummy_verify_forward(model_runner) if model_runner.spec_algorithm.is_speculative() else None
     calibration = calibrate(
         run, tokens=tokens, slot_bytes=cache.bytes_per_expert, device=device, run_verify=verify
     )
     forget_graph_path_state(model_runner.model)
-    if trial is not None:  # the larger of the measured trial and the eager estimate
-        calibration = replace(calibration, capture_estimate=max(trial.estimate, calibration.capture_estimate))
+    if trial is not None:
+        calibration = replace(calibration, capture_estimate=capture_estimate_of(trials, calibration.capture_estimate))
     calibration = settle(calibration, device)
     # The real capture expects the hot cache as startup left it: the residency updater still disabled and every
     # capacity holder agreeing. Otherwise nothing is resized and the launch goes on at the configured size.

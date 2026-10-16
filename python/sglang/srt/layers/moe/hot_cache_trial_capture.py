@@ -22,6 +22,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -87,17 +88,18 @@ def live_blocks() -> Dict[int, int]:
     return blocks
 
 
-def tensor_paths(roots: Dict[str, object], depth: int = 3) -> Dict[int, str]:
+def tensor_paths(roots: Dict[str, object], depth: int = 3, enter_modules: bool = False) -> Dict[int, str]:
     """data_ptr -> the first attribute path reaching a CUDA tensor from ``roots`` (attributes, dicts, lists and
-    tuples, ``depth`` levels; modules are not entered, so model weights are not walked)."""
+    tuples, ``depth`` levels; modules entered only with ``enter_modules``, which walks the weights too)."""
     found, seen = {}, set()
+    skipped = (type, str, bytes) if enter_modules else (torch.nn.Module, type, str, bytes)
 
     def walk(value, path, level):
         if isinstance(value, torch.Tensor):
             if value.is_cuda:
                 found.setdefault(value.untyped_storage().data_ptr(), path)
             return
-        if level >= depth or id(value) in seen or isinstance(value, (torch.nn.Module, type, str, bytes)):
+        if level >= depth or id(value) in seen or isinstance(value, skipped):
             return
         seen.add(id(value))
         if isinstance(value, dict):
@@ -116,15 +118,21 @@ def tensor_paths(roots: Dict[str, object], depth: int = 3) -> Dict[int, str]:
     return found
 
 
+def holder_of(path: str) -> str:
+    """One line per buffer family: module plumbing dropped, layer indices folded to [*]."""
+    path = re.sub(r"\._(modules|parameters|buffers)", "", path)
+    return re.sub(r"\['?\d+'?\]", "[*]", path)
+
+
 def attribute_blocks(new_blocks: Dict[int, int], paths: Dict[int, str]) -> Dict[str, int]:
-    """Bytes of each new block, charged to the holder whose tensor starts inside it (the top two path components,
-    so one buffer family is one line), or to 'unattributed'."""
+    """Bytes of each new block, charged to the holder whose tensor starts inside it (``holder_of``), or to
+    'unattributed'."""
     starts = sorted(paths)
     charged: Dict[str, int] = {}
     for address, size in new_blocks.items():
         i = bisect.bisect_left(starts, address)
         inside = i < len(starts) and starts[i] < address + size
-        holder = ".".join(paths[starts[i]].split(".")[:3]) if inside else "unattributed"
+        holder = holder_of(paths[starts[i]]) if inside else "unattributed"
         charged[holder] = charged.get(holder, 0) + size
     return dict(sorted(charged.items(), key=lambda kv: -kv[1]))
 
@@ -141,9 +149,9 @@ def _release(runner) -> None:
         cleanup()
 
 
-def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
+def trial_capture(model_runner, draft_worker=None, label: str = "") -> Optional[TrialCapture]:
     """Capture the target's graphs (and the draft worker's, when given) into a private pool, measure, tear down.
-    None when it cannot run safely (observability forward hooks configured)."""
+    None when it cannot run safely (observability forward hooks configured). ``label`` names it in the log."""
     from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import capture_cuda_graphs
     from sglang.srt.model_executor.runner_utils.pool import (
         get_global_graph_memory_pool,
@@ -171,7 +179,9 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
             draft_worker.init_cuda_graphs()
             sampler = getattr(draft_worker, "_draft_sampler", None)
             # Built here now, not at the real capture (which reuses it), so it is in the free memory the grow sees.
-            logger.info("hot cache trial capture: DSpark draft sampler %s", "not built" if sampler is None else "built")
+            logger.info(
+                "hot cache trial capture (%s): DSpark draft sampler %s", label, "not built" if sampler is None else "built"
+            )
             draft_runners = tuple(draft_worker._draft_model_runners())
             for runner in draft_runners:
                 runners += [runner.decode_cuda_graph_runner, runner.prefill_cuda_graph_runner]
@@ -198,9 +208,16 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
         roots.update({f"draft{i}": runner for i, runner in enumerate(draft_runners)})
         if draft_worker is not None:
             roots["draft_worker"] = draft_worker
-        held = attribute_blocks(new_blocks, tensor_paths(roots))
+        paths = tensor_paths(roots)
+        # Then the models' modules, deep: per-layer state built on the first graph-path forward or capture.
+        models = {"model": model_runner.model}
+        models.update({f"draft{i}.model": runner.model for i, runner in enumerate(draft_runners)})
+        for ptr, path in tensor_paths(models, depth=12, enter_modules=True).items():
+            paths.setdefault(ptr, path)
+        held = attribute_blocks(new_blocks, paths)
         logger.info(
-            "hot cache trial capture residue: %d blocks, %.1f MiB allocated after teardown; by holder (MiB): %s",
+            "hot cache trial capture (%s) residue: %d blocks, %.1f MiB allocated after teardown; by holder (MiB): %s",
+            label,
             len(new_blocks),
             sum(new_blocks.values()) / MIB,
             {k: round(v / MIB, 1) for k, v in list(held.items())[:12]},
