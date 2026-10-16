@@ -149,9 +149,12 @@ def install(worker, log: Optional[PrefillPeakLog] = None) -> PrefillPeakLog:
         # Inside attention: the projections, the compressor and indexer, and the FlashMLA core (attn_mqa).
         for name in ATTENTION_PARTS:
             _wrap_attr(log, getattr(layer.self_attn, name, None), "forward", f"L{i}.attn.{name}")
-        # The decoder layer's mHC stream mixing, which holds the 4-stream hidden and its residual.
-        for name in ("hc_pre", "hc_post"):
-            _wrap_attr(log, layer, name, f"L{i}.{name}")
+        # The decoder layer's mHC stream mixing, which holds the 4-stream hidden and its residual. The DSV4 layer
+        # loop enters a layer through forward_hc_pre_from_prev (not forward), which mixes with _hc_combine and
+        # _hc_post_with_combine.
+        _wrap_attr(log, layer, "forward_hc_pre_from_prev", f"L{i}")
+        for name in ("hc_pre", "hc_post", "_hc_combine", "_hc_post_with_combine"):
+            _wrap_attr(log, layer, name, f"L{i}.{name.lstrip('_')}")
         if getattr(layer, "mlp", None) is not None:
             _wrap_attr(log, layer.mlp, "forward", f"L{i}.moe")
     _wrap_attr(log, getattr(target, "logits_processor", None), "forward", "target.logits")
