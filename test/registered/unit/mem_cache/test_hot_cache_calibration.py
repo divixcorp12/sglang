@@ -6,7 +6,7 @@
 * The guards: inside calibration_context, ExpertStreamer.record_routes does not reach the residency policy and
   EngramFileTable.lookup returns zero rows without touching its store; outside it both behave as before.
 * The off path: maybe_calibrate_hot_cache returns None without reading the runner; require_hot_cache_headroom does
-  nothing without a calibration and raises when free memory is below the margin.
+  nothing without a calibration and warns (never refuses) when the projection is below the margin.
 """
 
 from types import SimpleNamespace
@@ -85,9 +85,25 @@ def test_slot_delta_grows_by_the_room_above_required_and_trims_below_it():
     assert tight.slot_delta == -2
 
 
-def test_calibration_shapes_follow_the_warmup_largest_then_repeat_the_chunk():
-    assert hc.calibration_shapes(4096) == (2048, 2049, 4096, 4096)
-    assert hc.calibration_shapes(2) == (2, 2)
+def test_calibration_shapes_replay_the_warmup_then_repeat_the_chunk():
+    from sglang.srt.entrypoints.warmup import DSV41_PREFILL_WARMUP_SIZES
+
+    assert hc.calibration_shapes(4096) == DSV41_PREFILL_WARMUP_SIZES + (4096, 4096)
+    assert hc.calibration_shapes(2048, (1, 5, 2048, 2049, 4096)) == (1, 5, 2048, 2048, 2048)  # sizes past the chunk
+    assert hc.calibration_shapes(4096).count(4096) == 1 + hc.REPEAT_CHUNK_RUNS
+
+
+def test_the_margin_is_the_worst_chunk_gap_plus_the_spread_of_the_chunk_peaks():
+    """calib7's shape: the chunk's reserve peak moved between repeats; the spread is measured noise in the margin."""
+    small = hc.RunPeak(13500 * M, 13300 * M, 13500 * M, 0, tokens=2048)  # its gap (200) is not a chunk run's
+    chunk = (
+        hc.RunPeak(14374 * M, 14100 * M, 14374 * M, 0, tokens=4096),  # gap 274
+        hc.RunPeak(14434 * M, 14100 * M, 14434 * M, 0, tokens=4096),  # gap 334
+        hc.RunPeak(14400 * M, 14100 * M, 14434 * M, 0, tokens=4096),  # gap 300
+    )
+    c = hc.Calibration(4096, 4000 * M, 12242 * M, (small,) + chunk, 13 * M)
+    assert c.margin == (334 + (14434 - 14374)) * M
+    assert c.peak_run is chunk[1]  # the regrow reads the highest chunk peak
 
 
 def test_the_highest_run_sets_lowest_free_and_the_last_repeat_the_margin():
@@ -244,14 +260,16 @@ def test_the_watch_measures_only_the_first_full_size_extend_then_removes_itself(
     assert calls == [16, 4096]
 
 
-def test_headroom_check_raises_below_the_margin(monkeypatch):
-    result = hc.CalibrationResult(_cal(), {0: 20})  # run-1 reserve peak 2500, margin 400
+def test_a_short_headroom_after_capture_warns_with_the_breakdown_and_does_not_refuse(monkeypatch, caplog):
+    result = hc.CalibrationResult(_cal(), {0: 20}, None, {"free_after_resize": 714 * M})  # reserve 2500, margin 400
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 2500 * M)  # reserve still held
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (500 * M, 32000 * M))
-    hc.require_hot_cache_headroom("after capture", result)  # 500 >= 400
+    assert hc.check_headroom("after capture", result)  # 500 >= 400
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (300 * M, 32000 * M))
-    with pytest.raises(hc.HotCacheHeadroomShort):
-        hc.require_hot_cache_headroom("after capture", result)
+    with caplog.at_level("WARNING"):
+        hc.require_hot_cache_headroom("after capture", result)  # short, but no raise
+    warning = [r for r in caplog.records if r.levelname == "WARNING"][-1].getMessage()
+    assert "SHORT by 100.0 MiB" in warning and "capture took 414.0 MiB" in warning and "margin 400.0" in warning
 
 
 def test_kv_pin_is_refused_when_the_pool_came_out_smaller():
@@ -268,8 +286,7 @@ def test_headroom_projection_charges_back_a_released_reserve(monkeypatch):
     assert hc.projected_free(result.calibration, free=2000 * M, reserved=2600 * M) == 2000 * M
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 1000 * M)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1800 * M, 32000 * M))
-    with pytest.raises(hc.HotCacheHeadroomShort):  # 1800 - 1500 = 300 < 400
-        hc.require_hot_cache_headroom("after capture", result)
+    assert not hc.check_headroom("after capture", result)  # 1800 - 1500 = 300 < 400
 
 
 def _verify(drop=400, reserve=50, persistent=0, alloc_peak=25, reserve_peak=100):

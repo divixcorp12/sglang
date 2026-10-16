@@ -1,7 +1,8 @@
 """Size the expert hot cache at startup from a measured prefill peak (SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP, step 3).
 
 After the KV pools and attention backends exist and before any CUDA graph is captured, the scheduler's hook calls
-``maybe_calibrate_hot_cache``. It runs the warm-up's largest dummy EXTEND prefills through the target model (allocator
+``maybe_calibrate_hot_cache``. It replays the HTTP warm-up's prefill sizes as dummy EXTEND prefills, then repeats the
+full chunk, through the target model (allocator
 cache emptied first) and one eager verify forward for the capture estimate, empties the allocator cache again and
 measures free memory (``settle``), then trims or grows the hot cache to fit (hot_cache_retire.set_hot_capacity). A
 grow is priced in mapped granules (``plan_grow``) and is guarded layer by layer against free memory; it stops short,
@@ -96,6 +97,7 @@ class RunPeak:
     # torch allocated when the run started: after earlier runs' persistent allocations (the MoE staging buffers the
     # first prefill makes), so peak less this is the run's own transient.
     allocated_in: Optional[int] = None
+    tokens: Optional[int] = None  # the run's prefill size
 
 
 @dataclass(frozen=True)
@@ -191,8 +193,20 @@ class Calibration:
         return self.lowest_free - self.required
 
     @property
+    def chunk_runs(self) -> tuple:
+        """The full-chunk runs (the warm-up's own and the repeats after it)."""
+        return tuple(r for r in self.runs if r.tokens == self.tokens)
+
+    @property
     def margin(self) -> int:
-        """The allocator's fragmentation at the highest run, or what the final repeat of the full chunk still grew."""
+        """With the full-chunk runs known: the worst allocator gap (reserve over live) among them, plus the spread of
+        their reserve peaks -- the measured run-to-run noise (calib6 and calib7's repeat grew +320 and +60).
+        Otherwise: the gap at the highest run, or what the final repeat of the full chunk still grew."""
+        chunk = self.chunk_runs
+        if len(chunk) >= 2:
+            gap = max(r.reserved_peak - r.allocated_peak for r in chunk)
+            spread = max(r.reserved_peak for r in chunk) - min(r.reserved_peak for r in chunk)
+            return max(0, gap) + spread
         peak, last, before_last = self.peak_run, self.runs[-1], self.runs[-2]
         return max(0, peak.reserved_peak - peak.allocated_peak, last.reserved_peak - before_last.reserved_after)
 
@@ -372,7 +386,7 @@ class CalibrationResult:
     extra: dict = field(default_factory=dict)
 
 
-def _measure(fn, device) -> RunPeak:
+def _measure(fn, device, tokens: Optional[int] = None) -> RunPeak:
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     allocated_in = torch.cuda.memory_allocated(device)
@@ -384,17 +398,22 @@ def _measure(fn, device) -> RunPeak:
         reserved_after=torch.cuda.memory_reserved(device),
         free_after=torch.cuda.mem_get_info(device)[0],
         allocated_in=allocated_in,
+        tokens=tokens,
     )
 
 
-def calibration_shapes(chunk: int) -> tuple:
-    """The prefill sizes the calibration runs, in order: the startup warm-up's largest (half a chunk, one token
-    more, the full chunk) so the reserve their mix strands is measured, then the full chunk again, whose further
-    growth is the repeat term of the margin."""
-    if chunk <= 2:
-        return (chunk, chunk)
-    half = chunk // 2
-    return (half, half + 1, chunk, chunk)
+# Full-chunk runs after the warm-up's own, so the margin sees the chunk's run-to-run reserve noise.
+REPEAT_CHUNK_RUNS = 2
+
+
+def calibration_shapes(chunk: int, warmup_sizes: Optional[tuple] = None) -> tuple:
+    """The prefill sizes the calibration runs, in order: the HTTP warm-up's own sequence (sizes below the chunk, then
+    the chunk), so the allocator reaches the reserve the real warm-up leaves; then ``REPEAT_CHUNK_RUNS`` more full
+    chunks. calib6/7 ran only the largest three and under-read the real 4096 reserve peak by 94-312 MiB."""
+    if warmup_sizes is None:
+        from sglang.srt.entrypoints.warmup import DSV41_PREFILL_WARMUP_SIZES as warmup_sizes
+    smaller = tuple(n for n in warmup_sizes if 0 < n < chunk)
+    return smaller + (chunk,) * (1 + REPEAT_CHUNK_RUNS)
 
 
 def calibrate(run_prefill, *, tokens: int, slot_bytes: int, device, run_verify=None) -> Calibration:
@@ -408,8 +427,7 @@ def calibrate(run_prefill, *, tokens: int, slot_bytes: int, device, run_verify=N
     capture_estimate = 0
     shapes = calibration_shapes(tokens)
     with calibration_context():
-        runs = tuple(_measure(lambda n=n: run_prefill(n), device) for n in shapes[:-1])
-        runs += (_measure(lambda: run_prefill(shapes[-1]), device),)
+        runs = tuple(_measure(lambda n=n: run_prefill(n), device, tokens=n) for n in shapes)
         verify = None
         if run_verify is not None:
             torch.cuda.synchronize(device)
@@ -518,14 +536,15 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
             strict=False,  # a holder mismatch rolls the resize back; the launch goes on at the configured size
         )
         keep = dict(retired.kept)
+    free_after_resize = torch.cuda.mem_get_info(device)[0]
     logger.info(
         "hot cache calibration: slots %d -> %d, free %.1f MiB after the resize (%.1f must stay free)",
         sum(capacity.values()),
         sum(keep.values()),
-        torch.cuda.mem_get_info(device)[0] / MIB,
+        free_after_resize / MIB,
         calibration.keep_free / MIB,
     )
-    result = CalibrationResult(calibration, keep, retired)
+    result = CalibrationResult(calibration, keep, retired, {"free_after_resize": free_after_resize})
     watch_first_full_prefill(model_runner, result)
     return result
 
@@ -654,40 +673,40 @@ def watch_first_full_prefill(model_runner, result: CalibrationResult) -> None:
     model_runner.forward = measured_forward
 
 
-class HotCacheHeadroomShort(RuntimeError):
-    pass
-
-
 def require_hot_cache_headroom(stage: str, result: Optional[CalibrationResult], device=None) -> None:
-    """The scheduler's post-capture check: refuse to start (raise) when free memory is below the calibrated margin.
-    After capture the calibration's prefill reserve is still cached by the allocator, so free memory now is what
-    the next prefill of that size can count on. Off (no calibration) it does nothing."""
-    if result is not None and not check_headroom(stage, result, device):
-        raise HotCacheHeadroomShort(
-            f"hot cache calibration: free memory {stage} is below the margin; see the log line above"
-        )
+    """The scheduler's post-capture check. Nothing can shrink after capture (the graphs bake the slot count), so a
+    short projection does not refuse the launch: it is logged at WARNING with the full breakdown, the captured
+    graphs' measured cost beside the calibration's estimate. Off (no calibration) it does nothing."""
+    check_headroom(stage, result, device)
 
 
 def check_headroom(stage: str, result: Optional[CalibrationResult], device=None) -> bool:
-    """Post-capture / post-warm-up check: free device memory now, against the calibrated margin. Logs every value;
-    returns False (the caller refuses to report healthy) when below."""
+    """Post-capture / post-warm-up check: free device memory now, against the calibrated margin. Logs every value
+    (WARNING when short); returns whether the projection covers the margin."""
     if result is None:
         return True
     free = torch.cuda.mem_get_info(device)[0]
     reserved = torch.cuda.memory_reserved(device)
-    projected = projected_free(result.calibration, free=free, reserved=reserved)
-    margin = result.calibration.margin
+    calibration = result.calibration
+    projected = projected_free(calibration, free=free, reserved=reserved)
+    margin = calibration.margin
     ok = projected >= margin
-    (logger.info if ok else logger.error)(
-        "hot cache calibration check %s: free %.1f MiB, torch reserved %.1f MiB, projected free at a %d-token "
-        "prefill %.1f MiB, margin %.1f MiB%s",
+    since = result.extra.get("free_after_resize")
+    (logger.info if ok else logger.warning)(
+        "hot cache calibration check %s: free %.1f MiB, torch reserved %.1f MiB, %d-token prefill reserve peak "
+        "%.1f MiB, projected free at that prefill %.1f MiB, margin %.1f MiB; capture took %s MiB of free memory "
+        "against an estimate of %.1f MiB%s",
         stage,
         free / MIB,
         reserved / MIB,
-        result.calibration.tokens,
+        calibration.tokens,
+        calibration.peak_run.reserved_peak / MIB,
         projected / MIB,
         margin / MIB,
-        "" if ok else f" -- SHORT by {(margin - projected) / MIB:.1f} MiB",
+        f"{(since - free) / MIB:.1f}" if since is not None else "?",
+        calibration.capture_estimate / MIB,
+        "" if ok else f" -- SHORT by {(margin - projected) / MIB:.1f} MiB; the launch goes on (nothing can shrink "
+        "after capture)",
     )
     return ok
 
