@@ -18,8 +18,8 @@ per-request insert score that counts verify routes only, decays by ``score_decay
 zero, and the verifies since the expert was last routed in this request. The head keeps that state itself
 (:class:`LaneHead`), updates it in the key kernel after the keys are written, and is reset by every prefill.
 
-Key per routed expert e: ``P = sigmoid(logit)``, ``key = int64(P * 2^31) * 2^16 + (experts - 1 - e)`` (the tie-break
-shape of residency_rank_keys). :class:`LaneHeadReference` is the Python definition the kernel
+Key per routed expert e: ``P = sigmoid(logit)``, ``key = bits(P) * 2^16 + (experts - 1 - e)`` (P's fp32 bit
+pattern, the shape of residency_rank_keys). :class:`LaneHeadReference` is the Python definition the kernel
 (kernels/ops/moe/lane_head.py) is tested against.
 
 File (safetensors, written by analysis/dsv41-drive/dspark/export_lane_head.py): the tensors of
@@ -47,7 +47,6 @@ FEATURES = (
 ODDS = FEATURES.index("odds")
 # next_verify_head.constant_safe: a feature whose training deviation was ~0 is scaled by this, zeroing its term.
 CONSTANT_SCALE = 1e9
-KEY_SCALE = float(1 << 31)
 # Gather widths the kernel takes: at most this many tokens, and 64 routes (the fused plan's dedup bound).
 MAX_TOKENS = 16
 MAX_ROUTES = 64
@@ -263,9 +262,11 @@ def head_logits(tensors: dict[str, torch.Tensor], row: int, z: torch.Tensor, f: 
 
 
 def plan_keys(p: torch.Tensor, e: torch.Tensor, experts: int) -> torch.Tensor:
-    """int64 plan keys of probabilities ``p`` (fp32) for experts ``e``: ``int64(P * 2^31) << 16 | (experts-1-e)``."""
-    scaled = (p.float() * KEY_SCALE).to(torch.int64)
-    return scaled * (1 << 16) + (experts - 1 - e.long())
+    """int64 plan keys of probabilities ``p`` (fp32, >= 0) for experts ``e``: ``bits(P) << 16 | (experts-1-e)``, as
+    residency_rank_keys. Nonnegative floats order like their bit patterns, so the keys order exactly as ``P``, down to
+    the tiny probabilities a fixed-point scale would round to zero."""
+    bits = (p.float() + 0.0).view(torch.int32).to(torch.int64)
+    return bits * (1 << 16) + (experts - 1 - e.long())
 
 
 class LaneHeadReference:

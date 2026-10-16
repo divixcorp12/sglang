@@ -23,7 +23,6 @@ constexpr int kLaneHeadRanksPerBlock = 16;
 constexpr int kLaneHeadKeyThreads = 512;   // >= experts and >= routes
 constexpr int kLaneHeadMaxTokens = 16;     // lane_head.MAX_TOKENS
 constexpr int kLaneHeadMaxRoutes = 64;     // lane_head.MAX_ROUTES
-constexpr float kLaneHeadKeyScale = 2147483648.0f;  // 2^31
 
 SGL_DEVICE fp32_t lane_head_f32(fp32_t v) {
   return v;
@@ -185,7 +184,8 @@ __global__ __launch_bounds__(kLaneHeadKeyThreads) void lane_head_keys_kernel(
       }
       const fp32_t logit = expert_bias[e] + (dense + dense_b[0]) + zdot + udot;
       const fp32_t p = 1.0f / (1.0f + expf(-logit));
-      keys[e] = static_cast<int64_t>(p * kLaneHeadKeyScale) * (static_cast<int64_t>(1) << 16) +
+      // P >= 0 orders like its bit pattern (residency_rank_keys' shape); ties go to the lower expert id.
+      keys[e] = static_cast<int64_t>(__float_as_int(p + 0.0f)) * (static_cast<int64_t>(1) << 16) +
                 (static_cast<int64_t>(experts) - 1 - e);
       s_cnt[e] = cnt;
     }
