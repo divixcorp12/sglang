@@ -27,6 +27,7 @@ import subprocess
 from typing import List
 
 from sglang.kernels.jit.utils.compile import toolchain
+from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.srt.environ import envs
 
@@ -34,6 +35,14 @@ logger = logging.getLogger(__name__)
 
 _BUILD_FILE = "build.ninja"
 _NINJA_TIMEOUT_S = 1800
+
+_CXX_COMPILE = '$cxx -MD -MF "$out.d" $cxxflags -c "$in" -o "$out"'
+_CUDA_COMPILE = '$nvcc -MD -MF "$out.d" $cudaflags -c "$in" -o "$out"'
+
+# The directory holding the `sglang` package, and the name a launched build
+# reaches it by: a symlink inside the build directory (see `_launched`).
+_SOURCE_ROOT = KERNEL_PATH.parents[2]
+_SOURCE_LINK = "sglang-src"
 
 
 def _escape(path: str) -> str:
@@ -107,11 +116,11 @@ def generate(spec: BuildSpec) -> str:
         "",
         "rule compile_cxx",
         "  depfile = $out.d",
-        '  command = $cxx -MD -MF "$out.d" $cxxflags -c "$in" -o "$out"',
+        f"  command = {_CXX_COMPILE}",
         "",
         "rule compile_cuda",
         "  depfile = $out.d",
-        '  command = $nvcc -MD -MF "$out.d" $cudaflags -c "$in" -o "$out"',
+        f"  command = {_CUDA_COMPILE}",
         "",
         "rule link",
         '  command = $cxx $in $ldflags -o "$out"',
@@ -135,6 +144,36 @@ def generate(spec: BuildSpec) -> str:
     return "\n".join(lines)
 
 
+def _launched(build_file: str, launcher: str) -> str:
+    """*build_file* with *launcher* in front of both compile rules (not the
+    link), and every path into the source tree taken through `_SOURCE_LINK`.
+
+    Applied only to the text written to disk, never to the text the build key
+    is taken over: a launcher such as ccache changes how an object is produced,
+    not what it contains, so it must not split the JIT cache.
+
+    The path rewrite is what lets a compiler cache hit across clones. ccache
+    hashes the command line and the preprocessed text, and both carry every
+    absolute path into the tree, so one module built from `wt-a` and from
+    `wt-b` would never match. CCACHE_BASEDIR does not fix that: it makes those
+    paths relative to the build directory, and the clone's name survives. A
+    link inside the staging directory turns each of them into the same relative
+    string from any clone and any staging directory. Depfiles then list
+    relative paths, which `scan_dependencies`' callers resolve against the
+    build directory, through the link, to the real files.
+    """
+    words = " ".join(_arg(word) for word in shlex.split(launcher))
+    first, rest = build_file.split("\n", 1)
+    rest = rest.replace(
+        f"  command = {_CXX_COMPILE}", f"  command = $launcher {_CXX_COMPILE}"
+    ).replace(f"  command = {_CUDA_COMPILE}", f"  command = $launcher {_CUDA_COMPILE}")
+    return _through_link(f"{first}\nlauncher = {words}\n{rest}")
+
+
+def _through_link(text: str) -> str:
+    return text.replace(f"{_SOURCE_ROOT}{os.sep}", f"{_SOURCE_LINK}{os.sep}")
+
+
 def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathlib.Path:
     """Write the sources and *build_file* into *build_dir*, then run ninja.
 
@@ -144,13 +183,21 @@ def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathl
 
     *build_dir* is always a fresh staging directory, so there is nothing here to
     keep current — every file is written once and compiled once.
+
+    The one deliberate difference is ``SGLANG_JIT_COMPILER_LAUNCHER``, applied
+    here by `_launched`, after the key was taken.
     """
     build_dir.mkdir(parents=True, exist_ok=True)
+    launcher = envs.SGLANG_JIT_COMPILER_LAUNCHER.get()
+    if launcher:
+        build_file = _launched(build_file, launcher)
+        (build_dir / _SOURCE_LINK).symlink_to(_SOURCE_ROOT, target_is_directory=True)
     for unit in spec.translation_units():
         # Only the generated wrappers are materialized; sources that already
         # exist are compiled where they are.
         if unit.source is not None:
-            (build_dir / unit.filename).write_text(unit.source)
+            source = _through_link(unit.source) if launcher else unit.source
+            (build_dir / unit.filename).write_text(source)
     (build_dir / _BUILD_FILE).write_text(build_file)
 
     command = ["ninja", "-f", _BUILD_FILE]

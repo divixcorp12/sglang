@@ -308,7 +308,9 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
 
     ``variant``/``lanes``/``nodes`` name the module the child constructs its ``ExpertStreamHost`` with (None: the
     child's default build). The child has no conftest, so its ``host_layout()`` also loads the default build at one
-    node, whatever the parent's autouse fixture says: that one is warmed too."""
+    node, whatever the parent's autouse fixture says: that one is warmed too. Cold modules are built side by side
+    (``load_in_parallel``); when all are cached no process is started."""
+    from sglang.kernels.jit.utils.compile.warm import load_in_parallel
     from sglang.kernels.ops.moe import expert_stream_transport as ops
 
     conftest_default, ops._DEFAULT_VARIANT = ops._DEFAULT_VARIANT, None
@@ -316,12 +318,29 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
         child_default = ops.host_variant()
     finally:
         ops._DEFAULT_VARIANT = conftest_default
-    ops._host_module("exl3", child_default, 8, 1)  # what host_layout() loads: its default lanes, one node
-    ops._host_module("exl3", variant or child_default, lanes, nodes)
-    # A child that serves a miss reads through this module, which the host modules do not load.
-    from sglang.kernels.ops.io import uring_file_reader
+    load_in_parallel(
+        [
+            (_HOST_OPS, "_host_module", ("exl3", child_default, 8, 1)),  # what host_layout() loads: its default lanes, one node
+            (_HOST_OPS, "_host_module", ("exl3", variant or child_default, lanes, nodes)),
+            # A child that serves a miss reads through this module, which the host modules do not load.
+            (_URING_OPS, "_uring_file_reader_type", ()),
+        ]
+    )
 
-    uring_file_reader._uring_file_reader_type()
+
+_HOST_OPS = "sglang.kernels.ops.moe.expert_stream_transport"
+_URING_OPS = "sglang.kernels.ops.io.uring_file_reader"
+
+
+def warm_host_module_set(variants: Sequence[str], lanes: Sequence[int], nodes: Sequence[int]) -> None:
+    """Load every exl3 host build in ``variants`` x ``lanes`` x ``nodes``, plus the uring reader, cold ones built side
+    by side: for a suite runner to call once before ``pytest -n 8``, so no worker waits on another's compile."""
+    from sglang.kernels.jit.utils.compile.warm import load_in_parallel
+
+    load_in_parallel(
+        [(_HOST_OPS, "_host_module", ("exl3", v, l, n)) for v in variants for l in lanes for n in nodes]
+        + [(_URING_OPS, "_uring_file_reader_type", ())]
+    )
 
 
 # First line of a child that is meant to abort: every service failure is a deliberate ``std::abort``, and on divix01

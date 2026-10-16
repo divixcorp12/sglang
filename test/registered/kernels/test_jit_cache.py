@@ -484,6 +484,99 @@ def test_non_header_only_module_compiles_its_sources_in_place(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Compiler launcher (SGLANG_JIT_COMPILER_LAUNCHER)
+# --------------------------------------------------------------------------
+
+
+def _written_build_file(spec, tmp_path, monkeypatch, launcher):
+    """What `ninja.build` writes for *spec* under *launcher*, ninja itself faked."""
+    import subprocess
+
+    from sglang.srt.environ import envs
+
+    monkeypatch.setattr(
+        ninja.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
+    )
+    with envs.SGLANG_JIT_COMPILER_LAUNCHER.override(launcher):
+        ninja.build(spec=spec, build_dir=tmp_path, build_file=ninja.generate(spec))
+    return (tmp_path / "build.ninja").read_text()
+
+
+def test_launcher_does_not_change_the_build_key():
+    """ccache changes how an object is made, not what it is: turning it on must
+    not cold-start the JIT cache, nor give its builds their own directories."""
+    from sglang.srt.environ import envs
+
+    spec = _spec(cuda_wrappers=(("run", "K::run"),))
+    baseline_text = ninja.generate(spec)
+    baseline = cache.compute_build_key(spec, build_file=baseline_text)
+    with envs.SGLANG_JIT_COMPILER_LAUNCHER.override("ccache"):
+        launched_text = ninja.generate(spec)
+        launched = cache.compute_build_key(spec, build_file=launched_text)
+    assert launched_text == baseline_text
+    assert launched == baseline
+
+
+def test_unset_or_empty_launcher_writes_the_generated_file(tmp_path, monkeypatch):
+    spec = _spec(cuda_wrappers=(("run", "K::run"),))
+    for launcher, build_dir in ((None, tmp_path / "unset"), ("", tmp_path / "empty")):
+        assert _written_build_file(spec, build_dir, monkeypatch, launcher) == (
+            ninja.generate(spec)
+        )
+        assert not (build_dir / ninja._SOURCE_LINK).exists()
+
+
+def test_launcher_prefixes_both_compiles_and_not_the_link(tmp_path, monkeypatch):
+    spec = _spec(cuda_wrappers=(("run", "K::run"),))
+    text = _written_build_file(spec, tmp_path, monkeypatch, "ccache --flag")
+    assert "\nlauncher = ccache --flag\n" in text
+    commands = [line for line in text.splitlines() if line.startswith("  command = ")]
+    compiles = [line for line in commands if ' -c "$in"' in line]
+    assert len(compiles) == 2
+    assert all(line.startswith("  command = $launcher $") for line in compiles)
+    (link,) = [line for line in commands if line not in compiles]
+    assert "$launcher" not in link
+
+
+def test_launched_build_reaches_the_tree_through_a_link(tmp_path, monkeypatch):
+    """The same module built from two clones must give ccache the same command
+    and the same preprocessed text, so no path into the clone may survive."""
+    source = str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh")
+    spec = _spec(
+        cuda_files=(source,),
+        cuda_wrappers=(("run", "K::run"),),
+        include_paths=(str(KERNEL_PATH / "include"),),
+    )
+    text = _written_build_file(spec, tmp_path, monkeypatch, "ccache")
+    wrapper = (tmp_path / "cuda.cu").read_text()
+    root = str(ninja._SOURCE_ROOT)
+    assert root not in text and root not in wrapper
+    assert f"-I{ninja._SOURCE_LINK}/sglang/kernels/jit/include" in text
+    assert f'#include "{ninja._SOURCE_LINK}/sglang/kernels/jit/csrc/' in wrapper
+    assert (tmp_path / ninja._SOURCE_LINK).resolve() == ninja._SOURCE_ROOT.resolve()
+
+
+def test_dependencies_listed_through_the_link_resolve_to_the_tree(tmp_path):
+    """A launched build's depfiles name files relative to the build directory;
+    the dependency list must still record the real files, or the leaf would
+    never cover its direct sources and would not be published."""
+    build_dir = tmp_path / ".staging-x"
+    build_dir.mkdir()
+    (build_dir / ninja._SOURCE_LINK).symlink_to(ninja._SOURCE_ROOT)
+    header = KERNEL_PATH / "include" / "sgl_kernel" / "utils.cuh"
+    relative = f"{ninja._SOURCE_LINK}/{header.relative_to(ninja._SOURCE_ROOT)}"
+    (build_dir / "main_0.o.d").write_text(f"main_0.o: main.cpp {relative}\n")
+    entries = cache._to_entries(
+        dependencies=ninja.scan_dependencies(build_dir), build_dir=build_dir
+    )
+    assert [(e.root, e.relpath) for e in entries] == [
+        ("kernels", "include/sgl_kernel/utils.cuh")
+    ]
+
+
+# --------------------------------------------------------------------------
 # depfile parsing
 # --------------------------------------------------------------------------
 
