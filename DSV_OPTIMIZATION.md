@@ -983,6 +983,15 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
                 Decode ms/token is unaffected, but any prefill-time comparison has to check nvme3n1 await per
                 prefill window.
               - This run alone had 4 SPCC stall episodes.
+          - **SPCC (nvme3, `/mnt/nvme4`) smart-log, 2026-10-16, from the owner:** **not thermal.** Every thermal
+            throttle counter and every warning/critical temperature time is 0 for the drive's life. It reads 34 °C
+            (sensor 1 46 °C). Media errors 0, 20% used, 148.7 TB written over 8,385 h, 127 unsafe shutdowns.
+            - The A/B arms wrote only 12-13 MB to it while reading ~308 GB each. No concurrent writer causes the
+              stalls.
+            - Fill: 89% (1.6 TB used, 206 GB free): mimo-reap 620 GB, mimi-v26-pro 535 GB, dsv41_flash 395 GB,
+              ray_tmp 28 GB. fstrim.timer is weekly; it last ran 10-12.
+            - **Remaining suspects:** background GC on a nearly full DRAM-less drive, or its HMB mapping-cache
+              misses on random reads spread over a 1.6 TB span. Both get better with less data on the drive.
               - Node 0's load minimum comes from the draft weight load in both arms, not from the trial capture
                 or the calibration replay.
 - **Known issue (pre-existing test pollution, not this work):**
