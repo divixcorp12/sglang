@@ -1201,6 +1201,13 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
           - **Decision:** no kernel fusion; fusing saves ~0.4 ms/verify and cannot change this result. The
             lane is held. The next version would add RAM-tier residency as a head feature, or restrict the head's
             choices to RAM-warm experts, and needs a replay that prices RAM against NVMe lanes before any GPU run.
+          - **Tier-priced replay approved (2026-10-16, owner), offline only** (lane-head agent; handoff
+            `eb1a14c8c0`, section 0):
+            - Lanes are priced as VRAM hit, RAM-warm miss or NVMe-cold miss, with costs measured from the A/B
+              traces.
+            - Gate: it must first reproduce the A/B's stream +51.7 / wait -46.9 ms/verify. If it does, it evaluates
+              the RAM-warm cap (b), the current head, and an oracle on held-out data, net of the head's cost.
+            - Retraining with a RAM-tier feature (a) comes only if (b) gains but leaves a gap; CPU only.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
