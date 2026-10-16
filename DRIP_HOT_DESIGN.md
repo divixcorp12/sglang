@@ -528,3 +528,70 @@ built on cache-tiers' `vram_cache_replay.py`.
    the time, so the replay must count these returns. They are the hidden cost of every extra insert.
 9. **After a prefill** fewer drip picks are eligible, since prefill admissions displace decode rows without bound
    and without an event. The A/B should report drip admits per verify against position after a prefill.
+
+## 7. Replay result (2026-10-16): no arm passes the build gate
+
+**Every result here is conditional on lane-tier's stage 0** (prefill admissions, TIER_RULES rule 8), which had not
+passed its own gate when this was written.
+
+Run details:
+- Script: `analysis/dsv41-drive/dspark/drip_hot_replay.py` at `0ae29b5ef9`.
+- It imports `expert_breakdown.py` from expert-breakdown `d79f05e077`, and `lane_tier_replay.py` and its NodeTier
+  model from lane-tier-replay `a98b5b527c`.
+- Outputs are under divix01:`/mnt/nvme1/drip-hot-replay/`: `gate-{drip,base}`, `arms-drip` (horizon 3),
+  `arms-drip-h{1,8}`, and `victims-{c2,drip}`.
+- Everything ran on cores 56-63 with no GPU.
+
+**Validation gate: passed.** The post's lane typing is re-run per record on the capture's own lanes.
+
+| | drip capture (131 verifies) | base capture (130 verifies) |
+|---|---|---|
+| lanes typed the same as the capture | 99.67% | 99.97% |
+| per-verify lane mix | every category within 2.0% | every category within 0.04% |
+
+- **What the gate tests.** The VRAM, spill and miss categories match by construction, because the model takes RAM
+  hit/miss and the spill boundary from the capture. The test is the split of the remaining lanes into scratch, DMA and
+  CPU-RAM: the split table, the miss cut and the drip timing.
+- **One fitted parameter.** drip_land's observation lag is 1.4 ms: the copy thread stamps the event at its next poll
+  of the store's mark. Without that lag, 22% of scratch lanes were mistimed.
+- **Join.** Records join the route lines by lane experts (`layer_misses.match_forwards`), and drips join their target
+  record by seq. No time offset is used.
+
+**Arms**, per verify, against "today" (the drip capture as typed):
+
+| arm | adopted (from spill) | lost hits | NVMe GPU lanes | CPU lanes, net of RAM-warm returns | NVMe-cold returns | added GPU ms | ms/verify at 0.07 / 0.28 per CPU-RAM lane | gate |
+|---|---|---|---|---|---|---|---|---|
+| B, window not extended | 77.1 (32.8) | 0 | -2.77 | **-13.4** | 0.01 | 0.50 | -4.6 / -8.1 | fails CPU |
+| B, window extended | 77.1 (32.8) | 0 | **+9.06** | -42.6 | 0.02 | 0.50 | +12.9 / +5.9 | fails NVMe |
+| A, 2 picks, no score cap | 53.3 (22.7) | 9.5 | +5.44 | -10.7 | 0 | -0.31 | +8.2 / +7.1 | fails both |
+| C, one spare per layer | 30.9 (13.4) | 4.3 | +2.97 | +1.3 | 0 | -0.31 | +4.8 / +5.7 | fails both |
+
+How the arms are priced and counted:
+- **Other lane kinds.** CPU-NVMe 1.06, CPU-pool 0.50, DMA 0 (lane_cost_fit on this capture); pool 0.65, NVMe GPU
+  1.47 + 1.09 (lane_tier_replay).
+- **Returns.** These are released VRAM victims routed again within 3 verifies while the capture still held them: a
+  RAM-warm return is priced as a CPU-RAM lane, an NVMe-cold one as an NVMe GPU lane. Horizons of 1 and 8 verifies
+  move every figure by less than 2 lanes.
+- **A's victims.** A reserved 74.9 victims per verify and wasted 22.4 of them on drips that never landed in time. Its
+  9.5 lost hits/verify match the design note's estimate of about 11.
+
+Readings:
+1. **B without extension saves fewer than half the CPU lanes the gate asks for.** About 33 adoptions per verify come
+   from spilled lanes, but each one shrinks the lanes' victim window by one, so only about 0.5 of a CPU lane is saved
+   per spilled adoption.
+   - It also moves 2.8 NVMe misses per verify from the GPU stream to forced CPU reads, which are the critical path.
+   - Its priced gain of -4.6 to -8.1 ms/verify (about 1.2-2.1 ms/token at 3.83 tokens/verify) is inside the noise of
+     a served pair.
+   - That gain depends on almost no released victim coming back NVMe-cold. If the 3.5 RAM-warm returns per verify
+     were cold instead, the gain is gone (+8 ms). Rule 8, the prefill admissions this tier model lacks, is exactly
+     what makes rows cold, so the sign of B's gain is open until stage 0.
+2. **B with extension reproduces the lane-head failure.** The freed victim lanes take NVMe-cold misses onto the GPU
+   stream (+9.1 per verify).
+3. **A loses about 9.5 hits per verify** before routing, and still adds NVMe GPU lanes.
+4. **C costs more capacity than it adopts.**
+
+**Recommendation: do not build drip-into-cache.** The drip stays as it is: off by default, neutral when on. If a
+lever is wanted here, it is lane order and NVMe-cold rows, not the drip's landing site.
+
+**C2.** It has no lane_kind or drip events, so only the shortlist-head statistics run there (`victims-c2.json`). They
+match the drip capture: rank 0-5 recurs 0.114-0.245 of the time in the same verify and 0.262-0.477 within 3.
