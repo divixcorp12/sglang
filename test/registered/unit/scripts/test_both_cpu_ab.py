@@ -791,7 +791,8 @@ def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
         assert ab.ARMS[base + "-mem"][1] is True
     assert ab.REFERENCE[PIN01_MEM_ARM] == PIN01_ARM and ab.REFERENCE[PIN01_SPLIT_MODEL_MEM_ARM] == PIN01_MEM_ARM
     capture = open(os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "spec_margin_capture.py")).read()
-    assert "*both_cpu_ab.server_flags(a.arm)]" in capture
+    # long-prompt-mode moved the argv into spec_margin_capture.server_argv(arm).
+    assert "*both_cpu_ab.server_flags(arm)]" in capture
     seen = {}
     monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, cwd: seen.update(env) or type("R", (), {"returncode": 0}))
     ab.run_timed(PIN01_MEM_ARM, "/out")
