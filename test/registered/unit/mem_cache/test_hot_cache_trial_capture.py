@@ -47,6 +47,7 @@ def world(monkeypatch):
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: "private")
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (mem["free"], 32000 * M))
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a: mem["reserved"])
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda: [])
 
     def empty_cache():
         if log and log[-1] == ("pool", None):  # teardown: everything but the residue and module loads comes back
@@ -97,6 +98,21 @@ def test_drop_capture_metadata_leaves_other_backends_alone():
     assert tc.drop_capture_metadata(None) == 0
     backend = SimpleNamespace(cuda_graph_metadata_of_bucket_and_bs={"a": {1: 0, 2: 0}, "b": {4: 0}})
     assert tc.drop_capture_metadata(backend) == 3
+
+
+def test_residue_blocks_are_charged_to_the_holder_whose_tensor_starts_inside_them():
+    paths = {1000: "input_buffer_pool[('input_ids', 6)]", 5000: "target.attn_backend._verify_mask", 5100: "target.x.y.z"}
+    new_blocks = {900: 512, 4096: 2048, 9000: 64}  # holds 1000; holds 5000 and 5100; holds nothing known
+    held = tc.attribute_blocks(new_blocks, paths)
+    assert held == {"target.attn_backend._verify_mask": 2048, "input_buffer_pool[('input_ids', 6)]": 512,
+                    "unattributed": 64}
+
+
+def test_live_blocks_reads_only_allocated_blocks(monkeypatch):
+    snapshot = [{"blocks": [{"address": 10, "size": 4, "state": "active_allocated"},
+                            {"address": 14, "size": 8, "state": "inactive"}]}, {"blocks": []}]
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda: snapshot)
+    assert tc.live_blocks() == {10: 4}
 
 
 def test_forward_hooks_skip_the_trial(world, monkeypatch):

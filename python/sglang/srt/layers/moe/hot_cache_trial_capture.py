@@ -19,11 +19,12 @@ Observability forward hooks would be registered twice, so with them configured t
 
 from __future__ import annotations
 
+import bisect
 import gc
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -76,6 +77,58 @@ def drop_capture_metadata(attn_backend) -> int:
     return dropped
 
 
+def live_blocks() -> Dict[int, int]:
+    """The caching allocator's allocated blocks, address -> size, every pool."""
+    blocks = {}
+    for segment in torch.cuda.memory_snapshot():
+        for block in segment.get("blocks", ()):
+            if block.get("state") == "active_allocated":
+                blocks[int(block["address"])] = int(block["size"])
+    return blocks
+
+
+def tensor_paths(roots: Dict[str, object], depth: int = 3) -> Dict[int, str]:
+    """data_ptr -> the first attribute path reaching a CUDA tensor from ``roots`` (attributes, dicts, lists and
+    tuples, ``depth`` levels; modules are not entered, so model weights are not walked)."""
+    found, seen = {}, set()
+
+    def walk(value, path, level):
+        if isinstance(value, torch.Tensor):
+            if value.is_cuda:
+                found.setdefault(value.untyped_storage().data_ptr(), path)
+            return
+        if level >= depth or id(value) in seen or isinstance(value, (torch.nn.Module, type, str, bytes)):
+            return
+        seen.add(id(value))
+        if isinstance(value, dict):
+            items = ((f"[{k!r}]", v) for k, v in value.items())
+        elif isinstance(value, (list, tuple)):
+            items = ((f"[{i}]", v) for i, v in enumerate(value))
+        elif hasattr(value, "__dict__"):
+            items = ((f".{k}", v) for k, v in vars(value).items())
+        else:
+            return
+        for name, child in items:
+            walk(child, path + name, level + 1)
+
+    for name, root in roots.items():
+        walk(root, name, 0)
+    return found
+
+
+def attribute_blocks(new_blocks: Dict[int, int], paths: Dict[int, str]) -> Dict[str, int]:
+    """Bytes of each new block, charged to the holder whose tensor starts inside it (the top two path components,
+    so one buffer family is one line), or to 'unattributed'."""
+    starts = sorted(paths)
+    charged: Dict[str, int] = {}
+    for address, size in new_blocks.items():
+        i = bisect.bisect_left(starts, address)
+        inside = i < len(starts) and starts[i] < address + size
+        holder = ".".join(paths[starts[i]].split(".")[:3]) if inside else "unattributed"
+        charged[holder] = charged.get(holder, 0) + size
+    return dict(sorted(charged.items(), key=lambda kv: -kv[1]))
+
+
 def _state(device):
     torch.cuda.synchronize(device)
     return torch.cuda.mem_get_info(device)[0], torch.cuda.memory_reserved(device)
@@ -106,6 +159,7 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     free0, reserved0 = _state(device)
+    blocks0 = live_blocks()
     saved_pool = get_global_graph_memory_pool()
     set_global_graph_memory_pool(torch.cuda.graph_pool_handle())
     runners, draft_runners = [], ()
@@ -136,6 +190,21 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
     free2, reserved2 = _state(device)
+    new_blocks = {a: s for a, s in live_blocks().items() if a not in blocks0}
+    if new_blocks:  # what the trial left allocated, by holder
+        from sglang.srt.model_executor import input_buffers
+
+        roots = {"input_buffer_pool": input_buffers._forward_input_buffer_pool, "target": model_runner}
+        roots.update({f"draft{i}": runner for i, runner in enumerate(draft_runners)})
+        if draft_worker is not None:
+            roots["draft_worker"] = draft_worker
+        held = attribute_blocks(new_blocks, tensor_paths(roots))
+        logger.info(
+            "hot cache trial capture residue: %d blocks, %.1f MiB allocated after teardown; by holder (MiB): %s",
+            len(new_blocks),
+            sum(new_blocks.values()) / MIB,
+            {k: round(v / MIB, 1) for k, v in list(held.items())[:12]},
+        )
     return TrialCapture(
         free_drop=free0 - free1,
         torch_reserved=reserved1 - reserved0,
