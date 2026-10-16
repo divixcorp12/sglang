@@ -343,7 +343,7 @@ def dspark_env() -> dict[str, str]:
 
 def prod_dspark_env() -> dict[str, str]:
     """Production's DSpark settings on top of dspark_env() since 2026-10-16 (MERGE_PLAN_1016.md): the best served arm,
-    both_cpu_ab's ...-pin01-splitmodel-mem-hicache1-mergechunk-expseg, without its RAM prefetch and with both startup
+    both_cpu_ab's ...-pin01-splitmodel-mem-hicache1-mergechunk-expseg, with its RAM prefetch and both startup
     calibrations on. The arms state each of these themselves, so they stay out of dspark_env(), which every arm builds
     on. Evidence is DSV_OPTIMIZATION.md (DO) and DSV41_REFERENCE.md; "pair" means one served A/B pair.
 
