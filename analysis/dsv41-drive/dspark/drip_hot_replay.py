@@ -19,8 +19,10 @@ expert_breakdown.py's within 5%. ``arms`` then perturbs each record (one verify 
           and routed, is adopted, swapping a victim in as the new spare
 
 and counts per verify: VRAM hits, lanes by kind, forced CPU lanes, inserts, lost hits, adoptions, extra evictions and
-their returns within --horizon verifies (rule-1 swaps: priced NVMe-cold or RAM-warm by lane_tier_replay's NodeTier
-model, TIER_RULES at a98b5b527c, without prefill admissions).
+their returns within --horizon verifies (rule-1 swaps: priced NVMe-cold or RAM-warm on lane_tier_replay's RAM tier with
+prefill admissions, rule 10, lane-tier-replay 3d331c9189, through its on_gather callback).
+
+The drip timing uses one parameter fitted on the drip capture itself: drip_land's observation lag (calibrate_lag).
 
 ``victims`` reports the proxy shortlist head's recurrence on any capture with graph_routes (C2 has no drip or lane_kind
 events, so only this runs there).
@@ -67,6 +69,7 @@ NVME_GPU_MS, NVME_ON_CPU_MISS_MS = 1.47, 1.09
 LANE_MS = {"cpu_nvme": 1.06, "cpu_pool": 0.50, "dma": 0.0, "sm": 0.87, "pool": 0.65,
            "nvme_gpu": NVME_GPU_MS + NVME_ON_CPU_MISS_MS}
 CPU_RAM_MS = (0.07, 0.28)
+COLD_UNDER_PREDICTION = 0.08  # lane-tier stage 0: the tier model's cold lanes fall short of the trace's by about 8%
 
 
 # ---- the capture ------------------------------------------------------------------------------------------------------
@@ -421,7 +424,7 @@ def arms(cap: Capture, horizon: int) -> dict:
             c2 = per_v[a][r["verify"]]
             c2["extra_evictions"] += len(victims)
             released[a].extend((li, r["row"], e) for e in victims)
-    returns = {a: tier_returns(cap, released[a], horizon) for a in names}
+    returns = tier_returns(cap, released, horizon)
     out = {"verifies": len(per_v["today"]), "horizon": horizon, "drip_publish_lag": lag_fit, "arms": {}}
     keys = CATS + ("forced", "inserts", "d2d", "adopted", "adopted_from_spill", "lost_hits", "reserved",
                    "reserved_wasted", "extra_evictions")
@@ -439,13 +442,19 @@ def arms(cap: Capture, horizon: int) -> dict:
         warm = ret.get("warm", 0) / nv
         cold = ret.get("cold", 0) / nv
         net_cpu = d_cpu + warm  # a RAM-warm return comes back as a lane: counted as a CPU lane (the bound)
-        priced = {}
         other = sum((m[k] - t[k]) * ms for k, ms in LANE_MS.items())
-        for per_lane in CPU_RAM_MS:
+
+        def price(per_lane: float, w: float, c: float) -> float:
             # a RAM-warm return is priced as a CPU-RAM lane, an NVMe-cold one as an NVMe GPU lane
-            priced[f"cpu_ram_{per_lane}"] = round(
-                (m["cpu_ram"] - t["cpu_ram"] + warm) * per_lane + other
-                + cold * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS) + gpu_ms, 2)
+            return round((m["cpu_ram"] - t["cpu_ram"] + w) * per_lane + other
+                         + c * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS) + gpu_ms, 2)
+
+        priced = {f"cpu_ram_{x}": price(x, warm, cold) for x in CPU_RAM_MS}
+        # The tier under-predicts cold lanes by about 8% (lane-tier stage 0): cold returns scaled up by 1/0.92, and the
+        # bound where every return is cold.
+        biased = min(warm + cold, cold / (1 - COLD_UNDER_PREDICTION))
+        priced_cold_bias = {f"cpu_ram_{x}": price(x, warm + cold - biased, biased) for x in CPU_RAM_MS}
+        priced_all_cold = {f"cpu_ram_{x}": price(x, 0.0, warm + cold) for x in CPU_RAM_MS}
         out["arms"][a] = {
             "per_verify": {k: round(v, 2) for k, v in m.items()},
             "delta_cpu_lanes": round(d_cpu, 2),
@@ -455,6 +464,8 @@ def arms(cap: Capture, horizon: int) -> dict:
             "net_cpu_lanes_with_warm_returns": round(net_cpu, 2),
             "added_gpu_ms": round(gpu_ms, 3),
             "ms_per_verify_vs_today": priced,  # negative is a saving
+            "ms_per_verify_cold_bias": priced_cold_bias,
+            "ms_per_verify_all_returns_cold": priced_all_cold,
             "build_gate": {
                 "cpu_lanes_-30": net_cpu <= -30,
                 # NVMe GPU lanes, an NVMe-cold return counted as one
@@ -466,95 +477,59 @@ def arms(cap: Capture, horizon: int) -> dict:
     return out
 
 
-def capacities(d: str, layers: int) -> tuple[dict[int, int], float, int, list[int]]:
-    """lane_tier_replay.numa_capacities, or for a server log whose startup line predates ``rows_per_layer`` (the
-    breakdown captures), its total ``rows`` spread over the layers as evenly as the tier does (210/209 at 8386)."""
-    try:
-        return ltr.numa_capacities(d)
-    except KeyError:
-        pass
-    total, frac, share = 0, 0.5, 0
-    with open(os.path.join(d, "server.log"), errors="replace") as f:
-        for line in f:
-            if "Pinned host expert cache startup" in line:
-                info = json.loads(line[line.index("{"):])
-                total = int(info["rows"])
-                b = info["numa"]["bound_bytes"]
-                frac = int(b["0"]) / (int(b["0"]) + int(b["1"]))
-            elif "RAM prefetch share" in line:
-                share = int(line.split("RAM prefetch share")[1].split(",")[0])
-    if not total:
-        raise ValueError(f"{d}: no pinned-tier startup line")
-    rows = {L: total // layers + (L < total % layers) for L in range(layers)}
-    return rows, frac, share, []
+def tier_returns(cap: Capture, released: dict[str, list[tuple[int, int, int]]], horizon: int) -> dict:
+    """Classify each arm's returns as RAM-warm or NVMe-cold on lane_tier_replay's RAM tier with prefill admissions
+    (TIER_RULES rule 10, ``prefill="prev"``), read through its ``on_gather`` callback.
 
+    The callback sees the capture's tier, where a released resident stayed VRAM-hot and so kept its RAM row (rule 3).
+    Unpinned at its release, it would have been the victim of any later eviction in its NUMA group that took a row
+    stamped more recently than it: such an eviction marks it cold. A return is the resident routed again within
+    ``horizon`` route lines while the capture still held it in VRAM; it is cold if marked, or if it had no RAM row at
+    its release."""
+    run = ltr.Run(cap.dir)
+    _, log = ltr.route_log(cap.dir)
+    off = ltr.align(run, log)
+    li_of_seq = {x.get("seq"): i for i, x in enumerate(cap.lines)}
+    by_line = {a: collections.defaultdict(list) for a in released}
+    for a, items in released.items():
+        for li, L, e in items:
+            by_line[a][li].append((L, e))
+    pending = {a: collections.defaultdict(dict) for a in released}  # layer -> expert -> [release line, stamp, cold]
+    snap: dict[tuple[int, int], dict] = {}
+    res = {a: collections.Counter() for a in released}
 
-def tier_returns(cap: Capture, released: list[tuple[int, int, int]], horizon: int) -> dict:
-    """Drive lane_tier_replay's NodeTier (TIER_RULES 1-6, 9; no prefill admissions, rule 8) over the route lines with
-    the released residents unpinned from their release until they are routed again or ``horizon`` lines pass, and
-    classify each return (routed again inside the horizon, while the capture kept it resident) as RAM-warm or
-    NVMe-cold."""
-    layers = len(cap.lines[0]["routes"])
-    rows, frac, share, full = capacities(cap.dir, layers)
-    tiers = [ltr.layer_tiers(rows.get(L, 210), frac, share) for L in range(layers)]
-    p_promote = ltr.promote_fraction(cap.dir)
-    lines = cap.lines
-    seqs = {r["seq"] for r in cap.records}
-    timeline = [(int(x["t"] * 1e9), 1, "line", i) for i, x in enumerate(lines)]
-    for e in cap.ev["evict"]:
-        if e["seq"] not in seqs:
-            timeline.append((e["ns"], 0, "evict", (e["row"], e["group"], e["a"], e["c"])))
-    for e in cap.ev["spec_land"]:
-        if ltr._hash01(e["row"], e["a"], e["ns"] & 0xFFFFFFFF) < p_promote:
-            timeline.append((e["ns"], 0, "promote", (e["row"], e["a"])))
-    timeline.sort(key=lambda t: (t[0], t[1]))
-    open_ = collections.defaultdict(dict)  # layer -> expert -> release line
-    by_line = collections.defaultdict(list)
-    for li, L, e in released:
-        by_line[li].append((L, e))
-    res = collections.Counter()
-    last_hot = collections.defaultdict(set)
-    tick = 0
-    for _, _, kind, payload in timeline:
-        tick += 1
-        if kind == "evict":
-            row, g, old, new = payload
-            if row < layers and row not in full:
-                tiers[row][g].apply_eviction(old, new, tick)
-            continue
-        if kind == "promote":
-            row, e = payload
-            if row < layers and row not in full:
-                tiers[row][e % NODES].promote(e, last_hot[row])
-            continue
-        li = payload
-        x = lines[li]
-        for L in range(layers):
-            routed = {e for e in x["routes"][L] if e >= 0}
-            hot = {e for e in x["hot"][L] if e >= 0}
-            for e, start in list(open_[L].items()):
+    def on_gather(v, L, tier, routed, hot, record):
+        i = v + off
+        li = li_of_seq.get(log[i].get("seq")) if 0 <= i < len(log) else None
+        for k in range(NODES):
+            now = tier[k].stamp
+            gone = [t for x, t in snap.get((L, k), {}).items() if x not in now]
+            if gone:
+                newest = max(gone)
+                for a in released:
+                    for e, p in pending[a][L].items():
+                        if e % NODES == k and p[1] is not None and newest > p[1]:
+                            p[2] = True
+            snap[(L, k)] = dict(now)
+        if li is None:
+            return
+        for a in released:
+            for e, (start, stamp, cold) in list(pending[a][L].items()):
                 if li - start > horizon or e not in hot:
-                    del open_[L][e]  # past the horizon, or the capture evicted it anyway
+                    del pending[a][L][e]  # past the horizon, or the capture evicted it from VRAM anyway
                 elif e in routed:
-                    res["returns"] += 1
-                    res["warm" if tiers[L][e % NODES].has(e) else "cold"] += 1
-                    del open_[L][e]
-            hot_cf = hot - set(open_[L])
-            last_hot[L] = hot_cf
-            if L in full:
-                continue
-            protected = hot_cf | routed
-            for e in routed:
-                t = tiers[L][e % NODES]
-                if t.has(e):
-                    t.stamp[e] = tick
-            for e in routed - hot_cf:
-                tiers[L][e % NODES].insert(e, tick, protected)
-        for L, e in by_line.get(li, ()):
-            open_[L][e] = li
-        res["released"] += len(by_line.get(li, ()))
-    res["model"] = f"lane_tier_replay NodeTier (TIER_RULES={ltr.TIER_RULES}), no prefill admissions; promote {p_promote:.3f}"
-    return dict(res)
+                    res[a]["returns"] += 1
+                    res[a]["cold" if cold or stamp is None else "warm"] += 1
+                    del pending[a][L][e]
+            for LL, e in by_line[a].get(li, ()):
+                if LL == L:
+                    pending[a][L][e] = [li, tier[e % NODES].stamp.get(e), False]
+                    res[a]["released"] += 1
+
+    _, stats = ltr.tier_replay(run, len(cap.lines[0]["routes"]), prefill="prev", on_gather=on_gather)
+    model = (f"lane_tier_replay NodeTier with prefill admissions (TIER_RULES={ltr.TIER_RULES}, prefill=prev); "
+             f"align offset {stats.get('align_offset')}")
+    return {a: {**dict(c), "model": model} for a, c in res.items()}
 
 
 def victims(d: str) -> dict:

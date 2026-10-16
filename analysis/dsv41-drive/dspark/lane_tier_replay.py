@@ -352,6 +352,27 @@ class NodeTier:
         if len(self.stamp) < self.capacity or new in self.stamp:
             self.stamp[new] = tick
 
+    def admit(self, e: int, tick: int, hot: set, protected: set, filling: set, fallback: bool) -> bool:
+        """A Python-side admission (take_slot_locked, ram_tier.h:2038): a free slot, else the LRU row that is not hot,
+        protected or filling; with ``fallback`` a protected one when nothing else qualifies. False: no slot taken."""
+        if len(self.stamp) >= self.capacity:
+            best = spare = None
+            for x, t in self.stamp.items():
+                if x in hot or x in filling:
+                    continue
+                if x in protected:
+                    if spare is None or t < self.stamp[spare]:
+                        spare = x
+                elif best is None or t < self.stamp[best]:
+                    best = x
+            if best is None and fallback:
+                best = spare
+            if best is None:
+                return False
+            del self.stamp[best]
+        self.stamp[e] = tick
+        return True
+
 
 # The RAM tier's rules, from the code the A/B ran (lane-head-ab d269f7aa90; paths under
 # python/sglang/kernels/jit/csrc/moe/expert_stream/host/ unless given):
@@ -388,7 +409,20 @@ class NodeTier:
 #     admissions and their victims emit no event: the trace cannot show them.
 #  9. A promotion's victim is not traced either (promote_landed calls take_victim_locked with count_eviction false and
 #     no trace_evict, ram_tier.h:2949). Only decode demand misses emit `evict` (ram_tier.h:2141 trace_evict).
-TIER_RULES = 9
+#  10. Rule 8 in detail (stage 0, PREFILL_CAPTURE_PLAN.md section 3; srt/layers/moe/expert_stream.py unless given). Every
+#     eager streamed MoE call (prefill, and the eager verifies before the graphs) runs _apply_streamed (exl3.py:778) over
+#     the layer's sorted distinct routed experts. prefill_fills (:2118) first claims the VRAM misses not mapped in RAM,
+#     in ascending order, protected = every routed expert of the layer, no fallback (prefetch_rows :496, fill_begin):
+#     the claim loop stops at the first expert with no victim (ram_tier.h:476). Claimed rows are `filling` until the
+#     first demand admission joins the prefetch (_fill_rows :469 calls finish_fills). Then the gather runs in chunks of
+#     64 routed experts (iter_gather_experts_host, EXL3_MAX_GATHER_ROWS): gather_rows (:685) looks the chunk's VRAM
+#     misses up, restamping each mapped one (lookup :406 touch, prefetched rows included), and admits the rest through
+#     ensure_rows -> _fill_rows -> fill_begin(fallback=True, protected = the chunk's experts).
+#     The line's `ram_miss` is the gather's host_read_rows: only rows recorded by _record_read inside the gather's
+#     window (_gather_eager_rows :2431). _fill_rows records rows=len(slots) (:479); prefetch_rows records no read and
+#     _wait_fill records time only (:552). So `ram_miss` counts the chunk (demand) admissions and not the prefetch's
+#     claims; a prefill's reads are claims + ram_miss.
+TIER_RULES = 10
 
 
 def numa_capacities(d: str) -> tuple[dict[int, int], float, int, list[int]]:
@@ -399,7 +433,11 @@ def numa_capacities(d: str) -> tuple[dict[int, int], float, int, list[int]]:
         for line in f:
             if "Pinned host expert cache startup" in line:
                 info = json.loads(line[line.index("{"):])
-                rows = {int(k): v for k, v in info["rows_per_layer"].items()}
+                if "rows_per_layer" in info:
+                    rows = {int(k): v for k, v in info["rows_per_layer"].items()}
+                else:  # older logs give the total only; the tier splits it evenly, the remainder to the first layers
+                    n, total = info["layers"], info["rows"]
+                    rows = {L: total // n + (L < total % n) for L in range(n)}
                 b = info["numa"]["bound_bytes"]
                 frac = int(b["0"]) / (int(b["0"]) + int(b["1"]))
                 full = info.get("full_layers", [])
@@ -428,6 +466,56 @@ def route_log(d: str) -> tuple[dict, list[dict]]:
             elif r.get("kind") == "graph_routes" and r.get("phase") == "target_verify" and "hot" in r:
                 recs.append(r)
     return header, recs
+
+
+def eager_lines(d: str) -> list[dict]:
+    """The route log's eager MoE lines (no `kind`; Exl3StreamTrace.record): prefills and the eager verifies, in order."""
+    out = []
+    with open(os.path.join(d, "stages.jsonl")) as f:
+        for line in f:
+            if '"kind"' in line or '"layer"' not in line:
+                continue
+            r = json.loads(line)
+            if "phase" in r:
+                out.append(r)
+    return out
+
+
+GATHER_CHUNK = 64  # EXL3_MAX_GATHER_ROWS
+
+
+def eager_admit(tier: list[NodeTier], line: dict, hot: set, tick: int, nodes: int = 2) -> tuple[int, int, int, int]:
+    """Rule 10 on one eager line. Returns (next tick, prefetch claims, demand admissions, VRAM misses)."""
+    routed = sorted(e for e in line["experts"] if e >= 0)
+    protected = set(routed)
+    vmiss = [e for e in routed if e not in hot]
+    filling: set = set()
+    claims = 0
+    for e in vmiss:  # the prefetch: ascending, all routed protected, no fallback; stops at the first refusal
+        t = tier[e % nodes]
+        if t.has(e):
+            continue
+        tick += 1
+        if not t.admit(e, tick, hot, protected, filling, fallback=False):
+            break
+        filling.add(e)
+        claims += 1
+    demand = 0
+    for start in range(0, len(routed), GATHER_CHUNK):
+        chunk = routed[start:start + GATHER_CHUNK]
+        cset = set(chunk)
+        for e in chunk:
+            if e in hot:
+                continue
+            t = tier[e % nodes]
+            tick += 1
+            if t.has(e):
+                t.stamp[e] = tick  # lookup's touch
+                continue
+            filling = set()  # _fill_rows joined the prefetch
+            if t.admit(e, tick, hot, cset, filling, fallback=True):
+                demand += 1
+    return tick, claims, demand, len(vmiss)
 
 
 def align(run: Run, log: list[dict]) -> int:
@@ -462,11 +550,16 @@ def _hash01(*xs: int) -> float:
     return (h >> 11) / float(1 << 53)
 
 
-def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
+def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None = None,
+                on_gather=None) -> tuple[dict, dict]:
     """Drive the RAM tier through the run (TIER_RULES; ``rules`` False is the first gate's plain LRU of 170 rows) and
     classify each record's GPU lanes (the experts it inserted into VRAM: its unforced lanes) as NVMe-cold, pool-served
     or RAM-warm. Outside the replayed verifies (prefill, warm-up, eager forwards) the trace's own evictions are applied,
-    since the lane key does not touch them. Returns per record seq the predicted (gpu_nvme, gpu_pool) and counts."""
+    since the lane key does not touch them. With ``prefill`` (stage 0), every eager route-log line also admits by rule
+    10, its VRAM-hot set taken from the graph verify before it ("prev") or after it ("next"); the per-line counts are
+    in stats["eager"]. ``on_gather(v, L, tier, routed, hot, record)`` is called at each replayed gather (verify window
+    v, layer L) before the gather updates the tier: ``tier[e % 2].has(e)`` is "expert e of row L is in RAM now";
+    ``record`` is the trace's Record or None. Returns per record seq the predicted (gpu_nvme, gpu_pool) and counts."""
     header, log = route_log(run.dir)
     off = align(run, log)
     rows, frac, share, full = numa_capacities(run.dir)
@@ -495,13 +588,34 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
         for _, e in _events(glob.glob(os.path.join(run.dir, "events.*.exl3-spec*.jsonl")), {"spec_land"}):
             if _hash01(e["row"], e["a"], e["ns"] & 0xFFFFFFFF) < p_promote:
                 timeline.append((e["ns"], 0, "promote", (e["row"], e["a"])))
+    graph_t = [g["t"] for g in log]
+    eager = eager_lines(run.dir) if prefill else []
+    for k, line in enumerate(eager):
+        # rule 10: the line is written after its layer's gather, so its admissions sit just before `t`
+        timeline.append((int(line["t"] * 1e9) - 1, 0, "eager", k))
     last_hot = collections.defaultdict(set)
     timeline.sort(key=lambda t: (t[0], t[1]))
     pred: dict[int, tuple[int, int]] = {}
     stats = collections.Counter()
+    per_line = []
     tick = 0
     for ns, _, kind, payload in timeline:
         tick += 1
+        if kind == "eager":
+            line = eager[payload]
+            L = line["layer"]
+            if L >= layers or L in full:
+                continue
+            if prefill == "next":
+                j = bisect.bisect_right(graph_t, line["t"])
+                hot = set(log[j]["hot"][L]) if j < len(log) else last_hot[L]
+            else:
+                hot = last_hot[L]
+            tick, claims, demand, vmiss = eager_admit(tiers[L], line, hot, tick)
+            per_line.append({"fpid": line["forward_pass_id"], "phase": line["phase"], "layer": L,
+                             "tokens": line["tokens"], "claims": claims, "demand": demand, "ram_miss": line["ram_miss"],
+                             "vmiss": vmiss, "vram_miss": line["vram_miss"]})
+            continue
         if kind == "evict":
             row, g, old, new = payload
             if row < layers and row not in full:
@@ -523,6 +637,8 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
         misses = routed - hot
         r = by_vr.get((v, L))
         cold_pred = set() if L in full else {e for e in misses if not tiers[L][e % nodes].has(e)}
+        if on_gather is not None:
+            on_gather(v, L, tiers[L], routed, hot, r)
         if r is not None and nxt is not None:
             inserted = (set(nxt["hot"][L]) - hot) & misses
             pool = set(r.pool)
@@ -549,6 +665,8 @@ def tier_replay(run: Run, layers: int, rules: bool = True) -> tuple[dict, dict]:
                 t.stamp[e] = tick
         for e in sorted(misses, key=lambda x: x not in cold_pred):  # rule 5: every miss is cached
             tiers[L][e % nodes].insert(e, tick, protected)
+    if prefill:
+        stats["eager"] = per_line
     stats["align_offset"] = off
     stats["promote_fraction"] = round(p_promote, 3)
     stats["capacities"] = {L: [t.capacity for t in tiers[L]] for L in (2, 39)}
@@ -562,7 +680,31 @@ def within(x: float, target: float, rel: float) -> bool:
     return abs(x - target) <= abs(target) * rel
 
 
-def gate(off_dir: str, on_dir: str, bootstrap: int) -> dict:
+def reads_check(run: Run, eager: list[dict]) -> dict:
+    """Stage 0's check 0.3: per serving prompt (the last len(prompts) prefills), the replay's demand admissions against
+    the route log's ram_miss (rule 10: both exclude the prefetch's claims), within 10%; and the replay's VRAM misses
+    against the line's vram_miss, which checks the hot set it used."""
+    fpids = list(dict.fromkeys(x["fpid"] for x in eager if x["phase"] == "extend"))
+    serving = fpids[-len(run.prompts):]
+    out = {}
+    for k, f in enumerate(serving):
+        xs = [x for x in eager if x["fpid"] == f]
+        sim, obs = sum(x["demand"] for x in xs), sum(x["ram_miss"] for x in xs)
+        out[f"prompt{k}_fpid{f}"] = {
+            "demand_sim": sim, "ram_miss": obs, "claims_sim": sum(x["claims"] for x in xs),
+            "vmiss_sim": sum(x["vmiss"] for x in xs), "vram_miss": sum(x["vram_miss"] for x in xs),
+            "ok": within(sim, obs, 0.10)}
+    xs = [x for x in eager if x["fpid"] in set(serving)]
+    a = np.array([x["demand"] for x in xs], dtype=float)
+    b = np.array([x["ram_miss"] for x in xs], dtype=float)
+    out["per_layer_corr"] = round(float(np.corrcoef(a, b)[0, 1]), 3) if a.std() and b.std() else None
+    out["warmup"] = {f"fpid{f}": [sum(x["demand"] for x in eager if x["fpid"] == f),
+                                  sum(x["ram_miss"] for x in eager if x["fpid"] == f)]
+                     for f in fpids[:-len(run.prompts)]}
+    return out
+
+
+def gate(off_dir: str, on_dir: str, bootstrap: int, prefill: str | None = None) -> dict:
     off, on = Run(off_dir), Run(on_dir)
     # serve_compare's pair verdict: prompts with no flag in either run
     both = [a and b for a, b in zip(off.clean, on.clean)]
@@ -586,8 +728,11 @@ def gate(off_dir: str, on_dir: str, bootstrap: int) -> dict:
         "off_in_sample_stream": [round(p_off["stream"], 2), round(m_off["stream"], 2), within(p_off["stream"], m_off["stream"], 0.10)],
         "off_in_sample_wait": [round(p_off["wait"], 2), round(m_off["wait"], 2), within(p_off["wait"], m_off["wait"], 0.10)],
     }
-    t_off, s_off = tier_replay(off, layers)
-    t_on, s_on = tier_replay(on, layers)
+    t_off, s_off = tier_replay(off, layers, prefill=prefill)
+    t_on, s_on = tier_replay(on, layers, prefill=prefill)
+    if prefill:
+        res["prefill_hot"] = prefill
+        res["R"] = {"off": reads_check(off, s_off.pop("eager")), "on": reads_check(on, s_on.pop("eager"))}
     nv_off = s_off["pred_gpu_nvme"] / off.n_verifies()
     nv_on = s_on["pred_gpu_nvme"] / on.n_verifies()
     ob_off = s_off["obs_gpu_nvme"] / off.n_verifies()
@@ -618,11 +763,13 @@ def gate(off_dir: str, on_dir: str, bootstrap: int) -> dict:
                        within(e_on["wait"] - e_off["wait"], dm["wait"], 0.25)],
     }
     res["passed"] = {part: all(v[-1] for v in res[part].values()) for part in ("P", "T", "E")}
-    res["diagnosis"] = diagnose(off, on, prices, layers)
+    if prefill:
+        res["passed"]["R"] = all(p["ok"] for arm in res["R"].values() for k, p in arm.items() if k.startswith("prompt"))
+    res["diagnosis"] = diagnose(off, on, prices, layers, prefill)
     return res
 
 
-def diagnose(off: Run, on: Run, prices: Prices, layers: int) -> dict:
+def diagnose(off: Run, on: Run, prices: Prices, layers: int, prefill: str | None = None) -> dict:
     """Where the gate's parts miss: the same prices fit on ON (does a cost move between runs?), the wait error by a
     record's GPU NVMe lanes, and the tier replay's misclassified GPU lanes by the verify's place after its prefill."""
     out = {"prices_fit_on_on": Prices(on).describe()}
@@ -644,7 +791,7 @@ def diagnose(off: Run, on: Run, prices: Prices, layers: int) -> dict:
         # the tier replay against the trace, lane by lane, by verifies since the request's first verify
         header, log = route_log(run.dir)
         off_i = align(run, log)
-        pred, _ = tier_replay(run, layers)
+        pred, _ = tier_replay(run, layers, prefill=prefill)
         by_vr = {(r.verify, r.row): r for r in run.records}
         first = {}
         for v in range(len(run.verifies)):
@@ -736,13 +883,16 @@ def main() -> int:
     g.add_argument("on")
     g.add_argument("--bootstrap", type=int, default=200, help="resamples of verifies for the prices' spread")
     g.add_argument("--json")
+    g.add_argument("--prefill", choices=("prev", "next"),
+                   help="stage 0: admit every eager route-log line by rule 10, with the hot set of the graph verify "
+                        "before it or after it")
     dp = sub.add_parser("departures")
     dp.add_argument("runs", nargs="+")
     a = ap.parse_args()
     if a.cmd == "departures":
         print(json.dumps({d: departures(d, 40) for d in a.runs}, indent=1))
         return 0
-    res = gate(a.off, a.on, a.bootstrap)
+    res = gate(a.off, a.on, a.bootstrap, a.prefill)
     print(json.dumps(res, indent=1))
     if a.json:
         with open(a.json, "w") as f:
