@@ -1126,9 +1126,11 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
-        self.tp_worker.init_cuda_graphs()
+        with startup_memory_probe("target graph capture"):  # logs only under SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
+            self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
-            self.draft_worker.init_cuda_graphs()
+            with startup_memory_probe("draft graph capture"):
+                self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
         # Load model weights.
