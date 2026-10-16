@@ -1159,6 +1159,13 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
           - **Decision:** run the served A/B first. 0.77 ms/verify is ~0.21 ms/token against an expected gain of
             1.2-1.4 ms/token; fusion would save only ~0.11 ms/token. Fuse, and then PDL, only if the A/B shows a
             gain.
+        - **A/B setup:**
+          - The throwaway branch `lane-head-ab` (lane-head + prefill-merge-chunk) is needed because the
+            `-mergechunk-expseg` arm uses the merge budget.
+          - Arms: `-mergechunk-expseg` against `-mergechunk-expseg-lanehead`. Both have the expert route-log trace
+            on (`SGLANG_DSV41_EXPERT_TRACE_PATH`, under /mnt/nvme1), so exact hits/verify can be counted. The
+            flag is the only difference.
+          - The head's gate→plan cost is taken from the microbenchmark.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
