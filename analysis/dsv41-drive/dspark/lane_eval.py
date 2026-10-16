@@ -33,6 +33,7 @@ Arms (the key orders the misses; the first k are inserted):
   product-emp  the product key with G_cold the served cost of the move itself (AB_SERVED_PER_COLD_LANE, +0.26 ms per
             NVMe-cold lane put on the GPU), G_warm from P.
   oracle-p  the product key with P = 1 for misses the next verify routes, else 0.
+  oracle-emp  product-emp's key with that oracle P: the ceiling of any tier-priced predictor, option (a) included.
 
 Net figures are against `today`. `_bias` prices every arm's NVMe-cold GPU lanes x 15.10/13.79 (T's under-prediction on
 the A/B); `_ab` charges AB_RESIDUAL_PER_COLD_LANE per NVMe-cold GPU lane added over `today` (P's net error on that
@@ -56,7 +57,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane_tier_replay as ltr  # noqa: E402
 
-ARMS = ("actual", "today", "head", "capb", "product", "product-ab", "product-emp", "oracle", "oracle-p")
+ARMS = ("actual", "today", "head", "capb", "product", "product-ab", "product-emp", "oracle", "oracle-p",
+        "oracle-emp")
 HEAD_ARMS = ("head", "capb", "product", "product-ab", "product-emp")
 NODES = 2
 
@@ -231,8 +233,9 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
             plan = sorted(misses, key=lambda e: (-(pred.get(e, 0.0) * kk.H - kk.G(e in warm, cnt[e])), -sc[e], e))
         elif arm == "oracle":
             plan = sorted((e for e in misses if e in nxt_u), key=lambda e: (-sc[e], e))
-        elif arm == "oracle-p":
-            plan = sorted(misses, key=lambda e: (-((e in nxt_u) * key.H - key.G(e in warm, cnt[e])), -sc[e], e))
+        elif arm in ("oracle-p", "oracle-emp"):
+            kk = key if arm == "oracle-p" else keys["product-emp"]
+            plan = sorted(misses, key=lambda e: (-((e in nxt_u) * kk.H - kk.G(e in warm, cnt[e])), -sc[e], e))
         else:
             raise ValueError(arm)
         if arm != "actual":
