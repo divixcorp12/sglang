@@ -207,6 +207,22 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   - `compaction_proactiveness` is back at 20.
   - The owner's `swapoff -a` was OOM-killed mid-way by prefill-merge's run 3; swap stays active, ~3.1 GB used.
   - **Every run before this used the old settings.** A'' (A' rerun) is the new baseline and also measures the change.
+  - **A''** (`splitmodel-stream-mem-hicache1-r3`, same code and env as A'):
+
+    | run | ms/token | median verify | mean verify | wait | stream | tokens/verify |
+    |---|---|---|---|---|---|---|
+    | A'' | 70.9 | 249.2 | 273.4 | 137.8 | 46.7 | 3.52 |
+    | A' | 66.8 | 241.8 | 269.7 | 141.4 | 41.3 | 3.60 |
+
+    - No speed-up. Lower acceptance accounts for ~1.5 ms/token; the rest is stream +5.3 ms/verify against wait
+      -3.6. VRAM, split and lanes are unchanged.
+    - CPU expert ms/expert: team 0 is 5% slower, team 1 5% faster, so no consistent effect.
+    - Decode swap-in fell from 13,563 to 757 pages and major faults from 3,528 to 459. That is real, but invisible
+      in time.
+  - **Measurement limit:** the stream lane moves 5-9 ms per verify between runs with identical split, VRAM and
+    lanes (A vs A', A' vs D, A' vs A''). A single pair cannot resolve effects below ~5 ms/token.
+  - Resolved: the ~7 GiB read from sdb3 at launch is the DSpark draft, read cold each launch because it is evicted
+    and dropped (~20 s at ~470 MB/s). The target load is warm.
 - **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
   The 3120 MiB attribution uses a gated peak logger instead: `SGLANG_DEBUG_PREFILL_PEAK_LOG`, default off,
   `debug_utils/prefill_peak_log.py`, `187cf1b589`..`7951fc18eb`.
