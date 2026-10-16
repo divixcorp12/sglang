@@ -952,6 +952,15 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               GPU free memory every 1 s. If serving dips below the warm-up peak, calibration is missing a source.
             - Next: release the residue (drop `cuda_graph_metadata_of_bucket_and_bs` after the trial), expecting
               ~+27 slots. Then calib9, then the served A/B against expseg2.
+          - **calib9** (`0df35739c1`): served, peak free 682 ≥ 508.5, slots 1,047 (+12).
+            - Dropping the metadata dict freed nothing: the residue is still 168. It is memory the real capture
+              *reuses* (its own new allocation is +100). Candidates: `_forward_input_buffer_pool` and the
+              backend's capture-state buffers.
+            - The estimate of 232 overcounts by ~134, which is safe but costs ~10 slots. The "new allocation"
+              estimate (64) would be 34 under, which is unsafe, so it was rejected.
+            - Decision: keep 232 and run the served A/B against expseg2 now. Its main purpose is to check the
+              margin under load, with GPU free memory sampled every 1 s. Release the residue holders later, with
+              a per-holder diagnostic.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
