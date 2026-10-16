@@ -12,8 +12,8 @@ What a capture leaves behind and how this handles it:
   and counters (``reset_trial_routes``) and checks the updater is still disabled;
 * the DSpark draft's sampler hook: built and appended once (dspark_worker_v2), so the real capture reuses it;
 * the cached Exl3FusedMoE pointer tables: the caller drops them (forget_graph_path_state) before any resize;
-* the DSV4 attention backend's capture metadata keeps some trial blocks until the real capture replaces it: measured
-  as ``residue_torch`` and not credited back to the estimate (the pessimistic side).
+* the DSV4 attention backend's capture metadata pins trial blocks: emptied at teardown (``drop_capture_metadata``);
+  whatever torch still holds after that is measured as ``residue_torch`` and not credited back to the estimate.
 Observability forward hooks would be registered twice, so with them configured the trial is skipped.
 """
 
@@ -63,16 +63,46 @@ class TrialCapture:
         }
 
 
-def tensor_bytes(obj) -> int:
-    """Bytes of the CUDA tensors an object holds directly in its attributes (or in lists, tuples or dicts there)."""
-    total, seen = 0, set()
-    for value in vars(obj).values() if hasattr(obj, "__dict__") else ():
-        items = value.values() if isinstance(value, dict) else value if isinstance(value, (list, tuple)) else (value,)
-        for item in items:
-            if isinstance(item, torch.Tensor) and item.is_cuda and id(item) not in seen:
-                seen.add(id(item))
-                total += item.numel() * item.element_size()
-    return total
+def drop_capture_metadata(attn_backend) -> int:
+    """Empty a DSV4 attention backend's per-bucket capture metadata, the trial's blocks it pins (calib8b: 168 MiB
+    held until the real capture's init_cuda_graph_state replaced it, which cost the grow ~13 slots). Eager forwards
+    read it only with ``.get``; replay reads it only after the real capture, which rebuilds it. Returns how many
+    entries it dropped."""
+    metadata = getattr(attn_backend, "cuda_graph_metadata_of_bucket_and_bs", None)
+    if not isinstance(metadata, dict):
+        return 0
+    dropped = sum(len(entries) for entries in metadata.values())
+    attn_backend.cuda_graph_metadata_of_bucket_and_bs = {bucket: {} for bucket in metadata}
+    return dropped
+
+
+def tensor_bytes(obj, depth: int = 5, cuda_only: bool = True) -> int:
+    """Bytes of the (CUDA) tensors reachable from an object through its attributes, lists, tuples and dicts, up to
+    ``depth`` levels; each storage counted once."""
+    seen_objects, storages = set(), {}
+
+    def walk(value, level):
+        if isinstance(value, torch.Tensor):
+            if value.is_cuda or not cuda_only:
+                storage = value.untyped_storage()
+                storages[storage.data_ptr()] = storage.nbytes()
+            return
+        if level >= depth or id(value) in seen_objects:
+            return
+        seen_objects.add(id(value))
+        if isinstance(value, dict):
+            children = value.values()
+        elif isinstance(value, (list, tuple)):
+            children = value
+        elif hasattr(value, "__dict__") and not isinstance(value, type):
+            children = vars(value).values()
+        else:
+            return
+        for child in children:
+            walk(child, level + 1)
+
+    walk(obj, 0)
+    return sum(storages.values())
 
 
 def _state(device):
@@ -130,6 +160,8 @@ def trial_capture(model_runner, draft_worker=None) -> Optional[TrialCapture]:
         for runner in draft_runners:  # the real capture assigns them again
             runner.decode_cuda_graph_runner = None
             runner.prefill_cuda_graph_runner = None
+        for runner in (model_runner,) + draft_runners:
+            drop_capture_metadata(getattr(runner, "attn_backend", None))
         runners.clear()
         gc.collect()  # a graph backend and its runner reference each other
         set_global_graph_memory_pool(saved_pool)

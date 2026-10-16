@@ -61,7 +61,11 @@ def world(monkeypatch):
         return SimpleNamespace(decode=SimpleNamespace(runner=runner("target decode")), prefill=SimpleNamespace(runner=None))
 
     monkeypatch.setattr(cuda_graph_setup, "capture_cuda_graphs", capture)
-    draft_runner = SimpleNamespace(decode_cuda_graph_runner=None, prefill_cuda_graph_runner=None)
+    draft_runner = SimpleNamespace(
+        decode_cuda_graph_runner=None,
+        prefill_cuda_graph_runner=None,
+        attn_backend=SimpleNamespace(cuda_graph_metadata_of_bucket_and_bs={"draft": {1: "meta"}}),
+    )
 
     def draft_init():
         log.append(("capture draft", pools["global"]))
@@ -73,7 +77,11 @@ def world(monkeypatch):
 
 
 def test_the_trial_captures_into_a_private_pool_measures_and_tears_down(world):
-    trial = tc.trial_capture(SimpleNamespace(device="cuda"), world.draft)
+    target_backend = SimpleNamespace(cuda_graph_metadata_of_bucket_and_bs={"verify": {1: "meta"}, "decode": {}})
+    trial = tc.trial_capture(SimpleNamespace(device="cuda", attn_backend=target_backend), world.draft)
+    # The capture metadata that pinned calib8b's 168 MiB is emptied, keeping its buckets.
+    assert target_backend.cuda_graph_metadata_of_bucket_and_bs == {"verify": {}, "decode": {}}
+    assert world.draft_runner.attn_backend.cuda_graph_metadata_of_bucket_and_bs == {"draft": {}}
     assert ("capture target", "private") in world.log and ("capture draft", "private") in world.log
     assert ("cleanup", "target decode") in world.log and ("cleanup", "draft decode") in world.log
     assert world.pools["global"] is None and world.log[-1] == ("pool", None)  # restored
@@ -82,6 +90,22 @@ def test_the_trial_captures_into_a_private_pool_measures_and_tears_down(world):
     assert trial.persistent == 12 * M and trial.residue_torch == 4 * M
     assert trial.estimate == (214 - 8) * M  # module loads credited back, the pinned residue not
     assert trial.summary()["estimate_mib"] == 206
+
+
+def test_drop_capture_metadata_leaves_other_backends_alone():
+    assert tc.drop_capture_metadata(SimpleNamespace()) == 0
+    assert tc.drop_capture_metadata(None) == 0
+    backend = SimpleNamespace(cuda_graph_metadata_of_bucket_and_bs={"a": {1: 0, 2: 0}, "b": {4: 0}})
+    assert tc.drop_capture_metadata(backend) == 3
+
+
+def test_tensor_bytes_follows_nested_attributes_and_counts_a_storage_once():
+    shared = torch.zeros(256, dtype=torch.float32)  # 1 KiB
+    inner = SimpleNamespace(table=shared, view=shared[:10], extra=[torch.zeros(128, dtype=torch.float16)])
+    sampler = SimpleNamespace(head=SimpleNamespace(state={"inner": inner}), again=shared)
+    assert tc.tensor_bytes(sampler, cuda_only=False) == 1024 + 256
+    assert tc.tensor_bytes(sampler) == 0  # CPU tensors are not device memory
+    assert tc.tensor_bytes(sampler, depth=1, cuda_only=False) == 1024  # only the top-level tensor
 
 
 def test_forward_hooks_skip_the_trial(world, monkeypatch):

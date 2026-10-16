@@ -104,6 +104,7 @@ def test_the_margin_is_the_worst_chunk_gap_plus_the_spread_of_the_chunk_peaks():
     c = hc.Calibration(4096, 4000 * M, 12242 * M, (small,) + chunk, 13 * M)
     assert c.margin == (334 + (14434 - 14374)) * M
     assert c.peak_run is chunk[1]  # the regrow reads the highest chunk peak
+    assert [r["tokens"] for r in c.summary()["runs"]] == [2048, 4096, 4096, 4096]  # sizes, not MiB
 
 
 def test_the_highest_run_sets_lowest_free_and_the_last_repeat_the_margin():

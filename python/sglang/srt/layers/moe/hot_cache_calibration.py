@@ -231,7 +231,10 @@ class Calibration:
             "tokens": self.tokens,
             "free_before_mib": round(self.free_before / MIB, 1),
             "reserved_before_mib": round(self.reserved_before / MIB, 1),
-            "runs": [{k: round(v / MIB, 1) for k, v in vars(r).items() if v is not None} for r in self.runs],
+            "runs": [
+                {k: (v if k == "tokens" else round(v / MIB, 1)) for k, v in vars(r).items() if v is not None}
+                for r in self.runs
+            ],
             "nontorch_growth_mib": round(self.nontorch_growth / MIB, 1),
         }
         if self.verify is not None:
