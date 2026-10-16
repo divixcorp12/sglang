@@ -1263,6 +1263,22 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
               - **A prefill share already exists:** `SGLANG_DSV41_ENABLE_PREFILL_SHARE`, fixed at 64
                 rows/layer, off in the A/B. In 2026-09 (section 27.9) it gave a small decode gain for +0.5/+0.7 s
                 TTFT, priced before the GPU-lane split. A sweep of 0-128 rows waits until T passes.
+            - **Stage 0 PASSES; no capture needed** (code `5508b65381`, write-up `69370e9bda`,
+              `/mnt/nvme1/lane-tier-replay/stage0-prev.json`):
+              - ram_miss counts only demand admissions; the fill prefetch claims a further 1,000-1,830 rows per
+                prompt (`expert_stream.py:2431`, `:479`, `:552`).
+              - Reads check: the replay is within -0.1% to -6.3% of ram_miss on all 16 serving prompts. Per-layer
+                correlation is 0.999, and VRAM misses match within 0.5%.
+              - T, NVMe-cold GPU lanes per verify: OFF 13.79 vs 15.10 (-8.7%), ON 30.61 vs 33.22 (-7.9%), delta
+                +16.8 vs +18.1 (-7.2%). Lane precision/recall 0.94/0.86 and 0.96/0.88.
+              - E: Δstream +50.7 vs +51.7, Δwait -53.2 vs -46.9. P unchanged. T still under-predicts by ~8%.
+              - **Approved next (offline):** an evaluation on C2/base (today's key, current head, (b), product
+                ranking, oracle) and the prefill-share sweep (0-128 rows, no admission, layers 2-20 only), the
+                latter also combined with the best head arm.
+          - **Owner constraint (2026-10-16): no predictor that must be retrained per RAM size.** The head stays
+            tier-agnostic and outputs P(recur). Serving ranks by P(recur) x the time saved for the expert's live
+            tier, with tier costs measured at startup. A RAM-tier feature inside the head (a) is a last resort, used
+            only if it clearly beats that product.
           - **Owner question (2026-10-16):** consolidate the GPU drip into the hot cache (land drips in victim
             slots and commit residency) before more predictor work, since both pick RAM-resident experts for VRAM.
             The drip was off in both lane-head A/B arms (`drip_issued` 0), so that result is not confounded.
