@@ -14,8 +14,9 @@ Production (launch_prod.sh) runs it too, with three more options:
 - --skip-evict-port PORT: while anything listens on PORT (another of our servers reading the same files), check the
   floor without evicting;
 - --node0-warn-gib: warn, never refuse, when node 0 starts below it;
-- --holders ROOT: on a refusal, name the directories under each ROOT holding the most page cache (whole box: which
-  node a cached page sits on needs root), within --holders-budget-s.
+- --holders ROOT: on a refusal, name the directories under each ROOT holding the most page cache, within
+  --holders-budget-s. Whole box (which node a cached page sits on needs root), and only files this user may write:
+  the kernel reports any other file as fully cached.
 --dry-run evicts nothing and does not wait: it reports the floor, the nodes and the decision it would make.
 
 Usage: prelaunch_evict.py --log OUT.json [--previous RUN.memsample.jsonl] [--hicache-gib 11.75] [--margin-gib 1.0]
@@ -200,6 +201,10 @@ def _cached_or_zero(path: str) -> int:
     try:
         if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) == 0:
             return 0
+        # Since Linux 5.0 mincore (and cachestat) reports every page of a file the caller may not write as resident,
+        # so another user's file reads as fully cached (a 248 GiB root-owned mdbx.dat did on divix01): skip it.
+        if not os.access(path, os.W_OK):
+            return 0
         return cached_bytes(path)
     except (OSError, ValueError):
         return 0
@@ -257,7 +262,8 @@ def main() -> int:
             f"{after['0']['FilePages']} GiB)."
         ]
         if holders["holders"]:
-            lines.append("prelaunch: largest page-cache holders (whole box; per-node attribution needs root)"
+            lines.append("prelaunch: largest page-cache holders among files this user may write (whole box; other users' "
+                         "files and per-node attribution need root)"
                          + ("" if holders["complete"] else ", scan cut short by its time budget") + ":")
             lines += [f"prelaunch:   {h['gib']:8.2f} GiB  {h['path']}" for h in holders["holders"]]
         lines.append("prelaunch: free node 1 (as root: sync; echo 1 > /proc/sys/vm/drop_caches; or stop the co-tenant "

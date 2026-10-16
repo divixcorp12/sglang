@@ -104,6 +104,22 @@ def test_a_listening_port_skips_the_eviction_but_not_the_check(tmp_path):
     assert record["rounds"][0]["evicted"]["files"] == 0
 
 
+def test_the_holders_skip_files_this_user_may_not_write(tmp_path):
+    # The kernel reports every page of such a file as resident (a 248 GiB root-owned file read as fully cached).
+    if os.geteuid() == 0:
+        import pytest
+
+        pytest.skip("root may write every file")
+    (tmp_path / "ours").mkdir()
+    (tmp_path / "theirs").mkdir()
+    (tmp_path / "ours" / "a.bin").write_bytes(os.urandom(1 << 20))
+    theirs = tmp_path / "theirs" / "b.bin"
+    theirs.write_bytes(os.urandom(1 << 20))
+    theirs.chmod(0o444)
+    holders = pe.page_cache_holders([str(tmp_path)], budget_s=10)
+    assert [h["path"] for h in holders["holders"]] == [str(tmp_path / "ours")]
+
+
 def test_cached_bytes_counts_a_just_written_file_and_less_once_it_is_dropped(tmp_path):
     path = tmp_path / "f.bin"
     path.write_bytes(os.urandom(1 << 20))
