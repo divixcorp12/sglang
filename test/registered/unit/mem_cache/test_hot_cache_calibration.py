@@ -244,3 +244,58 @@ def test_headroom_projection_charges_back_a_released_reserve(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1800 * M, 32000 * M))
     with pytest.raises(hc.HotCacheHeadroomShort):  # 1800 - 1500 = 300 < 400
         hc.require_hot_cache_headroom("after capture", result)
+
+
+def _verify(drop=400, reserve=50, persistent=0, alloc_peak=25, reserve_peak=100):
+    """calib3's shape: the verify run took ~400 MiB of free memory, most of it outside torch."""
+    peak = hc.RunPeak((2500 + reserve_peak) * M, (2000 + alloc_peak) * M, (2500 + reserve) * M, (1482 - drop) * M)
+    return hc.VerifyRun(1482 * M, 2500 * M, 2000 * M, peak, (2000 + persistent) * M)
+
+
+def test_the_verify_drop_splits_into_torch_reserve_and_non_torch():
+    v = _verify()
+    assert (v.drop, v.reserve_growth, v.nontorch, v.persistent_torch) == (400 * M, 50 * M, 350 * M, 0)
+    assert v.capture_estimate == 100 * M  # the reserve it grew beats its 25 MiB allocated peak
+    assert _verify(reserve_peak=10).capture_estimate == 25 * M
+
+
+def test_settled_sizing_takes_free_memory_after_every_run_and_charges_the_regrow():
+    c = hc.replace(_cal(), verify=_verify(), capture_estimate=100 * M, free_final=1082 * M, reserved_final=1000 * M)
+    assert c.regrow == 1500 * M  # run-1 reserve peak 2500 over the 1000 torch still holds
+    assert c.lowest_free == (1082 - 1500) * M
+    assert c.keep_free == (1500 + 400 + 100) * M and c.room == (1082 - 1500 - 500) * M
+    assert c.slot_delta < 0
+    summary = c.summary()
+    assert summary["verify_mib"] == {"drop": 400, "torch_reserve": 50, "nontorch": 350, "persistent_torch": 0}
+    assert summary["free_final_mib"] == 1082 and summary["regrow_mib"] == 1500
+
+
+def test_tensors_the_verify_left_do_not_shrink_the_regrow():
+    c = hc.replace(_cal(), verify=_verify(persistent=30), free_final=3000 * M, reserved_final=1030 * M)
+    assert c.regrow == 1500 * M  # the 30 MiB the verify left was not there for the prefill
+
+
+def test_the_calib3_grow_would_have_been_sized_from_memory_the_verify_took():
+    """calib3: 1,482 MiB free after the prefill runs, the verify took 400, the grow planned ~1,054. The unsettled
+    sizing ignores the drop; the settled one counts it, so the grow is ~400 MiB smaller."""
+    held = (2500 - 1000) * M
+    unsettled = _cal(free=1482 + 1500 + 20, f1=1482)  # lowest free 1482, margin 400
+    settled = hc.replace(unsettled, free_final=1082 * M + held, reserved_final=1000 * M, verify=_verify())
+    assert unsettled.lowest_free - settled.lowest_free == 400 * M
+
+
+def test_plan_grow_prices_slots_in_granules_and_closes_a_layer_that_no_longer_fits():
+    G = 2
+    mapped = {0: 26, 1: 26}
+
+    def cost(layer, rows):  # 1.4 granule-units a row, rounded up per layer, over what is mapped
+        def granules(r):
+            return -(-r * 14 // 10)
+
+        return max(0, granules(rows) - granules(mapped[layer])) * G
+
+    keep = hc.plan_grow({0: 26, 1: 26}, budget=8, upper={0: 40, 1: 27}, cost=cost)
+    spent = sum(cost(layer, keep[layer]) for layer in keep)
+    assert spent <= 8 and keep[1] == 27  # layer 1 stops at its bound
+    assert keep[0] > 27  # layer 0 keeps growing after layer 1 closed
+    assert hc.plan_grow({0: 26}, budget=0, upper={0: 40}, cost=cost) == {0: 26}

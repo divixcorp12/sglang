@@ -1,10 +1,11 @@
 """Size the expert hot cache at startup from a measured prefill peak (SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP, step 3).
 
 After the KV pools and attention backends exist and before any CUDA graph is captured, the scheduler's hook calls
-``maybe_calibrate_hot_cache``. It runs one dummy EXTEND prefill of the configured chunk size through the target model
-twice (allocator cache emptied first), measures the lowest free device memory the prefill reaches, and, when that is
-below the margin, retires just enough trailing hot-cache slots (hot_cache_retire.retire_hot_slots) to restore it.
-Trim-only: it never grows the cache.
+``maybe_calibrate_hot_cache``. It runs the warm-up's largest dummy EXTEND prefills through the target model (allocator
+cache emptied first) and one eager verify forward for the capture estimate, empties the allocator cache again and
+measures free memory (``settle``), then trims or grows the hot cache to fit (hot_cache_retire.set_hot_capacity). A
+grow is priced in mapped granules (``plan_grow``) and is guarded layer by layer against free memory; it stops short,
+never fails the launch.
 
 Measured, all in this launch:
   F0, R0: cudaMemGetInfo free and torch reserved before the first run (after empty_cache);
@@ -30,8 +31,8 @@ import contextlib
 import contextvars
 import logging
 import math
-from dataclasses import dataclass, field
-from typing import Dict, Iterator, Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import Callable, Dict, Iterator, Mapping, Optional
 
 import torch
 
@@ -95,6 +96,43 @@ class RunPeak:
 
 
 @dataclass(frozen=True)
+class VerifyRun:
+    """The capture estimate's eager verify forward: device state just before it, its peaks, and allocated after."""
+
+    free_before: int
+    reserved_before: int
+    allocated_before: int
+    peak: RunPeak
+    allocated_after: int
+
+    @property
+    def drop(self) -> int:
+        """Free device memory the run took."""
+        return self.free_before - self.peak.free_after
+
+    @property
+    def reserve_growth(self) -> int:
+        """Of the drop: torch's reserve, cached afterwards (empty_cache gives back what no tensor holds)."""
+        return self.peak.reserved_after - self.reserved_before
+
+    @property
+    def nontorch(self) -> int:
+        """Of the drop: memory outside torch (module loads, workspaces), kept for the life of the process."""
+        return self.drop - self.reserve_growth
+
+    @property
+    def persistent_torch(self) -> int:
+        """torch tensors the run left allocated."""
+        return max(0, self.allocated_after - self.allocated_before)
+
+    @property
+    def capture_estimate(self) -> int:
+        """What capture's private pool will hold: the run's allocated peak above its start, or its reserve growth
+        when larger (blocks the cached reserve could not serve)."""
+        return max(0, self.peak.allocated_peak - self.allocated_before, self.peak.reserved_peak - self.reserved_before)
+
+
+@dataclass(frozen=True)
 class Calibration:
     tokens: int
     free_before: int
@@ -106,6 +144,11 @@ class Calibration:
     capture_estimate: int = 0
     # torch allocated before the first run, the base of the calibration's transient.
     allocated_before: Optional[int] = None
+    verify: Optional[VerifyRun] = None
+    # cudaMemGetInfo free and torch reserved after every run, with the allocator cache emptied: the memory the hot
+    # cache can grow into, with whatever the runs kept outside torch already taken out.
+    free_final: Optional[int] = None
+    reserved_final: Optional[int] = None
 
     @property
     def peak_run(self) -> RunPeak:
@@ -117,9 +160,32 @@ class Calibration:
         return max(0, (self.free_before - last.free_after) - (last.reserved_after - self.reserved_before))
 
     @property
+    def regrow(self) -> int:
+        """Reserve the next full-size prefill takes back out of free memory, measured from the final state: its
+        reserve peak over what torch still holds (less tensors the verify run left, which the prefill did not
+        have)."""
+        persistent = self.verify.persistent_torch if self.verify is not None else 0
+        return max(0, self.peak_run.reserved_peak - (self.reserved_final - persistent))
+
+    @property
     def lowest_free(self) -> int:
-        """Over the whole run sequence: the highest reserve it reached, and what it took outside torch."""
+        """Over the whole run sequence: the highest reserve it reached, and what it took outside torch. With the
+        final measurement, the free memory after every run (verify included) less the reserve a prefill re-grows."""
+        if self.free_final is not None:
+            return self.free_final - self.regrow
         return self.free_before - (self.peak_run.reserved_peak - self.reserved_before) - self.nontorch_growth
+
+    @property
+    def keep_free(self) -> int:
+        """Free memory a hot-cache grow must leave right after calibration: what the prefill re-grows plus
+        ``required``."""
+        held = self.free_final - self.lowest_free if self.free_final is not None else 0
+        return held + self.required
+
+    @property
+    def room(self) -> int:
+        """Bytes the hot cache can grow by (negative: short)."""
+        return self.lowest_free - self.required
 
     @property
     def margin(self) -> int:
@@ -140,23 +206,63 @@ class Calibration:
     @property
     def slot_delta(self) -> int:
         """Slots to add (positive: whole slots the room above ``required`` buys) or retire (negative)."""
-        room = self.lowest_free - self.required
+        room = self.room
         return room // self.slot_bytes if room >= 0 else -self.slots_to_retire
 
     def summary(self) -> dict:
-        return {
+        out = {
             "tokens": self.tokens,
             "free_before_mib": round(self.free_before / MIB, 1),
             "reserved_before_mib": round(self.reserved_before / MIB, 1),
             "runs": [{k: round(v / MIB, 1) for k, v in vars(r).items()} for r in self.runs],
             "nontorch_growth_mib": round(self.nontorch_growth / MIB, 1),
-            "lowest_free_mib": round(self.lowest_free / MIB, 1),
-            "margin_mib": round(self.margin / MIB, 1),
-            "capture_estimate_mib": round(self.capture_estimate / MIB, 1),
-            "required_mib": round(self.required / MIB, 1),
-            "slots_to_retire": self.slots_to_retire,
-            "slot_delta": self.slot_delta,
         }
+        if self.verify is not None:
+            v = self.verify
+            out["verify_mib"] = {
+                "drop": round(v.drop / MIB, 1),
+                "torch_reserve": round(v.reserve_growth / MIB, 1),
+                "nontorch": round(v.nontorch / MIB, 1),
+                "persistent_torch": round(v.persistent_torch / MIB, 1),
+            }
+        if self.free_final is not None:
+            out.update(
+                free_final_mib=round(self.free_final / MIB, 1),
+                reserved_final_mib=round(self.reserved_final / MIB, 1),
+                regrow_mib=round(self.regrow / MIB, 1),
+                keep_free_mib=round(self.keep_free / MIB, 1),
+            )
+        out.update(
+            lowest_free_mib=round(self.lowest_free / MIB, 1),
+            margin_mib=round(self.margin / MIB, 1),
+            capture_estimate_mib=round(self.capture_estimate / MIB, 1),
+            required_mib=round(self.required / MIB, 1),
+            room_mib=round(self.room / MIB, 1),
+            slots_to_retire=self.slots_to_retire,
+            slot_delta=self.slot_delta,
+        )
+        return out
+
+
+def plan_grow(
+    capacity: Mapping[int, int], budget: int, upper: Mapping[int, int], cost: Callable[[int, int], int]
+) -> Dict[int, int]:
+    """Each layer's slots after growing into ``budget`` bytes: one slot at a time to the emptiest layer below its
+    upper bound (lowest layer id on ties), priced by ``cost(layer, rows)`` -- the bytes backing ``rows`` maps on top of
+    what is mapped now, whole granules -- so a slot that crosses a granule costs that granule and one that does not
+    is free. A layer whose next slot no longer fits is closed; the others may still take theirs."""
+    keep, spent, closed = dict(capacity), 0, set()
+    while True:
+        open_layers = [l for l in keep if l not in closed and keep[l] < upper.get(l, keep[l])]
+        if not open_layers:
+            return keep
+        layer = min(open_layers, key=lambda l: (keep[l], l))
+        step = cost(layer, keep[layer] + 1) - cost(layer, keep[layer])
+        if spent + step > budget:
+            closed.add(layer)
+            continue
+        spent += step
+        keep[layer] += 1
 
 
 def plan_capacity(
@@ -234,12 +340,32 @@ def calibrate(run_prefill, *, tokens: int, slot_bytes: int, device, run_verify=N
     with calibration_context():
         runs = tuple(_measure(lambda n=n: run_prefill(n), device) for n in shapes[:-1])
         runs += (_measure(lambda: run_prefill(shapes[-1]), device),)
+        verify = None
         if run_verify is not None:
             torch.cuda.synchronize(device)
-            allocated = torch.cuda.memory_allocated(device)
+            state = (
+                torch.cuda.mem_get_info(device)[0],
+                torch.cuda.memory_reserved(device),
+                torch.cuda.memory_allocated(device),
+            )
             peak = _measure(run_verify, device)
-            capture_estimate = max(0, peak.allocated_peak - allocated)
-    return Calibration(tokens, free_before, reserved_before, runs, slot_bytes, capture_estimate, allocated_before)
+            verify = VerifyRun(*state, peak, torch.cuda.memory_allocated(device))
+            capture_estimate = verify.capture_estimate
+    return Calibration(
+        tokens, free_before, reserved_before, runs, slot_bytes, capture_estimate, allocated_before, verify
+    )
+
+
+def settle(calibration: Calibration, device) -> Calibration:
+    """The calibration with its final measurement: allocator cache emptied, then free memory and torch reserved.
+    Whatever the runs kept outside torch is gone from this free memory, so a grow sized from it cannot count it."""
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    return replace(
+        calibration,
+        free_final=torch.cuda.mem_get_info(device)[0],
+        reserved_final=torch.cuda.memory_reserved(device),
+    )
 
 
 class KvPinMissed(RuntimeError):
@@ -290,20 +416,42 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
         run, tokens=tokens, slot_bytes=cache.bytes_per_expert, device=device, run_verify=verify
     )
     forget_graph_path_state(model_runner.model)
+    calibration = settle(calibration, device)
     floor = 2 * getattr(manager.gpu_residency, "victim_lanes", 0)
     capacity = {layer: c.capacity for layer, c in manager.caches.items()}
     upper = {
         layer: min(getattr(c, "upper_capacity", c.capacity), manager.gpu_residency.max_capacity)
         for layer, c in manager.caches.items()
     }
-    keep = plan_capacity(capacity, calibration.slot_delta, floor, upper)
-    retired = set_hot_capacity(manager, keep) if keep != capacity else None
+    if calibration.room >= 0:
+        keep = plan_grow(
+            capacity, calibration.room, upper, lambda layer, rows: manager.caches[layer].vmm_backing.bytes_to_back(rows)
+        )
+    else:
+        keep = plan_keep(capacity, calibration.slots_to_retire, floor)
+    # Logged before the resize, so a failure there still leaves the measurements in the log.
     logger.info(
-        "hot cache calibration: %s; slots %d -> %d (upper bound %d)",
+        "hot cache calibration: %s; plan slots %d -> %d (upper bound %d)",
         calibration.summary(),
         sum(capacity.values()),
         sum(keep.values()),
         sum(upper.values()),
+    )
+    retired = None
+    if keep != capacity:
+        retired = set_hot_capacity(
+            manager,
+            keep,
+            free_memory=lambda: torch.cuda.mem_get_info(device)[0],
+            keep_free=calibration.keep_free,
+        )
+        keep = dict(retired.kept)
+    logger.info(
+        "hot cache calibration: slots %d -> %d, free %.1f MiB after the resize (%.1f must stay free)",
+        sum(capacity.values()),
+        sum(keep.values()),
+        torch.cuda.mem_get_info(device)[0] / MIB,
+        calibration.keep_free / MIB,
     )
     result = CalibrationResult(calibration, keep, retired)
     watch_first_full_prefill(model_runner, result)

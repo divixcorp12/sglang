@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
+
+from sglang.srt.layers.moe.hot_cache_vmm import HotCacheMapOutOfMemory
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,9 @@ class RetireResult:
     retired: Dict[int, Tuple[int, int]]  # layer -> [first, end) of the retired slots
     evicted: Dict[int, List[int]] = field(default_factory=dict)
     freed_bytes: int = 0
+    # A grow that stopped early: layer -> slots asked for but not added, and why it stopped.
+    short: Dict[int, int] = field(default_factory=dict)
+    short_reason: str = ""
 
 
 class RetireRefused(RuntimeError):
@@ -96,11 +101,23 @@ def retire_hot_slots(manager, keep: Mapping[int, int], *, service: Any = "auto")
     return set_hot_capacity(manager, keep, service=service)
 
 
-def set_hot_capacity(manager, keep: Mapping[int, int], *, service: Any = "auto") -> RetireResult:
+def set_hot_capacity(
+    manager,
+    keep: Mapping[int, int],
+    *,
+    service: Any = "auto",
+    free_memory: Optional[Callable[[], int]] = None,
+    keep_free: int = 0,
+) -> RetireResult:
     """Set each listed layer's hot capacity to ``keep[layer]`` slots, lower or higher. Lowering evicts the retired
     slots and then releases their memory; raising maps the memory for the new slots first and then adds them FREE
     (promotions fill them). A layer grows only up to its cache's ``upper_capacity``. ``RetireResult.freed_bytes`` is
-    net: negative when the call mapped more than it released."""
+    net: negative when the call mapped more than it released.
+
+    Growing never fails the call. Layer by layer, with ``free_memory`` given, a layer grows only while
+    ``free_memory()`` less its mapping cost stays at or above ``keep_free``; a device out-of-memory while mapping
+    rolls that layer's mapping back. Either way growing stops there: the layers already grown keep their slots, the
+    rest keep their capacity, every holder agrees, and ``RetireResult.short`` records what was not added."""
     service = _service() if service == "auto" else service
     check_retire_allowed(manager, service)
     updater = manager.gpu_residency
@@ -116,12 +133,28 @@ def set_hot_capacity(manager, keep: Mapping[int, int], *, service: Any = "auto")
         if k > updater.max_capacity:
             raise RetireRefused(f"layer {layer_id}: keep {k} beyond the residency bank's {updater.max_capacity} slots")
     kept, retired, evicted, freed = {}, {}, {}, 0
+    short, short_reason = {}, ""
     for layer_id, k in keep.items():
         cache = manager.caches[layer_id]
         c = cache.capacity
         urow = updater.layer_ids.index(layer_id)
+        if k > c and not short_reason and free_memory is not None:
+            need, free = cache.vmm_backing.bytes_to_back(k), free_memory()
+            if free - need < keep_free:
+                short_reason = (
+                    f"layer {layer_id} needs {need / 2**20:.1f} MiB with {free / 2**20:.1f} MiB free, "
+                    f"{keep_free / 2**20:.1f} MiB must stay free"
+                )
+        if k > c and not short_reason:
+            try:
+                freed -= cache.vmm_backing.set_backed_rows(k)  # memory first, then the slots that use it
+            except HotCacheMapOutOfMemory as error:
+                short_reason = f"layer {layer_id}: {error}"
+        if k > c and short_reason:
+            short[layer_id] = k - c
+            kept[layer_id], retired[layer_id] = c, (c, c)
+            continue
         if k > c:
-            freed -= cache.vmm_backing.set_backed_rows(k)  # memory first, then the slots that use it
             _set_capacity(cache, manager.residency_policies.get(layer_id), updater, urow, k)
         elif k < c:
             evicted[layer_id] = _evict_tail(cache, updater, urow, k, c)
@@ -146,7 +179,14 @@ def set_hot_capacity(manager, keep: Mapping[int, int], *, service: Any = "auto")
         sum(len(v) for v in evicted.values()),
         -freed / 2**20,
     )
-    return RetireResult(kept, retired, evicted, freed)
+    if short:
+        logger.warning(
+            "hot cache capacity: grow stopped short by %d slots over %d layers (%s)",
+            sum(short.values()),
+            len(short),
+            short_reason,
+        )
+    return RetireResult(kept, retired, evicted, freed, short, short_reason)
 
 
 def _evict_tail(cache, updater, urow: int, k: int, c: int) -> List[int]:

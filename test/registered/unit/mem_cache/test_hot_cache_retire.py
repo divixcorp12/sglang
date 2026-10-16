@@ -6,7 +6,10 @@ Two kinds of test:
   capacity-named attribute that CAPACITY_HOLDERS neither lists nor exempts, so a new holder cannot slip past retire;
 * retire itself on CPU fakes with the real attribute names: evictions from the device bank, mapping and host lists,
   every capacity value lowered, the RAM-miss hot sets re-pushed, victims re-ranked, the VMM tail released, and the
-  ordering refusals (captured graph, armed copy engine, non-VMM cache, scratch rows, keep below the victim floor).
+  ordering refusals (captured graph, armed copy engine, non-VMM cache, scratch rows, keep below the victim floor);
+* a grow that cannot get its memory (injected: a mapping OOM on the first layer or part-way, or the free-memory guard
+  tripping before any mapping) stops short without raising, keeps the layers already grown, leaves every holder
+  consistent and the hot sets re-pushed, and the calibration hook still returns, so the launch goes on.
 """
 
 import ast
@@ -18,6 +21,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe import hot_cache_retire as hr
+from sglang.srt.layers.moe.hot_cache_vmm import HotCacheMapOutOfMemory
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -62,11 +66,22 @@ E, L, C = 16, 2, 20  # experts, layers, capacity (all layers)
 
 
 class FakeBacking:
+    """1 MiB a row. ``oom`` makes the next grow raise as the real backing does after rolling its mapping back."""
+
     def __init__(self):
         self.released = None
         self.backed_rows = C
+        self.oom = False
+        self.grow_calls = 0
+
+    def bytes_to_back(self, rows):
+        return max(0, rows - self.backed_rows) << 20
 
     def set_backed_rows(self, rows):
+        if rows > self.backed_rows:
+            self.grow_calls += 1
+            if self.oom:
+                raise HotCacheMapOutOfMemory("injected cuMemCreate OOM (rolled back)")
         delta, self.backed_rows = (rows - self.backed_rows) << 20, rows
         return delta
 
@@ -104,6 +119,7 @@ def _world(victim_lanes=8, upper=C):
             slot_to_expert=updater.slot_to_expert[row, :C].tolist(), slot_states=[3] * C, _slot_generations=[0] * C,
             slot_state=None, slot_generations=None, vmm_backing=FakeBacking(), scratch_rows=0, upper_capacity=upper,
             reserves_prefetch_pull_row=False, streamer=SimpleNamespace(row_planner=SimpleNamespace(scratch_base=C)),
+            device=torch.device("cpu"),
         )
         caches[layer] = cache
         policies[layer] = SimpleNamespace(capacity=C)
@@ -223,3 +239,89 @@ def test_an_unlisted_capacity_attribute_is_refused():
     with pytest.raises(hr.RetireRefused, match="unlisted capacity holder row_planner.shadow_capacity"):
         hr.retire_hot_slots(manager, {3: 17}, service=service)
     assert manager.caches[3].capacity == C and int(updater.capacity[0]) == C  # refused before any change
+
+
+def _grow_all(manager, service, **kwargs):
+    return hr.set_hot_capacity(manager, {3: 24, 7: 24}, service=service, **kwargs)
+
+
+def _all_holders(manager, updater, service):
+    return {layer: _holders(manager, updater, service, layer) for layer in (3, 7)}
+
+
+def test_an_oom_on_the_first_layer_grows_nothing_and_does_not_raise():
+    manager, updater, service, pushed, bound, ranked = _world(upper=26)
+    before = _all_holders(manager, updater, service)
+    manager.caches[3].vmm_backing.oom = True
+    result = _grow_all(manager, service)
+    assert result.kept == {3: C, 7: C} and result.short == {3: 4, 7: 4}
+    assert "injected cuMemCreate OOM" in result.short_reason and result.freed_bytes == 0
+    assert manager.caches[7].vmm_backing.grow_calls == 0  # stopped at the first failure
+    assert _all_holders(manager, updater, service) == before
+    assert pushed[0] == list(range(16)) and pushed[1] == list(range(16)) and bound and ranked  # service refreshed
+
+
+def test_an_oom_part_way_keeps_the_layers_already_grown():
+    manager, updater, service, *_ = _world(upper=26)
+    before7 = _holders(manager, updater, service, 7)
+    manager.caches[7].vmm_backing.oom = True
+    result = _grow_all(manager, service)
+    assert result.kept == {3: 24, 7: C} and result.short == {7: 4} and result.freed_bytes == -(4 << 20)
+    grown = _holders(manager, updater, service, 3)
+    assert grown["cache"][:4] == (24, 2400, 2400, 24) and grown["updater"][:2] == (24, 24)
+    assert grown["service"] == (24, 24) and grown["backed"] == 24 and grown["planner"] == 24
+    assert _holders(manager, updater, service, 7) == before7  # the failed layer is untouched
+    # The tables stay usable: the same authority moves both layers again.
+    manager.caches[7].vmm_backing.oom = False
+    hr.set_hot_capacity(manager, {3: C, 7: 22}, service=service)
+    assert _holders(manager, updater, service, 3)["cache"][0] == C and int(updater.capacity[1]) == 22
+
+
+def test_the_free_memory_guard_stops_before_any_mapping():
+    manager, updater, service, *_ = _world(upper=26)
+    before = _all_holders(manager, updater, service)
+    result = _grow_all(manager, service, free_memory=lambda: 100 << 20, keep_free=97 << 20)  # layer 3 needs 4 MiB
+    assert result.kept == {3: C, 7: C} and result.short == {3: 4, 7: 4}
+    assert "layer 3 needs 4.0 MiB" in result.short_reason
+    assert all(manager.caches[layer].vmm_backing.grow_calls == 0 for layer in (3, 7))
+    assert _all_holders(manager, updater, service) == before
+
+
+def test_the_guard_reads_free_memory_per_layer_and_stops_at_the_first_short_one():
+    manager, updater, service, *_ = _world(upper=26)
+    free = iter([10 << 20, 5 << 20])  # layer 3 mapped 4 MiB between the two reads
+    result = _grow_all(manager, service, free_memory=lambda: next(free), keep_free=2 << 20)
+    assert result.kept == {3: 24, 7: C} and result.short == {7: 4}
+    assert manager.caches[7].vmm_backing.grow_calls == 0
+
+
+def test_calibration_survives_a_grow_oom_and_reports_the_slots_it_got(monkeypatch):
+    """The launch path on fakes: the hook plans a grow, the mapping fails part-way, and it returns."""
+    from sglang.srt import runtime_context
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import hot_cache_calibration as hc
+    from sglang.srt.layers.moe import hot_cache_dummy_extend as hde
+
+    M = 1 << 20
+    manager, updater, service, *_ = _world(upper=26)
+    monkeypatch.setattr(hr, "_service", lambda: service)
+    manager.caches[7].vmm_backing.oom = True
+    run = hc.RunPeak(2500 * M, 2100 * M, 2500 * M, 2480 * M)
+    cal = hc.Calibration(4096, 4000 * M, 1000 * M, (run, run), 1 * M, 0, 1000 * M)
+    monkeypatch.setattr(hc, "calibrate", lambda *a, **k: cal)
+    monkeypatch.setattr(hc, "settle", lambda c, d: hc.replace(c, free_final=2420 * M, reserved_final=1000 * M))
+    monkeypatch.setattr(hde, "dummy_extend_forward", lambda runner, tokens: None)
+    monkeypatch.setattr(hde, "forget_graph_path_state", lambda model: 0)
+    monkeypatch.setattr(
+        runtime_context, "get_schedule", lambda: SimpleNamespace(max_total_tokens=None, chunked_prefill_size=4096)
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (3000 * M, 32000 * M))
+    runner = SimpleNamespace(
+        expert_hot_cache_manager=manager, max_total_num_tokens=None, model=None, forward=lambda *a, **k: None,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+    )
+    with envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.override(True):
+        result = hc.maybe_calibrate_hot_cache(runner)
+    # room = (2420 - 1500 regrow) - 400 margin = 520 MiB at 1 MiB a slot: both layers planned up to their bound 26.
+    assert result.retire.short == {7: 6} and result.keep == {3: 26, 7: C}
+    assert int(updater.capacity[0]) == 26 and int(updater.capacity[1]) == C

@@ -57,6 +57,10 @@ def tail_release(*, row_bytes: int, rows: int, keep_rows: int, granularity: int)
 MIN_VMM_GRANULES = 32
 
 
+class HotCacheMapOutOfMemory(RuntimeError):
+    """The device had no memory for a granule a grow needed; the grow was rolled back."""
+
+
 class VmmHotCacheBacking:
     """One device's hot cache tensors: the large ones each on their own VMM reservation, mapped one handle per
     granule; the small ones (below MIN_VMM_GRANULES) on torch.empty."""
@@ -110,11 +114,41 @@ class VmmHotCacheBacking:
     def mapped_bytes(self) -> int:
         return sum(h is not None for handles in self._handles.values() for h in handles) * self.granularity
 
+    def _needed_granules(self, name: str, rows: int) -> int:
+        """Granules [0, n) of tensor ``name`` hold a byte of its first ``rows`` rows."""
+        return tail_release(
+            row_bytes=self.row_bytes[name], rows=self.rows[name], keep_rows=rows, granularity=self.granularity
+        ).first
+
+    def bytes_to_back(self, rows: int) -> int:
+        """Device memory ``set_backed_rows(rows)`` would map on top of what is mapped now: whole granules, so a slot
+        costs its rows rounded up per tensor, not ``bytes_per_expert``. 0 when shrinking."""
+        if not 0 <= rows <= self.upper_rows:
+            raise ValueError(f"backed rows {rows} outside [0, {self.upper_rows}]")
+        missing = 0
+        for name, handles in self._handles.items():
+            missing += sum(h is None for h in handles[: self._needed_granules(name, rows)])
+        return missing * self.granularity
+
+    def _unmap(self, name: str, g: int, drv) -> None:
+        from sglang.srt.utils.cuda_vmm_utils import check_drv
+
+        reservation, handles = self._reservations[name], self._handles[name]
+        address = reservation.base + g * self.granularity
+        check_drv(drv.cuMemUnmap(address, self.granularity), "cuMemUnmap(hot tail)")
+        check_drv(drv.cuMemRelease(handles[g]), "cuMemRelease(hot tail)")
+        handles[g] = None
+        # The reservation's teardown must skip what is already unmapped and released.
+        reservation._mappings = [m for m in reservation._mappings if m[0] != address]
+
     def set_backed_rows(self, rows: int) -> int:
         """Back exactly the granules that hold any of the first ``rows`` rows of every VMM tensor: map the missing
         ones (growing) or unmap and free those wholly past them (shrinking). Returns the bytes this added (negative
-        when it freed). Addresses never move; rows past the boundary fault on access."""
-        from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver, check_drv
+        when it freed). Addresses never move; rows past the boundary fault on access.
+
+        A grow that fails part-way unmaps every granule it mapped first, so the backing is exactly as before the
+        call; a device out-of-memory is raised as ``HotCacheMapOutOfMemory`` for the caller to stop growing on."""
+        from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver
 
         if not 0 <= rows <= self.upper_rows:
             raise ValueError(f"backed rows {rows} outside [0, {self.upper_rows}]")
@@ -122,24 +156,28 @@ class VmmHotCacheBacking:
         if self.backed_rows is not None and rows < self.backed_rows:
             torch.cuda.synchronize(self.device_id)
         delta = 0
+        mapped_now = []
         with torch.cuda.device(self.device_id):
             for name, reservation in self._reservations.items():
-                need = tail_release(
-                    row_bytes=self.row_bytes[name], rows=self.rows[name], keep_rows=rows,
-                    granularity=self.granularity,
-                ).first  # granules [0, need) hold a kept byte
+                need = self._needed_granules(name, rows)  # granules [0, need) hold a kept byte
                 handles = self._handles[name]
                 for g in range(len(handles)):
-                    address = reservation.base + g * self.granularity
                     if g < need and handles[g] is None:
-                        handles[g] = reservation.map(g * self.granularity, self.granularity, retain_handle=True)
+                        try:
+                            handles[g] = reservation.map(g * self.granularity, self.granularity, retain_handle=True)
+                        except RuntimeError as error:
+                            for undo_name, undo_g in reversed(mapped_now):
+                                self._unmap(undo_name, undo_g, drv)
+                            if "OUT_OF_MEMORY" in str(error):
+                                raise HotCacheMapOutOfMemory(
+                                    f"hot cache VMM: out of device memory backing rows {self.backed_rows} -> {rows} "
+                                    f"({len(mapped_now)} granules mapped and rolled back)"
+                                ) from error
+                            raise
+                        mapped_now.append((name, g))
                         delta += self.granularity
                     elif g >= need and handles[g] is not None:
-                        check_drv(drv.cuMemUnmap(address, self.granularity), "cuMemUnmap(hot tail)")
-                        check_drv(drv.cuMemRelease(handles[g]), "cuMemRelease(hot tail)")
-                        handles[g] = None
-                        # The reservation's teardown must skip what is already unmapped and released.
-                        reservation._mappings = [m for m in reservation._mappings if m[0] != address]
+                        self._unmap(name, g, drv)
                         delta -= self.granularity
         if self.backed_rows is not None and rows != self.backed_rows:
             logger.info(
