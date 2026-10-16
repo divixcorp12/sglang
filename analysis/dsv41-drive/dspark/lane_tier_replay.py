@@ -652,6 +652,9 @@ def diagnose(off: Run, on: Run, prices: Prices, layers: int) -> dict:
     return out
 
 
+PREFILL_GAP_NS = 500_000_000
+
+
 def departures(d: str, layers: int) -> dict:
     """How each cold GPU lane's row had left RAM, from the trace alone. Decode evictions are traced (``evict``); a
     promotion's victim (promote_landed calls take_victim_locked without trace_evict, ram_tier.h:2949) and a prefill
@@ -675,6 +678,12 @@ def departures(d: str, layers: int) -> dict:
             hist[(e["row"], e["a"])].append((e["ns"], -1))
     for v in hist.values():
         v.sort()
+    # A prefill fill (take_admit_slot_locked) is a Python-side path with no service record: mark every gap between two
+    # verifies longer than PREFILL_GAP_NS as a prefill (a decode step's gap is ~50 ms), for every row.
+    gaps = [run.verifies[k][1] + 1 for k in range(len(run.verifies) - 1)
+            if run.verifies[k + 1][0] - run.verifies[k][1] > PREFILL_GAP_NS]
+    for row in range(layers):
+        nonverify[row].extend(gaps)
     for v in nonverify.values():
         v.sort()
     first_in = {}
