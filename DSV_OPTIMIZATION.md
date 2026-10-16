@@ -789,7 +789,20 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
           - The capture estimate is too small: 25 MiB against ~130 measured (graph-pool static buffers, and the
             draft is not covered).
           - The calibration-vs-real comparison must use transients, not absolute peaks.
-        - **Grow headroom at this launch: about 450 MiB, ~35 slots.** The combined
+        - **Grow headroom at this launch: about 450 MiB, ~35 slots.**
+      - **Grow built** (`acc829fc2f`, `75eac8b26f`, `6c7902bb7f`):
+        - The upper bound is the pinned tier's rows minus max_gather_rows (`inclusive_hot_slot_limit`). VA is
+          reserved for it, and only the configured slots are backed with physical memory.
+        - `set_hot_capacity(manager, keep)` is the single authority both ways. The inverse census test checks that
+          grow 20 -> 26 -> 20 restores every holder.
+        - Calibration runs the warm-up's shapes (2048, 2049, 4096, 4096), then grows or trims by the measured
+          headroom. The real-vs-calibration comparison now uses transients.
+        - The peak logger now wraps `forward_hc_pre_from_prev` and `_hc_combine`, for the 556 MiB.
+        - 150 CPU tests passed.
+        - **calib3:** GPU tests, then the expseg smoke with calibration (grow), A1 (indexer 32), A2+A3 and the
+          logger. Started 2026-10-16.
+      - **prefill-merge is being replaced by a fresh agent** (owner request, context nearly full). Its handoff goes
+        to `PREFILL_MERGE_HANDOFF.md` on its branch. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
