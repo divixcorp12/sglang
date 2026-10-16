@@ -706,6 +706,25 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
         - capture memory goes into the pre-capture sizing, from an eager TARGET_VERIFY dummy peak.
       - Pending: wiring routing (i) and the capture estimate, stating the upper-bound capacity derivation, then a
         ~8 min GPU smoke.
+  - **Step-3 calibration smoke** (2026-10-15 23:55 - 10-16 00:03, `c439ee2326`, expseg arm at 1,035 slots, flag on):
+    - **The dummy EXTEND runs on the speculative target.** 2 calibration runs, no traceback, 0 OOM.
+    - Measured: lowest free 1,017.9 MiB; margin 331 (the allocator gap of run 1; run 2 grew 0); non-torch growth 88.
+      Retire 0.
+    - **Routing (i) against the real warm-up 4096 prefill:** allocated +46 MiB, reserved +152 MiB, below the margin.
+      The approximation holds.
+    - **Bug A:** the post-capture check read 2,172 MiB free because capture released the calibration reserve. Fix:
+      project from the reserved peak.
+    - **Bug B:** the VMM backing rounds each of the 6 tensors x 40 layers to 2 MiB, costing ~140 MiB.
+      - So the KV pin missed: 372,480 tokens instead of 381,184.
+      - Free memory at the warm-up peak was 414 MiB, against 706 without the flag.
+      - Fix: VMM only for the large tensors, and a hard refusal if KV is below the pin.
+    - **Approved next:**
+      1. Fix B.
+      2. Fix A.
+      3. The capture estimate (TARGET_VERIFY dummy).
+      4. **Grow:** reserve VA for the derived upper bound (pinned-tier rows minus max_gather_rows), map physical memory
+         for the budget, then let calibration trim or grow through one authority.
+         - This launch had room for ~30-40 more slots after allowing for capture and the warm-up delta.
   - **Prefill transient cuts (scoping note; estimates at 4096 tokens):**
 
     | id | cut | saves | bit-identical | code |
