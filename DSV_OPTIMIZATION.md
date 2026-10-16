@@ -289,8 +289,33 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
         - If the thermal counters rise, the drive is throttling.
         - If not, it is GC/SLC on a full DRAM-less drive, and the lever is fstrim or freeing space.
         - The only writer to that drive is Ray's `/mnt/nvme4/ray_tmp`, at about 2 writes/s.
-      - Next: a stall-aware compare tool, used to re-score the recent pairs, and the cost and frequency of stalls in
-        decode (whether this also hurts production).
+      - **Final:**
+        - **Tool:** `analysis/dsv41-drive/dspark/serve_compare.py RUN_A RUN_B` (`stream-variance` `2ba6d98f44`).
+          - Takes serving prompts by session and reports per-prompt ms/token, stream, layers, ms/layer and wait.
+          - Flags a STALL when a prompt's ms/stream-layer exceeds 1.3x the run's median, and prints root busy.
+          - Reports the all-prompts and clean-both differences with a prompt-block bootstrap CI (typically ±2
+            ms/token).
+        - Every STALL-flagged serving prompt belongs to a stalled run: base-r2, splitmodel-r2, pin01, pin01-gpu01,
+          D, drip4 and confgate. No clean run has one.
+        - **A second excursion type, on the CPU side:**
+          - In A'', prompt 5 alone makes the +2.2 ms/token over A' (89 vs 69 ms/token). Its stream is normal, but
+            both CPU teams were 25-43% slower per lane.
+          - It coincides with a node-0 swap-in burst at 20:15:30 (pswpin 137, 95 major faults in 5 s). Team
+            threads took no faults.
+          - Without that prompt, A' vs A'' is about -1.
+        - **`-refine` vs A':** ms/token +0.1 (CI -1.7..+1.9). Stream -7.1 ms/verify (0.9 fewer stream layers,
+          4.02 ms/layer), wait +4.4. Its stall fell outside serving. **Refinement: no measurable gain.**
+        - **New verdict rule:**
+          - (a) Use serve_compare means, paired by prompt, quoting the clean-both difference with its CI. No more
+            skip-8 medians.
+          - (b) Stall gate: if root-1 busy is more than 5% above the Samsungs', drop STALL-flagged prompts from both
+            arms. If more than 2 are flagged, rerun the arm.
+          - (d) A per-prompt CPU ms/lane flag (requested).
+        - **Drive fix (owner):** run smart-log first. If it is GC, fstrim and free space; if thermal, add airflow.
+          For production, dynamic or busy-weighted mirror shares could route around a stalled root (pointer only,
+          not built).
+        - Pending: the re-scored table of recent pairs, the production stall tax (episodes per hour x cost) and
+          the ab_compare fix or deprecation.
   - Resolved: the ~7 GiB read from sdb3 at launch is the DSpark draft, read cold each launch because it is evicted
     and dropped (~20 s at ~470 MB/s). The target load is warm.
 - **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
