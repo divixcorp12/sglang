@@ -52,6 +52,38 @@
 - The driver was killed in prelaunch, before any server started. Log: `run_ab.aborted-1.log`.
 - The pair is relaunched unchanged once the box is quiet.
 
+## Share sized at start: share-64 vs share-startup (28), predictions before the run (2026-10-16)
+
+**Code.**
+- Branch `prefill-share-size`, commits `37bf19966f` and `4096b28933`.
+- The base is `lane-head-ab`, the code both served share runs used, because `ram-prefetch-pool-serve` lacks the
+  `-mergechunk-expseg` arm. The diff applies cleanly onto `ram-prefetch-pool-serve`.
+- **The share is `PREFILL_SHARE_FRACTION` (0.15) × the smallest admitting layer's usable rows.** Usable rows are each
+  group's range less its staging and pool slots, summed over groups. That is 28 on today's layout (189-190 usable
+  rows).
+- **`SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS`** (`EnvInt(None)`) fixes the share for A/B arms.
+
+**Arms.**
+- Both arms run `-mergechunk-expseg` with `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1`, from `wt-share-size`.
+- A sets `SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS=64`. B leaves it unset, so the computed 28 is used.
+- The resolved env differs only in that variable.
+
+**Predictions for B − A.** From `lane_eval.py --shares 64,28` on the served share-64 capture (`ab-on`); in brackets,
+from its OFF capture, with share 28 against share 64:
+
+| quantity | predicted |
+|---|---|
+| stream + wait per verify | -4.9 ms (-5.2 with the A/B residual) [-6.2] |
+| by position 0-4 / 5-14 / 15+ | +0.3 / -6.5 / -10.6 |
+| NVMe-cold GPU lanes per verify | 10.5 → 9.8 |
+| forced CPU misses per verify | 57.9 → 52.5 |
+| prefill demand reads per prompt | 2,448 → 2,985 (+537) |
+| prefetch claims per prompt | 1,090 → 501 |
+| TTFT per prompt | **+0.74 s** [+0.77] |
+
+- The model under-predicted share 64's decode gain by about 2.5×, so the decode gain here may be larger.
+- The model's TTFT was right for share 64.
+
 ## The plan as written
 
 Branch `lane-tier-replay`. This is a plan only: no code changed and nothing run, apart from read-only reads of the
