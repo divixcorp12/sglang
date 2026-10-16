@@ -888,6 +888,15 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
                 graph-pool buffers plus the draft capture.
               - (e) One served A/B against expseg2.
               - Later: a clean A2/A1 timing run and wq_b's temporary.
+            - (b) done (`fcd9d85c3d`). The watch was on the right forward, but the peak logger's
+              per-call `reset_peak_memory_stats` wiped it. It now keeps the peak across those resets. The
+              transient base is now the peak run's own entry, after staging: +4 MiB on calib6.
+            - (a) **A post-capture resize is unsafe:** captured graphs bake in `hot_capacity`, through kernel
+              parameters passed by value in spec_score/spec_head_tail, ExpertStreamDevice.post, and
+              row_planner.scratch_base. Instead, capture will be estimated before capture by running eager dummy
+              forwards inside fresh `torch.cuda.MemPool`s.
+              - calib6's 214 MiB: +188 graph pools (torch reserved) plus ~26 outside torch.
+              - calib7 adds log-only capture probes (`dd974488c9`), then calib8 validates the estimate.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
