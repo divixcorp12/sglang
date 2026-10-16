@@ -749,6 +749,9 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Log the CUDA allocator's allocated and reserved bytes around each target layer, attention, MoE, logits, sampler
+    # and draft injection call of a DSpark prefill (debug_utils/prefill_peak_log.py). Off: nothing is wrapped.
+    SGLANG_DEBUG_PREFILL_PEAK_LOG = EnvBool(False)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

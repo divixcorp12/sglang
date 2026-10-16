@@ -9,6 +9,9 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.debug_utils.prefill_peak_log import (
+    maybe_install as maybe_install_prefill_peak_log,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
@@ -494,6 +497,9 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+        # SGLANG_DEBUG_PREFILL_PEAK_LOG: wraps the prefill's calls once, here; off, nothing is wrapped.
+        maybe_install_prefill_peak_log(self)
 
     def _init_top_prob_gate(self) -> VerifyDeadRows:
         """Refuse a launch the top-probability gate cannot serve, and point the target's EXL3 MoE at its dead rows."""
