@@ -1178,6 +1178,29 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             on (`SGLANG_DSV41_EXPERT_TRACE_PATH`, under /mnt/nvme1), so exact hits/verify can be counted. The
             flag is the only difference.
           - The head's gate→plan cost is taken from the microbenchmark.
+        - **A/B result (2026-10-16 03:58-04:16, `lane-head-ab` `d269f7aa90`, one sample per arm, OFF first,
+          output in `/mnt/nvme1/lane-head-ab-20261016/`): more VRAM hits, no ms/token gain.**
+          - serve_compare, 5 clean prompts: **+0.74 ms/token, CI -3.11..+3.96, neutral**; tokens/verify -0.01.
+            All 8 prompts: +9.51 (CI -5.54..+31.33), dominated by an ON prompt-6 disk stall.
+          - Route log, per verify: **VRAM hits 388.8 → 408.3 (+19.5)**, misses 514.8 → 497.7, unique routed
+            903.6 → 905.9. That beats the replay's +7.5..+11, and the gather's miss count matches the route log
+            exactly.
+          - **Where the time went:** CPU wait -46.9 ms/verify, GPU stream +51.7 ms/verify. Stream layers per
+            verify went from 12.6 to 22.9. The head hands the GPU lanes to experts likely to recur, and those
+            are often cold rows. The GPU now streams them from NVMe where it used to copy from RAM. RAM-tier
+            reads were unchanged (10,950 vs 11,089 rows); copy-engine submits were 79.5 per verify in both arms.
+            Today's key implicitly favours RAM-warm experts for GPU lanes; the head does not see RAM residency.
+            The replay priced every non-VRAM lane at a flat 0.37 ms, which hid this.
+          - CPU lanes 366 vs 371 per verify, CPU 0.62 vs 0.60 ms/lane. Slots OFF 1,035, ON 1,030 (head
+            57.5 MB). No OOM; lowest free GPU memory OFF 556, ON 616 MiB.
+          - nvme3n1 prefill-window await: OFF 7.6-8.9 ms; ON 7.6-9.5 ms, except 32.4 ms before prompt 6 (a
+            stall serve_compare flags only in decode). OFF prompts 2 and 3 were CPUSLOW and are excluded.
+          - Gap: `lane_head_gathers` never reached the metrics, because the counter is not in the async
+            telemetry buffers. Proof the head ran comes from the startup line, `lane_head_bytes`, the hit shift
+            and the doubled stream layers.
+          - **Decision:** no kernel fusion; fusing saves ~0.4 ms/verify and cannot change this result. The
+            lane is held. The next version would add RAM-tier residency as a head feature, or restrict the head's
+            choices to RAM-warm experts, and needs a replay that prices RAM against NVMe lanes before any GPU run.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
