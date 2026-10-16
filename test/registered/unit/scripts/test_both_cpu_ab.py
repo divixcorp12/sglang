@@ -1101,3 +1101,37 @@ def test_every_arm_but_spcc13_pins_the_span_weights_unset_against_an_exported_sh
         want = ("6:10:6", "1:0:1") if arm == "dspark-both-misscut-twostage-spcc13" else ("", "")
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert (overrides[SPAN[0]], overrides[SPAN[1]]) == want, arm
+
+
+def test_prod_is_the_best_served_arm_without_its_prefetch_and_with_both_startup_calibrations():
+    # MERGE_PLAN_1016.md: production = -mergechunk-expseg (the best served arm) less the pending RAM prefetch, with the
+    # table and hot-cache calibrations on (owner rule); every other key the arm states is at its library default.
+    ab = _ab()
+    arm_env = ab.arm_env
+    arm = ab.MERGE_CHUNK_EXPSEG_ARM
+    best, prod = arm_env.arm_env(ab.ARMS[arm][0]), arm_env.prod_env()
+    differs = {k: (best.get(k), prod.get(k)) for k in set(best) | set(prod) if best.get(k) != prod.get(k)}
+    prefetch = {k for k in differs if k.startswith("SGLANG_DSV41_RAM_PREFETCH")}
+    assert best["SGLANG_DSV41_RAM_PREFETCH"] == "1" and all(prod.get(k) is None for k in prefetch)
+    stated_defaults = {
+        "SGLANG_DSPARK_TOP_PROB_GATE": "0",
+        "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS": "",
+        "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK": "0",
+        "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB": "5",
+        "SGLANG_DSV41_GPU_DRIP_SLOTS": "0",
+        "SGLANG_MOE_EXPERT_MIRROR_CAPS": "",
+        "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": "0",
+        "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY": "0.98",
+    }
+    calibrations = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": ("0", "1"),
+                    "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
+    rest = {k: v for k, v in differs.items() if k not in prefetch}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations}
+    # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
+    argv = arm_env.ServerArgs.prod().argv()
+    flags = ab.server_flags(arm)
+    assert flags == ("--weight-loader-drop-cache-after-load", "--mem-fraction-static",
+                     arm_env.PROD_DSPARK_MEM_FRACTION_STATIC, "--max-total-tokens",
+                     str(arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS))
+    assert ab.EXPSEG_HOT_GPU_MB == int(arm_env.PROD_DSPARK_HOT_GPU_MB)
+    assert all(flag in argv for flag in flags)
