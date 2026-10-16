@@ -174,6 +174,21 @@ def calibrate(run_prefill, *, tokens: int, slot_bytes: int, device) -> Calibrati
     return Calibration(tokens, free_before, reserved_before, runs, slot_bytes)
 
 
+class KvPinMissed(RuntimeError):
+    pass
+
+
+def check_kv_pin(*, pinned: Optional[int], sized: Optional[int]) -> None:
+    """Calibration sizes the hot cache around a pinned KV pool (--max-total-tokens). Refuse when the pool came out
+    smaller than the pin: the memory under the hot cache's upper bound left too little for it (the step-3 smoke's
+    372,480 against 381,184). Without a pin there is nothing to check."""
+    if pinned and sized is not None and sized < pinned:
+        raise KvPinMissed(
+            f"hot cache calibration: the KV pool has {sized} tokens, below --max-total-tokens {pinned}; "
+            "raise --mem-fraction-static or lower SGLANG_MOE_HOT_GPU_MB"
+        )
+
+
 def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
     """The scheduler's pre-capture hook. Off (the default) it returns None and touches nothing.
 
@@ -191,6 +206,9 @@ def maybe_calibrate_hot_cache(model_runner) -> Optional[CalibrationResult]:
     from sglang.srt.layers.moe.hot_cache_retire import retire_hot_slots
     from sglang.srt.runtime_context import get_schedule
 
+    check_kv_pin(
+        pinned=get_schedule().max_total_tokens, sized=getattr(model_runner, "max_total_num_tokens", None)
+    )
     tokens = int(get_schedule().chunked_prefill_size or get_schedule().max_prefill_tokens)
     cache = next(iter(manager.caches.values()))
     device = cache.device
@@ -279,13 +297,25 @@ def check_headroom(stage: str, result: Optional[CalibrationResult], device=None)
     if result is None:
         return True
     free = torch.cuda.mem_get_info(device)[0]
+    reserved = torch.cuda.memory_reserved(device)
+    projected = projected_free(result.calibration, free=free, reserved=reserved)
     margin = result.calibration.margin
-    ok = free >= margin
+    ok = projected >= margin
     (logger.info if ok else logger.error)(
-        "hot cache calibration check %s: free %.1f MiB, margin %.1f MiB%s",
+        "hot cache calibration check %s: free %.1f MiB, torch reserved %.1f MiB, projected free at a %d-token "
+        "prefill %.1f MiB, margin %.1f MiB%s",
         stage,
         free / MIB,
+        reserved / MIB,
+        result.calibration.tokens,
+        projected / MIB,
         margin / MIB,
-        "" if ok else f" -- SHORT by {(margin - free) / MIB:.1f} MiB",
+        "" if ok else f" -- SHORT by {(margin - projected) / MIB:.1f} MiB",
     )
     return ok
+
+
+def projected_free(calibration: Calibration, *, free: int, reserved: int) -> int:
+    """Free memory a prefill of the calibrated size would leave from now: whatever of its reserve peak torch no longer
+    holds (something released cached blocks since calibration) has to come out of free memory again."""
+    return free - max(0, calibration.runs[0].reserved_peak - reserved)

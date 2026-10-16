@@ -144,9 +144,28 @@ def test_the_watch_measures_only_the_first_full_size_extend_then_removes_itself(
 
 
 def test_headroom_check_raises_below_the_margin(monkeypatch):
-    result = hc.CalibrationResult(_cal(), {0: 20})
+    result = hc.CalibrationResult(_cal(), {0: 20})  # run-1 reserve peak 2500, margin 400
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 2500 * M)  # reserve still held
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (500 * M, 32000 * M))
     hc.require_hot_cache_headroom("after capture", result)  # 500 >= 400
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (300 * M, 32000 * M))
     with pytest.raises(hc.HotCacheHeadroomShort):
+        hc.require_hot_cache_headroom("after capture", result)
+
+
+def test_kv_pin_is_refused_when_the_pool_came_out_smaller():
+    hc.check_kv_pin(pinned=381184, sized=381184)
+    hc.check_kv_pin(pinned=None, sized=10)  # no pin, nothing to check
+    with pytest.raises(hc.KvPinMissed, match="372480"):
+        hc.check_kv_pin(pinned=381184, sized=372480)
+
+
+def test_headroom_projection_charges_back_a_released_reserve(monkeypatch):
+    # The smoke's case: capture released the calibration's cached reserve, so free memory alone looked roomy.
+    result = hc.CalibrationResult(_cal(), {0: 20})
+    assert hc.projected_free(result.calibration, free=2000 * M, reserved=1300 * M) == 800 * M  # 1200 to re-grow
+    assert hc.projected_free(result.calibration, free=2000 * M, reserved=2600 * M) == 2000 * M
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 1000 * M)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1800 * M, 32000 * M))
+    with pytest.raises(hc.HotCacheHeadroomShort):  # 1800 - 1500 = 300 < 400
         hc.require_hot_cache_headroom("after capture", result)

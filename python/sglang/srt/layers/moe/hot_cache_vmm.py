@@ -51,8 +51,15 @@ def tail_release(*, row_bytes: int, rows: int, keep_rows: int, granularity: int)
     return TailRelease(first, end, granularity)
 
 
+# A VMM tensor rounds up to whole granules, so it can waste up to one. Tensors smaller than this many granules (the
+# per-row scale vectors, ~0.5 MiB a layer) stay on torch.empty: rounding them cost ~140 MiB over 40 layers in the
+# step-3 smoke, and their retired rows are too small to be worth releasing. At 32 granules the rounding is <= 3%.
+MIN_VMM_GRANULES = 32
+
+
 class VmmHotCacheBacking:
-    """One device's hot cache tensors, each on its own VMM reservation, mapped one handle per granule."""
+    """One device's hot cache tensors: the large ones each on their own VMM reservation, mapped one handle per
+    granule; the small ones (below MIN_VMM_GRANULES) on torch.empty."""
 
     def __init__(self, device: torch.device, specs: Sequence[Tuple[str, int, Tuple[int, ...], torch.dtype]]):
         """``specs``: (name, rows, row_shape, dtype) per tensor."""
@@ -76,6 +83,9 @@ class VmmHotCacheBacking:
             for name, rows, row_shape, dtype in specs:
                 row_bytes = prod(row_shape) * torch.empty((), dtype=dtype).element_size()
                 granules = granule_count(rows * row_bytes, self.granularity)
+                if granules < MIN_VMM_GRANULES:
+                    self.tensors[name] = torch.empty((rows,) + tuple(row_shape), dtype=dtype, device=device)
+                    continue
                 reservation = VmmReservation(
                     granules * self.granularity, prop, self.device_id, alignment=self.granularity
                 )

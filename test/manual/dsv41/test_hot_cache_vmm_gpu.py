@@ -35,9 +35,11 @@ def _check(keep: int) -> dict:
     free0 = torch.cuda.mem_get_info()[0]
     freed = backing.release_tail(keep)
     free1 = torch.cuda.mem_get_info()[0]
+    assert "suh" not in backing._reservations  # below MIN_VMM_GRANULES: on torch.empty
     expect = sum(
         tail_release(row_bytes=backing.row_bytes[n], rows=r, keep_rows=keep, granularity=backing.granularity).nbytes
         for n, r, _, _ in SPECS
+        if n in backing._reservations
     )
     assert freed == expect > 0
     for n, t in backing.tensors.items():
