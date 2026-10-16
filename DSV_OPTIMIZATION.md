@@ -146,6 +146,17 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   - Weight = root throughput / mean, clamped to [0.5, 2]. Rounds disagreeing by >25%, a dead root or a missing
     manifest leave equal shares, with a warning. Explicit weights win.
   - Expected from read-amp's busy times: ~1.056 : 0.875 : 1.069 (nvme0 : nvme3 : nvme2).
+  - **Validated 2026-10-15 19:52-20:01 (`split-calib-20261015/mirror1/`): runs, but over-corrects. Do not use.**
+    - Probe: 0.47 s, noise check passed, no clamp.
+    - Measured nvme0 3.48, nvme4 (the SPCC, read-amp's "nvme3") 2.04, nvme2 3.41 GB/s. That gives weights
+      1.168 : 0.687 : 1.146 (1.7x).
+    - Served busy time puts the SPCC only ~1.21x slower. These weights would leave it ~30% less busy than the
+      Samsungs: the reverse imbalance.
+    - Likely cause: short isolated QD4 random reads flatter the Samsungs more than bursty served demand does.
+    - Fix needed: a probe that reproduces served demand (paced bursts of one row's sub-reads at the served queue
+      depth), or weights taken from live busy time.
+    - Same start: split-model calibration took 1.04 s and agreed with run1, apart from team1's hit intercept
+      (0.159 vs -0.124).
 - **A/B arms** (`f58bd94a44`):
   - `...-pin01-splitmodel-fixedcosts`: all old offline fits, calibration skipped.
   - `...-pin01-splitmodel-refine`: calibration + `REFINE_BATCHES=50`.
@@ -154,7 +165,12 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
     and `...-hicache1-refine`. Plain `-hicache1` now calibrates on this branch.
   - The fixed-cost arm publishes the same device words as A', so only `-refine` runs, against A'.
   - CPU tests after the merge: 187 passed.
-- **Box queue:** A' rerun -> prefill run3 -> mirror-probe validation start -> calibration A/B.
+- **`-refine` run started 2026-10-15 22:09** (`cores-ab-20261014/run_refine.sh`, a copy of `run_a2.sh` with only
+  the worktree `wt-split-calib-refine` at `e55aeaae6d`, the arm and the output name changed). Compared against A''.
+  - GPU tests before launch: 13 passed, EXIT=0, from `test_split_model_calibration_cuda.py` and
+    `test_exl3_lease_kernels_cuda.py` with `-k "split_model or calibration_pull or calibrate_fits"`.
+  - Prelaunch eviction left node 1 with 76.64 GiB free, above the 64.21 floor.
+  - It started ~1h45m late: the waiter was never queued after the mirror run.
 
 ### 3.4 Node-0 memory pressure — branch `split-model`
 
