@@ -30,6 +30,8 @@ Arms (the key orders the misses; the first k are inserted):
   oracle    next1-k: only misses the next verify routes are inserted (by score), victims spare them.
   product-ab  the product key with G_cold raised by P's net error on moving cold lanes to the GPU, measured on the
             lane-head A/B (AB_RESIDUAL_PER_COLD_LANE): the startup-measured tier cost the owner's form would use.
+  product-emp  the product key with G_cold the served cost of the move itself (AB_SERVED_PER_COLD_LANE, +0.26 ms per
+            NVMe-cold lane put on the GPU), G_warm from P.
   oracle-p  the product key with P = 1 for misses the next verify routes, else 0.
 
 Net figures are against `today`. `_bias` prices every arm's NVMe-cold GPU lanes x 15.10/13.79 (T's under-prediction on
@@ -54,8 +56,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane_tier_replay as ltr  # noqa: E402
 
-ARMS = ("actual", "today", "head", "capb", "product", "product-ab", "oracle", "oracle-p")
-HEAD_ARMS = ("head", "capb", "product", "product-ab")
+ARMS = ("actual", "today", "head", "capb", "product", "product-ab", "product-emp", "oracle", "oracle-p")
+HEAD_ARMS = ("head", "capb", "product", "product-ab", "product-emp")
 NODES = 2
 
 
@@ -102,7 +104,9 @@ def critical_shares(run: ltr.Run) -> tuple[float, float, float]:
 class ProductKey:
     """P(recur) x H - G(tier, routes), from P and the critical shares."""
 
-    def __init__(self, P: ltr.Prices, w_s: float, w_c: float, hit_routes: float, cold_extra: float = 0.0):
+    def __init__(self, P: ltr.Prices, w_s: float, w_c: float, hit_routes: float, cold_extra: float = 0.0,
+                 cold_served: float | None = None):
+        self.cold_served = cold_served
         st, hj, mj, ml = P.stream, P.hit_job, P.miss_job, P.miss_land
         self.H = w_c * (hj[1] + hj[2] * hit_routes)
         self.g_cold = (w_s * st[1], w_c * ml[1], w_c * mj[1])  # GPU stream lane; CPU landing + per-route job
@@ -110,6 +114,8 @@ class ProductKey:
         self.cold_extra = cold_extra
 
     def G(self, warm: bool, routes: int) -> float:
+        if not warm and self.cold_served is not None:
+            return self.cold_served
         a, b, c = self.g_warm if warm else self.g_cold
         return a - b - c * routes + (0.0 if warm else self.cold_extra)
 
@@ -122,10 +128,12 @@ class ProductKey:
 # stream + wait was +4.76 ms/verify measured (51.68 - 46.92) against -2.45 predicted (E: 50.74 - 53.19), for +18.12
 # NVMe-cold GPU lanes/verify. Charged per moved lane, it is the "_ab" correction and the product-ab key's G_cold term.
 AB_RESIDUAL_PER_COLD_LANE = (4.76 + 2.45) / 18.12
+# The served cost of that move itself: +4.76 ms/verify of stream + wait for +18.12 NVMe-cold GPU lanes (product-emp).
+AB_SERVED_PER_COLD_LANE = 4.76 / 18.12
 
 
-def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, key: ProductKey, key_ab: ProductKey, arm: str,
-             layers: int) -> dict:
+def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, layers: int) -> dict:
+    key = keys["product"]
     d = run.dir
     header, log = ltr.route_log(d)
     off = ltr.align(run, log)
@@ -218,8 +226,8 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, key: ProductKey, key_ab: 
             plan = sorted(misses, key=lambda e: (-pred.get(e, 0.0), -sc[e], e))
         elif arm == "capb":
             plan = sorted(misses, key=lambda e: (e not in warm, -pred.get(e, 0.0) if e in warm else -sc[e], e))
-        elif arm in ("product", "product-ab"):
-            kk = key if arm == "product" else key_ab
+        elif arm in keys:
+            kk = keys[arm]
             plan = sorted(misses, key=lambda e: (-(pred.get(e, 0.0) * kk.H - kk.G(e in warm, cnt[e])), -sc[e], e))
         elif arm == "oracle":
             plan = sorted((e for e in misses if e in nxt_u), key=lambda e: (-sc[e], e))
@@ -309,13 +317,14 @@ def main() -> int:
     P = ltr.Prices(ltr.Run(a.prices_from) if a.prices_from else run)
     w_s, w_c, hit_routes = critical_shares(run)
     key = ProductKey(P, w_s, w_c, hit_routes)
-    key_ab = ProductKey(P, w_s, w_c, hit_routes, AB_RESIDUAL_PER_COLD_LANE)
+    keys = {"product": key, "product-ab": ProductKey(P, w_s, w_c, hit_routes, AB_RESIDUAL_PER_COLD_LANE),
+            "product-emp": ProductKey(P, w_s, w_c, hit_routes, cold_served=AB_SERVED_PER_COLD_LANE)}
     layers = max(r.row for r in run.records) + 1
     preds = load_preds(a.pred)
     res = {"capture": a.capture, "prices": P.describe(), "critical_share_stream": round(w_s, 3),
-           "hit_routes": round(hit_routes, 3), "product_key": key.describe(), "product_ab_key": key_ab.describe(), "arms": {}}
+           "hit_routes": round(hit_routes, 3), "keys": {k: v.describe() for k, v in keys.items()}, "arms": {}}
     for arm in a.arms.split(","):
-        res["arms"][arm] = evaluate(run, preds, P, key, key_ab, arm, layers)
+        res["arms"][arm] = evaluate(run, preds, P, keys, arm, layers)
         print(arm, json.dumps({k: round(v, 2) for k, v in res["arms"][arm].items()}), flush=True)
     base = res["arms"].get("today")
     head_ms = [float(x) for x in a.head_ms.split(",")]
