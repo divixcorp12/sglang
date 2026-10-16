@@ -853,10 +853,16 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
           - **calib5 attempt 2** (2026-10-16 01:36-01:39): GPU tests passed.
             - The grow bound is 386 slots (non-static memory 4,434 MiB). The plan was +32 slots, the bound binding
               on 0 layers.
-            - Then the census post-check refused: `spec_score.hot_capacity is 26, not 27` on layer 25. **Grow
-              doesn't raise SpecScoreRow.** The CPU fakes missed it.
-            - Fix requested: test on the real `_bind_spec_scores` path, and roll the grow back with a loud log
-              instead of killing startup. Then calib6.
+            - Then the census post-check refused: `spec_score.hot_capacity is 26, not 27` on layer 25.
+            - **Cause: the check itself is wrong, not the grow.** A row's SpecScoreRow holds the capacity of its
+              prefetch *target* layer (L+2), not its own. Layer 25 grew to 27 while its target, layer 27, stayed at
+              26, so 26 was correct. This was the first launch where a capacity actually changed. The CPU fakes
+              set `spec_score=None`, so no test covered it.
+            - Other calib5 numbers: KV pin OK (available 1.05 GB, natural pool 513,536). Verify-run drop 430 MiB,
+              400 of it outside torch. Margin 574 MiB, because a repeated 4096 run still grew the reserve by
+              +320 MiB (to look at later). Draft load is all torch weights (+2,179 MiB).
+            - Fix approved: compare against the target layer's capacity, add a test on the real `_bind_spec_scores`
+              path, and on a mismatch roll the grow back with a loud log instead of killing startup. Then calib6.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
