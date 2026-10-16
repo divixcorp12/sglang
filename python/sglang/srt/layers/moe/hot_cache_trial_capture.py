@@ -102,12 +102,13 @@ def tensor_paths(roots: Dict[str, object], depth: int = 3, enter_modules: bool =
         if level >= depth or id(value) in seen or isinstance(value, skipped):
             return
         seen.add(id(value))
+        # Snapshots: service threads mutate some of these containers while the walk runs (calib11).
         if isinstance(value, dict):
-            items = ((f"[{k!r}]", v) for k, v in value.items())
+            items = [(f"[{k!r}]", v) for k, v in list(value.items())]
         elif isinstance(value, (list, tuple)):
-            items = ((f"[{i}]", v) for i, v in enumerate(value))
+            items = [(f"[{i}]", v) for i, v in enumerate(list(value))]
         elif hasattr(value, "__dict__"):
-            items = ((f".{k}", v) for k, v in vars(value).items())
+            items = [(f".{k}", v) for k, v in list(vars(value).items())]
         else:
             return
         for name, child in items:
@@ -135,6 +136,35 @@ def attribute_blocks(new_blocks: Dict[int, int], paths: Dict[int, str]) -> Dict[
         holder = holder_of(paths[starts[i]]) if inside else "unattributed"
         charged[holder] = charged.get(holder, 0) + size
     return dict(sorted(charged.items(), key=lambda kv: -kv[1]))
+
+
+def log_residue_holders(label, new_blocks, model_runner, draft_worker, draft_runners) -> None:
+    """Log what the trial left allocated, by holder. A diagnostic: any failure in it is logged and skipped, never
+    raised into the calibration."""
+    try:
+        from sglang.srt.model_executor import input_buffers
+
+        roots = {"input_buffer_pool": input_buffers._forward_input_buffer_pool, "target": model_runner}
+        roots.update({f"draft{i}": runner for i, runner in enumerate(draft_runners)})
+        if draft_worker is not None:
+            roots["draft_worker"] = draft_worker
+        paths = tensor_paths(roots)
+        # Then the models' modules, deep: per-layer state built on the first graph-path forward or capture.
+        models = {"model": model_runner.model}
+        models.update({f"draft{i}.model": runner.model for i, runner in enumerate(draft_runners)})
+        for ptr, path in tensor_paths(models, depth=12, enter_modules=True).items():
+            paths.setdefault(ptr, path)
+        held = attribute_blocks(new_blocks, paths)
+    except Exception:
+        logger.warning("hot cache trial capture (%s): residue attribution failed; skipped", label, exc_info=True)
+        return
+    logger.info(
+        "hot cache trial capture (%s) residue: %d blocks, %.1f MiB allocated after teardown; by holder (MiB): %s",
+        label,
+        len(new_blocks),
+        sum(new_blocks.values()) / MIB,
+        {k: round(v / MIB, 1) for k, v in list(held.items())[:12]},
+    )
 
 
 def _state(device):
@@ -201,27 +231,8 @@ def trial_capture(model_runner, draft_worker=None, label: str = "") -> Optional[
         torch.cuda.empty_cache()
     free2, reserved2 = _state(device)
     new_blocks = {a: s for a, s in live_blocks().items() if a not in blocks0}
-    if new_blocks:  # what the trial left allocated, by holder
-        from sglang.srt.model_executor import input_buffers
-
-        roots = {"input_buffer_pool": input_buffers._forward_input_buffer_pool, "target": model_runner}
-        roots.update({f"draft{i}": runner for i, runner in enumerate(draft_runners)})
-        if draft_worker is not None:
-            roots["draft_worker"] = draft_worker
-        paths = tensor_paths(roots)
-        # Then the models' modules, deep: per-layer state built on the first graph-path forward or capture.
-        models = {"model": model_runner.model}
-        models.update({f"draft{i}.model": runner.model for i, runner in enumerate(draft_runners)})
-        for ptr, path in tensor_paths(models, depth=12, enter_modules=True).items():
-            paths.setdefault(ptr, path)
-        held = attribute_blocks(new_blocks, paths)
-        logger.info(
-            "hot cache trial capture (%s) residue: %d blocks, %.1f MiB allocated after teardown; by holder (MiB): %s",
-            label,
-            len(new_blocks),
-            sum(new_blocks.values()) / MIB,
-            {k: round(v / MIB, 1) for k, v in list(held.items())[:12]},
-        )
+    if new_blocks:
+        log_residue_holders(label, new_blocks, model_runner, draft_worker, draft_runners)
     return TrialCapture(
         free_drop=free0 - free1,
         torch_reserved=reserved1 - reserved0,

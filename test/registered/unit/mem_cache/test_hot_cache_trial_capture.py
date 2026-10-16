@@ -131,6 +131,15 @@ def test_the_capture_estimate_is_the_warm_trial_never_below_the_cold_one_less_it
     assert hc.capture_estimate_of([], 30 * M) == 30 * M
 
 
+def test_residue_attribution_never_raises_into_the_trial(monkeypatch, caplog):
+    """calib11: a service thread grew a dict mid-walk ('dictionary changed size during iteration') and the exception
+    aborted the trial. Any failure in the diagnostic is now logged and skipped."""
+    monkeypatch.setattr(tc, "tensor_paths", lambda *a, **k: 1 / 0)
+    with caplog.at_level("WARNING"):
+        tc.log_residue_holders("cold", {1: 2}, SimpleNamespace(model=None), None, ())
+    assert any("attribution failed" in r.getMessage() for r in caplog.records)
+
+
 def test_live_blocks_reads_only_allocated_blocks(monkeypatch):
     snapshot = [{"blocks": [{"address": 10, "size": 4, "state": "active_allocated"},
                             {"address": 14, "size": 8, "state": "inactive"}]}, {"blocks": []}]
