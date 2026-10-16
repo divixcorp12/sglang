@@ -1499,7 +1499,7 @@ master's `prod_env()` at `a7cce264fe`.
 | split model | `ENABLE_CPU_SPLIT_MODEL=1` | -2.9%, one pair, matched by replay (3.2) | enable, with startup calibration on and refinement off (3.3) |
 | -mem | `SCHEDULER_MLOCK=1`, `HICACHE_HOST_NUMA_NODE=1`, `--weight-loader-drop-cache-after-load` | node-0 swap and faults fixed; speed neutral (3.4) | enable |
 | prefill share | (on since `a7cce264fe`) | -3.46 ms/token (3.8) | done; share 28 lost (TTFT +1.58 s), keep 64; startup fraction 64/187 |
-| prefetch stack | `RAM_PREFETCH` + horizon 2, T3 head file, cap 2, pool serve, promote, idle2 | no clean served win (DSV41_REFERENCE 33.14-33.37; promote "converts, does not add") | pending lane-tier's offline comparison; the head file lives outside the repo |
+| prefetch stack | `RAM_PREFETCH` + horizon 2, T3 head file, cap 2, pool serve, promote, idle2 | no clean served win (DSV41_REFERENCE 33.14-33.37; promote "converts, does not add") | **ship ON as tested (owner, 2026-10-16)**: every stacked served win was measured with it on. The offline comparison was not resolvable: today's arm used -3%, but pool-served -13..-16% outside the 10% gate (T's cold under-prediction), and there is no traced out-of-sample capture (`LANE_TIER_REPLAY_HANDOFF.md`). The head is at `/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors` (0444, sha256 `f0d7a1b1...5309`), which launch_prod.sh verifies |
 
 **Parked on master, OFF, and we are coming back to both (owner decision 2026-10-16):**
 - **Lane head** (`lane-head`, handoff `LANE_HEAD_HANDOFF.md`, `SGLANG_OPT_LANE_HEAD_PATH` unset). It is the
