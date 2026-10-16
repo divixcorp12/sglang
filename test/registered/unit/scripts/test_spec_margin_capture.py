@@ -83,3 +83,12 @@ def test_the_capture_logs_routes_router_inputs_and_verify_accepts_unless_told_no
     off = cap.server_env("/out", False, arm="dspark-both", verify_split=False)
     assert not any(k in off for k in ("SGLANG_DSV41_EXPERT_TRACE_PATH", "SGLANG_DSV41_ROUTER_CAPTURE_PATH",
                                       "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH"))
+
+
+def test_the_route_log_alone_writes_the_stage_trace_without_the_router_capture():
+    cap = _capture()
+    routes = cap.server_env("/out", False, arm="dspark-both", verify_split=False, route_log=True)
+    assert routes["SGLANG_DSV41_EXPERT_TRACE_PATH"] == "/out/stages.jsonl"
+    assert not any(k in routes for k in ("SGLANG_DSV41_ROUTER_CAPTURE_PATH", "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH"))
+    off = cap.server_env("/out", False, arm="dspark-both", verify_split=False)
+    assert {k: v for k, v in routes.items() if k != "SGLANG_DSV41_EXPERT_TRACE_PATH"} == off

@@ -37,10 +37,12 @@ PROBE = os.path.join(REPO, "scripts", "expert_prediction", "prefetch", "logprob_
 
 
 def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: str = "dspark-both-prefetch",
-               verify_split: bool = True) -> dict:
+               verify_split: bool = True, route_log: bool = False) -> dict:
     """The arm's env with the job trace on; ``top_k_only`` and ``scorer`` override the arm's only when given. With
     ``verify_split`` it also writes the stage trace's route log, the router capture and the per-verify accept log,
-    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs."""
+    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs.
+    ``route_log`` alone writes the stage trace's route log (each verify's routes, misses and hot sets, the input of
+    vram_cache_replay.py) without the router capture."""
     overrides, _ = both_cpu_ab.ARMS[arm]
     asked = {}
     if top_k_only:
@@ -53,6 +55,7 @@ def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: s
         **({"SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(out_dir, "stages.jsonl"),
             "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(out_dir, "router"),
             "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH": os.path.join(out_dir, "verify-accept")} if verify_split else {}),
+        **({"SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(out_dir, "stages.jsonl")} if route_log else {}),
         "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": os.path.join(out_dir, "events"),
         "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "524288",
         "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out_dir, "metrics.jsonl"),
@@ -123,12 +126,15 @@ def main() -> int:
     p.add_argument("--arm", choices=tuple(both_cpu_ab.ARMS), default="dspark-both-prefetch")
     p.add_argument("--no-verify-split", dest="verify_split", action="store_false",
                    help="skip the route log, router capture and accept log (verify_split.py's inputs)")
+    p.add_argument("--route-log", action="store_true",
+                   help="with --no-verify-split, still write the route log (stages.jsonl), not the router capture")
     p.add_argument("--draft-top-prob", action="store_true",
                    help="also log the draft's per-position top probability each verify (draft-top-prob.*.jsonl); "
                         "one extra draft LM-head pass per verify, so compare timings only against runs with it on")
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split, a.route_log) | {
+        "PYTHONPATH": os.path.join(REPO, "python")}
     if a.draft_top_prob:
         env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")
     argv = [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(a.arm)]

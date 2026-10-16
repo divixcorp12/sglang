@@ -477,6 +477,15 @@ ARMS[MERGE_CHUNK_EXPSEG_CALIB_ARM] = (
     {**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], CALIBRATE: "1", CHUNK_KERNELS: "1", MERGE_BUDGET: "32", INDEXER_BUDGET: "32"},
     True,
 )
+# -expseg with the gather-time lane head (SGLANG_OPT_LANE_HEAD_PATH, srt/layers/moe/lane_head.py): head B of
+# cache-tiers-20261015 exported with its fp32 PCA. Its ~55 MiB come out of -expseg's SGLANG_MOE_HOT_GPU_MB (about 4
+# slots fewer); fraction and KV pin are -expseg's. Every other arm pins the head off against a shell's.
+LANE_HEAD = "SGLANG_OPT_LANE_HEAD_PATH"
+LANE_HEAD_FILE = "/data/models/slang/nvfp4-work/ram-prefetch/lane-head/head-B-fp32.safetensors"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[LANE_HEAD] = ""
+MERGE_CHUNK_EXPSEG_LANE_HEAD_ARM = MERGE_CHUNK_EXPSEG_ARM + "-lanehead"
+ARMS[MERGE_CHUNK_EXPSEG_LANE_HEAD_ARM] = ({**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], LANE_HEAD: LANE_HEAD_FILE}, True)
 # An arm's own --mem-fraction-static and KV pool, appended to its argv (the last --mem-fraction-static wins).
 ARM_MEMORY_FLAGS = {
     arm: (
@@ -489,6 +498,7 @@ ARM_MEMORY_FLAGS = {
         (MERGE_CHUNK_ARM, MERGE_HOT_GPU_MB),
         (MERGE_CHUNK_EXPSEG_ARM, EXPSEG_HOT_GPU_MB),
         (MERGE_CHUNK_EXPSEG_CALIB_ARM, EXPSEG_HOT_GPU_MB),
+        (MERGE_CHUNK_EXPSEG_LANE_HEAD_ARM, EXPSEG_HOT_GPU_MB),
     )
 }
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
@@ -539,6 +549,7 @@ REFERENCE = {
     MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     MERGE_CHUNK_EXPSEG_ARM: MERGE_CHUNK_ARM,
     MERGE_CHUNK_EXPSEG_CALIB_ARM: MERGE_CHUNK_EXPSEG_ARM,
+    MERGE_CHUNK_EXPSEG_LANE_HEAD_ARM: MERGE_CHUNK_EXPSEG_ARM,
 }
 
 

@@ -883,6 +883,22 @@ def test_the_calib_arm_is_expseg_with_the_calibration_and_the_prefill_cuts_alone
     assert ab.server_flags(calib) == ab.server_flags(expseg) and ab.REFERENCE[calib] == expseg
 
 
+def test_the_lanehead_arm_is_expseg_with_the_lane_head_alone(monkeypatch):
+    """-expseg-lanehead is -expseg with SGLANG_OPT_LANE_HEAD_PATH at the exported fp32 head, at -expseg's fraction and
+    KV pin; every other arm pins the head off against a shell's. Mutant: another arm inherits the shell's path, or the
+    arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv(ab.LANE_HEAD, "/shell/head.safetensors")
+    expseg = PIN01_HICACHE_ARMS[5]
+    lanehead = expseg + "-lanehead"
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")[ab.LANE_HEAD] == (ab.LANE_HEAD_FILE if arm == lanehead else ""), arm
+    h, e = ab.ARMS[lanehead][0], ab.ARMS[expseg][0]
+    assert {k: v for k, v in h.items() if k != ab.LANE_HEAD} == {k: v for k, v in e.items() if k != ab.LANE_HEAD}
+    assert h[ab.LANE_HEAD].endswith("head-B-fp32.safetensors")
+    assert ab.server_flags(lanehead) == ab.server_flags(expseg) and ab.REFERENCE[lanehead] == expseg
+
+
 def test_hot_mb_for_margin_buys_whole_slots_of_the_measured_spare():
     """At the probe's own free memory and margin the arm keeps the probe's slots; each slot of extra margin costs one
     slot, and the MiB it returns floors back to that slot count."""
