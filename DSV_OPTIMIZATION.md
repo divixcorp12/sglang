@@ -975,6 +975,16 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               doesn't move ms/token. Its value is automation and safety, not speed. Next: release the 168 MiB
               residue (~+13 slots), write the final handoff, and wrap up the lane. (c) and (d) (wq_b) are
               deferred.
+            - Follow-up checks:
+              - ON's 2x-slow prefills (prompts 3 and 4, 30 s against 15 s) sit inside an nvme3n1 (SPCC) stall
+                during prefill: read await 47-52 ms against the ~9 ms baseline. OFF has the same thing on
+                prompts 0 and 1.
+              - **serve_compare's STALL flag covers decode only, so stalls confined to prefill go unflagged.**
+                Decode ms/token is unaffected, but any prefill-time comparison has to check nvme3n1 await per
+                prefill window.
+              - This run alone had 4 SPCC stall episodes.
+              - Node 0's load minimum comes from the draft weight load in both arms, not from the trial capture
+                or the calibration replay.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
