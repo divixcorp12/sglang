@@ -78,6 +78,9 @@ def _sized_slots(monkeypatch, head: bool) -> tuple[int, list]:
     _RecordingHotCache.made = []
     with (
         patch.object(expert_hot_cache, "ExpertHotCache", _RecordingHotCache),
+        # The CPU path of the upper bound (the pinned-tier limits); on a GPU box the bound also reads the launch's
+        # --mem-fraction-static, which a unit test has not published.
+        patch("torch.cuda.is_available", return_value=False),
         patch("torch.cuda.memory_allocated", return_value=0),
         patch("torch.cuda.memory_reserved", return_value=0),
     ):
