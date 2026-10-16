@@ -455,6 +455,78 @@ Notes on the table:
 
 **Best head arm for the share sweep:** product-emp.
 
+## Prefill-share sweep (2026-10-16)
+
+`lane_eval.py --shares` (`8b2d081f67`, and the shadowing fix after it); outputs in
+`/mnt/nvme1/lane-tier-replay/sweep/{ab-off,ab-on,base,c2}.json`.
+
+**Setup.**
+- **Which arms.** The A/B arms are replayed with their own served lanes (`actual`). C2 and base are replayed with
+  `today` and with product-emp, the best head arm. All are priced with the A/B OFF prices.
+- **How the share is modeled.** `eager_admit` follows take_admit_slot_locked:
+  - every admission is prefill-owned;
+  - past `share` owned rows with no free slot, the victim is the LRU owned row;
+  - with none, the prefetch stops and a demand admission falls back to decode's LRU;
+  - decode's use and set_hot end ownership.
+- **"none"** is staging without admission.
+- **TTFT bound.** The share's added demand reads per prompt, times the capture's demand read ms per row (1.35-1.62).
+
+### Δ decode ms/verify against share 0 (same arm, A/B prices)
+
+| share | A/B OFF | A/B ON | base today | base product-emp | C2 today | C2 product-emp |
+|---|---|---|---|---|---|---|
+| 16 | -10.7 | -11.8 | -18.2 | -19.6 | -23.4 | -25.0 |
+| 32 | -10.4 | -11.6 | -17.7 | -18.9 | -22.1 | -23.7 |
+| 64 (the existing flag) | -5.4 | -6.3 | -10.0 | -10.1 | -13.0 | -13.6 |
+| 96 | -4.0 | -4.8 | -7.5 | -7.7 | -9.1 | -9.8 |
+| 128 | -0.7 | -1.0 | -2.2 | -2.2 | -2.9 | -3.1 |
+| none (no admission) | -9.5 | -10.1 | -21.3 | -22.9 | -31.6 | -33.7 |
+| 64 on layers 2-20 | -5.6 | -6.5 | -8.3 | -8.6 | -10.6 | -11.3 |
+| 16 on layers 2-20 | -8.6 | -10.0 | -13.2 | -14.2 | -16.5 | -17.6 |
+
+- **Where it comes from.** NVMe-cold GPU lanes per verify fall from 13.8 to 9.3 (A/B OFF, share 16), from 29.9 to 17.9
+  (ON) and from 10.7 to 3.3 (C2 today). Forced CPU misses fall by 4-19 per verify. The A/B-residual correction
+  (`d_ms_ab`) adds 0.1-6 ms more gain.
+- **By verify position after the prefill** (0-4 / 5-14 / 15+):
+  - share 16: A/B OFF -4.9 / -10.9 / -19.6; C2 today -31.4 / -23.5 / -12.3;
+  - share 64: A/B OFF -5.6 / -5.5 / -4.7; C2 today -22.9 / -11.2 / -3.1;
+  - none: A/B OFF **+11.5** / -13.4 / -32.8; A/B ON **+8.5** / -18.3 / -29.6; C2 -37.7 / -32.5 / -21.4.
+  - On the A/B, no admission costs the first verifies, as section 27.9 found, and gains later.
+  - The 15+ bins hold only 19 / 11 verifies on the A/B.
+- **With the best head arm.** product-emp and the share add up, slightly better than additively. On C2, product-emp at
+  share 16 against today at share 0 is -28.1 ms/verify, before the head's cost. The parts are -3.1 (head arm) and
+  -23.4 (share).
+- **Layers 2-20 only** is no better at 64, and worse at 16. Keep the share on every layer.
+
+### Prefill cost
+
+- **Rows read.** Per serving prompt at share 0: 1,200-1,310 prefetch claims and 2,800-3,340 demand reads.
+- **Share 64:**
+  - The prefetch stops at the share, at about 27 claims per layer on average.
+  - Demand reads fall, by 330-620 per prompt, because the decode rows the share keeps are also the prompt's hits.
+  - So the bound gives -0.45 to -0.94 s of TTFT.
+- **Share 16** gives +0.27 to +0.46 s on A/B and base, and -0.08 s on C2.
+- **No admission:** +0.17 to +0.23 s on the A/B, -0.11 to -0.78 s on base and C2.
+
+### Caveats, against section 27.9's served share-64 result
+
+- **Section 27.9** (2026-09-25, pre-DSpark arms, one session each): S -3 ms/step, decode NVMe rows -4.7%, and TTFT
+  **+0.5 to +1.2 s**.
+- **This model at 64:** -8% cold reads (78 to 72 per verify on A/B OFF) and -5 to -14 ms/verify, through the CPU
+  forced-miss path, which those arms did not have.
+- **TTFT disagrees in sign.** This bound counts blocking reads only. It does not model what section 27.9 measured:
+  chunks after the first are no longer prefetched, so their reads stop overlapping the gather.
+- **The no-admission and small-share figures** go furthest from what T validated. T was checked on the A/B, where
+  every prefill admits.
+
+**What would settle it cheaply.** A served A/B of the existing flag, `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64,
+no code), on the `-mergechunk-expseg` arm, with the route log. It reads:
+- decode cold lanes per verify (predicted 13.8 to 10.2 on OFF);
+- stream + wait per verify (predicted -5.4);
+- TTFT.
+
+Smaller shares need `PREFILL_SHARE_ROWS` as an `EnvInt`, a small code change.
+
 ## Decisions asked of team-lead and the owner
 
 1. **Stage 0 now** (offline, the existing A/B, `taskset -c 56-63`, outputs under `/mnt/nvme1/lane-tier-replay/`). No
