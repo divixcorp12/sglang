@@ -1,192 +1,219 @@
-# Lane-head (v1 gather-time head) — handoff
+# Lane head (v1 gather-time head) — handoff, 2026-10-16
 
-Written by team-lead on 2026-10-16. The previous agent, cache-tiers-review, was interrupted twice before it could
-write this handoff. **No integration code has been written yet:** branch `lane-head` is `ram-prefetch-pool-serve`
-plus this file. The design below was approved; start from it.
+Written for a reader with no context. Branch `lane-head` (off `origin/ram-prefetch-pool-serve` at `a3bca01530`);
+analysis scripts and all replay evidence are on branch `cache-tiers` (`04b3d7f793`). Owner approvals and the five
+build conditions came through team-lead; nothing below was run on a GPU yet.
 
-## Goal
+## 1. Goal and status
 
-Integrate the trained v1 head at gather time. Per MoE layer and verify, it scores how likely each routed expert is to
-be routed again at v+1. The plan then gives GPU lanes to the likely-recurring experts and CPU lanes (the plan tail)
-to the unlikely ones. Victim ranking, insertion, prefetch and the split model stay unchanged.
+**Goal.** In DSpark decode of DeepSeek-V4.1 (EXL3), each MoE layer's graph gather plans its miss lanes and the fused
+route plan sorts them by an int64 key per expert, highest first; the GPU copies the head of the sorted list (those
+rows are inserted into the VRAM hot cache, DIRECT residency) and the CPU experts compute the tail (never inserted).
+Today the key is the residency ranking (`GpuResidencyUpdater.miss_keys`, decayed route counts). The lane head
+replaces the key with a learned probability that the routed expert is routed again by the *next* verify, so the GPU
+copies (and the cache keeps) the experts that will be reused and the CPU computes the rest. Offline replay on
+held-out captures: +7.5 hits/verify over the best no-learning table and +11.9 over today's key on C2, +11.0/+13.2
+on base, fewer inserts than today; ~1.2-1.4 ms/token traced (below the ~7 ms/token run-to-run noise, so the served
+A/B must read VRAM hits and CPU-lane time, not only ms/token).
 
-Expected served gain: +7.5..+11 VRAM hits/verify over today's ordering, about +1.2-1.4 ms/token traced. That sits
-at the edge of stall-free noise (SD 1.6 ms/token), so the A/B must show the mechanism (hits and CPU-lane time), not
-just ms/token.
+**Built (commit `8191a92d3b`, untested, never compiled on a GPU):**
+- `python/sglang/srt/layers/moe/lane_head.py`: file format (safetensors + JSON metadata `LaneHeadMeta`), validating
+  loader `read_lane_head_file`, `read_lane_head_meta`, `lane_head_device_bytes`, the fp32 reference
+  `reference_keys` (the test oracle), device state `LaneHead` (weights, `keys[layers, experts]`,
+  `last_routed[layers, experts]`, `z` scratch, `launches` counter; `launch`, `record_routed`, `describe`), and the
+  per-layer gather hook `LaneHeadGather`.
+- `python/sglang/kernels/jit/csrc/moe/lane_head.cuh` + `python/sglang/kernels/ops/moe/lane_head.py`: two kernels
+  per layer gather (`lane_head_pca_kernel`: grid (tokens, rank/16) x 256 threads; `lane_head_keys_kernel`: one block
+  of 128 threads, one thread per route), JIT wrapper `lane_head_keys(...)` templated on id dtype (int32/int64),
+  weight dtype (fp32/bf16) and PDL.
+- `analysis/dsv41-drive/dspark/export_lane_head.py`: folds the trained head + PCA into one file (see section 4).
+- Edits: `environ.py` (`SGLANG_OPT_LANE_HEAD_PATH = EnvStr(None)`), `expert_hot_cache.py` `from_model` (budget
+  subtraction, refusal if the head leaves no budget, `LaneHead` construction after the updater, `lane_head_bytes` in
+  the "Expert hot cache startup" log, `manager.lane_head`), `expert_residency_gpu.py` (`self.lane_head`, age update
+  in `_apply`), `exl3_ram_miss.py` `attach` (points `_plan_miss_keys` at `lane_head.keys[row]`, installs the hook),
+  `expert_stream.py` (`lane_head_hook` attribute; call before `plan_graph_routes_fused` in `_gather_graph`).
 
-## Status / next step
+**Not built:** tests (none), the exported head file (not yet produced), the divix01 worktree and any run, the
+allocation-order change for startup calibration (condition 2, see below), the A/B tooling. The code has been
+`py_compile`d only. Expect compile errors in the `.cuh` on first JIT (never built) and small integration mismatches.
 
-1. Read the skills `speculative-naming` and `env-var-conventions` (see `.claude/rules/modify-component-must-read.md`).
-2. Build the design below, then write the CPU tests, then ask team-lead for a GPU slot (GPU test plus microbenchmark),
-   then the served A/B.
-3. Commit and push to `lane-head` often.
+**Next concrete step.** Push is done; on divix01: `git -C /data/models/slang/sglang fetch origin && git -C
+/data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-lane-head origin/lane-head`, then
+`PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES= taskset -c 56-63 /data/models/slang/.venv/bin/python
+analysis/dsv41-drive/dspark/export_lane_head.py --head /data/models/slang/nvfp4-work/ram-prefetch/cache-tiers-20261015/head/B
+--data /mnt/nvme1/cache-tiers-tmp/head-data --out /mnt/nvme1/cache-tiers-tmp/lane_head_v1.safetensors` (CPU only),
+then write and run the CPU tests (section 3), then ask team-lead for a GPU slot for the JIT build, the GPU test and
+the microbenchmark.
 
-## Approved design
+## 2. Approved design (from the design note, as approved by team-lead)
 
-**Flag.** `SGLANG_OPT_LANE_HEAD_PATH = EnvStr(None)` in `environ.py`; the path is the switch.
-- None or "": off. Nothing is installed and `_plan_miss_keys` stays `direct.miss_keys`. Behaviour is bit-identical.
-- Set but unreadable or shape-mismatched (layers, experts, hidden, PCA rank): `ValueError` at
-  `Exl3RamMissService.attach`, naming the path, before graph capture.
-- A flag-on launch without CPU experts or without the fused plan is refused, as the existing miss order is.
+- **Flag.** `SGLANG_OPT_LANE_HEAD_PATH` (`EnvStr(None)`, in `environ.py` next to
+  `SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD`). The path is the switch: unset/empty means nothing is installed and
+  `_plan_miss_keys` stays `gpu_residency.miss_keys[row]`, bit-identical to today. Set but unreadable or mismatched
+  (format version, feature list, layer ids, expert count, shapes, non-finite, a "constant" feature with a nonzero
+  folded weight) raises `ValueError` naming the file, before graph capture. Needs DIRECT residency
+  (`SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`, `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2`), CPU experts and the fused plan
+  (the existing miss-order requirements); `from_model` refuses without DIRECT.
+- **Placement.** `Exl3MoEMethod._apply_graph` (`python/sglang/srt/layers/quantization/exl3/exl3.py` ~line 737) sets
+  `backend.cpu_input = (cpu_x, topk_weights)` right before `streamer.gather(topk_ids)`. Inside
+  `ExpertStreamer._gather_graph` (`expert_stream.py`), in the fused branch, `self.lane_head_hook(topk_ids)` runs
+  immediately before `plan_graph_routes_fused(...)`, on the gather's stream, captured in the breakable decode graph,
+  no host node. `plan_unique_routes_kernel` (`expert_route_plan.cuh`) then sorts the residual (miss) lanes by
+  `miss_keys[expert]` descending; `type_lanes` (`lease_device.cuh`) gives the CPU the tail as today. Victim ranking
+  (`_rank_victims`) is untouched (the replay showed the head's victim-side gain is ~0).
+- **Inputs per layer gather.** `x` bf16 `[tokens, hidden=5120]` from `cpu_input[0]`; `topk_ids`, `topk_weights`
+  `[tokens, 6]` (ids < 0 are dead rows); `insert_scores[row]` fp32 `[384]` (the boundary's decayed score, before this
+  forward's counts, exactly as the offline replay used it); new `last_routed[row]` int32 `[384]` (the forward each
+  expert was last routed in, -1 never; written in `GpuResidencyUpdater._apply` from `routed` for gated layers, reset
+  to -1 at a prefill boundary = new request); `forwards` int64 `[1]` (the updater's clock; one counted forward per
+  verify since drafts are not counted, so forwards == verifies); `mapping[row, :384]` int64 (expert_to_slot, >= 0 =
+  resident). Output: `keys[row]` int64 `[384]`, written for routed experts only (the plan reads only routed experts).
+- **Key.** `P = sigmoid(logit)`, `key = int64(P * 2^31) * 2^16 + (384 - 1 - e)` (same tie-break shape as
+  `residency_rank_keys`).
+- **Head math (variant B of the study), per layer L:** `z = (x[i*] - pca_mean_L) @ pca_proj_L` (rank 64; `i*` = the
+  token routing e with the largest gate weight, earliest on ties); `logit = expert_bias_L[e] + bias_L + dense_w_L .
+  f + z_w_L . z + expert_u_L[e] . z`. The 17 dense features, in order (`lane_head.FEATURES` ==
+  `next_verify_head.DENSE`): `cnt1, cnt2, cnt3p` (token count one-hot), `pos0..pos5` (first position one-hot),
+  `gate_w` (largest routing weight), `log_score` = log1p(max(score,0)), `score0` (score <= 0), `log_age` =
+  log1p(age) (age = forwards since last routed), `first_touch` (never routed), `resident` (expert_to_slot >= 0),
+  `live` = live tokens / 6, `odds` (draft acceptance odds; see condition 1). Standardization (`fm`, `fs`, `zs`) is
+  folded at export: `dense_w = w/fs`, `bias = b_dense - sum(w*fm/fs)`, `z_w = a/zs`, `expert_u = U/zs`; a feature
+  constant in training (`fs` = 1e9 after `next_verify_head.constant_safe`) folds to weight 0.
+- **Memory (total over 40 layers, not per layer):** `pca_proj` bf16 40x5120x64 = 26.2 MB; `expert_u` fp32
+  40x384x64 = 3.9 MB (the note said 2 MB bf16; the file stores fp32); `pca_mean` 0.8 MB; biases/dense ~0.1 MB; keys
+  int64 0.12 MB; last_routed int32 0.06 MB; z scratch 40x8x64 fp32 0.08 MB. `lane_head_device_bytes(meta)`
+  computes it from the metadata; `from_model` subtracts it from the hot-cache budget before sizing (so
+  `SGLANG_MOE_HOT_GPU_MB` stays the VRAM the two take together; ~2 slots fewer) and logs `lane_head_bytes`.
+- **Files to create/edit:** listed in section 1. Tests to add: `test/registered/unit/layers/moe/test_lane_head.py`
+  (CPU: file round-trip and refusals; reference ordering == p ordering; the constant-feature agreement test of
+  condition 1; a both-flags census test of condition 2), `test/manual/dsv41/test_lane_head_gpu.py` (kernel keys ==
+  `reference_keys` on random and captured inputs, P within 1e-3, order identical; microbenchmark per layer with and
+  without an L2 flush: 40 distinct weight sets and a 256 MB rotating buffer touched between calls, since the gathers
+  evict L2 between layers in serving), `test/manual/dsv41/test_lane_head_capture.py` (reference on C2's
+  `router.{ids,w,x}.bin` verifies reproduces the offline predictions' lane order; see section 4 on bf16 PCA).
+- **Expected cost.** ~4 MFLOP/layer, launch-dominated: ~5-10 us/layer = 0.2-0.4 ms/verify on the gate->plan
+  critical path (the earlier L+2 heads failed at 0.10 ms/layer = 4 ms/verify). Must be measured (condition 3).
 
-**Where the keys are written.**
-- Today `Exl3RamMissService.attach` sets `streamer._plan_miss_keys = gpu_residency.miss_keys[row]` (int64 [384],
-  updated once per boundary in `_rank_victims`).
-- `ExpertStreamer._gather_graph` passes it to `plan_graph_routes_fused`, whose `plan_unique_routes_kernel` sorts
-  miss lanes by key descending. `type_lanes` gives the CPU the plan tail.
-- `Exl3MoEMethod._apply_graph` (exl3.py ~737) sets `backend.cpu_input = (cpu_x, topk_weights)` just before
-  `streamer.gather(topk_ids)`, so x and the weights are on device before the plan runs.
-- New: one kernel per layer, launched inside `_gather_graph` on the gather's stream right before
-  `plan_graph_routes_fused`. It is captured in the breakable decode graph, with no host node.
-  - Inputs:
-    - x [live, 5120] bf16 from `cpu_input[0]`;
-    - `topk_ids` and `topk_weights` [live, 6];
-    - `insert_scores[row]` f32 [384], the boundary's decayed score before this forward's counts, exactly as the
-      replay used it;
-    - a new `last_routed[row]` int32 [384], the forward each expert was last routed in. It is written in
-      `GpuResidencyUpdater._apply` from `routed`, only when the head is on.
-    - `forwards[1]` and the head weights.
-  - Output: `keys[row]` int64 [384], for routed experts only, with `key = int64(P * 2^31) << 16 | (383 - e)` (the
-    same tie-break shape as `residency_rank_keys`).
-  - `attach` points `_plan_miss_keys` at `keys[row]`. `_rank_victims` is untouched.
+## 3. Team-lead's five conditions (all binding)
 
-**Head math (variant B).**
-- z = PCA_L(x_{i*}), where i* is the token routing e with the largest gate weight.
-- logit = b[e] + w·f + a·z + U[e]·z.
-- f has 17 dense features:
-  - token-count one-hot;
-  - first-position one-hot;
-  - gate weight;
-  - log1p(score) and score==0;
-  - log1p(age);
-  - first touch;
-  - resident flag;
-  - live/6;
-  - draft odds.
-- Cost: one 5120x64 GEMV per (layer, token), then a 64-d dot plus 17 MACs per routed expert. About 4 MFLOP/layer,
-  launch-dominated; the estimate is 5-10 µs/layer, 0.2-0.4 ms/verify, on the gate→plan critical path. Measure it.
+1. **Draft odds:** serve exactly what training saw. The B0 training corpus has no draft-top-prob, so `odds` was
+   constant 1.0 and its weight folds to 0. The exporter records every constant feature and its training value in
+   `meta.constant_features` (`{"odds": 1.0}` expected); the kernel takes `odds` from `meta.odds` (wrapper argument,
+   kernel `f[16] = odds`); the loader refuses a constant feature with a nonzero folded weight. Still needed: the
+   unit test that the exported file's `constant_features["odds"]` equals the value the training shards held and that
+   `reference_keys(..., odds=meta.odds)` and the kernel agree.
+2. **Startup calibration:** prefill-merge-2's `SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP` (branch
+   `origin/prefill-merge-chunk`, `expert_hot_cache.py` lines ~168-215 and ~1523) measures free memory after model
+   load and grows the cache toward an upper capacity on VMM memory. The head's bytes must be allocated before that
+   measurement and `lane_head_bytes` must show in the startup log (it does). As committed, `LaneHead` is constructed
+   after the caches, which is too late if calibration measures inside/after cache allocation: move the allocation to
+   right after the budget subtraction in `from_model` (device = the model's; validate layer ids/experts later against
+   the updater) or allocate before `from_model` is entered. Write one CPU test with both flags on checking the
+   hot-cache census still holds (that branch is not merged into `lane-head`; coordinate the merge order with
+   team-lead).
+3. **Critical-path cost:** report the microbenchmark per layer with and without the L2 flush; in the served A/B
+   report the gate->plan time from the per-layer device stamps (note: today's stamps cover post/S/wait, not
+   gate->plan; a stamp may need adding). If the head adds more than 0.5 ms/verify, tell team-lead before the served
+   run.
+4. **A/B verdict:** report VRAM hits/verify, CPU-lane time per verify and gate->plan time alongside ms/token, with
+   `serve_compare.py` as the verdict; the gain must show as hits moving from CPU lanes to VRAM, not only ms/token.
+5. **Generalization:** the head was trained on the B0 corpus (100 sessions, `dspark-both-misscut` recipe, 853 slots,
+   prefetch off) and evaluated on held-out captures C2 (`split-ab-20261014/C2`, 48 prompts, fixed-split arm, 853
+   slots) and `breakdown-20261015/base`; the +7.5..+11 hits came from those two. If startup calibration changes slot
+   counts per launch, the `resident` feature's distribution shifts (share of routed experts resident); note it in the
+   A/B and retrain if calibration moves the slot count far from 853.
 
-**Files.**
-- New:
-  - `python/sglang/srt/layers/moe/lane_head.py`: a safetensors head file following the
-    `ram_prefetch_learned_head.py` pattern (byte-range reads, no pickle). Metadata: layers, hidden, rank, feature
-    list, draft-odds training value, training commit. Device load. Python reference `lane_keys_reference()`.
-  - `python/sglang/kernels/jit/csrc/moe/lane_head.cuh` and `python/sglang/kernels/ops/moe/lane_head.py`.
-  - `analysis/dsv41-drive/dspark/export_lane_head.py`: `head/B/L*.npz` + `pca.npz` → one file.
-- Edited:
-  - `environ.py`;
-  - `exl3_ram_miss.py` attach: load, refuse, point `_plan_miss_keys`, install the hook on `Exl3RamMissRowBackend`;
-  - `expert_stream.py` `_gather_graph`: call the hook when installed;
-  - `expert_residency_gpu.py`: the `last_routed` buffer and its update, plus a keys-written counter;
-  - `expert_hot_cache.py` `from_model`: budget accounting.
+## 4. Where the trained head lives
 
-**Memory: ~28.5 MB of persistent VRAM in total** (not per layer):
-- PCA 40×5120×64 bf16 = 26.2 MB;
-- U 40×384×64 = 2.0 MB;
-- the rest is under 0.3 MB.
+- Weights: divix01 `/data/models/slang/nvfp4-work/ram-prefetch/cache-tiers-20261015/head/B/L00..L39.npz` (per layer:
+  `fm, fs, zs, state_bias.weight [384,1], state_dense.weight [1,17], state_dense.bias [1], state_z.weight [1,64],
+  state_u.weight [384,64]`) and `head/B/summary.json` (variant B, 8 epochs, dev log loss per layer; mean 0.528 vs base
+  0.685). Variant A (no per-expert direction) in `head/A/`, weaker (precision 0.557 vs 0.595).
+- PCA and training shards: `/mnt/nvme1/cache-tiers-tmp/head-data/pca.npz` (`mean [40,5120]`, `proj [40,5120,64]`
+  fp32, fit on every 8th training verify, 6000 rows/layer), shards `train-b000..b003/L*.npz`, eval shards `c2/`,
+  `base/`, `manifest.json`. Scratch volume; copy to `/data` if it must survive.
+- Training command (branch `cache-tiers`, script `analysis/dsv41-drive/dspark/next_verify_head.py`, commits
+  `fbdb846930`, `33a8118dca`, `e0aa95a7c7`): `extract --out D --train B0/blocks/b000..b003 --eval c2=... base=...
+  --pca-rank 64 --pca-every 8 --pca-rows 6000`; `train --data D --out head/B --variant B --epochs 8`; `predict`;
+  `report`. Runner `cache-tiers-20261015/run_head_train.sh`. 5.35M training examples (5,969 consecutive-verify pairs),
+  31 s on 4 CPU threads. **Always `CUDA_VISIBLE_DEVICES=""` before importing torch** (the script sets it; see rules).
+- Held-out numbers (precision at k = the capture's own GPU-lane count, misses only, `head/{c2,base}.report-B.json`):
+  C2 head 0.595 / recall 0.378 vs table 0.471/0.299, score 0.408/0.259, actual 0.420/0.267, oracle 0.851/0.541; base
+  0.614/0.393 vs 0.517/0.331, oracle 0.851. Log loss C2 0.544 (head) vs 0.610 (table). Replay hits/verify (test
+  forwards, `{c2,base}.replay-headB.txt`): C2 head-k 397.8 vs table-k 390.3, score-k 385.9, next1-k 431.6, belady-k
+  460.5; base 373.9 vs 362.9 / 360.7 / 405.4. Inserts 116.8/verify vs today's 121.7.
+- bf16 PCA: the offline predictions (`head/c2.pred-B.npz`) used fp32 PCA; the file stores `pca_proj` in bf16, so the
+  capture test should regenerate predictions through `reference_keys` and compare lane orders (expect agreement on
+  all but near-ties; report the flip count), and rerun `vram_cache_replay.py --pred` with them to confirm the hits.
 
-When the flag is set, `from_model` reads the file metadata and subtracts these bytes from the hot budget before
-sizing. The "Expert hot cache startup" log line gains `lane_head_bytes` and the resulting slots.
+## 5. Replay findings (all on branch `cache-tiers`, outputs in `cache-tiers-20261015/`)
 
-## Team-lead's five conditions (binding)
+- **VRAM replay** (`vram_cache_replay.py`, C2 806 verifies, 853 slots = 21-22/layer; `c2.replay*.txt`): actual
+  41.1% unique hit rate (361 of 879 unique routed experts/verify), 112 inserts, 405 CPU lanes, 45% of inserts
+  evicted before reuse; LRU stack-distance median 32 > capacity. Simulated today's rule 43.7% (model validated).
+  Insert-all (CPU experts too): +36 hits for +292 copies/verify, ruled out. Per-layer non-uniform slots: +1-3 hits,
+  ruled out. Decay 0.98 -> 0.995: +5-6 hits (cheap arm). Capacity: +1 slot/layer ~ +7.5 hits/verify ~ 2.8 ms/verify
+  traced; 853 -> 951 slots ~ +18 hits. Belady-with-bypass 57.2% (+141), one-verify oracle 54.1% (+114), k-limited
+  oracle 48.9% (+68 with no extra copies). Rejected-token routes recur within one verify 42% vs 26% for accepted
+  routes (rejected positions are regenerated); acceptance-aware bypass loses hits. Cost model (`lane_cost_fit.py`,
+  breakdown base, OLS r2 0.81): CPU RAM-hit lane 0.29 ms, NVMe-read lane ~1.1 ms, DMA ~0; mix 0.37 ms per non-VRAM
+  lane (traced).
+- **NVMe prefetch a verify ahead** (`ram_prefetch_replay.py`, `c2.ramprefetch*.txt`, `c2.ramcalib.json`): a routed
+  expert is a RAM hit next verify by construction (0.7% of NVMe demand misses were routed the verify before), so
+  recurrence heads cannot feed prefetch. Oracle bounds on top of today's L+2 T3 prefetch: 20 rows/verify save 19.5
+  of 50.4 RAM misses, 40 save 33.4, 80 save 44.3 (candidates run out at ~50); timing not the constraint. Near-miss
+  gate baseline (ranks 7+ of this verify's tokens): 5% precision, net negative (wasted landings evict useful rows).
+- **RAM-tier calibration:** per-layer LRU with VRAM-hot protection reproduces the capture's 51.7 RAM misses/verify
+  (33.5 demand + 18.2 covered) at 190 rows/layer (nominal 210; ~20 slots/layer are pool/promotion mechanics).
+- **Churn fix refuted:** evicting never-routed landings first is worse (52.9 vs 50.4 misses/verify: a landing is
+  unrouted until its target layer runs); stale-first (after its verify passed) saves 0.5. `promote_landed` already
+  stamps a promoted row with its victim's old recency, so the real tier is stale-first already. The earlier "13.5
+  misses induced by churn" attribution was wrong (a calibration artifact). Cold-miss ages of the experts today's
+  prefetch covers: 1.9% last routed 1-2 verifies earlier, 18.2% 3-8, 25.4% 9-16, 24.4% 17-32, 30.0% not in 32.
+- miss-cut-replay's independent numbers agree: VRAM pair hit rate 0.51-0.53, residency key a ~6-point reuse
+  predictor; keep the greedy split rule, no residency cost term.
 
-1. **Draft odds:** serve exactly what training saw. B0 had draft odds constant, and the feature was **zeroed** in
-   training (fix `e0aa95a7c7`; without it C2 precision collapses to 0.32). Store the training value in the file
-   metadata, have the kernel use it, and add a test that they agree. Do not feed 1.0.
-2. **Startup calibration** (`SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP`, branch `prefill-merge-chunk`, owned by
-   prefill-merge-2) measures free memory after model load. The head's bytes must be allocated before calibration
-   measures. Add a CPU test with both flags on that checks the hot-cache capacity census still holds.
-3. **Critical path:** report the microbenchmark in µs/layer, with and without the L2 flush (40 distinct weight sets
-   plus a 256 MB rotating buffer touched between calls; the CLAUDE.md rule on working sets past the 96 MiB L2). If
-   it adds more than 0.5 ms/verify, tell team-lead before any served run.
-4. **A/B reporting:** the verdict comes from `serve_compare.py` (in `wt-stream-variance`, merged into
-   `ram-prefetch-pool-serve` at `91cf7c7c02`). Report VRAM verify hits/verify, CPU-lane time/verify and gate→plan
-   time alongside ms/token. Run one plain A/B against the current arm, not a/b/a/b.
-5. **Generalization:** state which held-out data the hit numbers come from (below: C2 and base). Calibration can
-   change slot counts per launch (1,035 → ~1,047); note whether the "resident" feature's distribution shifts.
+## 6. Held items
 
-## Tests to write
+- **(c) Draft-hidden-state capture** (owner's call, ~2 h of box time, ~16 GB on /mnt/nvme1): B0-style, served recipe
+  with prefetch on, 100 sessions, adding per verify the draft's final hidden states for the drafted tokens (~25
+  KB/verify) and draft-top-prob. Needed because no capture pairs draft state with the next verify's routes, and B0
+  ran with prefetch off.
+- **(d) v2 plan** (conditional on (c)): one model per verify, off the critical path during the draft phase
+  (end-to-next-begin gap 51.7 ms median, 42.7 p10), inputs = verify v's gate inputs for all layers/tokens (240 x 5120
+  bf16 on device), the draft's hidden states for v+1's tokens, a per-(layer, expert) route-history state (16-d,
+  updated once per verify), positions and draft confidence; shared 5120->256 projection + 2 attention layers over
+  the 240 token-layer vectors + per-(layer, expert) 256-d vectors (~4-5M parameters; per-layer full-dim per-expert
+  weights would be 79M on ~350 examples each and overfit); two outputs per (layer, expert): P(routed at v+1) for
+  prefetch and P(routed at v+2 | routed at v+1) as the prior the gather-time key reads. Cost ~0.4 GFLOP, <0.2 ms per
+  verify in a 40 ms window; GPU training 15-20 min under cc-gpu.lock on a 790 MB projected dataset. Data: 5,969
+  pairs; B0 requests run 10 verifies median (p25 7, p75 14; 332 runs of 8+). Ceiling: VRAM lanes 431.6 hits (oracle)
+  vs v1 397.8, realistic 405-415; prefetch oracle -19.5 RAM misses at 20 reads, a 50%-precision head +3..+10.
 
-- CPU, `test/registered/unit/layers/moe/test_lane_head.py`: the Python reference on a captured C2 verify
-  (`router.{x,ids,w}.bin`) with the exported file must reproduce `next_verify_head.py`'s predictions, and therefore
-  the replay's lane order, **exactly** (use the same fp32 op order as `predict`).
-- GPU, `test/manual/dsv41/test_lane_head_gpu.py`: kernel keys == reference keys for random and captured inputs, P
-  within 1e-3 and an identical order. The microbenchmark goes in the same file.
-- Flag off: bit-identical (existing exl3/expert tests unchanged).
+## 7. Rules
 
-## Trained head and data (divix01)
+- `.claude/rules/divix01-run-protocol.md`: code reaches divix01 only by push + `git worktree add --detach
+  /data/models/slang/nvfp4-work/wt-<name> origin/<branch>`; `PYTHONPATH=$PWD/python`, print `sglang.__file__`;
+  interpreter `/data/models/slang/.venv/bin/python`; read `${PIPESTATUS[0]}`; run only the affected tests.
+- CPU work on cores 56-63 (`taskset -c 56-63`, OMP threads <= 8) while any capture runs; `taskset -c 0-63` only
+  when team-lead confirms the box is quiet. GPU work only with a slot from team-lead, under `cc-gpu.lock` on cores
+  32-63 (serialized with prefill-merge-2); lock order `rowimg-disk.lock` then `cc-gpu.lock`.
+- `CUDA_VISIBLE_DEVICES=""` before importing torch in every offline job: torch's AdamW step calls
+  `torch.accelerator.current_stream()` and creates a CUDA context. Incident 2026-10-15 18:32 CDT: the first training
+  attempt did this while arm C was serving, failed with CUDA OOM, allocated nothing; team-lead checked arm C's log,
+  no harm. `next_verify_head.py` and `ram_prefetch_replay.py` set the variable at import.
+- Outputs under `/mnt/nvme1` (TMPDIR `/mnt/nvme1/cache-tiers-tmp`) or `ram-prefetch/cache-tiers-20261015/`; never
+  `/tmp` on divix01; never touch `cc-expert-prediction/dsv41-direct-prod`, port 7867, or `DSV_OPTIMIZATION.md`.
+- Repo hook: edit tracked files with Edit/Write, not sed/python/redirects. Env vars per
+  `.claude/skills/env-var-conventions`; spec-decoding names per `.claude/skills/speculative-naming`; JIT kernels per
+  `.claude/skills/add-jit-kernel` (abstractions in `sgl_kernel/`, Doxygen comments, ASCII only).
+- Never amend or force-push; stage by name; commit trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+  and the session line.
 
-- Analysis dir: `/data/models/slang/nvfp4-work/ram-prefetch/cache-tiers-20261015/`
-  - Head weights: `head/B/L00.npz` … `L39.npz` (variant B). Variant A is in `head/A/` and isn't used.
-  - Held-out predictions and reports: `head/{c2,base}.pred-B.npz` and `head/{c2,base}.report-B.json`; training log
-    `head/train-B.log`.
-  - Hit replays: `{c2,base}.replay-headB.{txt,json}`. Baselines: `{c2,base}.replay.{txt,json}`.
-  - Training and extraction scripts: `run_head.sh`, `run_head_train.sh` (logs `run_head.extract.log`,
-    `run_head_train.log`), `next_verify_head.py`.
-- Training shards: `/mnt/nvme1/cache-tiers-tmp/head-data/` (`train-b000…`, `c2`, `base`, `manifest.json`,
-  **`pca.npz`**, the PCA64 fit on training rows only), 2.3 GB.
-- Training data: B0 corpus `/mnt/nvme1/nvfp4-work/b0-corpus-100-20261012` b000-b003, 5.35M (verify, layer,
-  expert) examples over 5,969 consecutive-verify pairs.
-- Held out: C2 (658k examples over 752 pairs) and the base capture. Training takes 31 s on 4 threads, CPU only.
-- Code: branch `cache-tiers` (last `04b3d7f793`); head fix `e0aa95a7c7`. Scripts in
-  `analysis/dsv41-drive/dspark/`:
-  - `vram_cache_replay.py`: the VRAM lane/hit replay;
-  - `lane_cost_fit.py`: per-lane cost fit;
-  - `next_verify_head.py`: extract, train, predict;
-  - `ram_prefetch_replay.py`: the RAM-tier replay.
-- Verify the paths with `ls` before relying on them.
+## 8. Branches and commits
 
-## Results so far (held-out)
-
-- Precision/recall at k = GPU lanes, C2: head B 0.595/0.378; table 0.471/0.299; today's score 0.408/0.259;
-  oracle 0.851/0.541. Variant A (without the per-expert PCA term) reaches 0.557.
-- Hits/verify:
-
-  | capture | head B | table-k | today | next1-k oracle |
-  |---|---|---|---|---|
-  | C2 | 397.8 | 390.3 | 385.9 | 431.6 |
-  | base | 373.9 | 362.9 | 360.7 | 405.4 |
-
-- Inserts drop to 116.8/verify from 121.7, so there is no extra link traffic. All the gain is from lane choice.
-
-## RAM-tier replay findings (context; not this build)
-
-- The replay is calibrated at 190 rows/layer (nominal 210, ~20 taken by pool mechanics): 50.4 RAM misses/verify
-  against 51.7 measured. Outputs: `c2.ramprefetch*.{txt,json}`, `c2.ramcalib.json`.
-- Oracle next-verify prefetch on top of today's saves 19.5 / 33.4 / 44.3 misses at 20 / 40 / 80 reads. The
-  near-miss gate is net negative (5% precision).
-- **The churn fix is refuted:** speculative-first eviction gives 52.9 (worse), stale-first 49.9. `promote_landed`
-  already stamps a landing with its victim's old recency. The earlier "13.5 induced misses" was a replay
-  calibration artifact.
-- 70% of the misses prefetch covers are cold (not routed in the last 9+ verifies). The lever for prefetch is
-  precision.
-
-## Held (owner's call; don't start)
-
-- (c) A capture with the draft's final hidden states per verify (~2 h of box time, 100 sessions, ~16 GB).
-- (d) v2: a 384-way next-verify head (shared 5120→256 projection, 2 attention layers over 240 token-layer vectors,
-  route-history GRU state, outputs P(routed at v+1) and P(v+2 | v+1)). Only if (c) shows the draft states predict
-  new experts well above 35%.
-
-## Rules
-
-- Follow `.claude/rules/divix01-run-protocol.md`:
-  - push, then use a fresh worktree on divix01;
-  - `PYTHONPATH=$PWD/python`, print `sglang.__file__`, interpreter `/data/models/slang/.venv/bin/python`;
-  - read `${PIPESTATUS[0]}`;
-  - run only the affected tests.
-- Cores and locks:
-  - CPU work under `taskset -c 0-63` with `OMP_NUM_THREADS`; offline analysis on cores 56-63; keep 64-71 free.
-  - GPU work only with team-lead's OK, via `flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63`. Take
-    `rowimg-disk.lock` before `cc-gpu.lock`.
-  - GPU tests need `SGLANG_EXL3_SRC=/data/models/slang/nvfp4-work/exllamav3`.
-- Offline torch jobs set `CUDA_VISIBLE_DEVICES=""` before importing torch. (Incident: the first training run touched
-  the GPU through AdamW's stream check during a served arm.) Some test utilities break on an empty value; use `99`
-  there.
-- Outputs go under `/mnt/nvme1` or `/data/models/slang/nvfp4-work/ram-prefetch/`, with `TMPDIR` set there.
-- Never touch production (`cc-expert-prediction/dsv41-direct-prod`) or port 7867; harness ports 30017/30032 are
-  fine. Never edit `DSV_OPTIMIZATION.md` (team-lead owns it).
-- Git: never amend or force-push; stage files by name; use Edit/Write for repo files (a hook blocks sed/python
-  edits).
-- New behaviour stays off by default.
-- Report to team-lead.
+- `lane-head`: `8191a92d3b` (this WIP) + this handoff.
+- `cache-tiers` (`04b3d7f793`): `analysis/dsv41-drive/dspark/vram_cache_replay.py` (VRAM policy replay, `--pred`
+  hook, predictor report), `lane_cost_fit.py` (traced marginal cost per lane kind), `next_verify_head.py`
+  (extract/train/predict/report), `ram_prefetch_replay.py` (RAM tier + prefetch policies, victim rules,
+  calibrate-only). Memory notes in `~/.claude/projects/-Users-dnikolaidis-Desktop-divix-sglang-nvfp4/memory/`.
