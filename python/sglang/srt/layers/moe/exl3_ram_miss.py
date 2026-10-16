@@ -2069,8 +2069,14 @@ class Exl3RamMissService:
             logger.info("exl3 RAM miss split model calibrated in %.2f s%s%s: %s", seconds,
                         f", clamped {', '.join(clamped)}" if clamped else "",
                         ", with SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS" if overrides.strip() else "", costs.line())
-        self.device_side.set_split_model_costs(costs.words())
+        self._publish_split_model(costs)
         self._split_model_refiner = calib.SplitModelRefiner(costs, self._split_model_moments(), overrides)
+
+    def _publish_split_model(self, costs) -> None:
+        """Write ``costs`` (SplitModelCosts) and the flags word (SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK) to the
+        device."""
+        tiebreak = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.get()
+        self.device_side.set_split_model_costs(costs.words(residency_tiebreak=tiebreak))
 
     def _split_model_moments(self) -> list:
         """Every node's CPU fit moments (cpu_experts.h fit_moments), in node order."""
@@ -2083,7 +2089,7 @@ class Exl3RamMissService:
         try:
             costs = refiner.refine(self._split_model_moments())
             if costs is not None:
-                self.device_side.set_split_model_costs(costs.words())
+                self._publish_split_model(costs)
                 logger.info("exl3 RAM miss split model refined (%d): %s", refiner.refines, costs.line())
         except Exception as error:  # noqa: BLE001 - a refit must not stop serving
             logger.warning("exl3 RAM miss split model refinement failed (%r); keeping the published costs", error)

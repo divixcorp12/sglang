@@ -3448,7 +3448,7 @@ class ExpertStreamDevice:
         self.miss_cut, self.miss_cut_max = int(miss_cut), int(miss_cut_max)
         # The split model's cost words (ram_slot_map.split_model_words) and its counters, or empty: the split and the
         # miss cut.
-        costs = 5 * self.wire.nodes + 5
+        costs = 5 * self.wire.nodes + 6
         if split_model is not None and len(split_model) != costs:
             raise ValueError(f"the split model has {costs} cost words for {self.wire.nodes} nodes, got {len(split_model)}")
         # The counters (ram_slot_map.split_model_stats_words): records, then per node to_cpu and to_copy.
@@ -4114,7 +4114,7 @@ class ExpertStreamDevice:
         """Replace the split model's cost words (ram_slot_map.split_model_words, or split_model_off_words) in place,
         leaving its counters. The copy is queued on the current stream from pinned memory, so a captured post reads
         the new words from its next replay on; the host does not wait for it."""
-        costs = 5 * self.wire.nodes + 5
+        costs = 5 * self.wire.nodes + 6  # the costs and the flags word
         if self.split_model.numel() == 0:
             raise ValueError("the split model is off: the post has no cost words to replace")
         if len(words) != costs:
@@ -4129,14 +4129,14 @@ class ExpertStreamDevice:
         """The split model's cost words as the device holds them (a device-to-host copy), or None when it is off."""
         if self.split_model.numel() == 0:
             return None
-        return self.split_model[: 5 * self.wire.nodes + 5].cpu().tolist()
+        return self.split_model[: 5 * self.wire.nodes + 6].cpu().tolist()
 
     def split_model_stats(self) -> Optional[dict]:
         """The split model's counters (a device-to-host copy), or None when it is off: records it typed, and per node
         the lanes it put on the CPU that the table would not (``to_cpu``) and took off the CPU (``to_copy``)."""
         if self.split_model.numel() == 0:
             return None
-        words = self.split_model[5 * self.wire.nodes + 5 :].cpu().tolist()
+        words = self.split_model[5 * self.wire.nodes + 6 :].cpu().tolist()
         return {
             "records": words[0],
             "to_cpu": words[1::2],

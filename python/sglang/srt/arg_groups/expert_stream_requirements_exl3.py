@@ -358,8 +358,11 @@ def _check_slot_map() -> None:
         from sglang.srt.layers.moe.ram_slot_map import split_model_words
 
         split_model_words(2, envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get())
-    elif envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get().strip():
-        raise ValueError("SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS needs SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL=1")
+    else:
+        if envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get().strip():
+            raise ValueError("SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS needs SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL=1")
+        if envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.get():
+            raise ValueError("SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK needs SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL=1")
     if envs.SGLANG_DSV41_CPU_TWO_STAGE.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # Without CPU experts there is no CPU miss to split: a set flag is a launch typo.
         raise ValueError("SGLANG_DSV41_CPU_TWO_STAGE needs SGLANG_DSV41_CPU_EXPERTS=1")

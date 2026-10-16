@@ -9,8 +9,12 @@ RAM row cache shared by every Engram layer does, and misses read with O_DIRECT.
 
 from __future__ import annotations
 
+import atexit
 import glob
+import logging
 import os
+import threading
+import time
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -22,6 +26,53 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram_row_cache import EngramRowCache
+
+logger = logging.getLogger(__name__)
+
+# How often the native store's counters are logged.
+NATIVE_STATS_INTERVAL_S = 60.0
+_LOGGED_STORES: set = set()
+
+
+def native_cache_bytes() -> int:
+    """SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB in bytes; 0 is a store that keeps no rows."""
+    gib = envs.SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB.get()
+    if gib < 0:
+        raise ValueError(f"SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB must be >= 0, got {gib}")
+    return int(gib * (1 << 30))
+
+
+def native_stats_line(now: dict, before: Optional[dict]) -> str:
+    """One log line: the window's and the run's accesses, hits, unique misses and hit rate."""
+    def part(acc: int, hits: int, misses: int) -> str:
+        return f"{acc} accesses, {hits} hits, {misses} unique misses, hit rate {hits / acc if acc else 0.0:.3f}"
+
+    keys = ("accesses", "hits", "unique_misses")
+    window = [now[k] - (before[k] if before else 0) for k in keys]
+    return (f"engram native cache ({now['cache_bytes'] / (1 << 30):.2f} GiB, {now['capacity_rows']} rows): "
+            f"window {part(*window)}; total {part(*(now[k] for k in keys))}")
+
+
+def log_native_stats(store, interval_s: float = NATIVE_STATS_INTERVAL_S) -> None:
+    """Log the shared native store's counters every interval_s (a daemon thread) and at exit; once per store."""
+    if id(store) in _LOGGED_STORES:
+        return
+    _LOGGED_STORES.add(id(store))
+    state = {"before": None}
+
+    def emit() -> None:
+        now = dict(store.stats())
+        if now["accesses"] != (state["before"] or {}).get("accesses", 0):
+            logger.info(native_stats_line(now, state["before"]))
+        state["before"] = now
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval_s)
+            emit()
+
+    threading.Thread(target=loop, name="engram-cache-stats", daemon=True).start()
+    atexit.register(emit)
 
 
 class EngramFileTable:
@@ -123,10 +174,10 @@ class EngramFileTable:
                         from sglang.srt.layers.engram_host_node import native_engram_host_node
 
                         table._host_node_extension = native_engram_host_node()
-                        budget = 5 << 30
                         table._native_store = table._host_node_extension.get_shared_store(
-                            budget, dim + dim // 32
+                            native_cache_bytes(), dim + dim // 32
                         )
+                        log_native_stats(table._native_store)
                         table._native_store.register_table(
                             path, table.weight_offset, table.scale_offset,
                             num_embeddings, dim, dim // table.block, layer_id << 40,

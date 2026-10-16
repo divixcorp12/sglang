@@ -837,6 +837,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Lock the scheduler process's memory against swap once the scheduler is built (model loaded, graphs captured):
+    # mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT), so touched pages stay resident without faulting anything in
+    # (sglang/srt/utils/memory_lock.py). Needs RLIMIT_MEMLOCK unlimited; a failure is logged, not raised.
+    SGLANG_ENABLE_SCHEDULER_MLOCK = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -1016,6 +1020,9 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # NUMA node the mmap host KV pools (mmap_allocator.alloc_mmap) are bound to before their pages are touched;
+    # unset: first touch places them, on the allocating thread's node.
+    SGLANG_HICACHE_HOST_NUMA_NODE = EnvInt(None)
     # Device bytes one page_first host pool may spend on its write-back staging buffer; fewer pages, more chunks.
     SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB = EnvInt(32)
     # Device memory reserved out of the KV budget for HiCache allocations made after the pool is sized.
@@ -1856,6 +1863,9 @@ class Envs:
     # Capture layer-1 Engram lookup as a CUDA host node backed by a shared native
     # row cache and an io_uring worker. Disabled unless explicitly requested.
     SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING = EnvBool(False)
+    # Size in GiB of that native row cache (shared by every Engram layer). 0 keeps no rows: every lookup reads its
+    # rows through io_uring.
+    SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB = EnvFloat(5.0)
     # With the above, capture the decode lookup as a device post kernel and a device
     # wait kernel served by a polling thread instead of a host node; the decode graph
     # then has no host nodes, which is asserted at capture.
@@ -2035,6 +2045,9 @@ class Envs:
     # Batches between live refinements of the split model's CPU costs from the CPU jobs served (SplitModelRefiner in
     # split_model_calibration.py); 0 keeps the calibrated costs. Off by default.
     SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES = EnvInt(0)
+    # With it, among a node's lanes the model prices alike (same tokens) the CPU takes the lowest residency keys, so
+    # the copy engine, whose lanes become VRAM residents, gets the highest. Off until a served A/B decides.
+    SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK = EnvBool(False)
     # Experiment: a two-stage CPU miss. The reader fetches a CPU-computed miss's w13 prefix across the mirror roots
     # before its w2 suffix, and the CPU job starts once w13 has landed: it runs the gate/up GEMVs while w2 is still being
     # read and waits for w2 before anything reads it. Needs SGLANG_DSV41_CPU_EXPERTS. Off until a served A/B decides.
