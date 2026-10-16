@@ -897,6 +897,25 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               forwards inside fresh `torch.cuda.MemPool`s.
               - calib6's 214 MiB: +188 graph pools (torch reserved) plus ~26 outside torch.
               - calib7 adds log-only capture probes (`dd974488c9`), then calib8 validates the estimate.
+          - **calib7** (2026-10-16 02:12, `dd974488c9`): served with 0 OOM lines, but **peak free was 38 MiB**
+            (nvidia-smi), a near-OOM. Prelaunch waited ~13 min: node 1 had 8.7 GiB of reclaimable slab,
+            partly from my own `find`, until the user dropped the caches.
+            - Grew +66 slots (1,035 → 1,101) on a margin of 334 (calib6: 574).
+            - Capture probes: two graphs, both bs=1.
+              - Target verify: −172 free (146 torch reserved, 26 outside torch).
+              - Draft: −42.
+              - Total 214 again, against a 30 estimate.
+            - **The margin is unstable:** reserve growth on the repeated 4,096 run was +320 in calib6 and +60 in
+              calib7. The real warm-up's reserved peak is steady (~14,750), because its small shapes (1 to 400)
+              set the allocator history before the 2048 run.
+            - The fixed watch works: real transient vs calibration +41; reserved peak +312.
+            - **Next:**
+              - (a1) Estimate capture with eager dummies in fresh MemPools, taking the larger of that and the
+                last probe.
+              - (a2) Calibration replays the full real warm-up shape sequence. The margin comes from the worst
+                repeated 4,096 run plus the measured noise between repeats.
+              - calib8 must show peak free ≥ margin. The arm has to beat 1,035 slots at expseg2's peak free
+                (706) to be worth it.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
