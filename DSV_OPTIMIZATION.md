@@ -271,8 +271,14 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
 - **Prefill churn:** 46,900 eager evictions across 8,782 RAM slots (prefill share 0). Decode misses per verify are
   flat by position after a prefill (pos 0 67.6, pos 1 77.6, pos 10+ 82.9). The first verify is slower (0.60 vs ~0.36 s)
   but not from reads, so it is likely a one-time first-verify cost. Not pursued.
-- **Counter fix (approved, agent `read-amp`):** `host_fill_rows`, a third drive-load kind for eager/fill reads, and
-  eager-path evictions in their own counter (today they land in group 0's block). Observability only.
+- **Counter fix built** (branch `read-amp` on split-model f9cf8b5cd0: `3965123c2c`, `ca965e7c06`; not merged).
+  Observability only, and every existing field keeps its name, offset and meaning.
+  - `host_fill_rows` in the gather stats and metrics: a prefill's real reads = host_read_rows + host_fill_rows.
+  - Per-root `fill_bytes` (part of demand_bytes), appended after the original 47 snapshot words and as a new key in
+    the shutdown line.
+  - `eager_evictions`, appended to the enum; evictions minus eager_evictions = the service's count.
+  - Tests: 295 passed. 1 failure pre-existed at the base (a stale `_gather_cached` stub) and is fixed in
+    `ca965e7c06`. Two mutants are caught.
 - **Mirror lead (sent to split-calib):** nvme3 (SPCC, max_sectors_kb 256) was busy 104.5 s vs 86.6 / 85.6 s on the
   two Samsung 990 EVO Plus drives at equal bytes. Busy-time-balanced mirror weights (`SGLANG_MOE_EXPERT_MIRROR_WEIGHTS`)
   could cut demand-read time by up to ~10% (~0.1 ms per NVMe lane), ideally derived by a startup throughput probe.
