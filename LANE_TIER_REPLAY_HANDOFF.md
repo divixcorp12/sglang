@@ -75,6 +75,33 @@ sweep", "Served share-64 A/B"). Scripts, all in `analysis/dsv41-drive/dspark/`:
   - TTFT improved, as the model said, where section 27.9 (older arms) had measured +0.5 to +1.2 s.
   - T under-predicted the OFF cold lanes again: 14.4 modeled on this capture's OFF, against 16.7 measured.
 
+### 5. Share sized at start (28) vs 64, served (`/mnt/nvme1/share28-ab-20261016`)
+
+- **Code.**
+  - `prefill-share-size` (`37bf19966f`, `4096b28933`, off `lane-head-ab`). The share is `PREFILL_SHARE_FRACTION`
+    (0.15) × the smallest admitting layer's usable rows, logged at start. On this layout that is 28 = 0.15 × 187.
+  - `SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS` overrides it for A/B arms.
+  - Ported to `prefill-share-size-ps` (`57e64ed0e1`, off `ram-prefetch-pool-serve` 1066d873cf). Its CPU tests pass:
+    9 + 6.
+- **Result (ab-start − ab-64, 6 pair-clean prompts):**
+  - ms/token -1.78, 95% CI -4.53 .. +0.82: not significant.
+  - Stream + wait -7.5 ms/verify, against -4.9 predicted. Forced CPU misses -11.7 per verify.
+  - TTFT **+1.58 s** per prompt (+0.58 to +3.30), against +0.74 predicted.
+- **Per prompt** (32-89 generated tokens), the TTFT cost exceeds the decode gain on every prompt. Break-even is about
+  900 generated tokens.
+- **Recommendation:** keep the size at 64 for this workload (fraction about 0.34 on today's layout). Pending
+  team-lead's call on the fraction.
+
+### 6. Offline RAM-prefetch comparison: stopped at validation
+
+- **Script:** `prefetch_eval.py`.
+- **Validation of today's arm** against the capture's own events:
+  - landed within 1-5%;
+  - pool-served -7% / -8% / -12.5% (ab-64 / base / C2);
+  - **used +19% to +29%: FAIL.** The excess is entirely forced-CPU takes of landed rows: 2,022 modelled against
+    1,390 in the capture. GPU pool serves and takes of still-reading rows match.
+- **Not run:** no arm comparison yet. Reported to team-lead with the options.
+
 ### Next (team-lead's plan)
 
 - The size knob (`PREFILL_SHARE_ROWS` as a startup-calibrated value, about 0.15 × usable rows per layer by the sweep).
