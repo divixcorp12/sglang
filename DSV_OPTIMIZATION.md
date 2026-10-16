@@ -863,6 +863,31 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               +320 MiB (to look at later). Draft load is all torch weights (+2,179 MiB).
             - Fix approved: compare against the target layer's capacity, add a test on the real `_bind_spec_scores`
               path, and on a mismatch roll the grow back with a loud log instead of killing startup. Then calib6.
+          - **calib6** (2026-10-16, `53832f12e8`, `/mnt/nvme1/prefill-merge/calib6/`): **started and served.**
+            0 OOM lines. GPU tests 66 passed and 12 skipped; residency tests 72 passed.
+            - KV pinned at 381,184 (natural pool 462,592).
+            - Hot cache grew 1,035 → **1,059** (+24 slots, +288 MiB). The grow bound bound on 0 layers, with no
+              rollback.
+            - Calibration: F 2,489.9, regrow 1,595.8, verify drop 432 (402 outside torch), margin 574.4,
+              keep_free 2,200.2.
+            - **Capture under-estimated:** it took ~214 MiB against a 30 MiB estimate. The margin absorbed the
+              gap: the post-capture projection gives 589.9 free at a 4,096-token prefill.
+            - **Free at the warm-up peak: 472 MiB** (nvidia-smi), below the 508 floor (expseg2 had 706). It fit
+              by luck, not by design, because the margin covered the capture miss.
+            - Real vs calibration transient: ≈ +6 MiB once calibration's base is corrected for the 813 MiB of
+              MoE staging. Reserved peak 14,768 against 14,674 (+94).
+            - The cross-layer 556 MiB is now 481, the carried 4-stream residual state. B1 (in-place hc_post)
+              would not lower the peak, so it is **dropped**.
+            - Attention peak with A1: 584 (A0 903, calib2 704). The binding op is now wq_b (522).
+            - Prefill of a 4,096-token prompt: 19.79 s with the logger on (calib2 19.70; without A2/A3 19.35).
+              Not a clean A/B.
+            - **Next:**
+              - (b) Fix the watch's base and hook.
+              - (a) Fix the capture estimate. First check whether a final trim or grow can run after capture,
+                against measured free memory, safely with VMM. Otherwise derive the estimate from the
+                graph-pool buffers plus the draft capture.
+              - (e) One served A/B against expseg2.
+              - Later: a clean A2/A1 timing run and wq_b's temporary.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
