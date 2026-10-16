@@ -1,4 +1,4 @@
-"""Pre-launch step for a served DSV4.1 capture: drop leftover file cache of the files the server reads (no root:
+"""Pre-launch step for a served DSV4.1 capture: drop leftover file cache of the draft, row-image and Engram files (no root:
 posix_fadvise DONTNEED per file), log per-node FilePages/MemFree, and refuse to start while node 1 cannot hold the run.
 
 Leftover cache from the previous server on the box pushed node 1 below its low watermark in
@@ -21,8 +21,9 @@ import os
 import sys
 import time
 
+# Not the target model's shards (dsv41-full40): their ~9 GiB of non-expert weights read cold from the SATA root volume
+# at ~55 MB/s, ~150 s a launch (cores-ab-20261014/splitmodel-stream-mem-tiebreak), and the loader drops them after load.
 PATHS = (
-    "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-full40",  # target model
     "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-dspark-draft",  # DSpark draft
     "/mnt/nvme0/dsv41_flash/exl3_row_images",  # row images, three mirrors
     "/mnt/nvme4/dsv41_flash/exl3_row_images",
