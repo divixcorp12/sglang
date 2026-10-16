@@ -388,6 +388,44 @@ class NodeTier:
         return True
 
 
+class PoolRows:
+    """The RAM prefetch's landed rows per target row and group, waiting for a claim (rule 6). ``share`` entries per
+    group and row (SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE); a landing into a full group drops its oldest entry."""
+
+    def __init__(self, share: int, nodes: int = 2):
+        self.share = max(1, share)
+        self.nodes = nodes
+        self.rows: dict[int, list[collections.OrderedDict]] = {}
+
+    def _groups(self, row: int) -> list:
+        return self.rows.setdefault(row, [collections.OrderedDict() for _ in range(self.nodes)])
+
+    def land(self, row: int, e: int) -> None:
+        g = self._groups(row)[e % self.nodes]
+        g.pop(e, None)
+        if len(g) >= self.share:
+            g.popitem(last=False)
+        g[e] = True
+
+    def consume(self, row: int, routed: set) -> None:
+        for g in self._groups(row):
+            for e in [x for x in g if x in routed]:
+                del g[e]
+
+    def claim(self, row: int, tier: list, hot: set) -> int:
+        """promote_landed for ``row``: every landed entry not mapped takes an LRU victim and its stamp. Returns how many."""
+        promoted = 0
+        for g in self._groups(row):
+            for e in list(g):
+                del g[e]
+                t = tier[e % self.nodes]
+                if t.has(e):
+                    continue
+                t.promote(e, hot)
+                promoted += t.has(e)
+        return promoted
+
+
 # The RAM tier's rules, from the code the A/B ran (lane-head-ab d269f7aa90; paths under
 # python/sglang/kernels/jit/csrc/moe/expert_stream/host/ unless given):
 #  1. Per NUMA group: a row's slots are split into one contiguous range per node (srt/layers/moe/host_numa.py:300
@@ -411,10 +449,15 @@ class NodeTier:
 #     the row enters RAM.
 #  6. Prefetch: an L+2 read lands in a pool slot (kSpec), not in the map. A demand miss can be served from it: a GPU
 #     lane streams from the pool slot (ram_tier.h:2369 point_pooled_locked, called at :3040) and a forced CPU miss
-#     takes it over (ram_tier.h:2419 take_pooled_locked, called at :3020); either way the row is cached as rule 5. An unused landed row may be promoted into the map
-#     when its row's delta is claimed (ram_tier.h:2919 promote_landed): it takes an LRU victim (no record protection)
-#     and inherits the victim's stamp (ram_tier.h:2960), so it is the next to go unless routed. Promotion is skipped
-#     when the row's lock is busy, the read is still in flight, or the delta has no room (spec_promote_* counters).
+#     takes it over (ram_tier.h:2419 take_pooled_locked, called at :3020); either way the row is cached as rule 5.
+#     A landed row is promoted into the map when its target row's delta is claimed: serving row R's record claims row
+#     R + 1's delta (publish_due, ram_tier.h:2980, trigger 1 at :2993 -> publish_pending :2886 -> promote_landed
+#     :2919), and every landed, unmapped entry of row R + 1 then takes an LRU victim with no record protection
+#     (take_victim_locked(..., {}, ..., false), :2949) and inherits its stamp (:2960). So a row landing before layer
+#     T - 1 is served is mapped before T's gather (a RAM hit there); one landing later waits in the pool for T's own
+#     use or the next claim (PoolRows). Skipped while the read is in flight, the row's lock is busy or the delta has
+#     no room (spec_promote_* counters; the last two were 0 in the A/B). Until 2026-10-16 evening this rule promoted
+#     at landing at the run's measured rate, which matched the totals but not which rows were mapped when.
 #  7. Full layers (SGLANG_MOE_PINNED_HOST_FULL_LAYERS) map every expert and never miss.
 #  8. Prefill (SGLANG_DSV41_ENABLE_PREFILL_FILLS=1) admits rows from the Python side with the service paused
 #     (ram_tier.h:399 assign, :456 fill_begin): take_admit_slot_locked (ram_tier.h:1982) gives a free slot, else
@@ -623,11 +666,10 @@ def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None =
         if e["seq"] not in replayed and rules:
             timeline.append((e["ns"], 0, "evict", (e["row"], e["group"], e["a"], e["c"])))
     if rules:
-        # rule 6: each landed pool row is promoted when its row's delta is claimed, just after it lands, at the run's
-        # measured promotion rate (the rest stay in the pool: still reading, no delta, row busy)
+        # rule 6: a landed row waits in its target row's pool until that row's delta is claimed (PoolRows.claim)
         for _, e in _events(glob.glob(os.path.join(run.dir, "events.*.exl3-spec*.jsonl")), {"spec_land"}):
-            if _hash01(e["row"], e["a"], e["ns"] & 0xFFFFFFFF) < p_promote:
-                timeline.append((e["ns"], 0, "promote", (e["row"], e["a"])))
+            timeline.append((e["ns"], 0, "land", (e["row"], e["a"])))
+    pools = PoolRows(share)
     graph_t = [g["t"] for g in log]
     eager = eager_lines(run.dir) if prefill else []
     for k, line in enumerate(eager):
@@ -661,13 +703,10 @@ def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None =
             if row < layers and row not in full:
                 tiers[row][g].apply_eviction(old, new, tick)
             continue
-        if kind == "promote":
+        if kind == "land":
             row, e = payload
             if row < layers and row not in full:
-                t = tiers[row][e % nodes]
-                before = t.has(e)
-                t.promote(e, last_hot[row])
-                stats["sim_promotions"] += not before and t.has(e)
+                pools.land(row, e)
             continue
         v, i, L = payload
         cur = log[i]
@@ -696,6 +735,10 @@ def tier_replay(run: Run, layers: int, rules: bool = True, prefill: str | None =
                 stats["pred_cold_misses"] += len(cold_pred)
                 stats["obs_nvme_reads"] += len(set(r.evict_in))
         last_hot[L] = hot
+        if rules:
+            pools.consume(L, routed)  # a routed pool row is served, taken, or already a hit: it leaves the pool
+            if L + 1 < layers and L + 1 not in full:
+                stats["sim_promotions"] += pools.claim(L + 1, tiers[L + 1], last_hot[L + 1])
         if L in full:
             continue
         protected = hot | routed
