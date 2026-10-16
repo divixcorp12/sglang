@@ -4,6 +4,9 @@ itself on a scratch file (CPU)."""
 import importlib.util
 import json
 import os
+import socket
+import subprocess
+import sys
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -50,3 +53,65 @@ def test_evict_drops_each_file_and_counts_it(tmp_path):
     (tmp_path / "y.safetensors").write_bytes(b"1" * 4096)
     result = pe.evict([str(tmp_path), str(tmp_path / "missing")])
     assert result == {"files": 2, "bytes": 12288, "failed": 0}
+
+
+def _nodes(tmp_path, free0_gib, free1_gib):
+    root = tmp_path / "sysfs"
+    for node, free in ((0, free0_gib), (1, free1_gib)):
+        (root / f"node{node}").mkdir(parents=True)
+        (root / f"node{node}" / "meminfo").write_text(
+            f"Node {node} MemFree:        {int(free * GIB)} kB\nNode {node} FilePages:      {GIB} kB\n"
+            f"Node {node} Shmem:          0 kB\n"
+        )
+    return root
+
+
+def _main(tmp_path, free1_gib, *args):
+    evictable = tmp_path / "evictable"
+    evictable.mkdir(exist_ok=True)
+    (evictable / "rows").write_bytes(b"0" * 8192)
+    env = dict(os.environ, PRELAUNCH_NODE_SYSFS=str(_nodes(tmp_path, 80.0, free1_gib)),
+               PRELAUNCH_EVICT_PATHS=str(evictable))
+    log = tmp_path / "prelaunch.json"
+    r = subprocess.run([sys.executable, _PATH, "--log", str(log), "--wait-min", "0", *args], env=env,
+                       capture_output=True, text=True, timeout=60)
+    return r, json.loads(log.read_text())
+
+
+def test_a_start_below_the_floor_evicts_once_then_refuses_with_the_holders(tmp_path):
+    holders = tmp_path / "holders"
+    (holders / "co-tenant").mkdir(parents=True)
+    (holders / "co-tenant" / "w.bin").write_bytes(os.urandom(1 << 20))
+    r, record = _main(tmp_path, 20.0, "--holders", str(holders))
+    assert r.returncode == 3
+    assert record["ready"] is False and record["rounds"][0]["evicted"]["files"] == 1
+    assert "refusing to start: node 1 has 20.0 GiB free" in r.stderr
+    assert record["page_cache_holders"]["holders"][0]["path"] == str(holders / "co-tenant")
+
+
+def test_above_the_floor_it_is_ready_and_names_no_holders(tmp_path):
+    r, record = _main(tmp_path, 80.0)
+    assert r.returncode == 0 and record["ready"] is True and "page_cache_holders" not in record
+
+
+def test_a_listening_port_skips_the_eviction_but_not_the_check(tmp_path):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen()
+        port = s.getsockname()[1]
+        r, record = _main(tmp_path, 20.0, "--skip-evict-port", str(port))
+    assert r.returncode == 3 and record["evict_skipped_for_ports"] == [port]
+    assert record["rounds"][0]["evicted"]["files"] == 0
+
+
+def test_cached_bytes_counts_a_just_written_file_and_less_once_it_is_dropped(tmp_path):
+    path = tmp_path / "f.bin"
+    path.write_bytes(os.urandom(1 << 20))
+    assert pe.cached_bytes(str(path)) == 1 << 20
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    assert pe.cached_bytes(str(path)) < 1 << 20

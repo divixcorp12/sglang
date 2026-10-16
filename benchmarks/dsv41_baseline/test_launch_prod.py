@@ -97,7 +97,8 @@ def test_stop_fails_while_another_job_still_holds_the_gpu_lock(tmp_path):
 def test_a_dry_run_restart_stops_and_starts_nothing(tmp_path):
     prod = _stand_in(PORT)
     try:
-        r = _run(tmp_path, "restart", DRY_RUN=1, LAUNCH_PROD_LOG_ROOT=tmp_path / "servers")
+        r = _run(tmp_path, "restart", DRY_RUN=1, LAUNCH_PROD_LOG_ROOT=tmp_path / "servers",
+                 PRELAUNCH_NODE_SYSFS=_fake_nodes(tmp_path, 86.0, 84.0))
         assert r.returncode == 0, r.stderr
         assert f"would stop production (pid {prod.pid})" in r.stdout
         assert "would start production, log " + str(tmp_path / "servers") in r.stdout
@@ -111,3 +112,60 @@ def test_an_unknown_command_is_refused_with_the_usage(tmp_path):
     r = _run(tmp_path, "reboot")
     assert r.returncode == 2
     assert "usage: launch_prod.sh [start|stop|restart]" in r.stderr
+
+
+def _fake_nodes(tmp_path, free0_gib, free1_gib, file1_gib=2.0):
+    """A sysfs node directory whose meminfo reads as the given free memory (PRELAUNCH_NODE_SYSFS)."""
+    root = tmp_path / "sysfs"
+    for node, free, file_gib in ((0, free0_gib, 1.0), (1, free1_gib, file1_gib)):
+        (root / f"node{node}").mkdir(parents=True)
+        (root / f"node{node}" / "meminfo").write_text(
+            f"Node {node} MemTotal:       100000000 kB\n"
+            f"Node {node} MemFree:        {int(free * 2**20)} kB\n"
+            f"Node {node} FilePages:      {int(file_gib * 2**20)} kB\n"
+            f"Node {node} Shmem:          0 kB\n"
+        )
+    return root
+
+
+def _floor_env(tmp_path, free0_gib, free1_gib):
+    holders = tmp_path / "holders"
+    (holders / "big-model").mkdir(parents=True)
+    (holders / "big-model" / "shard.bin").write_bytes(os.urandom(1 << 20))  # just written: in the page cache
+    evictable = tmp_path / "evictable"
+    evictable.mkdir()
+    (evictable / "rows").write_bytes(b"0" * 8192)
+    return dict(
+        PRELAUNCH_NODE_SYSFS=_fake_nodes(tmp_path, free0_gib, free1_gib),
+        PRELAUNCH_EVICT_PATHS=evictable,
+        LAUNCH_PROD_PAGE_CACHE_ROOTS=holders,
+        LAUNCH_PROD_HOLDERS_BUDGET_S=10,
+        LAUNCH_PROD_LOG_ROOT=tmp_path / "servers",
+    )
+
+
+def test_a_dry_run_start_reports_the_memory_floor_and_would_start_above_it(tmp_path):
+    r = _run(tmp_path, "start", DRY_RUN=1, **_floor_env(tmp_path, 86.0, 84.0))
+    assert r.returncode == 0, r.stderr
+    # arm_env.PROD_NODE1_*: HiCache 12.67 + arm A's rest 51.24 + 1 GiB margin.
+    assert "node-1 floor 64.91 GiB" in r.stdout
+    assert "evicted 0 files" in r.stdout  # a dry run evicts nothing
+    assert "would start: node 1 is above its floor" in r.stdout
+    assert not (tmp_path / "servers").exists()
+
+
+def test_a_dry_run_start_below_the_floor_names_the_nodes_the_floor_and_the_page_cache_holders(tmp_path):
+    r = _run(tmp_path, "start", DRY_RUN=1, **_floor_env(tmp_path, 70.0, 20.0))
+    assert r.returncode == 0, r.stderr  # a dry run decides, it does not fail
+    assert "would refuse: node 1 has 20.0 GiB free" in r.stderr
+    assert "below its floor of 64.91 GiB; node 0 has 70.0 GiB free" in r.stderr
+    assert "WARNING node 0 has 70.0 GiB free" in r.stderr  # under PROD_NODE0_WARN_GIB: a warning, not a refusal
+    assert str(tmp_path / "holders" / "big-model") in r.stderr
+    assert "drop_caches" in r.stderr
+
+
+def test_the_floor_check_runs_under_the_lock_and_before_the_server_starts():
+    text = open(SCRIPT).read()
+    start = text.index("flock --nonblock 9")
+    check = text.index('if ! prelaunch "$prelaunch_log"', start)
+    assert start < check < text.index("exec taskset", check)

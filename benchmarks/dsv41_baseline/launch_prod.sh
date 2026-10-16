@@ -9,8 +9,10 @@
 #        launch_prod.sh restart     stop, then start detached with its log in a new
 #                                   $LAUNCH_PROD_LOG_ROOT/prod-<timestamp>/server.log (default: cc-expert-prediction/servers)
 #        DRY_RUN=1 launch_prod.sh [start|stop|restart]
-#                                   print what it would do (the checkout, cores, env and argv for a start), take no lock,
-#                                   stop and start nothing
+#                                   print what it would do (the checkout, cores, env and argv for a start, and the
+#                                   memory floor's decision), take no lock, evict, stop and start nothing
+# A start holds the memory floor first (prelaunch below): it evicts this model's leftover page cache, waits a bounded
+# time for node 1 to have room, and refuses with exit 3 if it never does.
 # Holds cc-gpu.lock for the server's lifetime (fd 9 survives the exec) and refuses to start if it is taken.
 # Once it holds the lock, points the SERVER_LOG_LINK symlink at the file its stdout goes to (not when stdout is a
 # terminal or pipe), so the link always names the running server's log.
@@ -74,6 +76,34 @@ stop_server() {
     echo "stopped production (pid $pids)"
 }
 
+# The pre-launch memory floor, the served arms' own step (analysis/dsv41-drive/dspark/prelaunch_evict.py, sizes in
+# arm_env.PROD_NODE1_*): drop leftover page cache of this model's draft, row images and Engram tables (posix_fadvise on
+# read-only opens; skipped while another of our servers reads them), then wait, at most PROD_FLOOR_WAIT_MIN, for node 1
+# to hold the HiCache pools and its share of the pinned tier. Below the floor it refuses (exit 3) naming each node's free
+# memory, the floor and the largest page-cache holders: a launch there swaps for minutes and serves slowly, silently.
+# Node 0 below PROD_NODE0_WARN_GIB only warns. Extra arguments go to the script (--dry-run).
+# LAUNCH_PROD_PAGE_CACHE_ROOTS (colon-separated) and LAUNCH_PROD_HOLDERS_BUDGET_S exist for test_launch_prod.py.
+prelaunch() {
+    local log=$1
+    shift
+    local args
+    args=$(PYTHONPATH="$here" "$py" -c '
+import os
+import arm_env as a
+roots = os.environ.get("LAUNCH_PROD_PAGE_CACHE_ROOTS")
+out = ["--hicache-gib", a.PROD_NODE1_HICACHE_GIB, "--margin-gib", a.PROD_NODE1_MARGIN_GIB,
+       "--wait-min", a.PROD_FLOOR_WAIT_MIN, "--node0-warn-gib", a.PROD_NODE0_WARN_GIB,
+       "--holders-budget-s", os.environ.get("LAUNCH_PROD_HOLDERS_BUDGET_S", "60")]
+for port in a.PROD_PRELAUNCH_SKIP_EVICT_PORTS:
+    out += ["--skip-evict-port", port]
+for root in roots.split(":") if roots else a.PROD_PAGE_CACHE_ROOTS:
+    out += ["--holders", root]
+print(" ".join(map(str, out)))
+')
+    # shellcheck disable=SC2086
+    "$py" "$repo/analysis/dsv41-drive/dspark/prelaunch_evict.py" --log "$log" $args "$@"
+}
+
 if [ "$cmd" = stop ]; then
     stop_server
     exit
@@ -84,6 +114,9 @@ if [ "$cmd" = restart ]; then
     if [ "$dry" = 1 ]; then
         stop_server
         echo "would start production, log $log_dir/server.log"
+        dry_log=$(mktemp)
+        prelaunch "$dry_log" --dry-run || true
+        rm -f "$dry_log"
         exit 0
     fi
     stop_server
@@ -112,14 +145,29 @@ for k, v in sorted(arm_env.prod_env().items()):
     print(f"env {k}={v}")
 print("argv:", " ".join(arm_env.ServerArgs.prod().argv()))
 '
+    dry_log=$(mktemp)
+    prelaunch "$dry_log" --dry-run || true
+    rm -f "$dry_log"
     exit 0
 fi
 
 exec 9>"$gpu_lock"
 flock --nonblock 9 || { echo "cc-gpu.lock is held by another GPU job; not starting production" >&2; exit 1; }
 
-log_link=${SERVER_LOG_LINK:-/data/models/slang/nvfp4-work/server.log}
 log_file=$(readlink -f "/proc/$$/fd/1" || true)
+# Under the lock, so a refused or waiting start never evicts under another GPU job's server.
+if [ -f "$log_file" ]; then
+    prelaunch_log=$(dirname "$log_file")/prelaunch-$(date +%Y%m%d-%H%M%S).json
+else
+    prelaunch_log=${LAUNCH_PROD_LOG_ROOT:-$(arm CC)/servers}/prelaunch-$(date +%Y%m%d-%H%M%S).json
+    mkdir -p "$(dirname "$prelaunch_log")"
+fi
+if ! prelaunch "$prelaunch_log"; then
+    echo "not starting production: node 1 is below its memory floor (record: $prelaunch_log)" >&2
+    exit 3
+fi
+
+log_link=${SERVER_LOG_LINK:-/data/models/slang/nvfp4-work/server.log}
 if [ -f "$log_file" ]; then
     # A temporary link renamed over the old one, so the link is never missing.
     ln -sfn "$log_file" "$log_link.tmp.$$"

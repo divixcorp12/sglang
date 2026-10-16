@@ -10,13 +10,25 @@ exists: node-1 MemFree at its first sample less its minimum, less the pools it b
 rise). Otherwise it is DEFAULT_REST_GIB, from arm A (splitmodel-stream-mem-hicache1, 2026-10-15: 64.69 GiB free at
 start, 1.70 GiB at its lowest, 11.75 GiB of it HiCache). The record says which was used.
 
+Production (launch_prod.sh) runs it too, with three more options:
+- --skip-evict-port PORT: while anything listens on PORT (another of our servers reading the same files), check the
+  floor without evicting;
+- --node0-warn-gib: warn, never refuse, when node 0 starts below it;
+- --holders ROOT: on a refusal, name the directories under each ROOT holding the most page cache (whole box: which
+  node a cached page sits on needs root), within --holders-budget-s.
+--dry-run evicts nothing and does not wait: it reports the floor, the nodes and the decision it would make.
+
 Usage: prelaunch_evict.py --log OUT.json [--previous RUN.memsample.jsonl] [--hicache-gib 11.75] [--margin-gib 1.0]
-                           [--wait-min 30]
+                           [--wait-min 30] [--skip-evict-port P] [--node0-warn-gib G] [--holders ROOT ...] [--dry-run]
 Exit 0: ready; 3: node 1 stayed below the floor for --wait-min minutes (evicting again each minute).
+PRELAUNCH_NODE_SYSFS and PRELAUNCH_EVICT_PATHS (colon-separated) replace the sysfs node directory and the evicted
+paths, for tests.
 """
 import argparse
+import ctypes
 import glob
 import json
+import mmap
 import os
 import sys
 import time
@@ -30,9 +42,13 @@ PATHS = (
     "/mnt/nvme2/dsv41_flash/exl3_row_images",
     "/mnt/nvme2/DeepSeek-V4.1-Flash",  # Engram tables (SGLANG_DSV41_ENGRAM_TABLE_DIR)
 )
+if os.environ.get("PRELAUNCH_EVICT_PATHS"):
+    PATHS = tuple(os.environ["PRELAUNCH_EVICT_PATHS"].split(":"))
+NODE_SYSFS = os.environ.get("PRELAUNCH_NODE_SYSFS", "/sys/devices/system/node")
 DEFAULT_HICACHE_GIB = 11.75
 DEFAULT_REST_GIB = 64.69 - 1.70 - DEFAULT_HICACHE_GIB  # 51.24
 GIB_KB = 2**20
+WINDOW = 1 << 30  # mincore window: a 1 GiB map at a time keeps the residency vector at 256 KiB
 
 
 def node_meminfo() -> dict:
@@ -40,7 +56,7 @@ def node_meminfo() -> dict:
     out = {}
     for n in (0, 1):
         d = {}
-        for line in open(f"/sys/devices/system/node/node{n}/meminfo"):
+        for line in open(f"{NODE_SYSFS}/node{n}/meminfo"):
             parts = line.split()
             if parts[2].rstrip(":") in ("MemFree", "FilePages", "Shmem"):
                 d[parts[2].rstrip(":")] = round(int(parts[3]) / GIB_KB, 2)
@@ -96,6 +112,99 @@ def evict(paths=PATHS) -> dict:
     return {"files": files, "bytes": scanned, "failed": failed}
 
 
+def listening(port: int, proc_net: str = "/proc/net") -> bool:
+    """Whether a TCP socket (v4 or v6) listens on port, from /proc/net/tcp{,6} (state 0A)."""
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(os.path.join(proc_net, name)) as f:
+                next(f, None)
+                for line in f:
+                    fields = line.split()
+                    if len(fields) > 3 and fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.mmap.restype = ctypes.c_void_p
+_libc.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long)
+_libc.munmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+_libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+_MAP_FAILED = ctypes.c_void_p(-1).value
+_RESIDENT_BIT = bytes(b & 1 for b in range(256))  # mincore's vector: bit 0 is residency, the rest are reserved
+
+
+def cached_bytes(path: str) -> int:
+    """Bytes of path in the page cache: mincore over read-only shared maps of it, a window at a time. Mapping reads
+    nothing, so the scan itself caches nothing."""
+    page = mmap.PAGESIZE
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        total = 0
+        for offset in range(0, size, WINDOW):
+            length = min(WINDOW, size - offset)
+            addr = _libc.mmap(None, length, mmap.PROT_READ, mmap.MAP_SHARED, fd, offset)
+            if addr == _MAP_FAILED:
+                raise OSError(ctypes.get_errno(), "mmap")
+            try:
+                vec = (ctypes.c_ubyte * ((length + page - 1) // page))()
+                if _libc.mincore(addr, length, vec) != 0:
+                    raise OSError(ctypes.get_errno(), "mincore")
+                total += bytes(vec).translate(_RESIDENT_BIT).count(1) * page
+            finally:
+                _libc.munmap(addr, length)
+        return total
+    finally:
+        os.close(fd)
+
+
+def page_cache_holders(roots, budget_s: float, top: int = 10) -> dict:
+    """The directories one level under each root holding the most page cache, largest first, scanned within budget_s.
+    Whole box: without root a cached page's node is not visible."""
+    deadline = time.monotonic() + budget_s
+    sums: dict[str, int] = {}
+    complete = True
+    for root in roots:
+        try:
+            entries = sorted(os.scandir(root), key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in entries:
+            total = 0
+            walk = [entry.path] if entry.is_dir(follow_symlinks=False) else []
+            if entry.is_file(follow_symlinks=False):
+                total += _cached_or_zero(entry.path)
+            for top_dir in walk:
+                for dirpath, _, files in os.walk(top_dir):
+                    for name in files:
+                        if time.monotonic() > deadline:
+                            complete = False
+                            break
+                        total += _cached_or_zero(os.path.join(dirpath, name))
+                    if not complete:
+                        break
+            if total:
+                sums[entry.path] = total
+            if not complete:
+                break
+        if not complete:
+            break
+    ranked = sorted(sums.items(), key=lambda kv: -kv[1])[:top]
+    return {"complete": complete, "holders": [{"path": p, "gib": round(b / 2**30, 2)} for p, b in ranked]}
+
+
+def _cached_or_zero(path: str) -> int:
+    try:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return 0
+        return cached_bytes(path)
+    except (OSError, ValueError):
+        return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--log", required=True)
@@ -103,14 +212,24 @@ def main() -> int:
     p.add_argument("--hicache-gib", type=float, default=DEFAULT_HICACHE_GIB)
     p.add_argument("--margin-gib", type=float, default=1.0)
     p.add_argument("--wait-min", type=float, default=30.0)
+    p.add_argument("--skip-evict-port", type=int, action="append", default=[])
+    p.add_argument("--node0-warn-gib", type=float, default=0.0)
+    p.add_argument("--holders", action="append", default=[], help="a root whose page-cache holders a refusal names")
+    p.add_argument("--holders-budget-s", type=float, default=60.0)
+    p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
     floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib)
-    record = {"t": time.time(), **floor, "before": node_meminfo(), "rounds": []}
+    record = {"t": time.time(), **floor, "before": node_meminfo(), "rounds": [], "dry_run": a.dry_run}
     print(f"prelaunch: node-1 floor {floor['floor_gib']} GiB = HiCache {a.hicache_gib} + rest {floor['rest_gib']} "
           f"({floor['rest_source']}) + margin {a.margin_gib}", flush=True)
+    busy = [port for port in a.skip_evict_port if listening(port)]
+    record["evict_skipped_for_ports"] = busy
+    if busy:
+        print(f"prelaunch: port(s) {busy} in use by another server reading the same files; checking without evicting",
+              flush=True)
     deadline = time.time() + 60 * a.wait_min
     while True:
-        result = evict()
+        result = {"files": 0, "bytes": 0, "failed": 0} if (a.dry_run or busy) else evict()
         after = node_meminfo()
         record["rounds"].append({"t": time.time(), "evicted": result, "after": after})
         print(f"prelaunch: evicted {result['files']} files ({result['bytes'] / 2**30:.0f} GiB scanned, "
@@ -119,10 +238,33 @@ def main() -> int:
         if after["1"]["MemFree"] >= floor["floor_gib"]:
             record["ready"] = True
             break
-        if time.time() > deadline:
+        if a.dry_run or time.time() > deadline:
             record["ready"] = False
             break
         time.sleep(60)
+    after = record["rounds"][-1]["after"]
+    if a.node0_warn_gib and after["0"]["MemFree"] < a.node0_warn_gib:
+        record["node0_warning"] = True
+        print(f"prelaunch: WARNING node 0 has {after['0']['MemFree']} GiB free, below the {a.node0_warn_gib} GiB every "
+              f"served arm started with; the load may swap", file=sys.stderr, flush=True)
+    if not record["ready"]:
+        holders = page_cache_holders(a.holders, a.holders_budget_s) if a.holders else {"complete": True, "holders": []}
+        record["page_cache_holders"] = holders
+        verb = "would refuse" if a.dry_run else "refusing to start"
+        lines = [
+            f"prelaunch: {verb}: node 1 has {after['1']['MemFree']} GiB free (file cache {after['1']['FilePages']} GiB),"
+            f" below its floor of {floor['floor_gib']} GiB; node 0 has {after['0']['MemFree']} GiB free (file cache "
+            f"{after['0']['FilePages']} GiB)."
+        ]
+        if holders["holders"]:
+            lines.append("prelaunch: largest page-cache holders (whole box; per-node attribution needs root)"
+                         + ("" if holders["complete"] else ", scan cut short by its time budget") + ":")
+            lines += [f"prelaunch:   {h['gib']:8.2f} GiB  {h['path']}" for h in holders["holders"]]
+        lines.append("prelaunch: free node 1 (as root: sync; echo 1 > /proc/sys/vm/drop_caches; or stop the co-tenant "
+                     "filling it), then start again.")
+        print("\n".join(lines), file=sys.stderr, flush=True)
+    elif a.dry_run:
+        print("prelaunch: would start: node 1 is above its floor", flush=True)
     with open(a.log, "w") as f:
         json.dump(record, f, indent=1)
     return 0 if record["ready"] else 3
