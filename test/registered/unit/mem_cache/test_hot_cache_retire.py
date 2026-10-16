@@ -64,29 +64,37 @@ E, L, C = 16, 2, 20  # experts, layers, capacity (all layers)
 class FakeBacking:
     def __init__(self):
         self.released = None
+        self.backed_rows = C
+
+    def set_backed_rows(self, rows):
+        delta, self.backed_rows = (rows - self.backed_rows) << 20, rows
+        return delta
 
     def release_tail(self, k):
         self.released = k
-        return (C - k) << 20
+        return -self.set_backed_rows(k)
 
 
-def _world(victim_lanes=8):
-    slot_to_expert = torch.full((L, C + 1), -1, dtype=torch.long)
+def _world(victim_lanes=8, upper=C):
+    """Two layers of C slots; the residency banks and each cache's reservation span ``upper`` slots."""
+    slot_to_expert = torch.full((L, upper + 1), -1, dtype=torch.long)
     mapping = torch.full((L, E + 1), -1, dtype=torch.long)
     for row in range(L):  # experts 0..15 in slots 4..19 (the tail holds residents)
         for e in range(E):
             slot_to_expert[row, 4 + e] = e
             mapping[row, e] = 4 + e
-    slot_ids = torch.arange(C + 1)
+    slot_ids = torch.arange(upper + 1)
     capacity = torch.full((L,), C)
     miss_columns = torch.arange(6)
     ranked = []
+    slot_state = torch.zeros((L, upper + 1), dtype=torch.uint8)
+    slot_state[:, :C] = 3
     updater = SimpleNamespace(
         enabled=torch.tensor(False), layer_ids=[3, 7], slot_to_expert=slot_to_expert, mapping=mapping,
-        slot_state=torch.full((L, C + 1), 3, dtype=torch.uint8), slot_generations=torch.zeros((L, C + 1)),
+        slot_state=slot_state, slot_generations=torch.zeros((L, upper + 1)),
         capacity=capacity, slot_ids=slot_ids, slot_valid=slot_ids.unsqueeze(0) < capacity.unsqueeze(1),
         miss_columns=miss_columns, scratch_columns=capacity.unsqueeze(1) + miss_columns.unsqueeze(0),
-        victim_lanes=victim_lanes, route_counts=torch.zeros((L, E)), max_capacity=C,
+        victim_lanes=victim_lanes, route_counts=torch.zeros((L, E)), max_capacity=upper,
         _rank_victims=lambda routed: ranked.append(routed.shape),
     )
     caches, policies = {}, {}
@@ -94,7 +102,7 @@ def _world(victim_lanes=8):
         cache = SimpleNamespace(
             capacity=C, capacity_bytes=C * 100, allocation_bytes=C * 100, bytes_per_expert=100,
             slot_to_expert=updater.slot_to_expert[row, :C].tolist(), slot_states=[3] * C, _slot_generations=[0] * C,
-            slot_state=None, slot_generations=None, vmm_backing=FakeBacking(), scratch_rows=0,
+            slot_state=None, slot_generations=None, vmm_backing=FakeBacking(), scratch_rows=0, upper_capacity=upper,
             reserves_prefetch_pull_row=False, streamer=SimpleNamespace(row_planner=SimpleNamespace(scratch_base=C)),
         )
         caches[layer] = cache
@@ -164,6 +172,49 @@ def test_retire_refuses_below_the_victim_floor_and_above_capacity():
         hr.retire_hot_slots(manager, {3: 15}, service=service)
     with pytest.raises(hr.RetireRefused, match="outside"):
         hr.retire_hot_slots(manager, {3: 21}, service=service)
+
+
+def _holders(manager, updater, service, layer):
+    """Every capacity holder of one layer, as plain values."""
+    cache, row = manager.caches[layer], updater.layer_ids.index(layer)
+    srow = service.row_of(layer)
+    return {
+        "cache": (cache.capacity, cache.capacity_bytes, cache.allocation_bytes, len(cache.slot_to_expert),
+                  len(cache.slot_states), len(cache._slot_generations)),
+        "policy": manager.residency_policies[layer].capacity,
+        "updater": (int(updater.capacity[row]), int(updater.slot_valid[row].sum()),
+                    updater.scratch_columns[row].tolist()),
+        "planner": cache.streamer.row_planner.scratch_base,
+        "service": (service._row_backends[srow].hot_capacity, service._spec_hot[srow][1]),
+        "backed": cache.vmm_backing.backed_rows,
+    }
+
+
+def test_set_hot_capacity_grows_into_the_reservation_with_free_slots():
+    manager, updater, service, pushed, bound, ranked = _world(upper=26)
+    result = hr.set_hot_capacity(manager, {3: 24}, service=service)
+    c3 = manager.caches[3]
+    assert c3.vmm_backing.backed_rows == 24 and result.freed_bytes == -(4 << 20)  # mapped first, net negative
+    assert _holders(manager, updater, service, 3)["cache"][:4] == (24, 2400, 2400, 24)
+    assert c3.slot_to_expert[20:] == [-1] * 4 and c3.slot_states[20:] == [0] * 4 and c3.slot_state.numel() == 24
+    assert (updater.slot_to_expert[0, 20:24] == -1).all() and (updater.slot_state[0, 20:24] == 0).all()
+    assert int(updater.slot_valid[0].sum()) == 24 and updater.scratch_columns[0].tolist() == list(range(24, 30))
+    assert c3.streamer.row_planner.scratch_base == 24 and service._row_backends[0].hot_capacity == 24
+    assert pushed[0] == list(range(16))  # residents unchanged: the new slots are empty
+    with pytest.raises(hr.RetireRefused, match="outside"):
+        hr.set_hot_capacity(manager, {3: 27}, service=service)  # past the reservation
+
+
+def test_growing_then_shrinking_back_restores_every_holder():
+    """The inverse census: each holder set_hot_capacity raises comes back to its starting value when lowered again."""
+    manager, updater, service, *_ = _world(upper=26)
+    before = _holders(manager, updater, service, 3)
+    hr.set_hot_capacity(manager, {3: 26}, service=service)
+    grown = _holders(manager, updater, service, 3)
+    assert all(grown[k] != before[k] for k in before), (before, grown)  # every holder moved
+    result = hr.set_hot_capacity(manager, {3: C}, service=service)
+    assert _holders(manager, updater, service, 3) == before
+    assert result.evicted.get(3, []) == []  # the added slots were empty
 
 
 def test_an_unlisted_capacity_attribute_is_refused():

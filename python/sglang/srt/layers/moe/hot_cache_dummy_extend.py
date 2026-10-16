@@ -43,8 +43,9 @@ def forget_graph_path_state(model) -> int:
     return dropped
 
 
-def dummy_extend_forward(model_runner, tokens: int) -> Callable[[], None]:
-    """A callable that runs the dummy EXTEND forward of ``tokens`` tokens; built once, run as often as needed."""
+def dummy_extend_forward(model_runner, tokens: int) -> Callable[[int], None]:
+    """A callable ``run(n)`` that runs the dummy EXTEND forward of ``n <= tokens`` tokens; the buffers are built
+    once for ``tokens`` and sliced."""
     from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len, set_is_extend_in_batch
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, ForwardMode
     from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -66,25 +67,30 @@ def dummy_extend_forward(model_runner, tokens: int) -> Callable[[], None]:
         extend_start_loc = torch.zeros(1, dtype=torch.int32)
     seq_lens_cpu = seq_lens.cpu()
 
-    def run() -> None:
+    def run(n: int = tokens) -> None:
+        if not 0 < n <= tokens:
+            raise ValueError(f"dummy prefill of {n} tokens outside (0, {tokens}]")
+        seq_lens.fill_(n)
+        seq_lens_cpu.fill_(n)
+        extend_seq_lens.fill_(n)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=1,
-            input_ids=input_ids,
+            input_ids=input_ids[:n],
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=tokens,
+            out_cache_loc=out_cache_loc[:n],
+            seq_lens_sum=n,
             return_logprob=False,
-            positions=positions,
-            extend_num_tokens=tokens,
+            positions=positions[:n],
+            extend_num_tokens=n,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_start_loc=extend_start_loc,
             extend_prefix_lens_cpu=[0],
-            extend_seq_lens_cpu=[tokens],
+            extend_seq_lens_cpu=[n],
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             spec_algorithm=mr.spec_algorithm,
             spec_info=None,
@@ -93,10 +99,10 @@ def dummy_extend_forward(model_runner, tokens: int) -> Callable[[], None]:
         )
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
-        set_dp_buffer_len(None, tokens, False, None)
+        set_dp_buffer_len(None, n, False, None)
         set_is_extend_in_batch(True)
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             with torch.inference_mode():
-                mr.model.forward(input_ids, forward_batch.positions, forward_batch)
+                mr.model.forward(input_ids[:n], forward_batch.positions, forward_batch)
 
     return run

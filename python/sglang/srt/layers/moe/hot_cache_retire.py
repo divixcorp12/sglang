@@ -41,7 +41,14 @@ CAPACITY_HOLDERS = (
 # Capacity-named attributes that are not the layer's slot count: the updater's bank width (an upper bound, kept), the
 # pinned RAM tier's rows, and byte totals of other regions.
 EXEMPT_CAPACITY_ATTRS = frozenset(
-    {"max_capacity", "scratch_bytes", "prefetch_pull_bytes", "pinned_host_cache", "reserves_prefetch_pull_row"}
+    {
+        "max_capacity",
+        "upper_capacity",  # the reservation's bound, fixed at construction
+        "scratch_bytes",
+        "prefetch_pull_bytes",
+        "pinned_host_cache",
+        "reserves_prefetch_pull_row",
+    }
 )
 
 
@@ -83,23 +90,42 @@ def check_retire_allowed(manager, service) -> None:
 
 def retire_hot_slots(manager, keep: Mapping[int, int], *, service: Any = "auto") -> RetireResult:
     """Lower each listed layer's hot capacity to ``keep[layer]`` slots (only lower), then release the memory."""
+    for layer_id, k in keep.items():
+        if k > manager.caches[layer_id].capacity:
+            raise RetireRefused(f"layer {layer_id}: keep {k} outside [0, {manager.caches[layer_id].capacity}]")
+    return set_hot_capacity(manager, keep, service=service)
+
+
+def set_hot_capacity(manager, keep: Mapping[int, int], *, service: Any = "auto") -> RetireResult:
+    """Set each listed layer's hot capacity to ``keep[layer]`` slots, lower or higher. Lowering evicts the retired
+    slots and then releases their memory; raising maps the memory for the new slots first and then adds them FREE
+    (promotions fill them). A layer grows only up to its cache's ``upper_capacity``. ``RetireResult.freed_bytes`` is
+    net: negative when the call mapped more than it released."""
     service = _service() if service == "auto" else service
     check_retire_allowed(manager, service)
     updater = manager.gpu_residency
     _check_unlisted_holders(manager, updater, service, keep)  # before anything changes
+    floor = 2 * getattr(updater, "victim_lanes", 0)
+    for layer_id, k in keep.items():
+        cache = manager.caches[layer_id]
+        upper = getattr(cache, "upper_capacity", cache.capacity)
+        if not 0 <= k <= upper:
+            raise RetireRefused(f"layer {layer_id}: keep {k} outside [0, {upper}]")
+        if k < floor:
+            raise RetireRefused(f"layer {layer_id}: keep {k} below twice the graph-gather victim lanes ({floor})")
+        if k > updater.max_capacity:
+            raise RetireRefused(f"layer {layer_id}: keep {k} beyond the residency bank's {updater.max_capacity} slots")
     kept, retired, evicted, freed = {}, {}, {}, 0
     for layer_id, k in keep.items():
         cache = manager.caches[layer_id]
         c = cache.capacity
-        if not 0 <= k <= c:
-            raise RetireRefused(f"layer {layer_id}: keep {k} outside [0, {c}]")
-        floor = 2 * getattr(updater, "victim_lanes", 0)
-        if k < floor:
-            raise RetireRefused(f"layer {layer_id}: keep {k} below twice the graph-gather victim lanes ({floor})")
         urow = updater.layer_ids.index(layer_id)
-        if k < c:
+        if k > c:
+            freed -= cache.vmm_backing.set_backed_rows(k)  # memory first, then the slots that use it
+            _set_capacity(cache, manager.residency_policies.get(layer_id), updater, urow, k)
+        elif k < c:
             evicted[layer_id] = _evict_tail(cache, updater, urow, k, c)
-            _lower_capacity(cache, manager.residency_policies.get(layer_id), updater, urow, k)
+            _set_capacity(cache, manager.residency_policies.get(layer_id), updater, urow, k)
         kept[layer_id], retired[layer_id] = k, (k, c)
     _refresh_service(manager, updater, service, kept)
     if hasattr(updater, "_rank_victims"):
@@ -111,12 +137,14 @@ def retire_hot_slots(manager, keep: Mapping[int, int], *, service: Any = "auto")
             freed += manager.caches[layer_id].vmm_backing.release_tail(k)
     _check_capacity_holders(manager, updater, service, kept)
     logger.info(
-        "hot cache retire: %d slots kept, %d retired over %d layers, %d experts evicted, %.1f MiB released",
+        "hot cache capacity: %d -> %d slots over %d layers (%d retired, %d added), %d experts evicted, %+.1f MiB",
+        sum(c for _, c in retired.values()),
         sum(kept.values()),
-        sum(c - k for k, c in retired.values()),
         len(kept),
+        sum(max(0, c - k) for k, c in retired.values()),
+        sum(max(0, k - c) for k, c in retired.values()),
         sum(len(v) for v in evicted.values()),
-        freed / 2**20,
+        -freed / 2**20,
     )
     return RetireResult(kept, retired, evicted, freed)
 
@@ -134,14 +162,25 @@ def _evict_tail(cache, updater, urow: int, k: int, c: int) -> List[int]:
     return experts
 
 
-def _lower_capacity(cache, policy, updater, urow: int, k: int) -> None:
+def _set_capacity(cache, policy, updater, urow: int, k: int) -> None:
+    """Every capacity holder of one layer to ``k`` slots. Below the old count the tail was evicted first; above it
+    the new slots start FREE and empty (the device bank already holds them so: -1 and FREE past the capacity)."""
     bpe = cache.bytes_per_expert
+    c = cache.capacity
     cache.capacity = k
     cache.capacity_bytes = k * bpe
     cache.allocation_bytes = k * bpe
-    del cache.slot_to_expert[k:]
-    del cache.slot_states[k:]
-    del cache._slot_generations[k:]
+    if k < c:
+        del cache.slot_to_expert[k:]
+        del cache.slot_states[k:]
+        del cache._slot_generations[k:]
+    else:
+        free = type(cache.slot_states[0])(0) if cache.slot_states else 0
+        cache.slot_to_expert.extend([-1] * (k - c))
+        cache.slot_states.extend([free] * (k - c))
+        cache._slot_generations.extend([0] * (k - c))
+        updater.slot_to_expert[urow, c:k] = -1
+        updater.slot_state[urow, c:k] = 0  # FREE
     cache.slot_state = updater.slot_state[urow, :k]
     cache.slot_generations = updater.slot_generations[urow, :k]
     if policy is not None:

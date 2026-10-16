@@ -145,7 +145,9 @@ class GpuResidencyUpdater:
         self.promotion_margin = policies[0].promotion_margin
         self.promotion_sigmas = policies[0].promotion_sigmas
         capacities = [cache.capacity for cache in caches]
-        self.max_capacity = max(capacities)
+        # Banks span each cache's upper bound, so startup calibration can grow a layer in place
+        # (hot_cache_retire.set_hot_capacity); without it upper_capacity equals capacity.
+        self.max_capacity = max(getattr(cache, "upper_capacity", cache.capacity) for cache in caches)
         self.max_promotions = max(
             1, min(index(max_promotions), max(self.max_capacity, 1))
         )

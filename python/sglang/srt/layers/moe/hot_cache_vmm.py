@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from math import prod
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -61,8 +61,15 @@ class VmmHotCacheBacking:
     """One device's hot cache tensors: the large ones each on their own VMM reservation, mapped one handle per
     granule; the small ones (below MIN_VMM_GRANULES) on torch.empty."""
 
-    def __init__(self, device: torch.device, specs: Sequence[Tuple[str, int, Tuple[int, ...], torch.dtype]]):
-        """``specs``: (name, rows, row_shape, dtype) per tensor."""
+    def __init__(
+        self,
+        device: torch.device,
+        specs: Sequence[Tuple[str, int, Tuple[int, ...], torch.dtype]],
+        backed_rows: Optional[int] = None,
+    ):
+        """``specs``: (name, rows, row_shape, dtype) per tensor; ``rows`` is the reservation (the upper bound).
+        Only the first ``backed_rows`` rows (all when None) get physical memory now; ``set_backed_rows`` moves that
+        boundary either way later, while every address stays where it is."""
         from sglang.srt.utils.cuda_vmm_utils import (
             VmmReservation,
             get_device_granularity,
@@ -78,7 +85,7 @@ class VmmHotCacheBacking:
         self.rows: Dict[str, int] = {}
         self._reservations = {}
         self._handles: Dict[str, List] = {}
-        self._released: Dict[str, TailRelease] = {}
+        self.backed_rows = None
         with torch.cuda.device(self.device_id):
             for name, rows, row_shape, dtype in specs:
                 row_bytes = prod(row_shape) * torch.empty((), dtype=dtype).element_size()
@@ -90,53 +97,61 @@ class VmmHotCacheBacking:
                     granules * self.granularity, prop, self.device_id, alignment=self.granularity
                 )
                 self._reservations[name] = reservation
-                self._handles[name] = [
-                    reservation.map(g * self.granularity, self.granularity, retain_handle=True)
-                    for g in range(granules)
-                ]
+                self._handles[name] = [None] * granules
                 self.tensors[name] = tensor_from_pointer(
                     reservation.base, rows * row_bytes, shape=(rows,) + tuple(row_shape), dtype=dtype,
                     device_id=self.device_id,
                 )
                 self.row_bytes[name], self.rows[name] = row_bytes, rows
+        self.upper_rows = max(self.rows.values(), default=0)
+        self.set_backed_rows(self.upper_rows if backed_rows is None else backed_rows)
 
     @property
     def mapped_bytes(self) -> int:
         return sum(h is not None for handles in self._handles.values() for h in handles) * self.granularity
 
-    def release_tail(self, keep_rows: int) -> int:
-        """Unmap and free every tensor's granules wholly past its first ``keep_rows`` rows; return the bytes freed.
-        Once per backing: the kept tensors keep their addresses, the released rows fault on access."""
-        if self._released:
-            raise RuntimeError("hot cache VMM tail already released")
+    def set_backed_rows(self, rows: int) -> int:
+        """Back exactly the granules that hold any of the first ``rows`` rows of every VMM tensor: map the missing
+        ones (growing) or unmap and free those wholly past them (shrinking). Returns the bytes this added (negative
+        when it freed). Addresses never move; rows past the boundary fault on access."""
         from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver, check_drv
 
-        drv = _get_cuda_driver()
-        torch.cuda.synchronize(self.device_id)
-        freed = 0
-        for name, reservation in self._reservations.items():
-            tail = tail_release(
-                row_bytes=self.row_bytes[name], rows=self.rows[name], keep_rows=keep_rows,
-                granularity=self.granularity,
+        if not 0 <= rows <= self.upper_rows:
+            raise ValueError(f"backed rows {rows} outside [0, {self.upper_rows}]")
+        drv = _get_cuda_driver() if self._reservations else None
+        if self.backed_rows is not None and rows < self.backed_rows:
+            torch.cuda.synchronize(self.device_id)
+        delta = 0
+        with torch.cuda.device(self.device_id):
+            for name, reservation in self._reservations.items():
+                need = tail_release(
+                    row_bytes=self.row_bytes[name], rows=self.rows[name], keep_rows=rows,
+                    granularity=self.granularity,
+                ).first  # granules [0, need) hold a kept byte
+                handles = self._handles[name]
+                for g in range(len(handles)):
+                    address = reservation.base + g * self.granularity
+                    if g < need and handles[g] is None:
+                        handles[g] = reservation.map(g * self.granularity, self.granularity, retain_handle=True)
+                        delta += self.granularity
+                    elif g >= need and handles[g] is not None:
+                        check_drv(drv.cuMemUnmap(address, self.granularity), "cuMemUnmap(hot tail)")
+                        check_drv(drv.cuMemRelease(handles[g]), "cuMemRelease(hot tail)")
+                        handles[g] = None
+                        # The reservation's teardown must skip what is already unmapped and released.
+                        reservation._mappings = [m for m in reservation._mappings if m[0] != address]
+                        delta -= self.granularity
+        if self.backed_rows is not None and rows != self.backed_rows:
+            logger.info(
+                "hot cache VMM: backed rows %d -> %d of %d (%+.1f MiB)",
+                self.backed_rows, rows, self.upper_rows, delta / 2**20,
             )
-            released = set()
-            for g in range(tail.first, tail.end):
-                address = reservation.base + g * self.granularity
-                check_drv(drv.cuMemUnmap(address, self.granularity), "cuMemUnmap(hot tail)")
-                check_drv(drv.cuMemRelease(self._handles[name][g]), "cuMemRelease(hot tail)")
-                self._handles[name][g] = None
-                released.add(address)
-            # The reservation's teardown must skip what is already unmapped and released.
-            reservation._mappings = [m for m in reservation._mappings if m[0] not in released]
-            self._released[name] = tail
-            freed += tail.nbytes
-            if tail.end > tail.first:
-                logger.info(
-                    "hot cache VMM %s: released rows %d.. (granules %d-%d of %d, %.1f MiB) at 0x%x",
-                    name, keep_rows, tail.first, tail.end - 1, tail.end, tail.nbytes / 2**20,
-                    reservation.base + tail.first * self.granularity,
-                )
-        return freed
+        self.backed_rows = rows
+        return delta
+
+    def release_tail(self, keep_rows: int) -> int:
+        """Shrink the backing to ``keep_rows`` rows; return the bytes freed."""
+        return -self.set_backed_rows(keep_rows)
 
     def close(self) -> None:
         torch.cuda.synchronize(self.device_id)

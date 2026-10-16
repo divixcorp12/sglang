@@ -78,6 +78,46 @@ def test_forget_graph_path_state_drops_the_cached_fused_moe():
     assert not any(hasattr(m, "_exl3_fused_moe") for m in layers)
 
 
+def test_slot_delta_grows_by_the_room_above_required_and_trims_below_it():
+    assert _cal().slot_delta == (2480 - 400) // 13  # 160 slots of room
+    tight = _cal(free=1900, f1=1900 - 1500 - 20)
+    assert tight.slot_delta == -2
+
+
+def test_calibration_shapes_follow_the_warmup_largest_then_repeat_the_chunk():
+    assert hc.calibration_shapes(4096) == (2048, 2049, 4096, 4096)
+    assert hc.calibration_shapes(2) == (2, 2)
+
+
+def test_the_highest_run_sets_lowest_free_and_the_last_repeat_the_margin():
+    runs = (
+        hc.RunPeak(2000 * M, 1900 * M, 2000 * M, 3000 * M),  # 2048
+        hc.RunPeak(2100 * M, 1900 * M, 2100 * M, 2900 * M),  # 2049: fragmentation
+        hc.RunPeak(2500 * M, 2300 * M, 2600 * M, 2400 * M),  # 4096
+        hc.RunPeak(2650 * M, 2300 * M, 2650 * M, 2350 * M),  # 4096 again: grew 50 past 2600
+    )
+    c = hc.Calibration(4096, 4000 * M, 1000 * M, runs, 13 * M, 0, 900 * M)
+    assert c.peak_run is runs[3]
+    assert c.nontorch_growth == (1650 - 1650) * M  # (4000 - 2350) - (2650 - 1000)
+    assert c.lowest_free == (4000 - 1650) * M
+    assert c.margin == 350 * M  # the highest run's gap; the repeat grew 50
+
+
+def test_compare_uses_transients_when_both_entries_are_known():
+    runs = (hc.RunPeak(2500 * M, 2100 * M, 2500 * M, 0), hc.RunPeak(2500 * M, 2100 * M, 2500 * M, 0))
+    c = hc.Calibration(4096, 4000 * M, 1000 * M, runs, 13 * M, 0, 900 * M)
+    r = hc.compare_with_real(c, 3000 * M, 2600 * M, real_allocated_in=1700 * M)
+    assert r["calibration_transient_mib"] == 1200 and r["real_transient_mib"] == 1300
+    assert r["delta_transient_mib"] == 100 and r["delta_reserved_mib"] == 100
+
+
+def test_plan_capacity_grows_the_emptiest_layers_up_to_their_bound():
+    # 20 -> 21 -> 22, then the 22s tie and the lower layer id takes the third.
+    assert hc.plan_capacity({0: 20, 1: 22}, 3, 16, {0: 30, 1: 30}) == {0: 23, 1: 22}
+    assert hc.plan_capacity({0: 20, 1: 22}, 10, 16, {0: 21, 1: 23}) == {0: 21, 1: 23}  # bounds cap it
+    assert hc.plan_capacity({0: 20, 1: 22}, -2, 16, {0: 30, 1: 30}) == {0: 20, 1: 20}
+
+
 def test_plan_keep_takes_from_the_fullest_layer_and_keeps_the_floor():
     # 27 -> 26 first, then the 26s from the lowest layer id.
     assert hc.plan_keep({0: 26, 1: 27, 2: 26}, 3, 16) == {0: 25, 1: 25, 2: 26}
@@ -166,6 +206,7 @@ def test_the_watch_measures_only_the_first_full_size_extend_then_removes_itself(
     for name, value in (("synchronize", None), ("reset_peak_memory_stats", None)):
         monkeypatch.setattr(torch.cuda, name, lambda *a, **k: value)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a: 2200 * M)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a: 1000 * M)
     monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *a: 2600 * M)
     hc.watch_first_full_prefill(runner, result)
     extend = lambda n: SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: True), extend_num_tokens=n)
