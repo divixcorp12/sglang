@@ -1971,8 +1971,11 @@ class Envs:
     # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
     # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own
     # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
-    # Off by default.
+    # Off by default. The share's size is set at start from the tier's layout (exl3_ram_miss.prefill_share_rows).
     SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
+    # With the prefill share on: a fixed share in rows per layer instead of the size computed at start, for A/B arms.
+    # Unset (the default) uses the computed size.
+    SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS = EnvInt(None)
     # Test only: test/manual/dsv41/test_bs1_build_digest.py skips, instead of failing, when nvcc or the GPU arch differs
     # from its golden's (the golden is then stale: re-record it). Off by default.
     SGLANG_TEST_BS1_DIGEST_TOOLCHAIN_ACKNOWLEDGED = EnvBool(False)
