@@ -1275,6 +1275,32 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
               - **Approved next (offline):** an evaluation on C2/base (today's key, current head, (b), product
                 ranking, oracle) and the prefill-share sweep (0-128 rows, no admission, layers 2-20 only), the
                 latter also combined with the best head arm.
+          - **Lane-key evaluation (`lane_eval.py` `55bec79464`, write-up `bd59b08c07`,
+            `/mnt/nvme1/lane-tier-replay/eval/`):** one joint replay per arm (VRAM cache, RAM tier rules 1-10,
+            tier-priced lanes). Base has 121 clean verifies, C2 has 700. Δ ms/verify against today, base / C2, after
+            the head's 0.77 ms:
+
+            | arm | Δ ms/verify | ≈ ms/token |
+            |---|---|---|
+            | current head | +0.3 / +0.6 | +0.1 / +0.2 (matches the served +0.74, CI over 0) |
+            | (b) cap to RAM-warm | -0.6 / -0.1 | -0.2 / -0.03 |
+            | **product-emp** (P(recur) x tier saving, cold-lane cost = served +0.26 ms) | **-3.1 / -2.3** (-3.5 / -2.8 fused) | -0.9 / -0.6 |
+            | oracle, VRAM only | -4.9 / -4.0 | -1.4 / -1.1 |
+            | oracle-emp (the ceiling for (a)) | -5.1 / -4.5 | -1.4 / -1.3 |
+
+            - **P's own tier costs can't rank lanes.** P puts the CPU path on the critical path in 96-99% of records,
+              so moving a cold lane onto the GPU looks free: -2.4 for the head, against the served ~0. The A/B
+              measured +0.26 ms per moved cold lane, and with that price the head check passes.
+            - **(a) not justified:** oracle-emp is only 1.2-1.6 ms/verify better than product-emp.
+            - T under-predicts cold lanes by ~12% on these captures. Correcting for it makes the head 0.8-0.9 worse,
+              and capb and product-emp 1.1-1.3 better.
+            - **Reframe:** the whole next-verify lane-choice lever is worth at most ~1.4 ms/token in this regime,
+              not the ~7 ms/token estimated from hits in section 3.5. A hit is worth far less than the flat lane cost
+              assumed, because the CPU's NVMe reads are the critical path.
+            - The ranking rests on one served number (+0.26 ms per moved cold lane, one sample per arm), which a
+              startup calibration would have to measure before product-emp is served.
+            - **Next (approved):** the prefill-share sweep with product-emp as the head arm, with a startup rule for
+              the share size (today a hard-coded 64 rows, `exl3_ram_miss.py:785`).
           - **Owner constraint (2026-10-16): no predictor that must be retrained per RAM size.** The head stays
             tier-agnostic and outputs P(recur). Serving ranks by P(recur) x the time saved for the expert's live
             tier, with tier costs measured at startup. A RAM-tier feature inside the head (a) is a last resort, used
