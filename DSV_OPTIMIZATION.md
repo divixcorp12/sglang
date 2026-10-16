@@ -1033,8 +1033,25 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
       - **Today's L+2 prefetch nets only 4.7 misses/verify for 40 reads/verify.** It covers ~18.2, but its 40
         landings raise tier evictions from 49.8 to 54.1, and the induced re-misses take back most of the gain.
         RAM misses go from 55.1 without prefetch to 50.4 with it.
-    - Next (CPU): the RAM-tier LRU replay, then the oracle bound at 20/40/80
-      rows/verify, a near-miss gate baseline, timing, wasted reads and the RAM-capacity effect of today's prefetch.
+    - **RAM replay results** (2026-10-16, `c2.ramprefetch.{txt,json}`; 805 verifies):
+      - **Oracle next-verify prefetch on top of today's** saves 19.5 / 33.4 / 44.3 of 50.4 RAM misses at
+        20 / 40 / 80 reads per verify. Timing isn't the limit (51.7 ms median gap); bandwidth and precision are.
+        The 20-row oracle is worth ~5 ms/token.
+      - **The near-miss gate is net negative:** 5% precision, and RAM misses go *up*, to 51.6 / 53.0 / 56.2.
+        Experts just below this verify's top 6 don't predict the next verify's new experts.
+      - **Churn:** each landing at today's precision causes ~0.34 extra misses. That caps any low-precision
+        prefetch.
+      - **v2 verdict:** the only plausible input for predicting new experts is the draft's hidden states for
+        v+1, and no capture has them. v2 needs a new capture (~2 h of box, owner's call) and comes after the
+        churn fix. VRAM-lane v2 is worth about +1-2 ms/token over v1.
+      - **Ranking:**
+        - (a) Churn fix: evict speculative landings that haven't been routed first, in `take_victim_locked`.
+          Replay running now.
+        - (b) Integrate v1 at gather time (+1.2-1.4 ms/token).
+        - (c) The draft-hidden-state capture.
+        - (d) v2.
+      - **Decision:** (a) first, built only if the replay recovers ≥ 5 misses/verify; also replay it with 20
+        landings in place of 40. (b) to (d) wait until (a) has a served A/B.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
