@@ -1333,7 +1333,19 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
               - **TTFT -0.48 s mean** (per prompt +0.21 .. -1.06; predicted -0.45). Section 27.9's +0.5..+1.2 s did
                 not reproduce on today's arms.
               - No OOM; lowest free GPU memory 642 / 598 MiB.
-              - **Production default: owner's call** (existing flag, no code).
+              - **ENABLED by default (owner, 2026-10-16):** `arm_env.base_env()` sets
+                `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1`, so production and every arm get it. Master `a7cce264fe`
+                (fast-forward), merged into `ram-prefetch-pool-serve` as `1066d873cf`.
+                - The library default stays off, because the service refuses the share without a recorder. Every
+                  recipe passes `--expert-distribution-recorder-mode per_pass`, and a new test pins both.
+                - Tests: baseline 168 passed; affected unit tests 247 passed on master, 253 on pool-serve. The
+                  `dsv41_flash/test_harness.py` failures (2) also fail at master `ee528f2c74`, so they predate this
+                  change.
+                - Production's resolved env against its checkout `f1ba1a3d18`: the only difference is this flag;
+                  argv and cores are identical. The pull brings 646 commits, all opt-in and off. **The owner pulls
+                  and restarts.**
+                - Not measured on the production recipe itself; the A/B arm was `-mergechunk-expseg`, which adds
+                  pool serve, prefill-merge-chunk and expseg.
               - **Next (approved):** a startup-computed share size (usable rows per layer x the sweep's 0.15
                 knee), then one served pair, share-64 vs share-startup (~28).
             - **Approved:** one served A/B pair of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64, no code) on
