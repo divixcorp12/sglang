@@ -155,6 +155,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with --long-prompt: cancel the request this long after its first streamed token")
     p.add_argument("--ttft-repeats", type=int, default=0,
                    help="with --long-prompt: first send it this many times with 20 s of decode, for TTFT samples")
+    p.add_argument("--resolve-env", metavar="KEYS",
+                   help="launch nothing: print the server's env (the comma-separated KEYS from the caller's env under "
+                        "the capture's own), its argv, and which of KEYS the capture overrides, as JSON")
     a = p.parse_args(argv)
     if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats):
         p.error("--decode-seconds and --ttft-repeats need --long-prompt")
@@ -165,15 +168,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return a
 
 
-def main() -> int:
-    a = parse_args()
-    os.makedirs(a.out_dir, exist_ok=True)
-    env = os.environ | server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split) | {"PYTHONPATH": os.path.join(REPO, "python")}
+def capture_env(a: argparse.Namespace) -> dict:
+    """What the capture sets over the caller's env for its server; a caller's value for one of these keys is lost."""
+    env = server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)
     if a.long_prompt:
         env["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] = LONG_TRACE_CAPACITY
     if a.draft_top_prob:
         env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")
-    argv = [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(a.arm)]
+    return env
+
+
+def server_argv(arm: str) -> list[str]:
+    return [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(arm)]
+
+
+def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
+    """The server's env as resolved-env.json records it: the caller's ``keys`` (an arm's assignments) under the
+    capture's env, and the keys the capture would override with another value, which the arm would not get."""
+    own = capture_env(a)
+    asked = {k: os.environ[k] for k in keys if k in os.environ}
+    return {"env": asked | own, "argv": server_argv(a.arm),
+            "overridden": sorted(k for k, v in asked.items() if k in own and own[k] != v)}
+
+
+def main() -> int:
+    a = parse_args()
+    if a.resolve_env is not None:
+        print(json.dumps(resolve_env(a, [k for k in a.resolve_env.split(",") if k])))
+        return 0
+    os.makedirs(a.out_dir, exist_ok=True)
+    env = os.environ | capture_env(a) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    argv = server_argv(a.arm)
     with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(a.out_dir, "server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
