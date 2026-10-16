@@ -177,6 +177,22 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
       - Served A/B: `run_mirrorab.sh` (worktree `wt-mirror-ab`, `a988627f06`, the mergechunk-r2 code plus the probe
         and per-round logging), arm `...-mergechunk-mirrorcal`, against mergechunk-r2. Started first, ahead of the
         bigger-cache run.
+- **Mirror weight A/B result (2026-10-15 23:14-23:24, `...-mergechunk-mirrorcal` vs mergechunk-r2): NOT adopted.**
+  - serve_compare: **+0.04 ms/token (CI -0.72..+0.63)**, 8/8 prompts clean. Stream -1.44 and wait -1.10 ms/verify.
+  - Per-root busy (nvme0 / SPCC / nvme2):
+
+    | run | nvme0 | SPCC | nvme2 |
+    |---|---|---|---|
+    | r2, equal shares | 86.5 | 88.3 | 85.6 s |
+    | mirrorcal | 93.3 | 74.9 | 89.4 s |
+
+    - **With equal shares and no stall, the drives are already balanced.** The weights push the SPCC 17% under,
+      and the busiest root gets busier.
+  - So read-amp's 1.21x was stall episodes or the old box settings, not throughput. The probe sees 1.3x only in
+    isolated bursts.
+  - **Static mirror weights are dropped.** Kept as an opt-in diagnostic (`mirror-weight-calib` `cb77329dd8`,
+    unmerged). The startup line is a cheap per-drive health readout.
+  - Stalls need dynamic routing (`SGLANG_MOE_EXPERT_MIRROR_DYNAMIC`) or fixing the drive.
 - **Refinement verdict (split-calib):** the `-refine` run published only 2 refinements, so it ended about 44% of the
   way to the served fit: a weak test. Even a fair one is unlikely to beat ~1 ms/token. **Not worth pursuing.**
   Startup calibration stays useful: it matches the offline fits within noise with no hard-coded constants.
