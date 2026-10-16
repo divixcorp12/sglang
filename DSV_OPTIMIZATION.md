@@ -706,6 +706,25 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
         - capture memory goes into the pre-capture sizing, from an eager TARGET_VERIFY dummy peak.
       - Pending: wiring routing (i) and the capture estimate, stating the upper-bound capacity derivation, then a
         ~8 min GPU smoke.
+  - **Prefill transient cuts (scoping note; estimates at 4096 tokens):**
+
+    | id | cut | saves | bit-identical | code |
+    |---|---|---|---|---|
+    | A1 | indexer score budget 128 -> 32 MB | ~290 MiB if it is in the peak window | yes (§27.7) | env |
+    | A3 | merge budget 128 -> 32 MB | ~96 MiB | yes | env |
+    | A2 | per-chunk SWA/extra kernels into one output | ~240 MiB | yes (grid per token/head) | `flash_mla_sm120_triton.py` |
+    | B1 | in-place hc_post residual | ~160 MiB if both mHC copies are live | yes | `deepseek_v4.py` hc_pre/hc_post |
+    | B2 | free DSpark aux capture earlier | ~0 at the peak | yes | — |
+    | A4 | chunk the whole attention block over tokens | ~500-700 MiB | **no** (GEMM tactics by M) | MQALayer.forward |
+
+    - Bit-identical potential: ~0.6-0.8 GB, 50-60 slots. MoE cuts would reorder fp32 sums, so they are skipped.
+    - **Decided:**
+      1. The A0 measurement run now: finer peak-logger wrappers on the expseg2 config.
+      2. A1 + A3.
+      3. A2.
+      4. B1 if A0 confirms the double copy.
+      - A4 is skipped unless the others fall well short; that would be an owner call.
+    - The served check pairs the cuts with the calibration flag, so the freed memory goes to the hot cache.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
