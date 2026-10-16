@@ -151,9 +151,9 @@ CHUNK_KERNELS = envs.SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS
 
 
 def test_kernel_chunk_tokens_from_budget():
-    # Per token: two bf16 partials and three fp32 merge copies of 64 x 512 = 1 MiB a token.
-    assert tmod.kernel_chunk_tokens(64, 512, 32) == 32
-    assert tmod.kernel_chunk_tokens(64, 512, 128) == 128
+    # Per token: two bf16 partials and three fp32 merge copies of 64 x 512 = 16 B x 32768 = 0.5 MiB a token.
+    assert tmod.kernel_chunk_tokens(64, 512, 32) == 64
+    assert tmod.kernel_chunk_tokens(64, 512, 128) == 256
     assert tmod.kernel_chunk_tokens(64, 512, 0) == 1
 
 
