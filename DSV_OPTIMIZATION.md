@@ -821,7 +821,14 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
              rest and log the shortfall. Never crash. Fault-injection tests come first.
           3. Log the summary before `set_hot_capacity`.
           4. The capture estimate counts reserve growth and the free-memory drop, not just the allocated peak.
-        - Next: calib4, the same combined smoke. The combined
+        - **Fixes pushed** (`6bd1f06eb2`):
+          - `settle()` sizes from F after every run, with `bytes_to_back` granule pricing.
+          - Guarded per-layer grow with rollback on OOM (`HotCacheMapOutOfMemory`).
+          - The summary is logged before the resize.
+          - The capture estimate is the max of the allocated-peak and reserve-peak deltas.
+          - 72 CPU tests passed, including fault injection: OOM on the first layer, OOM part-way, guard trip,
+            rollback, and end to end. The three mutants (no rollback, no guard, unsettled sizing) are each caught.
+        - calib4 (the same combined smoke) started 2026-10-16. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
