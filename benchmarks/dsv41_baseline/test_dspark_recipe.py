@@ -28,7 +28,7 @@ def test_prod_serves_the_dspark_mode_with_its_own_settings():
     assert argv[argv.index("--speculative-algorithm") + 1] == "DSPARK"
 
 
-# MERGE_PLAN_1016.md: production is the best served arm without its RAM prefetch, with both startup calibrations on.
+# MERGE_PLAN_1016.md: production is the best served arm, RAM prefetch included, with both startup calibrations on.
 PROD_DSPARK_SETTINGS = {
     "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": "0,1",
     "SGLANG_MOE_PINNED_HOST_MB": "111530",
