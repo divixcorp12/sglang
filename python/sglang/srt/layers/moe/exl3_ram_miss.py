@@ -53,7 +53,6 @@ from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.cpu_experts.threading_config import ThreadingConfig
 from sglang.srt.layers.moe.exl3_expert_format import (
-    EXL3_MAX_GATHER_ROWS,
     EXL3_STREAMED_NAMES,
     RowSegment,
 )
@@ -578,6 +577,21 @@ def full_layer_shortfall(ranges, *, staging_width: int, share: int, experts: int
     return short
 
 
+def usable_rows(ranges, *, staging_width: int, share: int) -> int:
+    """The slots of a row that can hold a mapped expert, over every group: each group's range less its
+    min(width, slots - 1) staging slots and ``share`` pool slots (ram_tier.h, reserve_staging and reserve_spec_pool).
+    The prefill share is counted over the same groups (owned_in_row)."""
+    return sum(max(0, hi - lo - min(staging_width, hi - lo - 1) - share) for lo, hi in ranges)
+
+
+def prefill_share_rows(usable: list[int], fraction: float = PREFILL_SHARE_FRACTION) -> int:
+    """The prefill share for rows of ``usable`` mapped slots each: ``fraction`` of the smallest, at least 1. The host
+    keeps one share for every layer (set_prefill_share), so the smallest row decides."""
+    if not usable:
+        raise ValueError("exl3 RAM miss: the prefill share needs at least one row that admits")
+    return max(1, round(fraction * min(usable)))
+
+
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
     """``PinnedTierRowBackend`` whose gather is the lease chain.
 
@@ -783,9 +797,12 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 # deadlocked (at thresholds of 4 batches and of 1). 16 covers the warm-up; the value
 # beyond that is arbitrary.
 COPY_ENGINE_ARM_DECODES = 16
-# The prefill share: one eager gather chunk, the most rows gather_rows protects at once
-# (the replay's best bound, analysis/dsv41-drive/prefill-evict/ram_replay.py).
-PREFILL_SHARE_ROWS = EXL3_MAX_GATHER_ROWS
+# The prefill share's size, as a fraction of a layer's usable RAM rows (prefill_share_rows). The fraction is the knee of
+# the tier-priced share sweep (analysis/dsv41-drive/dspark/lane_eval.py --shares --rows-scale, PREFILL_CAPTURE_PLAN.md
+# "Prefill-share sweep" on lane-tier-replay; outputs /mnt/nvme1/lane-tier-replay/sweep/{aboff,c2}.scale*.json): the
+# decode gain is flat for any share up to ~0.15 of the usable rows, halves at ~0.33 and is mostly gone by ~0.6, at
+# tier sizes of 0.75-1.25x today's; below the knee only the prefill's blocking reads grow.
+PREFILL_SHARE_FRACTION = 0.15
 # CPU experts log their cumulative counters every this many batches, about twice per
 # 128-token turn at batch 1.
 CPU_STATS_LOG_BATCHES = 64
@@ -881,6 +898,8 @@ class Exl3RamMissService:
         self._node_ranges = None
         # The RAM prefetch's pool slots per row and group, set at start (0: no pool).
         self._spec_share = 0
+        # SGLANG_DSV41_ENABLE_PREFILL_SHARE: the rows per layer a prefill may own, set at start (0: off).
+        self._prefill_share_rows = 0
         # The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu), set at start; its per-row table is built as rows attach.
         self._spec_gpu = None
         self._spec_hot: dict[int, tuple] = {}
@@ -1307,7 +1326,8 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
-            cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
+                self._prefill_share_rows = self._size_prefill_share(tables, spec_share)
+            cores =[-1 if plan.ram is None else plan.ram for plan in numa.plans]
             busy_poll = all(plan.busy_poll for plan in numa.plans)
             spin_us = envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.get()
             if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
@@ -1972,15 +1992,48 @@ class Exl3RamMissService:
         self._trace_step()
         self._trace_stages()
 
+    def _size_prefill_share(self, tables, spec_share: int) -> int:
+        """The prefill share's rows per layer: PREFILL_SHARE_FRACTION of the smallest admitting row's usable rows
+        (full layers map every expert and admit nothing), or SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS when set. Logs its
+        inputs."""
+        full = pinned_full_layers()
+        usable = {}
+        for row, layer_id in enumerate(tables.layer_ids):
+            if layer_id in full:
+                continue
+            capacity = int(tables.capacity[row])
+            ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
+            usable[int(layer_id)] = usable_rows(ranges, staging_width=self.staging_width(), share=spec_share)
+        computed = prefill_share_rows(list(usable.values()))
+        forced = envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.get()
+        if forced is not None and forced < 1:
+            raise ValueError(f"exl3 RAM miss: SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS={forced} must be at least 1")
+        rows = computed if forced is None else forced
+        logger.info(
+            "exl3 RAM miss prefill share: %d rows per layer (%s; computed %d = %.2f x the smallest layer's %d usable "
+            "rows; usable rows per layer %d-%d over %d admitting layers, staging %d and pool %d slots per group)",
+            rows,
+            "computed" if forced is None else "SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS",
+            computed,
+            PREFILL_SHARE_FRACTION,
+            min(usable.values()),
+            min(usable.values()),
+            max(usable.values()),
+            len(usable),
+            self.staging_width(),
+            spec_share,
+        )
+        return rows
+
     def _set_prefill_share(self, forward_pass_id: int, forward_batch) -> None:
         """Pre-forward observer for ``SGLANG_DSV41_ENABLE_PREFILL_SHARE``.
 
-        A prefill's pinned-tier admissions own at most ``PREFILL_SHARE_ROWS`` rows per
-        layer (then they evict their own); any other forward's own none. The value
-        holds until the next forward's observer runs.
+        A prefill's pinned-tier admissions own at most the share sized at start rows per
+        layer (then they evict their own); any other forward's own none. The value holds
+        until the next forward's observer runs.
         """
         prefill = forward_batch.forward_mode.is_extend_without_speculative()
-        self.host.set_prefill_share(PREFILL_SHARE_ROWS if prefill else 0)
+        self.host.set_prefill_share(self._prefill_share_rows if prefill else 0)
 
     def _copy_engine_barrier(self, forward_pass_id: int, forward_batch) -> None:
         """Pre-forward observer: drain the device before an eager forward once armed.

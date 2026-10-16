@@ -1385,13 +1385,13 @@ def _mode(prefill: bool):
 
 
 def _prefill_share_service(tiers, monkeypatch, *, on, share=1):
+    """Starts the service with the prefill share ``on``, forced to ``share`` rows (None: the size computed at start)."""
     from sglang.srt.eplb import expert_distribution
 
     service, _, caches = tiers
     recorder = _Recorder()
     monkeypatch.setattr(expert_distribution, "get_global_expert_distribution_recorder", lambda: recorder)
-    monkeypatch.setattr(module, "PREFILL_SHARE_ROWS", share)
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(on):
+    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(on), envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.override(share):
         service.ensure_started()
     return service, caches, recorder
 
@@ -1431,6 +1431,35 @@ def test_only_a_prefill_forward_sets_the_share(tiers, monkeypatch):
     observer(1, _mode(prefill=True))
     observer(2, _mode(prefill=False))  # decode, and also idle, mixed or a speculative verify
     assert shares == [5, 0]
+
+
+def test_the_share_sized_at_start_reaches_set_prefill_share(tiers, monkeypatch):
+    """Unforced, a prefill's share is the size computed at start from the tier's usable rows. Mutations: the observer
+    keeps a constant, or the size is computed from the raw capacity (staging and pool slots counted)."""
+    sizes = []
+    real = module.prefill_share_rows
+    monkeypatch.setattr(module, "prefill_share_rows", lambda usable: sizes.append(list(usable)) or real(usable) + 6)
+    service, _, recorder = _prefill_share_service(tiers, monkeypatch, on=True, share=None)
+    (usable,) = sizes
+    staging = service.staging_width()
+    expected = [
+        module.usable_rows([(0, int(service.host.tables.capacity[row]))], staging_width=staging, share=0)
+        if service._node_ranges is None
+        else module.usable_rows([g[row] for g in service._node_ranges], staging_width=staging, share=0)
+        for row in range(len(service.host.tables.layer_ids))
+    ]
+    assert usable == expected
+    shares = []
+    monkeypatch.setattr(service.host, "set_prefill_share", shares.append)
+    (observer,) = recorder.observers
+    observer(1, _mode(prefill=True))
+    observer(2, _mode(prefill=False))
+    assert shares == [real(usable) + 6, 0]
+
+
+def test_a_forced_share_below_one_is_refused(tiers, monkeypatch):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"):
+        _prefill_share_service(tiers, monkeypatch, on=True, share=0)
 
 
 def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
