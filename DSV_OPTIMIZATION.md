@@ -314,8 +314,37 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
         - **Drive fix (owner):** run smart-log first. If it is GC, fstrim and free space; if thermal, add airflow.
           For production, dynamic or busy-weighted mirror shares could route around a stalled root (pointer only,
           not built).
-        - Pending: the re-scored table of recent pairs, the production stall tax (episodes per hour x cost) and
-          the ab_compare fix or deprecation.
+        - **serve_compare MERGED** into `ram-prefetch-pool-serve` (`91cf7c7c02`, tool `79d8147098`).
+          - It adds a CPUSLOW flag: either team's ms/lane above 1.2x the run's median prompt, corroborated by the
+            swap-in/major-fault rate and node-0 MemFree.
+          - It replaces ab_compare and step_budget medians for verdicts. ab_compare is an untracked run-dir script,
+            now marked deprecated.
+        - **Re-scored pairs** (first minus second, ms/token; clean = no flag in either arm; 95% prompt-block CI):
+
+          | pair | all | clean (n) | clean CI | stream/v | wait/v | flags |
+          |---|---|---|---|---|---|---|
+          | A - A'' | -0.80 | +1.72 (7) | -0.7..+4.7 | -2.2 | +6.9 | A'' p5 CPUSLOW (swap x22) |
+          | refine - A'' | -2.11 | +0.43 (7) | -2.6..+3.3 | -8.7 | +8.8 | A'' p5 |
+          | mergechunk-r2 - A'' | -2.82 | +0.27 (7) | -2.0..+3.6 | +1.2 | -1.7 | A'' p5 |
+          | **mergechunk-r2 - A** | -2.02 | **-2.02 (8)** | **-3.7..-0.6** | +4.1 | -9.2 | none |
+          | D - A' | +11.89 | -0.47 (7) | -1.9..+2.2 | +0.5 | +1.1 | D p1 STALL |
+          | C - A | +0.49 | -0.56 (6) | -1.4..+0.1 | +2.8 | -0.8 | C p0, p5 CPUSLOW |
+          | drip3 - base | -0.54 | -0.54 (8) | -2.2..+1.8 | -0.2 | -2.1 | none |
+          | drip4 - base | +11.09 | -0.64 (7) | -2.1..+0.7 | +1.2 | -4.4 | drip4 p7 STALL |
+
+          - On clean prompts every pair is within ±2 ms/token.
+          - **Only merge-chunk at 11721 MiB vs A clears zero: -2.0 ms/token (CI -3.7..-0.6).** Wait falls by 9.2
+            ms/verify and stream rises by 4.1. A real but small gain.
+          - Refine moves 8.7 ms/verify from stream to wait, with no net change.
+          - Tiebreak (D), decay 0.995 (C) and drip3/drip4 are all neutral, not losses.
+        - **SPCC production tax:**
+          - Frequency: 5 episodes in 0.59 h of drive-active time, about 8.5 per hour and 20-51 s each (~6% of
+            active time). 6.6% of traced serving decode fell in a stall.
+          - Cost: a hit prompt runs at 1.94x expected ms/token (1.14-2.98x).
+          - **Tax: ~3.2% of decode time, about 1.9 ms/token on average.**
+          - Caveats: small sample, and the test runs are prefill-heavy. The cause awaits the owner's smart-log.
+        - CPUSLOW causes: memory pressure fits A'' p5 (node 0 at 918 MiB), but C's two flags have only weak swap
+          corroboration, so the cause is open.
   - Resolved: the ~7 GiB read from sdb3 at launch is the DSpark draft, read cold each launch because it is evicted
     and dropped (~20 s at ~470 MB/s). The target load is warm.
 - **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
