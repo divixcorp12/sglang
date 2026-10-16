@@ -1542,7 +1542,14 @@ class ExpertHotCacheManager:
         devices = {cache.device for cache in manager.caches.values()}
         manager.lane_head = None
         if lane_head_path:
-            from sglang.srt.layers.moe.lane_head import LaneHead, read_lane_head_file
+            # The head's device bytes are allocated here, at model load. Startup calibration
+            # (SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP) measures free memory later, from the scheduler's hook after
+            # the KV pools exist, so it sees them by construction.
+            from sglang.srt.layers.moe.lane_head import (
+                LaneHead,
+                check_serving_matches_training,
+                read_lane_head_file,
+            )
 
             updater = manager.gpu_residency
             if updater is None or not updater.insert_direct:
@@ -1554,6 +1561,11 @@ class ExpertHotCacheManager:
                 lane_head_path,
                 layer_ids=list(updater.layer_ids),
                 experts=updater.num_experts,
+            )
+            check_serving_matches_training(
+                head_file.meta,
+                insert_decay=updater.insert_on_miss_decay,
+                top_prob_gate=envs.SGLANG_DSPARK_TOP_PROB_GATE.get(),
             )
             manager.lane_head = LaneHead(head_file, updater.device)
             updater.lane_head = manager.lane_head

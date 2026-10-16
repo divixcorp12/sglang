@@ -282,6 +282,72 @@ def test_the_state_counts_live_verify_routes_decays_by_live_tokens_and_resets():
     assert not ref.score.any() and (ref.last == -1).all() and ref.verify_ct[0] == 0
 
 
+def test_a_served_sequence_of_prefills_verifies_and_drafts_keeps_the_extractions_per_request_state(nvh, tmp_path):
+    """Prefill, verify x3 (drafts between), a chunked prefill (two PREFILL forwards), verify x3, driven through the
+    residency updater's observe_forward wiring: every extracted feature (score, age, first touch included) equals
+    next_verify_head's, and the final state is the second request's alone. Mutations: no reset at the second prefill,
+    a reset at a draft or verify, or a chunk's second reset counting as a verify all break it."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.expert_residency_clock import ForwardKind
+    from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+    src = FakeSource(verifies=(3, 3))
+    data, head_dir = _write_training_dirs(nvh, src, tmp_path)
+    head = _export(head_dir, data, tmp_path / "lane.safetensors", "fp32", src.layers)
+    ref = lh.LaneHeadReference(head.tensors, head.meta)
+    updater = SimpleNamespace(
+        lane_head=ref, host_pending=False, flush=lambda: None, _count=lambda *args, **kwargs: None,
+        _apply=lambda *args: None, enabled=torch.ones(1, dtype=torch.bool), prefill_promotions=0,
+        decode_forwards=torch.zeros(1), boundary_pending=torch.zeros(1, dtype=torch.bool),
+        _decode_boundary_reached=lambda: torch.zeros(1, dtype=torch.bool),
+    )
+
+    def observe(kind, boundary=False, graph_served=False):
+        GpuResidencyUpdater.observe_forward(updater, kind, 6, boundary, graph_served)
+
+    replay = {}
+    recs = iter(src.recs)
+
+    def verify():
+        rec = next(recs)
+        for L in range(src.layers):  # the layers' gathers, each running the hook
+            ids, w, x, resident, dead = src.serving_inputs(rec, L)
+            feats = ref.features(L, ids, w, x, resident, dead)
+            keys, p = ref.gather(L, ids, w, x, resident, dead)
+            replay[(rec["router"], L)] = (feats, keys, p, resident)
+        observe(ForwardKind.VERIFY, boundary=True, graph_served=True)
+        observe(ForwardKind.DRAFT)
+
+    observe(ForwardKind.PREFILL, boundary=True)
+    verify(), verify(), verify()
+    observe(ForwardKind.PREFILL, boundary=False)  # chunk 1, under the boundary's token count
+    observe(ForwardKind.PREFILL, boundary=True)  # chunk 2
+    verify(), verify(), verify()
+    _check_against_training(nvh, data, head_dir, "syn", replay, src.layers, tol=(1e-5, 1e-6))
+    # The extraction's state after request r1's three verifies, recomputed from its definition.
+    for L in range(src.layers):
+        score, last = np.zeros(EXPERTS), np.full(EXPERTS, -1)
+        for t, rec in enumerate(src.recs[3:]):
+            cnt = np.bincount(src.ids[rec["router"], L, : rec["live"]].reshape(-1), minlength=EXPERTS)
+            score = score * 0.98 ** rec["live"] + cnt
+            last[cnt > 0] = t
+        np.testing.assert_allclose(ref.score[L], score, rtol=1e-12)
+        assert np.array_equal(ref.last[L], last) and ref.verify_ct[L] == 3
+
+
+def test_a_launch_off_the_training_distribution_is_refused():
+    meta = lh.LaneHeadMeta(
+        format_version=1, layer_ids=(0,), hidden=16, rank=16, experts=8, features=lh.FEATURES, pca_proj_dtype="fp32",
+        score_decay=0.98, constant_features={"odds": 1.0}, training={},
+    )
+    lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.0)
+    with pytest.raises(ValueError, match="SGLANG_DSPARK_TOP_PROB_GATE=0.4"):
+        lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.4)
+    with pytest.raises(ValueError, match="SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is 0.995"):
+        lh.check_serving_matches_training(meta, insert_decay=0.995, top_prob_gate=0.0)
+
+
 def test_every_prefill_starts_a_request_for_the_heads_state():
     """The residency updater resets the head at every prefill it observes (boundary or not, graph-served or not),
     never at a verify or a draft. Mutation: resetting only at a qualifying prefill boundary."""

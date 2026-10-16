@@ -76,7 +76,8 @@ class LaneHeadMeta(msgspec.Struct, frozen=True):
     features: tuple[str, ...]
     # "bf16" (26 MB at 40 layers, rank 64) or "fp32" (the training's own projection, bit for bit).
     pca_proj_dtype: str
-    # The score feature's per-token decay (next_verify_head.DECAY).
+    # The score feature's per-token decay (next_verify_head.DECAY), also the training captures' hot-cache insert decay;
+    # a launch with another SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is refused (check_serving_matches_training).
     score_decay: float
     # Features constant in training, with the value training saw; serving feeds exactly that value.
     constant_features: dict[str, float]
@@ -222,6 +223,24 @@ def read_lane_head_file(
                 f"lane head file {path!r}: constant feature {name!r} is fed {value}, but training's mean differs"
             )
     return LaneHeadFile(path=path, tensors=tensors, meta=meta)
+
+
+def check_serving_matches_training(meta: LaneHeadMeta, *, insert_decay: float, top_prob_gate: float) -> None:
+    """Refuse a launch whose features would come from a distribution training never saw.
+
+    The training corpus served every verify at its full width (no DSpark top-probability gate: ``live`` is 6 on all
+    but 26 of 45k rows, so a gated verify's ``live`` lands ~100 deviations off) and with the hot cache's insert decay
+    equal to the score decay the features use (``score_decay``), which shaped the ``resident`` feature."""
+    if top_prob_gate:
+        raise ValueError(
+            f"SGLANG_OPT_LANE_HEAD_PATH: the head was trained on ungated verifies; SGLANG_DSPARK_TOP_PROB_GATE="
+            f"{top_prob_gate} cuts them (set it to 0 or retrain on gated captures)"
+        )
+    if abs(float(insert_decay) - meta.score_decay) > 1e-12:
+        raise ValueError(
+            f"SGLANG_OPT_LANE_HEAD_PATH: the head was trained with insert decay {meta.score_decay}; "
+            f"SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is {insert_decay}"
+        )
 
 
 # ---- the Python definition -----------------------------------------------------------------------------------------
