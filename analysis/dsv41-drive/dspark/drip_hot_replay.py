@@ -457,7 +457,8 @@ def arms(cap: Capture, horizon: int) -> dict:
             "ms_per_verify_vs_today": priced,  # negative is a saving
             "build_gate": {
                 "cpu_lanes_-30": net_cpu <= -30,
-                "no_more_nvme_gpu": d_nvme <= 0 and cold == 0 if a != "today" else None,
+                # NVMe GPU lanes, an NVMe-cold return counted as one
+                "no_more_nvme_gpu": d_nvme + cold <= 0 if a != "today" else None,
                 "gpu_ms_<=0.5": gpu_ms <= 0.5,
             },
         }
