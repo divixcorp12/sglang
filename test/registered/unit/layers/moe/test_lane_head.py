@@ -180,7 +180,11 @@ def _check_against_training(nvh, data: Path, head_dir: Path, split: str, replay:
             for i in rows:
                 e = int(shard["e"][i])
                 j = index[e]
-                assert np.array_equal(feats["f"][j].numpy(), shard["f"][i]), (router, L, e, feats["f"][j], shard["f"][i])
+                # A capture with draft confidence (C2) extracted the real odds; training saw 1.0 and zeroed the term
+                # (scale 1e9), so serving feeds 1.0 and every other feature must match bit for bit.
+                want_f = shard["f"][i].copy()
+                want_f[lh.ODDS] = 1.0
+                assert np.array_equal(feats["f"][j].numpy(), want_f), (router, L, e, feats["f"][j], shard["f"][i])
                 dz = float(np.abs(feats["z"][j].numpy() - shard["z"][i]).max() / max(1.0, np.abs(shard["z"][i]).max()))
                 stats["max_dz"] = max(stats["max_dz"], dz)
                 dp = abs(float(p[e]) - float(pred[L]["p"][i]))
