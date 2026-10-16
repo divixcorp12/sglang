@@ -390,6 +390,17 @@ GPU_DRIP_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-gpudrip"
 GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
 PIN01_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-pin01"
 PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
+PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
+PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
+PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
+PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-calib")
+MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
+SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
+SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
 FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
 SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
 PROMOTE_PAIR_ARMS = (
@@ -401,6 +412,10 @@ PROMOTE_PAIR_ARMS = (
     GPU_DRIP_LEAN_ARM,
     PIN01_ARM,
     PIN01_GPU01_ARM,
+    PIN01_SPLIT_MODEL_ARM,
+    PIN01_MEM_ARM,
+    PIN01_SPLIT_MODEL_MEM_ARM,
+    *PIN01_HICACHE_ARMS,
 )
 SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
 CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
@@ -682,7 +697,10 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM) else ""), arm
+            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
+                                                               PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                               *PIN01_HICACHE_ARMS)
+                                              else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
     pin, plain, gpu = ab.ARMS[PIN01_ARM][0], ab.ARMS[reference][0], ab.ARMS[PIN01_GPU01_ARM][0]
@@ -704,6 +722,179 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
         fixed = [0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 13, 14, 15, 15, 16, 17, 17, 18, 19, 19,
                  20, 21, 21, 22, 23, 23, 24, 24, 25, 26, 26]
         assert len(split) == len(fixed) and all(a <= b for a, b in zip(split, fixed))  # only lanes to the link
+
+
+def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins_it_off(monkeypatch):
+    """-splitmodel is pin01 with SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL=1 at the default costs, compared with pin01; every
+    other arm states the model off and its costs empty against a shell's. The fixed split stays: the model replaces it
+    on the device only where the copy engine can take hits. Mutant: the arm changes another knob, an arm inherits the
+    shell's flag or costs, or the arm is compared with the wrong one -- red."""
+    ab = _ab()
+    monkeypatch.setenv(SPLIT_MODEL, "1")
+    monkeypatch.setenv(SPLIT_MODEL_COSTS, "copy_lane=9")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[SPLIT_MODEL] == ("1" if arm in (PIN01_SPLIT_MODEL_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                             *PIN01_HICACHE_ARMS)
+                                              else "0"), arm
+            assert overrides[SPLIT_MODEL_COSTS] == "", arm
+    model, pin = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0], ab.ARMS[PIN01_ARM][0]
+    assert {k: v for k, v in model.items() if k != SPLIT_MODEL} == {k: v for k, v in pin.items() if k != SPLIT_MODEL}
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_ARM] == PIN01_ARM and ab.ARMS[PIN01_SPLIT_MODEL_ARM][1] is True
+
+
+def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
+    """-mem is its arm with the scheduler's mlockall and --weight-loader-drop-cache-after-load, nothing else; every
+    other arm pins the mlock off against a shell's and adds no server flag; the capture and the timed run both append
+    the arm's flags. The ON -mem arm is compared with the OFF -mem arm. Mutant: a -mem arm changes another knob, the
+    flag is not appended, or an arm inherits the shell's mlock -- red."""
+    ab = _ab()
+    monkeypatch.setenv(MLOCK, "1")
+    for arm in ab.ARMS:
+        mem = "-mem-" in arm + "-"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[MLOCK] == ("1" if mem else "0"), arm
+        drop = ("--weight-loader-drop-cache-after-load",) if mem else ()
+        assert ab.server_flags(arm) == drop + ab.ARM_MEMORY_FLAGS.get(arm, ()), arm
+    for base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
+        mem, plain = ab.ARMS[base + "-mem"][0], ab.ARMS[base][0]
+        assert {k: v for k, v in mem.items() if k != MLOCK} == {k: v for k, v in plain.items() if k != MLOCK}
+        assert ab.ARMS[base + "-mem"][1] is True
+    assert ab.REFERENCE[PIN01_MEM_ARM] == PIN01_ARM and ab.REFERENCE[PIN01_SPLIT_MODEL_MEM_ARM] == PIN01_MEM_ARM
+    capture = open(os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "spec_margin_capture.py")).read()
+    assert "*both_cpu_ab.server_flags(a.arm)]" in capture
+    seen = {}
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, cwd: seen.update(env) or type("R", (), {"returncode": 0}))
+    ab.run_timed(PIN01_MEM_ARM, "/out")
+    assert seen["DSV41_EXTRA_SERVER_ARGS"].endswith("--weight-loader-drop-cache-after-load")
+
+
+def test_the_hicache_and_engram_arms_add_their_knob_alone(monkeypatch):
+    """-hicache1 is the ON -mem arm with the HiCache host pools on node 1, -engram0 that with the native Engram cache
+    at 0; every other arm states the Engram cache at its default 5 against a shell's, and no other arm names the node.
+    Both keep the -mem server flag. Mutant: an arm changes another knob or loses the cache drop -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB", "0")
+    hicache, engram0 = PIN01_SPLIT_MODEL_MEM_ARM + "-hicache1", PIN01_SPLIT_MODEL_MEM_ARM + "-hicache1-engram0"
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        assert overrides["SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"] == ("0" if arm == engram0 else "5"), arm
+        assert ("SGLANG_HICACHE_HOST_NUMA_NODE" in ab.ARMS[arm][0]) == (arm in PIN01_HICACHE_ARMS), arm
+    base, h, e = (ab.ARMS[a][0] for a in (PIN01_SPLIT_MODEL_MEM_ARM, hicache, engram0))
+    assert {k: v for k, v in h.items() if k != "SGLANG_HICACHE_HOST_NUMA_NODE"} == base
+    assert h["SGLANG_HICACHE_HOST_NUMA_NODE"] == "1"
+    assert {k: v for k, v in e.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"} == \
+        {k: v for k, v in h.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"}
+    assert ab.server_flags(hicache) == ab.server_flags(engram0) == ("--weight-loader-drop-cache-after-load",)
+    assert ab.REFERENCE[hicache] == PIN01_SPLIT_MODEL_MEM_ARM and ab.REFERENCE[engram0] == hicache
+
+
+def test_the_decay_arm_is_arm_a_with_the_hot_decay_alone(monkeypatch):
+    """-decay995 is -hicache1 with SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995; every other arm states 0.98 against a
+    shell's. Mutant: another arm inherits the shell's decay, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY", "0.9")
+    decay, arm_a = PIN01_HICACHE_ARMS[2], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"] == ("0.995" if arm == decay else "0.98")
+    d, a = ab.ARMS[decay][0], ab.ARMS[arm_a][0]
+    assert {k: v for k, v in d.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"} == \
+        {k: v for k, v in a.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"}
+    assert ab.REFERENCE[decay] == arm_a and ab.server_flags(decay) == ("--weight-loader-drop-cache-after-load",)
+
+
+def test_the_tiebreak_arm_is_arm_a_with_the_tiebreak_alone(monkeypatch):
+    """-tiebreak is -hicache1 with SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK=1; every other arm states 0 against
+    a shell's. Mutant: another arm inherits the shell's flag, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK", "1")
+    tiebreak, arm_a = PIN01_HICACHE_ARMS[3], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"] == (
+            "1" if arm == tiebreak else "0"), arm
+    t, a = ab.ARMS[tiebreak][0], ab.ARMS[arm_a][0]
+    key = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
+    assert {k: v for k, v in t.items() if k != key} == {k: v for k, v in a.items() if k != key}
+    assert ab.REFERENCE[tiebreak] == arm_a and ab.server_flags(tiebreak) == ("--weight-loader-drop-cache-after-load",)
+
+
+def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alone(monkeypatch):
+    """-mergechunk is -hicache1 with the triton merge budget and a hot cache sized by hot_mb_for_margin, launched with
+    its own fraction and the KV pool pinned; every other arm states the budget 0 against a shell's and adds no memory
+    flag. Mutant: another arm inherits the shell's budget, the arm changes another knob, or the pin is dropped -- red."""
+    ab = _ab()
+    budget = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
+    monkeypatch.setenv(budget, "64")
+    merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
+    merges = (merge, PIN01_HICACHE_ARMS[5])  # -mergechunk and -mergechunk-expseg
+    calib = PIN01_HICACHE_ARMS[6]  # -mergechunk-expseg-calib: its own budget (A3)
+    for arm in ab.ARMS:
+        want = str(ab.MERGE_CHUNK_MB) if arm in merges else "32" if arm == calib else "0"
+        assert ab._overrides(arm, "/out")[budget] == want, arm
+        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm in merges + (calib,)), arm
+    m, a = ab.ARMS[merge][0], ab.ARMS[arm_a][0]
+    knobs = (budget, "SGLANG_MOE_HOT_GPU_MB")
+    assert {k: v for k, v in m.items() if k not in knobs} == {k: v for k, v in a.items() if k not in knobs}
+    assert m["SGLANG_MOE_HOT_GPU_MB"] == str(ab.hot_mb_for_margin())
+    flags = ab.server_flags(merge)
+    assert flags[0] == "--weight-loader-drop-cache-after-load"
+    assert flags[flags.index("--max-total-tokens") + 1] == str(ab.MERGE_KV_TOKENS)
+    fraction = flags[flags.index("--mem-fraction-static") + 1]
+    assert fraction == ab.fraction_keeping_kv(ab.hot_mb_for_margin(), ab.MERGE_KV_TOKENS)
+    assert ab.REFERENCE[merge] == arm_a
+
+
+def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_alone(monkeypatch):
+    """-expseg is -mergechunk with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and a hot cache sized from its smoke
+    (923 slots, 2,040 MiB free, 29.39 GiB) less 3 held-back slots: 1035 slots, KV still pinned; every other arm states the
+    allocator config empty against a shell's. Mutant: another arm inherits the shell's config, or the size moves -- red."""
+    ab = _ab()
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
+    expseg, merge = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[4]
+    on_expseg = (expseg, PIN01_HICACHE_ARMS[6])  # -expseg and -expseg-calib
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["PYTORCH_CUDA_ALLOC_CONF"] == (
+            "expandable_segments:True" if arm in on_expseg else ""), arm
+    e, m = ab.ARMS[expseg][0], ab.ARMS[merge][0]
+    knobs = ("PYTORCH_CUDA_ALLOC_CONF", "SGLANG_MOE_HOT_GPU_MB")
+    assert {k: v for k, v in e.items() if k not in knobs} == {k: v for k, v in m.items() if k not in knobs}
+    assert int(e["SGLANG_MOE_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 1035
+    flags = ab.server_flags(expseg)
+    assert flags[flags.index("--max-total-tokens") + 1] == "381184"
+    assert flags[flags.index("--mem-fraction-static") + 1] == ab.fraction_keeping_kv(ab.EXPSEG_HOT_GPU_MB, 381184)
+    assert ab.REFERENCE[expseg] == merge
+
+
+def test_the_calib_arm_is_expseg_with_the_calibration_and_the_prefill_cuts_alone(monkeypatch):
+    """-expseg-calib is -expseg with the startup hot-cache calibration and A1/A2/A3 (indexer budget 32, chunk kernels,
+    merge budget 32), at -expseg's fraction and KV pin; every other arm states the calibration and the chunk kernels off
+    against a shell's. Mutant: another arm inherits the shell's flag, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv(ab.CALIBRATE, "1")
+    monkeypatch.setenv(ab.CHUNK_KERNELS, "1")
+    calib, expseg = PIN01_HICACHE_ARMS[6], PIN01_HICACHE_ARMS[5]
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        assert (overrides[ab.CALIBRATE], overrides[ab.CHUNK_KERNELS]) == (("1", "1") if arm == calib else ("0", "0")), arm
+    c, e = ab.ARMS[calib][0], ab.ARMS[expseg][0]
+    knobs = {ab.CALIBRATE: "1", ab.CHUNK_KERNELS: "1", ab.MERGE_BUDGET: "32", ab.INDEXER_BUDGET: "32"}
+    assert {k: v for k, v in c.items() if k not in knobs} == {k: v for k, v in e.items() if k not in knobs}
+    assert {k: c[k] for k in knobs} == knobs
+    assert ab.server_flags(calib) == ab.server_flags(expseg) and ab.REFERENCE[calib] == expseg
+
+
+def test_hot_mb_for_margin_buys_whole_slots_of_the_measured_spare():
+    """At the probe's own free memory and margin the arm keeps the probe's slots; each slot of extra margin costs one
+    slot, and the MiB it returns floors back to that slot count."""
+    ab = _ab()
+    slot = ab.HOT_SLOT_BYTES
+    for margin in (0, 93, 94, 200, 508):
+        mb = ab.hot_mb_for_margin(margin)
+        slots = mb * 2**20 // slot
+        assert -(-slots * slot // 2**20) == mb
+        worst = ab.PROBE_FREE_AT_PEAK_MIB * 2**20 - (ab.PROBE_PRE_LOAD_GIB - ab.MIN_PRE_LOAD_GIB) * 2**30
+        assert slots == ab.PROBE_HOT_SLOTS + int((worst - margin * 2**20) // slot)
+        assert worst - (slots - ab.PROBE_HOT_SLOTS) * slot >= margin * 2**20
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):

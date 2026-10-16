@@ -31,6 +31,153 @@ def split_miss_cut(cut: int, cut_max: int, *, cpu_experts: bool) -> tuple[int, i
     return (cut if cpu_experts else 0), cut_max
 
 
+# The model-based split's per-node cost words (ns): a CPU hit job of k experts and p (token, expert) pairs costs
+# hit_a + hit_b * k + hit_c * p, a CPU miss of t tokens miss_a + miss_c * t.
+SPLIT_MODEL_NODE_KEYS = ("hit_a", "hit_b", "hit_c", "miss_a", "miss_c")
+SPLIT_MODEL_KEYS = ("copy_lane", "first_byte", "per_expert", "stream_lane", "stream_base")
+# Fits on cores-ab-20261014/pin01-r2's CPU jobs (analysis/dsv41-drive/dspark/split_replay.py), scaled by 0.93 to the
+# untraced cost per lane, in ms; miss i (1-based) of a node lands first_byte + per_expert * i after the post. With m
+# GPU-streamed misses in the record, the GPU's stream kernel (S) ends at stream_base + first_byte + per_expert * m +
+# stream_lane * copy lanes: its pulls share the link with the copy engine. stream_lane is the fit on pin01-r2,
+# splitmodel, splitmodel-r2 and split-ab A2/B1 (S grows 0.3-1.4 ms per added copy lane between runs, 0.44-1.04 within
+# one; node-independent); 0 drops the stream side.
+SPLIT_MODEL_DEFAULTS_MS = {
+    "hit_a": (0.016, -0.050),
+    "hit_b": (0.154, 0.179),
+    "hit_c": (0.395, 0.390),
+    "miss_a": (0.331, 0.291),
+    "miss_c": (0.193, 0.245),
+    "copy_lane": 1.05,
+    "first_byte": 0.8,
+    "per_expert": 1.6,
+    "stream_lane": 0.65,
+    "stream_base": 0.0,
+}
+# The flags word's residency tiebreak (lease_device.cuh kSplitModelResidencyTiebreak): among a node's candidates with
+# the same tokens, which the model prices alike, the CPU takes the lowest residency keys and the copy engine the rest.
+SPLIT_MODEL_RESIDENCY_TIEBREAK = 1
+
+
+def split_model_words(nodes: int, overrides: str = "", residency_tiebreak: bool = False) -> list[int]:
+    """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``, then
+    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK).
+
+    ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS) is ``name=ms`` pairs, comma-separated; a per-node name takes
+    ``.node`` (``hit_c.1=0.4``), and without it sets every node. Node n past the defaults' nodes takes the last's."""
+    per_node = [
+        {key: SPLIT_MODEL_DEFAULTS_MS[key][min(n, len(SPLIT_MODEL_DEFAULTS_MS[key]) - 1)] for key in SPLIT_MODEL_NODE_KEYS}
+        for n in range(nodes)
+    ]
+    shared = {key: SPLIT_MODEL_DEFAULTS_MS[key] for key in SPLIT_MODEL_KEYS}
+    for item in filter(None, (x.strip() for x in overrides.split(","))):
+        name, sep, value = item.partition("=")
+        key, _, node = name.strip().partition(".")
+        if not sep or key not in SPLIT_MODEL_NODE_KEYS + SPLIT_MODEL_KEYS or (node and key in SPLIT_MODEL_KEYS):
+            raise ValueError(f"split model costs: cannot read {item!r} (name[.node]=ms with names "
+                             f"{', '.join(SPLIT_MODEL_NODE_KEYS + SPLIT_MODEL_KEYS)})")
+        ms = float(value)
+        if key in SPLIT_MODEL_KEYS:
+            if ms < 0:
+                raise ValueError(f"split model costs: {key} must be >= 0, got {ms}")
+            shared[key] = ms
+        elif node:
+            if not node.isdigit() or int(node) >= nodes:
+                raise ValueError(f"split model costs: {item!r} names a node outside 0..{nodes - 1}")
+            per_node[int(node)][key] = ms
+        else:
+            for costs in per_node:
+                costs[key] = ms
+    ns = lambda ms: int(round(ms * 1_000_000))
+    return [ns(costs[key]) for costs in per_node for key in SPLIT_MODEL_NODE_KEYS] + [
+        ns(shared[key]) for key in SPLIT_MODEL_KEYS
+    ] + [SPLIT_MODEL_RESIDENCY_TIEBREAK if residency_tiebreak else 0]
+
+
+def split_model_stats_words(nodes: int) -> int:
+    """The device's split-model counters after the cost words: records typed by the model, then per node the lanes it
+    put on the CPU that the table would not and the lanes it took off the CPU."""
+    return 1 + 2 * nodes
+
+
+def model_node_finish(words: Sequence[int], node: int, k: int, pairs: int, miss_tokens: Sequence[int],
+                      nodes: int) -> int:
+    """The model's predicted end (ns after the post) of node's CPU: a hit job of k experts and `pairs` (token, expert)
+    pairs, then each forced miss i (1-based, plan order) after it lands at first_byte + per_expert * i."""
+    hit_a, hit_b, hit_c, miss_a, miss_c = words[5 * node : 5 * node + 5]
+    first_byte, per_expert = words[5 * nodes + 1], words[5 * nodes + 2]
+    t = hit_a + hit_b * k + hit_c * pairs if k > 0 else 0
+    for i, tokens in enumerate(miss_tokens, 1):
+        t = max(t, first_byte + per_expert * i) + miss_a + miss_c * tokens
+    return t
+
+
+def model_cpu_lanes(
+    node_of: Sequence[int],
+    tokens: Sequence[int],
+    hit: Sequence[bool],
+    eligible: Sequence[bool],
+    forced: Sequence[bool],
+    copyable: Sequence[bool],
+    words: Sequence[int],
+    nodes: int,
+    streamed: int = 0,
+) -> list[bool]:
+    """The model-based split's unforced CPU lanes, in integer ns as the device computes them.
+
+    Each node's CPU starts with its forced hits (and, as CPU lanes, eligible lanes the copy engine cannot take); its
+    forced misses follow the hit job. The copyable eligible hits, heaviest-token first (ties: plan order), each go to
+    their node's CPU when that node would finish no later than the copy side would with the lane, else to the copy
+    engine. The copy side is the copy engine's FIFO (one copy_lane a lane, both nodes sharing it) and, with `streamed`
+    GPU-streamed misses and stream_lane > 0, the stream kernel: stream_base + first_byte + per_expert * streamed +
+    stream_lane * copy lanes."""
+    k, pairs = [0] * nodes, [0] * nodes
+    misses = [[] for _ in range(nodes)]
+    cpu = [False] * len(node_of)
+    candidates = []
+    for j, node in enumerate(node_of):
+        if forced[j]:
+            if hit[j]:
+                k[node] += 1
+                pairs[node] += tokens[j]
+            else:
+                misses[node].append(tokens[j])
+        elif eligible[j]:
+            if hit[j] and copyable[j]:
+                candidates.append(j)
+            else:
+                cpu[j] = True
+                if hit[j]:
+                    k[node] += 1
+                    pairs[node] += tokens[j]
+    copy_lane, first_byte, per_expert, stream_lane, stream_base = words[5 * nodes : 5 * nodes + 5]
+    stream0 = stream_base + first_byte + per_expert * streamed
+    copy, lanes = 0, 0
+    for j in sorted(candidates, key=lambda j: (-tokens[j], j)):
+        node = node_of[j]
+        t = model_node_finish(words, node, k[node] + 1, pairs[node] + tokens[j], misses[node], nodes)
+        side = copy + copy_lane
+        if streamed > 0 and stream_lane > 0:
+            side = max(side, stream0 + stream_lane * (lanes + 1))
+        if t <= side:
+            cpu[j] = True
+            k[node] += 1
+            pairs[node] += tokens[j]
+        else:
+            copy += copy_lane
+            lanes += 1
+    if words[5 * nodes + 5] & SPLIT_MODEL_RESIDENCY_TIEBREAK:
+        # A node's candidates with the same tokens cost the model the same: keep how many of them the CPU takes, and
+        # give it the highest plan indexes (plan order is residency key, highest first).
+        groups: dict = {}
+        for j in candidates:
+            groups.setdefault((node_of[j], tokens[j]), []).append(j)
+        for members in groups.values():
+            on_cpu = sum(cpu[j] for j in members)
+            for rank, j in enumerate(sorted(members, reverse=True)):
+                cpu[j] = rank < on_cpu
+    return cpu
+
+
 def type_lanes(
     experts: Sequence[int],
     ram_slot: Sequence[int],
@@ -51,6 +198,9 @@ def type_lanes(
     miss_cut: int = 0,
     miss_cut_max: int = 3,
     scratch: Optional[Sequence[int]] = None,
+    split_model: Optional[Sequence[int]] = None,
+    tokens: Optional[Sequence[int]] = None,
+    model_stats: Optional[list] = None,
 ) -> tuple[list[LaneKind], list[int]]:
     """Each lane's kind and source slot: its RAM slot for a hit, the next staging slot of its home node for a miss.
 
@@ -70,7 +220,14 @@ def type_lanes(
 
     GPU drip (host/gpu_drip.h): ``scratch[j]`` is the scratch slot whose published word names lane j's expert for this
     row, else -1. With host lanes, an unforced lane with a scratch slot is HIT_SCRATCH at that slot, before any RAM
-    lookup: it takes no staging slot and is not eligible, so the split sees one lane fewer."""
+    lookup: it takes no staging slot and is not eligible, so the split sees one lane fewer.
+
+    Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): with ``split_model`` (split_model_words) and the copy engine able
+    to take hits, model_cpu_lanes picks the unforced CPU lanes in place of the split and the miss cut, from each lane's
+    ``tokens`` (the routes that name its expert). ``model_stats`` (split_model_stats_words long) counts what the device
+    counts: records with an eligible lane, then per node the lanes moved onto and off the CPU against the table."""
+    if split_model is not None and (tokens is None or len(tokens) != len(experts)):
+        raise ValueError("the split model needs each lane's tokens")
     if len(experts) > lanes:
         raise ValueError(f"a request has at most {lanes} lanes, got {len(experts)}")
     if len(set(experts)) != len(experts):
@@ -116,13 +273,30 @@ def type_lanes(
         forced_misses = sum(1 for j, e in enumerate(experts) if j >= forced_from and not hit[j] and home(e) == node)
         if miss_cut > 0 and 1 <= forced_misses <= miss_cut_max:
             take[node] = max(0, take[node] - miss_cut)
-    cpu = [j >= forced_from for j in range(len(experts))]
+    table = [False] * len(experts)
     for j in reversed(range(len(experts))):
         node = home(experts[j])
         if take[node] > 0 and eligible[j]:
-            cpu[j] = True
+            table[j] = True
             take[node] -= 1
     copy_ok = host_lanes and hit_copy == "ce" and ce_ok
+    cpu = [j >= forced_from or table[j] for j in range(len(experts))]
+    if split_model is not None and copy_ok:
+        node_of = [home(e) for e in experts]
+        copyable = [True if dst_ok is None else bool(dst_ok[j]) for j in range(len(experts))]
+        forced = [j >= forced_from for j in range(len(experts))]
+        # GPU-streamed misses (MISS_GPU): unforced, unscratched misses the CPU does not take.
+        streamed = sum(1 for j in range(len(experts))
+                       if not forced[j] and not scratched[j] and not hit[j] and not eligible[j])
+        model = model_cpu_lanes(node_of, tokens, hit, eligible, forced, copyable, split_model, nodes, streamed)
+        cpu = [forced[j] or model[j] for j in range(len(experts))]
+        if model_stats is not None and any(eligible):
+            model_stats[0] += 1
+            for j, node in enumerate(node_of):
+                if eligible[j] and model[j] and not table[j]:
+                    model_stats[1 + 2 * node] += 1
+                elif eligible[j] and table[j] and not model[j]:
+                    model_stats[2 + 2 * node] += 1
     kinds = []
     for j, (h, c) in enumerate(zip(hit, cpu)):
         if scratched[j]:

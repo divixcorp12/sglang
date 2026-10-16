@@ -300,9 +300,17 @@ ARMS[GPU_DRIP_LEAN_ARM] = (
 # a shell that exports them cannot carry them into one.
 FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
 SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
+# The model-based split (and its cost overrides) likewise: off in every arm but -splitmodel.
+SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
+SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
+# The scheduler's mlockall, off in every arm but the -mem ones.
+MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[FULL_LAYERS] = ""
     _overrides_of_arm[SPLIT_LAYERS] = ""
+    _overrides_of_arm[SPLIT_MODEL] = "0"
+    _overrides_of_arm[SPLIT_MODEL_COSTS] = ""
+    _overrides_of_arm[MLOCK] = "0"
 # Layers 0 and 1 read 6.6 and 4.5 experts a verify from NVMe, which the L+2 prefetch cannot reach
 # (ram-prefetch/breakdown-20261015). Each full layer takes 204 rows a node (192 homed experts, 8 staging, 2 pool, 2
 # seam), 5182 MiB a node for the pair; the other 7:6 remainder buys the 7966 rows layers 2-39 hold today (210/209).
@@ -316,6 +324,38 @@ PIN01_SPLIT_L0 = "0,0,0,1,2,3,3,4,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17
 PIN01_SPLIT_L1 = "0,0,1,2,3,3,4,5,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17,17,18,19,19,20,21,21,22,23,23,24,24,25,26,26"
 PIN01_GPU01_ARM = PIN01_ARM + "-gpu01"
 ARMS[PIN01_GPU01_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_LAYERS: f"0:{PIN01_SPLIT_L0};1:{PIN01_SPLIT_L1}"}, True)
+# pin01 with the model-based split in place of split A and the miss cut (misscut-replay, split_replay.py: the
+# token-weighted greedy, +17 ms a verify on breakdown-20261015/base at untraced CPU costs), at its default costs.
+PIN01_SPLIT_MODEL_ARM = PIN01_ARM + "-splitmodel"
+ARMS[PIN01_SPLIT_MODEL_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_MODEL: "1"}, True)
+# Node-0 headroom (cores-ab-20261014/splitmodel-stream swapped node 0 in load and decode): -mem adds the scheduler's
+# mlockall and drops each safetensors shard's page cache after loading it (server_flags), and nothing else.
+MEM_SUFFIX = "-mem"
+MEM_SERVER_FLAGS = ("--weight-loader-drop-cache-after-load",)
+for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
+    ARMS[_base + MEM_SUFFIX] = ({**ARMS[_base][0], MLOCK: "1"}, True)
+# Node-0 headroom, step 2: the HiCache host KV pools (12.1 GB, node 0 by first touch) bound to node 1, then also the
+# native Engram row cache off (5 GiB). The node is an EnvInt with no valid "unset" value, so only these arms name it.
+HICACHE_NODE = "SGLANG_HICACHE_HOST_NUMA_NODE"
+ENGRAM_NATIVE_GIB = "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"
+HOT_DECAY = "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"
+RESIDENCY_TIEBREAK = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[ENGRAM_NATIVE_GIB] = "5"
+    _overrides_of_arm[HOT_DECAY] = "0.98"
+    _overrides_of_arm[RESIDENCY_TIEBREAK] = "0"
+PIN01_SPLIT_MODEL_HICACHE1_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-hicache1"
+ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0], HICACHE_NODE: "1"}, True)
+PIN01_SPLIT_MODEL_ENGRAM0_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-engram0"
+ARMS[PIN01_SPLIT_MODEL_ENGRAM0_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], ENGRAM_NATIVE_GIB: "0"}, True)
+# The hot cache's insert-on-miss decay at 0.995 (every other arm 0.98, the default): the cache-tiers replay puts it at
+# +5.5 VRAM hits a verify, so the routed-pair hit rate is the evidence and ms/token only a regression check.
+PIN01_SPLIT_MODEL_DECAY_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-decay995"
+ARMS[PIN01_SPLIT_MODEL_DECAY_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], HOT_DECAY: "0.995"}, True)
+# The split model's residency tiebreak (equal-token lanes of a node: the CPU takes the lowest residency keys): the
+# breakdown-base replay gives the same saving with 56% fewer inverted pairs; compared with -hicache1.
+PIN01_SPLIT_MODEL_TIEBREAK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-tiebreak"
+ARMS[PIN01_SPLIT_MODEL_TIEBREAK_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], RESIDENCY_TIEBREAK: "1"}, True)
 # The miss-cut arm with the verify's Engram lookups captured in the graph (device wait), so the verify graph has no
 # breaks; prefetch stays off so the A/B reads the two Engram breaks alone (DSV41_REFERENCE.md 33.35). The flag is on by
 # default since then, so this arm now equals its A unless the shell exports the flag as 0.
@@ -323,6 +363,134 @@ ARMS["dspark-both-misscut-engram-verify-graph"] = (
     {**ARMS["dspark-both-misscut"][0], "SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH": "1"},
     True,
 )
+# The triton FlashMLA merge in token chunks, off in every arm but -mergechunk.
+MERGE_BUDGET = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[MERGE_BUDGET] = "0"
+# The OFF -mem arm's init, from its server.log (cores-ab-20261014/splitmodel-stream-mem, 0.78 / 10840 MiB): free memory
+# before loading, the KV pool, its bytes a token, and the hot cache's slot (853 slots of 10840 MiB).
+OFF_PRE_LOAD_GIB = 29.35
+OFF_KV_TOKENS = 339712
+KV_BYTES_PER_TOKEN = 1670.75
+HOT_SLOT_BYTES = 13315584
+# Free memory before loading moved 0.12 GiB between launches (29.33 in mem-budget/L2 to 29.45 in
+# /mnt/nvme1/prefill-merge/peaks/m1-off-b0); the KV budget moves by that times the fraction, so the fraction carries it
+# as margin and --max-total-tokens pins the pool. With the pool pinned the margin is free: prefill headroom is whatever
+# the pinned pool leaves, whatever the fraction.
+PRE_LOAD_JITTER_GIB = 0.12
+
+
+def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
+    """--mem-fraction-static that funds a hot cache of hot_mb MiB and a KV pool of at least kv_tokens on top of the OFF
+    arm's init. The pool's budget is free memory less pre_load * (1 - fraction), and the hot cache comes out of it, so
+    every extra byte of either raises the fraction by bytes / pre_load. Rounded up to 4 places."""
+    pre_load = OFF_PRE_LOAD_GIB * 2**30
+    off_slots = int(arm_env.DSPARK_HOT_GPU_MB) * 2**20 // HOT_SLOT_BYTES
+    hot = (hot_mb * 2**20 // HOT_SLOT_BYTES - off_slots) * HOT_SLOT_BYTES
+    kv = (kv_tokens - OFF_KV_TOKENS) * KV_BYTES_PER_TOKEN
+    off = float(arm_env.DSPARK_MEM_FRACTION_STATIC)
+    jitter = PRE_LOAD_JITTER_GIB * 2**30 * off
+    return f"{-(-round((off + (hot + kv + jitter) / pre_load) * 1e6) // 100) / 1e4:.4f}"
+
+
+# Prefill peaks by prefill_peak_probe.py (/mnt/nvme1/prefill-merge/peaks, 4096- and 30k-token prompts; the arms' longest
+# prompt is ~7.7k characters, and the peak is set by the startup warm-up, which the 30k prompt exceeds by 2 MiB): the
+# OFF -mem arm peaks 4337 MiB above init, 3120 with the merge chunked (1217 MiB freed). The capture of this arm itself
+# (cores-ab-20261014/splitmodel-stream-mem-hicache1-mergechunk, spec_margin_capture.py, KV pinned at 381,184, 956 hot
+# slots) left 134 MiB of nvidia-smi memory.free at its peak (the 4096-token warm-up), after 29.37 GiB free before
+# loading. memory.free is the basis of PEAK_MARGIN_MIB; the probes' first "left" figures were total - used, 404 MiB
+# higher (the driver's reserve). With the pool pinned, every hot slot comes out of that free memory one for one.
+PROBE_HOT_SLOTS = 956
+PROBE_FREE_AT_PEAK_MIB = 134
+PROBE_PRE_LOAD_GIB = 29.37
+# The lowest free-before-load seen (mem-budget/L2): a launch that low leaves that much less at the peak.
+MIN_PRE_LOAD_GIB = 29.33
+# The margin the DSpark arms keep today over their 4096-token warm-up (arm_env, at DSPARK_MEM_FRACTION_STATIC).
+PEAK_MARGIN_MIB = 508
+
+
+def hot_mb_for_margin(
+    margin_mib: int = PEAK_MARGIN_MIB,
+    *,
+    probe_slots: int = PROBE_HOT_SLOTS,
+    probe_free_mib: int = PROBE_FREE_AT_PEAK_MIB,
+    probe_pre_load_gib: float = PROBE_PRE_LOAD_GIB,
+    held_back_slots: int = 0,
+) -> int:
+    """The largest SGLANG_MOE_HOT_GPU_MB whose slots leave margin_mib free at a measured prefill peak (a probe run's
+    slots, memory.free and free-before-load), at the lowest free-before-load seen, with the pool pinned: the probe's
+    slots plus the whole slots the spare buys, less held_back_slots."""
+    worst_free = probe_free_mib * 2**20 - (probe_pre_load_gib - MIN_PRE_LOAD_GIB) * 2**30
+    slots = probe_slots + int((worst_free - margin_mib * 2**20) // HOT_SLOT_BYTES) - held_back_slots
+    return -(-slots * HOT_SLOT_BYTES // 2**20)  # rounded up: the cache takes floor(MiB / slot) slots
+
+
+# The splitmodel -mem-hicache1 arm (HiCache host pools on node 1) with the merge chunked under MERGE_CHUNK_MB and the
+# freed prefill headroom spent on the hot cache (arm_env's TODO at DSPARK_MEM_FRACTION_STATIC); the KV pool is pinned
+# (the HiCache host pools scale with it, so they are ~12% larger than its reference's).
+MERGE_CHUNK_MB = 128
+MERGE_HOT_GPU_MB = hot_mb_for_margin()
+MERGE_KV_TOKENS = 381184
+MERGE_CHUNK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-mergechunk"
+ARMS[MERGE_CHUNK_ARM] = (
+    {
+        **ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0],
+        MERGE_BUDGET: str(MERGE_CHUNK_MB),
+        "SGLANG_MOE_HOT_GPU_MB": str(MERGE_HOT_GPU_MB),
+    },
+    True,
+)
+# The caching allocator on expandable segments, off (unset) in every arm but -expseg. Its smoke
+# (cores-ab-20261014/splitmodel-stream-mem-hicache1-mergechunk-expseg, 923 slots) left 2,040 MiB memory.free at the
+# warm-up peak after 29.39 GiB free before loading, against 482-598 without it: reserve 26,730 MiB against an
+# allocated peak of 26,292 (1,879 MiB of stranded reserve became 438).
+ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[ALLOC_CONF] = ""
+# -expseg spends that on the hot cache by hot_mb_for_margin from the smoke, holding back 3 slots against a node-0
+# squeeze during load (the smoke's node 0 fell below its low watermark loading): 1035 slots.
+EXPSEG_HELD_BACK_SLOTS = 3
+EXPSEG_HOT_GPU_MB = hot_mb_for_margin(
+    probe_slots=923, probe_free_mib=2040, probe_pre_load_gib=29.39, held_back_slots=EXPSEG_HELD_BACK_SLOTS
+)
+MERGE_CHUNK_EXPSEG_ARM = MERGE_CHUNK_ARM + "-expseg"
+ARMS[MERGE_CHUNK_EXPSEG_ARM] = (
+    {
+        **ARMS[MERGE_CHUNK_ARM][0],
+        ALLOC_CONF: "expandable_segments:True",
+        "SGLANG_MOE_HOT_GPU_MB": str(EXPSEG_HOT_GPU_MB),
+    },
+    True,
+)
+# -expseg with the startup hot-cache calibration (trial capture, warm-up replay, grow/trim from measured free memory)
+# and the bit-identical prefill transient cuts: A1 indexer score budget 32, A2 per-chunk FlashMLA kernels with A3
+# merge budget 32. Its fraction and KV pin are -expseg's; the calibration sizes the hot cache from there. Every other arm
+# states the calibration and the chunk kernels off against a shell's.
+CALIBRATE = "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP"
+CHUNK_KERNELS = "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS"
+INDEXER_BUDGET = "SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[CALIBRATE] = "0"
+    _overrides_of_arm[CHUNK_KERNELS] = "0"
+MERGE_CHUNK_EXPSEG_CALIB_ARM = MERGE_CHUNK_EXPSEG_ARM + "-calib"
+ARMS[MERGE_CHUNK_EXPSEG_CALIB_ARM] = (
+    {**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], CALIBRATE: "1", CHUNK_KERNELS: "1", MERGE_BUDGET: "32", INDEXER_BUDGET: "32"},
+    True,
+)
+# An arm's own --mem-fraction-static and KV pool, appended to its argv (the last --mem-fraction-static wins).
+ARM_MEMORY_FLAGS = {
+    arm: (
+        "--mem-fraction-static",
+        fraction_keeping_kv(hot_mb, MERGE_KV_TOKENS),
+        "--max-total-tokens",
+        str(MERGE_KV_TOKENS),
+    )
+    for arm, hot_mb in (
+        (MERGE_CHUNK_ARM, MERGE_HOT_GPU_MB),
+        (MERGE_CHUNK_EXPSEG_ARM, EXPSEG_HOT_GPU_MB),
+        (MERGE_CHUNK_EXPSEG_CALIB_ARM, EXPSEG_HOT_GPU_MB),
+    )
+}
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
 # An arm whose outputs are also compared with its A's, not only with prod's.
@@ -361,7 +529,25 @@ REFERENCE = {
     GPU_DRIP_LEAN_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
     PIN01_ARM: PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX,
     PIN01_GPU01_ARM: PIN01_ARM,
+    PIN01_SPLIT_MODEL_ARM: PIN01_ARM,
+    PIN01_ARM + MEM_SUFFIX: PIN01_ARM,
+    PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX: PIN01_ARM + MEM_SUFFIX,
+    PIN01_SPLIT_MODEL_HICACHE1_ARM: PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX,
+    PIN01_SPLIT_MODEL_ENGRAM0_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_DECAY_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    PIN01_SPLIT_MODEL_TIEBREAK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    MERGE_CHUNK_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
+    MERGE_CHUNK_EXPSEG_ARM: MERGE_CHUNK_ARM,
+    MERGE_CHUNK_EXPSEG_CALIB_ARM: MERGE_CHUNK_EXPSEG_ARM,
 }
+
+
+def server_flags(arm: str) -> tuple[str, ...]:
+    """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop, for
+    the -mem arms and those built on them, and an arm's own fraction and KV pool (ARM_MEMORY_FLAGS)."""
+    return (MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ()) + ARM_MEMORY_FLAGS.get(arm, ())
+
+
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
 COUNTER_MARKER = "exl3 RAM miss thread counters "
 RAM_KEYS = (
@@ -437,7 +623,7 @@ def run_timed(arm: str, out: str, sessions: str = DEFAULT_SESSIONS) -> int:
     env = os.environ | {
         "DSV41_RUN_ROOT": out,
         "DSV41_SESSION_INDICES": sessions,
-        "DSV41_EXTRA_SERVER_ARGS": shlex.join(arm_env.DSPARK_ARGV) if dspark else "",
+        "DSV41_EXTRA_SERVER_ARGS": shlex.join((*(arm_env.DSPARK_ARGV if dspark else ()), *server_flags(arm))),
         "DSV41_HEALTH_TIMEOUT_S": str(_health_timeout_s(dspark)),
     }
     if dspark:

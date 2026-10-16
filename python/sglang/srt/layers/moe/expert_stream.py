@@ -2192,7 +2192,11 @@ class ExpertStreamer:
         if residency_policy is not None and not (
             flat_ids.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
-            residency_policy.record_routes(flat_ids)
+            from sglang.srt.layers.moe.hot_cache_calibration import calibrating
+
+            # The startup hot-cache calibration's dummy prefill must not move residency.
+            if not calibrating():
+                residency_policy.record_routes(flat_ids)
 
     def gather(
         self, topk_ids: torch.Tensor

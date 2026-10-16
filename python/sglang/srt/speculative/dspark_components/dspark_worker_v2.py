@@ -9,6 +9,9 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.debug_utils.prefill_peak_log import (
+    maybe_install as maybe_install_prefill_peak_log,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
@@ -21,6 +24,9 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.prefill_cache_release import (
+    maybe_install as maybe_install_larger_prefill_release,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -272,6 +278,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._draft_sampler_built = False
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -495,6 +502,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+        # SGLANG_DEBUG_PREFILL_PEAK_LOG: wraps the prefill's calls once, here; off, nothing is wrapped.
+        maybe_install_prefill_peak_log(self)
+        # SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL, likewise; outside the log, so its "before" follows the release.
+        maybe_install_larger_prefill_release(self)
+
     def _init_top_prob_gate(self) -> VerifyDeadRows:
         """Refuse a launch the top-probability gate cannot serve, and point the target's EXL3 MoE at its dead rows."""
         refusals = []
@@ -633,7 +645,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # block eagerly from the graph's hidden states instead. Apart
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
-                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                # Built and hooked once: the startup hot-cache calibration's trial capture
+                # (SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP) calls this before the real one,
+                # which must reuse the same sampler and hook, not capture a second pair.
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get() and not self._draft_sampler_built:
+                    self._draft_sampler_built = True
                     self._draft_sampler = self._maybe_build_draft_sampler(
                         available_memory_gb=available_mem
                     )

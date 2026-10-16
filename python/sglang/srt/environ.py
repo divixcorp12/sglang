@@ -749,6 +749,9 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Log the CUDA allocator's allocated and reserved bytes around each target layer, attention, MoE, logits, sampler
+    # and draft injection call of a DSpark prefill (debug_utils/prefill_peak_log.py). Off: nothing is wrapped.
+    SGLANG_DEBUG_PREFILL_PEAK_LOG = EnvBool(False)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
@@ -837,6 +840,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Lock the scheduler process's memory against swap once the scheduler is built (model loaded, graphs captured):
+    # mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT), so touched pages stay resident without faulting anything in
+    # (sglang/srt/utils/memory_lock.py). Needs RLIMIT_MEMLOCK unlimited; a failure is logged, not raised.
+    SGLANG_ENABLE_SCHEDULER_MLOCK = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -1016,6 +1023,9 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # NUMA node the mmap host KV pools (mmap_allocator.alloc_mmap) are bound to before their pages are touched;
+    # unset: first touch places them, on the allocating thread's node.
+    SGLANG_HICACHE_HOST_NUMA_NODE = EnvInt(None)
     # Device bytes one page_first host pool may spend on its write-back staging buffer; fewer pages, more chunks.
     SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB = EnvInt(32)
     # Device memory reserved out of the KV budget for HiCache allocations made after the pool is sized.
@@ -1376,6 +1386,23 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Byte cap (MiB) on the fp32 temporaries of the triton backend's LSE merge and
+    # attention-sink scaling, which peak at 3 fp32 copies of the [tokens, heads,
+    # head_dim_v] output (1.5 GiB at a 4096-token prefill chunk). Tokens are merged
+    # independently, so chunking them under the cap gives bitwise the same output.
+    # 0 keeps the one-pass merge.
+    SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB = EnvInt(0)
+    # With the merge budget set, also run the triton backend's SWA and extra kernels per token chunk (sized by the
+    # same budget), so the two full-size partial outputs never exist; bitwise the same output.
+    SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS = EnvBool(False)
+    # Release the CUDA caching allocator's unused segments (torch.cuda.empty_cache) before a DSpark prefill larger than
+    # any before it, so the startup warm-up's growing shapes do not strand reserve sized for the smaller ones (1.9 GB
+    # above the live peak, /mnt/nvme1/prefill-merge/peaklog). Allocator-only: no math changes.
+    SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL = EnvBool(False)
+    # Size the expert hot cache at startup from a measured prefill peak: its tensors go on CUDA VMM memory
+    # (layers/moe/hot_cache_vmm.py) so slots past the calibrated capacity can be retired and their memory released
+    # before CUDA graph capture.
+    SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP = EnvBool(False)
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
@@ -1861,6 +1888,9 @@ class Envs:
     # Capture layer-1 Engram lookup as a CUDA host node backed by a shared native
     # row cache and an io_uring worker. Disabled unless explicitly requested.
     SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING = EnvBool(False)
+    # Size in GiB of that native row cache (shared by every Engram layer). 0 keeps no rows: every lookup reads its
+    # rows through io_uring.
+    SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB = EnvFloat(5.0)
     # With the above, capture the decode lookup as a device post kernel and a device
     # wait kernel served by a polling thread instead of a host node; the decode graph
     # then has no host nodes, which is asserted at capture.
@@ -2027,6 +2057,15 @@ class Envs:
     SGLANG_DSV41_CPU_SPLIT_MISS_CUT = EnvInt(1)
     # The most forced misses on a node for which the cut applies.
     SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX = EnvInt(3)
+    # Experiment: a model-based split. The post picks each record's CPU hits from per-team cost constants, each lane's
+    # tokens, the forced lanes and a miss landing estimate (ram_slot_map.model_cpu_lanes) in place of the split table and
+    # the miss cut. Needs SGLANG_DSV41_CPU_EXPERTS and the copy engine (RAM_HIT_COPY=ce). Off until a served A/B decides.
+    SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL = EnvBool(False)
+    # Its costs, overriding the defaults (ram_slot_map.SPLIT_MODEL_DEFAULTS_MS): name[.node]=ms pairs, comma-separated.
+    SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS = EnvStr("")
+    # With it, among a node's lanes the model prices alike (same tokens) the CPU takes the lowest residency keys, so
+    # the copy engine, whose lanes become VRAM residents, gets the highest. Off until a served A/B decides.
+    SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK = EnvBool(False)
     # Experiment: a two-stage CPU miss. The reader fetches a CPU-computed miss's w13 prefix across the mirror roots
     # before its w2 suffix, and the CPU job starts once w13 has landed: it runs the gate/up GEMVs while w2 is still being
     # read and waits for w2 before anything reads it. Needs SGLANG_DSV41_CPU_EXPERTS. Off until a served A/B decides.

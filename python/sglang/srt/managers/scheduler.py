@@ -116,6 +116,11 @@ from sglang.srt.layer_major.gate import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.hot_cache_calibration import (
+    maybe_calibrate_hot_cache,
+    require_hot_cache_headroom,
+    startup_memory_probe,
+)
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
@@ -368,6 +373,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.memory_lock import maybe_lock_process_memory
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1120,16 +1126,19 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
-        self.tp_worker.init_cuda_graphs()
+        with startup_memory_probe("target graph capture"):  # logs only under SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
+            self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
-            self.draft_worker.init_cuda_graphs()
+            with startup_memory_probe("draft graph capture"):
+                self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
-        self.maybe_init_draft_worker()
+        with startup_memory_probe("draft load"):  # logs only under SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
+            self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()
@@ -1137,7 +1146,12 @@ class Scheduler(
         self.kv_cache_allocation_time = time.perf_counter() - tic
 
         self.init_all_attention_backends()
+        # SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP: size the hot cache from a measured prefill before capture.
+        self.hot_cache_calibration = maybe_calibrate_hot_cache(
+            self.tp_worker.model_runner, draft_worker=self.draft_worker
+        )
         self.init_all_cuda_graphs()
+        require_hot_cache_headroom("after capture", self.hot_cache_calibration)
 
         model_runner = self.tp_worker.model_runner
         device_module = torch.get_device_module(model_runner.device)
@@ -6215,6 +6229,7 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+        maybe_lock_process_memory(logger)
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

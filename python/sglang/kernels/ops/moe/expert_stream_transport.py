@@ -3303,7 +3303,8 @@ class ExpertStreamDevice:
     ``timeout_ms`` is the post's delta wait and S's deadline. ``hit_copy`` ("ce" or
     "sm") and ``cpu_misses`` carry ``SGLANG_DSV41_RAM_HIT_COPY`` and
     ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
-    ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` (ram_slot_map.type_lanes); ``lease_pdl``
+    ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` (ram_slot_map.type_lanes); ``split_model`` carries the experiment
+    ``SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL``'s cost words (ram_slot_map.split_model_words); ``lease_pdl``
     (``SGLANG_DSV41_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
     PDL.
 
@@ -3338,6 +3339,7 @@ class ExpertStreamDevice:
         miss_cut_max: int = 3,
         lanes: int = 8,
         nodes: int = 1,
+        split_model: Optional[Sequence[int]] = None,
     ) -> None:
         self.wire = expert_lease_block.wire_layout(lanes, nodes)
         if (
@@ -3397,6 +3399,14 @@ class ExpertStreamDevice:
             if value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
         self.miss_cut, self.miss_cut_max = int(miss_cut), int(miss_cut_max)
+        # The split model's cost words (ram_slot_map.split_model_words) and its counters, or empty: the split and the
+        # miss cut.
+        costs = 5 * self.wire.nodes + 6
+        if split_model is not None and len(split_model) != costs:
+            raise ValueError(f"the split model has {costs} cost words for {self.wire.nodes} nodes, got {len(split_model)}")
+        # The counters (ram_slot_map.split_model_stats_words): records, then per node to_cpu and to_copy.
+        words = [] if split_model is None else list(split_model) + [0] * (1 + 2 * self.wire.nodes)
+        self.split_model = torch.tensor(words, dtype=torch.int64, device=device)
         state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
         # Continue from the page's head: the thread serves demand_head + 1 next, so a
         # device restarting at 1 over a used page would never be served.
@@ -3959,6 +3969,7 @@ class ExpertStreamDevice:
             self.scratch_dst_1,
             self.scratch_go_1,
             self.row_split,
+            self.split_model,
             int(self.lease_pdl),
         )
 
@@ -4045,6 +4056,18 @@ class ExpertStreamDevice:
             self.cpu_lanes if self.cpu_x_rows is not None else self._no_cpu,
             int(self.lease_pdl),
         )
+
+    def split_model_stats(self) -> Optional[dict]:
+        """The split model's counters (a device-to-host copy), or None when it is off: records it typed, and per node
+        the lanes it put on the CPU that the table would not (``to_cpu``) and took off the CPU (``to_copy``)."""
+        if self.split_model.numel() == 0:
+            return None
+        words = self.split_model[5 * self.wire.nodes + 6 :].cpu().tolist()
+        return {
+            "records": words[0],
+            "to_cpu": words[1::2],
+            "to_copy": words[2::2],
+        }
 
     def stats(self) -> dict[str, int]:
         """Return the device words ``STATE_WORDS`` (a device-to-host copy)."""

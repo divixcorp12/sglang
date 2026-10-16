@@ -290,6 +290,7 @@ struct LanePlan {
   int64_t count;
   int64_t forced_from;
   const int32_t* scratch = nullptr;  // [Wire::kLanes]: the lane's landed GPU drip slot (match_scratch), -1 for none
+  const int32_t* tokens = nullptr;   // [Wire::kLanes]: the routes naming the lane's expert; read by the split model
 };
 
 // The GPU drip (host/gpu_drip.h): out[j] is the scratch slot among the table's first `slots` whose word names (row,
@@ -327,7 +328,132 @@ struct LanePolicy {
   int32_t miss_cut;
   int32_t miss_cut_max;
   int32_t split[Wire::kNodes][Wire::kLanes + 1];  // Wire::kSplit: per node, CPU lanes per n eligible lanes
+  // Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): the split model's words in device memory, kSplitModelCosts cost
+  // words then kSplitModelStats counters (ram_slot_map.split_model_words); nullptr: the split and the miss cut.
+  int64_t* split_model = nullptr;
 };
+
+// The split model's words: per node hit_a, hit_b, hit_c, miss_a, miss_c, then copy_lane, first_byte, per_expert,
+// stream_lane, stream_base (ns), then the counters: records typed by the model, and per node the lanes it put on the
+// CPU that the table would not and the lanes it took off the CPU (ram_slot_map.split_model_words,
+// split_model_stats_words).
+// The last cost word is flags: kSplitModelResidencyTiebreak.
+constexpr int kSplitModelCosts = 5 * Wire::kNodes + 6;
+constexpr int kSplitModelStats = 1 + 2 * Wire::kNodes;
+constexpr int kSplitModelWords = 7 * Wire::kNodes + 7;  // kSplitModelCosts + kSplitModelStats
+// SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK: among a node's candidates with the same tokens (the model prices
+// them alike), the CPU takes the highest plan indexes (lowest residency keys) and the copy engine the rest.
+constexpr int64_t kSplitModelResidencyTiebreak = 1;
+static_assert(kSplitModelWords == kSplitModelCosts + kSplitModelStats, "split model words");
+
+// ram_slot_map.model_node_finish: node's predicted CPU end (ns) for a hit job of k experts and `pairs` (token, expert)
+// pairs, then its `misses` forced misses of miss_tokens[0..misses) tokens, miss i landing at first_byte + per_expert*i.
+SGL_DEVICE int64_t model_node_finish(
+    const int64_t* words, int node, int64_t k, int64_t pairs, const int32_t* miss_tokens, int misses) {
+  const int64_t* c = words + 5 * node;
+  const int64_t first_byte = words[5 * Wire::kNodes + 1];
+  const int64_t per_expert = words[5 * Wire::kNodes + 2];
+  int64_t t = k > 0 ? c[0] + c[1] * k + c[2] * pairs : 0;
+  for (int i = 0; i < misses; ++i) {
+    const int64_t land = first_byte + per_expert * (i + 1);
+    t = (t > land ? t : land) + c[3] + c[4] * miss_tokens[i];
+  }
+  return t;
+}
+
+// ram_slot_map.model_cpu_lanes: the split model's unforced CPU lanes. Each node's CPU starts with its forced hits and
+// the eligible lanes the copy engine cannot take; its forced misses follow the hit job. The copyable eligible hits,
+// heaviest-token first (ties: plan order), each go to their node's CPU when it would finish no later than the copy side
+// would with the lane, else to the copy engine. The copy side is the shared copy FIFO and, with `streamed` GPU-streamed
+// misses and stream_lane > 0, the stream kernel: stream_base + first_byte + per_expert * streamed + stream_lane * lanes.
+SGL_DEVICE void model_cpu_lanes(
+    const LanePlan& plan,
+    const int64_t* words,
+    const int32_t (&node_of)[Wire::kLanes],
+    const bool (&hit)[Wire::kLanes],
+    const bool (&eligible)[Wire::kLanes],
+    const bool (&copyable)[Wire::kLanes],
+    int streamed,
+    bool (&cpu)[Wire::kLanes]) {
+  int64_t k[Wire::kNodes] = {};
+  int64_t pairs[Wire::kNodes] = {};
+  int32_t miss_tokens[Wire::kNodes][Wire::kLanes];
+  int misses[Wire::kNodes] = {};
+  bool candidate[Wire::kLanes];
+  for (int j = 0; j < Wire::kLanes; ++j) {
+    cpu[j] = false;
+    candidate[j] = false;
+    if (j >= plan.count) continue;
+    const int node = node_of[j];
+    const int32_t tok = plan.tokens[j];
+    if (j >= plan.forced_from) {
+      if (hit[j]) {
+        ++k[node];
+        pairs[node] += tok;
+      } else {
+        miss_tokens[node][misses[node]++] = tok;
+      }
+    } else if (eligible[j]) {
+      if (hit[j] && copyable[j]) {
+        candidate[j] = true;
+      } else {
+        cpu[j] = true;
+        if (hit[j]) {
+          ++k[node];
+          pairs[node] += tok;
+        }
+      }
+    }
+  }
+  bool pool[Wire::kLanes];  // the candidates, kept for the residency tiebreak
+  for (int j = 0; j < Wire::kLanes; ++j)
+    pool[j] = candidate[j];
+  const int64_t copy_lane = words[5 * Wire::kNodes];
+  const int64_t stream_lane = words[5 * Wire::kNodes + 3];
+  const int64_t stream0 = words[5 * Wire::kNodes + 4] + words[5 * Wire::kNodes + 1] + words[5 * Wire::kNodes + 2] * streamed;
+  int64_t copy = 0;
+  int64_t lanes = 0;
+  for (;;) {
+    int best = -1;
+    for (int j = 0; j < Wire::kLanes; ++j)
+      if (j < plan.count && candidate[j] && (best < 0 || plan.tokens[j] > plan.tokens[best])) best = j;
+    if (best < 0) break;
+    candidate[best] = false;
+    const int node = node_of[best];
+    const int32_t tok = plan.tokens[best];
+    const int64_t t = model_node_finish(words, node, k[node] + 1, pairs[node] + tok, miss_tokens[node], misses[node]);
+    int64_t side = copy + copy_lane;
+    if (streamed > 0 && stream_lane > 0) {
+      const int64_t stream = stream0 + stream_lane * (lanes + 1);
+      side = stream > side ? stream : side;
+    }
+    if (t <= side) {
+      cpu[best] = true;
+      ++k[node];
+      pairs[node] += tok;
+    } else {
+      copy += copy_lane;
+      ++lanes;
+    }
+  }
+  if ((words[5 * Wire::kNodes + 5] & kSplitModelResidencyTiebreak) == 0) return;
+  // Lanes of one node with the same tokens cost the model the same, so the greedy's count of them on the CPU stands
+  // and only which ones moves: the CPU takes the highest plan indexes (plan order is residency key, highest first).
+  bool tied[Wire::kLanes];
+  for (int j = 0; j < Wire::kLanes; ++j) {
+    tied[j] = false;
+    if (j >= plan.count || !pool[j]) continue;
+    int on_cpu = 0, above = 0;
+    for (int i = 0; i < plan.count; ++i)
+      if (pool[i] && node_of[i] == node_of[j] && plan.tokens[i] == plan.tokens[j]) {
+        on_cpu += cpu[i] ? 1 : 0;
+        above += i > j ? 1 : 0;
+      }
+    tied[j] = above < on_cpu;
+  }
+  for (int j = 0; j < Wire::kLanes; ++j)
+    if (j < plan.count && pool[j]) cpu[j] = tied[j];
+}
 
 // Loads every node's Wire::kSplit table in whole 16-byte loads; words past a table are dropped.
 SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kNodes][Wire::kLanes + 1]) {
@@ -362,6 +488,8 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kNodes][Wi
 // takes policy.miss_cut fewer of its split's lanes, at least 0; forced lanes stay CPU lanes.
 // With host lanes, an unforced lane with a plan.scratch slot is kKindHitScratch at that slot: no staging slot, not
 // eligible, so its node's split reads one lane fewer.
+// With policy.split_model and the copy engine able to take hits, model_cpu_lanes picks the unforced CPU lanes in place
+// of the split and the miss cut, from plan.tokens, and the post's counters compare it with the table.
 // Returns false where the reference raises LaneOverflow: forced lanes with no host lanes or no CPU layer; `out` is then
 // partial. Reads no host memory; the caller loads the split table into the policy.
 SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
@@ -430,11 +558,35 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
       take[node] = take[node] > policy.miss_cut ? take[node] - policy.miss_cut : 0;
   }
   const bool copy_ok = policy.host_lanes && policy.hit_copy_ce && policy.ce_ok;
+  // The split model replaces the table's choice (and its miss cut) when the copy engine can take hits.
+  const bool model = policy.split_model != nullptr && copy_ok;
+  bool model_cpu[Wire::kLanes];
+  if (model) {
+    if (plan.tokens == nullptr) __trap();  // the reference raises ValueError: the model needs each lane's tokens
+    int32_t node_of[Wire::kLanes];
+    bool copyable[Wire::kLanes];
+    int streamed = 0;  // GPU-streamed misses (kKindMissGpu): unforced, unscratched misses the CPU does not take
+#pragma unroll
+    for (int j = 0; j < Wire::kLanes; ++j) {
+      node_of[j] = j < plan.count ? out.node[j] : 0;
+      copyable[j] = j < plan.count && dst[j] >= 0 && dst[j] < policy.dst_rows;
+      if (j >= plan.count) hit[j] = eligible[j] = false;
+      if (j < plan.count && j < plan.forced_from && !scratched[j] && !hit[j] && !eligible[j]) ++streamed;
+    }
+    model_cpu_lanes(plan, policy.split_model, node_of, hit, eligible, copyable, streamed, model_cpu);
+  }
+  bool any_eligible = false;
   for (int64_t j = plan.count - 1; j >= 0; --j) {
     const int node = out.node[j];
     const bool forced = j >= plan.forced_from;
-    const bool cpu = forced || (take[node] > 0 && eligible[j]);
-    if (cpu && !forced) --take[node];
+    const bool table = take[node] > 0 && eligible[j];
+    if (table) --take[node];
+    const bool cpu = forced || (model ? model_cpu[j] : table);
+    if (model && eligible[j]) {
+      any_eligible = true;
+      if (cpu && !table) ++policy.split_model[kSplitModelCosts + 1 + 2 * node];
+      if (!cpu && table) ++policy.split_model[kSplitModelCosts + 2 + 2 * node];
+    }
     uint8_t kind;
     if (scratched[j]) {
       kind = Wire::kKindHitScratch;
@@ -447,6 +599,7 @@ SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     }
     out.kind[j] = kind;
   }
+  if (any_eligible) ++policy.split_model[kSplitModelCosts];
   return true;
 }
 

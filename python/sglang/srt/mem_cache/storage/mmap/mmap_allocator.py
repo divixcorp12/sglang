@@ -31,6 +31,8 @@ try:
     ]
     _libc.munmap.restype = ctypes.c_int
     _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _libc.madvise.restype = ctypes.c_int
+    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 except OSError:
     _libc = None
 
@@ -109,6 +111,30 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     return array
 
 
+def _alloc_bound(n_bytes: int, alloc_bytes: int, extra_flags: int, node: int) -> ctypes.Array:
+    """A shared anonymous mapping (hugepage flags in extra_flags) bound to NUMA ``node`` before any page is touched,
+    then pre-faulted there, as host_numa.allocate_bound binds the expert slabs (SGLANG_HICACHE_HOST_NUMA_NODE).
+    An owning ctypes array, unmapped when garbage-collected."""
+    from sglang.srt.layers.moe.host_numa import _mbind
+
+    if _libc is None:
+        raise OSError("SGLANG_HICACHE_HOST_NUMA_NODE needs libc to map and bind the host pool")
+    ptr = _libc.mmap(None, alloc_bytes, _PROT_RW, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | extra_flags, -1, 0)
+    if ptr is None or ptr == _MAP_FAILED:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
+    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
+    _mbind(ptr, alloc_bytes, node)
+    if _libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(alloc_bytes), _MADV_POPULATE_WRITE) != 0:
+        errno = ctypes.get_errno()
+        if errno != 22:  # anything but EINVAL (no MADV_POPULATE_WRITE): the node could not hold the pool
+            raise OSError(errno, f"populating the host pool on NUMA node {node}: {os.strerror(errno)}")
+        ctypes.memset(ptr, 0, alloc_bytes)  # fault every page in by writing
+    logger.info("HiCache host pool: %.2f GB bound to NUMA node %d", alloc_bytes / 1e9, node)
+    return array
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
 
@@ -138,6 +164,11 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         page_size, extra_flags = mmap.PAGESIZE, 0
 
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+
+    node = envs.SGLANG_HICACHE_HOST_NUMA_NODE.get()
+    if node is not None:
+        array = _alloc_bound(n_bytes, alloc_bytes, extra_flags, node)
+        return torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
     if extra_flags:
         if _libc is None:

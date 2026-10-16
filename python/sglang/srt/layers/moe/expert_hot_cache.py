@@ -156,8 +156,19 @@ class ExpertHotCache:
     visible only when the promotion completes.
     """
 
-    def __init__(self, streamer: ExpertStreamer, capacity: int, scratch_rows: int = 0):
-        """Allocate ``capacity`` slots plus ``scratch_rows`` graph-gather rows."""
+    def __init__(
+        self,
+        streamer: ExpertStreamer,
+        capacity: int,
+        scratch_rows: int = 0,
+        upper_capacity: Optional[int] = None,
+    ):
+        """Allocate ``capacity`` slots plus ``scratch_rows`` graph-gather rows.
+
+        With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP and ``upper_capacity`` (and no scratch or side-pull rows),
+        the tensors reserve address space for ``upper_capacity`` slots but back only ``capacity``, and the index
+        buffers are sized for the upper bound, so startup calibration can grow or shrink the slot count in place
+        (hot_cache_retire.set_hot_capacity)."""
         capacity = index(capacity)
         scratch_rows = index(scratch_rows)
         if not 0 <= capacity <= streamer.num_experts:
@@ -171,6 +182,17 @@ class ExpertHotCache:
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
         )
         allocation_rows = capacity + scratch_rows + int(self.reserves_prefetch_pull_row)
+        resizable = (
+            envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get()
+            and upper_capacity is not None
+            and not scratch_rows
+            and not self.reserves_prefetch_pull_row
+        )
+        # The slot count startup calibration may grow to; index buffers below are sized for it.
+        self.upper_capacity = (
+            min(max(index(upper_capacity), capacity), streamer.num_experts) if resizable else capacity
+        )
+        index_rows = self.upper_capacity
         self.bytes_per_expert = streamer.bytes_per_expert
         self.capacity_bytes = capacity * self.bytes_per_expert
         self.scratch_bytes = scratch_rows * self.bytes_per_expert
@@ -188,14 +210,29 @@ class ExpertHotCache:
         self.device = next(
             iter(devices), torch.device("cuda", torch.cuda.current_device())
         )
-        self.tensors = {
-            spec.name: torch.empty(
-                (allocation_rows,) + spec.row_shape,
-                dtype=spec.dtype,
-                device=self.device,
+        # SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP: on VMM memory, so startup calibration can release trailing slots.
+        self.vmm_backing = None
+        if envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get() and self.device.type == "cuda":
+            from sglang.srt.layers.moe.hot_cache_vmm import VmmHotCacheBacking
+
+            self.vmm_backing = VmmHotCacheBacking(
+                self.device,
+                [
+                    (spec.name, max(allocation_rows, self.upper_capacity), spec.row_shape, spec.dtype)
+                    for spec in streamer.specs
+                ],
+                backed_rows=allocation_rows,
             )
-            for spec in streamer.specs
-        }
+            self.tensors = dict(self.vmm_backing.tensors)
+        else:
+            self.tensors = {
+                spec.name: torch.empty(
+                    (allocation_rows,) + spec.row_shape,
+                    dtype=spec.dtype,
+                    device=self.device,
+                )
+                for spec in streamer.specs
+            }
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
@@ -217,7 +254,7 @@ class ExpertHotCache:
             AsyncExpertTransferExecutor.for_device(self.device) if capacity else None
         )
         self._transfer_plan = (
-            FixedRowTransferPlan(max_rows=capacity, device=self.device)
+            FixedRowTransferPlan(max_rows=index_rows, device=self.device)
             if capacity
             else None
         )
@@ -229,21 +266,21 @@ class ExpertHotCache:
         self._slot_upload_recorded = False
         if capacity:
             self._slot_upload_host = torch.zeros(
-                (3, capacity), dtype=torch.int64
+                (3, index_rows), dtype=torch.int64
             ).pin_memory()
             self._slot_upload_rows = self._slot_upload_host.numpy()
             self._slot_upload_device = torch.zeros(
-                (3, capacity), dtype=torch.int64, device=self.device
+                (3, index_rows), dtype=torch.int64, device=self.device
             )
             self._slot_upload_event = torch.cuda.Event()
             self._slot_ids = torch.arange(
-                capacity, dtype=torch.long, device=self.device
+                index_rows, dtype=torch.long, device=self.device
             )
             self._slot_dump_targets = np.arange(
-                streamer.num_experts, streamer.num_experts + capacity, dtype=np.int64
+                streamer.num_experts, streamer.num_experts + index_rows, dtype=np.int64
             )
             self._mapping_scratch = torch.full(
-                (streamer.num_experts + capacity,),
+                (streamer.num_experts + index_rows,),
                 -1,
                 dtype=torch.long,
                 device=self.device,
@@ -273,23 +310,25 @@ class ExpertHotCache:
             return
         if self._slot_upload_recorded:
             self._slot_upload_event.synchronize()
-        rows = self._slot_upload_rows
+        # The buffers may be sized for upper_capacity; the live slots are the first `capacity` columns.
+        c = self.capacity
+        rows = self._slot_upload_rows[:, :c]
         rows[0] = self.slot_states
         rows[1] = self._slot_generations
         ready = rows[0] == int(HotCacheSlotState.READY)
         rows[2] = np.where(
             ready,
             np.asarray(self.slot_to_expert, dtype=np.int64),
-            self._slot_dump_targets,
+            self._slot_dump_targets[:c],
         )
-        upload = self._slot_upload_device
-        upload.copy_(self._slot_upload_host, non_blocking=True)
+        upload = self._slot_upload_device[:, :c]
+        upload.copy_(self._slot_upload_host[:, :c], non_blocking=True)
         self._slot_upload_event.record(torch.cuda.current_stream(self.device))
         self._slot_upload_recorded = True
         self.slot_state.copy_(upload[0])
         self.slot_generations.copy_(upload[1])
         self._mapping_scratch.fill_(-1)
-        self._mapping_scratch.index_copy_(0, upload[2], self._slot_ids)
+        self._mapping_scratch.index_copy_(0, upload[2], self._slot_ids[:c])
         self.expert_to_slot.copy_(self._mapping_scratch[: self.streamer.num_experts])
 
     def wait_for_slot_publication(self) -> None:
@@ -1494,12 +1533,29 @@ class ExpertHotCacheManager:
         manager._trace_drain_thread: threading.Thread | None = None
         if manager.metrics_path is not None:
             atexit.register(manager.close_telemetry)
+        # The most each layer could hold: its inclusive pinned tier's limit, else every expert. Used only under
+        # SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP, where calibration may grow toward it, bounded there by the memory
+        # a grow could ever have (the small per-row tensors are allocated for every reserved row).
+        upper_capacity = {
+            layer_id: slot_limits[layer_id] or streamers[layer_id].num_experts for layer_id in selected
+        }
+        if envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get() and torch.cuda.is_available():
+            from sglang.srt.layers.moe.hot_cache_calibration import bounded_upper_capacities
+
+            upper_capacity = bounded_upper_capacities(
+                {layer_id: len(expert_ids) for layer_id, expert_ids in selected.items()},
+                upper_capacity,
+                slot_bytes=max(streamer.bytes_per_expert for streamer in streamers.values()),
+            )
         for layer_id, expert_ids in selected.items():
             if expert_ids or gather_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
                 layer_streamer.expert_copy_backend = copy_backend
                 cache = ExpertHotCache(
-                    layer_streamer, len(expert_ids), scratch_rows[layer_id]
+                    layer_streamer,
+                    len(expert_ids),
+                    scratch_rows[layer_id],
+                    upper_capacity=upper_capacity[layer_id],
                 )
                 cache._owner_manager = manager
                 manager.caches[layer_id] = cache
