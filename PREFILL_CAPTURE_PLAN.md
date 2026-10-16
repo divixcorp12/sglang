@@ -1,5 +1,27 @@
 # Prefill admissions in the RAM-tier replay: capture plan, 2026-10-16
 
+## Outcome (2026-10-16)
+
+- **No capture was needed.** The A/B's route log already held every prefill's routes. With prefill admissions
+  simulated from them (rule 10), T passes its gate on the A/B:
+  - NVMe-cold GPU lanes/verify -8.7% (OFF) and -7.9% (ON); the delta -7.2%;
+  - lane precision and recall 0.94-0.96 and 0.86-0.88;
+  - prefill reads within 0.1-6.3% on all 16 prompts.
+  - The event in section 1 stays unbuilt.
+- **Lane keys** (C2 and base, A/B prices, which pass the served-head check):
+  - The owner's product form, with the served cold-lane cost (`product-emp`), is the best head arm: -2.3 to -3.1
+    ms/verify net at 0.77 ms of head cost.
+  - Option (a) is not justified: its oracle ceiling is only 1.2-1.6 ms/verify better than product-emp.
+  - P alone cannot price moving cold lanes onto the GPU; the A/B's +0.26 ms/lane is the cost used.
+- **Prefill share.**
+  - Predicted decode gains: -5 to -14 ms/verify at the existing 64, and -11 to -25 at shares of 8-32.
+  - The gain is flat up to about 0.15 × usable RAM rows per layer, and is mostly gone at 0.6 ×.
+  - TTFT is uncertain: this model gives -0.5 to -0.9 s at 64; section 27.9 measured +0.5 to +1.2 s.
+- **Next:** one served A/B of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64), approved; results below once run.
+  No size knob or startup rule until it agrees with the model's direction.
+
+## The plan as written
+
 Branch `lane-tier-replay`. This is a plan only: no code changed and nothing run, apart from read-only reads of the
 2026-10-16 A/B on divix01. It answers the two pending owner decisions that `LANE_TIER_REPLAY_HANDOFF.md` ends with:
 1. a served capture that logs prefill admissions;
