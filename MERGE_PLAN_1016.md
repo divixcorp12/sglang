@@ -98,11 +98,28 @@ Dry runs chained with `git merge-tree --write-tree` (each step on the previous s
 | 7 | arm_env changes (one commit) | — |
 | 8 | `lane-tier-replay` `1cbfdfc7ef` (brings `lane-head`), owner 2026-10-16 | none textually; the lane head and the startup hot-cache calibration share the hot-cache budget (checked in sect. 9) |
 | 9 | `drip-hot` `21fe80bc93`, owner 2026-10-16 | `analysis/dsv41-drive/dspark/lane_tier_replay.py` add/add: drip-hot carries lane-tier-replay's `3d331c9189` copy (byte-identical); kept lane-tier-replay's tip |
-| later | `prefill-share-size-ps` `57e64ed0e1`, once its A/B is decided | none on top of 1-6 |
+| 10 | `prefill-share-size-ps` `f5abd2c9df` (share = 64/187 x the smallest layer's usable rows; 64 on this layout, logged "computed") | none |
+| 11 | `long-prompt-mode` `70510de09c` (contains `54e0d9dbfb`; long-prompt capture, `run_capture_pair.sh`) | none textually; one source-text assertion in `test_both_cpu_ab.py` followed `spec_margin_capture.server_argv` |
+| 12 | `lane-tier-replay` `ef4c99d06d` (`prefetch_eval.py`, rule 6 at the claim; offline) | none |
+| 13 | prefetch on in `prod_dspark_env()` with the checksummed head (owner, 2026-10-16) | — |
 
 Then the integration tests (phase 2), then a fast-forward of `master` on your go.
 
-## 4. Prefetch flags: PENDING (code merged, flags not set in arm_env)
+## 4. Prefetch flags: ON in production (owner decision, 2026-10-16; this section's original "PENDING" text follows)
+
+Production ships the best arm's prefetch keys exactly as `share64-ab-20261016` resolved them "on", with the head at
+`/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors` (0444, SHA256 pinned as
+`arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256`; `launch_prod.sh` refuses a missing or mismatched file). Why:
+- No clean served win of its own (REF 33.14-33.37).
+- Every stacked served win was measured with it on.
+- The offline comparison could not be resolved (`LANE_TIER_REPLAY_HANDOFF.md`).
+
+Its GPU side (the scorer's candidate page and the uploaded T3 head) is allocated at service start and attach, before
+the startup hot-cache calibration measures. Its pool slots are host rows inside the pinned tier, in the usable rows
+the prefill share is sized from (187, giving 64). The calibration's served A/B and calib8b-11b all ran on
+`-mergechunk-expseg` with the prefetch, promote and pool serve on, and the margin held under serving.
+
+### Original phase-1 text
 
 Set by the best arm, all in `ram-prefetch-pool-serve` (already the base, so the code is merged by construction):
 
