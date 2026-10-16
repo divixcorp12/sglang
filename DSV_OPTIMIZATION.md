@@ -774,8 +774,22 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
         - Sizing requires margin + capture estimate. The cached Exl3FusedMoE pointer tables are dropped afterwards.
         - Draft capture (0.04-0.25 GB) is not estimated; the post-capture check is the backstop.
         - 77 CPU tests passed.
-      - GPU tests (torch.equal at 4096/2065/171 tokens, budgets 32 and 1 MiB, peak bound) and the combined smoke
-        (calibration + A2 + A3 on expseg) are running together as `calib2`. The combined
+      - **calib2** (2026-10-16 00:16-00:21, `/mnt/nvme1/prefill-merge/calib2`):
+        - **GPU tests: 66 passed, 12 skipped, EXIT=0.** A2 is torch.equal at all three sizes and both budgets. The
+          per-call peak at 4096 tokens is 289 MiB, against 583 (merge-only chunking) and 2,054 (one pass).
+        - **Combined smoke** (expseg, calibration + A2 + merge budget 32): KV pin held at 381,184, 1,035 slots,
+          trimmed 0, 0 OOM.
+          - Calibration: lowest free 1,526; margin 298; capture estimate 25; post-capture projection 1,098, OK.
+          - **memory.free at the warm-up peak: 876 MiB** (expseg2 706).
+        - **Prefill transient 1,459 -> 1,259 MiB (attention 903 -> 704).** The indexer at a 128 MiB budget is now
+          the binding op, so **A1 (indexer budget 32) is back in, at about -150 MiB more.**
+        - Prefill time for the 4096 prompt: 19.70 s against 19.35 s (+1.8%), partly the logger. A clean A/B is
+          needed before choosing the budget.
+        - Calibration findings:
+          - The capture estimate is too small: 25 MiB against ~130 measured (graph-pool static buffers, and the
+            draft is not covered).
+          - The calibration-vs-real comparison must use transients, not absolute peaks.
+        - **Grow headroom at this launch: about 450 MiB, ~35 slots.** The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
