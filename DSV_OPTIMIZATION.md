@@ -916,6 +916,20 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
                 repeated 4,096 run plus the measured noise between repeats.
               - calib8 must show peak free ≥ margin. The arm has to beat 1,035 slots at expseg2's peak free
                 (706) to be worth it.
+            - (a2) is pushed (`95709bcd05`). Calibration replays `DSV41_PREFILL_WARMUP_SIZES` plus 2 full chunks.
+              The margin is the worst gap plus the measured spread between the full-chunk peaks. The post-capture
+              check now warns and never refuses. Carrying a value across launches was dropped: it would break
+              the startup-only rule.
+            - (a1) The MemPool estimate is ruled out, because eager runs reuse freed blocks (~30 vs 146). Chosen:
+              **(C) a throwaway trial capture** of target verify plus the draft into a private graph pool, measured,
+              then `backend.cleanup()`. It is exact and touches no hot-path kernels; startup cost is ~3-6 s.
+              Needs:
+              - bypassing `init_cuda_graphs`, so the residency updater stays off;
+              - an idempotent DSpark sampler hook;
+              - a swap of the global pool;
+              - `forget_graph_path_state` after the trial.
+              Rejected fallback (A): bake the upper bound into the graphs and trim after capture. That touches
+              hot-path kernels and needs a writer audit.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
