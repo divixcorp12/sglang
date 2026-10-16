@@ -37,6 +37,10 @@ import sys
 
 import numpy as np
 
+# CPU only: torch's optimizer health check (torch.accelerator.current_stream) otherwise creates a CUDA context on a
+# GPU that may be serving. Set before torch is imported anywhere below.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 DENSE = ("cnt1", "cnt2", "cnt3p", "pos0", "pos1", "pos2", "pos3", "pos4", "pos5", "gate_w", "log_score", "score0",
          "log_age", "first_touch", "resident", "live", "odds")
 NUM_EXPERTS = 384
