@@ -693,6 +693,19 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - The approximation is checked: the post-capture check logs the calibration peak beside the real warm-up
         4096-token peak, and flags a gap larger than the fragmentation term.
       - The Engram and route-recording skips are calibration-context checks.
+    - **Step 3 first cut pushed** (`1551a883ba`, `5ac2200cea`, flag off):
+      - `layers/moe/hot_cache_calibration.py` `maybe_calibrate_hot_cache`, returning a frozen `CalibrationResult`;
+        `hot_cache_dummy_extend.py` builds the EXTEND batch.
+      - Two measured runs. lowest free = F0 - (P1 - R0) - non-torch growth; margin = max(P1 - A1, P2 - R1).
+        `plan_keep` retires from the fullest layer first, never below 2x the victim lanes.
+      - Scheduler hooks: calibration before `init_all_cuda_graphs`; `require_hot_cache_headroom` after capture
+        refuses to start if free memory is below the margin. `model_runner.py` is untouched.
+      - 109 CPU tests passed.
+      - Decided:
+        - post-warm-up check is log-only, with the calibration peak shown beside the real warm-up peak;
+        - capture memory goes into the pre-capture sizing, from an eager TARGET_VERIFY dummy peak.
+      - Pending: wiring routing (i) and the capture estimate, stating the upper-bound capacity derivation, then a
+        ~8 min GPU smoke.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
