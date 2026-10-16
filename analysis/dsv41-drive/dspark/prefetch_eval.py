@@ -131,11 +131,16 @@ def load_reads(run: ltr.Run, d: str):
     subs = collections.defaultdict(list)
     lands = {}
     uses = collections.defaultdict(dict)
+    serve = {}
     for path, e in ltr._events(glob.glob(os.path.join(d, "events.*.exl3-spec*.jsonl")) +
                                glob.glob(os.path.join(d, "events.*.exl3-tier*.jsonl")),
-                               {"spec_submit", "spec_land", "spec_use", "pool_point"}):
+                               {"spec_submit", "spec_land", "spec_use", "pool_point", "svc_record"}):
         k = e["event"]
-        if k == "spec_submit":
+        if k == "svc_record":
+            # a = the serve's duration: its start is when the service looked at the pool
+            start = e["ns"] - e["a"]
+            serve[e["seq"]] = min(serve.get(e["seq"], start), start)
+        elif k == "spec_submit":
             subs[e["seq"]].append((e["gen"], e["row"], e["a"], e["ns"]))
         elif k == "spec_land":
             lands[(e["seq"], e["row"], e["a"])] = e["ns"]
@@ -147,11 +152,11 @@ def load_reads(run: ltr.Run, d: str):
     for seq, xs in subs.items():
         xs.sort()
         reads[seq] = [(row, a, ns, lands.get((seq, row, a))) for _, row, a, ns in xs]
-    return reads, uses
+    return reads, uses, serve
 
 
 def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, scorer: GateScorer | None,
-             predict_routed: int, reads, uses) -> dict:
+             predict_routed: int, reads, uses, serve) -> dict:
     d = run.dir
     header, log = ltr.route_log(d)
     off = ltr.align(run, log)
@@ -256,15 +261,22 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
                 out["issued"] += 1
                 if land is not None:
                     out["landed"] += 1
-                    pool[(v, T)][e] = land
+                    pool[(v, T)][e] = (sub, land)
                     inflight.append((sub, land))
-        # pooled rows for this record, landed before its gather
-        pooled = {e for e, land in pool.pop((v, L), {}).items() if land <= ns}
+        # This record's pool when the service serves it (svc_record's start, else the post): a GPU lane is pointed at
+        # a landed row (point_pooled_locked); a forced CPU miss also takes a row still reading, waiting for it
+        # (take_pooled_locked, ram_tier.h:2419).
+        start = serve.get(r.seq, ns) if r is not None else ns
+        entries = pool.pop((v, L), {})
+        landed_by = {e for e, (sub, land) in entries.items() if land <= start}
+        reading = {e for e, (sub, land) in entries.items() if sub <= start < land}
+        pooled = landed_by | reading
         if L in full:
             warm = set(misses)
         else:
             warm = {e for e in misses if tier[e % NODES].has(e)}
-        used = (misses - warm) & pooled
+        cold = misses - warm
+        used = (cold & landed_by) | ((cold - inserted) & reading)
         nv = sum(1 for e in inserted if e not in warm and e not in used)
         po = sum(1 for e in inserted if e in used)
         dma = sum(1 for e in inserted if e in warm)
@@ -284,7 +296,7 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
             obs_u = uses[r.seq]
             out["obs_used"] += len(obs_u)
             out["obs_pool_served"] += sum(1 for x in obs_u.values() if x == "gpu")
-        for e in pooled - used:
+        for e in set(entries) - used:
             out["unused_landed"] += 1
             if ltr._hash01(L, e, ns & 0xFFFFFFFF) < p_promote:
                 pending.append((ns, L, e))
@@ -341,7 +353,7 @@ def main() -> int:
     run = ltr.Run(a.capture)
     P = ltr.Prices(ltr.Run(a.prices_from) if a.prices_from else run)
     layers = max(r.row for r in run.records) + 1
-    reads, uses = load_reads(run, a.capture)
+    reads, uses, serve = load_reads(run, a.capture)
     with open(os.path.join(a.capture, "counters.json")) as f:
         counters = json.load(f)
     res = {"capture": a.capture, "share": a.share, "counters": {k: counters.get(k) for k in (
@@ -354,7 +366,7 @@ def main() -> int:
         r0 = log[len(log) // 2]["router"]
         res["gate_self_check"] = round(float(np.mean([scorer.self_check(r0, L) for L in (2, 10, 20, 30)])), 3)
     for arm in a.arms.split(","):
-        res["arms"][arm] = evaluate(run, P, arm, layers, a.share, scorer, a.predict_routed, reads, uses)
+        res["arms"][arm] = evaluate(run, P, arm, layers, a.share, scorer, a.predict_routed, reads, uses, serve)
         print(arm, json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in res["arms"][arm].items()
                                if not isinstance(v, dict)}), flush=True)
     if a.validate and "today" in res["arms"]:
