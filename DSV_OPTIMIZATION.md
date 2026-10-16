@@ -157,6 +157,15 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
       depth), or weights taken from live busy time.
     - Same start: split-model calibration took 1.04 s and agreed with run1, apart from team1's hit intercept
       (0.159 vs -0.124).
+  - **Reworked probe** (`mirror-weight-calib` `9e7ca5691a`, flag off, pushed; not yet run on the box):
+    - A round is 40 bursts. Each burst puts one row's 8 sub-reads per root in flight, each root at its own share.
+    - Each root is timed until its last sub-read lands. The probe then idles for as long as the burst took
+      (`IDLE_RATIO=1.0`).
+    - 3 rounds. A root's rate is its share divided by its median burst time.
+    - Clamp, noise check and fallbacks are unchanged.
+    - New fake-drive test (2x slow root): weights come out ~2:1, at most 8 sub-reads in flight per root, each root
+      reads its own share, and bursts don't overlap.
+    - `IDLE_RATIO` and queue depth 8 are assumptions. The validation start after the peak logger checks for ~1.21x.
 - **A/B arms** (`f58bd94a44`):
   - `...-pin01-splitmodel-fixedcosts`: all old offline fits, calibration skipped.
   - `...-pin01-splitmodel-refine`: calibration + `REFINE_BATCHES=50`.
