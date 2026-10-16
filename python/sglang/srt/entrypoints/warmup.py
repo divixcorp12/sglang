@@ -165,7 +165,9 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 # Triton's own M == 1 / M % 16 == 0 / other specialization, crossed with the M
 # thresholds the launchers branch on (8 and 48 in hc_combine_norm, 64-384 and
 # 2048 in mhc's hc_mix_stats), plus a full 4096-token prefill chunk.
-_DSV41_PREFILL_WARMUP_SIZES = (1, 5, 8, 16, 33, 64, 257, 400, 2048, 2049, 4096)
+# The startup hot-cache calibration replays the same sequence (hot_cache_calibration.calibration_shapes), so its
+# allocator history matches this warm-up's.
+DSV41_PREFILL_WARMUP_SIZES = (1, 5, 8, 16, 33, 64, 257, 400, 2048, 2049, 4096)
 
 
 @warmup("dsv41_prefill_shapes")
@@ -180,7 +182,7 @@ async def dsv41_prefill_shapes(
     streams its routed experts and costs seconds.
     """
     rng = np.random.default_rng(0)
-    for size in tqdm.tqdm(_DSV41_PREFILL_WARMUP_SIZES, desc="Warmup DSV4.1 prefill"):
+    for size in tqdm.tqdm(DSV41_PREFILL_WARMUP_SIZES, desc="Warmup DSV4.1 prefill"):
         req = GenerateReqInput(
             input_ids=rng.integers(2**16, size=size).tolist(),
             sampling_params={"max_new_tokens": 1, "temperature": 0.0},

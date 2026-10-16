@@ -590,6 +590,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             topk = topk.to_standard(layer_id=layer.layer_id)
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         streamer = expert_streamer_of(layer)
+        if streamer is not None:
+            from sglang.srt.layers.moe.hot_cache_calibration import calibration_routes
+
+            # The startup hot-cache calibration's dummy prefill routes onto RAM-resident experts (no admissions).
+            topk_ids = calibration_routes(topk_ids, streamer)
         dead = self.verify_dead_rows
         if dead is not None and (
             streamer is None or topk_ids.shape[0] > dead.shape[0]

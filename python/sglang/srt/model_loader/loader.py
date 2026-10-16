@@ -109,6 +109,7 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    drop_files_cache,
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
@@ -633,6 +634,14 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
+            if weight_loader_drop_cache_after_load:
+                # Dropped again once the whole model is loaded (load_model): the iterators drop a shard while the
+                # consumer can still hold a tensor of it, whose mmap keeps every page of a one-shard checkpoint (the
+                # DSpark draft) mapped and cached.
+                self._drop_cache_files = [
+                    *getattr(self, "_drop_cache_files", []),
+                    *hf_weights_files,
+                ]
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -1001,6 +1010,7 @@ class DefaultModelLoader(BaseModelLoader):
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
+        drop_files_cache(self.__dict__.pop("_drop_cache_files", []))
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()

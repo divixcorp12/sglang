@@ -415,10 +415,57 @@ def test_a_row_split_reaches_the_post_of_its_row_only():
     dev._kernels = lambda: recorder
     for row in (0, 1):
         _post(dev, _args(), row=row)
-    banks = [args[-2] for _, args in recorder.calls]
+    banks = [args[-3] for _, args in recorder.calls]
     assert banks[0] is banks[1] is dev.row_split
     assert dev.row_split[0, 0] == -1
     assert dev.row_split[1].tolist() == table * 2
+
+
+def test_the_split_model_reaches_the_post_before_use_pdl_with_room_for_its_counters():
+    """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL: off, the post's split_model argument (after row_split) is empty; on, it
+    holds the cost words and zeroed counters (records, then per node to_cpu and to_copy), which split_model_stats
+    reads back; a word count the build cannot read is refused. Mutation: the counters not appended -- red."""
+    for nodes in (1, 2):
+        off = _device(nodes=nodes)
+        recorder = _Recorder()
+        off._kernels = lambda: recorder
+        _post(off, _args())
+        assert recorder.calls[0][1][-2].numel() == 0 and off.split_model_stats() is None
+        words = list(range(1, 5 * nodes + 7))
+        with pytest.raises(ValueError, match="cost words"):
+            _device(nodes=nodes, split_model=words[:-1])
+        on = _device(nodes=nodes, split_model=words)
+        recorder = _Recorder()
+        on._kernels = lambda: recorder
+        _post(on, _args())
+        bank = recorder.calls[0][1][-2]
+        assert bank is on.split_model and bank.dtype == torch.int64
+        assert bank.tolist() == words + [0] * (1 + 2 * nodes)
+        bank[len(words):] = torch.arange(1, 2 + 2 * nodes)
+        assert on.split_model_stats() == {
+            "records": 1, "to_cpu": list(range(2, 2 + 2 * nodes, 2)), "to_copy": list(range(3, 3 + 2 * nodes, 2))}
+
+
+def test_the_service_builds_its_device_side_with_the_split_model_words():
+    """exl3_ram_miss passes _split_model_words(): the env's words when SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL is on and
+    CPU experts run, else None."""
+    import sglang.srt.layers.moe.exl3_ram_miss as service
+
+    tree = ast.parse(Path(service.__file__).read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]
+    for call in calls:
+        assert {k.arg: ast.unparse(k.value) for k in call.keywords}["split_model"] == "self._split_model_words()"
+    stub = SimpleNamespace(cpu_experts=object(), wire=SimpleNamespace(nodes=2))
+    words = service.Exl3RamMissService._split_model_words
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(False):
+        assert words(stub) is None
+    with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True), \
+            envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=2"):
+        got = words(stub)
+        assert len(got) == 16 and got[10] == 2_000_000 and got[15] == 0
+        assert words(SimpleNamespace(cpu_experts=None, wire=stub.wire)) is None
 
 
 @pytest.mark.parametrize("name", ["miss_cut", "miss_cut_max"])
