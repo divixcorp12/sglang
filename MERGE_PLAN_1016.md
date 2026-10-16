@@ -54,7 +54,7 @@ and `CUDA_ARCH` are the recording shell's, not the server's.
 
 | flag / argv | master | best arm | branch | evidence | proposal |
 |---|---|---|---|---|---|
-| `SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL` | off | 1 | split-model | DO 3.2: 65.9 vs 67.9 ms/token, one `-mem` pair | **enable** (with startup calibration, sect. 5 item 2) |
+| `SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL` | off | 1 | split-model | DO 3.2: 65.9 vs 67.9 ms/token (-2.9%), one `-mem` pair | **enable** (with startup calibration, sect. 5 item 2); miss cut 1/3 stays at its library default, stated explicitly |
 | `SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES` | n/a | n/a | split-model-calib | DO 3.4: no gain | leave 0 (default) |
 | `SGLANG_ENABLE_SCHEDULER_MLOCK` | off | 1 | split-model | DO 3.4: team major faults 11,877 -> 20-250 | **enable** (risk in sect. 5 item 4) |
 | `SGLANG_HICACHE_HOST_NUMA_NODE` | unset | 1 | split-model | DO 3.4: node-0 swap 11.6 GiB -> 5 MB at load; speed unchanged | **enable** |
@@ -62,11 +62,12 @@ and `CUDA_ARCH` are the recording shell's, not the server's.
 | `SGLANG_MOE_PINNED_HOST_MB` / `_NUMA_MB` | 106496 / 0:57344,1:49152 | 111530 / 0:59656,1:51874 | pin01 budget (`PIN01_BUDGET`) | DO 3.1 | **enable** with pin01 |
 | `SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB` | unset (0) | 128 | prefill-merge-chunk | DO 3.7 / 3.4 re-score: -2.02, CI -3.7..-0.6 | **enable** |
 | `PYTORCH_CUDA_ALLOC_CONF` | unset | expandable_segments:True | (env only; arm on prefill-merge-chunk) | DO 3.7 expseg: ~1.5 GB recovered, no cost (-0.26, CI -0.39..-0.02) | **enable** |
-| `SGLANG_MOE_HOT_GPU_MB` | 10840 | 13144 (1,035 slots) | prefill-merge-chunk (`EXPSEG_HOT_GPU_MB`) | DO 3.7 expseg2: -1.79, CI -4.51..-0.64; VRAM hit +1.9 pp | **enable** (or calibrate, sect. 5 item 3) |
+| `SGLANG_MOE_HOT_GPU_MB` | 10840 | 13144 (1,035 slots) | prefill-merge-chunk (`EXPSEG_HOT_GPU_MB`) | DO 3.7 expseg2: -1.79, CI -4.51..-0.64; VRAM hit +1.9 pp | **enable** as the start size the startup calibration grows or trims from (sect. 5 item 3) |
 | argv `--mem-fraction-static` | 0.78 | 0.8623 | `fraction_keeping_kv` | as above | **enable** |
 | argv `--max-total-tokens` | none | 381184 | KV pin | DO 3.7 | **enable** |
 | argv `--weight-loader-drop-cache-after-load` | none | present | split-model `-mem` arms (fix `7e77a55ba2`) | DO 3.4: works; shard cache was not the problem | **enable** (harmless, part of the measured arm) |
-| `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` | default **on** | 0 (`-fixedsplit`) | A/B control (REF 33.36) | none; it pins the table between arms | **leave default on** (owner rule; sect. 5 item 2) |
+| `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` | default **on** | 0 (`-fixedsplit`) | A/B control (REF 33.36) | none; it pins the table between arms | **on** (owner rule; stated explicitly in `dspark_env`, sect. 5 item 2) |
+| `SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP` | unset | 0 | prefill-merge-chunk | DO 3.7: served A/B neutral (+0.62, CI -1.88..+2.60), margin held under serving | **enable** (owner rule: replaces the hard-coded 13144 with a measured size; sect. 5 item 3) |
 | prefetch family | unset | on | rpps | sect. 4 | **PENDING** |
 | `SGLANG_DSV41_EXPERT_JOB_TRACE_*`, `SGLANG_DSV41_EXPERT_TRACE_PATH`, `SGLANG_MOE_HOT_METRICS_FILE` | unset | run paths | measurement | — | **not for production** (sect. 5 item 6) |
 
@@ -109,40 +110,114 @@ Set by the best arm, all in `ram-prefetch-pool-serve` (already the base, so the 
 Evidence on record: L+2 / T3 / cap 2 captures REF 33.29-33.35 (mixed; per-session table in the untracked
 `RAM_PREFETCH_FIXED_SPLIT_NEXT_HANDOFF.md` shows cap 2 faster in 4 of 8 sessions); promote REF 33.37: **no gain**
 (wall +2.6%, matched -0.14 ms/record, one pair). I found no served pool-serve result in the repo docs. Waiting on
-lane-tier's offline prefetch comparison, as you said. Note the learned head is a file outside the repo.
+lane-tier's offline prefetch comparison, as you said. DSV41_REFERENCE 33.14-33.37 has no clean served win for the
+stack.
+
+**The learned head is a model file outside the repo**, and production would depend on it if the prefetch is enabled:
+`divix01:/data/models/slang/nvfp4-work/ram-prefetch/l2-t3-head/t3-f109-calib-b075.safetensors`, 4,758,132 bytes,
+mode 0600, dated 2026-10-13, SHA256 `f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309`. `ram-prefetch/`
+is a scratch tree for run outputs. Proposal: copy it to a production asset path beside the other model inputs,
+`/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-prefetch-heads/t3-f109-calib-b075.safetensors` (next to
+`dsv41-dspark-draft` and the resident-set JSON), read-only. Pin the path and its SHA256 as constants in `arm_env.py`,
+and have `launch_prod.sh` refuse to start on a missing file or a checksum mismatch. At 4.7 MB it could also live in the
+repo, but no model weights are tracked in git today, so I would not start here.
 
 ## 5. For your decision
 
 1. **The best arm was never served without the prefetch.** Every component's A/B (split model, pin01, merge chunk,
    expseg, prefill share) ran on top of the prefetch + promote + pool-serve stack. If the prefetch stays off,
    production is a combination nobody served.
-2. **CPU split calibration.** The arm ran `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0` (`-fixedsplit`, an A/B
-   control) and the split model on the **fixed offline costs** (`split-model` predates `split-model-calib`). With
-   split-model-calib merged, the model's costs are always calibrated at startup when it is on (+~1.1 s inside the
-   first request; on failure the table types the lanes). Calibrated without refinement was **never served as an A/B**;
-   the nearest is `-refine` vs fixed costs, +0.1 ms/token (CI -1.7..+1.9). I propose leaving the table calibration at
-   its default (on), which differs from the measured arm; with the model on, the table only types lanes when the
-   model is off or failed.
-3. **Hot-cache size is a probe-derived constant, not a startup value.** 13144 MiB / 0.8623 / KV 381,184 come from
-   `hot_mb_for_margin` on one smoke (3 slots held back). The owner's startup rule points at
-   `SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP`: served once, safe, neutral (+0.62, CI -1.88..+2.60; ~+11 slots), but
-   with A1/A2/A3 bundled (indexer budget 32, chunk kernels, merge budget 32), +18-24 s startup, and the final design
-   (calib11b) was smoke-tested, not A/B'd. The tip's residue-walk fix `a75bb27afb` has no GPU run. Options: (a) ship
-   13144 constant (measured), (b) ship calibration on. I lean (a) for this launch.
+2. **CPU split calibration: on (owner rule).** The arm ran `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0`
+   (`-fixedsplit`, an A/B control) and the split model on the **fixed offline costs** (`split-model` predates
+   `split-model-calib`). Production gets the table calibration on, stated explicitly, and split-model-calib's startup
+   fit, which runs whenever the model is on (+~1.1 s inside the first request; on failure the table types the lanes),
+   with refinement off (`REFINE_BATCHES=0`, the default). Calibrated without refinement was **never served as an A/B**;
+   the nearest is `-refine` vs fixed costs, +0.1 ms/token (CI -1.7..+1.9). With the model on, the table types lanes
+   only when the model is off or has failed.
+3. **Hot-cache size: startup calibration on (owner rule).** 13144 MiB comes from `hot_mb_for_margin` on one smoke (3
+   slots held back), so it is not a startup value. `SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP=1` measures the size at
+   every launch. Its served A/B was safe and neutral (+0.62, CI -1.88..+2.60; ~+11 slots). Points to settle in phase 2:
+   - **Bundling.** The served `-expseg-calib` arm also carried A1/A2/A3 (indexer budget 32, chunk kernels, merge
+     budget 32). Proposal: enable the calibration with merge budget 128, chunk kernels off and indexer 128, as in the
+     best arm, so the only change is the calibration. The calibration measures whatever transient is configured, so it
+     is valid either way. A1/A2/A3 stay off until they are measured on their own.
+   - **Start size.** The calibration grows or trims from `SGLANG_MOE_HOT_GPU_MB`. Keep 13144 as the start value, and
+     keep the fraction 0.8623 and the KV pin 381,184 (the calibration refuses to start if KV falls below the pin).
+   - **Cost and state of the code.** Startup takes +18-24 s. The final design (calib11b, `abaae5fdd0`) was
+     smoke-tested, not A/B'd. The tip's residue-walk fix `a75bb27afb` has not run on the GPU, so phase 2 runs the
+     calibration GPU tests at the tip. A failed calibration falls back to the configured size and does not fail the
+     launch.
 4. **Node-0 memory with mlock + pin01 budget.** The `-mem` arms left node 0 at 0.04-0.24 GiB free during load
-   (expseg 0.04, below the low watermark) and ~0.14 GiB under mlockall; those runs had `prelaunch_evict.py` and an idle
-   box. `launch_prod.sh` does no eviction, and production's co-tenants are not the A/B box state. Risk: swap or OOM at
-   load. Not a loss, but unmeasured under production conditions.
+   (expseg 0.04, below the low watermark) and ~0.14 GiB under mlockall. Those runs had `prelaunch_evict.py` and an idle
+   box. Node 1 is covered by the launch floor in section 7. Node 0 has no floor today. Proposal: the same check logs
+   node 0's MemFree and warns below the arms' observed start value. It does not refuse there, since the arms passed
+   with as little.
 5. **Split model's own evidence is one pre-serve_compare pair** (65.9 vs 67.9); not re-scored with the stall-aware
    rule. pin01's 70.5 vs 76.2 compares against base-r2, which serve_compare flags as a stalled run. Both are in the
    best arm, so I list them as enable, but neither has a clean-CI number of its own.
 6. **The arm was measured on the instrumented host build** (`SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX` set, plus the route
    and metrics files). Production runs without them; expected equal or faster, not measured.
-7. **Not served, flag stays off:** `cpu-out-rows` (`STORE_OUT`), `SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS` and
-   `SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL` (both only inside the calibration arm or not served), residency
-   tiebreak (neutral).
+7. **Stays off:**
+   - lane head: held;
+   - GPU drip and drip-hot: neutral, and drip-hot was not built;
+   - residency tiebreak: neutral;
+   - decay 0.995: no detectable gain;
+   - split-model refinement: no gain;
+   - mirror weights: dropped;
+   - the DSpark confidence gate: its one served run was a loss, but that run is STALL-flagged by serve_compare (DO
+     3.4), so the loss is not evidence against it either. It is simply unmeasured;
+   - `SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS` and `SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL`: not measured alone;
+   - `cpu-out-rows` (`STORE_OUT`): bit-identical, ~10-25 us/job, never served. It rides along with its flag off
+     (clean merge, small, and the next larger served A/B can carry it).
+8. **Never acted on, in no arm: `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1`.** REF 33.22 records it as -1.16 ms/token,
+   8/8 sessions (2026-09-27), left "for the owner". It was measured before the copy engine, and before DSpark's
+   graphed verify. REF (around line 3968) also records an earlier 131.8 vs 131.9 with no gain, part of it lost to C1
+   sharing SMs, which the copy engine removes. **Needs a check before any enable, not part of this merge:**
+   - does the side stream (shared expert + DIRECT commit) capture in the breakable decode graph with the DSpark
+     verify;
+   - does it order correctly against the copy engine's per-layer gate and the lease chain;
+   - does `expert_stream_requirements` refuse it for EXL3, as it does `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP`.
+   Then a served pair. The code is already on master (`environ.py`), so no merge is needed.
 
-## 6. Phase 2 test plan (after your go)
+## 7. Production launch safety: the node-1 floor
+
+The served arms needed node 1 to hold, at launch:
+- the HiCache host pools (bound there by `SGLANG_HICACHE_HOST_NUMA_NODE=1`, ~11.75 GiB);
+- node 1's 51,874 MiB share of the larger pinned tier;
+- the rest of the scheduler.
+
+`prelaunch_evict.py` (on `prefill-merge-chunk`, so it arrives with merge 1) set the floor at **64.2-64.9 GiB of node-1
+MemFree** in the arms' records (DO 3.3: "76.64 GiB free, above the 64.21 floor"). The formula is HiCache + rest + 1
+GiB margin, where "rest" comes from the arm's last memsample or defaults to arm A's 51.24. It waits up to `--wait-min`,
+evicting each minute, and exits 3 if the floor is never met. `launch_prod.sh` has no such step. Another project's page
+cache (e.g. mimo-reap's 620 GB on nvme4) can fill node 1, and then the populate/mbind of the HiCache pools pushes node
+1 under its low watermark and swaps, which is the failure the arms hit in `-decay995` (DO 3.6).
+
+**Proposal** (phase 2, its own commit, after the arm_env commit):
+1. `launch_prod.sh start` runs `prelaunch_evict.py --log <prod log dir>/prelaunch-<ts>.json --wait-min 0 --hicache-gib
+   <from arm_env> --margin-gib 1.0` before taking the GPU lock.
+   - `--wait-min 0` means one eviction round, then a decision. Production should not sit in a hidden 30-minute wait.
+   - It evicts only this model's draft, row images and Engram files, through `posix_fadvise(DONTNEED)`, without root.
+     Production is down at that point, so dropping that cache costs no other server of ours anything. lane-tier's
+     arms on port 30032 read the same files, so the script logs whether port 30032 is up and skips the eviction (but
+     still checks) while it is.
+   - A new arm_env constant, `PROD_NODE1_FLOOR_GIB`, is set from the arms' record (rest 51.24 + HiCache 11.75 + margin
+     1.0 = 63.99, rounded up to 65). It is used instead of `--previous`, because production has no memsample of its
+     own.
+2. **Below the floor, refuse, and do not launch.** Exit non-zero with a message giving:
+   - the floor and node 1's MemFree and FilePages, before and after eviction;
+   - the biggest page-cache holders on node 1, where `fincore`/`numastat -p` can name them without root;
+   - the fix: free node 1 (as root, `echo 1 > /proc/sys/vm/drop_caches`, or stop the co-tenant), then rerun.
+   - Refusing is better than launching into swap: a swapping launch takes 6+ minutes and serves slowly with no error.
+3. **Node 0:** log its MemFree and warn below the arms' observed start (item 5.4). No refusal.
+4. A test in `test_launch_prod.py`, run with `DRY_RUN=1` and a fake meminfo, checks three things: the launch calls
+   the check before the lock, refuses below the floor, and proceeds above it.
+
+Alternative, if you'd rather not have production evict anything: step 2 alone, a pure refusal check. The operator then
+evicts by hand. I recommend the eviction round, because the files it drops are our own and production is down when it
+runs.
+
+## 8. Phase 2 test plan (after your go)
 
 Per the run protocol: push `integrate-1016`, divix01 worktree `wt-merge-clean` at the pushed commit and one at the
 merge base (`975f56fb3e`), `PYTHONPATH=$PWD/python`, print `sglang.__file__` and `git log -1`, `taskset -c 0-55`,
