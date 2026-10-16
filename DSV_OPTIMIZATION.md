@@ -640,9 +640,31 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - Scheduler VmLck is 715 GiB against 389: expandable segments' VA reservations count as locked VMAs under
         mlockall ONFAULT. That should not use RAM in itself, but it is not yet isolated from launch-to-launch
         variation.
-    - Next: the same arm with the hot cache grown into the freed memory (2-3 slots of extra headroom), A/B against
-      mergechunk-r2 via serve_compare. It doubles as the node-0 repeat, with VmPTE/VmLck and per-node page tables
-      sampled, and aborts below the min watermark.
+  - **expseg2: expandable_segments plus 1,035 slots (13,144 MiB, +112)** (2026-10-15 23:29-23:36, code
+    `23d8931dcd`):
+    - **serve_compare vs mergechunk-r2: -1.79 ms/token (CI -4.51..-0.64), with all 8 prompts clean.**
+      - Wall -6.5, wait -8.6 and stream +2.4 ms/verify.
+      - Prompt 4 carries much of the mean (-14.8). The other prompts run +0.07..-2.07.
+      - **Against A this stacks to about -3.8 ms/token** (mergechunk-r2 was -2.0 vs A).
+    - **VRAM verify hit rate 41.71% -> 43.61% (+1.9 pp).** Miss rows -3.0%, misses/forward 76.8 -> 73.2, NVMe left
+      60.4 -> 57.7. Prefill hit rate 11.8% -> 13.2%.
+    - GPU:
+      - 706 MiB free at the warm-up peak; the prediction held after scaling for free-before-load (29.47 GiB).
+      - Graphs captured, 0 OOM, 0 kernel OOM kills.
+      - Allocator reserve gap: 439 MiB.
+    - **Node 0 during load:** a minimum of 0.14 GiB, above the min watermark (r2 0.24, expseg 0.04), and 14 MiB
+      swapped out. So expseg's deep dip was launch variance, not the allocator.
+      - VmPTE tracks RSS (236-290 MiB).
+      - The 715 GiB VmLck is unpopulated VA reservations: no RAM or page-table cost.
+      - The -mem arms leave node 0 little room during load whatever the allocator.
+    - **Candidate for the owner:** the `-mergechunk-expseg` arm at 1,035 slots (merge budget plus
+      `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`). Defaults are unchanged; that is the owner's call.
+  - **(C) step 1 pushed** (`bf68f4ca52`, flag off): `layers/moe/hot_cache_vmm.py` `VmmHotCacheBacking`, with one VA
+    reservation per tensor in 2 MiB granules. `release_tail(keep_rows)` unmaps whole granules past the kept rows.
+    - 23 CPU tests passed.
+    - GPU test `test/manual/dsv41/test_hot_cache_vmm_gpu.py`: kept addresses and contents, free memory rising by
+      the released bytes, coexistence with expandable_segments. Running now.
+    - Next: step 2 (retire through one capacity authority).
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
