@@ -91,17 +91,30 @@ class Capture:
         self.demand = [[set() for _ in range(self.layers)] for _ in range(self.n)]
         self.covered = [[set() for _ in range(self.layers)] for _ in range(self.n)]
         self.landed = [[set() for _ in range(self.layers)] for _ in range(self.n)]
+        # today's landings cut to the scorer's first pick per record: spec_submit's gen is the pick index
+        self.landed_pick0 = [[set() for _ in range(self.layers)] for _ in range(self.n)]
+        pick0 = set()
+        lands = []
         for path in glob.glob(os.path.join(d, "events.*.exl3-tier*.jsonl")) + glob.glob(os.path.join(d, "events.*.exl3-spec*.jsonl")):
             with open(path) as f:
                 for line in f:
                     e = json.loads(line)
                     k = e.get("event")
+                    if k == "spec_submit":
+                        if e["gen"] == 0:
+                            pick0.add((e["row"], e["seq"], e["a"]))
+                        continue
                     if k not in ("miss_land", "spec_use", "pool_point", "spec_land"):
                         continue
                     v = bisect.bisect_right(self.begin, e["ns"]) - 1
                     if not 0 <= v < self.n or e["row"] >= self.layers:
                         continue
                     (self.demand if k == "miss_land" else self.landed if k == "spec_land" else self.covered)[v][e["row"]].add(e["a"])
+                    if k == "spec_land":
+                        lands.append((v, e["row"], e["seq"], e["a"]))
+        for v, row, seq, a in lands:
+            if (row, seq, a) in pick0:
+                self.landed_pick0[v][row].add(a)
         with open(os.path.join(d, "router.json")) as f:
             meta = json.load(f)
         self.tokens, self.topk, self.hidden = int(meta["tokens"]), int(meta["topk"]), int(meta["hidden"])
@@ -136,7 +149,8 @@ class RamTier:
         self.capacity = capacity
         self.victim = victim
         self.stamp = {}  # expert -> last use tick
-        self.speculative = set()  # rows that arrived by prefetch and were not routed since
+        self.speculative = {}  # rows that arrived by prefetch and were not routed since -> the verify they were for
+        self.now = 0  # the current verify index, for staleness
         self.tick = 0
         self.evictions = 0
         self.spec_evictions = 0
@@ -147,11 +161,13 @@ class RamTier:
     def touch(self, e: int) -> None:
         self.tick += 1
         self.stamp[e] = self.tick
-        self.speculative.discard(e)
+        self.speculative.pop(e, None)
 
-    def insert(self, e: int, protected: set, speculative: bool = False) -> bool:
+    def insert(self, e: int, protected: set, speculative: bool = False, due: int = 0) -> bool:
         """Insert e, evicting a row when full: ``lru`` the least recently used unprotected row; ``specfirst`` the
-        least recently landed never-routed prefetch row when one exists, else LRU. False when nothing could go."""
+        least recently landed never-routed prefetch row when one exists; ``stalefirst`` such a row only once the
+        verify it was read for has passed (the real tier: a promoted row inherits its victim's recency, and promotion
+        happens just before its target layer); else LRU. False when nothing could go."""
         if e in self.stamp:
             self.touch(e)
             return True
@@ -159,16 +175,21 @@ class RamTier:
             cands = [(t, r) for r, t in self.stamp.items() if r not in protected]
             if not cands:
                 return False
-            spec = [(t, r) for t, r in cands if r in self.speculative] if self.victim == "specfirst" else []
+            if self.victim == "specfirst":
+                spec = [(t, r) for t, r in cands if r in self.speculative]
+            elif self.victim == "stalefirst":
+                spec = [(t, r) for t, r in cands if r in self.speculative and self.speculative[r] < self.now]
+            else:
+                spec = []
             _, victim = min(spec) if spec else min(cands)
             if victim in self.speculative:
                 self.spec_evictions += 1
             del self.stamp[victim]
-            self.speculative.discard(victim)
+            self.speculative.pop(victim, None)
             self.evictions += 1
         self.touch(e)
         if speculative:
-            self.speculative.add(e)
+            self.speculative[e] = due
         return True
 
 
@@ -182,6 +203,8 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
     for v in range(cap.n):
         counted = v >= cap.skip
         begin = cap.begin[v]
+        for t in tiers:
+            t.now = v
         # prefetched rows that landed before each layer's gather enter the tier first (in landing order)
         pending.sort()
         still = []
@@ -199,17 +222,17 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
             hot = cap.hot(v, Lx)
             routed = cap.routes(v, Lx)
             for e in landed_now[Lx]:
-                tiers[Lx].insert(e, hot | routed, speculative=True)
+                tiers[Lx].insert(e, hot | routed, speculative=True, due=v)
                 if counted:
                     out["reads_landed"] += 1
                     if e in routed:
                         out["useful"] += 1
                     else:
                         out["wasted"] += 1
-            if mode == "ontop":
-                # the existing prefetch's landings, as captured, enter the tier during this verify
-                for e in cap.landed[v][Lx]:
-                    tiers[Lx].insert(e, hot | routed, speculative=True)
+            if mode in ("ontop", "cut"):
+                # the existing prefetch's landings, as captured (or cut to its first picks), enter the tier now
+                for e in (cap.landed if mode == "ontop" else cap.landed_pick0)[v][Lx]:
+                    tiers[Lx].insert(e, hot | routed, speculative=True, due=v)
             # demand: every routed expert that is not a VRAM hit touches RAM
             for e in routed:
                 if e in hot:
@@ -227,7 +250,7 @@ def replay(cap: Capture, policy: str, mode: str, budget: int, rows_per_layer: in
         # late rows still land eventually (within this verify) and stay in the tier
         for land_ns, Lx, e, fv in pending:
             if land_ns <= cap.end[v]:
-                tiers[Lx].insert(e, cap.hot(v, Lx) | cap.routes(v, Lx), speculative=True)
+                tiers[Lx].insert(e, cap.hot(v, Lx) | cap.routes(v, Lx), speculative=True, due=fv)
                 if counted:
                     out["reads_landed"] += 1
                     out["wasted"] += 1
@@ -287,6 +310,7 @@ def main() -> int:
     ap.add_argument("--ms-per-row", type=float, default=2.3)
     ap.add_argument("--ms-per-layer", type=float, default=5.5)
     ap.add_argument("--victims", default="lru,specfirst", help="tier victim rules to replay the policies under")
+    ap.add_argument("--calibrate-only", action="store_true", help="stop after the capacity sweeps (no gate recompute)")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
     cap = Capture(args.capture, args.skip)
@@ -306,9 +330,44 @@ def main() -> int:
         print(f"  capacity {c}: replay RAM misses {r['ram_misses']:.1f}/verify (capture: demand {measured['demand_misses']:.1f} "
               f"+ covered {measured['covered']:.1f} = {measured['demand_misses'] + measured['covered']:.1f})", flush=True)
     target = measured["demand_misses"] + measured["covered"]
+    # the same sweep under specfirst: promote_landed stamps a promoted row with its victim's recency, so the real
+    # tier already evicts unrouted landings early; whichever rule matches near the nominal capacity is the tier's
+    for c in (int(x) for x in args.calibrate.split(",")):
+        line = f"  capacity {c}:"
+        for rule in ("specfirst", "stalefirst"):
+            r = replay(cap, "none", "ontop", 0, c, args.ms_per_row, args.ms_per_layer, None, victim=rule)
+            calib[c][f"ram_misses_{rule}"] = r["ram_misses"]
+            line += f" {rule} {r['ram_misses']:.1f}"
+        a = replay(cap, "none", "alone", 0, c, args.ms_per_row, args.ms_per_layer, None)
+        calib[c]["ram_misses_alone"] = a["ram_misses"]
+        print(line + f"; alone (no landings, lru) {a['ram_misses']:.1f}", flush=True)
     best = min(calib, key=lambda c: abs(calib[c]["ram_misses"] - target))
     rows = best if args.rows_per_layer == 0 else args.rows_per_layer
-    print(f"using {rows} rows/layer (best calibration {best})", flush=True)
+    print(f"using {rows} rows/layer (best lru calibration {best})", flush=True)
+    # how recently the experts the existing prefetch covered were routed in their layer: a covered expert routed a few
+    # verifies earlier was evicted by the real tier although an ideal LRU of this capacity may have kept it
+    recency = collections.Counter()
+    for v in range(args.skip, cap.n):
+        for Lx in range(cap.layers):
+            for e in cap.covered[v][Lx]:
+                d = next((v - u for u in range(v - 1, max(-1, v - 33), -1) if e in cap.routes(u, Lx)), None)
+                recency["never_in_32" if d is None else "1-2" if d <= 2 else "3-8" if d <= 8 else "9-16" if d <= 16 else "17-32"] += 1
+    tot = max(1, sum(recency.values()))
+    print("covered experts' last routing in the same layer (verifies ago): " +
+          ", ".join(f"{k} {v / tot:.3f}" for k, v in sorted(recency.items())), flush=True)
+    cut_n = sum(len(cap.landed_pick0[v][L]) for v in range(args.skip, cap.n) for L in range(cap.layers)) / nv
+    cuts = {}
+    for victim in ("lru", "stalefirst"):
+        r = replay(cap, "none", "cut", 0, rows, args.ms_per_row, args.ms_per_layer, None, victim=victim)
+        cuts[victim] = r
+        print(f"today's landings cut to the scorer's first pick ({cut_n:.1f}/verify instead of {measured['landed']:.1f}), "
+              f"victim {victim}: RAM misses/verify {r['ram_misses']:.1f}, evictions {r['evictions_per_verify']:.1f}", flush=True)
+    if args.calibrate_only:
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump({"measured": measured, "calibration": calib, "covered_recency": dict(recency), "cut": cuts,
+                           "cut_landings_per_verify": cut_n}, f, indent=1)
+        return 0
     # the existing prefetch's own churn: tier without its landings, covered misses back in the demand
     alone0 = replay(cap, "none", "alone", 0, rows, args.ms_per_row, args.ms_per_layer, None)
     ontop0 = replay(cap, "none", "ontop", 0, rows, args.ms_per_row, args.ms_per_layer, None)
@@ -335,10 +394,11 @@ def main() -> int:
     # the tier's victim rule: today's LRU, or never-routed prefetch landings first
     spec0 = replay(cap, "none", "ontop", 0, rows, args.ms_per_row, args.ms_per_layer, None, victim="specfirst")
     print(f"victim rule specfirst, no new policy: RAM misses/verify {spec0['ram_misses']:.1f} (lru {ontop0['ram_misses']:.1f}, "
-          f"alone {alone0['ram_misses']:.1f}); speculative evictions {spec0['speculative_evictions_per_verify']:.1f} of "
-          f"{spec0['evictions_per_verify']:.1f}", flush=True)
+          f"alone {alone0['ram_misses']:.1f}); evictions {spec0['evictions_per_verify']:.1f}, of them speculative "
+          f"{spec0['speculative_evictions_per_verify']:.1f}", flush=True)
     results = {"measured": measured, "calibration": calib, "rows_per_layer": rows,
-               "none": {"alone": alone0, "ontop": ontop0, "ontop_specfirst": spec0}, "policies": {}}
+               "none": {"alone": alone0, "ontop": ontop0, "ontop_specfirst": spec0, "cut_landings_per_verify": cut_n,
+                        "cut": cuts}, "policies": {}}
     base = {"alone": alone0["ram_misses"], "ontop": ontop0["ram_misses"]}
     for victim in args.victims.split(","):
         for policy in ("oracle", "nearmiss", "recur"):
