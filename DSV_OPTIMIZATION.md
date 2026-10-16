@@ -194,11 +194,25 @@ first-shard stall.
 **Cold target load:** the target's ~9 GiB of non-expert weights come from sdb3 (SATA) at ~55 MB/s when not
 cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now left out of the eviction list.
 
-**Read amplification (open, agent `read-amp`):** on a clean, idle-box run (arm D), the three NVMe mirror
-partitions read ~895 GiB (831 GiB in 262 s of decode, ~3.2 GB/s). The server's own counters account for 209 GiB
-(rows_read 10,858 + spec_landed 6,008, x 13.3 MB), so the disks read ~4.3x more. Even a full row read from all
-three mirrors would leave ~1.4x unexplained. Arm C showed the same. The agent is breaking the bytes down by phase,
-device and consumer before proposing a fix.
+**Read amplification: none (agent `read-amp`).** Arm D's NVMe mirrors read ~895 GiB against 209 GiB in
+`rows_read` + `spec_landed`. The reader's own per-root byte counters ("drive load" at stop) match diskstats to within
+0.1 GiB on nvme0/nvme3; nvme2's +15.8 GiB is weight load and Engram.
+- **The counters only cover decode.** With `SGLANG_DSV41_ENABLE_PREFILL_FILLS=1`, prefill's prefetched rows are
+  counted as pinned hits; `pinned_admissions` sees them.
+- **The "262 s of decode" window was mostly prefill.** The run had only 50.8 s of verify time.
+- Breakdown:
+
+  | consumer | GiB | share |
+  |---|---|---|
+  | prefill (11 warm-up + 3 health + 8 serving requests; 48-68 GiB, ~4,500 rows, ~113 rows/layer per request) | ~640 | 72% |
+  | decode demand | 134.6 | 15% |
+  | spec prefetch (incl. 6.4 abandoned) | 80.9 | 9% |
+  | startup fills | 23.5 | 3% |
+  | weight load + Engram | ~16 | 2% |
+
+- The row split works: each row is read once, a third from each mirror.
+- **Avoidable:** only the spec rows that landed unused, 45-54 GiB (5-6%). They are gated to idle drives (1.3-3.1 s
+  overlap with demand per root), so removing them would save well under 1% of verify time.
 
 ### 3.7 Prefill VRAM spike / hot-cache capacity — agent `prefill-merge`, branch `prefill-merge-chunk` (not pushed yet)
 
