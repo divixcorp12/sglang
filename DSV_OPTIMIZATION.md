@@ -424,9 +424,22 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
     barrier so -Ofast keeps the bits identical (including -0). Later writes add.
   - Only rows of unrouted tokens are zeroed, and the engine memset is skipped. NVFP4 already overwrites every row.
   - Unit tests: 165 passed.
-  - Queued after run3 and the mirror validation: the bit-identical CPU test (11 cases x threads 1/4/10) and a bench
-    on the real engine's 6-token jobs. Expected gain is 20-40 us per job, under 1 ms per verify, so bench only
-    unless it shows more.
+  - **Bit test passed** (2026-10-15 20:03-20:08, `wt-cpu-out-rows` at `901ab0fead`, `KERNEL EXIT=0` from
+    PIPESTATUS): `test/manual/dsv41/test_exl3_cpu_store_out.py`, with 11 cases x threads 1/4/10 plus -0. It compares
+    the old zero-then-accumulate, the new store_first and the kernel overwrite bit for bit on int32 views, then
+    again after a second accumulating job. Unrouted tokens read exactly +0. `test_exl3_cpu_dsv41_plan_multitoken.py`
+    is still green, giving 51 passed.
+  - **Bench** (`bench_cpu_store_out.py`: cores 6-15, 10 threads, node 0, real EXL3 kernel via `run_job`, 6 rounds of
+    alternated arms, 50 reps):
+    - k=1 median: 472 us off vs 448 us on.
+    - Paired deltas without outlier rounds: 5-37 us.
+    - k=2/3 deltas move with the outlier rounds, so they are noise. k=4 shows no difference.
+    - **Saving: ~10-25 us per job**, which matches the 19 us memset. That is far below the 1 ms/verify bar, so no
+      served arm.
+  - Verdict: correct and bit-identical, but too small to serve alone. Kept off and unmerged on `cpu-out-rows` until
+    a larger served A/B can carry it.
+  - Two quiet-box rounds had one cell 30-80% slow, the same right-tail variance as in the gap analysis.
+  - Logs: `ram-prefetch/cpu-expert-gap-20261015/cpu-out-rows/`.
 - Other suspects, not yet tested: NUMA balancing on (TLB IPIs near prefill), IRQ 239 on core 14, swap (now addressed
   by `-mem`). Proposed benches: numa_balancing A/B, perf clock check, busy-socket bench.
 - Facts: no CPU core copies expert weights to the GPU (copy engine = `cuMemcpyAsync` DMA; stream kernel and drip are
