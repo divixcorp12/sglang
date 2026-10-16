@@ -531,6 +531,32 @@ def test_the_pool_room_is_checked_per_group_as_the_host_reserves_it(ranges, widt
     assert module.pool_room_shortfall(ranges, staging_width=width, share=2) == short
 
 
+@pytest.mark.parametrize(
+    "ranges, width, share, usable",
+    [
+        ([(0, 113), (113, 210)], 8, 2, 103 + 87),  # two nodes split 113 / 97, staging 8 and pool 2 each
+        ([(0, 10), (10, 20)], 7, 0, 3 + 3),  # each group stages 7, not 7 for the row
+        ([(0, 3), (3, 20)], 8, 1, 0 + 8),  # a tiny group stages all but one slot and gives none to the pool's excess
+        ([(0, 210)], 8, 0, 202),  # one node
+    ],
+)
+def test_usable_rows_count_each_group_past_its_staging_and_pool(ranges, width, share, usable):
+    assert module.usable_rows(ranges, staging_width=width, share=share) == usable
+
+
+def test_the_prefill_share_is_the_served_fraction_of_the_smallest_row():
+    """64/187 of the served layout's 187-188 usable rows is the 64 served; the smallest row decides (the host keeps one
+    share for every layer), and a share is at least one row. Mutations: the largest row, truncation, no floor of 1."""
+    assert module.PREFILL_SHARE_FRACTION == 64 / 187
+    assert module.prefill_share_rows([188, 187, 188]) == 64
+    assert module.prefill_share_rows([300, 100]) == 34
+    assert module.prefill_share_rows([189]) == 65  # 64.69 rounds, not truncates
+    assert module.prefill_share_rows([190], fraction=0.5) == 95
+    assert module.prefill_share_rows([1]) == 1
+    with pytest.raises(ValueError, match="at least one row"):
+        module.prefill_share_rows([])
+
+
 def test_a_row_with_a_target_scores_right_after_its_post(monkeypatch):
     """The scoring forks off the post's stream before C1 and joins it after the copy wait is enqueued, so it overlaps
     this layer's copy wait instead of delaying C1, and the next post cannot overwrite the seq it publishes under."""
