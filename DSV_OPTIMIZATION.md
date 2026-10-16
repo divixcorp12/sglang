@@ -213,6 +213,14 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
 - The row split works: each row is read once, a third from each mirror.
 - **Avoidable:** only the spec rows that landed unused, 45-54 GiB (5-6%). They are gated to idle drives (1.3-3.1 s
   overlap with demand per root), so removing them would save well under 1% of verify time.
+- **Prefill churn:** 46,900 eager evictions across 8,782 RAM slots (prefill share 0). Decode misses per verify are
+  flat by position after a prefill (pos 0 67.6, pos 1 77.6, pos 10+ 82.9). The first verify is slower (0.60 vs ~0.36 s)
+  but not from reads, so it is likely a one-time first-verify cost. Not pursued.
+- **Counter fix (approved, agent `read-amp`):** `host_fill_rows`, a third drive-load kind for eager/fill reads, and
+  eager-path evictions in their own counter (today they land in group 0's block). Observability only.
+- **Mirror lead (sent to split-calib):** nvme3 (SPCC, max_sectors_kb 256) was busy 104.5 s vs 86.6 / 85.6 s on the
+  two Samsung 990 EVO Plus drives at equal bytes. Busy-time-balanced mirror weights (`SGLANG_MOE_EXPERT_MIRROR_WEIGHTS`)
+  could cut demand-read time by up to ~10% (~0.1 ms per NVMe lane), ideally derived by a startup throughput probe.
 
 ### 3.7 Prefill VRAM spike / hot-cache capacity — agent `prefill-merge`, branch `prefill-merge-chunk` (not pushed yet)
 
