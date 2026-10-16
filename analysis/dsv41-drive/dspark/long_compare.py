@@ -12,8 +12,8 @@ verifies share a clock):
     --stall-factor x the run's median window, corroborated by the memsample's worst drive await; CPUSLOW when either
     team's CPU ms per lane is over --cpu-factor x the median, corroborated by swap-in and major fault rate;
   PREFILL-STALL per request (share_ab_report.py's 2x rule): the nvme3n1 read await over its prefill (sent to first
-    token) over 2x the median await of the run's decode windows. With one prefill per run there is no prefill median
-    to compare against, so decode is the reference here;
+    token) over 2x the median prefill's, pooled over every run given (a run holds only K+1 prefills); with under 3
+    prefills nothing is flagged and the awaits are reported for reading by eye;
   trace truncation: the job trace keeps each file's first CAPACITY events, so a window past a file's last event when
     it dropped any is marked TRUNC and its server columns undercount.
 Pair (first run vs each other): greedy decoding makes the two texts equal until they diverge. The divergence token is
@@ -42,6 +42,7 @@ import share_ab_report  # noqa: E402
 
 FIRST_WINDOWS_S = (30.0, 60.0)
 WINDOW_S = 60.0
+MIN_PREFILLS = 3
 
 
 def window_edges(duration_s: float) -> list[float]:
@@ -209,18 +210,30 @@ def corroborate(d: str, windows: list[dict], t0_epoch_s: float, edges: list[floa
         w["node0_free_mib"] = min((iv["node0_free_mib"] for iv in over), default=None)
 
 
-def prefill_stalls(d: str, requests: list[dict], decode_epochs: list[tuple[float, float]]) -> list[dict]:
+def prefill_awaits(d: str, requests: list[dict]) -> list[dict]:
+    """Each request's nvme3n1 read await from its send to its first token."""
     samples = share_ab_report.nvme3n1_samples(d)
-    decode = [aw for aw, _ in (share_ab_report.window_await(samples, a, b) for a, b in decode_epochs) if aw is not None]
-    ref = statistics.median(decode) if decode else None
     out = []
     for r in requests:
         first = epoch_of_first_token(r)
         aw, reads = (share_ab_report.window_await(samples, r["sent_epoch_ns"] / 1e9, first)
                      if first is not None else (None, 0))
-        out.append({"rid": r["rid"], "nvme3n1_await_ms": aw, "nvme3n1_reads": reads, "decode_median_await_ms": ref,
-                    "prefill_stall": bool(aw and ref and aw > share_ab_report.STALL_FACTOR * ref)})
+        out.append({"rid": r["rid"], "nvme3n1_await_ms": aw, "nvme3n1_reads": reads, "prefill_stall": None})
     return out
+
+
+def flag_prefills(results: list[dict]) -> float | None:
+    """share_ab_report's PREFILL-STALL: a prefill's await over 2x the median prefill's, pooled over every run given,
+    since a run holds one prefill per request. Prefill reads queue deeper than decode's, so decode is no reference.
+    Under MIN_PREFILLS awaits there is no median to trust and nothing is flagged."""
+    awaits = [p["nvme3n1_await_ms"] for r in results for p in r["prefill"] if p["nvme3n1_await_ms"] is not None]
+    if len(awaits) < MIN_PREFILLS:
+        return None
+    ref = statistics.median(awaits)
+    for r in results:
+        for p in r["prefill"]:
+            p["prefill_stall"] = bool(p["nvme3n1_await_ms"] and p["nvme3n1_await_ms"] > share_ab_report.STALL_FACTOR * ref)
+    return ref
 
 
 def epoch_of_first_token(r: dict) -> float | None:
@@ -258,7 +271,6 @@ def analyse(d: str, stall_factor: float, cpu_factor: float, run: ltr.Run | None 
     complete_s = (min(ends.values()) - t0) / 1e9 if ends else None
     for w in windows:
         w["truncated"] = complete_s is not None and w["t1_s"] > complete_s
-    decode_epochs = [(t0_epoch + a, t0_epoch + b) for a, b in zip(edges, edges[1:])]
     requests = record["requests"]
     return {
         "dir": d,
@@ -269,7 +281,7 @@ def analyse(d: str, stall_factor: float, cpu_factor: float, run: ltr.Run | None 
         "long": {"ttft_s": long["ttft_s"], "decode_s": (cut - t0) / 1e9, "tokens": tokens_at(points, cut),
                  "cut": long["cut"], "finish_reason": long["finish_reason"]},
         "windows": windows,
-        "prefill": prefill_stalls(d, requests, decode_epochs),
+        "prefill": prefill_awaits(d, requests),
         "trace_dropped_files": sorted(ends),
         "trace_complete_through_s": complete_s,
         "drive_busy_s": serve_compare.drive_load(d),
@@ -325,9 +337,8 @@ def print_run(res: dict) -> None:
     lg = res["long"]
     print(f"   long: {lg['tokens']} tokens over {lg['decode_s']:.1f} s of decode (cut {lg['cut']}, finish {lg['finish_reason']})")
     for p in res["prefill"]:
-        if p["prefill_stall"]:
-            print(f"   PREFILL-STALL {p['rid']}: nvme3n1 await {p['nvme3n1_await_ms']:.1f} ms vs decode median "
-                  f"{p['decode_median_await_ms']:.1f}")
+        print(f"   prefill {p['rid']}: nvme3n1 await {_f(p['nvme3n1_await_ms'], '.1f')} ms over {p['nvme3n1_reads']} reads"
+              + ("  PREFILL-STALL" if p["prefill_stall"] else ""))
     print("   window(s)  tokens ms/token verifies tok/v stream/v  wait/v cpu-forced/v gpu-cold/v ms/layer  disk x swap x  flags")
     for w in res["windows"]:
         print(f"   {w['t0_s']:4.0f}-{w['t1_s']:<4.0f} {w['tokens']:7d} {_f(w['ms_per_token'], '8.2f')} {w['verifies']:8d}"
@@ -367,9 +378,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cpu-factor", type=float, default=1.2)
     ap.add_argument("--json")
     a = ap.parse_args(argv)
-    out = {}
+    out = {d: analyse(d, a.stall_factor, a.cpu_factor) for d in a.runs}
+    ref = flag_prefills(list(out.values()))
+    print(f"prefill nvme3n1 await median over {sum(len(r['prefill']) for r in out.values())} prefills: "
+          + (f"{ref:.1f} ms (PREFILL-STALL over {share_ab_report.STALL_FACTOR:g}x)" if ref is not None
+             else f"under {MIN_PREFILLS} prefills with reads, none flagged"))
     for d in a.runs:
-        out[d] = analyse(d, a.stall_factor, a.cpu_factor)
+        out[d]["prefill_median_await_ms"] = ref
         print_run(out[d])
     first = a.runs[0]
     for d in a.runs[1:]:

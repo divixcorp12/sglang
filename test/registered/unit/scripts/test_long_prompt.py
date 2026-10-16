@@ -1,7 +1,6 @@
 """The long-prompt, time-boxed capture: spec_margin_capture.py's flags, long_prompt.py's streaming client and its cut,
 and long_compare.py's windows and two-arm alignment (CPU)."""
 
-import collections
 import http.server
 import importlib.util
 import json
@@ -320,6 +319,19 @@ def test_one_run_reads_as_a_diagnostic_and_two_are_paired_on_their_common_tokens
     assert first["ms_per_token"][0] == pytest.approx(1000 / 3) and first["ms_per_token"][1] == pytest.approx(500)
     # past the divergence there are no common tokens to compare
     assert p["by_window_same_tokens"][-1]["tokens"] is None
+
+
+def test_a_prefill_is_flagged_against_the_median_prefill_of_every_run_and_not_on_too_few():
+    lc = _load("long_compare")
+
+    def run(*awaits):
+        return {"prefill": [{"nvme3n1_await_ms": aw, "prefill_stall": None} for aw in awaits]}
+
+    two = [run(5.0), run(50.0)]
+    assert lc.flag_prefills(two) is None and all(p["prefill_stall"] is None for r in two for p in r["prefill"])
+    pooled = [run(5.0, 6.0), run(4.0, 20.0, None)]
+    assert lc.flag_prefills(pooled) == pytest.approx(5.5)
+    assert [p["prefill_stall"] for r in pooled for p in r["prefill"]] == [False, False, False, True, False]
 
 
 def test_a_window_past_a_truncated_job_trace_is_marked(tmp_path):
