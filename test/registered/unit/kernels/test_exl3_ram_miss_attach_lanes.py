@@ -263,7 +263,50 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
     assert all(kwargs["cpu_experts"] for kwargs in built)
 
 
-@pytest.mark.parametrize("lanes, capacity, width", [(8, 3, 8), (16, 5, 16), (16, 40, 40), (32, 12, 32)])
+def test_with_a_lane_head_each_layer_plans_by_the_heads_keys_and_runs_its_hook(tiers, monkeypatch):
+    """SGLANG_OPT_LANE_HEAD_PATH: the fused plan reads the head's row of keys (a view the hook writes in the graph)
+    instead of the residency ranking's, and the gather calls the layer's hook. Mutation: keeping updater.miss_keys."""
+    from sglang.srt.layers.moe.lane_head import LaneHeadGather
+
+    service, streamers = tiers
+    service.ensure_started()
+    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    service.cpu_experts = SimpleNamespace(
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
+        attach_device=lambda device_side: None,
+    )
+    updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
+    head = SimpleNamespace(keys=torch.zeros((LAYERS, EXPERTS), dtype=torch.int64), meta=SimpleNamespace(experts=EXPERTS))
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater, lane_head=head)
+    try:
+        for layer_id, streamer in streamers.items():
+            streamer._graph_pinned_tier = True
+            streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
+            streamer.graph_gather_rows = 1
+            streamer.residency_row = LAYERS - 1 - layer_id
+            streamer.row_backend = SimpleNamespace(
+                segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64)
+            )
+            service.attach(manager, streamer)
+    finally:
+        service.cpu_experts = None
+    for streamer in streamers.values():
+        assert streamer._plan_miss_keys.data_ptr() == head.keys[streamer.residency_row].data_ptr()
+        hook = streamer.lane_head_hook
+        assert isinstance(hook, LaneHeadGather) and hook.row == streamer.residency_row and hook.head is head
+
+
+def test_a_lane_head_without_cpu_experts_is_refused(tiers):
+    """The head orders the CPU experts' miss lanes; with none it would load and do nothing, so the launch stops."""
+    service, streamers = tiers
+    service.ensure_started()
+    manager = _manager()
+    manager.lane_head = SimpleNamespace()
+    with pytest.raises(ValueError, match="SGLANG_OPT_LANE_HEAD_PATH orders the CPU experts"):
+        _attach(service, streamers[0], 1, manager)
+
+
+@pytest.mark.parametrize("lanes, capacity, width",[(8, 3, 8), (16, 5, 16), (16, 40, 40), (32, 12, 32)])
 def test_the_backend_pads_its_plan_to_the_build_lanes(lanes, capacity, width):
     """The production backend (not only the service's helper) pads ``planned`` to max(capacity, lanes): an eager post
     of 9-16 lanes at 16 must fit the tensor. Mutation: padded_plan_width returns the capacity."""

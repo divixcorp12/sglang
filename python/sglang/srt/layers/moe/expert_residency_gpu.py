@@ -235,7 +235,8 @@ class GpuResidencyUpdater:
         self.insert_active = None
         self.victims = None
         self.miss_keys = None
-        # A lane_head.LaneHead when SGLANG_OPT_LANE_HEAD_PATH is set (expert_hot_cache.from_model installs it).
+        # A lane_head.LaneHead when SGLANG_OPT_LANE_HEAD_PATH is set (expert_hot_cache.from_model installs it). Its
+        # per-request state restarts at every prefill and after capture.
         self.lane_head = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
@@ -555,6 +556,9 @@ class GpuResidencyUpdater:
         """
         if kind is ForwardKind.DRAFT:
             return
+        if kind is ForwardKind.PREFILL and self.lane_head is not None:
+            # A request starts: the head's score and age features count its verifies only, as in training.
+            self.lane_head.reset()
         if graph_served:
             self.host_pending = False
             if kind is not ForwardKind.DECODE and kind is not ForwardKind.VERIFY:
@@ -578,6 +582,9 @@ class GpuResidencyUpdater:
         self.boundary_pending.fill_(False)
         self.host_pending = False
         self.enabled.fill_(True)
+        if self.lane_head is not None:
+            # Warm-up and capture gathers ran the head on dummy routes.
+            self.lane_head.reset()
         if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(False)
         if self.insert_direct:
@@ -660,9 +667,6 @@ class GpuResidencyUpdater:
                 )
             )
         routed = self.route_counts > 0 if self.insert_on_miss else None
-        if self.lane_head is not None and routed is not None:
-            # The lane head's age feature: the forward each expert was last routed in, per layer.
-            self.lane_head.record_routed(gate, routed, self.forwards, phase == _PREFILL_PHASE)
         decay = self.decay_table.index_select(
             0, self.tokens.clamp(max=self.decay_table_tokens)
         )
