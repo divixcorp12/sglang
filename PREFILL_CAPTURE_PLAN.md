@@ -20,6 +20,34 @@
 - **Next:** one served A/B of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64), approved; results below once run.
   No size knob or startup rule until it agrees with the model's direction.
 
+## Served share-64 A/B: predictions, written before the run (2026-10-16)
+
+**Arms and environment.**
+- OFF: `...-mergechunk-expseg`. ON: the same plus `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64).
+- Code: `wt-lane-head-ab` (d269f7aa90 code; HEAD 022acb70b9 adds only an analysis script).
+- The resolved env (`/mnt/nvme1/share64-ab-20261016/resolved-env.json`) differs only in that flag.
+- The flag needs the expert-distribution recorder, which both arms already have (`per_pass`), and forces nothing else.
+
+**Predictions** for OFF → ON, from `lane_eval.py --shares` on ab-off's own served lanes (A/B prices, its clean prompts):
+
+| quantity | OFF | ON | change |
+|---|---|---|---|
+| NVMe-cold GPU lanes per verify | 13.76 | 10.17 | -3.6 |
+| forced CPU misses per verify | 64.4 | 61.6 | -2.8 |
+| stream + wait per verify | | | -5.4 ms (-6.8 with the A/B residual) |
+| prefill demand reads (route-log `ram_miss`) per serving prompt | 2,796 | 2,464 | -332 |
+| TTFT per prompt | | | -0.45 s |
+
+- **By verify position after the prefill:** -5.6 ms (0-4), -5.5 (5-14), -4.7 (15+).
+- **TTFT caveat:** section 27.9 measured +0.5 to +1.2 s at this share. The model omits the lost prefetch overlap, so
+  the measurement is expected to side with 27.9 on TTFT.
+
+**First attempt aborted, 13:46 CDT.**
+- Another project's jobs (mimo-reap on /mnt/nvme4) started after the quiet-box check.
+- Node 1 stayed at 26 GiB free, against the 64.91 GiB prelaunch floor.
+- The driver was killed in prelaunch, before any server started. Log: `run_ab.aborted-1.log`.
+- The pair is relaunched unchanged once the box is quiet.
+
 ## The plan as written
 
 Branch `lane-tier-replay`. This is a plan only: no code changed and nothing run, apart from read-only reads of the
