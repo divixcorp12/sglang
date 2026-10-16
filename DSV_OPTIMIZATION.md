@@ -1151,6 +1151,14 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             The cost is the key kernel's serial per-route dot products, not the PCA. fp32 costs only +0.08
             ms/verify over bf16, so fp32 qualifies.
           - Fix `f4eadc1fa7`: shared-memory PCA sums plus a warp per route. Re-running.
+        - **GPU run 2** (`f4eadc1fa7`): correct (C2 P within 1.8e-7, identical orders).
+          - **0.77 ms/verify** in a 40-layer graph replay (PCA kernel 8.5 µs/layer + key kernel 9.4 µs/layer). The
+            launch floor is 121 µs/verify for two kernels per layer.
+          - fp32 PCA costs the same as bf16, so fp32 is used.
+          - Proposed next: a fused single kernel, ~0.35 ms/verify.
+          - **Decision:** run the served A/B first. 0.77 ms/verify is ~0.21 ms/token against an expected gain of
+            1.2-1.4 ms/token; fusion would save only ~0.11 ms/token. Fuse, and then PDL, only if the A/B shows a
+            gain.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
