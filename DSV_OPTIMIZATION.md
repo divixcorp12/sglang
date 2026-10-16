@@ -575,7 +575,12 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
       gate's near-miss ranks 7-12.
     - **Side finding:** 18.9% of NVMe misses are rows routed 2-8 verifies earlier and since evicted from the RAM
       tier. That fits the 40 prefetch landings/verify (26 unused) churning the LRU faster than demand does.
-    - Next (CPU): a RAM-tier LRU replay validated against measured misses, then the oracle bound at 20/40/80
+    - **RAM-tier LRU replay calibrated** (`cache-tiers` `80c815adeb`): 190 rows/layer reproduces 50.4 RAM
+      misses/verify, against 51.7 measured.
+      - **Today's L+2 prefetch nets only 4.7 misses/verify for 40 reads/verify.** It covers ~18.2, but its 40
+        landings raise tier evictions from 49.8 to 54.1, and the induced re-misses take back most of the gain.
+        RAM misses go from 55.1 without prefetch to 50.4 with it.
+    - Next (CPU): the RAM-tier LRU replay, then the oracle bound at 20/40/80
       rows/verify, a near-miss gate baseline, timing, wasted reads and the RAM-capacity effect of today's prefetch.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
