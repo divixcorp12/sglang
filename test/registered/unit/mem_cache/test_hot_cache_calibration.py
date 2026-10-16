@@ -47,7 +47,8 @@ def test_trim_only_retires_just_enough_slots():
 
 
 def test_plan_keep_takes_from_the_fullest_layer_and_keeps_the_floor():
-    assert hc.plan_keep({0: 26, 1: 27, 2: 26}, 3, 16) == {0: 25, 1: 25, 2: 25}
+    # 27 -> 26 first, then the 26s from the lowest layer id.
+    assert hc.plan_keep({0: 26, 1: 27, 2: 26}, 3, 16) == {0: 25, 1: 25, 2: 26}
     assert hc.plan_keep({0: 20, 1: 20}, 0, 16) == {0: 20, 1: 20}
     with pytest.raises(ValueError, match="only 8 sit above"):
         hc.plan_keep({0: 20, 1: 20}, 9, 16)
