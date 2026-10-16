@@ -2,24 +2,31 @@
 
 A mirrored row is read from every root at once, each root its weight's share of the row
 (SGLANG_MOE_EXPERT_MIRROR_WEIGHTS, StaticSplitPolicy). With equal shares a slower drive
-finishes last and the row waits for it: on divix01 nvme3 (max_sectors_kb 256) was busy
-104.5 s on demand reads against 86.6 / 85.6 s on nvme0 / nvme2 for equal bytes
-(cores-ab-20261014/splitmodel-stream-mem-tiebreak). Shares in proportion to each
-root's read throughput give every drive the same busy time.
+finishes last and the row waits for it: on divix01 the SPCC drive (nvme4 in
+arm_env.EXPERT_MIRROR_DIRS, max_sectors_kb 256) was busy 104.5 s on demand reads against
+86.6 / 85.6 s on the two Samsungs for equal bytes (cores-ab-20261014/splitmodel-stream-mem-tiebreak),
+about 1.21x slower, so weights near 1.056 : 0.875 : 1.069 would even out the busy time.
 
-With the flag on and SGLANG_MOE_EXPERT_MIRROR_WEIGHTS unset, ``probed_weights`` reads
-each root's row images before the tables are built: PROBE_DEPTH threads per root, all
-roots at once as serving reads them, issue O_DIRECT reads of one sub-read each (a row's
-share of a root over its pieces, so the drive's request splitting is what serving sees)
-at random rows of the images, for PROBE_ROUNDS rounds of PROBE_SECONDS. A root's weight
-is its mean throughput over the mean of every root's, clamped to WEIGHT_RANGE.
+The probe reproduces served demand, not a saturating benchmark. A first probe (4 random
+reads in flight per root, back to back for 0.15 s) measured the SPCC 1.7x slower
+(2.04 against 3.48 / 3.41 GB/s, split-calib-20261015/mirror1) and its weights would have
+over-corrected: sustained queued reads flatter the Samsungs far more than demand does.
+Demand arrives in bursts: a row's sub-reads (PIECES on every root, one row's share of
+that root each) issued together, then nothing until the next row, so each drive starts
+every burst idle. ``burst_rates`` does exactly that: BURSTS bursts a round, each at a
+random row of the images, every root's PIECES sub-reads in flight at once (the served
+queue depth of one row), timed from the burst's start until that root's last sub-read
+lands, then an idle gap of IDLE_RATIO times the burst. A root's rate in a round is its
+share's bytes over its median burst time; its weight is its mean rate over every root's
+mean, clamped to WEIGHT_RANGE, so each root finishes a row's share at the same time.
 
 Guardrails: a root that read nothing, or whose rounds disagree by more than NOISE_LIMIT of
-its mean (a drive busy with something else, a probe too short to settle), fails the
-probe; so does a missing manifest or file. A failure warns and keeps the static weights
-(equal shares). An explicit SGLANG_MOE_EXPERT_MIRROR_WEIGHTS always wins and is not
-probed. The result is computed once per process and roots (every caller of
-exl3_mirror_config sees the same weights) and logged with the throughputs.
+its mean (a drive busy with something else), fails the probe; so does a missing manifest
+or file. A failure warns and keeps the static weights (equal shares). An explicit
+SGLANG_MOE_EXPERT_MIRROR_WEIGHTS always wins and is not probed. The result is computed
+once per process and roots (every caller of exl3_mirror_config sees the same weights) and
+logged with the rates. The flag stays off until a served start checks the weights
+against the busy-time target above.
 """
 
 from __future__ import annotations
@@ -28,16 +35,19 @@ import logging
 import mmap
 import os
 import random
+import statistics
 import threading
 import time
 from typing import Callable, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-PROBE_DEPTH = 4  # reads in flight per root
+PIECES = 8  # the reader's pieces per row (expert_stream_transport.STAGE_PIECES): one row's sub-reads per root
 PROBE_ROUNDS = 3
-PROBE_SECONDS = 0.15  # per round
-PIECES = 8  # the reader's pieces per row (expert_stream_transport.STAGE_PIECES)
+BURSTS = 40  # per round
+# The idle gap after a burst, as a multiple of the burst's time: drives start each row idle, as in decode, where a
+# layer's reads wait for its routing.
+IDLE_RATIO = 1.0
 ALIGN = 4096
 NOISE_LIMIT = 0.25
 # A weight over the mean, at most this far either way: past it the probe more likely measured a drive's transient
@@ -104,86 +114,93 @@ def chunk_bytes(stride: int, roots: int) -> int:
     return max(ALIGN, -(-stride // (roots * PIECES * ALIGN)) * ALIGN)
 
 
-def read_rate(paths: Sequence[str], chunk: int, seconds: float, *, depth: int = PROBE_DEPTH, direct: bool = True,
-              seed: int = 0, start: Optional[threading.Barrier] = None) -> float:
-    """Bytes/s of ``depth`` threads reading ``chunk``-byte, chunk-aligned blocks at random offsets of ``paths`` for
-    ``seconds`` (O_DIRECT when ``direct``). ``start`` lines the threads up with other roots' probes."""
+def _preadv(fd: int, buf, offset: int) -> int:
+    return os.preadv(fd, [buf], offset)
+
+
+def burst_rates(files: Sequence[Sequence[str]], stride: int, *, rounds: int = PROBE_ROUNDS, bursts: int = BURSTS,
+                idle_ratio: float = IDLE_RATIO, direct: bool = True, seed: int = 0,
+                read: Callable = _preadv) -> tuple[list, int]:
+    """rates[round][root] (bytes/s) of row bursts over ``files[root]`` (row-image files of one row ``stride``), and the
+    sub-read size: the module doc's procedure. ``read(fd, buf, offset)`` replaces os.preadv (tests)."""
+    roots = len(files)
+    chunk = chunk_bytes(stride, roots)
+    share = PIECES * chunk  # one root's share of a row
     flags = os.O_RDONLY | (os.O_DIRECT if direct else 0)
-    fds = [os.open(p, flags) for p in paths]
-    sizes = [os.fstat(fd).st_size // chunk for fd in fds]
-    if not all(sizes):
-        raise MirrorProbeError(f"a row-image file is smaller than one {chunk}-byte read")
-    total = [0] * depth
-    deadline = [0.0]
-    ready = threading.Barrier(depth + 1)
+    fds = [[os.open(p, flags) for p in paths] for paths in files]
+    rows = [[os.fstat(fd).st_size // stride for fd in root_fds] for root_fds in fds]
+    if any(n == 0 for root_rows in rows for n in root_rows):
+        raise MirrorProbeError(f"a row-image file is smaller than one {stride}-byte row")
+    workers = roots * PIECES
+    go, done = threading.Barrier(workers + 1), threading.Barrier(workers + 1)
+    burst = {"file": 0, "row": 0, "stop": False}
+    ends = [0.0] * workers
     errors = []
 
-    def worker(i: int) -> None:
-        rng = random.Random(seed * 1000 + i)
+    def worker(w: int) -> None:
+        root, piece = divmod(w, PIECES)
         buf = mmap.mmap(-1, chunk)  # page-aligned, as O_DIRECT needs
         try:
-            ready.wait()
-            while time.monotonic() < deadline[0]:
-                f = rng.randrange(len(fds))
-                n = os.preadv(fds[f], [buf], rng.randrange(sizes[f]) * chunk)
+            while True:
+                go.wait()
+                if burst["stop"]:
+                    return
+                f = burst["file"] % len(fds[root])
+                row = burst["row"] % rows[root][f]
+                # Root p reads its share of the row, as the static split lays the shares out in root order.
+                offset = row * stride + min(root * share + piece * chunk, stride - chunk)
+                n = read(fds[root][f], buf, offset)
                 if n <= 0:
-                    raise MirrorProbeError(f"a read of {paths[f]} returned {n}")
-                total[i] += n
+                    raise MirrorProbeError(f"a read of {files[root][f]} returned {n}")
+                ends[w] = time.monotonic()
+                done.wait()
+        except threading.BrokenBarrierError:
+            return
         except Exception as e:  # noqa: BLE001 - reported by the caller
             errors.append(e)
+            go.abort()
+            done.abort()
         finally:
             buf.close()
 
-    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(depth)]
+    threads = [threading.Thread(target=worker, args=(w,), daemon=True) for w in range(workers)]
     for t in threads:
         t.start()
+    rng = random.Random(seed)
+    rates = []
     try:
-        if start is not None:
-            start.wait()
-        began = time.monotonic()
-        deadline[0] = began + seconds
-        ready.wait()
+        for _ in range(rounds):
+            times = [[] for _ in range(roots)]
+            for _ in range(bursts):
+                burst["file"], burst["row"] = rng.randrange(1 << 30), rng.randrange(1 << 30)
+                start = time.monotonic()
+                go.wait()
+                done.wait()
+                for root in range(roots):
+                    times[root].append(max(ends[root * PIECES : (root + 1) * PIECES]) - start)
+                time.sleep((time.monotonic() - start) * idle_ratio)
+            rates.append([share / statistics.median(t) for t in times])
+        burst["stop"] = True
+        go.wait()
     except threading.BrokenBarrierError:
-        ready.abort()  # another root's probe failed: release this root's threads unread
-        raise MirrorProbeError("another root's probe failed") from None
+        raise MirrorProbeError(f"a probe read failed: {errors[0]!r}" if errors else "the probe broke") from None
     finally:
+        go.abort()
+        done.abort()
         for t in threads:
             t.join()
-        for fd in fds:
-            os.close(fd)
-    elapsed = time.monotonic() - began
+        for root_fds in fds:
+            for fd in root_fds:
+                os.close(fd)
     if errors:
         raise MirrorProbeError(f"a probe read failed: {errors[0]!r}")
-    return sum(total) / elapsed
-
-
-def probe_rates(roots: Sequence[str], *, rounds: int = PROBE_ROUNDS, seconds: float = PROBE_SECONDS,
-                direct: bool = True) -> tuple[list, int]:
-    """rates[round][root] (bytes/s), every root read at once each round, and the sub-read size."""
-    files = [root_files(r) for r in roots]
-    chunk = chunk_bytes(files[0][1], len(roots))
-    rates = []
-    for r in range(rounds):
-        out = [0.0] * len(roots)
-        errors = []
-        start = threading.Barrier(len(roots))
-
-        def one(i: int) -> None:
-            try:
-                out[i] = read_rate(files[i][0], chunk, seconds, direct=direct, seed=r, start=start)
-            except Exception as e:  # noqa: BLE001 - reported below
-                errors.append(e)
-                start.abort()
-
-        threads = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(len(roots))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        if errors:
-            raise MirrorProbeError(f"probe round {r} failed: {errors[0]!r}")
-        rates.append(out)
     return rates, chunk
+
+
+def probe_rates(roots: Sequence[str], *, direct: bool = True, **kwargs) -> tuple[list, int]:
+    """burst_rates over each root's row images."""
+    found = [root_files(r) for r in roots]
+    return burst_rates([f for f, _ in found], found[0][1], direct=direct, **kwargs)
 
 
 def probed_weights(roots: Sequence[str], probe: Optional[Callable] = None) -> tuple[float, ...]:
@@ -203,8 +220,8 @@ def probed_weights(roots: Sequence[str], probe: Optional[Callable] = None) -> tu
     else:
         means = [sum(r[i] for r in rates) / len(rates) / 1e9 for i in range(len(key))]
         logger.info(
-            "mirror weight calibration in %.2f s, %d KiB reads x %d deep, %d rounds: %s -> weights %s%s",
-            time.monotonic() - began, chunk // 1024, PROBE_DEPTH, len(rates),
+            "mirror weight calibration in %.2f s, row bursts of %d x %d KiB a root, %d rounds: %s -> weights %s%s",
+            time.monotonic() - began, PIECES, chunk // 1024, len(rates),
             ", ".join(f"{root} {gb:.2f} GB/s" for root, gb in zip(key, means)),
             ":".join(f"{w:g}" for w in weights),
             f" (clamped to {WEIGHT_RANGE[0]:g}..{WEIGHT_RANGE[1]:g} of the mean: roots {clamped})" if clamped else "",

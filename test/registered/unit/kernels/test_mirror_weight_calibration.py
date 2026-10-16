@@ -5,6 +5,8 @@ fallback, and the precedence of an explicit SGLANG_MOE_EXPERT_MIRROR_WEIGHTS."""
 import logging
 import math
 import os
+import threading
+import time
 
 import pytest
 
@@ -68,12 +70,59 @@ def _root(tmp_path, name, experts=8, stride=64 * 1024):
     return str(root)
 
 
-def test_the_probe_reads_every_root_at_once(tmp_path):
+def test_the_probe_reads_every_roots_images(tmp_path):
     roots = [_root(tmp_path, "a"), _root(tmp_path, "b")]
     files, stride = mw.root_files(roots[0])
     assert len(files) == 2 and stride == 64 * 1024
-    rates, chunk = mw.probe_rates(roots, rounds=2, seconds=0.05, direct=False)
+    rates, chunk = mw.probe_rates(roots, rounds=2, bursts=5, direct=False)
     assert chunk == mw.ALIGN and len(rates) == 2 and all(r > 0 for row in rates for r in row)
+
+
+class _Drives:
+    """A fake read: each root's sub-read takes its own time, and the calls are recorded per root."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds  # by root name
+        self.lock = threading.Lock()
+        self.calls = []  # (root, start, end, offset)
+        self.in_flight = {name: 0 for name in seconds}
+        self.peak = {name: 0 for name in seconds}
+
+    def __call__(self, fd, buf, offset):
+        name = os.path.basename(os.path.dirname(os.path.dirname(os.readlink(f"/proc/self/fd/{fd}"))))
+        with self.lock:
+            self.in_flight[name] += 1
+            self.peak[name] = max(self.peak[name], self.in_flight[name])
+        start = time.monotonic()
+        time.sleep(self.seconds[name])
+        with self.lock:
+            self.in_flight[name] -= 1
+            self.calls.append((name, start, time.monotonic(), offset))
+        return len(buf)
+
+
+def test_row_bursts_give_each_root_its_share_by_burst_time(tmp_path):
+    """A root whose sub-reads take twice as long gets half the weight of one whose do not, so both finish a row's share
+    together; each burst puts one row's PIECES sub-reads in flight on every root at once, at that root's share of the
+    row, and the next burst starts only after an idle gap. Mutations: rates from mean throughput of back-to-back reads,
+    or all roots reading root 0's share -- red."""
+    roots = [_root(tmp_path, "a", stride=mw.ALIGN * mw.PIECES * 2), _root(tmp_path, "b", stride=mw.ALIGN * mw.PIECES * 2)]
+    drives = _Drives({"a": 0.004, "b": 0.008})
+    found = [mw.root_files(r) for r in roots]
+    rates, chunk = mw.burst_rates([f for f, _ in found], found[0][1], rounds=3, bursts=6, direct=False, read=drives)
+    weights, clamped = mw.weights_from_rates(rates)
+    assert clamped == [] and math.isclose(weights[0] / weights[1], 2.0, rel_tol=0.15), (weights, rates)
+    assert drives.peak == {"a": mw.PIECES, "b": mw.PIECES}
+    share = mw.PIECES * chunk
+    for name, root in (("a", 0), ("b", 1)):
+        offsets = {o % (2 * share) for n, _, _, o in drives.calls if n == name}
+        assert offsets == {root * share + p * chunk for p in range(mw.PIECES)}, name
+    # Bursts do not overlap: sorted by start, each burst's reads end before the next burst's begin.
+    calls = sorted(drives.calls, key=lambda c: c[1])
+    groups = [calls[i : i + 2 * mw.PIECES] for i in range(0, len(calls), 2 * mw.PIECES)]
+    assert len(groups) == 3 * 6
+    for a, b in zip(groups, groups[1:]):
+        assert max(c[2] for c in a) < min(c[1] for c in b)
 
 
 def test_a_root_without_images_fails_the_probe_and_keeps_equal_weights(tmp_path, caplog):
