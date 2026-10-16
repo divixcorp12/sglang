@@ -400,7 +400,21 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   bytes copied. `SGLANG_MOE_HOT_ASYNC_PROMOTIONS` is refused for EXL3. CPU keep-warm
   `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US=2000` is on by default in all runs.
 
-### 3.11 JIT build speed — branch `jit-build-speed` (`99e54e2bf3`, `fc653e9a8a`, ... `d81d37dcf1`)
+### 3.11 JIT build speed — MERGED as `0923ed8e97` (`99e54e2bf3`, `fc653e9a8a`, `d81d37dcf1`)
+
+- Cold build of the 9 expert-stream host modules:
+  - serial (old): 614.7 s;
+  - parallel warm (`python -m sglang.test.warm_expert_stream_modules --variants instr,prod --lanes 8,16 --nodes
+    1,2`): 109.5 s;
+  - parallel + launcher, ccache cold: 105.0 s;
+  - from another worktree with `SGLANG_JIT_COMPILER_LAUNCHER=ccache`: 22.2 s (9 direct hits);
+  - all cached: 0.1 s.
+- Tests: 53 + 22 passed.
+- Only the launcher gets cross-worktree hits: it reaches the tree through a `sglang-src` symlink, so paths match.
+  The system-wide masquerade only caches nvcc's host `c++` subcalls with per-worktree paths.
+- nvcc through the launcher is untested on the box.
+- `hash_dir = false` is added to `~/.config/ccache/ccache.conf`; with -g, the cwd would otherwise defeat hits.
+- A suite runner should run the warm-up command once before `pytest -n 8`.
 
 - Opt-in `SGLANG_JIT_COMPILER_LAUNCHER` (ccache for nvcc builds) and parallel warm-up. Cold-build timings running
   (serial, parallel, ccache); may be inflated by concurrent test compiles.
