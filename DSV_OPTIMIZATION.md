@@ -85,10 +85,13 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
     | D | 75.4 | 268.9 | 320.2 | 145.7 | 50.5 | 0.515 |
 
     - The VRAM hit rate didn't move.
-    - **Suspicious:** rule counters fell far more than a reorder allows. to_cpu went 2440/2158 -> 1856/1655 and
-      to_copy 3820/3645 -> 3187/3195, on similar record counts, while stream rose 7.6 ms.
-    - Being checked offline before any rerun: does the serving path's cost-word packing (5N+6 with the flags word)
-      match what the device reads?
+    - **Not a cost-word bug** (checked offline):
+      - `to_cpu`/`to_copy` count lanes where the model disagrees with the table, so the tiebreak lowers both. The
+        net lanes moved to copy are unchanged (0.552 vs 0.565 per record).
+      - D's logged cost words equal A's, plus the flags word.
+      - The job-trace split matches A within 0.5% (CPU hit lanes 318.3 vs 320.0, DMA 116.2 vs 115.9).
+    - What remains is the draft drop-cache fix or run noise. Arm A' (A at D's code, tiebreak off) is the new OFF
+      sample.
 
 ### 3.3 Startup calibration of the split-model constants — branch `split-model-calib` (`7171570959`), NOT merged
 
