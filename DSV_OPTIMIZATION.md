@@ -1144,6 +1144,13 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
           - The key is now P's fp32 bit pattern: the fixed-point key rounded small P to 0 and reordered lanes.
           - GPU tests and the microbenchmark are approved. PCA precision is chosen by microbenchmark (fp32 unless
             it costs more than 0.1 ms/verify).
+        - **GPU run 1:** correctness passes. `test_lane_head_gpu.py` 8 passed; on C2, P is within 2.4e-7 and
+          lane order is identical for both PCA dtypes. Flag-off pass/fail sets match base (the one known failure on
+          base is `test_fused_moe_refuses_cpu_experts_for_several_tokens`).
+          - **Too slow: 1.34 ms/verify** in a 40-layer graph replay (33.5 µs/layer) against the 0.5 ms limit.
+            The cost is the key kernel's serial per-route dot products, not the PCA. fp32 costs only +0.08
+            ms/verify over bf16, so fp32 qualifies.
+          - Fix `f4eadc1fa7`: shared-memory PCA sums plus a warp per route. Re-running.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
