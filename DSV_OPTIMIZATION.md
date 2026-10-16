@@ -1348,6 +1348,17 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
                   pool serve, prefill-merge-chunk and expseg.
               - **Next (approved):** a startup-computed share size (usable rows per layer x the sweep's 0.15
                 knee), then one served pair, share-64 vs share-startup (~28).
+              - **Result (2026-10-16, `/mnt/nvme1/share28-ab-20261016`): share 28 loses; keep 64.** Startup computed
+                28 = 0.15 x 187 usable rows. Both arms rc 0, no OOM.
+                - Decode ms/token (28 - 64), 6 clean prompts: -1.78, 95% CI -4.53..+0.82, so not significant.
+                - TTFT: +1.58 s per prompt (predicted +0.74). On every prompt, the TTFT cost exceeded the decode
+                  saving (at most 0.45 s). Break-even is about 900 generated tokens per request.
+                - Stream + wait per verify: -7.5 ms (predicted -4.9). Forced CPU misses per verify: -11.7 (predicted
+                  -5.4). Prefill demand reads per prompt: +571 (predicted +537).
+                - Flags: ab-start p3 STALL/PREFILL-STALL, ab-64 p6 CPUSLOW.
+                - 0.15 is the decode-optimal knee, but the wrong default when TTFT counts. The startup rule's fraction
+                  becomes 64/187 (about 0.34) on `prefill-share-size-ps`: it reproduces 64 today and scales with the
+                  tier.
             - **Approved:** one served A/B pair of `SGLANG_DSV41_ENABLE_PREFILL_SHARE=1` (share 64, no code) on
               `-mergechunk-expseg`, with the route log, predictions written down first. If it matches the model's
               direction: a share-size knob with a startup calibration rule (64 is hard-coded today).
@@ -1487,7 +1498,7 @@ master's `prod_env()` at `a7cce264fe`.
 | pin01 | `PINNED_HOST_FULL_LAYERS=0,1`, pinned MB 111530 / NUMA 59656:51874 | 70.5 vs 76.2, layers 0+1 20.5 -> 13.0 ms/verify (3.1) | enable |
 | split model | `ENABLE_CPU_SPLIT_MODEL=1` | -2.9%, one pair, matched by replay (3.2) | enable, with startup calibration on and refinement off (3.3) |
 | -mem | `SCHEDULER_MLOCK=1`, `HICACHE_HOST_NUMA_NODE=1`, `--weight-loader-drop-cache-after-load` | node-0 swap and faults fixed; speed neutral (3.4) | enable |
-| prefill share | (on since `a7cce264fe`) | -3.46 ms/token (3.8) | done; startup size under test |
+| prefill share | (on since `a7cce264fe`) | -3.46 ms/token (3.8) | done; share 28 lost (TTFT +1.58 s), keep 64; startup fraction 64/187 |
 | prefetch stack | `RAM_PREFETCH` + horizon 2, T3 head file, cap 2, pool serve, promote, idle2 | no clean served win (DSV41_REFERENCE 33.14-33.37; promote "converts, does not add") | pending lane-tier's offline comparison; the head file lives outside the repo |
 
 **Parked on master, OFF, and we are coming back to both (owner decision 2026-10-16):**
