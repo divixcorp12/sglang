@@ -166,6 +166,11 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
     - New fake-drive test (2x slow root): weights come out ~2:1, at most 8 sub-reads in flight per root, each root
       reads its own share, and bursts don't overlap.
     - `IDLE_RATIO` and queue depth 8 are assumptions. The validation start after the peak logger checks for ~1.21x.
+    - **Validation #2** (2026-10-15 22:46-22:53, `mirror2`): 11 CPU tests passed.
+      - Probe in 0.58 s: nvme0 2.80, nvme4 2.13, nvme2 2.67 GB/s, giving weights **1.1052 : 0.8416 : 1.0532**.
+      - That is 1.31x, against a target of ~1.21x: much closer than the first probe's 1.7x.
+      - Pending: the stall check over the probe window, then a served A/B against mergechunk-r2 to test whether
+        it equalises root busy times.
 - **A/B arms** (`f58bd94a44`):
   - `...-pin01-splitmodel-fixedcosts`: all old offline fits, calibration skipped.
   - `...-pin01-splitmodel-refine`: calibration + `REFINE_BATCHES=50`.
@@ -575,6 +580,14 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       - Step 1 is a map of the capacity-dependent init and a reorder proposal, before any code. `model_runner.py`
         stays a hook call at most.
       - The expandable_segments smoke still runs first.
+  - **expandable_segments smoke** (`splitmodel-stream-mem-hicache1-mergechunk-expseg`, 2026-10-15 22:55-23:03),
+    read from the log:
+    - **Peak used 30,163 MiB, 2,040 MiB free** (482-598 before).
+    - Reserved peak 26,730 (28,242 before); allocated peak 26,292.
+    - Graphs captured, 0 OOM lines.
+    - **That recovers ~1.5 GB, about 115 slots.** The agent's speed check is pending.
+    - Next: the same arm with the hot cache grown into the freed memory, A/B against mergechunk-r2 via
+      serve_compare.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
