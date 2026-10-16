@@ -22,8 +22,12 @@ and counts per verify: VRAM hits, lanes by kind, forced CPU lanes, inserts, lost
 their returns within --horizon verifies (rule-1 swaps: priced NVMe-cold or RAM-warm by lane_tier_replay's NodeTier
 model, TIER_RULES at a98b5b527c, without prefill admissions).
 
+``victims`` reports the proxy shortlist head's recurrence on any capture with graph_routes (C2 has no drip or lane_kind
+events, so only this runs there).
+
 Usage: drip_hot_replay.py gate CAPTURE [--skip 8] [--json OUT]
        drip_hot_replay.py arms CAPTURE [--skip 8] [--horizon 3] [--json OUT]
+       drip_hot_replay.py victims CAPTURE [--json OUT]
 """
 
 from __future__ import annotations
@@ -84,7 +88,10 @@ class Capture:
             s = stamps.get(r["seq"])
             r["row"], r["gen"] = key
             r["verify"] = k
-            r["post"] = s["post_start"] if s and s["post_start"] else r["start"]
+            # The post reads the scratch table after its delta wait, so its end, not its start, bounds the read.
+            r["post"] = s["post_end"] if s and s["post_end"] else r["start"]
+            # An adoption runs at the gather, before the post starts: the arms use this bound.
+            r["gather"] = s["post_start"] if s and s["post_start"] else r["start"]
             r["ordered"] = [order[key][j] for j in sorted(order[key])]
             if len(r["ordered"]) != r["lane_count"]:
                 continue  # a group's lane_kind events are missing: not a whole record
@@ -96,8 +103,9 @@ class Capture:
         self._routes()
 
     def _drips(self, ev: dict) -> None:
-        """Per target record: the drips published before its post (expert -> land ns), and the admitted picks in pick
-        order. A drip's target is its row's first record after the scored (source) record."""
+        """Per target record: the drips published before its post ends (expert -> land ns), and the admitted picks in
+        pick order with their land ns (None: never landed). A drip's target is its row's first record after the scored
+        (source) record."""
         by_row = collections.defaultdict(list)
         for r in self.records:
             by_row[r["row"]].append(r)
@@ -258,14 +266,275 @@ def gate(cap: Capture) -> dict:
     }
 
 
+# ---- arms -------------------------------------------------------------------------------------------------------------
+
+
+def proxy_rankings(lines: list[dict]) -> list[list[list[int]]]:
+    """Per route line and layer, the residents before that forward in a proxy of _rank_victims' order: (routed by the
+    previous forward, insert score, -expert) ascending, the score decayed 0.98 per token and fed by route counts
+    (MOE/expert_residency_gpu.py:650-659, 933-941). Scores start at 0 at the first line: prefill counts are absent."""
+    layers = len(lines[0]["routes"])
+    score = [collections.defaultdict(float) for _ in range(layers)]
+    prev = [set() for _ in range(layers)]
+    out = []
+    for x in lines:
+        tokens = max(1, len(x["routes"][0]) // 6)
+        ranked = []
+        for L in range(layers):
+            hot = [e for e in x["hot"][L] if e >= 0]
+            ranked.append(sorted(hot, key=lambda e: (e in prev[L], score[L][e], -e)))
+        out.append(ranked)
+        decay = 0.98 ** tokens
+        for L in range(layers):
+            routed = collections.Counter(e for e in x["routes"][L] if e >= 0)
+            for e in list(score[L]):
+                score[L][e] *= decay
+            for e, n in routed.items():
+                score[L][e] += n
+            prev[L] = set(routed)
+    return out
+
+
+def counts_of(r: dict, lanes: list[tuple[int, bool]], kinds: list[int], forced_from: int) -> collections.Counter:
+    c = collections.Counter()
+    for j, ((e, _), k) in enumerate(zip(lanes, kinds)):
+        c[category(k, e, r)] += 1
+        c["forced"] += j >= forced_from
+        c["inserts"] += j < forced_from and k in (HIT_COPY, HIT_SM, MISS_GPU, HIT_SCRATCH)
+        c["d2d"] += k == HIT_SCRATCH
+    return c
+
+
+def perturb(r: dict, arm: str, ranked: list[int] | None, routed: set | None) -> tuple[collections.Counter, list[int]]:
+    """One record under ``arm``: its lane counts and the residents it evicts beyond its inserts' (pre-route losses)."""
+    lanes, ff = record_lanes(r)
+    count = len(lanes)
+    usable = ff if ff < count else 1 << 30  # victims the lanes found (unbounded when nothing spilled)
+    if arm == "today":
+        kinds = type_record(lanes, ff, set(r["published"]))
+        c = counts_of(r, lanes, kinds, ff)
+        c["vram"] += r["routed"] - count
+        return c, []
+    lane_experts = {e for e, _ in lanes}
+    ready = {e for _, e, ns in r["picks"] if ns is not None and ns < r["gather"]}
+    lost: list[int] = []
+    if arm in ("B_noext", "B_ext"):
+        adopt = ready & lane_experts
+    elif arm == "A2":
+        reserved = [(e, ns) for p, e, ns in r["picks"] if p < 2]
+        adopt = {e for e, ns in reserved if ns is not None and ns < r["gather"]} & lane_experts
+        lost = (ranked or [])[: len(reserved)]
+    elif arm == "C1":
+        first = [(e, ns) for p, e, ns in r["picks"] if p == 0]
+        adopt = {e for e, ns in first if ns is not None and ns < r["gather"]} & lane_experts
+        lost = (ranked or [])[:1]
+    else:
+        raise ValueError(arm)
+    lost_routed = [e for e in lost if routed is not None and e in routed and e not in lane_experts]
+    # Kept lanes in plan order; a lost resident is a RAM-warm miss of the VRAM cache (its RAM row was pinned while
+    # hot, TIER_RULES 3) with the lowest key, so it plans last.
+    new = [(e, hit) for e, hit in lanes if e not in adopt] + [(e, True) for e in lost_routed]
+    n_adopt_spilled = sum(1 for j, (e, _) in enumerate(lanes) if e in adopt and j >= ff)
+    if arm == "B_noext":
+        window = usable - len(adopt) if usable < (1 << 30) else 1 << 30
+    else:
+        window = usable
+    ff2 = min(len(new), window)
+    kinds = type_record(new, ff2, set())
+    c = counts_of(r, new, kinds, ff2)
+    c["vram"] += r["routed"] - count + len(adopt) - len(lost_routed)
+    c["adopted"] += len(adopt)
+    c["adopted_from_spill"] += n_adopt_spilled
+    c["d2d"] += len(adopt) if arm.startswith("B") else 0
+    c["inserts"] += len(adopt)
+    c["lost_hits"] += len(lost_routed)
+    c["reserved"] += len(lost) if arm == "A2" else 0
+    c["reserved_wasted"] += (len(lost) - len(adopt)) if arm == "A2" else 0
+    return c, lost
+
+
+def arms(cap: Capture, horizon: int) -> dict:
+    lines = cap.lines
+    ranks = proxy_rankings(lines)
+    names = ("today", "B_noext", "B_ext", "A2", "C1")
+    per_v = {a: collections.defaultdict(collections.Counter) for a in names}
+    released = {a: [] for a in names}  # (route line, layer, expert): residents evicted beyond today's
+    for r in cap.records:
+        li = cap.line_of_verify.get(r["verify"])
+        ranked = routed = None
+        if li is not None:
+            ranked = ranks[li][r["row"]]
+            routed = {e for e in lines[li]["routes"][r["row"]] if e >= 0}
+        base, _ = perturb(r, "today", ranked, routed)
+        per_v["today"][r["verify"]] += base
+        for a in names[1:]:
+            c, lost = perturb(r, a, ranked, routed)
+            per_v[a][r["verify"]] += c
+            if li is None:
+                continue
+            # Residents this arm evicts that the capture kept: its extra inserts' victims (the next ranked residents
+            # the capture did not evict), and A/C's pre-route victims.
+            nxt = lines[li + 1]["hot"][r["row"]] if li + 1 < len(lines) else []
+            kept = [e for e in ranked if e in set(nxt) and e not in routed]
+            # A2's adopted drips land in slots their reservations already emptied; C1's lost resident is its missing
+            # slot, recounted each verify, not an eviction.
+            if a == "A2":
+                extra = max(0, c["inserts"] - c["adopted"] - base["inserts"])
+                head = lost
+            else:
+                extra = max(0, c["inserts"] - base["inserts"])
+                head = []
+            victims = list(dict.fromkeys(head + [e for e in kept if e not in lost][:extra]))
+            c2 = per_v[a][r["verify"]]
+            c2["extra_evictions"] += len(victims)
+            released[a].extend((li, r["row"], e) for e in victims)
+    returns = {a: tier_returns(cap, released[a], horizon) for a in names}
+    out = {"verifies": len(per_v["today"]), "horizon": horizon, "arms": {}}
+    keys = CATS + ("forced", "inserts", "d2d", "adopted", "adopted_from_spill", "lost_hits", "reserved",
+                   "reserved_wasted", "extra_evictions")
+    nv = len(per_v["today"])
+    mean = {a: {k: sum(v[k] for v in per_v[a].values()) / nv for k in keys} for a in names}
+    t = mean["today"]
+    cpu = lambda m: m["cpu_ram"] + m["cpu_pool"] + m["cpu_nvme"]
+    for a in names:
+        m = mean[a]
+        ret = returns[a]
+        d_cpu = cpu(m) - cpu(t)
+        d_nvme = m["nvme_gpu"] - t["nvme_gpu"]
+        d_d2d = m["d2d"] - t["d2d"]
+        gpu_ms = d_d2d * D2D_MS_PER_ROW + (cap.rows * ADOPT_LAUNCH_MS if a != "today" else 0.0)
+        warm = ret.get("warm", 0) / nv
+        cold = ret.get("cold", 0) / nv
+        net_cpu = d_cpu + warm  # a RAM-warm return comes back as a lane: counted as a CPU lane (the bound)
+        priced = {}
+        for name, per_lane in (("cpu_0.07", 0.07), ("cpu_0.28", 0.28)):
+            priced[name] = round(
+                d_cpu * per_lane + warm * per_lane + cold * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS)
+                + d_nvme * (NVME_GPU_MS + NVME_ON_CPU_MISS_MS) + gpu_ms, 2)
+        out["arms"][a] = {
+            "per_verify": {k: round(v, 2) for k, v in m.items()},
+            "delta_cpu_lanes": round(d_cpu, 2),
+            "delta_nvme_gpu_lanes": round(d_nvme, 2),
+            "returns_ram_warm": round(warm, 2),
+            "returns_nvme_cold": round(cold, 2),
+            "net_cpu_lanes_with_warm_returns": round(net_cpu, 2),
+            "added_gpu_ms": round(gpu_ms, 3),
+            "ms_per_verify_vs_today": priced,  # negative is a saving
+            "build_gate": {
+                "cpu_lanes_-30": net_cpu <= -30,
+                "no_more_nvme_gpu": d_nvme <= 0 and cold == 0 if a != "today" else None,
+                "gpu_ms_<=0.5": gpu_ms <= 0.5,
+            },
+        }
+    out["tier_model"] = returns["today"]["model"]
+    return out
+
+
+def tier_returns(cap: Capture, released: list[tuple[int, int, int]], horizon: int) -> dict:
+    """Drive lane_tier_replay's NodeTier (TIER_RULES 1-6, 9; no prefill admissions, rule 8) over the route lines with
+    the released residents unpinned from their release until they are routed again or ``horizon`` lines pass, and
+    classify each return (routed again inside the horizon, while the capture kept it resident) as RAM-warm or
+    NVMe-cold."""
+    rows, frac, share, full = ltr.numa_capacities(cap.dir)
+    layers = len(cap.lines[0]["routes"])
+    tiers = [ltr.layer_tiers(rows.get(L, 210), frac, share) for L in range(layers)]
+    p_promote = ltr.promote_fraction(cap.dir)
+    lines = cap.lines
+    seqs = {r["seq"] for r in cap.records}
+    timeline = [(int(x["t"] * 1e9), 1, "line", i) for i, x in enumerate(lines)]
+    for e in cap.ev["evict"]:
+        if e["seq"] not in seqs:
+            timeline.append((e["ns"], 0, "evict", (e["row"], e["group"], e["a"], e["c"])))
+    for e in cap.ev["spec_land"]:
+        if ltr._hash01(e["row"], e["a"], e["ns"] & 0xFFFFFFFF) < p_promote:
+            timeline.append((e["ns"], 0, "promote", (e["row"], e["a"])))
+    timeline.sort(key=lambda t: (t[0], t[1]))
+    open_ = collections.defaultdict(dict)  # layer -> expert -> release line
+    by_line = collections.defaultdict(list)
+    for li, L, e in released:
+        by_line[li].append((L, e))
+    res = collections.Counter()
+    last_hot = collections.defaultdict(set)
+    tick = 0
+    for _, _, kind, payload in timeline:
+        tick += 1
+        if kind == "evict":
+            row, g, old, new = payload
+            if row < layers and row not in full:
+                tiers[row][g].apply_eviction(old, new, tick)
+            continue
+        if kind == "promote":
+            row, e = payload
+            if row < layers and row not in full:
+                tiers[row][e % NODES].promote(e, last_hot[row])
+            continue
+        li = payload
+        x = lines[li]
+        for L in range(layers):
+            routed = {e for e in x["routes"][L] if e >= 0}
+            hot = {e for e in x["hot"][L] if e >= 0}
+            for e, start in list(open_[L].items()):
+                if li - start > horizon or e not in hot:
+                    del open_[L][e]  # past the horizon, or the capture evicted it anyway
+                elif e in routed:
+                    res["returns"] += 1
+                    res["warm" if tiers[L][e % NODES].has(e) else "cold"] += 1
+                    del open_[L][e]
+            hot_cf = hot - set(open_[L])
+            last_hot[L] = hot_cf
+            if L in full:
+                continue
+            protected = hot_cf | routed
+            for e in routed:
+                t = tiers[L][e % NODES]
+                if t.has(e):
+                    t.stamp[e] = tick
+            for e in routed - hot_cf:
+                tiers[L][e % NODES].insert(e, tick, protected)
+        for L, e in by_line.get(li, ()):
+            open_[L][e] = li
+        res["released"] += len(by_line.get(li, ()))
+    res["model"] = f"lane_tier_replay NodeTier (TIER_RULES={ltr.TIER_RULES}), no prefill admissions; promote {p_promote:.3f}"
+    return dict(res)
+
+
+def victims(d: str) -> dict:
+    """The proxy shortlist's head on any capture with graph_routes: P(routed this forward) and within 3, by rank."""
+    lines = []
+    with open(os.path.join(d, "stages.jsonl")) as f:
+        for line in f:
+            if '"graph_routes"' in line:
+                x = json.loads(line)
+                if x.get("kind") == "graph_routes":
+                    lines.append(x)
+    ranks = proxy_rankings(lines)
+    now, soon, n = collections.Counter(), collections.Counter(), collections.Counter()
+    for li in range(8, len(lines)):
+        for L, ranked in enumerate(ranks[li]):
+            for k, e in enumerate(ranked[:12]):
+                n[k] += 1
+                now[k] += any(e == x for x in lines[li]["routes"][L])
+                soon[k] += any(e in lines[w]["routes"][L] for w in range(li, min(li + 3, len(lines))))
+    return {"capture": os.path.abspath(d), "lines": len(lines),
+            "by_rank": {k: {"routed_now": round(now[k] / n[k], 3), "routed_within_3": round(soon[k] / n[k], 3),
+                            "n": n[k]} for k in sorted(n)}}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=("gate", "arms"))
+    p.add_argument("mode", choices=("gate", "arms", "victims"))
     p.add_argument("capture")
     p.add_argument("--skip", type=int, default=8)
     p.add_argument("--horizon", type=int, default=3)
     p.add_argument("--json")
     a = p.parse_args()
+    if a.mode == "victims":
+        res = victims(a.capture)
+        print(json.dumps(res, indent=1))
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump(res, f, indent=1)
+        return 0
     cap = Capture(a.capture, a.skip)
     if a.mode == "gate":
         res = gate(cap)
