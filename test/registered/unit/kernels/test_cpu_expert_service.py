@@ -228,9 +228,10 @@ class FakeHost:
 
     def enable_cpu_experts(
         self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0, two_stage=False,
-        two_stage_weights=None,
+        two_stage_weights=None, store_out=False,
     ):
         self.two_stage_weights = two_stage_weights
+        self.store_out = store_out
         self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
         self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
         self.keep_warm_us = keep_warm_us
@@ -330,6 +331,23 @@ def test_service_passes_the_two_stage_flag_to_the_host_and_logs_it(caplog):
         host = FakeHost()
         _service(host, FakeServiceTrait())
     assert host.two_stage is True and "two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): on" in caplog.text
+
+
+def test_service_passes_the_store_out_flag_to_the_host_and_logs_it(caplog):
+    """SGLANG_DSV41_CPU_EXPERTS_STORE_OUT reaches enable_cpu_experts, off by default, and the startup log names it."""
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        _service(host, FakeServiceTrait())
+    assert host.store_out is False and "output rows (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT): off" in caplog.text
+    caplog.clear()
+    with envs.SGLANG_DSV41_CPU_EXPERTS_STORE_OUT.override(True), caplog.at_level(
+        "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
+    ):
+        host = FakeHost()
+        _service(host, FakeServiceTrait())
+    assert host.store_out is True and "output rows (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT): on" in caplog.text
 
 
 def test_service_passes_the_span_weights_to_the_host_and_logs_them(caplog):

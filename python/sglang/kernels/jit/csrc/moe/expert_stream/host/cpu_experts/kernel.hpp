@@ -73,6 +73,10 @@ struct ForwardCall {
   // kernel that cannot split its forward calls it first. Null: one stage.
   void (*stage_two)(void*) = nullptr;
   void* stage_two_ctx = nullptr;
+  // An overwrite (accumulate false) may store each row's first sum and zero only the rows no route writes, instead of
+  // zeroing every row and then adding (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT). The bits are the same either way; a kernel
+  // that ignores it overwrites as before. Last, so a kernel built before it reads a call it knows.
+  bool store_first = false;
 };
 
 class CpuExpertKernel {

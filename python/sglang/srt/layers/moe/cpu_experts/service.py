@@ -197,6 +197,7 @@ class CpuExpertService:
             self.layers: dict[int, object] = {}
         keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
         self.two_stage = envs.SGLANG_DSV41_CPU_TWO_STAGE.get()
+        self.store_out = envs.SGLANG_DSV41_CPU_EXPERTS_STORE_OUT.get()
         self.span_weights = (None, None)
         if self.two_stage:
             from sglang.srt.layers.moe.exl3_expert_format import two_stage_span_weights
@@ -213,6 +214,7 @@ class CpuExpertService:
             keep_warm_us=max(keep_warm_us, 0),
             two_stage=self.two_stage,
             two_stage_weights=self.span_weights,
+            store_out=self.store_out,
         )
         self._last_stats = host.cpu_stats(self.group)
         logger.info(
@@ -236,6 +238,11 @@ class CpuExpertService:
             f"on, w13 weights {span(self.span_weights[0])}, w2 weights {span(self.span_weights[1])}"
             if self.two_stage
             else "off",
+        )
+        logger.info(
+            "CPU experts group %d kernel stores its output rows (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT): %s",
+            self.group,
+            "on" if self.store_out else "off",
         )
 
     def _capacity(self, slabs: Mapping[str, torch.Tensor]) -> int:

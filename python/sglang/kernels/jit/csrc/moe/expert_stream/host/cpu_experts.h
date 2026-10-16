@@ -133,6 +133,9 @@ struct CpuExpertConfig {
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
   bool two_stage = false;    // SGLANG_DSV41_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job (CpuJob::staged)
+  // SGLANG_DSV41_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (ForwardCall::store_first), not a zeroing of
+  // the job's token rows on this thread followed by an accumulating forward.
+  bool store_out = false;
   // SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS: a weight per mirror root for each span of a two-span row
   // (empty: the mirror's shares). The tier hands them to its readers (RamTier::enable_cpu_experts).
   std::vector<double> span_weights[2];
@@ -484,6 +487,7 @@ class BasicCpuExpertEngine {
         reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
     call.accumulate = job.accumulate;
     call.cores = config_.cores;
+    call.store_first = config_.store_out;
     if (job.staged) {
       call.stage_two = &BasicCpuExpertEngine::stage_two;
       call.stage_two_ctx = this;
@@ -499,9 +503,12 @@ class BasicCpuExpertEngine {
       for (int i = 0; i < call.rows * call.k; ++i)
         pairs += call.slots[i] >= 0;
       // A token that routes none of the lanes must read 0, whatever an earlier record left: zero the rows here rather
-      // than trust the kernel's overwrite, then accumulate.
-      if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
-      call.accumulate = true;
+      // than trust the kernel's overwrite, then accumulate. With store_out the kernel's overwrite does it (a store per
+      // token's first sum, zeros for the rest): the same bits, without this thread zeroing every row first.
+      if (!config_.store_out) {
+        if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
+        call.accumulate = true;
+      }
     }
     if constexpr (Build::kMetrics) {
       if (trace_.enabled()) {
