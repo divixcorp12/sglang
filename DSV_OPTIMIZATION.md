@@ -845,7 +845,16 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
             - Log Σupper and B.
             - Refuse early, before the hot cache allocates, if the pin can't fit.
           - The watcher had caught the refusal 25 s after it happened, but the agent wasn't woken. It now waits in
-            the foreground for short runs. The combined
+            the foreground for short runs.
+          - Fix pushed (`ed1ceb5aeb`, `2d12a5ac1d`): the grow bound, a draft-load memory probe, and
+            test_expert_tier_startup's fake now takes upper_capacity. 103 CPU tests passed.
+          - **calib5 attempt 1 stopped at its GPU-test gate:** 1 failed, 137 passed. The smoke is rerunning with
+            the residency tests in their own process.
+- **Known issue (pre-existing test pollution, not this work):**
+  `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
+  fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
+  - It passes in isolation at every commit, including base `1ddfaae39e`.
+  - Owner: the residency tests. Run it in its own process until fixed. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
