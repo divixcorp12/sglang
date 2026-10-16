@@ -433,7 +433,11 @@ def numa_capacities(d: str) -> tuple[dict[int, int], float, int, list[int]]:
         for line in f:
             if "Pinned host expert cache startup" in line:
                 info = json.loads(line[line.index("{"):])
-                rows = {int(k): v for k, v in info["rows_per_layer"].items()}
+                if "rows_per_layer" in info:
+                    rows = {int(k): v for k, v in info["rows_per_layer"].items()}
+                else:  # older logs give the total only; the tier splits it evenly, the remainder to the first layers
+                    n, total = info["layers"], info["rows"]
+                    rows = {L: total // n + (L < total % n) for L in range(n)}
                 b = info["numa"]["bound_bytes"]
                 frac = int(b["0"]) / (int(b["0"]) + int(b["1"]))
                 full = info.get("full_layers", [])
