@@ -1035,11 +1035,15 @@ class _OperationalCounters:
     host_read_split_bytes: int = 0
     host_read_ns: int = 0
     host_split_ns: int = 0
+    # Rows prefill fills read for the gathers (ExpertGatherStats.host_fill_rows): with
+    # SGLANG_DSV41_ENABLE_PREFILL_FILLS, a prefill's reads are host_read_rows plus these.
+    host_fill_rows: int = 0
 
 
 def _add_host_read_counters(counters: _OperationalCounters, stats: Any) -> None:
     """Sum one gather's row-source reads into a phase/layer's counters."""
     counters.host_read_rows += getattr(stats, "host_read_rows", 0)
+    counters.host_fill_rows += getattr(stats, "host_fill_rows", 0)
     counters.host_read_file_bytes += getattr(stats, "host_read_file_bytes", 0)
     counters.host_read_split_bytes += getattr(stats, "host_read_split_bytes", 0)
     counters.host_read_ns += getattr(stats, "host_read_ns", 0)

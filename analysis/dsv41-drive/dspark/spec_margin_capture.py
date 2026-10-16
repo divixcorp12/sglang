@@ -77,7 +77,10 @@ def counter_summary(log_path: str) -> dict:
             "spec_skip_landed_gpu",
             "spec_skip_landed_cpu", "spec_skip_reading_gpu", "spec_skip_reading_cpu",
             "drip_issued", "drip_landed", "drip_used", "drip_abandoned", "drip_no_slot",
-            "drip_paused", "drip_skipped_bytes", "drip_late")
+            "drip_paused", "drip_skipped_bytes", "drip_late",
+            # rows_read is the service's demand misses only; prefill fills show in the drive load line's fill_bytes
+            # and their victims here.
+            "evictions", "eager_evictions")
     out = {k: c.get(k) for k in keys}
     if c.get("spec_scored"):
         out["wait_or_score_us_per_record"] = c["spec_score_ns"] / c["spec_scored"] / 1000

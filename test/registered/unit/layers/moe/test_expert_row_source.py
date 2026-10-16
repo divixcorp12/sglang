@@ -361,6 +361,7 @@ class TestGatherReadStats(unittest.TestCase):
                 "host_read_split_bytes",
                 "host_read_ns",
                 "host_split_ns",
+                "host_fill_rows",
             ],
         )
         self.assertEqual(ExpertGatherStats(1, 2).host_read_rows, 0)
@@ -409,8 +410,8 @@ class TestGatherReadStats(unittest.TestCase):
         created = []
         original = streamer._gather_cached
 
-        def gather_cached(*args):
-            result = original(*args)
+        def gather_cached(*args, **kwargs):
+            result = original(*args, **kwargs)
             created.append(streamer.last_gather_stats)
             return result
 
@@ -446,8 +447,9 @@ class TestGatherReadStats(unittest.TestCase):
             host_split_ns=1,
         )
         _add_host_read_counters(counters, stats)
-        _add_host_read_counters(counters, stats)
+        _add_host_read_counters(counters, dataclasses.replace(stats, host_fill_rows=5))
         _add_host_read_counters(counters, SimpleNamespace())
+        self.assertEqual(counters.host_fill_rows, 5)
         self.assertEqual(
             (
                 counters.host_read_rows,

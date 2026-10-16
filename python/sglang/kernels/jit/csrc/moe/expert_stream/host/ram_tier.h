@@ -2027,6 +2027,7 @@ class RamTier {
       fill_landed_.store(static_cast<int64_t>(landed), std::memory_order_release);
     };
     int result = 0;
+    group.reader.set_fill(true);  // the drive load counts its bytes as fill bytes too
     try {
       // A demand's batch size, and no publish target since a fill has no device readiness words.
       result = group.reader.read(
@@ -2044,6 +2045,7 @@ class RamTier {
       std::fprintf(stderr, "ERROR %sprefill fill: %s\n", error_prefix<Layout>().c_str(), error.what());
       result = 0;
     }
+    group.reader.set_fill(false);
     _mm_sfence();  // the rows' bytes land before the caller is told (fill_landed_)
     // No tier state here: until the owner's epilogue the claimed slots stay filling, so no admission takes one and
     // release() refuses it.
@@ -2162,6 +2164,7 @@ class RamTier {
         *evicted = tier.slot_to_expert[best];
         release_locked(row, best);  // unmaps it before its bytes are overwritten, and ends its ownership
         count<kEvictions>();
+        count<kEagerEvictions>();
         slot = best;
       } else if (stop_at_share) {
         *evicted = -1;
@@ -2230,6 +2233,7 @@ class RamTier {
     disown_locked(dist_.home_group(expert).rows[row], tier, best);
     *evicted = victim;
     count<kEvictions>();
+    count<kEagerEvictions>();
     return best;
   }
 

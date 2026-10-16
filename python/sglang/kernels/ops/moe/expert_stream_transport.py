@@ -518,6 +518,9 @@ def read_rows_traced(
 # ``overlap_ns`` is the time a root had demand and speculative reads in flight at once;
 # ``moved_from``/``moved_to`` count the sub-reads the dynamic root choice
 # (``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``) sent away from and to the root.
+# ``DRIVE_TAIL_FIELDS`` follow every root's ``DRIVE_FIELDS``, field-major, and decode
+# into the same per-root dict: ``fill_bytes`` are the bytes of the tier's fills (prefill
+# fills, hot-cache promotions, full layers), already counted in ``demand_bytes``.
 DRIVE_SLOTS = 4  # kMaxDrives
 DRIVE_FIELDS = (
     "demand_reads",
@@ -532,12 +535,14 @@ DRIVE_FIELDS = (
     "moved_from",
     "moved_to",
 )
-DRIVE_LOAD_WORDS = 3 + DRIVE_SLOTS * len(DRIVE_FIELDS)
+DRIVE_TAIL_FIELDS = ("fill_bytes",)
+DRIVE_TAIL_START = 3 + DRIVE_SLOTS * len(DRIVE_FIELDS)  # kDriveTailStart
+DRIVE_LOAD_WORDS = DRIVE_TAIL_START + DRIVE_SLOTS * len(DRIVE_TAIL_FIELDS)
 
 
 def decode_drive_load(words) -> dict:
     """Decode ``DRIVE_LOAD_WORDS`` int64 words into ``{"elapsed_ns", "clock_reads",
-    "roots": [one dict of DRIVE_FIELDS per root]}``."""
+    "roots": [one dict of DRIVE_FIELDS then DRIVE_TAIL_FIELDS per root]}``."""
     words = [int(w) for w in words]
     roots = words[2]
     fields = len(DRIVE_FIELDS)
@@ -545,7 +550,13 @@ def decode_drive_load(words) -> dict:
         "elapsed_ns": words[0],
         "clock_reads": words[1],
         "roots": [
-            dict(zip(DRIVE_FIELDS, words[3 + q * fields : 3 + (q + 1) * fields]))
+            {
+                **dict(zip(DRIVE_FIELDS, words[3 + q * fields : 3 + (q + 1) * fields])),
+                **{
+                    name: words[DRIVE_TAIL_START + k * DRIVE_SLOTS + q]
+                    for k, name in enumerate(DRIVE_TAIL_FIELDS)
+                },
+            }
             for q in range(roots)
         ],
     }
@@ -1497,6 +1508,8 @@ COUNTERS = (
     "drip_paused",
     "drip_skipped_bytes",
     "drip_late",
+    # Eager admissions' evictions, also counted in "evictions".
+    "eager_evictions",
 )
 
 # The counters a production host keeps: the shutdown line's served, rows and errors,
@@ -1547,6 +1560,7 @@ CORE_COUNTERS = (
     "drip_paused",
     "drip_skipped_bytes",
     "drip_late",
+    "eager_evictions",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 

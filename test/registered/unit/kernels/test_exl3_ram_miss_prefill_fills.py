@@ -78,6 +78,32 @@ def test_a_fill_claims_in_order_and_lands_every_row_byte_for_byte(tier):
     assert not host.contains(1, 4)
 
 
+def test_a_fill_counts_its_bytes_as_fill_and_demand_and_its_victims_as_eager_evictions(tier):
+    """The drive load's fill_bytes are a part of its demand_bytes, so the shutdown line separates the tier's fills from
+    the service's misses; an eager admission's eviction counts in eager_evictions as well as evictions.
+
+    Mutations: run_fill leaves set_fill out (red: fill_bytes stay 0); take_slot_locked counts no eager eviction (red)."""
+    s, host = tier
+    before = host.drive_load()
+    assert sum(root["fill_bytes"] for root in before["roots"]) == 0
+    slots, evictions = host.fill_begin(1, [4, 1, 3], protected=[4, 1, 3])
+    assert len(slots) == 3 and evictions == 0
+    assert host.fill_end() and _landed(s, host, 1, [4, 1, 3])
+    after = host.drive_load()
+    fill = [root["fill_bytes"] for root in after["roots"]]
+    demand = [b["demand_bytes"] - a["demand_bytes"] for a, b in zip(before["roots"], after["roots"])]
+    assert sum(fill) > 0 and fill == demand, (fill, demand)
+    assert all(root["spec_bytes"] == 0 for root in after["roots"])
+    counters = host.counters()
+    assert counters["eager_evictions"] == 0 and counters["evictions"] == 0
+    # A fourth row fills the last free slot, and a fifth evicts: one eviction, eager.
+    host.assign(1, 0)
+    slots, evictions = host.fill_begin(1, [2], protected=[2])
+    assert len(slots) == 1 and evictions == 1 and host.fill_end()
+    counters = host.counters()
+    assert counters["eager_evictions"] == 1 and counters["evictions"] == 1, counters
+
+
 def test_claiming_stops_at_the_first_expert_with_no_unprotected_victim(tier):
     s, host = tier
     for expert in (0, 1, 2, 3):

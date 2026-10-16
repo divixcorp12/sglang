@@ -12,7 +12,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_host_tier import PinnedSlotLRU
-from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
+from sglang.srt.layers.moe.expert_stream import (
+    ExpertGatherStats,
+    ExpertPinnedHostCache,
+    ExpertStreamer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.moe_expert_fakes import SpecOnlyFormat
 
@@ -178,6 +182,27 @@ def test_prefill_fills_prefetches_the_layers_vram_misses_in_ascending_order():
     with streamer.prefill_fills(torch.tensor([6, 5, 3, 1])):
         assert fills.events == [("begin", [1, 5], [1, 3, 5, 6], False)]
     assert fills.events[-1] == ("end",) and flushes == [True]
+
+
+def test_the_layers_first_gather_reports_the_prefetched_rows_as_fill_rows():
+    """prefill_fills' rows are found in the tier by the gathers (pinned hits), so the first gather inside reports them
+    as host_fill_rows, once; a gather after the context reports none."""
+    streamer, cache, fills, reference = _setup()
+    cache.ensure_rows(torch.tensor([4]))
+
+    def dispatch(*args, **kwargs):
+        streamer.last_gather_stats = ExpertGatherStats(requested_rows=1)
+        return None, {}
+
+    streamer._dispatch_eager_rows = dispatch
+    ids = torch.tensor([1])
+    with streamer.prefill_fills(torch.tensor([1, 2, 4])):
+        streamer._gather_eager_rows(ids, ids, ids)
+        assert streamer.last_gather_stats.host_fill_rows == 2  # 1 and 2; 4 was resident
+        streamer._gather_eager_rows(ids, ids, ids)
+        assert streamer.last_gather_stats.host_fill_rows == 0
+    streamer._gather_eager_rows(ids, ids, ids)
+    assert streamer.last_gather_stats.host_fill_rows == 0
 
 
 def test_prefill_fills_does_nothing_without_row_fills():
