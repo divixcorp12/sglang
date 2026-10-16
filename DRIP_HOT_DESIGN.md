@@ -1,5 +1,44 @@
 # Drip into the hot cache: design note (drip-hot)
 
+## Outcome (2026-10-16): not built
+
+**Decision (team lead, 2026-10-16): do not build drip-into-cache.** The pre-agreed build gate fails for every variant
+on the validated RAM tier. The GPU drip stays as it is: off by default, neutral when on. No serving code was written.
+
+- **Gate (agreed before the run, not changed after).** Per verify against today's drip: at least 30 fewer CPU lanes,
+  no more NVMe GPU lanes (an NVMe-cold return counts as one), and at most 0.5 ms of added GPU time.
+- **Model.** The replay `analysis/dsv41-drive/dspark/drip_hot_replay.py` runs on `breakdown-20261015/drip`.
+  - Its lane typing reproduces the capture's lane mix within 2% (base capture: 0.04%).
+  - One parameter is fitted on that same capture: drip_land's 1.4 ms observation lag.
+  - Returns use lane-tier's RAM tier with prefill admissions (rule 10, stage 0 passed at `5508b65381`; imported at
+    `3d331c9189`), over a horizon of 3 verifies.
+
+Per verify, against today's drip. ms/verify is at 0.07 / 0.28 ms per CPU-RAM lane; negative is a saving.
+
+| variant | CPU lanes, net of RAM-warm returns | NVMe GPU lanes | returns warm / cold | ms/verify | if every return were cold | gate |
+|---|---|---|---|---|---|---|
+| B: adopt at the gather, window not extended | -14.0 | -2.77 | 2.84 / 0.62 | -3.1 / -6.7 | +4.0 / -0.2 | fails: CPU lanes |
+| B: adopt at the gather, window extended | -44.3 | +9.06 | 7.73 / 1.69 | +17.1 / +9.7 | +36.3 / +27.3 | fails: NVMe lanes |
+| A: land in a victim before routing, 2 picks | -11.7 | +5.44 | 6.99 / 0.98 | +10.6 / +9.3 | +28.0 / +25.2 | fails both (9.5 lost hits) |
+| C: one spare row per layer | +0.9 | +2.97 | 2.10 / 0.40 | +5.8 / +6.6 | +11.0 / +11.4 | fails both |
+
+- **Does B without extension keep its sign once released victims can go cold?** Yes, with the tier as modelled:
+  0.62 of its 3.5 returns per verify come back cold. Its gain is -3.1 to -6.7 ms/verify (about 0.8-1.8 ms/token):
+  -2.9 to -6.6 with the tier's 8% cold bias, and about neutral only if every return were cold. That gain is inside
+  the noise of a served pair, and the arm saves fewer than half the CPU lanes the gate asks for.
+- **The premise was wrong.** A used drip already enters VRAM residency (section 0 below). The drip's real waste is
+  the routed landings that fall past the 8 victim lanes.
+- **What would change the verdict:**
+  1. CPU-RAM lanes turning out to be on the critical path at about the fit's 0.28 ms, or more. B without extension
+     would still miss the lane criterion, so this alone would need the gate renegotiated.
+  2. A lane order that keeps NVMe-cold misses off the GPU stream, which would make "B, window extended" pass the
+     NVMe criterion. That is lane-order work, not drip work.
+  3. Fewer forced CPU misses from NVMe, the critical path the drip never touches.
+
+Full design below (sections 0-6); replay detail in section 7.
+
+---
+
 Branch `drip-hot`, based on `origin/ram-prefetch-pool-serve` at `fd5dfa5bef`. Design only: no code is written yet.
 
 Path prefixes used below:
