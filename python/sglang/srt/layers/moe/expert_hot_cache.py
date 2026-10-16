@@ -188,14 +188,25 @@ class ExpertHotCache:
         self.device = next(
             iter(devices), torch.device("cuda", torch.cuda.current_device())
         )
-        self.tensors = {
-            spec.name: torch.empty(
-                (allocation_rows,) + spec.row_shape,
-                dtype=spec.dtype,
-                device=self.device,
+        # SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP: on VMM memory, so startup calibration can release trailing slots.
+        self.vmm_backing = None
+        if envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get() and self.device.type == "cuda":
+            from sglang.srt.layers.moe.hot_cache_vmm import VmmHotCacheBacking
+
+            self.vmm_backing = VmmHotCacheBacking(
+                self.device,
+                [(spec.name, allocation_rows, spec.row_shape, spec.dtype) for spec in streamer.specs],
             )
-            for spec in streamer.specs
-        }
+            self.tensors = dict(self.vmm_backing.tensors)
+        else:
+            self.tensors = {
+                spec.name: torch.empty(
+                    (allocation_rows,) + spec.row_shape,
+                    dtype=spec.dtype,
+                    device=self.device,
+                )
+                for spec in streamer.specs
+            }
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
