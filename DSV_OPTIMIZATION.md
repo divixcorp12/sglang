@@ -833,7 +833,19 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
             not recover it.
           - Suspect: buffers sized to the upper bound since grow (residency banks, upload buffers, transfer plan),
             or the VA reservation itself.
-          - The diagnosis with numbers is pending. The combined
+          - **Diagnosis:** the 4 small scale tensors (suh/svh, 44,544 B per row) are on torch.empty at the
+            upper-bound rows (Σ ≈ 6,227 rows, 277 MB), against 46 MB at capacity. **That +232 MB is the whole
+            shortfall.**
+            - The KV-sizing headroom by run: expseg2 1.19 GB; calib2 1.09 (fix B worked); calib3 0.87 (passed by ~30
+              MB); calib4 0.83 (refused).
+            - Banks and index buffers are under 1 MB. The VA reservation has no physical cost.
+          - **Fix approved, calib5:**
+            - Bound the upper capacity by the possible grow budget B = total memory x (1 - mem_fraction_static),
+              about 4.5 GB or ~340 slots, spread over the layers within the tier caps.
+            - Log Σupper and B.
+            - Refuse early, before the hot cache allocates, if the pin can't fit.
+          - The watcher had caught the refusal 25 s after it happened, but the agent wasn't woken. It now waits in
+            the foreground for short runs. The combined
         smoke must report prefill ms per 4096 chunk with and without A2: 64-token chunks mean many more launches.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
