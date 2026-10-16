@@ -110,7 +110,7 @@ def format_record(tokens: Optional[int], entries: list[dict]) -> str:
 
 def parse_line(line: str) -> Optional[dict]:
     """The record of one logged line, or None for any other line."""
-    at = line.find(LOG_PREFIX)
+    at = line.find(LOG_PREFIX + "{")  # not the "prefill peak log installed" line
     return json.loads(line[at + len(LOG_PREFIX) :]) if at >= 0 else None
 
 

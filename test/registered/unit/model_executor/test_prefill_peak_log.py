@@ -131,6 +131,7 @@ def test_on_logs_each_call_with_nested_peaks(caplog):
     assert calls["dspark.prefill"]["alloc_peak_mib"] == 500 and calls["dspark.prefill"]["depth"] == 0
     assert calls["dspark.prefill"]["alloc_after_mib"] == 15
     assert calls["dspark.prefill"]["reserved_peak_mib"] == 500 and calls["L0.moe"]["reserved_peak_mib"] == 500
+    assert ppl.parse_line("[x] prefill peak log installed on DeepseekV4ForCausalLM") is None
     for c in records[0]["calls"]:
         assert set(c) == {"name", "depth", "alloc_before_mib", "alloc_peak_mib", "alloc_after_mib",
                           "reserved_before_mib", "reserved_peak_mib", "reserved_after_mib"}
