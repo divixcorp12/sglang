@@ -459,6 +459,7 @@ def arms(cap: Capture, horizon: int) -> dict:
             "per_verify": {k: round(v, 2) for k, v in m.items()},
             "delta_cpu_lanes": round(d_cpu, 2),
             "delta_nvme_gpu_lanes": round(d_nvme, 2),
+            "released_seen_by_tier": ret.get("released", 0),
             "returns_ram_warm": round(warm, 2),
             "returns_nvme_cold": round(cold, 2),
             "net_cpu_lanes_with_warm_returns": round(net_cpu, 2),
