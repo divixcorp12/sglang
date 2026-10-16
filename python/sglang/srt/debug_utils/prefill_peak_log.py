@@ -23,6 +23,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "prefill peak log "
+# A DSV4 attention layer's submodules measured on their own (absent ones are skipped).
+ATTENTION_PARTS = ("wqkv_a", "wq_a", "wq_b", "wkv", "compressor", "indexer", "attn_mqa", "wo_a", "wo_b")
 MIB = 1 << 20
 
 
@@ -144,6 +146,12 @@ def install(worker, log: Optional[PrefillPeakLog] = None) -> PrefillPeakLog:
             continue  # PP placeholders
         _wrap_attr(log, layer, "forward", f"L{i}")
         _wrap_attr(log, layer.self_attn, "forward", f"L{i}.attn")
+        # Inside attention: the projections, the compressor and indexer, and the FlashMLA core (attn_mqa).
+        for name in ATTENTION_PARTS:
+            _wrap_attr(log, getattr(layer.self_attn, name, None), "forward", f"L{i}.attn.{name}")
+        # The decoder layer's mHC stream mixing, which holds the 4-stream hidden and its residual.
+        for name in ("hc_pre", "hc_post"):
+            _wrap_attr(log, layer, name, f"L{i}.{name}")
         if getattr(layer, "mlp", None) is not None:
             _wrap_attr(log, layer.mlp, "forward", f"L{i}.moe")
     _wrap_attr(log, getattr(target, "logits_processor", None), "forward", "target.logits")
