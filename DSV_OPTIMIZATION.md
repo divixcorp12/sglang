@@ -1077,6 +1077,14 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
         - The lever for L+2 prefetch is prediction precision, not the RAM tier.
       - **Next: (b) v1 gather-time integration**, flag off by default, with a design note before code.
         (c) and (d) stay held.
+      - **(b) design approved** (branch `lane-head`; ~1.5 days to tests passing):
+        - Flag `SGLANG_OPT_LANE_HEAD_PATH`: the path is the switch, unset means off and bit-identical.
+        - One kernel per layer inside `_gather_graph`, right before `plan_graph_routes_fused`, writes
+          `keys[row]` for the routed experts. `_plan_miss_keys` then points at them, so CPU lanes take the
+          experts least likely to recur. Victim ranking is unchanged.
+        - +28.5 MB VRAM in total (PCA 26.2 MB), subtracted from the hot budget in `from_model` and logged.
+        - Cost estimate 5-10 µs/layer, to be measured past L2.
+        - The A/B reports VRAM hits per verify, CPU-lane time and gate→plan time alongside ms/token.
   - **Owner decisions (2026-10-15):**
     - **v2 head:** plan it only if the replay shows clear hit gains. A plan only; no GPU training without approval.
       - GPU-trained on the full 5120-dim gate inputs.
