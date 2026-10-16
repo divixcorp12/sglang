@@ -218,13 +218,14 @@ def test_the_trained_head_on_captured_c2_verifies(tmp_path, proj_dtype):
     print(f"C2 {proj_dtype}: {gathers} gathers, max |dP| {max_dp:.2e}")
 
 
-def test_microbenchmark(tmp_path):
+@pytest.mark.parametrize("proj_dtype", ["bf16", "fp32"])
+def test_microbenchmark(tmp_path, proj_dtype):
     """µs per layer launch (PCA + keys), 40 distinct layers, tokens 6, top_k 6. Warm: back to back, the weights
     (~29 MB) stay in the 96 MB L2. Cold: a 256 MB buffer is rewritten before each layer's launch, as the MoE work
     between two layers' gathers would evict it. Each timed with CUDA events around the launch alone, and the warm
     case also as one captured 40-layer graph replay."""
     layers = 40
-    head = _file(tmp_path, _random_head(layers), _meta(layers))
+    head = _file(tmp_path, _random_head(layers, lh.PROJ_DTYPES[proj_dtype]), _meta(layers, proj_dtype))
     dev = lh.LaneHead(head, "cuda")
     rng = np.random.default_rng(4)
     pool = rng.choice(EXPERTS, size=64, replace=False)
@@ -276,4 +277,4 @@ def test_microbenchmark(tmp_path):
         "device_bytes": dev.device_bytes,
     }
     report["cold_ms_per_verify_40_layers"] = report["eager_cold_us_per_layer"] * layers / 1e3
-    print("lane head microbenchmark", json.dumps(report))
+    print("lane head microbenchmark", proj_dtype, json.dumps(report))
