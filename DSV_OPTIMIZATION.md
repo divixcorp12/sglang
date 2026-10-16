@@ -208,7 +208,12 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   - The owner's `swapoff -a` was OOM-killed mid-way by prefill-merge's run 3; swap stays active, ~3.1 GB used.
   - **Every run before this used the old settings.** A'' (A' rerun) is the new baseline and also measures the change.
 - **In-server allocator profiling is stopped:** the snapshot dump grows the node-0-bound heap and OOM-kills.
-  The 3120 MiB attribution moves to a standalone single-layer probe.
+  The 3120 MiB attribution uses a gated peak logger instead: `SGLANG_DEBUG_PREFILL_PEAK_LOG`, default off,
+  `debug_utils/prefill_peak_log.py`, `187cf1b589`..`7951fc18eb`.
+  - It wraps the DSpark prefill root, the target forward, each layer's attention/MLP, logits, the sampler, the
+    draft-KV injection and the draft forward. Per call it logs allocated and reserved before, at peak and after.
+  - No history, no stacks, no syncs.
+  - 5 CPU tests passed, and a mutant is caught. Its run goes last in the queue.
 
 ### 3.5 VRAM hot cache review — branch `cache-tiers` (`4d81ad411f`, `a4c674a2b9`)
 
