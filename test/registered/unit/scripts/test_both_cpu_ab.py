@@ -397,7 +397,8 @@ PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MO
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg",
-                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-calib")
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-calib",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-lanehead")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -826,7 +827,7 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
     budget = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
     monkeypatch.setenv(budget, "64")
     merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
-    merges = (merge, PIN01_HICACHE_ARMS[5])  # -mergechunk and -mergechunk-expseg
+    merges = (merge, PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[7])  # -mergechunk, -mergechunk-expseg(-lanehead)
     calib = PIN01_HICACHE_ARMS[6]  # -mergechunk-expseg-calib: its own budget (A3)
     for arm in ab.ARMS:
         want = str(ab.MERGE_CHUNK_MB) if arm in merges else "32" if arm == calib else "0"
@@ -851,7 +852,7 @@ def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_
     ab = _ab()
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
     expseg, merge = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[4]
-    on_expseg = (expseg, PIN01_HICACHE_ARMS[6])  # -expseg and -expseg-calib
+    on_expseg = (expseg, PIN01_HICACHE_ARMS[6], PIN01_HICACHE_ARMS[7])  # -expseg, -expseg-calib, -expseg-lanehead
     for arm in ab.ARMS:
         assert ab._overrides(arm, "/out")["PYTORCH_CUDA_ALLOC_CONF"] == (
             "expandable_segments:True" if arm in on_expseg else ""), arm
@@ -889,8 +890,7 @@ def test_the_lanehead_arm_is_expseg_with_the_lane_head_alone(monkeypatch):
     arm changes another knob -- red."""
     ab = _ab()
     monkeypatch.setenv(ab.LANE_HEAD, "/shell/head.safetensors")
-    expseg = PIN01_HICACHE_ARMS[5]
-    lanehead = expseg + "-lanehead"
+    expseg, lanehead = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[7]
     for arm in ab.ARMS:
         assert ab._overrides(arm, "/out")[ab.LANE_HEAD] == (ab.LANE_HEAD_FILE if arm == lanehead else ""), arm
     h, e = ab.ARMS[lanehead][0], ab.ARMS[expseg][0]
