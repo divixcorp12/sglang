@@ -669,7 +669,20 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
       static jitter allowance costs 143 MiB). So (C) is worth about 4-15 slots per launch.
     - **The bigger lever is the 1,459 MiB live prefill transient (~115 slots):** attention 903 MiB plus 556 MiB held
       across layers. A scoping note on bit-identical cuts comes after step 2.
-    - Next: step 2 (retire through one capacity authority).
+    - **Step 2 pushed** (`dff9c6fe42`, `layers/moe/hot_cache_retire.py` `retire_hot_slots(manager, keep)`): the only
+      place capacity drops.
+      - It evicts tail experts, lowers every holder, re-pushes the host hot sets, re-ranks victims and releases the
+        VMM tail.
+      - It refuses before any change if any of these hold:
+        - the updater is enabled, meaning capture has happened;
+        - a capture is in progress;
+        - the copy engine is armed;
+        - the cache is not VMM-backed, or not DIRECT;
+        - keep is below twice the victim lanes;
+        - a capacity attribute is not in the census.
+      - 8 CPU tests. The census test parses the real classes' source for `*capacity*` attributes. The mutant that
+        skips `policy.capacity` is caught.
+      - Not yet tested on a real manager; that comes with the step-3 GPU smoke.
 
 ### 3.8 Next-verify route predictor study — `cache-tiers` agent, offline
 
