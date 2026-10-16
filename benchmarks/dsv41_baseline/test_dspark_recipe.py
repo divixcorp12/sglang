@@ -31,6 +31,16 @@ def test_prod_serves_the_dspark_mode():
     assert argv[argv.index("--mem-fraction-static") + 1] == "0.78"
 
 
+def test_prod_and_every_arm_bound_the_prefill_share_with_the_recorder_it_needs():
+    # The service refuses SGLANG_DSV41_ENABLE_PREFILL_SHARE under the no-op recorder, so the share is on only where
+    # argv also names a recorder mode.
+    assert arm_env.prod_env()["SGLANG_DSV41_ENABLE_PREFILL_SHARE"] == "1"
+    assert arm_env.base_env()["SGLANG_DSV41_ENABLE_PREFILL_SHARE"] == "1"
+    for args in (arm_env.ServerArgs.prod(), arm_env.ServerArgs(port=1), arm_env.ServerArgs(port=1, dspark=True)):
+        argv = args.argv()
+        assert argv[argv.index("--expert-distribution-recorder-mode") + 1] == "per_pass"
+
+
 def test_dspark_server_args_use_the_dspark_mem_fraction():
     assert arm_env.DSPARK_MEM_FRACTION_STATIC == "0.78"
     argv = arm_env.ServerArgs(port=1, dspark=True).argv()

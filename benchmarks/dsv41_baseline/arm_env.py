@@ -240,6 +240,12 @@ def base_env() -> dict[str, str]:
         # Reads the row images the RAM-miss service always reads (built on every mirror root by
         # scripts/dsv41/build_row_images.py; startup refuses a root without a matching set).
         "SGLANG_DSV41_ENABLE_PREFILL_FILLS": "1",
+        # A prefill's pinned-tier admissions own at most 64 rows per layer, then evict their own LRU row instead of
+        # decode's. Served A/B 2026-10-16 (DSpark -mergechunk-expseg arm, one pair): -3.46 ms/token, 95% CI
+        # -4.91..-1.55, TTFT -0.48 s; 56-59% of decode's NVMe-cold GPU lanes had been evicted by a prefill
+        # (DSV_OPTIMIZATION.md 3.8, /mnt/nvme1/share64-ab-20261016). Needs --expert-distribution-recorder-mode
+        # (passed below); the service refuses to start without it. On by the owner's decision, 2026-10-16.
+        "SGLANG_DSV41_ENABLE_PREFILL_SHARE": "1",
         # Fewer fp16/bf16 casts around the EXL3 gemvs at BS1 decode: 358 fewer kernels per step, bit-identical,
         # 112.4 -> 111.8 ms/token (within noise; DSV41_REFERENCE.md 27.8).
         "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION": "1",
