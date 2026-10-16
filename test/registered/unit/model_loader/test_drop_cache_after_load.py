@@ -4,7 +4,6 @@ DefaultModelLoader.load_model drops every loaded shard again once the model is b
 
 import ast
 import inspect
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -34,10 +33,6 @@ def shard(tmp_path):
         pytest.skip("needs fincore (util-linux)")
     path = tmp_path / "model.safetensors"
     save_file({f"w{i}": torch.randn(1024, 1024) for i in range(8)}, str(path))  # 32 MiB
-    # Written back first: POSIX_FADV_DONTNEED leaves dirty pages cached, so an unsynced shard can survive the drop
-    # (it did under load on divix01, and always on the xfs root's /tmp).
-    with open(path, "rb+") as f:
-        os.fsync(f.fileno())
     path.read_bytes()  # into the page cache
     if _cached(path) == 0:
         pytest.skip("this filesystem keeps no page cache to drop (tmpfs?)")
