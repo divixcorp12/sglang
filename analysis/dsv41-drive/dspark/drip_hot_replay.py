@@ -103,9 +103,9 @@ class Capture:
         self._routes()
 
     def _drips(self, ev: dict) -> None:
-        """Per target record: the drips published before its post ends (expert -> land ns), and the admitted picks in
-        pick order with their land ns (None: never landed). A drip's target is its row's first record after the scored
-        (source) record."""
+        """Per target record: the admitted picks in pick order with their drip_land ns (None: never landed). A drip's
+        target is its row's first record after the scored (source) record. ``published`` decides which of them the
+        post saw (calibrate_lag)."""
         by_row = collections.defaultdict(list)
         for r in self.records:
             by_row[r["row"]].append(r)
@@ -120,7 +120,7 @@ class Capture:
 
         land = {(e["seq"], e["row"], e["a"]): e["ns"] for e in ev["drip_land"]}
         for r in self.records:
-            r["published"], r["picks"] = {}, []
+            r["picks"] = []
         rank = collections.Counter()
         for e in sorted(ev["drip_admit"], key=lambda e: e["ns"]):
             t = target(e["row"], e["seq"])
@@ -129,10 +129,7 @@ class Capture:
             rank[k] += 1
             if t is None:
                 continue
-            landed = land.get((e["seq"], e["row"], e["a"]))
-            t["picks"].append((pick, e["a"], landed))
-            if landed is not None and landed < t["post"]:
-                t["published"][e["a"]] = landed
+            t["picks"].append((pick, e["a"], land.get((e["seq"], e["row"], e["a"]))))
 
     def _routes(self) -> None:
         """Each record's graph_routes line (routes and the residency before the forward), joined by layer_misses."""
@@ -207,10 +204,37 @@ def category(kind: int, e: int, r: dict) -> str:
     return c
 
 
+def published(r: dict, at: str, lag_ns: int) -> set:
+    """The record's drips whose words were in device memory when its post (``at`` "post", its end) or its gather
+    (``at`` "gather", the post's start) read the table: drip_land less the observation lag precedes that time.
+    drip_land is stamped when the copy thread next polls the store's mark, which can be a demand job later."""
+    return {e for _, e, ns in r["picks"] if ns is not None and ns - lag_ns < r[at]}
+
+
+def calibrate_lag(cap: Capture) -> tuple[int, dict]:
+    """The observation lag that best reproduces the capture's scratch lanes (HIT_SCRATCH exactly on the unforced lanes
+    whose drip the post saw), over 0..3 ms in 100 us steps; one parameter, fitted on the capture it is checked on."""
+    cases = []
+    for r in cap.records:
+        lanes, ff = record_lanes(r)
+        kind = {e: b & 0xFF for e, b in r["ordered"]}
+        unforced = {e for j, (e, _) in enumerate(lanes) if j < ff}
+        for _, e, ns in r["picks"]:
+            if ns is not None and e in unforced:
+                cases.append((ns - r["post"], kind[e] == HIT_SCRATCH))
+    best = None
+    for lag in range(0, 3_000_001, 100_000):
+        right = sum((gap - lag < 0) == used for gap, used in cases)
+        if best is None or right > best[1]:
+            best = (lag, right)
+    return best[0], {"lag_us": best[0] // 1000, "landed_unforced_drips": len(cases), "explained": best[1]}
+
+
 # ---- gate -------------------------------------------------------------------------------------------------------------
 
 
 def gate(cap: Capture) -> dict:
+    lag, lag_fit = calibrate_lag(cap)
     agree = collections.Counter()
     confusion = collections.Counter()
     model = collections.defaultdict(collections.Counter)
@@ -218,7 +242,7 @@ def gate(cap: Capture) -> dict:
     scratch_tp = scratch_pred = scratch_obs = 0
     for r in cap.records:
         lanes, ff = record_lanes(r)
-        pred = type_record(lanes, ff, set(r["published"]))
+        pred = type_record(lanes, ff, published(r, "post", lag))
         v = r["verify"]
         model[v]["vram"] += r["routed"] - len(lanes)
         actual[v]["vram"] += r["routed"] - len(lanes)
@@ -262,6 +286,7 @@ def gate(cap: Capture) -> dict:
         "expert_breakdown_per_verify": ref,
         "checks": {c: {"model": x, "capture": y, "rel": round(rel, 4)} for c, (x, y, rel) in checks.items()},
         "routes_joined_verifies": len(cap.line_of_verify),
+        "drip_publish_lag": lag_fit,
         "passed": passed,
     }
 
@@ -305,28 +330,29 @@ def counts_of(r: dict, lanes: list[tuple[int, bool]], kinds: list[int], forced_f
     return c
 
 
-def perturb(r: dict, arm: str, ranked: list[int] | None, routed: set | None) -> tuple[collections.Counter, list[int]]:
-    """One record under ``arm``: its lane counts and the residents it evicts beyond its inserts' (pre-route losses)."""
+def perturb(
+    r: dict, arm: str, ranked: list[int] | None, routed: set | None, lag: int
+) -> tuple[collections.Counter, list[int]]:
+    """One record under ``arm``: its lane counts and the residents it evicts before routing (A2, C1)."""
     lanes, ff = record_lanes(r)
     count = len(lanes)
     usable = ff if ff < count else 1 << 30  # victims the lanes found (unbounded when nothing spilled)
     if arm == "today":
-        kinds = type_record(lanes, ff, set(r["published"]))
+        kinds = type_record(lanes, ff, published(r, "post", lag))
         c = counts_of(r, lanes, kinds, ff)
         c["vram"] += r["routed"] - count
         return c, []
     lane_experts = {e for e, _ in lanes}
-    ready = {e for _, e, ns in r["picks"] if ns is not None and ns < r["gather"]}
+    ready = published(r, "gather", lag)
+    first_two = {e for p, e, _ in r["picks"] if p < 2}
     lost: list[int] = []
     if arm in ("B_noext", "B_ext"):
         adopt = ready & lane_experts
     elif arm == "A2":
-        reserved = [(e, ns) for p, e, ns in r["picks"] if p < 2]
-        adopt = {e for e, ns in reserved if ns is not None and ns < r["gather"]} & lane_experts
-        lost = (ranked or [])[: len(reserved)]
+        adopt = ready & first_two & lane_experts
+        lost = (ranked or [])[: len(first_two)]
     elif arm == "C1":
-        first = [(e, ns) for p, e, ns in r["picks"] if p == 0]
-        adopt = {e for e, ns in first if ns is not None and ns < r["gather"]} & lane_experts
+        adopt = ready & {e for p, e, _ in r["picks"] if p == 0} & lane_experts
         lost = (ranked or [])[:1]
     else:
         raise ValueError(arm)
@@ -354,6 +380,7 @@ def perturb(r: dict, arm: str, ranked: list[int] | None, routed: set | None) -> 
 
 
 def arms(cap: Capture, horizon: int) -> dict:
+    lag, lag_fit = calibrate_lag(cap)
     lines = cap.lines
     ranks = proxy_rankings(lines)
     names = ("today", "B_noext", "B_ext", "A2", "C1")
@@ -365,10 +392,10 @@ def arms(cap: Capture, horizon: int) -> dict:
         if li is not None:
             ranked = ranks[li][r["row"]]
             routed = {e for e in lines[li]["routes"][r["row"]] if e >= 0}
-        base, _ = perturb(r, "today", ranked, routed)
+        base, _ = perturb(r, "today", ranked, routed, lag)
         per_v["today"][r["verify"]] += base
         for a in names[1:]:
-            c, lost = perturb(r, a, ranked, routed)
+            c, lost = perturb(r, a, ranked, routed, lag)
             per_v[a][r["verify"]] += c
             if li is None:
                 continue
@@ -389,7 +416,7 @@ def arms(cap: Capture, horizon: int) -> dict:
             c2["extra_evictions"] += len(victims)
             released[a].extend((li, r["row"], e) for e in victims)
     returns = {a: tier_returns(cap, released[a], horizon) for a in names}
-    out = {"verifies": len(per_v["today"]), "horizon": horizon, "arms": {}}
+    out = {"verifies": len(per_v["today"]), "horizon": horizon, "drip_publish_lag": lag_fit, "arms": {}}
     keys = CATS + ("forced", "inserts", "d2d", "adopted", "adopted_from_spill", "lost_hits", "reserved",
                    "reserved_wasted", "extra_evictions")
     nv = len(per_v["today"])
