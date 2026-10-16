@@ -464,16 +464,17 @@ ARMS[MERGE_CHUNK_EXPSEG_ARM] = (
 )
 # -expseg with the startup hot-cache calibration (trial capture, warm-up replay, grow/trim from measured free memory)
 # and the bit-identical prefill transient cuts: A1 indexer score budget 32, A2 per-chunk FlashMLA kernels with A3
-# merge budget 32. Its fraction and KV pin are -expseg's; the calibration sizes the hot cache from there.
+# merge budget 32. Its fraction and KV pin are -expseg's; the calibration sizes the hot cache from there. Every other arm
+# states the calibration and the chunk kernels off against a shell's.
+CALIBRATE = "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP"
+CHUNK_KERNELS = "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS"
+INDEXER_BUDGET = "SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[CALIBRATE] = "0"
+    _overrides_of_arm[CHUNK_KERNELS] = "0"
 MERGE_CHUNK_EXPSEG_CALIB_ARM = MERGE_CHUNK_EXPSEG_ARM + "-calib"
 ARMS[MERGE_CHUNK_EXPSEG_CALIB_ARM] = (
-    {
-        **ARMS[MERGE_CHUNK_EXPSEG_ARM][0],
-        "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": "1",
-        "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS": "1",
-        MERGE_BUDGET: "32",
-        "SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB": "32",
-    },
+    {**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], CALIBRATE: "1", CHUNK_KERNELS: "1", MERGE_BUDGET: "32", INDEXER_BUDGET: "32"},
     True,
 )
 # An arm's own --mem-fraction-static and KV pool, appended to its argv (the last --mem-fraction-static wins).

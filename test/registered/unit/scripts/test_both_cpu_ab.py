@@ -396,7 +396,8 @@ PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
-                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg")
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-calib")
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
 SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
@@ -826,9 +827,11 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
     monkeypatch.setenv(budget, "64")
     merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
     merges = (merge, PIN01_HICACHE_ARMS[5])  # -mergechunk and -mergechunk-expseg
+    calib = PIN01_HICACHE_ARMS[6]  # -mergechunk-expseg-calib: its own budget (A3)
     for arm in ab.ARMS:
-        assert ab._overrides(arm, "/out")[budget] == (str(ab.MERGE_CHUNK_MB) if arm in merges else "0"), arm
-        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm in merges), arm
+        want = str(ab.MERGE_CHUNK_MB) if arm in merges else "32" if arm == calib else "0"
+        assert ab._overrides(arm, "/out")[budget] == want, arm
+        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm in merges + (calib,)), arm
     m, a = ab.ARMS[merge][0], ab.ARMS[arm_a][0]
     knobs = (budget, "SGLANG_MOE_HOT_GPU_MB")
     assert {k: v for k, v in m.items() if k not in knobs} == {k: v for k, v in a.items() if k not in knobs}
@@ -848,9 +851,10 @@ def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_
     ab = _ab()
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
     expseg, merge = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[4]
+    on_expseg = (expseg, PIN01_HICACHE_ARMS[6])  # -expseg and -expseg-calib
     for arm in ab.ARMS:
         assert ab._overrides(arm, "/out")["PYTORCH_CUDA_ALLOC_CONF"] == (
-            "expandable_segments:True" if arm == expseg else ""), arm
+            "expandable_segments:True" if arm in on_expseg else ""), arm
     e, m = ab.ARMS[expseg][0], ab.ARMS[merge][0]
     knobs = ("PYTORCH_CUDA_ALLOC_CONF", "SGLANG_MOE_HOT_GPU_MB")
     assert {k: v for k, v in e.items() if k not in knobs} == {k: v for k, v in m.items() if k not in knobs}
@@ -859,6 +863,24 @@ def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_
     assert flags[flags.index("--max-total-tokens") + 1] == "381184"
     assert flags[flags.index("--mem-fraction-static") + 1] == ab.fraction_keeping_kv(ab.EXPSEG_HOT_GPU_MB, 381184)
     assert ab.REFERENCE[expseg] == merge
+
+
+def test_the_calib_arm_is_expseg_with_the_calibration_and_the_prefill_cuts_alone(monkeypatch):
+    """-expseg-calib is -expseg with the startup hot-cache calibration and A1/A2/A3 (indexer budget 32, chunk kernels,
+    merge budget 32), at -expseg's fraction and KV pin; every other arm states the calibration and the chunk kernels off
+    against a shell's. Mutant: another arm inherits the shell's flag, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv(ab.CALIBRATE, "1")
+    monkeypatch.setenv(ab.CHUNK_KERNELS, "1")
+    calib, expseg = PIN01_HICACHE_ARMS[6], PIN01_HICACHE_ARMS[5]
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        assert (overrides[ab.CALIBRATE], overrides[ab.CHUNK_KERNELS]) == (("1", "1") if arm == calib else ("0", "0")), arm
+    c, e = ab.ARMS[calib][0], ab.ARMS[expseg][0]
+    knobs = {ab.CALIBRATE: "1", ab.CHUNK_KERNELS: "1", ab.MERGE_BUDGET: "32", ab.INDEXER_BUDGET: "32"}
+    assert {k: v for k, v in c.items() if k not in knobs} == {k: v for k, v in e.items() if k not in knobs}
+    assert {k: c[k] for k in knobs} == knobs
+    assert ab.server_flags(calib) == ab.server_flags(expseg) and ab.REFERENCE[calib] == expseg
 
 
 def test_hot_mb_for_margin_buys_whole_slots_of_the_measured_spare():
