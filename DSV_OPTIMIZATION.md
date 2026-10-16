@@ -940,6 +940,18 @@ cached, about +150 s per launch. Arms A and D both paid it. dsv41-full40 is now 
               teardown. That makes the grow 148 MiB more conservative than needed.
             - Also requested: any exception during calibration falls back to the configured size, logged at
               ERROR, instead of killing the launch. Rerun as calib8b.
+          - **calib8b** (`0588d70bf6`): **served, safe by design.** 0 OOM lines, no rollback.
+            - **Peak free 692 MiB ≥ margin 508.5** (worst chunk gap 488.5 + spread 20).
+            - The replayed reserve peak is 14,722 against the real 14,758 (+36). calib7 was −312.
+            - Slots 1,035 → 1,049 (+14): about even with expseg2 (706 free at 1,035).
+            - The pinned 168 MiB residue held back ~13 slots. It is counted against F and not credited in the
+              estimate. The real capture's net was 98, because it frees the residue. The trial's gross cost of
+              232 is within 8% of the real 214.
+            - Startup +18 s against calib7 (trial 8.8 s, longer replay 7 s). Prefill of a 4,096 prompt: 19.96 s.
+            - Decision: the 706 is **not** a floor; the calibrated margin is the rule. The served A/B samples
+              GPU free memory every 1 s. If serving dips below the warm-up peak, calibration is missing a source.
+            - Next: release the residue (drop `cuda_graph_metadata_of_bucket_and_bs` after the trial), expecting
+              ~+27 slots. Then calib9, then the served A/B against expseg2.
 - **Known issue (pre-existing test pollution, not this work):**
   `test_expert_residency_gpu.py::TestInsertOnMissDirect::test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies`
   fails with graphed_verify_ct 1 vs 2 when run in one pytest process after the merge-chunk and VMM GPU tests.
