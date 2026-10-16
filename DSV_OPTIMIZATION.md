@@ -1240,6 +1240,20 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
             - **To continue:** a served capture with prefill route logging (or a prefill admission event) plus
               the decode route log. **Owner's call.** Separately, prefill evicting decode rows looks like a lever
               in its own right (a prefill share for the RAM tier).
+            - **Agent restarted** as `lane-tier` (opus); handoff `LANE_TIER_REPLAY_HANDOFF.md` `a98b5b527c`.
+              Plan `PREFILL_CAPTURE_PLAN.md` `001bc406b7`:
+              - **The A/B's stages.jsonl already has every prefill's routes:** one eager `extend` line per
+                (prefill, layer) with experts, counts, vram_miss, ram_miss and a timestamp. A serving prompt's
+                prefill reads 2,200-3,530 RAM rows, up to 235 per layer against ~190 usable, so one long prompt
+                rewrites most of the tier in layers 2-20.
+              - **Stage 0 (approved, offline):** add the prefill admission rule from the code to T, check
+                simulated reads against ram_miss per (prefill, layer) within ±10%, then rerun T's gate. If it
+                passes, no capture is needed.
+              - The event (`SGLANG_DEBUG_DSV41_RAM_ADMIT_TRACE`, instrumented builds only) and a ~20-minute
+                capture come only if the reads match but the victims don't. Owner's call.
+              - **A prefill share already exists:** `SGLANG_DSV41_ENABLE_PREFILL_SHARE`, fixed at 64
+                rows/layer, off in the A/B. In 2026-09 (section 27.9) it gave a small decode gain for +0.5/+0.7 s
+                TTFT, priced before the GPU-lane split. A sweep of 0-128 rows waits until T passes.
           - **Owner question (2026-10-16):** consolidate the GPU drip into the hot cache (land drips in victim
             slots and commit residency) before more predictor work, since both pick RAM-resident experts for VRAM.
             The drip was off in both lane-head A/B arms (`drip_issued` 0), so that result is not confounded.
