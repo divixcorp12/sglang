@@ -131,6 +131,16 @@ def test_the_capture_estimate_is_the_warm_trial_never_below_the_cold_one_less_it
     assert hc.capture_estimate_of([], 30 * M) == 30 * M
 
 
+def test_the_walk_does_not_call_a_dict_subclass_items():
+    """calib11b: transformers' lazy auto-mapping imports models from items(); the walk must not call it."""
+
+    class Lazy(dict):
+        def items(self):
+            raise ValueError("Could not find VoxtralRealtimeTextModel")
+
+    assert tc.tensor_paths({"root": SimpleNamespace(mapping=Lazy(a=1), plain={"b": 2})}, depth=6) == {}
+
+
 def test_residue_attribution_never_raises_into_the_trial(monkeypatch, caplog):
     """calib11: a service thread grew a dict mid-walk ('dictionary changed size during iteration') and the exception
     aborted the trial. Any failure in the diagnostic is now logged and skipped."""

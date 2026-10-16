@@ -102,10 +102,11 @@ def tensor_paths(roots: Dict[str, object], depth: int = 3, enter_modules: bool =
         if level >= depth or id(value) in seen or isinstance(value, skipped):
             return
         seen.add(id(value))
-        # Snapshots: service threads mutate some of these containers while the walk runs (calib11).
-        if isinstance(value, dict):
+        # Snapshots: service threads mutate some of these containers while the walk runs (calib11). Exact types only:
+        # a dict subclass's items() can run code (transformers' lazy auto-mappings import models; calib11b).
+        if type(value) is dict:
             items = [(f"[{k!r}]", v) for k, v in list(value.items())]
-        elif isinstance(value, (list, tuple)):
+        elif type(value) in (list, tuple):
             items = [(f"[{i}]", v) for i, v in enumerate(list(value))]
         elif hasattr(value, "__dict__"):
             items = [(f".{k}", v) for k, v in list(vars(value).items())]
