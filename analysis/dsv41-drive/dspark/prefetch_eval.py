@@ -292,6 +292,8 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
         inflight = [(sub, land) for sub, land in inflight if land > ns]
         out["used"] += len(used)
         out["pool_served"] += po
+        out["used_cpu_landed"] += len((cold - inserted) & landed_by)
+        out["used_cpu_reading"] += len((cold - inserted) & reading - landed_by)
         if r is not None and r.seq in uses:
             obs_u = uses[r.seq]
             out["obs_used"] += len(obs_u)
@@ -331,7 +333,7 @@ def evaluate(run: ltr.Run, P: ltr.Prices, arm: str, layers: int, share: int, sco
         res[f"{key}_by_position"] = {b: out[f"{key}@{b}"] / max(1, out[f"verifies@{b}"]) for b in ("0-4", "5-14", "15+")}
     prompts = max(1, len(set(x["forward_pass_id"] for x in eager if x["phase"] == "extend")))
     res.update({k: out[k] for k in ("issued", "landed", "used", "pool_served", "unused_landed", "promoted",
-                                    "obs_used", "obs_pool_served")})
+                                    "obs_used", "obs_pool_served", "used_cpu_landed", "used_cpu_reading")})
     res["prefill_claims_per_prefill"] = out["prefill_claims"] / prompts
     res["prefill_demand_per_prefill"] = out["prefill_demand"] / prompts
     res["verifies"] = out["verifies"]
