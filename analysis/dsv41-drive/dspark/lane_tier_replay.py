@@ -355,6 +355,7 @@ class NodeTier:
     def admit(self, e: int, tick: int, hot: set, protected: set, filling: set, fallback: bool) -> bool:
         """A Python-side admission (take_slot_locked, ram_tier.h:2038): a free slot, else the LRU row that is not hot,
         protected or filling; with ``fallback`` a protected one when nothing else qualifies. False: no slot taken."""
+        self.last_victim = None
         if len(self.stamp) >= self.capacity:
             best = spare = None
             for x, t in self.stamp.items():
@@ -370,6 +371,19 @@ class NodeTier:
             if best is None:
                 return False
             del self.stamp[best]
+            self.last_victim = best
+        self.stamp[e] = tick
+        return True
+
+    def admit_owned(self, e: int, tick: int, owned: set, hot: set, protected: set, filling: set) -> bool:
+        """The prefill share's victim (take_admit_slot_locked, ram_tier.h:1993): the LRU prefill-owned row of this
+        range that is not hot, protected or filling. False: none qualifies."""
+        cands = [x for x in owned if x in self.stamp and x not in hot and x not in protected and x not in filling]
+        if not cands:
+            return False
+        victim = min(cands, key=lambda x: self.stamp[x])
+        del self.stamp[victim]
+        owned.discard(victim)
         self.stamp[e] = tick
         return True
 
@@ -484,22 +498,48 @@ def eager_lines(d: str) -> list[dict]:
 GATHER_CHUNK = 64  # EXL3_MAX_GATHER_ROWS
 
 
-def eager_admit(tier: list[NodeTier], line: dict, hot: set, tick: int, nodes: int = 2) -> tuple[int, int, int, int]:
-    """Rule 10 on one eager line. Returns (next tick, prefetch claims, demand admissions, VRAM misses)."""
+def eager_admit(tier: list[NodeTier], line: dict, hot: set, tick: int, nodes: int = 2, share: int = 0,
+                owned: set | None = None, cache: bool = True) -> tuple[int, int, int, int]:
+    """Rule 10 on one eager line. Returns (next tick, prefetch claims, demand reads, VRAM misses).
+
+    ``share`` > 0 is SGLANG_DSV41_ENABLE_PREFILL_SHARE at that size (take_admit_slot_locked, ram_tier.h:1982-2017):
+    every admission makes its row prefill-owned (``owned``, the layer's set); once the layer owns ``share`` rows and
+    the home range has no free slot, the victim is the LRU owned row of the range; with none, the prefetch stops
+    (stop_at_share) and a demand admission falls back to the decode LRU. ``cache`` False is staging without admission:
+    every miss is read and nothing enters the tier."""
     routed = sorted(e for e in line["experts"] if e >= 0)
     protected = set(routed)
     vmiss = [e for e in routed if e not in hot]
+    if owned is not None:
+        owned.intersection_update(x for x in list(owned) if tier[x % nodes].has(x))
+
+    def take(e: int, prot: set, filling: set, fallback: bool) -> bool:
+        t = tier[e % nodes]
+        if share and len(owned) >= share and len(t.stamp) >= t.capacity:
+            if t.admit_owned(e, tick, owned, hot, prot, filling):
+                owned.add(e)
+                return True
+            if not fallback:
+                return False
+        if not t.admit(e, tick, hot, prot, filling, fallback):
+            return False
+        if share:
+            if t.last_victim is not None:
+                owned.discard(t.last_victim)
+            owned.add(e)
+        return True
+
     filling: set = set()
     claims = 0
-    for e in vmiss:  # the prefetch: ascending, all routed protected, no fallback; stops at the first refusal
-        t = tier[e % nodes]
-        if t.has(e):
-            continue
-        tick += 1
-        if not t.admit(e, tick, hot, protected, filling, fallback=False):
-            break
-        filling.add(e)
-        claims += 1
+    if cache:
+        for e in vmiss:  # the prefetch: ascending, all routed protected, no fallback; stops at the first refusal
+            if tier[e % nodes].has(e):
+                continue
+            tick += 1
+            if not take(e, protected, filling, fallback=False):
+                break
+            filling.add(e)
+            claims += 1
     demand = 0
     for start in range(0, len(routed), GATHER_CHUNK):
         chunk = routed[start:start + GATHER_CHUNK]
@@ -510,10 +550,10 @@ def eager_admit(tier: list[NodeTier], line: dict, hot: set, tick: int, nodes: in
             t = tier[e % nodes]
             tick += 1
             if t.has(e):
-                t.stamp[e] = tick  # lookup's touch
+                t.stamp[e] = tick  # lookup's touch (under a share it stays owned, ram_tier.h:390)
                 continue
             filling = set()  # _fill_rows joined the prefetch
-            if t.admit(e, tick, hot, cset, filling, fallback=True):
+            if not cache or take(e, cset, filling, fallback=True):
                 demand += 1
     return tick, claims, demand, len(vmiss)
 

@@ -134,7 +134,8 @@ AB_RESIDUAL_PER_COLD_LANE = (4.76 + 2.45) / 18.12
 AB_SERVED_PER_COLD_LANE = 4.76 / 18.12
 
 
-def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, layers: int) -> dict:
+def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, layers: int, share: int = 0,
+             share_layers: set | None = None, no_admit: bool = False) -> dict:
     key = keys["product"]
     d = run.dir
     header, log = ltr.route_log(d)
@@ -172,6 +173,12 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
     last_hot = [set() for _ in range(layers)]
     resync = [True] * layers
     clean_v = {v for v in range(len(run.verifies)) if run.prompt_of[v] >= 0 and run.clean[run.prompt_of[v]]}
+    first = {}
+    for v in range(len(run.verifies)):
+        first.setdefault(run.prompt_of[v], v)
+    owned = [set() for _ in range(layers)]
+    serving_fpids = set(list(dict.fromkeys(x["forward_pass_id"] for x in eager if x["phase"] == "extend"))
+                        [-len(run.prompts):])
     out = collections.Counter()
     tick = 0
     for ns, _, kind, payload in timeline:
@@ -179,9 +186,18 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
         if kind == "eager":
             line = eager[payload]
             L = line["layer"]
+            prefill = line["phase"] == "extend"
             if L < layers and L not in full:
-                tick, *_ = ltr.eager_admit(tiers[L], line, last_hot[L], tick)
-            if line["phase"] == "extend":
+                on = prefill and (share_layers is None or L in share_layers)
+                tick, claims, demand, _ = ltr.eager_admit(
+                    tiers[L], line, last_hot[L], tick, share=share if on else 0, owned=owned[L],
+                    cache=not (no_admit and on))
+                if prefill and line["forward_pass_id"] in serving_fpids:
+                    out["prefill_claims"] += claims
+                    out["prefill_demand"] += demand
+                    out["prefill_ram_miss_obs"] += line["ram_miss"]
+                    out["prefill_read_ms_obs"] += line["read_ms"]
+            if prefill:
                 resync = [True] * layers
             continue
         if kind == "evict":
@@ -278,6 +294,12 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
             out["gpu_copy"] += dma
             out["cpu_hit_lanes"] += sum(t[0] for t in teams.values())
             out["cpu_forced"] += sum(len(t[2]) for t in teams.values())
+            pos = v - first[run.prompt_of[v]]
+            b = "0-4" if pos < 5 else "5-14" if pos < 15 else "15+"
+            out[f"ms_pos{b}"] += s + w
+            out[f"gpu_nvme_pos{b}"] += nv
+            if L == 0:
+                out[f"verifies_pos{b}"] += 1
             if r is not None:
                 out["measured_stream"] += r.stream
                 out["measured_wait"] += r.wait
@@ -294,8 +316,19 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
                 t.stamp[e] = tick
         for e in sorted(misses, key=lambda x: x in warm):  # rule 5, against the record's hot bitmap (rule 3)
             tier[e % NODES].insert(e, tick, hot_plan | u)
+        owned[L] -= u | hot_plan  # decode's use, and set_hot, end a row's prefill ownership
     n = sum(p["verifies"] for p, c in zip(run.prompts, run.clean) if c)
+    per_pos = {}
+    for b in ("0-4", "5-14", "15+"):
+        nb = out.pop(f"verifies_pos{b}", 0)
+        per_pos[b] = {"verifies": nb, "ms": out.pop(f"ms_pos{b}", 0.0) / max(1, nb),
+                      "gpu_nvme": out.pop(f"gpu_nvme_pos{b}", 0) / max(1, nb)}
+    prompts = max(1, len(serving_fpids))
+    per_prompt = {k: out.pop(k) / prompts for k in ("prefill_claims", "prefill_demand", "prefill_ram_miss_obs",
+                                                    "prefill_read_ms_obs") if k in out}
     res = {k: v / n for k, v in out.items()}
+    res["by_position"] = per_pos
+    res["prefill_per_prompt"] = per_prompt
     res["ms"] = res["stream"] + res["wait"]
     res["ms_bias"] = res["stream_bias"] + res["wait_bias"]
     res["verifies"] = n
@@ -307,15 +340,70 @@ def evaluate(run: ltr.Run, preds: dict, P: ltr.Prices, keys: dict, arm: str, lay
 BIAS = 15.10 / 13.79
 
 
+def sweep(a) -> int:
+    """The prefill-share sweep: each --arms arm at each --shares setting, against the same arm at share 0. A prefill's
+    displaced reads are the demand reads the share adds (the prefetch stops at the share, so later chunks read on
+    demand, blocking); their TTFT cost is bounded by the capture's own demand read time per row."""
+    run = ltr.Run(a.capture)
+    P = ltr.Prices(ltr.Run(a.prices_from) if a.prices_from else run)
+    w_s, w_c, hit_routes = critical_shares(run)
+    keys = {"product": ProductKey(P, w_s, w_c, hit_routes),
+            "product-emp": ProductKey(P, w_s, w_c, hit_routes, cold_served=AB_SERVED_PER_COLD_LANE)}
+    layers = max(r.row for r in run.records) + 1
+    preds = load_preds(a.pred) if a.pred else {}
+    res = {"capture": a.capture, "prices_from": a.prices_from or a.capture, "sweep": {}}
+    for arm in a.arms.split(","):
+        rows = {}
+        for spec in a.shares.split(","):
+            size, _, span = spec.partition("@")
+            span_set = None
+            if span:
+                lo, hi = (int(x) for x in span.split("-"))
+                span_set = set(range(lo, hi + 1))
+            r = evaluate(run, preds, P, keys, arm, layers, share=0 if size == "none" else int(size),
+                         share_layers=span_set, no_admit=size == "none")
+            rows[spec] = r
+        base = rows.get("0") or next(iter(rows.values()))
+        pp0 = base["prefill_per_prompt"]
+        ms_per_row = pp0["prefill_read_ms_obs"] / max(1.0, pp0["prefill_ram_miss_obs"])
+        table = {}
+        for spec, r in rows.items():
+            pp = r["prefill_per_prompt"]
+            d_demand = pp["prefill_demand"] - pp0["prefill_demand"]
+            table[spec] = {
+                "gpu_nvme": round(r["gpu_nvme"], 2), "cpu_forced": round(r["cpu_forced"], 2),
+                "d_ms": round(r["ms"] - base["ms"], 2),
+                "d_ms_ab": round(r["ms"] - base["ms"] + AB_RESIDUAL_PER_COLD_LANE * (r["gpu_nvme"] - base["gpu_nvme"]), 2),
+                "d_ms_by_position": {b: round(r["by_position"][b]["ms"] - base["by_position"][b]["ms"], 2)
+                                     for b in r["by_position"]},
+                "gpu_nvme_by_position": {b: round(r["by_position"][b]["gpu_nvme"], 2) for b in r["by_position"]},
+                "prefill_claims": round(pp["prefill_claims"], 1), "prefill_demand": round(pp["prefill_demand"], 1),
+                "ttft_s_upper": round(d_demand * ms_per_row / 1e3, 3),
+            }
+        res["sweep"][arm] = {"demand_ms_per_row": round(ms_per_row, 3),
+                             "verifies_by_position": {b: base["by_position"][b]["verifies"] for b in base["by_position"]},
+                             "table": table}
+        print(arm, json.dumps(res["sweep"][arm], indent=1), flush=True)
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(res, f, indent=1)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("capture")
-    ap.add_argument("--pred", required=True)
+    ap.add_argument("--pred", default=None)
     ap.add_argument("--prices-from", default=None, help="fit P on this run instead of the capture")
     ap.add_argument("--head-ms", default="0.77,0.40,0.32")
     ap.add_argument("--arms", default=",".join(ARMS))
+    ap.add_argument("--shares", default=None,
+                    help="prefill-share sweep instead of the arm comparison: sizes per layer, 'none' (no admission), "
+                         "and SIZE@LO-HI for a share on those layers only, e.g. 0,16,32,64,96,128,none,64@2-20")
     ap.add_argument("--json")
     a = ap.parse_args()
+    if a.shares:
+        return sweep(a)
     run = ltr.Run(a.capture)
     P = ltr.Prices(ltr.Run(a.prices_from) if a.prices_from else run)
     w_s, w_c, hit_routes = critical_shares(run)
@@ -328,7 +416,8 @@ def main() -> int:
            "hit_routes": round(hit_routes, 3), "keys": {k: v.describe() for k, v in keys.items()}, "arms": {}}
     for arm in a.arms.split(","):
         res["arms"][arm] = evaluate(run, preds, P, keys, arm, layers)
-        print(arm, json.dumps({k: round(v, 2) for k, v in res["arms"][arm].items()}), flush=True)
+        print(arm, json.dumps({k: round(v, 2) for k, v in res["arms"][arm].items() if isinstance(v, float)}),
+              flush=True)
     base = res["arms"].get("today")
     head_ms = [float(x) for x in a.head_ms.split(",")]
     if base:
