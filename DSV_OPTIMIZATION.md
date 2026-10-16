@@ -428,6 +428,17 @@ tested (token count, draft confidence, prior score, acceptance) give +0 to -1 hi
 - **Step (3) approved and running:** a per-layer head P(miss recurs at v+1 | PCA64 of the routing tokens' gate
   inputs, position / odds features, per-(layer, expert) bias). Trained CPU-only on B0, held-out C2. Estimated serving
   cost ~2.5 MFLOP per layer, similar to the spec_score kernels. No integration until the precision is in.
+  - Extraction done 18:32 (cores 56-63): B0 b000-b003 gives 5.35M (verify, layer, expert) examples over 5,969
+    consecutive-verify pairs. Held-out C2: 658k examples over 752 pairs. PCA64 is fit on training rows only.
+    Shards: `/mnt/nvme1/cache-tiers-tmp/head-data`, 2.3 GB.
+  - **Incident:** the first training attempt touched the GPU during arm C (decay 0.995) at about 18:32:20-40.
+    - torch AdamW's `torch.accelerator.current_stream()` check tried to create a CUDA context, which failed with OOM,
+      so nothing was allocated.
+    - Arm C's server log has no error there, only the usual late-Triton-load warnings, which already appear at 18:31.
+      Its timing was already marked confounded.
+    - Fixed: `CUDA_VISIBLE_DEVICES=""` is now set before torch import, in both the script and the runner.
+    - **Rule:** any offline torch job sets `CUDA_VISIBLE_DEVICES=""`.
+  - Training (variants B then A), C2/base report and the replay with `--pred` are running CPU-only.
 
 ### 3.9 Graded miss cut — branch `misscut-replay` (`5014aaff0a`, `23c09c180c`, `f2e2e0c80b`, `760736c33b`, `7d105fabfe`), NOT merged
 
