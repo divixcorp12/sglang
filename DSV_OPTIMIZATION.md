@@ -138,7 +138,10 @@ Runs: `cores-ab-20261014/` (pin01, splitmodel*, *-mem), `breakdown-20261015/{bas
   - `...-pin01-splitmodel-fixedcosts`: all old offline fits, calibration skipped.
   - `...-pin01-splitmodel-refine`: calibration + `REFINE_BATCHES=50`.
   - Plain `...-splitmodel`: calibrated, no refinement.
-  - To be rebased onto the `-mem-hicache1` base, via a merge of split-model.
+  - Rebased onto the `-mem-hicache1` base via a merge of split-model (`e55aeaae6d`): `...-hicache1-fixedcosts`
+    and `...-hicache1-refine`. Plain `-hicache1` now calibrates on this branch.
+  - The fixed-cost arm publishes the same device words as A', so only `-refine` runs, against A'.
+  - CPU tests after the merge: 187 passed.
 - **Box queue:** A' rerun -> prefill run3 -> mirror-probe validation start -> calibration A/B.
 
 ### 3.4 Node-0 memory pressure — branch `split-model`
