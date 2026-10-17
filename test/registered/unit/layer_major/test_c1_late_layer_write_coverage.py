@@ -16,6 +16,8 @@ is what each commit's own code decides, and is what this test observes through t
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.models.deepseek_v4_layer_major import (
     DSV4_WINDOW,
     DeepseekV4LayerMajorAdapter,
@@ -51,14 +53,22 @@ class _RecordingCausalLM:
     """Records the (layer, positions) the late layers ran on: one call per span, all late layers
     at once, at the positions the currently-installed tail names."""
 
-    def __init__(self, backend):
+    def __init__(self, backend, *, capture):
         self._backend = backend
+        self._capture = capture
         self.calls = []  # (span_index, positions)
 
     def forward_late_tail(self, *, forward_batch, hidden_states, prev_pre, hash_ids):
         positions = list(self._backend.tail_forward_metadata.late_layer_tail.positions)
         self.calls.append((forward_batch.span_index, positions))
-        return SimpleNamespace(output_for=forward_batch.span_index)
+        # As the real forward_late_tail: tail row indices within the span, and (DSpark capture only) one aux row
+        # per tail row -- here the row's absolute position, so a test can read back which rows were kept.
+        rows = torch.tensor(positions) - forward_batch.span_start
+        return SimpleNamespace(
+            output_for=forward_batch.span_index,
+            hidden_states_token_indices=rows,
+            hidden_states=torch.tensor(positions, dtype=torch.float32)[:, None] if self._capture else None,
+        )
 
 
 class _FakeStore:
@@ -69,15 +79,15 @@ class _FakeStore:
         return f"META{index}"
 
 
-def _run_finish_pass(*, seq_len, prefix_len=0, chunk=CHUNK, window=DSV4_WINDOW):
+def _run_finish_pass(*, seq_len, prefix_len=0, chunk=CHUNK, window=DSV4_WINDOW, capture=False):
     spans = chunk_spans(prefix_len=prefix_len, seq_len=seq_len, chunk=chunk)
     # Every span that could possibly be needed (final, plus the one before it) gets real tail
     # metadata; a single-span suffix has no "one before it".
     tail_candidates = spans[-2:] if len(spans) >= 2 else spans[-1:]
     tail_meta_by_index = {s.index: SimpleNamespace(late_layer_tail=_FakeTail(s, window)) for s in tail_candidates}
-    forward_batches = [SimpleNamespace(span_index=s.index) for s in spans]
+    forward_batches = [SimpleNamespace(span_index=s.index, span_start=s.start) for s in spans]
     backend = _RecordingBackend()
-    causal_lm = _RecordingCausalLM(backend)
+    causal_lm = _RecordingCausalLM(backend, capture=capture)
     handle = SimpleNamespace(
         spans=spans,
         forward_batches=forward_batches,
@@ -146,6 +156,36 @@ class TestLateLayerWriteCoverage(unittest.TestCase):
         spans = chunk_spans(prefix_len=0, seq_len=CHUNK * 2 + 8, chunk=CHUNK)
         r = _run_finish_pass(seq_len=CHUNK * 2 + 8)
         self.assertEqual(r.output.output_for, spans[-1].index)
+
+
+class TestDSparkTailHiddens(unittest.TestCase):
+    """DSpark injects the draft KV from the pass's aux hiddens at batch.out_cache_loc[token_indices], which covers
+    the whole suffix: the indices must be suffix rows, and every tail span's rows must be there, as a chunked
+    prefill would have injected each chunk's own tail."""
+
+    def _check(self, *, seq_len, prefix_len=0):
+        r = _run_finish_pass(seq_len=seq_len, prefix_len=prefix_len, capture=True)
+        positions = [p for _, span_positions in r.calls for p in span_positions]
+        self.assertEqual(r.output.hidden_states_token_indices.tolist(), [p - prefix_len for p in positions])
+        self.assertEqual(r.output.hidden_states[:, 0].tolist(), [float(p) for p in positions])
+        return positions
+
+    def test_a_short_final_chunk_also_reports_the_penultimate_tail(self):
+        positions = self._check(seq_len=CHUNK * 2 + 8)
+        self.assertEqual(positions, list(range(8064, 8200)))
+
+    def test_a_full_final_chunk_reports_its_own_tail_only(self):
+        positions = self._check(seq_len=CHUNK * 2 + DSV4_WINDOW)
+        self.assertEqual(positions, list(range(8192, 8320)))
+
+    def test_indices_are_relative_to_the_uncached_suffix(self):
+        positions = self._check(seq_len=1024 + CHUNK * 2 + 8, prefix_len=1024)
+        self.assertEqual(positions, list(range(1024 + 8064, 1024 + 8200)))
+
+    def test_without_capture_hiddens_stay_none_and_indices_are_still_suffix_rows(self):
+        r = _run_finish_pass(seq_len=CHUNK * 2 + 8)
+        self.assertIsNone(r.output.hidden_states)
+        self.assertEqual(r.output.hidden_states_token_indices.tolist(), list(range(8064, 8200)))
 
 
 if __name__ == "__main__":

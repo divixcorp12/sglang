@@ -2182,6 +2182,9 @@ class Envs:
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
     # stream once per prompt. 0 turns it off. Model- and quant-agnostic; the model must provide an adapter.
     SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS = EnvInt(0)
+    # Lets layer-major prefill run under DSpark: the late-layer tail captures the draft's aux hiddens and the pass
+    # reports them at whole-extend row indices for the KV injection. Off: launch_refusal refuses DSpark as before.
+    SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK = EnvBool(False)
     # NUMA node for the layer-major host state store; node 0 is kept near full by the expert tier (DSV41_REFERENCE
     # §25.4, 27.17).
     SGLANG_LAYER_MAJOR_STATE_NUMA_NODE = EnvInt(1)

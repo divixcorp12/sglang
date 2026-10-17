@@ -8,6 +8,7 @@ import os
 import unittest
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.layer_major.gate import (
     LayerMajorGate,
     gate_from_env,
@@ -44,6 +45,19 @@ class TestGate(unittest.TestCase):
         self.assertIn("context parallelism", launch_refusal(**{**ok, "attn_cp_size": 2}))
         self.assertIn("two-batch overlap", launch_refusal(**{**ok, "enable_two_batch_overlap": True}))
         self.assertIn("pipeline parallelism", launch_refusal(**{**ok, "pp_size": 2}))
+
+    def test_dspark_is_refused_unless_enabled(self):
+        ok = dict(max_running_requests=1, enable_dp_attention=False, attn_cp_size=1, enable_two_batch_overlap=False)
+        # The launch hook passes "DSPARK", the scheduler str(SpeculativeAlgorithm.DSPARK).
+        for algorithm in ("DSPARK", "SpeculativeAlgorithm.DSPARK"):
+            with envs.SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK.override(False):
+                self.assertIn("speculative", launch_refusal(**ok, speculative_algorithm=algorithm))
+            with envs.SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK.override(True):
+                self.assertIsNone(launch_refusal(**ok, speculative_algorithm=algorithm))
+        with envs.SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK.override(True):
+            self.assertIn("speculative", launch_refusal(**ok, speculative_algorithm="EAGLE"))
+            self.assertIn("max-running-requests", launch_refusal(**{**ok, "max_running_requests": 2},
+                                                                 speculative_algorithm="DSPARK"))
 
     def test_scheduler_refusals(self):
         ok = dict(
