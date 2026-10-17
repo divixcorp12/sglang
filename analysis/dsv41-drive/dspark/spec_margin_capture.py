@@ -182,7 +182,10 @@ def capture_env(a: argparse.Namespace) -> dict:
 
 
 def server_argv(arm: str) -> list[str]:
-    return [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(arm)]
+    # The production arms warm up as production does (ServerArgs.prod(): dsv41_decode_paths too).
+    decode_warmup = arm in both_cpu_ab.PROD_ARMS
+    return [*arm_env.ServerArgs(port=PORT, dspark=True, decode_warmup=decode_warmup).argv(),
+            *both_cpu_ab.server_flags(arm)]
 
 
 def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:

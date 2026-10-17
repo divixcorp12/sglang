@@ -1227,6 +1227,11 @@ def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_ow
     assert cap.server_env("/cap", False, arm=CONFIDENCE_CUT_ARM)[STS_COLLECT] == ""
     assert STS_PATH_FLAG in cap.server_argv(CONFIDENCE_CUT_ARM)
     assert STS_PATH_FLAG not in cap.server_argv(STS_COLLECT_ARM)
+    # The production arms run production's warm-ups; the others keep the prefill-only one.
+    for arm in ab.ARMS:
+        argv = cap.server_argv(arm)
+        want = "dsv41_prefill_shapes,dsv41_decode_paths" if arm in PROD_ARMS else "dsv41_prefill_shapes"
+        assert argv[argv.index("--warmups") + 1] == want, arm
 
 
 def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monkeypatch, tmp_path):
@@ -1251,4 +1256,5 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
         assert ab.run_probe(arm, str(tmp_path)) == 1
     prod, collect, cut = argvs
     assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
     assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect

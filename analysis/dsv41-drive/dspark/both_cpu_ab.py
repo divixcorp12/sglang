@@ -727,7 +727,8 @@ def run_probe(arm: str, out: str) -> int:
     """The arm's server on PROBE_PORT under cc-gpu.lock, for logprob_probe.py only."""
     _, dspark = ARMS[arm]
     env = os.environ | arm_env.arm_env(_probe_overrides(arm, out)) | {"PYTHONPATH": os.path.join(REPO, "python")}
-    argv = [*arm_env.ServerArgs(port=PROBE_PORT, dspark=dspark).argv(), *ARM_SPEC_FLAGS.get(arm, ())]
+    argv = [*arm_env.ServerArgs(port=PROBE_PORT, dspark=dspark, decode_warmup=arm in PROD_ARMS).argv(),
+            *ARM_SPEC_FLAGS.get(arm, ())]
     with run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(out, f"{arm}.probe-server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
