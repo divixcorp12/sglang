@@ -82,7 +82,7 @@ def hash_pieces(pool, data: np.ndarray) -> list[concurrent.futures.Future]:
 
 
 def capture_running() -> list[str]:
-    out = subprocess.run(["pgrep", "-af", "run_capture_pair"], capture_output=True, text=True).stdout
+    out = subprocess.run(["pgrep", "-af", "run_capture_pair|spec_margin_capture"], capture_output=True, text=True).stdout
     return [line for line in out.splitlines() if "pgrep" not in line and "engram_relayout" not in line]
 
 
