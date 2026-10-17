@@ -104,7 +104,13 @@ def generate(
             drafts[:, k] = token
         prev_seq = torch.cat([anchor[:, None], drafts[:, :-1]], dim=1)
         confidence = confidence_table[positions[None, :], prev_seq]
-        verify_lens = verify_lens_fn(confidence, drafts).to(device=device, dtype=torch.int64)
+        if getattr(verify_lens_fn, "reads_drawn_q", False):
+            # [m, gamma] q_k(d_k): the draft's probability of the token it drew at each position.
+            drawn_q = draft_probs.gather(-1, drafts[..., None]).squeeze(-1)
+            verify_lens = verify_lens_fn(confidence, drafts, drawn_q)
+        else:
+            verify_lens = verify_lens_fn(confidence, drafts)
+        verify_lens = verify_lens.to(device=device, dtype=torch.int64)
         if widths_out is not None:
             widths_out.append(verify_lens.cpu())
         candidates = torch.cat([anchor[:, None], drafts], dim=1)
@@ -238,6 +244,21 @@ def calibrated_cut(*, gamma: int, base_ms: float, per_row_ms: float, device="cpu
     cut.verify_lens(confidence)
     assert cut.calibrated, "the toy calibration did not freeze T(w)"
     return cut
+
+
+def drawn_q_cut(cut, *, shift: int = 0) -> VerifyLensFn:
+    """The cut's stopping rule over confidences built from the draft's own probabilities, c_k = 0.05 + 0.9 q_{k+shift}
+    (d_{k+shift}), the shape of a draft-probability acceptance predictor. shift 0 reads draft k's own token, which the
+    rule allows (c_k only feeds the admission of slots k+1 and later); shift 1 reads draft k+1's, so the admission of
+    slot k+1 reads d_{k+1}: a mutant. The last positions past the block read q = 1."""
+
+    def verify_lens(confidence, drafts, drawn_q):
+        if shift:
+            drawn_q = torch.cat([drawn_q[:, shift:], torch.ones_like(drawn_q[:, :shift])], dim=1)
+        return cut.verify_lens(0.05 + 0.9 * drawn_q, sampled=True)
+
+    verify_lens.reads_drawn_q = True
+    return verify_lens
 
 
 def token_at_slot_mutant(verify_lens_fn: VerifyLensFn, *, token: int) -> VerifyLensFn:

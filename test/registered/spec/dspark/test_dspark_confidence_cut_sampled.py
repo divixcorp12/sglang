@@ -247,6 +247,17 @@ def test_a_cut_that_reads_the_admitted_slots_own_draft_shifts_the_output_law(sam
     assert dist.sequence_pvalue(toy, sequences) < 1e-6
 
 
+def test_a_confidence_built_from_draft_ks_own_drawn_probability_keeps_the_output_law(sampled_cut):
+    """A draft-probability predictor's confidence for draft k reads d_k itself. The stopping rule feeds c_k only to
+    the admission of slots k+1 and later, which may read d_1..d_k, so it stays exact. Mutant: c_k reads d_{k+1}
+    (shift 1), so admitting slot k+1 reads its own draft -- red."""
+    toy, sequences, widths = _decode(dist.drawn_q_cut(sampled_cut), seed=14)
+    assert (torch.bincount(widths, minlength=GAMMA + 2)[1:] > 0).sum() >= 4
+    assert dist.sequence_pvalue(toy, sequences) > PASS_P
+    toy, sequences, _ = _decode(dist.drawn_q_cut(sampled_cut, shift=1), seed=15)
+    assert dist.sequence_pvalue(toy, sequences) < 1e-6
+
+
 def test_the_goodness_of_fit_test_rejects_a_one_percent_shift_at_this_sample_size():
     toy = dist.MarkovToy(vocab=VOCAB, gamma=GAMMA, temperature=TEMPERATURE, seed=0)
     exact = toy.exact_sequence_probs(LENGTH)
