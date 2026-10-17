@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
@@ -87,14 +88,26 @@ def test_the_cut_picks_the_best_expected_tokens_per_ms_and_ends_the_prefix_at_a_
     assert lens.tolist() == [3, 2, 1, 1]
 
 
-def test_calibration_forces_widths_round_robin_then_freezes_a_monotone_median_table():
-    # Width 3 runs faster than width 2 (a noisy measurement); the running max lifts it back to width 2's time.
-    base = {1: 1.0, 2: 2.0, 3: 1.5, 4: 3.0, 5: 3.5, 6: 4.0}
-    timings = FakeTimings(lambda width: base[width])
+def calibrate(ms_for_width):
+    timings = FakeTimings(ms_for_width)
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.99)
+    for _ in range(CALIBRATION_VERIFIES):
+        run_verify(cut, timings, confident)
+    timings.complete_all()
+    cut.verify_lens(confident)
+    return cut
+
+
+def test_calibration_forces_widths_round_robin_then_freezes_an_affine_fit_over_every_sample():
+    timings = FakeTimings(None)
 
     def ms_for_width(width):
-        # One outlier per width, in the first round; the median ignores it.
-        return base[width] * (50.0 if len(timings.events) <= 2 * (GAMMA + 1) else 1.0)
+        # +-3 ms noise, alternating per verify round so each width's noise sums to zero; the record() of a verify's
+        # end event is the 2nd of its two events.
+        verify_idx = (len(timings.events) - 1) // 2
+        noise = 3.0 if (verify_idx // (GAMMA + 1)) % 2 == 0 else -3.0
+        return 100.0 + 20.0 * (width - 1) + noise
 
     timings.ms_for_width = ms_for_width
     cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
@@ -109,12 +122,19 @@ def test_calibration_forces_widths_round_robin_then_freezes_a_monotone_median_ta
     timings.complete_all()
     cut.verify_lens(confident)
     assert cut.calibrated and not cut.disabled
-    assert cut.cost_ms() == [1.0, 2.0, 2.0, 3.0, 3.5, 4.0]
-    # Calibrated: the cut, not a forced width, and no further timing. E(w) / T(w) at c = 0.99 peaks at w = 3
-    # (2.97 / 2.0), where the monotone table makes width 3 cost no less than width 2.
+    assert cut.cost_ms() == pytest.approx([100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
+    # Calibrated: the cut, not a forced width, and no further timing. At c = 0.99, E(6) / T(6) = 5.85 / 200 is the
+    # best rate; at c = 0.01, E(2) / T(2) = 1.01 / 120 loses to the anchor's 1 / 100.
     num_events = len(timings.events)
-    assert run_verify(cut, timings, confident) == 3
+    assert run_verify(cut, timings, confident) == GAMMA + 1
+    assert run_verify(cut, timings, torch.full((1, GAMMA), 0.01)) == 1
     assert len(timings.events) == num_events
+
+
+def test_a_negative_fitted_slope_clamps_to_a_flat_table_at_the_mean():
+    cut = calibrate(lambda width: 200.0 - 10.0 * (width - 1))
+    assert cut.calibrated
+    assert cut.cost_ms() == pytest.approx([175.0] * (GAMMA + 1))
 
 
 def test_calibration_drains_only_completed_timings_in_order():
@@ -130,7 +150,7 @@ def test_calibration_drains_only_completed_timings_in_order():
     assert not cut.calibrated
     timings.events[-1].ready = True
     cut.verify_lens(confident)
-    assert cut.cost_ms() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert cut.cost_ms() == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
 
 
 def test_a_width_without_a_valid_time_disables_the_cut_and_verifies_every_row():
@@ -147,15 +167,9 @@ def test_a_width_without_a_valid_time_disables_the_cut_and_verifies_every_row():
     assert len(timings.events) == num_events
 
 
-def test_a_non_positive_time_disables_the_cut():
-    timings = FakeTimings(lambda width: 0.0 if width == 1 else 1.0)
-    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
-    confident = torch.full((1, GAMMA), 0.1)
-    for _ in range(CALIBRATION_VERIFIES):
-        run_verify(cut, timings, confident)
-    timings.complete_all()
-    cut.verify_lens(confident)
-    assert cut.disabled
+def test_a_non_positive_fitted_anchor_time_disables_the_cut():
+    cut = calibrate(lambda width: 2.0 * (width - 1) - 1.0)
+    assert cut.disabled and cut.cost_ms() is None
 
 
 def test_the_cut_applies_to_greedy_single_request_batches_only():
