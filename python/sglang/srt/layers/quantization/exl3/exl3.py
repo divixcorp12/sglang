@@ -833,10 +833,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     exl3_moe_accumulate(
                         out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts
                     )
+        sources = getattr(streamer, "last_prefill_sources", None)
+        if sources is not None:
+            streamer.last_prefill_sources = None
         get_exl3_stream_trace().record(
             layer.layer_id,
             topk_ids,
             streamer.last_gather_stats if gathered else None,
             streamer.background_read_stats.rows,
+            sources=sources,
         )
         return out.to(x.dtype)

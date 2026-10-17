@@ -593,11 +593,44 @@ STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
 # fails.
 CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
 ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
+# Layer-major prefill under DSpark (prototype, branch layer-major-dspark): production with every uncached suffix of
+# 8192+ tokens prefilled layer by layer. dspark_env() keeps the threshold at 0 for every other arm.
+LAYER_MAJOR_ARM = PROD_ARM + "-layermajor"
+ARMS[LAYER_MAJOR_ARM] = (
+    {
+        **ARMS[PROD_ARM][0],
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
+        "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": "1",
+    },
+    True,
+)
+# Layer-major expert residency, stage 0 (branch layer-major-residency): its buffer is a plain allocation at the first
+# pass, so both arms give up RESIDENCY_ROWS rows of hot cache with the startup calibration off (it would grow the hot
+# cache back into the freed memory). -smallhot is the residency-off A, -res the B; a TTFT/prefill-read pair, not a
+# decode result (the hot cache is ~35% smaller).
+RESIDENCY = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"
+RESIDENCY_ROWS = 360
+LAYER_MAJOR_SMALL_HOT_MB = int(arm_env.PROD_DSPARK_HOT_GPU_MB) - -(-RESIDENCY_ROWS * HOT_SLOT_BYTES // 2**20)
+LAYER_MAJOR_SMALL_HOT_ARM = LAYER_MAJOR_ARM + "-smallhot"
+ARMS[LAYER_MAJOR_SMALL_HOT_ARM] = (
+    {**ARMS[LAYER_MAJOR_ARM][0], "SGLANG_MOE_HOT_GPU_MB": str(LAYER_MAJOR_SMALL_HOT_MB), CALIBRATE: "0"},
+    True,
+)
+LAYER_MAJOR_RESIDENCY_ARM = LAYER_MAJOR_ARM + "-res"
+ARMS[LAYER_MAJOR_RESIDENCY_ARM] = (
+    {**ARMS[LAYER_MAJOR_SMALL_HOT_ARM][0], RESIDENCY: str(RESIDENCY_ROWS)},
+    True,
+)
+PROD_ARMS = (
+    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM
+)
 ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
 # An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
 ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
-REFERENCE.update({PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM})
+REFERENCE.update(
+    {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM, LAYER_MAJOR_ARM: PROD_ARM,
+     LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM}
+)
 
 
 def sts_collect_stem(directory: str) -> str:

@@ -55,7 +55,18 @@ def layer_major_runtime(model_runner) -> LayerMajorRuntime | None:
         numa_node=envs.SGLANG_LAYER_MAJOR_STATE_NUMA_NODE.get(),
         pin=True,
     )
-    return LayerMajorRuntime(adapter=adapter, store=store, residency=NullResidency())
+    return LayerMajorRuntime(adapter=adapter, store=store, residency=_residency(model_runner))
+
+
+def _residency(model_runner):
+    rows = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.get()
+    if rows < 0:
+        raise ValueError(f"SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS={rows} must be 0 (off) or a row count")
+    if rows == 0:
+        return NullResidency()
+    from sglang.srt.layers.moe.prefill_residency import Exl3LayerMajorResidency
+
+    return Exl3LayerMajorResidency(model_runner, rows)
 
 
 def layer_major_runtime_for_worker(model_runner, *, is_draft_worker: bool) -> LayerMajorRuntime | None:

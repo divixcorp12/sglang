@@ -149,7 +149,11 @@ class DeepseekV4LayerMajorAdapter:
             positions = torch.arange(prefix_len, seq_len, device=full.device)
             self.allocator.map_ring_positions(full, positions, ring)
             for span in spans:
-                fb = self._chunk_forward_batch(schedule_batch, req, slot, span, last=span is spans[-1])
+                # A tail span runs the late layers, where DSpark's aux hiddens are captured (FULL from its worker).
+                fb = self._chunk_forward_batch(
+                    schedule_batch, req, slot, span, last=span is spans[-1],
+                    capture_hidden_mode=forward_batch.capture_hidden_mode if span.index in tail_indices else None,
+                )
                 # Mapping before init_forward_metadata: the tail's swa_out_cache_loc is translated through the
                 # mapping when metadata is built.
                 self.backend.init_forward_metadata(fb)
@@ -171,7 +175,7 @@ class DeepseekV4LayerMajorAdapter:
             raise
         return handle
 
-    def _chunk_forward_batch(self, batch, req, slot, span, *, last):
+    def _chunk_forward_batch(self, batch, req, slot, span, *, last, capture_hidden_mode=None):
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 
         device = self.runner.device
@@ -198,7 +202,9 @@ class DeepseekV4LayerMajorAdapter:
             n = self.model.engram_hasher.max_ngram_size - 1
             sub.engram_history = torch.tensor([engram_history(req.full_untruncated_fill_ids, span.start, n)],
                                               dtype=torch.int32, device=device)
-        return ForwardBatch.init_new(sub, self.runner, capture_hidden_mode=CaptureHiddenMode.NULL,
+        if capture_hidden_mode is None:
+            capture_hidden_mode = CaptureHiddenMode.NULL
+        return ForwardBatch.init_new(sub, self.runner, capture_hidden_mode=capture_hidden_mode,
                                      return_hidden_states_before_norm=False)
 
     # --- the strategy's loop ----------------------------------------------------------------------------------------
@@ -254,10 +260,15 @@ class DeepseekV4LayerMajorAdapter:
     def finish_pass(self, handle: _Pass, store: StateStore) -> Any:
         prefix_len = int(handle.schedule_batch.prefix_lens[0])
         tail_spans = tail_run_spans(handle.spans, window=DSV4_WINDOW, prefix_len=prefix_len)
-        # C1: run every needed span's own tail, oldest first; only the true final span's output returns.
-        for span in tail_spans[:-1]:
-            self._run_late_layers(handle, store, span)
-        output = self._run_late_layers(handle, store, tail_spans[-1])
+        # C1: run every needed span's own tail, oldest first; only the true final span's logits return.
+        outputs = [self._run_late_layers(handle, store, span) for span in tail_spans]
+        output = outputs[-1]
+        # Tail row indices are per span; the extend's consumer (DSpark's KV injection) indexes the whole suffix.
+        indices = [out.hidden_states_token_indices + (span.start - prefix_len) for out, span in zip(outputs, tail_spans)]
+        output.hidden_states_token_indices = torch.cat(indices)
+        if output.hidden_states is not None:
+            # Every span a chunked prefill would have run its own tail for: the draft's window needs all of them.
+            output.hidden_states = torch.cat([out.hidden_states for out in outputs])
         self._finalize_ring(handle)
         return output
 
