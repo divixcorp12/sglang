@@ -152,6 +152,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
     FinishReasonDict,
+    EndStartupWarmupReqInput,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -238,6 +239,9 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.startup_warmup_end import (
+    SchedulerStartupWarmupEnd,
+)
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -1339,6 +1343,10 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             ipc_channels=self.ipc_channels,
         )
+        self.startup_warmup_end = SchedulerStartupWarmupEnd(
+            is_fully_idle=self.is_fully_idle,
+            send_output=self.ipc_channels.send_to_tokenizer.send_output,
+        )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -1826,6 +1834,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (EndStartupWarmupReqInput, self.startup_warmup_end.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1962,10 +1971,10 @@ class Scheduler(
 
         The event loop blocks until shutdown.
         """
-        # Engine init (graph capture, warmups) is done; from here on any
-        # Triton kernel device-load is a lazy first-use at serving time.
+        # Engine init (graph capture) is done. The load watcher arms when the
+        # HTTP startup warm-ups end (startup_warmup_end), since they run after this.
         triton_load_watch.install()
-        triton_load_watch.mark_serving_started()
+        self.startup_warmup_end.on_event_loop_start()
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
@@ -2221,6 +2230,7 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        self.startup_warmup_end.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 

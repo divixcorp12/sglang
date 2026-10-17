@@ -309,6 +309,12 @@ PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4",
 # file is there with this SHA256 (check_prod_assets).
 PROD_RAM_PREFETCH_LEARNED_HEAD = "/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors"
 PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309"
+# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the cut arm
+# only (both_cpu_ab's -prod-confcut); production stays off and loads neither. Fitted 2026-10-16 from the -prod-stscollect
+# arm's long-prompt capture (/mnt/nvme1/sts-collect-20261016, 2,048 verifies): temperatures 0.89/0.79/1.26/0.89/0.63,
+# ECE 2.9-3.8% -> 2.1-3.0%. Read-only copy, 0444.
+PROD_DSPARK_STS_PATH = "/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json"
+PROD_DSPARK_STS_SHA256 = "a0f2fc7c6acd4ca06dca213d68954b3f46e0fef2a5e6ed4ab460feda7538bcd5"
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:
@@ -457,11 +463,13 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     mem_fraction_static: str | None = None
     max_total_tokens: int | None = None
     drop_cache_after_load: bool = False
+    # Production's warm-up also runs dsv41_decode_paths (~35 s); the arms keep the prefill-only one they measured with.
+    decode_warmup: bool = False
 
     @classmethod
     def prod(cls) -> "ServerArgs":
         if not PROD_DSPARK:
-            return cls(port=PROD_PORT, host=PROD_HOST)
+            return cls(port=PROD_PORT, host=PROD_HOST, decode_warmup=True)
         return cls(
             port=PROD_PORT,
             host=PROD_HOST,
@@ -469,6 +477,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             mem_fraction_static=PROD_DSPARK_MEM_FRACTION_STATIC,
             max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
             drop_cache_after_load=True,
+            decode_warmup=True,
         )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
@@ -530,8 +539,10 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--tool-call-parser",
             "deepseekv41",
             # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).
+            # Production also decodes, greedy and sampled, after a two-chunk prompt: its first long request otherwise
+            # loaded the SWA eviction and DSpark sampling kernels mid-serving (prod-20261016-180932/server.log).
             "--warmups",
-            "dsv41_prefill_shapes",
+            "dsv41_prefill_shapes,dsv41_decode_paths" if self.decode_warmup else "dsv41_prefill_shapes",
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]

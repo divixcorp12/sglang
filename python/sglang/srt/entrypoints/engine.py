@@ -339,11 +339,22 @@ class Engine(EngineScoreMixin, EngineBase):
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
 
+        # The offline Engine runs no startup warm-up, so it ends it at once: the scheduler arms the Triton load
+        # watcher, and the EXL3 copy engine at its first idle moment after enough decodes.
+        in_running_loop = True
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
+            in_running_loop = False
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+        if self.tokenizer_manager is not None:
+            end = self.tokenizer_manager.end_startup_warmup(None)
+            if in_running_loop:
+                # Sent when the caller next yields to its loop.
+                self._end_startup_warmup_task = self.loop.create_task(end)
+            else:
+                self.loop.run_until_complete(end)
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""

@@ -225,16 +225,24 @@ def read_lane_head_file(
     return LaneHeadFile(path=path, tensors=tensors, meta=meta)
 
 
-def check_serving_matches_training(meta: LaneHeadMeta, *, insert_decay: float, top_prob_gate: float) -> None:
+def check_serving_matches_training(
+    meta: LaneHeadMeta, *, insert_decay: float, top_prob_gate: float, confidence_cut: bool
+) -> None:
     """Refuse a launch whose features would come from a distribution training never saw.
 
-    The training corpus served every verify at its full width (no DSpark top-probability gate: ``live`` is 6 on all
-    but 26 of 45k rows, so a gated verify's ``live`` lands ~100 deviations off) and with the hot cache's insert decay
-    equal to the score decay the features use (``score_decay``), which shaped the ``resident`` feature."""
+    The training corpus served every verify at its full width (no DSpark top-probability gate or confidence cut:
+    ``live`` is 6 on all but 26 of 45k rows, so a cut verify's ``live`` lands ~100 deviations off) and with the hot
+    cache's insert decay equal to the score decay the features use (``score_decay``), which shaped the ``resident``
+    feature."""
     if top_prob_gate:
         raise ValueError(
             f"SGLANG_OPT_LANE_HEAD_PATH: the head was trained on ungated verifies; SGLANG_DSPARK_TOP_PROB_GATE="
             f"{top_prob_gate} cuts them (set it to 0 or retrain on gated captures)"
+        )
+    if confidence_cut:
+        raise ValueError(
+            "SGLANG_OPT_LANE_HEAD_PATH: the head was trained on uncut verifies; SGLANG_DSPARK_CONFIDENCE_CUT "
+            "cuts them (unset it or retrain on cut captures)"
         )
     if abs(float(insert_decay) - meta.score_decay) > 1e-12:
         raise ValueError(

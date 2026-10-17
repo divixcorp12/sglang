@@ -256,6 +256,7 @@ class BasicCpuExpertEngine {
       return bits;
     };
     store(table, static_cast<uint32_t>(tokens));
+    store(table + CpuTokenTable::kLiveTokens, static_cast<uint32_t>(tokens));
     for (int64_t lane = 0; lane < kLanes; ++lane)
       store(table + CpuTokenTable::kHeaderBytes + 4 * lane, mask(lane));
     for (int64_t t = 0; t < tokens; ++t)

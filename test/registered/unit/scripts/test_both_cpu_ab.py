@@ -12,6 +12,9 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 METRICS = "SGLANG_MOE_HOT_METRICS_FILE"
+STS_COLLECT = "SGLANG_DSPARK_STS_COLLECT_PATH"
+CONFIDENCE_CUT = "SGLANG_DSPARK_CONFIDENCE_CUT"
+STS_PATH_FLAG = "--speculative-dspark-confidence-sts-path"
 
 
 def _ab():
@@ -30,7 +33,10 @@ def test_the_probe_server_writes_its_own_metrics_file_and_keeps_the_arms_env():
         probe = ab._probe_overrides(arm, "/out")
         # summarize() reads the timed server's last record; an appending probe server would overwrite it.
         assert probe[METRICS] != timed[METRICS]
-        assert {k: v for k, v in probe.items() if k != METRICS} == {k: v for k, v in timed.items() if k != METRICS}
+        # A collecting probe server's recorder would overwrite the timed server's shards from shard 0.
+        assert (probe[STS_COLLECT] != timed[STS_COLLECT]) == (arm == STS_COLLECT_ARM), arm
+        own = (METRICS, STS_COLLECT)
+        assert {k: v for k, v in probe.items() if k not in own} == {k: v for k, v in timed.items() if k not in own}
 
 
 def test_a_dspark_arm_gets_a_health_budget_past_its_measured_startup_and_run_arm_honours_it(monkeypatch):
@@ -393,12 +399,17 @@ PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
 PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
 PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
 PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
+# Production's arm (-expseg with production's additions) and the confidence cut's two arms built on it.
+PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
+STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-calib",
-                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-fixedcosts", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-refine")
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-fixedcosts", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-refine",
+                      *PROD_ARMS)
 PIN01_SPLIT_MODEL_FIXED_COSTS_ARM, PIN01_SPLIT_MODEL_REFINE_ARM = PIN01_HICACHE_ARMS[7:9]
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
@@ -566,6 +577,8 @@ def test_the_t3_arm_is_the_l2_arm_with_the_head_file_alone_and_every_other_arm_p
     assert ab.REFERENCE[T3_ARM] == "dspark-both-misscut"
     for arm in ab.ARMS:
         want = ab.T3_HEAD if arm in (T3_ARM, T3_CAP2_ARM, T3_CAP3_ARM, *PROMOTE_PAIR_ARMS) else ""
+        if arm in PROD_ARMS:
+            want = ab.arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD  # production's checksummed copy of the same head
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[LEARNED_HEAD] == want, arm
 
@@ -784,7 +797,7 @@ def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[MLOCK] == ("1" if mem else "0"), arm
         drop = ("--weight-loader-drop-cache-after-load",) if mem else ()
-        assert ab.server_flags(arm) == drop + ab.ARM_MEMORY_FLAGS.get(arm, ()), arm
+        assert ab.server_flags(arm) == drop + ab.ARM_MEMORY_FLAGS.get(arm, ()) + ab.ARM_SPEC_FLAGS.get(arm, ()), arm
     for base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
         mem, plain = ab.ARMS[base + "-mem"][0], ab.ARMS[base][0]
         assert {k: v for k, v in mem.items() if k != MLOCK} == {k: v for k, v in plain.items() if k != MLOCK}
@@ -856,7 +869,7 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
     budget = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
     monkeypatch.setenv(budget, "64")
     merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
-    merges = (merge, PIN01_HICACHE_ARMS[5])  # -mergechunk and -mergechunk-expseg
+    merges = (merge, PIN01_HICACHE_ARMS[5], *PROD_ARMS)  # -mergechunk, -mergechunk-expseg and those built on it
     calib = PIN01_HICACHE_ARMS[6]  # -mergechunk-expseg-calib: its own budget (A3)
     for arm in ab.ARMS:
         want = str(ab.MERGE_CHUNK_MB) if arm in merges else "32" if arm == calib else "0"
@@ -881,7 +894,7 @@ def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_
     ab = _ab()
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
     expseg, merge = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[4]
-    on_expseg = (expseg, PIN01_HICACHE_ARMS[6])  # -expseg and -expseg-calib
+    on_expseg = (expseg, PIN01_HICACHE_ARMS[6], *PROD_ARMS)  # -expseg and the arms built on it
     for arm in ab.ARMS:
         assert ab._overrides(arm, "/out")["PYTORCH_CUDA_ALLOC_CONF"] == (
             "expandable_segments:True" if arm in on_expseg else ""), arm
@@ -905,7 +918,9 @@ def test_the_calib_arm_is_expseg_with_the_calibration_and_the_prefill_cuts_alone
     calib, expseg = PIN01_HICACHE_ARMS[6], PIN01_HICACHE_ARMS[5]
     for arm in ab.ARMS:
         overrides = ab._overrides(arm, "/out")
-        assert (overrides[ab.CALIBRATE], overrides[ab.CHUNK_KERNELS]) == (("1", "1") if arm == calib else ("0", "0")), arm
+        # Production's arms calibrate the hot cache without the per-chunk kernels, as production does.
+        want = ("1", "1") if arm == calib else ("1", "0") if arm in PROD_ARMS else ("0", "0")
+        assert (overrides[ab.CALIBRATE], overrides[ab.CHUNK_KERNELS]) == want, arm
     c, e = ab.ARMS[calib][0], ab.ARMS[expseg][0]
     knobs = {ab.CALIBRATE: "1", ab.CHUNK_KERNELS: "1", ab.MERGE_BUDGET: "32", ab.INDEXER_BUDGET: "32"}
     assert {k: v for k, v in c.items() if k not in knobs} == {k: v for k, v in e.items() if k not in knobs}
@@ -1118,6 +1133,8 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
     prefetch = set()
     stated_defaults = {
         "SGLANG_DSPARK_TOP_PROB_GATE": "0",
+        CONFIDENCE_CUT: "0",
+        STS_COLLECT: "",
         "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS": "",
         "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK": "0",
         "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB": "5",
@@ -1138,3 +1155,106 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                      str(arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS))
     assert ab.EXPSEG_HOT_GPU_MB == int(arm_env.PROD_DSPARK_HOT_GPU_MB)
     assert all(flag in argv for flag in flags)
+
+
+def test_the_prod_arm_is_production_with_the_arms_stated_defaults_and_takes_no_fixed_split(monkeypatch, tmp_path):
+    """-prod is production's env and flags, plus the off-states every arm pins, and runs without a driver split table
+    (production calibrates it). Mutant: the arm drops a production setting, keeps -expseg's head or calibration off, or
+    takes the shell's split -- red."""
+    ab = _ab()
+    arm_env = ab.arm_env
+    assert ab.PROD_ARM == PROD_ARM and ab.PROD_ARMS == PROD_ARMS
+    env, prod = arm_env.arm_env(ab.ARMS[PROD_ARM][0]), arm_env.prod_env()
+    assert {k: v for k, v in env.items() if k in prod} == prod
+    extra = {k: v for k, v in env.items() if k not in prod}
+    assert all(v in ("", "0", "5", "0.98") for v in extra.values()), extra  # stated off or at the library default
+    assert extra[SPLIT] == "" and extra[CONFIDENCE_CUT] == "0" and extra[STS_COLLECT] == ""
+    assert ab.ARMS[PROD_ARM][1] is True and ab.REFERENCE[PROD_ARM] == PIN01_HICACHE_ARMS[5]
+    assert ab.server_flags(PROD_ARM) == ab.server_flags(PIN01_HICACHE_ARMS[5])
+    assert all(flag in arm_env.ServerArgs.prod().argv() for flag in ab.server_flags(PROD_ARM))
+    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    for arm in PROD_ARMS:
+        assert ab._overrides(arm, "/out")[SPLIT] == "", arm
+    monkeypatch.delenv(SPLIT)
+    ran = []
+    monkeypatch.setattr(ab, "run_timed", lambda arm, out, **_: ran.append(arm) or 0)
+    monkeypatch.setattr(ab, "run_probe", lambda arm, out: 0)
+    monkeypatch.setattr(ab, "summarize", lambda out: {})
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), *PROD_ARMS])
+    ab.main()
+    assert ran == list(PROD_ARMS)
+
+
+def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the_collection_off(monkeypatch):
+    """Both cut arms are -prod with SGLANG_DSPARK_CONFIDENCE_CUT=1 alone; the collect arm has no STS file (collect mode:
+    the head built, the cut off) and the cut arm has production's STS path. Every other arm states the flag 0 and the
+    collect path empty against a shell's. Mutant: an arm inherits the shell's flag or path, the collect arm passes the
+    STS file, or the cut arm drops it -- red."""
+    ab = _ab()
+    monkeypatch.setenv(CONFIDENCE_CUT, "1")
+    monkeypatch.setenv(STS_COLLECT, "/shell/sts")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[CONFIDENCE_CUT] == ("1" if arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM) else "0"), arm
+            assert (overrides[STS_COLLECT] != "") == (arm == STS_COLLECT_ARM), arm
+        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm == CONFIDENCE_CUT_ARM), arm
+    prod = {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k != CONFIDENCE_CUT}
+    for arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM):
+        cut = ab.ARMS[arm][0]
+        assert cut[CONFIDENCE_CUT] == "1", arm
+        assert {k: v for k, v in cut.items() if k != CONFIDENCE_CUT} == prod, arm
+        assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == PROD_ARM
+    flags = ab.server_flags(CONFIDENCE_CUT_ARM)
+    assert flags[:-2] == ab.server_flags(PROD_ARM)
+    assert flags[-2:] == (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+
+
+def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_own(monkeypatch):
+    """The timed server, the probe server and a capture each collect into their own directory, at the stem the fit's
+    --data-glob '<stem>.*.pt' names. Mutant: the probe shares the timed stem (its shard 0 overwrites the timed one) or
+    the capture leaves the path empty -- red."""
+    ab = _ab()
+    timed = ab._overrides(STS_COLLECT_ARM, "/out")[STS_COLLECT]
+    probe = ab._probe_overrides(STS_COLLECT_ARM, "/out")[STS_COLLECT]
+    assert timed == f"/out/{STS_COLLECT_ARM}/sts/confidence"
+    assert probe == f"/out/{STS_COLLECT_ARM}.probe/sts/confidence"
+    spec = importlib.util.spec_from_file_location(
+        "spec_margin_capture", os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "spec_margin_capture.py")
+    )
+    cap = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cap)
+    assert cap.server_env("/cap", False, arm=STS_COLLECT_ARM)[STS_COLLECT] == "/cap/sts/confidence"
+    assert cap.server_env("/cap", False, arm=CONFIDENCE_CUT_ARM)[STS_COLLECT] == ""
+    assert STS_PATH_FLAG in cap.server_argv(CONFIDENCE_CUT_ARM)
+    assert STS_PATH_FLAG not in cap.server_argv(STS_COLLECT_ARM)
+    # The production arms run production's warm-ups; the others keep the prefill-only one.
+    for arm in ab.ARMS:
+        argv = cap.server_argv(arm)
+        want = "dsv41_prefill_shapes,dsv41_decode_paths" if arm in PROD_ARMS else "dsv41_prefill_shapes"
+        assert argv[argv.index("--warmups") + 1] == want, arm
+
+
+def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monkeypatch, tmp_path):
+    """The probe server launches the arm too, so it needs the cut's STS file; without it the launch refuses the cut.
+    Mutant: run_probe builds its argv without the arm's speculative flags -- red."""
+    import contextlib
+
+    ab = _ab()
+    argvs = []
+
+    class Server:
+        pid = 1
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(ab.subprocess, "Popen", lambda cmd, **_: argvs.append(cmd) or Server())
+    monkeypatch.setattr(ab, "_healthy", lambda port, deadline: False)  # no client: run_probe returns 1
+    monkeypatch.setattr(ab.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
+    for arm in PROD_ARMS:
+        assert ab.run_probe(arm, str(tmp_path)) == 1
+    prod, collect, cut = argvs
+    assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
+    assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect

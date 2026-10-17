@@ -67,6 +67,17 @@ def test_prod_leaves_the_pending_and_held_flags_off():
     assert not any("TRACE" in k for k in env) and "SGLANG_MOE_HOT_METRICS_FILE" not in env
 
 
+def test_prod_leaves_the_confidence_cut_and_its_sts_collection_off():
+    # docs/hx/compact-verify-exl3.draft.md: off by default; the cut and its STS file belong to both_cpu_ab's cut arm.
+    env = arm_env.prod_env()
+    assert "SGLANG_DSPARK_CONFIDENCE_CUT" not in env and "SGLANG_DSPARK_STS_COLLECT_PATH" not in env
+    assert "--speculative-dspark-confidence-sts-path" not in arm_env.ServerArgs.prod().argv()
+    assert not any("DSPARK_STS" in k or "CONFIDENCE_CUT" in k for k in arm_env.dspark_env())
+    # The arm's fitted STS file: a production asset path with its digest pinned.
+    assert arm_env.PROD_DSPARK_STS_PATH.startswith("/data/models/slang/prod-assets/dspark-sts/")
+    assert len(arm_env.PROD_DSPARK_STS_SHA256) == 64
+
+
 # The best arm's prefetch keys, from divix01:/mnt/nvme1/share64-ab-20261016/resolved-env.json "on" (its head was
 # nvfp4-work/ram-prefetch/l2-t3-head/t3-f109-calib-b075.safetensors, production's is the checksummed copy).
 SERVED_PREFETCH = {
@@ -154,6 +165,18 @@ def test_prod_and_every_arm_pass_the_v41_reasoning_and_tool_call_parsers():
         assert ns.reasoning_parser == "deepseek-v41"
         assert ns.tool_call_parser == "deepseekv41"
         assert ns.language_model_only is True
+
+
+def test_prod_warms_decode_after_the_prefill_shapes_and_the_arms_keep_prefill_only():
+    from sglang.srt.entrypoints.warmup import _warmup_registry
+
+    argv = arm_env.ServerArgs.prod().argv()
+    # Order matters: the decode warm-up's long prompt evicts the SWA KV that the prefill warm-up left cached.
+    assert argv[argv.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths"
+    assert {"dsv41_prefill_shapes", "dsv41_decode_paths"} <= set(_warmup_registry)
+    for args in (arm_env.ServerArgs(port=1), arm_env.ServerArgs(port=1, dspark=True)):
+        argv = args.argv()
+        assert argv[argv.index("--warmups") + 1] == "dsv41_prefill_shapes"
 
 
 def test_prod_and_every_arm_bound_the_prefill_share_with_the_recorder_it_needs():

@@ -156,10 +156,23 @@ def test_done_is_published_only_after_the_rows_and_status(setup):
 
 def test_a_failed_lookup_publishes_its_status(setup):
     ring, _, _ = setup
-    seq = ring.post([1, -1, 2])
+    seq = ring.post([1, -2, 2])
     assert ring.wait(seq)
     assert ring.status() == 2
     assert not ring.rows.any()
+
+
+def test_a_dead_row_id_is_served_as_a_zero_row(setup):
+    """A cut verify row's -1 (engram.DEAD_ROW_ID) succeeds with a zero row and no access; the live ids beside it
+    are served as before."""
+    ring, store, packed = setup
+    ring.rows.fill_(0xFF)
+    accesses = store.stats()["accesses"]
+    seq = ring.post([4, -1, 6])
+    assert ring.wait(seq)
+    assert ring.status() == 0
+    assert torch.equal(ring.rows[[0, 2]], packed[[4, 6]]) and not ring.rows[1].any()
+    assert store.stats()["accesses"] == accesses + 2
 
 
 def test_a_device_timeout_latches_and_the_service_refuses_later_requests(setup):

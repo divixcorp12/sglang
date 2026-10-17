@@ -1477,6 +1477,99 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - divix01 has ccache 4.11.3 system-wide (`/etc/profile.d/ccache.sh`), `~/.config/ccache/ccache.conf` max_size 50G.
   Build-time measurements must set `CCACHE_DISABLE=1`.
 
+### 3.12 DSpark confidence-head verify cut — branch `confidence-cut` (`60852853fd`), NOT merged, off by default
+
+- **What it does.** At batch size 1 with greedy sampling, each verify keeps the w* rows that maximise
+  (1 + sum_{k<w} S_k) / T(w). S_k is the STS-calibrated cumulative product of the draft's trained Markov confidence
+  head (DSpark paper eq. 7). T(w) is verify ms with w live rows, measured at startup from 48 interleaved forced-width
+  verifies. Cut rows go through the existing static-graph dead-row mask (no experts routed) and the accept cap.
+  Switch: `SGLANG_DSPARK_CONFIDENCE_CUT=1` plus `--speculative-dspark-confidence-sts-path`. Spec:
+  `docs/hx/compact-verify-exl3.draft.md`. Real `compact` mode was dropped: at bs 1 its tier grid is [6], and its
+  padding rows still route experts.
+- **STS.** Fitted from `/mnt/nvme1/sts-collect-20261016` (one long prompt, 2,048 verifies). Temperatures
+  0.89/0.79/1.26/0.89/0.63, ECE 2.9-3.8% -> 2.1-3.0%. Installed read-only at
+  `/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json`, sha256 `a0f2fc7c...bcd5`.
+- **Smoke** (`/mnt/nvme1/confcut-smoke-20261016`, instr build, long prompt, 300 s):
+  - T(w) = [126, 187, 187, 187, 207, 257] ms.
+  - w* 3.7-4.0; E(w*) 2.37-2.59 against accept 2.38-2.58, so the calibration holds.
+  - Greedy text matched the all-rows run for 57 tokens, then split at a near-tie wording choice (ordinary on this stack).
+  - Not an A/B: in the windows clean in both runs (60-180 s), 64-66 vs 75-79 ms/token, wait per verify 80 vs 90-119 ms.
+- **Follow-ups merged into `confidence-cut` (owner, 2026-10-16; test run pending):**
+  - T(w) is an affine least-squares fit over every calibration sample instead of per-width medians.
+  - Prefetch scorers rank only live rows. The post kernel writes a device-side live count into spare bytes of the
+    token-table header (offset 4), and the GPU select kernel reads the routes. Picks were already unchanged, because a
+    dead row duplicates row 0; this saves ranking work and CPU-scorer dot products. The learned head still uses the
+    token count fixed when the graph is captured.
+  - Dead routes no longer add to the hot-cache route counts. They still count in the graph, unique and outcome counters,
+    the GPU residency updater's decay clock still counts all 6 rows, and the eager streamed path still records them as
+    row 0's experts. Production uses the static graph, so the eager path is moot.
+  - Dead rows' Engram lookups post -1, which the native store serves as a zero row: no access, read or insert. Any other
+    negative id is still fatal. This covers the in-graph device wait (the default) only.
+- **Served pair, -prod vs -prod-confcut** (2026-10-16 21:55-22:29, `confidence-cut` @ `5158aa38d3` incl. the dead-row
+  follow-ups and the V4.1 parsers; long prompt, 420 s decode each, one sample each, prod first, instr build in both;
+  `/mnt/nvme1/confcut-ab-20261017`, `long_compare.txt`):
+
+  | | -prod | -prod-confcut | delta |
+  |---|---:|---:|---:|
+  | tokens in 420 s | 6,309 | 6,725 | +6.6% |
+  | ms/token, whole decode | 66.6 | 62.5 | -6.2% |
+  | ms/token, 60-360 s | 70.8 | 60.8 | -14% |
+  | ms per verify, 60-360 s | 180.4 | 158.4 | -12% |
+  | tokens per verify, 60-360 s | 2.55 | 2.61 | +2% |
+  | wait per verify, 120-300 s | 107-123 | 53-84 | |
+  | TTFT | 16.44 s | 17.07 s | +0.63 s |
+
+  - The verify is cheaper and accept did not fall. Texts diverged at token 41, so tokens/verify is content-dependent;
+    ms per verify is the cleaner number.
+  - Cold GPU lanes per verify rose by about 3 (1.9-2.3 -> 3.2-5.2), and stream per verify rose 5.8 -> 9.8-13.4. Not
+    explained yet.
+  - Noise: the cut arm's 0-30 s and 300-360 s windows had swap-in spikes (CPUSLOW), and 360-420 s was a disk stall
+    (x10.8) and is truncated (the copy engine's job trace overflowed at 414.8 s, which is why the capture reported
+    rc=1). All excluded from the 60-360 s rows.
+- **The startup T(w) fit is noise-dominated** (found 2026-10-16 in the two cut arms below and above). The affine fit
+  over the 48 calibration verifies gave a = 226.6, b = 16.8 ms/row (r^2 = 0.015) in the confcut arm, and a = 271.0,
+  b = 4.7 ms/row (r^2 = 0.0009) in the engramscales arm. With the shallower slope the cut is much weaker: w* 4.4-5.3
+  and about 50 cut rows per 40 verifies, against w* 3.4-4.1 and about 90. So how hard the cut bites is set by
+  calibration noise at each launch. Needs a decision (owner) before the cut ships.
+- **Engram scales in node-1 RAM, served** (`engram-scales-ram` @ `e9fb5bbd2d`, `-prod-confcut` +
+  `SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1`; owner skipped the off arm; compared with the confcut arm above;
+  `/mnt/nvme1/engramscales-20261017`):
+  - Works: 2 x 2.861 GiB loaded in 1.9 s each, 0 pages off node 1. Engram NVMe reads per unique miss fell from 2 to
+    1.0 (for example 48,370 reads for 48,370 misses in one 60 s window).
+  - Node 1 free in decode 14.35 -> 8.21 GiB (median); node 0 and swap unchanged.
+  - Throughput is not comparable: the T(w) fit above made this arm cut far less, so it verified more rows (about 226
+    Engram accesses per verify against 174) and waited longer. 60-360 s: 166.2 vs 158.4 ms per verify, 65.9 vs 60.8
+    ms/token. A clean read needs a fixed-width base (for example `-prod` vs `-prod` + scales).
+- **Dead-row audit** (2026-10-16, read-only; confcut smoke server.log Engram stats against verify.jsonl, prefill-free
+  60 s windows only):
+  - **Engram lookups are the only disk/host work a dead row still causes.** Both runs do 288 accesses per verify
+    (6 rows x 24 hash columns x layers 1 and 14), so the cut saves none today. At cap len 3.90, 2.1 of 6 rows are dead,
+    about 101 accesses and 65 unique misses per verify, which is about 130 4 KiB O_DIRECT reads (0.5 MiB) on nvme2n1.
+    nvme2n1 is also an expert mirror root, and it served 2.4x nvme0n1's read count for the same MiB. Estimated
+    0.3-1 ms per verify; not measured, because ring wait stats are not logged. Fix in progress: a -1 sentinel that the
+    native Store skips (zero row, no access counted), applied in graph from `VerifyDeadRows.dead`. Expected effect:
+    about 288 x live/6 accesses per verify in the "engram native cache" log line, instead of 288.
+  - **Everything else a dead row runs is GPU work at about 0 marginal cost at 6 rows**: indexer scoring and top-k (under
+    0.05 ms at 3K context, growing with context), the sparse MLA gather (about 0.02 ms), KV and compressor-state writes
+    (position-keyed, every ring has margin, never read back), shared expert, projections and lm_head. A static graph
+    cannot shrink M, so none of it is worth skipping now. The indexer is the one to revisit at long context.
+  - **No functional consumer reads a dead row**: accept, bonus (correct_len is capped at L-1), KV/state, the draft
+    hidden inject and the Engram/n-gram history all key off commit_lens. Three metrics do read dead rows, and are
+    already counterfactual because those rows route no experts:
+    - `cap_trim_lens` reads the uncapped correct_len and feeds `block_accept_lens`;
+    - the debug confidence metrics and `block_accept_recorder` read every row's logits;
+    - dead routes count toward row 0's experts in the planner route counts.
+    Outputs are unaffected. Fix them if any of those metrics gets used for a decision.
+- **TODO (owner, 2026-10-16):**
+  - Broaden the STS calibration data: collect a few more prompt types (code, chat, short answers) and refit.
+    Positions 4-5 have the fewest samples.
+  - Drive-pressure-aware cost: scale T(w)'s slope by a live NVMe pressure signal (e.g. recent NVMe wait per row), so
+    the cut is harder while the SPCC stalls. Check it against the owner's startup-calibration rule first.
+  - A per-row cost conditioned on predicted misses: price each extra row by the likelihood that its experts miss
+    VRAM/RAM. Needs a per-row miss predictor; the parked lane head (4a) is the foundation.
+  - Use the calibrated S_k beyond the cut: weight RAM prefetch candidates toward likely-accepted positions, and feed the
+    split model's CPU/GPU decisions.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.
@@ -1484,6 +1577,14 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   NUMA move unless arm A leaves node 0 short.
 - In-server interleaved A/B harness for noise (offered; owner chose other work).
 - RAM prefetch `promote_landed`: ~42 rows land and ~20 are used per verify; a RAM-tier precision concern.
+- **TODO (owner, 2026-10-17): FP4 C4 indexer arm** (`--enable-deepseek-v4-fp4-indexer`, off in prod).
+  - What it changes: the C4 indexer K cache is stored in FP4 (per-32 UE8M0) instead of FP8 (`set_index_k_fp4`), the
+    query is quantized to FP4, and scoring uses DeepGEMM `fp8_fp4` kernels. So it changes which compressed tokens
+    attention selects; it is an accuracy change, not a pure speed knob. sglang labels it experimental.
+  - Platform: the launch gate (`serving_hook.py`) admits SM100/SM120/gfx95, so it starts on the 5090.
+  - Open: whether production's torch prefill indexer (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`) reads FP4 K pages.
+  - Plan: an arm `-prod-confcut-fp4idx` (`-prod-confcut` + the flag), long prompt against `-prod-confcut`. Compare
+    ms/token, accept length (the first sign of worse attention), where the text diverges, and VRAM freed.
 
 ## 4a. Consolidation review (2026-10-16, before the merge to master)
 

@@ -192,7 +192,9 @@ constexpr int kExpertRoutePlanDedupMaxRoutes = 64;
 // route is its earliest; only a residual expert's first route takes a scratch row, and every route of that expert
 // remaps to it. Compaction puts those rows first, by first appearance (or by `miss_keys`, highest first, ties by
 // first appearance), then every other route in route order. Counters are `plan_graph_routes`': routes and
-// nonresident routes with multiplicity, hits and misses by distinct expert.
+// nonresident routes with multiplicity, hits and misses by distinct expert. `dead_rows` (optional, [>= routes /
+// row_top_k] bool) marks a verify's dead rows, whose routes repeat row 0's (layers/moe/verify_dead_rows.py): they
+// add nothing to `route_counts`, the residency scores. The graph and outcome counters still count them.
 template <typename IdT, typename RemapT>
 __global__ __launch_bounds__(kExpertRoutePlanDedupMaxRoutes, 1) void plan_dedup_routes_kernel(
     const IdT* __restrict__ topk_ids,
@@ -210,7 +212,9 @@ __global__ __launch_bounds__(kExpertRoutePlanDedupMaxRoutes, 1) void plan_dedup_
     const int32_t* __restrict__ prefetch_count,
     int32_t prefetch_slot,
     int64_t* __restrict__ outcome_counters,
-    const int64_t* __restrict__ miss_keys) {
+    const int64_t* __restrict__ miss_keys,
+    const bool* __restrict__ dead_rows,
+    int row_top_k) {
   enum : uint8_t { kInactive = 0, kHit = 1, kPrefetched = 2, kResidual = 3 };
   __shared__ int64_t s_expert[kExpertRoutePlanDedupMaxRoutes];
   __shared__ int64_t s_key[kExpertRoutePlanDedupMaxRoutes];
@@ -264,7 +268,8 @@ __global__ __launch_bounds__(kExpertRoutePlanDedupMaxRoutes, 1) void plan_dedup_
     source_rows_out[dest_pos] = expert;
     slots_out[dest_pos] = destination;
     remap_out[i] = static_cast<RemapT>(destination);
-    if (route_counts != nullptr) atomicAdd(route_counts + expert, 1.0f);
+    const bool dead = dead_rows != nullptr && dead_rows[i / row_top_k];
+    if (route_counts != nullptr && !dead) atomicAdd(route_counts + expert, 1.0f);
   }
   if (i == 0) {
     unsigned demand = 0, covered = 0, residual_routes = 0, unique_hits = 0, unique_misses = 0;
@@ -298,7 +303,8 @@ __global__ __launch_bounds__(kExpertRoutePlanDedupMaxRoutes, 1) void plan_dedup_
   }
 }
 
-// `plan_unique_routes_gpu`'s arguments, for `plan_dedup_routes_kernel`: one block of 64 threads.
+// `plan_unique_routes_gpu`'s arguments, for `plan_dedup_routes_kernel`: one block of 64 threads. `dead_rows`, bool
+// with one entry per row of `row_top_k` routes, is optional.
 template <typename IdT, typename RemapT>
 void plan_dedup_routes_gpu(
     tvm::ffi::TensorView topk_ids,
@@ -315,9 +321,16 @@ void plan_dedup_routes_gpu(
     tvm::ffi::TensorView prefetch_count,
     int64_t prefetch_slot,
     tvm::ffi::Optional<tvm::ffi::TensorView> outcome_counters,
-    tvm::ffi::Optional<tvm::ffi::TensorView> miss_keys) {
+    tvm::ffi::Optional<tvm::ffi::TensorView> miss_keys,
+    tvm::ffi::Optional<tvm::ffi::TensorView> dead_rows,
+    int64_t row_top_k) {
   host::RuntimeCheck(
       0 < topk_ids.numel() && topk_ids.numel() <= kExpertRoutePlanDedupMaxRoutes, "topk_ids must hold 1-64 routes");
+  if (dead_rows.has_value())
+    host::RuntimeCheck(
+        dead_rows.value().dtype().code == kDLBool && dead_rows.value().is_contiguous() && row_top_k >= 1 &&
+            dead_rows.value().numel() * row_top_k >= topk_ids.numel(),
+        "dead_rows must be contiguous bool, one entry per row of row_top_k routes");
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
   auto ptr = [](auto& opt) { return opt.has_value() ? opt.value().data_ptr() : nullptr; };
   host::LaunchKernel(1, kExpertRoutePlanDedupMaxRoutes, stream)(
@@ -337,7 +350,9 @@ void plan_dedup_routes_gpu(
       static_cast<const int32_t*>(prefetch_count.data_ptr()),
       static_cast<int32_t>(prefetch_slot),
       static_cast<int64_t*>(ptr(outcome_counters)),
-      static_cast<const int64_t*>(ptr(miss_keys)));
+      static_cast<const int64_t*>(ptr(miss_keys)),
+      static_cast<const bool*>(ptr(dead_rows)),
+      static_cast<int>(row_top_k));
 }
 
 }  // namespace sglang

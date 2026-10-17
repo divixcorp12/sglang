@@ -50,9 +50,12 @@ def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: s
                verify_split: bool = True) -> dict:
     """The arm's env with the job trace on; ``top_k_only`` and ``scorer`` override the arm's only when given. With
     ``verify_split`` it also writes the stage trace's route log, the router capture and the per-verify accept log,
-    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs."""
+    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs. An
+    STS collection arm writes its shards under OUT_DIR (both_cpu_ab.sts_collect_stem)."""
     overrides, _ = both_cpu_ab.ARMS[arm]
     asked = {}
+    if arm in both_cpu_ab.STS_COLLECT_ARMS:
+        asked[both_cpu_ab.STS_COLLECT] = both_cpu_ab.sts_collect_stem(out_dir)
     if top_k_only:
         asked["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] = "1"
     if scorer is not None:
@@ -155,6 +158,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with --long-prompt: cancel the request this long after its first streamed token")
     p.add_argument("--ttft-repeats", type=int, default=0,
                    help="with --long-prompt: first send it this many times with 20 s of decode, for TTFT samples")
+    p.add_argument("--then-generate", metavar="JSON",
+                   help="after the client succeeds and before the shutdown, POST this /generate body once and save the "
+                        "reply as OUT_DIR/then_generate.json (e.g. a sampled request outside the timed windows)")
     p.add_argument("--resolve-env", metavar="KEYS",
                    help="launch nothing: print the server's env (the comma-separated KEYS from the caller's env under "
                         "the capture's own), its argv, and which of KEYS the capture overrides, as JSON")
@@ -179,7 +185,10 @@ def capture_env(a: argparse.Namespace) -> dict:
 
 
 def server_argv(arm: str) -> list[str]:
-    return [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(arm)]
+    # The production arms warm up as production does (ServerArgs.prod(): dsv41_decode_paths too).
+    decode_warmup = arm in both_cpu_ab.PROD_ARMS
+    return [*arm_env.ServerArgs(port=PORT, dspark=True, decode_warmup=decode_warmup).argv(),
+            *both_cpu_ab.server_flags(arm)]
 
 
 def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
@@ -189,6 +198,24 @@ def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
     asked = {k: os.environ[k] for k in keys if k in os.environ}
     return {"env": asked | own, "argv": server_argv(a.arm),
             "overridden": sorted(k for k, v in asked.items() if k in own and own[k] != v)}
+
+
+def then_generate(body_path: str, out_path: str, timeout_s: float = 600.0) -> int:
+    """POST ``body_path`` to the server's /generate once; the reply goes to ``out_path``. 0 on HTTP 200."""
+    with open(body_path, "rb") as f:
+        body = f.read()
+    request = urllib.request.Request(f"http://127.0.0.1:{PORT}/generate", data=body,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as r:
+            reply = r.read()
+    except OSError as error:
+        print(f"then-generate failed: {error!r}")
+        return 1
+    with open(out_path, "wb") as f:
+        f.write(reply)
+    print(f"then-generate: {len(reply)} bytes -> {out_path}")
+    return 0
 
 
 def main() -> int:
@@ -208,6 +235,8 @@ def main() -> int:
             if not _healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
                 return 1
             rc = subprocess.run(["taskset", "-c", arm_env.DRIVER_CORES, *client_argv(a)], cwd=REPO).returncode
+            if rc == 0 and a.then_generate:
+                rc = then_generate(a.then_generate, os.path.join(a.out_dir, "then_generate.json"))
         finally:
             stop_server(server)
     if rc != 0:

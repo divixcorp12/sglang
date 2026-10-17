@@ -262,7 +262,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
                              ? p.cpu_x_dst + p.cpu_tokens_max * p.cpu_x_token_bytes
                              : nullptr;
   const int64_t top_k = p.cpu_tokens > 0 ? p.cpu_weights_count / p.cpu_tokens : 0;
-  if (table != nullptr) st_relaxed_sys<uint32_t>(table, static_cast<uint32_t>(p.cpu_tokens));
+  if (table != nullptr) {
+    st_relaxed_sys<uint32_t>(table, static_cast<uint32_t>(p.cpu_tokens));
+    st_relaxed_sys<uint32_t>(
+        table + expert_stream::CpuTokenTable::kLiveTokens,
+        static_cast<uint32_t>(live_route_tokens(p.routes, p.route_count, p.cpu_tokens, top_k)));
+  }
   int32_t protect[Wire::kLanes];
   int protect_count = 0;
   for (int64_t i = 0; i < p.route_count && protect_count < Wire::kLanes; ++i) {

@@ -10,6 +10,8 @@
 
 #include <sgl_kernel/tensor.h>
 
+#include <tvm/ffi/optional.h>
+
 #include "lease_device.cuh"
 #include "spec_candidates.h"
 #include "tensor_checks.h"
@@ -144,8 +146,13 @@ __global__ __launch_bounds__(device::expert_stream::kScoreThreads) void exl3_ram
 // Arguments of the select kernel, a __grid_constant__ a captured graph freezes.
 struct SpecSelectParams {
   const float* scores;  // the score kernel's [tokens_max, experts]
-  int64_t tokens;       // the record's live tokens; outside 1..tokens_max the slot gets count 0
+  int64_t tokens;       // the record's tokens; outside 1..tokens_max the slot gets count 0
   int64_t tokens_max;
+  // The record's routes, route_top_k per token (lease_kernels.cuh PostParams::routes): only tokens through the last
+  // with a route >= 0 are ranked (live_route_tokens), so a verify's dead rows spend no per_token picks. Null: all.
+  const int64_t* routes;
+  int64_t route_count;
+  int64_t route_top_k;
   int64_t experts;
   int64_t top_k;
   int64_t per_token;
@@ -172,6 +179,8 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
   __shared__ int16_t order[kSelectMaxTokens][kSpecDepth];
   __shared__ int16_t list[kSelectMaxTokens * kSpecDepth];
   const bool live = p.tokens >= 1 && p.tokens <= p.tokens_max;
+  const int64_t tokens =
+      live && p.routes != nullptr ? live_route_tokens(p.routes, p.route_count, p.tokens, p.route_top_k) : p.tokens;
   const int64_t depth = min(static_cast<int64_t>(kSpecDepth), p.experts);
   for (int64_t e = threadIdx.x; e < p.experts; e += blockDim.x) {
     skip[e] = p.ram_slot[e] >= 0 ? 1 : 0;
@@ -184,7 +193,7 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
   }
   if (live) {
     const int lane = threadIdx.x % 32;
-    for (int64_t t = threadIdx.x / 32; t < p.tokens; t += kSelectThreads / 32) {
+    for (int64_t t = threadIdx.x / 32; t < tokens; t += kSelectThreads / 32) {
       const float* s = p.scores + t * p.experts;
       uint32_t taken = 0;  // bit k: expert lane + 32k is already ordered
       for (int64_t i = 0; i < depth; ++i) {
@@ -216,7 +225,7 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
   int n = 0;
   if (live) {
     const int64_t walk = p.top_k_only != 0 ? p.top_k : depth;
-    for (int64_t t = 0; t < p.tokens; ++t) {
+    for (int64_t t = 0; t < tokens; ++t) {
       const float* s = p.scores + t * p.experts;
       const float kth = s[order[t][p.top_k - 1]];
       int64_t taken = 0;
@@ -455,7 +464,8 @@ struct SpecScoreKernel {
   }
 
   /// Launches the select kernel; see SpecSelectParams. `ram_slot` is the device map bank's [rows, experts] and
-  /// `target` its row; `candidates_address` the pinned candidate page's address.
+  /// `target` its row; `candidates_address` the pinned candidate page's address. `routes`, int64 [route_count] or
+  /// absent, holds route_top_k routes per token.
   static void select(
       tvm::ffi::TensorView scores,
       int64_t tokens,
@@ -467,7 +477,9 @@ struct SpecScoreKernel {
       tvm::ffi::TensorView ram_slot,
       int64_t target,
       tvm::ffi::TensorView state,
-      int64_t candidates_address) {
+      int64_t candidates_address,
+      tvm::ffi::Optional<tvm::ffi::TensorView> routes,
+      int64_t route_top_k) {
     using namespace host;
     using namespace device::expert_stream;
     auto device = SymbolicDevice{};
@@ -475,6 +487,12 @@ struct SpecScoreKernel {
     auto E_ = SymbolicSize{"experts"};
     auto M_ = SymbolicSize{"tokens_max"};
     auto Rows_ = SymbolicSize{"rows"};
+    auto R_ = SymbolicSize{"routes"};
+    if (routes.has_value()) {
+      expert_stream::verify_named(
+          "routes", TensorMatcher({R_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), routes.value());
+      RuntimeCheck(routes.value().is_contiguous() && route_top_k >= 1, "routes: contiguous, with route_top_k >= 1");
+    }
     expert_stream::verify_named(
         "scores", TensorMatcher({M_, E_}).with_dtype<fp32_t>().with_device<kDLCUDA>(device), scores);
     expert_stream::verify_named(
@@ -498,6 +516,9 @@ struct SpecScoreKernel {
         .scores = static_cast<const float*>(scores.data_ptr()),
         .tokens = tokens,
         .tokens_max = M_.unwrap(),
+        .routes = routes.has_value() ? static_cast<const int64_t*>(routes.value().data_ptr()) : nullptr,
+        .route_count = routes.has_value() ? R_.unwrap() : 0,
+        .route_top_k = route_top_k,
         .experts = experts,
         .top_k = top_k,
         .per_token = per_token,

@@ -81,6 +81,27 @@ def test_a_zero_budget_returns_the_same_rows_as_the_default(table):
     assert s_off["unique_misses"] > s_on["unique_misses"]
 
 
+@pytest.mark.parametrize("budget", [0, ROWS * ROW_BYTES])
+def test_a_dead_row_id_is_a_zero_row_that_counts_and_reads_nothing(table, budget):
+    """-1 (engram.DEAD_ROW_ID, a cut verify row) is served zeros without an access, a read or an insert; the live
+    ids of the same request are served as before. Any other negative id still fails the request."""
+    t, packed = table
+    store = _store(t, budget)
+    keys = ("accesses", "hits", "unique_misses", "submitted_sqes", "filled_rows", "evictions")
+    before = {k: store.stats()[k] for k in keys}
+    got = store.lookup(np.array([-1, -1], dtype=np.int64), t._tag)
+    assert got.shape == (2, ROW_BYTES) and not got.any()
+    assert {k: store.stats()[k] for k in keys} == before
+    ids = np.array([5, -1, 7, -1, 5], dtype=np.int64)
+    got = store.lookup(ids, t._tag)
+    live = ids >= 0
+    assert np.array_equal(got[live], packed[ids[live]]) and not got[~live].any()
+    after = dict(store.stats())
+    assert after["accesses"] - before["accesses"] == 3 and after["unique_misses"] - before["unique_misses"] == 2
+    with pytest.raises(RuntimeError, match="lookup failed"):
+        store.lookup(np.array([5, -2], dtype=np.int64), t._tag)
+
+
 def test_a_budget_below_one_row_is_still_refused():
     with pytest.raises(ValueError):
         native_engram_host_node().create_store(ROW_BYTES - 1, ROW_BYTES)

@@ -268,7 +268,8 @@ def test_native_callback_failure_clears_staging_rows_and_sets_status(table, monk
     monkeypatch.setenv("SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING", "1")
     directory, *_ = table
     t = EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
-    ids = torch.tensor([-1], dtype=torch.int64)
+    # -1 is the dead-row sentinel (engram.DEAD_ROW_ID), served as a zero row; -2 is invalid.
+    ids = torch.tensor([-2], dtype=torch.int64)
     rows = torch.full(
         (1, DIM + DIM // BLOCK), 0xA5, dtype=torch.uint8, pin_memory=True
     )
@@ -506,7 +507,7 @@ def _layer14_invalid_id_graph_worker(directory, connection):
         assert context.rows.any()
 
         with torch.cuda.stream(replay_stream):
-            ids.copy_(torch.tensor([[-1, 2]], device="cuda"))
+            ids.copy_(torch.tensor([[-2, 2]], device="cuda"))
             with pytest.raises(
                 RuntimeError,
                 match="Engram file lookup failed|device-side assert triggered",

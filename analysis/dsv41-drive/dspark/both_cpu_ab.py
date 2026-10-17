@@ -563,12 +563,58 @@ REFERENCE = {
     PIN01_SPLIT_MODEL_FIXED_COSTS_ARM: PIN01_SPLIT_MODEL_HICACHE1_ARM,
     PIN01_SPLIT_MODEL_REFINE_ARM: PIN01_SPLIT_MODEL_FIXED_COSTS_ARM,
 }
+# The DSpark confidence-head verify cut (docs/hx/compact-verify-exl3.draft.md) and its STS data collection, off in every
+# arm but the two below, pinned so a shell that exports them cannot carry them into one.
+CONFIDENCE_CUT = "SGLANG_DSPARK_CONFIDENCE_CUT"
+STS_COLLECT = "SGLANG_DSPARK_STS_COLLECT_PATH"
+for _overrides_of_arm, _ in ARMS.values():
+    _overrides_of_arm[CONFIDENCE_CUT] = "0"
+    _overrides_of_arm[STS_COLLECT] = ""
+# Production's arm: -expseg with what production adds to it (arm_env.prod_dspark_env: both startup calibrations on and
+# the prefetch head's checksummed copy) and production's server flags. It takes no fixed split, as production
+# calibrates its table at startup (_takes_fixed_split). The two cut arms build on it and are compared with it.
+PROD_ARM = MERGE_CHUNK_EXPSEG_ARM + "-prod"
+ARMS[PROD_ARM] = ({**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], **arm_env.prod_dspark_env(), FIXED_SPLIT_VAR: ""}, True)
+# Step 1 of the cut's calibration, STS collection: the flag on with SGLANG_DSPARK_STS_COLLECT_PATH set and no STS file
+# is collect mode. The head is built under static, the cut does not apply, and every verify covers all gamma + 1 rows
+# with identity temperatures, so each verify's raw head logits and accepted prefix are valid; StsDataRecorder saves
+# them as <stem>.<n>.pt shards of 256 verifies (the last partial shard is not written). _overrides and
+# spec_margin_capture put the stem under OUT (sts_collect_stem). The owner's capture is the long prompt, thinking on:
+#     spec_margin_capture.py OUT --arm <this arm> --long-prompt PATH --no-verify-split
+# Step 2, the fit (any host, CPU only):
+#     PYTHONPATH=$PWD/python python -m sglang.benchmark.dspark_sts_fit --data-glob 'OUT/sts/confidence.*.pt' \
+#         --out dsv41-dspark-sts.json --gamma 5
+# (this driver's timed run writes OUT/<arm>/sts/confidence.*.pt). Step 3: install the JSON read-only at
+# arm_env.PROD_DSPARK_STS_PATH and pin its digest in arm_env.PROD_DSPARK_STS_SHA256.
+STS_COLLECT_ARM = PROD_ARM + "-stscollect"
+ARMS[STS_COLLECT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
+STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
+# The cut: production with the flag and the fitted STS file (ARM_SPEC_FLAGS). Until the file is fitted, its launch
+# fails.
+CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
+ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
+ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
+# An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
+ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
+REFERENCE.update({PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM})
+
+
+def sts_collect_stem(directory: str) -> str:
+    """A collecting server's shard stem: StsDataRecorder writes <stem>.<n>.pt, so the fit's --data-glob is
+    '<stem>.*.pt'."""
+    return os.path.join(directory, "sts", "confidence")
 
 
 def server_flags(arm: str) -> tuple[str, ...]:
     """Server flags an arm adds to the launch argv (its env overrides cannot carry them): -mem's page-cache drop, for
-    the -mem arms and those built on them, and an arm's own fraction and KV pool (ARM_MEMORY_FLAGS)."""
-    return (MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ()) + ARM_MEMORY_FLAGS.get(arm, ())
+    the -mem arms and those built on them, an arm's own fraction and KV pool (ARM_MEMORY_FLAGS), and its speculative
+    flags (ARM_SPEC_FLAGS)."""
+    return (
+        (MEM_SERVER_FLAGS if MEM_SUFFIX + "-" in arm + "-" else ())
+        + ARM_MEMORY_FLAGS.get(arm, ())
+        + ARM_SPEC_FLAGS.get(arm, ())
+    )
 
 
 DEFAULT_SESSIONS = ",".join(str(i) for i in range(8))
@@ -618,7 +664,8 @@ TWO_STAGE_OFF = {
 
 
 def _takes_fixed_split(arm: str) -> bool:
-    return FIXED_SPLIT_SUFFIX in arm  # a -fixedsplit arm or one built on it (-confgate, -gpudrip)
+    # A -fixedsplit arm or one built on it (-confgate, -gpudrip), but not production's arms, which calibrate the table.
+    return FIXED_SPLIT_SUFFIX in arm and arm not in PROD_ARMS
 
 
 def _overrides(arm: str, out: str) -> dict:
@@ -626,15 +673,21 @@ def _overrides(arm: str, out: str) -> dict:
     passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
     if _takes_fixed_split(arm) and os.environ.get(FIXED_SPLIT_VAR):
         passed[FIXED_SPLIT_VAR] = os.environ[FIXED_SPLIT_VAR]
+    if arm in STS_COLLECT_ARMS:
+        passed[STS_COLLECT] = sts_collect_stem(os.path.join(out, arm))
     return {
         **TWO_STAGE_OFF, **overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")
     }
 
 
 def _probe_overrides(arm: str, out: str) -> dict:
-    """The arm's overrides for the probe server, with a metrics file of its own: the timed server's file is appended to
-    and summarize() reads its last record, which a second server would replace."""
-    return {**_overrides(arm, out), "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.probe.metrics.jsonl")}
+    """The arm's overrides for the probe server, with a metrics file and STS shards of its own: the timed server's
+    metrics file is appended to and summarize() reads its last record, which a second server would replace, and a
+    second recorder would overwrite the timed server's shards from shard 0."""
+    probe = {**_overrides(arm, out), "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.probe.metrics.jsonl")}
+    if arm in STS_COLLECT_ARMS:
+        probe[STS_COLLECT] = sts_collect_stem(os.path.join(out, f"{arm}.probe"))
+    return probe
 
 
 def _health_timeout_s(dspark: bool) -> int:
@@ -674,7 +727,8 @@ def run_probe(arm: str, out: str) -> int:
     """The arm's server on PROBE_PORT under cc-gpu.lock, for logprob_probe.py only."""
     _, dspark = ARMS[arm]
     env = os.environ | arm_env.arm_env(_probe_overrides(arm, out)) | {"PYTHONPATH": os.path.join(REPO, "python")}
-    argv = arm_env.ServerArgs(port=PROBE_PORT, dspark=dspark).argv()
+    argv = [*arm_env.ServerArgs(port=PROBE_PORT, dspark=dspark, decode_warmup=arm in PROD_ARMS).argv(),
+            *ARM_SPEC_FLAGS.get(arm, ())]
     with run_locks.take(arm_env.GPU_LOCK):
         with open(os.path.join(out, f"{arm}.probe-server.log"), "w") as log:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,

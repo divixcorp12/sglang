@@ -23,9 +23,10 @@ BF16 = torch.bfloat16
 
 
 def _candidates(x, w, bias, *, top_k, per_token, top_k_only=False, hot=(), mapped=(), seq=1, tokens_max=None,
-                page=None, scores=None, module=None):
+                page=None, scores=None, module=None, routes=None, route_top_k=0):
     """Scores `x` (bf16 [tokens, hidden]) against (w, bias) for target row 1 of a two-row map, with `hot` VRAM-resident
-    and `mapped` mapped in RAM there, and returns record `seq`'s slot."""
+    and `mapped` mapped in RAM there, and returns record `seq`'s slot. `routes` (int64 flat, route_top_k per token)
+    go to the select kernel."""
     experts, tokens = w.shape[0], x.shape[0]
     tokens_max = tokens_max or max(1, tokens)
     if scores is None:
@@ -44,6 +45,7 @@ def _candidates(x, w, bias, *, top_k, per_token, top_k_only=False, hot=(), mappe
     es.run_spec_select(
         scores, tokens, top_k=top_k, per_token=per_token, top_k_only=top_k_only, hot_slots=hot_slots,
         hot_capacity=len(hot), ram_slot=ram_slot, target=1, state=state, candidates=page, module=module,
+        routes=None if routes is None else routes.cuda(), route_top_k=route_top_k,
     )
     torch.cuda.synchronize()
     return es.read_candidates(page, seq)
@@ -132,6 +134,26 @@ def test_on_random_data_the_top_candidate_agrees_with_torch_in_99_percent_of_rec
         want = gate_reference(x, w, bias, [False] * experts, top_k=6, per_token=1, per_layer=1)
         agree += got.picks[0][0] == want[0]
     assert agree >= 0.99 * trials
+
+
+@pytest.mark.parametrize("live", [1, 3, 6])
+@pytest.mark.parametrize("seed", range(4))
+def test_a_verifys_dead_rows_take_no_picks(seed, live):
+    """A 6-token verify whose rows from `live` on are dead (all -1 routes, verify_dead_rows.py) ranks as its live rows
+    alone, whatever the dead rows' inputs; with every row routed it ranks all 6. A dead row copying the anchor, as
+    serving stages it, changes no pick either way (the union by best margin is idempotent). Mutant: rank p.tokens rows
+    -- red for live < 6."""
+    route_top_k = 6
+    x, w, bias = exact_gate_case(seed, tokens=6)
+    routes = torch.arange(6 * route_top_k, dtype=torch.int64) % 16
+    routes[live * route_top_k :] = -1
+    kw = dict(top_k=6, per_token=2)
+    got = _candidates(x.to(BF16), w, bias, routes=routes, route_top_k=route_top_k, **kw)
+    assert list(got.picks) == gate_reference(x[:live], w, bias, [False] * 16, per_layer=KEEP, meta=True, **kw)
+    anchored = x.clone()
+    anchored[live:] = x[0]
+    with_routes = _candidates(anchored.to(BF16), w, bias, routes=routes, route_top_k=route_top_k, **kw)
+    assert list(with_routes.picks) == list(_candidates(anchored.to(BF16), w, bias, **kw).picks)
 
 
 @pytest.mark.parametrize("tokens", [0, 3])
