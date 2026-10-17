@@ -1023,6 +1023,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        if self._confidence_cut is not None:
+            # Opens the draft ms bracket the T(w) calibration's timed verify closes (one event until T(w) freezes).
+            self._confidence_cut.begin_draft()
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,

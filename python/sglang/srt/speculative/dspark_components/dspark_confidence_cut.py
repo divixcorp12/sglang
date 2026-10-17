@@ -119,6 +119,7 @@ class ConfidenceCut:
         new_event: Optional[Callable[[], object]] = None,
         cut_sampled: bool = False,
         sampled_rescale: Optional[torch.Tensor] = None,
+        draft_cost: bool = False,
     ):
         self.gamma = gamma
         self.device = device
@@ -127,13 +128,20 @@ class ConfidenceCut:
         self.cut_sampled = cut_sampled
         # [gamma] T_head / T_sampled per position (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH), or None.
         self._sampled_rescale = sampled_rescale
+        # SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST: the rule divides by draft ms + T(w), not T(w) alone.
+        self.draft_cost = draft_cost
         # Any object with CUDA Event's record() / query() / elapsed_time(end); tests inject a CPU fake.
         self._new_event = new_event or (lambda: torch.cuda.Event(enable_timing=True))
         self._num_forced = 0
         self._timed_width: Optional[int] = None
+        self._draft_start_event = None
         self._start_event = None
-        self._pending: list[tuple[int, object, object]] = []
+        # (width, draft start event or None, verify start event, verify end event)
+        self._pending: list[tuple[int, object, object, object]] = []
         self._samples: list[list[float]] = [[] for _ in range(self.num_widths)]
+        self._draft_samples: list[float] = []
+        self._verify_cost_ms: Optional[list[float]] = None
+        self._draft_ms: Optional[float] = None
         self._cost_ms: Optional[list[float]] = None
         self._cost_ms_tensor: Optional[torch.Tensor] = None
         self._disabled = False
@@ -183,7 +191,14 @@ class ConfidenceCut:
                     else "with the head's STS temperatures"
                 )
             )
-        return cls(gamma=gamma, device=device, cut_sampled=cut_sampled, sampled_rescale=sampled_rescale)
+        draft_cost = envs.SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST.get()
+        return cls(
+            gamma=gamma,
+            device=device,
+            cut_sampled=cut_sampled,
+            sampled_rescale=sampled_rescale,
+            draft_cost=draft_cost,
+        )
 
     @property
     def calibrated(self) -> bool:
@@ -194,7 +209,16 @@ class ConfidenceCut:
         return self._disabled
 
     def cost_ms(self) -> Optional[list[float]]:
+        """The per-width cost the rule divides by: T(w), plus the draft ms with SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST."""
         return self._cost_ms
+
+    def verify_cost_ms(self) -> Optional[list[float]]:
+        """The fitted T(w) alone."""
+        return self._verify_cost_ms
+
+    def draft_ms(self) -> Optional[float]:
+        """The median draft ms over the calibration verifies (None before T(w) freezes, or with no draft timed)."""
+        return self._draft_ms
 
     def applies(self, *, bs: int, sampling_info) -> bool:
         return bs == 1 and (self.cut_sampled or sampling_info is None or sampling_info.is_all_greedy)
@@ -240,6 +264,15 @@ class ConfidenceCut:
         self._timed_width = None
         return self._full_width(bs=bs, device=confidence.device)
 
+    def begin_draft(self) -> None:
+        """Before a step's draft, until T(w) freezes: an event a timed verify's begin_verify closes, so the draft ms
+        (the proposal, the confidence and every launch up to the verify's) is timed on the same verifies as T(w),
+        read as lazily. An untimed step's event is replaced by the next step's."""
+        if self._cost_ms is not None or self._disabled:
+            return
+        self._draft_start_event = self._new_event()
+        self._draft_start_event.record()
+
     def begin_verify(self) -> None:
         if self._timed_width is None:
             return
@@ -251,20 +284,25 @@ class ConfidenceCut:
             return
         end_event = self._new_event()
         end_event.record()
-        self._pending.append((self._timed_width, self._start_event, end_event))
+        self._pending.append((self._timed_width, self._draft_start_event, self._start_event, end_event))
         self._num_forced += 1
         self._timed_width = None
+        self._draft_start_event = None
         self._start_event = None
 
     def _full_width(self, *, bs: int, device) -> torch.Tensor:
         return torch.full((bs,), self.num_widths, dtype=torch.int64, device=device)
 
     def _drain_ready_samples(self) -> None:
-        while self._pending and self._pending[0][2].query():
-            width, start_event, end_event = self._pending.pop(0)
+        while self._pending and self._pending[0][3].query():
+            width, draft_start_event, start_event, end_event = self._pending.pop(0)
             ms = float(start_event.elapsed_time(end_event))
             if math.isfinite(ms):
                 self._samples[width - 1].append(ms)
+            if draft_start_event is not None:
+                draft_ms = float(draft_start_event.elapsed_time(start_event))
+                if math.isfinite(draft_ms):
+                    self._draft_samples.append(draft_ms)
         if self._num_forced == CALIBRATION_VERIFIES and not self._pending:
             self._freeze()
 
@@ -276,14 +314,37 @@ class ConfidenceCut:
         if fit.base_ms <= 0.0:
             self._disable(reason=f"non-positive fitted T(1) {fit.base_ms} ms")
             return
-        cost_ms = fit.cost_ms(num_widths=self.num_widths)
+        verify_cost_ms = fit.cost_ms(num_widths=self.num_widths)
+        self._verify_cost_ms = verify_cost_ms
+        self._draft_ms = statistics.median(self._draft_samples) if self._draft_samples else None
+        if self.draft_cost and self._draft_ms is None:
+            logger.warning("dspark confidence cut: no draft was timed, so the cost leaves the draft out")
+        # The draft costs the same at every width (gamma drafts, one draft forward), so it adds to a alone: the cost
+        # stays affine with b unchanged, and the stopping form's argument holds (a + draft > 0).
+        cost_ms = (
+            [ms + self._draft_ms for ms in verify_cost_ms]
+            if self.draft_cost and self._draft_ms is not None
+            else verify_cost_ms
+        )
         self._cost_ms = cost_ms
         self._cost_ms_tensor = torch.tensor(cost_ms, dtype=torch.float32, device=self.device)
         medians = [round(statistics.median(samples), 4) for samples in self._samples]
+        if self._draft_ms is None:
+            draft = "draft ms not timed"
+        else:
+            draft = (
+                f"draft ms {self._draft_ms:.4f} (median; mean {statistics.fmean(self._draft_samples):.4f}, "
+                f"n {len(self._draft_samples)}), "
+                + (
+                    f"in the cost: {[round(ms, 4) for ms in cost_ms]}"
+                    if cost_ms is not verify_cost_ms
+                    else "not in the cost (SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST off)"
+                )
+            )
         logger.info(
-            f"dspark confidence cut: T(w) ms = {[round(ms, 4) for ms in cost_ms]} "
+            f"dspark confidence cut: T(w) ms = {[round(ms, 4) for ms in verify_cost_ms]} "
             f"(a={fit.base_ms:.4f}, b={fit.per_row_ms:.4f}/row, r2={fit.r2:.4f}; "
-            f"per-width median ms {medians}, counts {[len(samples) for samples in self._samples]})"
+            f"per-width median ms {medians}, counts {[len(samples) for samples in self._samples]}); {draft}"
         )
 
     def _disable(self, *, reason: str) -> None:

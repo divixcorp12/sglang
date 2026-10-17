@@ -211,6 +211,78 @@ def test_a_health_check_mid_calibration_is_held_back_and_logs_no_second_start(ca
     assert cut.cost_ms() == pytest.approx([100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
 
 
+def _calibrate_with_draft(*, draft_cost, draft_ms=30.0):
+    """96 forced verifies as the worker runs them, each step's draft opened by begin_draft and closed by the timed
+    verify's start event. The fake clock: begin_draft at t, the verify start at t + draft_ms, its end at
+    t + draft_ms + T(w)."""
+    clock = {"t": 0.0}
+
+    class Clocked:
+        def __init__(self):
+            self.t = None
+
+        def record(self):
+            self.t = clock["t"]
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, end):
+            return end.t - self.t
+
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=Clocked, draft_cost=draft_cost)
+    confident = torch.full((1, GAMMA), 0.99)
+    for _ in range(CALIBRATION_VERIFIES):
+        cut.begin_draft()
+        clock["t"] += draft_ms
+        assert cut.admit_calibration(OPEN)
+        width = int(cut.verify_lens(confident)[0])
+        cut.begin_verify()
+        clock["t"] += 100.0 + 20.0 * (width - 1)
+        cut.end_verify()
+        clock["t"] += 1.0
+    cut.begin_draft()
+    cut.verify_lens(confident)
+    return cut
+
+
+def test_the_draft_ms_is_timed_on_the_calibration_verifies_and_logged_whether_or_not_it_is_in_the_cost(caplog):
+    with caplog.at_level(logging.INFO, logger=cc.__name__):
+        off = _calibrate_with_draft(draft_cost=False)
+    assert off.calibrated and off.draft_ms() == pytest.approx(30.0)
+    assert off.cost_ms() == pytest.approx([100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
+    assert off.verify_cost_ms() == off.cost_ms()
+    line = next(r.getMessage() for r in caplog.records if "T(w) ms" in r.getMessage())
+    assert "draft ms 30.0000 (median; mean 30.0000, n 96), not in the cost" in line
+    # Calibrated: begin_draft records nothing more.
+    last = off._draft_start_event
+    off.begin_draft()
+    assert off._draft_start_event is last
+
+
+def test_with_draft_cost_on_the_rule_divides_by_draft_plus_verify_ms(caplog):
+    with caplog.at_level(logging.INFO, logger=cc.__name__):
+        on = _calibrate_with_draft(draft_cost=True, draft_ms=200.0)
+    assert on.verify_cost_ms() == pytest.approx([100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
+    assert on.cost_ms() == pytest.approx([300.0, 320.0, 340.0, 360.0, 380.0, 400.0])
+    line = next(r.getMessage() for r in caplog.records if "T(w) ms" in r.getMessage())
+    assert "in the cost: [300.0, 320.0, 340.0, 360.0, 380.0, 400.0]" in line
+    # c = 0.15: verify-only, E(2) / T(2) = 1.15 / 120 loses to 1 / 100; with the draft's 200 ms, 1.15 / 320 beats
+    # 1 / 300.
+    doubtful = torch.full((1, GAMMA), 0.15)
+    assert int(on.verify_lens(doubtful)[0]) > 1
+    assert int(_calibrate_with_draft(draft_cost=False, draft_ms=200.0).verify_lens(doubtful)[0]) == 1
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(""):
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST.override(True):
+            assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu").draft_cost
+        assert not ConfidenceCut.from_envs(gamma=GAMMA, device="cpu").draft_cost
+
+
+def test_a_calibration_without_a_timed_draft_logs_it_and_keeps_t_w_alone():
+    cut = calibrate(lambda width: 100.0 + 20.0 * (width - 1))
+    assert cut.draft_ms() is None and cut.cost_ms() == pytest.approx([100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
+
+
 def test_serving_rids_exclude_warm_up_and_health_check_requests():
     assert is_serving_rid("0a1b2c")
     assert not is_serving_rid("WARMUP_0a1b2c_0")

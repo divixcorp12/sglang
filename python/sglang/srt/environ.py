@@ -832,6 +832,9 @@ class Envs:
     # the head's output from --speculative-dspark-confidence-sts-path's temperatures to these. Empty: they use the
     # greedy file's, fitted on argmax labels.
     SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH = EnvStr("")
+    # The cut's rule maximises E(w) / (draft ms + T(w)), the draft ms timed on the T(w) calibration's verifies, not
+    # E(w) / T(w). The draft ms is timed and logged either way.
+    SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

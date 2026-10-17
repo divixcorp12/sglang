@@ -99,6 +99,8 @@ def test_calibration_times_forced_widths_through_the_verify_events_then_cuts_by_
     widths = []
     for _ in range(CALIBRATION_VERIFIES):
         assert cut.applies(bs=1, sampling_info=None) and not cut.calibrated
+        cut.begin_draft()
+        torch.mm(work, work, out=scratch)  # the draft: one matmul, at every width
         assert cut.admit_calibration(serving)
         lens = cut.verify_lens(confident)
         assert lens.device.type == "cuda" and lens.dtype == torch.int64 and lens.shape == (1,)
@@ -120,6 +122,9 @@ def test_calibration_times_forced_widths_through_the_verify_events_then_cuts_by_
     cost = cut.cost_ms()
     assert len(cost) == TOKENS and all(c > 0 for c in cost)
     assert all(a <= b for a, b in zip(cost, cost[1:]))
+    # The draft's matmul, timed between the draft's event and the verify's start; one matmul is about T(w)'s slope,
+    # so it is well under T(2) and not in the cost with the flag off.
+    assert 0 < cut.draft_ms() < cost[1] and cut.verify_cost_ms() == cost
     assert 1 <= int(lens.item()) <= TOKENS
 
     # A draft the head is sure is wrong is not worth a row past the anchor's.
