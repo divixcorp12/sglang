@@ -1,12 +1,23 @@
 """DSpark's sampled (temperature > 0) chain accept for the cases the classic kernel (reject_sampling.py) does not
-cover: a one-hot draft distribution, which greedy drafting of a sampled request (SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT)
-produces.
+cover:
 
-The draft proposed X_i = argmax, so q_i is a point mass at X_i: X_i is accepted with probability p_i(X_i), and a
-rejection samples the residual normalize(max(0, p_i - q_i)), which is p_i with X_i removed. Neither needs q in memory.
+- A one-hot draft distribution, which greedy drafting of a sampled request (SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT)
+  produces. The draft proposed X_i = argmax, so q_i is a point mass at X_i: X_i is accepted with probability
+  p_i(X_i), and a rejection samples the residual normalize(max(0, p_i - q_i)), which is p_i with X_i removed. Neither
+  needs q in memory.
+- Block verification (SGLANG_DSPARK_SAMPLED_BLOCK_VERIFY): Sun et al. 2024, "Block Verification Accelerates
+  Speculative Decoding" (arXiv:2403.10444), Algorithm 2. It is lossless and accepts at least as many drafts in
+  expectation as token-by-token rejection. With w_0 = 1 and w_i = min(w_{i-1} p_i(X_i) / q_i(X_i), 1) over the gamma
+  live drafts, the stop weight after i drafts is h_i = r_i / (r_i + 1 - w_i) for i < gamma, where
+  r_i = sum_x max(w_i p_{i+1}(x) - q_{i+1}(x), 0), and h_gamma = w_gamma. The accept keeps tau = the largest i with
+  coin_i < h_i (0 if none), then samples p_{gamma+1} if tau = gamma and normalize(max(w_tau p - q, 0)) at row tau
+  otherwise. The structure follows vLLM's implementation (vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py,
+  Apache-2.0); no code is taken from it. With a one-hot q, r_i reduces to w_i (1 - p_{i+1}(X_{i+1})) and the residual
+  to p with X_{i+1} removed, as above.
 
 Rows past ``verify_lens - 1`` drafts were never verified (a confidence cut's dead rows): their target logits, draft
-probabilities and candidates are not read, and the chain ends there, the bonus coming from p at the last live row.
+probabilities and candidates are not read, and the chain ends there (gamma is the live draft count), the bonus coming
+from p at the last live row.
 """
 
 from __future__ import annotations
@@ -72,6 +83,7 @@ class AcceptSampledChain:
         draft_input: DFlashDraftInputV2,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        block_verify: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return _accept_sampled_chain(
             candidates=candidates,
@@ -81,6 +93,7 @@ class AcceptSampledChain:
             draft_input=draft_input,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            block_verify=block_verify,
             chain_accept=sampled_chain_accept,
         )
 
@@ -95,6 +108,7 @@ class AcceptSampledChain:
         draft_input: DFlashDraftInputV2,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        block_verify: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return _accept_sampled_chain(
             candidates=candidates,
@@ -104,6 +118,7 @@ class AcceptSampledChain:
             draft_input=draft_input,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            block_verify=block_verify,
             chain_accept=sampled_chain_accept_triton,
         )
 
@@ -117,6 +132,7 @@ def _accept_sampled_chain(
     draft_input: DFlashDraftInputV2,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    block_verify: bool,
     chain_accept,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(correct_len int32, bonus int64, cap_trim_lens int32). A cut ends the chain itself, so nothing is trimmed after
@@ -139,6 +155,7 @@ def _accept_sampled_chain(
         draft_probs=draft_probs,
         verify_lens=cutoff_verify_lens,
         uniforms=uniforms,
+        block_verify=block_verify,
     )
     return correct_len, bonus, torch.zeros_like(correct_len)
 
@@ -168,6 +185,7 @@ def sampled_chain_accept(
     draft_probs: Optional[torch.Tensor],
     verify_lens: Optional[torch.Tensor],
     uniforms: torch.Tensor,
+    block_verify: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Torch reference. ``candidates`` [bs, S] (slot 0 the anchor), ``target_probs`` [bs, S, V], ``draft_probs``
     [bs, S - 1, V] or None for a one-hot draft at each candidate, ``uniforms`` [bs, S]."""
@@ -177,6 +195,7 @@ def sampled_chain_accept(
         draft_probs=draft_probs,
         verify_lens=verify_lens,
         uniforms=uniforms,
+        block_verify=block_verify,
     )
     bonus = _inverse_cdf(weights, uniforms[:, -1])
     return correct_len.to(torch.int32), bonus.to(torch.int64)
@@ -189,6 +208,7 @@ def sampled_chain_bonus_weights(
     draft_probs: Optional[torch.Tensor],
     verify_lens: Optional[torch.Tensor],
     uniforms: torch.Tensor,
+    block_verify: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The reference's correct_len [bs] and the unnormalized [bs, V] distribution its bonus is drawn from."""
     bs, num_slots, vocab = target_probs.shape
@@ -211,17 +231,64 @@ def sampled_chain_bonus_weights(
     live = steps[None, :] <= live_drafts[:, None]
     coins = uniforms[:, : num_slots - 1]
 
-    accept = live & q_ok & (coins * q_x < p_x)
-    correct_len = accept.to(torch.int64).cumprod(-1).sum(-1)
+    # weight[:, i]: the residual's scale on row i, w_i under block verification, 1 token by token.
+    weight = torch.ones((bs, num_slots), device=device)
+    if block_verify:
+        ratio = torch.where(q_ok, p_x / torch.where(q_ok, q_x, torch.ones_like(q_x)), 0)
+        for t in range(1, num_slots):
+            weight[:, t] = (weight[:, t - 1] * ratio[:, t - 1]).clamp_max(1.0)
+        mass = (weight[:, :-1, None] * target_probs[:, :-1] - q_rows).clamp_min(0).sum(-1)
+        w_t = weight[:, 1:]
+        mass_t = torch.cat([mass[:, 1:], torch.zeros((bs, 1), device=device)], 1)
+        den = mass_t + 1 - w_t
+        h_mid = torch.where(den > 0, mass_t / torch.where(den > 0, den, 1), 1)
+        h = torch.where(steps[None, :] < live_drafts[:, None], h_mid, w_t)
+        stops = torch.where(live & (coins < h), steps[None, :], 0)
+        correct_len = stops.max(-1).values
+    else:
+        accept = live & q_ok & (coins * q_x < p_x)
+        correct_len = accept.to(torch.int64).cumprod(-1).sum(-1)
 
     rows = torch.arange(bs, device=device)
     p_row = target_probs[rows, correct_len]
     stop_row = correct_len.clamp_max(num_slots - 2)
-    residual = (p_row - q_rows[rows, stop_row]).clamp_min(0)
+    residual = (weight[rows, correct_len, None] * p_row - q_rows[rows, stop_row]).clamp_min(0)
     weights = torch.where((correct_len < live_drafts)[:, None], residual, p_row)
-    # A residual with no mass (p == q on the rejected row) falls back to p.
+    # A residual with no mass (p == q on the stop row) falls back to p.
     weights = torch.where((weights.sum(-1) > 0)[:, None], weights, p_row)
     return correct_len, weights
+
+
+@triton.jit
+def _prefix_weight(
+    cand_base,
+    tp_base,
+    dp_base,
+    stride_tp_s,
+    stride_dp_s,
+    n,
+    NUM_SLOTS: tl.constexpr,
+    ONE_HOT_Q: tl.constexpr,
+):
+    """Block verification's w_n: w_0 = 1, w_t = min(w_{t-1} p(X_t) / q(X_t), 1), and 0 from the first q(X) that is not a
+    positive probability."""
+    w = n.to(tl.float32) * 0.0 + 1.0
+    for t in tl.static_range(1, NUM_SLOTS):
+        use = t <= n
+        x = tl.load(cand_base + t, mask=use, other=0)
+        p = tl.load(tp_base + (t - 1) * stride_tp_s + x, mask=use, other=0.0).to(
+            tl.float32
+        )
+        if ONE_HOT_Q:
+            q = p * 0.0 + 1.0
+        else:
+            q = tl.load(dp_base + (t - 1) * stride_dp_s + x, mask=use, other=1.0).to(
+                tl.float32
+            )
+        q_ok = (q > 0.0) & (q <= 1.0)
+        ratio = tl.where(q_ok, p / tl.where(q_ok, q, 1.0), 0.0)
+        w = tl.where(use, tl.minimum(w * ratio, 1.0), w)
+    return w
 
 
 @triton.jit
@@ -242,39 +309,49 @@ def _chain_residual_partials_kernel(
     NUM_SLOTS: tl.constexpr,
     BLOCK_V: tl.constexpr,
     ONE_HOT_Q: tl.constexpr,
+    BLOCK_VERIFY: tl.constexpr,
 ):
-    """Per (request, live row, vocab block): the block's mass of the row's residual max(0, p - q) (the last live row,
-    which has no draft after it, uses p), and of p itself for a residual with no mass."""
+    """Per (request, live row, vocab block): the block's mass of the row's residual max(0, w p - q) (w = 1 token by
+    token; the last live row, which has no draft after it, uses p), and of p itself for a residual with no mass."""
     pid_row = tl.program_id(0)
     blk = tl.program_id(1)
     b = pid_row // NUM_SLOTS
     row = pid_row % NUM_SLOTS
+    b64 = b.to(tl.int64)
+    cand_base = cand_ptr + b64 * stride_cand_b
+    tp_base = tp_ptr + b64 * stride_tp_b
+    dp_base = dp_ptr + b64 * stride_dp_b
     live_drafts = tl.load(live_drafts_ptr + b).to(tl.int32)
     row_live = row <= live_drafts
     is_draft_row = row < live_drafts
+    if BLOCK_VERIFY:
+        w = _prefix_weight(
+            cand_base,
+            tp_base,
+            dp_base,
+            stride_tp_s,
+            stride_dp_s,
+            tl.minimum(row, live_drafts),
+            NUM_SLOTS,
+            ONE_HOT_Q,
+        )
+    else:
+        w = 1.0
 
     offs = blk * BLOCK_V + tl.arange(0, BLOCK_V)
     vmask = (offs < vocab) & row_live
-    p = tl.load(
-        tp_ptr + b.to(tl.int64) * stride_tp_b + row * stride_tp_s + offs,
-        mask=vmask,
-        other=0.0,
-    ).to(tl.float32)
+    p = tl.load(tp_base + row * stride_tp_s + offs, mask=vmask, other=0.0).to(
+        tl.float32
+    )
     if ONE_HOT_Q:
-        nxt = tl.load(
-            cand_ptr + b.to(tl.int64) * stride_cand_b + row + 1,
-            mask=is_draft_row,
-            other=-1,
-        )
+        nxt = tl.load(cand_base + row + 1, mask=is_draft_row, other=-1)
         q = tl.where(offs == nxt, 1.0, 0.0)
     else:
         q = tl.load(
-            dp_ptr + b.to(tl.int64) * stride_dp_b + row * stride_dp_s + offs,
-            mask=vmask & is_draft_row,
-            other=0.0,
+            dp_base + row * stride_dp_s + offs, mask=vmask & is_draft_row, other=0.0
         ).to(tl.float32)
         q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
-    val = tl.where(is_draft_row, tl.maximum(p - q, 0.0), p)
+    val = tl.where(is_draft_row, tl.maximum(w * p - q, 0.0), p)
     out = pid_row * num_blocks + blk
     tl.store(residual_partials_ptr + out, tl.sum(val, axis=0), mask=row_live)
     tl.store(p_partials_ptr + out, tl.sum(p, axis=0), mask=row_live)
@@ -303,6 +380,7 @@ def _chain_accept_kernel(
     BLOCK_V: tl.constexpr,
     NB_PAD: tl.constexpr,
     ONE_HOT_Q: tl.constexpr,
+    BLOCK_VERIFY: tl.constexpr,
 ):
     b = tl.program_id(0)
     b64 = b.to(tl.int64)
@@ -311,33 +389,60 @@ def _chain_accept_kernel(
     dp_base = dp_ptr + b64 * stride_dp_b
     uni_base = uniform_ptr + b64 * stride_uni_b
     live_drafts = tl.load(live_drafts_ptr + b).to(tl.int32)
+    blocks = tl.arange(0, NB_PAD)
+    bmask = blocks < num_blocks
 
     correct_len = live_drafts * 0
     going = live_drafts >= 0
     for t in tl.static_range(1, NUM_SLOTS):
         live = t <= live_drafts
-        x = tl.load(cand_base + t, mask=live, other=0)
-        p = tl.load(tp_base + (t - 1) * stride_tp_s + x, mask=live, other=0.0).to(
-            tl.float32
-        )
-        if ONE_HOT_Q:
-            q = 1.0
+        coin = tl.load(uni_base + (t - 1))
+        if BLOCK_VERIFY:
+            w = _prefix_weight(
+                cand_base,
+                tp_base,
+                dp_base,
+                stride_tp_s,
+                stride_dp_s,
+                tl.minimum(t, live_drafts),
+                NUM_SLOTS,
+                ONE_HOT_Q,
+            )
+            has_next = t < live_drafts
+            mass = tl.sum(
+                tl.load(
+                    residual_partials_ptr + (b * NUM_SLOTS + t) * num_blocks + blocks,
+                    mask=bmask & has_next,
+                    other=0.0,
+                ),
+                axis=0,
+            )
+            den = mass + 1.0 - w
+            h_next = tl.where(den > 0.0, mass / tl.where(den > 0.0, den, 1.0), 1.0)
+            h = tl.where(has_next, h_next, w)
+            correct_len = tl.where(live & (coin < h), t, correct_len)
         else:
-            q = tl.load(dp_base + (t - 1) * stride_dp_s + x, mask=live, other=0.0).to(
+            x = tl.load(cand_base + t, mask=live, other=0)
+            p = tl.load(tp_base + (t - 1) * stride_tp_s + x, mask=live, other=0.0).to(
                 tl.float32
             )
-        coin = tl.load(uni_base + (t - 1))
-        # As in the classic kernel: X came from q, so a q(X) that is not a positive probability rejects.
-        accepted = going & live & (q > 0.0) & (q <= 1.0) & (coin * q < p)
-        correct_len = tl.where(accepted, t, correct_len)
-        going = accepted
+            if ONE_HOT_Q:
+                q = 1.0
+            else:
+                q = tl.load(
+                    dp_base + (t - 1) * stride_dp_s + x, mask=live, other=0.0
+                ).to(tl.float32)
+            # As in the classic kernel: X came from q, so a q(X) that is not a positive probability rejects.
+            accepted = going & live & (q > 0.0) & (q <= 1.0) & (coin * q < p)
+            correct_len = tl.where(accepted, t, correct_len)
+            going = accepted
 
-    # The bonus row: the residual after a rejection, p after the last live draft; p again if the residual is empty.
+    # The bonus row: the residual at the stop, p after the last live draft; p again if the residual is empty.
     row = correct_len
-    blocks = tl.arange(0, NB_PAD)
-    bmask = blocks < num_blocks
     part_base = (b * NUM_SLOTS + row) * num_blocks
-    residual_parts = tl.load(residual_partials_ptr + part_base + blocks, mask=bmask, other=0.0)
+    residual_parts = tl.load(
+        residual_partials_ptr + part_base + blocks, mask=bmask, other=0.0
+    )
     has_residual = tl.sum(residual_parts, axis=0) > 0.0
     p_parts = tl.load(p_partials_ptr + part_base + blocks, mask=bmask, other=0.0)
     parts = tl.where(has_residual, residual_parts, p_parts)
@@ -350,6 +455,19 @@ def _chain_accept_kernel(
     blk = tl.where(blk < NB_PAD, blk, last_pos_blk)
     before = tl.sum(tl.where(blocks < blk, parts, 0.0), axis=0)
 
+    if BLOCK_VERIFY:
+        w_row = _prefix_weight(
+            cand_base,
+            tp_base,
+            dp_base,
+            stride_tp_s,
+            stride_dp_s,
+            row,
+            NUM_SLOTS,
+            ONE_HOT_Q,
+        )
+    else:
+        w_row = 1.0
     is_draft_row = (row < live_drafts) & has_residual
     offs = blk * BLOCK_V + tl.arange(0, BLOCK_V)
     vmask = offs < vocab
@@ -364,7 +482,7 @@ def _chain_accept_kernel(
             dp_base + row * stride_dp_s + offs, mask=vmask & is_draft_row, other=0.0
         ).to(tl.float32)
         q_vals = tl.where((q_vals >= 0.0) & (q_vals <= 1.0), q_vals, 0.0)
-    vals = tl.where(is_draft_row, tl.maximum(p_vals - q_vals, 0.0), p_vals)
+    vals = tl.where(is_draft_row, tl.maximum(w_row * p_vals - q_vals, 0.0), p_vals)
     local = before + tl.cumsum(vals, axis=0)
     in_blk = tl.arange(0, BLOCK_V)
     local_hit = (local > target_u) & vmask
@@ -383,6 +501,7 @@ def sampled_chain_accept_triton(
     draft_probs: Optional[torch.Tensor],
     verify_lens: Optional[torch.Tensor],
     uniforms: torch.Tensor,
+    block_verify: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     bs, num_slots, vocab = target_probs.shape
     device = target_probs.device
@@ -418,6 +537,7 @@ def sampled_chain_accept_triton(
         NUM_SLOTS=num_slots,
         BLOCK_V=_BLOCK_V,
         ONE_HOT_Q=one_hot_q,
+        BLOCK_VERIFY=block_verify,
     )
     correct_len = torch.empty((bs,), dtype=torch.int32, device=device)
     bonus = torch.empty((bs,), dtype=torch.int64, device=device)
@@ -443,24 +563,45 @@ def sampled_chain_accept_triton(
         BLOCK_V=_BLOCK_V,
         NB_PAD=triton.next_power_of_2(num_blocks),
         ONE_HOT_Q=one_hot_q,
+        BLOCK_VERIFY=block_verify,
     )
     return correct_len, bonus
 
 
+def sampled_accept_variants(
+    *, greedy_draft: bool, block_verify: bool
+) -> list[tuple[bool, bool]]:
+    """The (one_hot_q, block_verify) kernel variants a launch with these flags can reach. A greedy draft is one-hot;
+    under block verification a draft that still samples (a folded-sampling draft graph) takes the general q."""
+    variants = []
+    if greedy_draft:
+        variants.append((True, block_verify))
+    if block_verify:
+        variants.append((False, True))
+    return variants
+
+
 def preload_sampled_accept_kernels(
-    *, device, verify_num_draft_tokens: int, vocab: int
+    *,
+    device,
+    verify_num_draft_tokens: int,
+    vocab: int,
+    variants: list[tuple[bool, bool]],
 ) -> None:
-    """Load the one-hot chain accept's kernels at worker init. The decode warm-up's sampled requests reach them too,
-    but a launch whose warm-up is skipped would otherwise device-load them on its first sampled verify."""
+    """Load the chain accept's kernel ``variants`` ((one_hot_q, block_verify) pairs) at worker init. The decode
+    warm-up's sampled requests reach them too, but a launch whose warm-up is skipped would otherwise device-load
+    them on its first sampled verify."""
     candidates = torch.zeros((1, verify_num_draft_tokens), dtype=torch.int64, device=device)
     target_probs = torch.full(
         (1, verify_num_draft_tokens, vocab), 1.0 / vocab, dtype=torch.float32, device=device
     )
     uniforms = torch.full((1, verify_num_draft_tokens), 0.5, device=device)
-    sampled_chain_accept_triton(
-        candidates=candidates,
-        target_probs=target_probs,
-        draft_probs=None,
-        verify_lens=torch.ones((1,), dtype=torch.int64, device=device),
-        uniforms=uniforms,
-    )
+    for one_hot_q, block_verify in variants:
+        sampled_chain_accept_triton(
+            candidates=candidates,
+            target_probs=target_probs,
+            draft_probs=None if one_hot_q else target_probs[:, 1:],
+            verify_lens=torch.ones((1,), dtype=torch.int64, device=device),
+            uniforms=uniforms,
+            block_verify=block_verify,
+        )

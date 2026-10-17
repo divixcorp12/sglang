@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.kernels.ops.speculative.dspark.dspark_sampled_accept import (
     AcceptSampledChain,
     preload_sampled_accept_kernels,
+    sampled_accept_variants,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -140,14 +141,17 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
-        if (
-            envs.SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT.get()
-            and torch.device(model_runner.device).type == "cuda"
-        ):
+        self._sampled_block_verify = envs.SGLANG_DSPARK_SAMPLED_BLOCK_VERIFY.get()
+        variants = sampled_accept_variants(
+            greedy_draft=envs.SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT.get(),
+            block_verify=self._sampled_block_verify,
+        )
+        if variants and torch.device(model_runner.device).type == "cuda":
             preload_sampled_accept_kernels(
                 device=model_runner.device,
                 verify_num_draft_tokens=verify_num_draft_tokens,
                 vocab=target_worker.model_runner.model_config.vocab_size,
+                variants=variants,
             )
 
     def accept_and_finalize(
@@ -187,6 +191,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             cutoff_verify_lens=gate_verify_lens,
+            block_verify=self._sampled_block_verify,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -857,8 +862,10 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    block_verify: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``cutoff_verify_lens`` caps a verify that has no ``cutoff_layout`` (a static one); never both."""
+    """``cutoff_verify_lens`` caps a verify that has no ``cutoff_layout`` (a static one); never both.
+    ``block_verify`` verifies the sampled rows with block verification (SGLANG_DSPARK_SAMPLED_BLOCK_VERIFY)."""
     greedy_mask = draft_block.greedy_mask
     if cutoff_layout is not None:
         assert cutoff_verify_lens is None
@@ -881,6 +888,7 @@ def accept_draft_tokens(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        block_verify=block_verify,
     )
     if not sampling_info.is_any_greedy:
         return sampling_len, sampling_bonus, sampling_trim
@@ -913,27 +921,32 @@ def _accept_sampled_rows(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    block_verify: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The sampled rows' rejection-sampling accept. A greedy draft's q is one-hot at its token, which the chain
     accept in dspark_sampled_accept.py takes without materializing it; a sampled draft's q is its corrected logits'
-    softmax at the request temperature."""
-    if draft_block.greedy_draft:
+    softmax at the request temperature. That chain accept also runs block verification; token by token, a sampled
+    draft keeps the classic kernel."""
+    draft_probs = None
+    if not draft_block.greedy_draft:
+        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        ).view(bs, gamma_rows, vocab)
+        expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    if draft_block.greedy_draft or block_verify:
         return AcceptSampledChain.execute(
             candidates=candidates,
             target_logits=target_logits,
-            draft_probs=None,
+            draft_probs=draft_probs,
             sampling_info=sampling_info,
             draft_input=draft_input,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            block_verify=block_verify,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
-    expect(_VERIFY_DRAFT_PROBS, draft_probs)
     return AcceptSampling.execute(
         candidates=candidates,
         target_logits=target_logits,

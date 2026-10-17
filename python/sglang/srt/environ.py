@@ -828,6 +828,9 @@ class Envs:
     # Sampled requests draft greedily, through the greedy draft graph, and verify against the one-hot draft
     # distribution that proposal has (dspark_sampled_accept.py), which keeps the accept lossless.
     SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT = EnvBool(False)
+    # Sampled requests verify their draft chain with block verification (Sun et al. 2024) instead of token-by-token
+    # rejection: lossless, and at least as many accepted drafts in expectation (dspark_sampled_accept.py).
+    SGLANG_DSPARK_SAMPLED_BLOCK_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

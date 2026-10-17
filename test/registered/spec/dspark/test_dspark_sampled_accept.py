@@ -264,6 +264,53 @@ class TestSampledAcceptDistribution(CustomTestCase):
     def test_greedy_draft_token_by_token(self):
         self._check(greedy_draft=True, seed0=11)
 
+    def test_block_verify_sampled_draft(self):
+        self._check(greedy_draft=False, block_verify=True, seed0=21)
+
+    def test_block_verify_greedy_draft(self):
+        self._check(greedy_draft=True, block_verify=True, seed0=31)
+
+    def test_block_accepts_at_least_token_by_token(self):
+        """Same drafts, targets and cuts: block verification's mean accepted length is not below token-by-token's."""
+        n = NUM_SAMPLES
+        for greedy_draft in (False, True):
+            for fi, (top_k, top_p) in enumerate(_FILTERS):
+                chain = _Chain(seed=50 + fi, top_k=top_k, top_p=top_p, greedy_draft=greedy_draft)
+                torch.manual_seed(50 + fi)
+                candidates, draft_probs = chain.propose(n)
+                target_probs = torch.cat(
+                    [
+                        sampled_verify_target_probs(
+                            target_logits=chain.target_rows(candidates[s : s + _CHUNK]),
+                            sampling_info=chain.sampling_info(min(_CHUNK, n - s)),
+                            draft_input=SimpleNamespace(max_top_k=None, uniform_top_k_value=None),
+                            verify_num_draft_tokens=NUM_SLOTS,
+                            bs=min(_CHUNK, n - s),
+                        )
+                        for s in range(0, n, _CHUNK)
+                    ]
+                )
+                verify_lens = _verify_lens("mixed", n, 50 + fi)
+                means = {}
+                for block_verify in (False, True):
+                    correct_len, _ = sampled_chain_accept_triton(
+                        candidates=candidates,
+                        target_probs=target_probs,
+                        draft_probs=None if greedy_draft else draft_probs,
+                        verify_lens=verify_lens,
+                        uniforms=torch.rand((n, NUM_SLOTS), device=DEVICE),
+                        block_verify=block_verify,
+                    )
+                    lens = correct_len.double()
+                    means[block_verify] = (float(lens.mean()), float(lens.std()) / math.sqrt(n))
+                (tbt, tbt_se), (block, block_se) = means[False], means[True]
+                print(
+                    f"greedy_draft={greedy_draft} top_k={top_k} top_p={top_p}: mean correct_len "
+                    f"token-by-token {tbt:.4f}, block {block:.4f}"
+                )
+                with self.subTest(greedy_draft=greedy_draft, top_k=top_k, top_p=top_p):
+                    self.assertGreaterEqual(block, tbt - 4 * math.hypot(tbt_se, block_se))
+
     def test_sampled_draft_classic_control(self):
         """The classic kernel with a sampled draft and no cut, as a control for the harness itself."""
         for fi, (top_k, top_p) in enumerate(_FILTERS):
@@ -336,27 +383,37 @@ class TestSampledChainParity(CustomTestCase):
 
     def test_triton_matches_torch(self):
         for one_hot in (True, False):
-            with self.subTest(one_hot=one_hot):
-                inputs = self._inputs(bs=256, vocab=129280, one_hot=one_hot, seed=5)
-                want_len, want_bonus = sampled_chain_accept(**inputs)
-                got_len, got_bonus = sampled_chain_accept_triton(**inputs)
-                torch.testing.assert_close(got_len, want_len.to(torch.int32))
-                self.assertGreater(int(want_len.max()), 1)
-                self.assertGreater(int((want_len == 0).sum()), 0)
-                # The triton bonus is the inverse-CDF draw of the reference's distribution, up to float32
-                # summation order: its token holds the draw within a 1e-5 band of the float64 CDF.
-                _, weights = sampled_chain_bonus_weights(**inputs)
-                cdf = weights.double().cumsum(-1)
-                total = cdf[:, -1]
-                draw = inputs["uniforms"][:, -1].double() * total
-                rows = torch.arange(weights.shape[0], device=DEVICE)
-                hi = cdf[rows, got_bonus]
-                lo = hi - weights[rows, got_bonus].double()
-                eps = 1e-5 * total
-                self.assertTrue(bool((weights[rows, got_bonus] > 0).all()))
-                self.assertTrue(bool(((lo - eps <= draw) & (draw <= hi + eps)).all()))
-                agree = float((got_bonus == want_bonus).float().mean())
-                self.assertGreaterEqual(agree, 0.95)
+            for block_verify in (False, True):
+                with self.subTest(one_hot=one_hot, block_verify=block_verify):
+                    self._check_parity(one_hot=one_hot, block_verify=block_verify)
+
+    def _check_parity(self, *, one_hot, block_verify):
+        inputs = self._inputs(bs=256, vocab=129280, one_hot=one_hot, seed=5)
+        inputs["block_verify"] = block_verify
+        want_len, want_bonus = sampled_chain_accept(**inputs)
+        got_len, got_bonus = sampled_chain_accept_triton(**inputs)
+        # The block rule's stop weights are float32 ratios of vocab-wide sums, so a coin within rounding of one
+        # may land either side of it.
+        len_agree = float((got_len == want_len.to(torch.int32)).float().mean())
+        self.assertGreaterEqual(len_agree, 1.0 if not block_verify else 0.99)
+        self.assertGreater(int(want_len.max()), 1)
+        self.assertGreater(int((want_len == 0).sum()), 0)
+        # Where the lengths agree, the triton bonus is the inverse-CDF draw of the reference's distribution, up to
+        # float32 summation order: its token holds the draw within a 1e-5 band of the float64 CDF.
+        _, weights = sampled_chain_bonus_weights(**inputs)
+        same = got_len == want_len.to(torch.int32)
+        weights, got_bonus = weights[same], got_bonus[same]
+        cdf = weights.double().cumsum(-1)
+        total = cdf[:, -1]
+        draw = inputs["uniforms"][same][:, -1].double() * total
+        rows = torch.arange(weights.shape[0], device=DEVICE)
+        hi = cdf[rows, got_bonus]
+        lo = hi - weights[rows, got_bonus].double()
+        eps = 1e-5 * total
+        self.assertTrue(bool((weights[rows, got_bonus] > 0).all()))
+        self.assertTrue(bool(((lo - eps <= draw) & (draw <= hi + eps)).all()))
+        agree = float((got_bonus == want_bonus[same]).float().mean())
+        self.assertGreaterEqual(agree, 0.95)
 
 
 class _BlockHead:
