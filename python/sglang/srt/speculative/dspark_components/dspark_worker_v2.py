@@ -381,8 +381,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
         )
         self._top_prob_gate = TopProbGate.from_envs()
-        self._confidence_cut = ConfidenceCut.from_envs(
-            gamma=self.gamma, device=self.device
+        self._confidence_cut = self._build_confidence_cut()
+        # Static STS collection reads the folded proposal's pre-STS logits from the draft graph (dspark_draft_sampler).
+        self._record_confidence_raw = bool(
+            envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+            and self._verify_planner.carries_confidence
+            and self._verify_planner.mode_value == "static"
         )
         self._verify_dead_rows = None
         if self._top_prob_gate is not None:
@@ -553,6 +557,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         return dead_rows
 
+    def _build_confidence_cut(self) -> Optional[ConfidenceCut]:
+        """The configured confidence cut, or None. STS collection (SGLANG_DSPARK_STS_COLLECT_PATH) builds the head
+        under the cut's flag but verifies every row: its labels are the target's argmax over all of them, and a cut
+        row's logits are not valid."""
+        if envs.SGLANG_DSPARK_STS_COLLECT_PATH.get():
+            if envs.SGLANG_DSPARK_CONFIDENCE_CUT.get() and self.ps.tp_rank == 0:
+                logger.info(
+                    "DSpark confidence cut off for STS collection (SGLANG_DSPARK_STS_COLLECT_PATH): "
+                    "every verify covers all %d rows.",
+                    self.verify_num_draft_tokens,
+                )
+            return None
+        return ConfidenceCut.from_envs(gamma=self.gamma, device=self.device)
+
     def _init_confidence_cut(self) -> VerifyDeadRows:
         """Refuse a launch the confidence-head verify cut cannot serve, and attach its dead rows."""
         if self._top_prob_gate is not None:
@@ -595,6 +613,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             return None
         return cut.verify_lens(confidence)
+
+    def _folded_confidence_raw(self, proposal, bs: int) -> Optional[torch.Tensor]:
+        """The folded proposal's [bs, gamma] pre-STS confidence logits when the draft graph records them, else None."""
+        if not proposal.folded or self._draft_sampler is None:
+            return None
+        raw = self._draft_sampler.confidence_raw_out
+        return None if raw is None else raw[:bs]
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -728,6 +753,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else None
             ),
             record_top_prob=self._top_prob_gate is not None,
+            record_confidence_raw=self._record_confidence_raw,
         )
 
     def clear_cache_pool(self):
@@ -1199,6 +1225,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
             cut_verify_lens=cut_verify_lens,
             cut_calibrated=cut_calibrated,
+            folded_confidence_raw=self._folded_confidence_raw(proposal, bs),
         )
         if draft_probs is not None:
             self._draft_top_prob_log.record(

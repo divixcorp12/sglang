@@ -962,18 +962,22 @@ class DsparkStepObservers:
         dp_tier_num_tokens: Optional[int],
         cut_verify_lens: Optional[torch.Tensor] = None,
         cut_calibrated: bool = False,
+        folded_confidence_raw: Optional[torch.Tensor] = None,
     ) -> None:
         """``cut_verify_lens`` is the confidence cut's [bs] verify widths when it set this verify's (forced widths
-        while it calibrates, then ``cut_calibrated``), else None."""
+        while it calibrates, then ``cut_calibrated``), else None. ``folded_confidence_raw`` is the folded proposal's
+        pre-STS confidence logits when its draft graph records them (static STS collection), else None."""
         if self._verify_markers is not None:
             self._verify_markers.end(forward_ct=forward_ct, bs=bs)
         planner = self._planner
-        if not proposal_folded:
+        if not proposal_folded or folded_confidence_raw is not None:
             self._maybe_record_sts_collect(
                 verify_ids_2d=verify_ids_2d,
                 target_logits=target_logits,
                 bs=bs,
+                confidence_raw=folded_confidence_raw,
             )
+        if not proposal_folded:
             self._confidence_probe.maybe_observe(
                 carries_confidence=planner.carries_confidence,
                 is_compact_mode=planner.is_compact_mode,
@@ -1081,12 +1085,14 @@ class DsparkStepObservers:
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
         bs: int,
+        confidence_raw: Optional[torch.Tensor] = None,
     ) -> None:
         if not self._sts_collect_path:
             return
         if not self._planner.carries_confidence:
             return
-        confidence_raw = self._planner.last_confidence_raw
+        if confidence_raw is None:
+            confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
             return
         if self._sts_recorder is None:

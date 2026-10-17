@@ -10,13 +10,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.environ import envs
+from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.speculative.dspark_components import dspark_worker_v2 as dw
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     ConfidenceCutStats,
+    DsparkStepObservers,
     expect_accept_lengths,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -91,6 +93,21 @@ def test_the_cut_refuses_the_top_probability_gate_and_a_draft_without_a_confiden
     assert attached[0]["flag"] == "SGLANG_DSPARK_CONFIDENCE_CUT"
 
 
+def test_sts_collection_builds_no_cut_so_every_row_is_verified(monkeypatch):
+    built = []
+    monkeypatch.setattr(
+        dw.ConfidenceCut, "from_envs", classmethod(lambda cls, *, gamma, device: built.append(gamma) or "cut")
+    )
+    worker = SimpleNamespace(gamma=GAMMA, device="cpu", ps=SimpleNamespace(tp_rank=0), verify_num_draft_tokens=GAMMA + 1)
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True):
+        with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/tmp/sts-collect/shard"):
+            assert dw.DSparkWorkerV2._build_confidence_cut(worker) is None
+        assert built == []
+        with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(""):
+            assert dw.DSparkWorkerV2._build_confidence_cut(worker) == "cut"
+        assert built == [GAMMA]
+
+
 def test_the_dead_row_refusals_name_the_cut_that_asked(monkeypatch):
     monkeypatch.setattr(dw, "get_parallel", lambda: SimpleNamespace(enable_dp_attention=False))
     monkeypatch.setattr(dw, "attach_verify_dead_rows", lambda model, dead_rows: 3)
@@ -142,6 +159,57 @@ def test_the_folded_greedy_proposal_writes_this_steps_confidence_for_the_static_
     want = torch.sigmoid((hidden[:, :1] * 0.1).view(1, GAMMA) + draft_tokens.float())
     # The proposer hands confidence_out[:bs] to the worker as proposal.confidence: the same step's, not a lagged one.
     assert torch.allclose(sampler.confidence_out[:1], want)
+
+
+@torch.no_grad()
+def test_static_sts_collection_records_the_folded_proposals_pre_sts_logits():
+    model = _ToyDraft()
+    model.confidence_head = DSparkConfidenceHead(hidden_size=1, markov_rank=0, with_markov=False)
+    model.confidence_head.sts_temperatures = torch.tensor(2.0)
+
+    def confidence_fn(*, draft_hidden, anchor_tokens, draft_tokens, confidence_tap):
+        raw = model.confidence_head(confidence_tap.view(-1, GAMMA, 1))
+        return model.confidence_head.apply_sts(raw)
+
+    def sampler(record_confidence_raw):
+        return DsparkDraftSampler(
+            model=model, gamma=GAMMA, max_bs=2, device="cpu",
+            tp_sync=SimpleNamespace(sync=lambda site, tensor: tensor),
+            confidence_fn=confidence_fn, folded_sampling=False, record_confidence_raw=record_confidence_raw,
+        )
+
+    assert sampler(False).confidence_raw_out is None
+    recording = sampler(True)
+    hidden = torch.randn(GAMMA, 4)
+    recording(hidden, torch.tensor([4, 0, 0, 0, 0]))
+    want_raw = model.confidence_head(hidden[:, :1].view(1, GAMMA, 1) * 0.1)
+    assert torch.allclose(recording.confidence_raw_out[:1], want_raw)
+    assert torch.allclose(recording.confidence_out[:1], torch.sigmoid(want_raw / 2.0))
+
+
+def test_a_folded_verify_feeds_sts_collection_only_with_recorded_logits():
+    recorded = []
+    observers = SimpleNamespace(
+        _verify_markers=None,
+        _planner=SimpleNamespace(carries_confidence=True, is_compact_mode=False, last_confidence_raw=None),
+        _maybe_record_sts_collect=lambda **kwargs: recorded.append(kwargs["confidence_raw"]),
+        _confidence_probe=SimpleNamespace(maybe_observe=lambda **kwargs: None),
+        _block_accept_recorder=None,
+        _confidence_cut_stats=None,
+        _info_dumper=SimpleNamespace(enabled=False),
+    )
+    kwargs = dict(
+        forward_ct=0, reqs=[], bs=1, verify_ids_2d=None, target_logits=None, layout=None, confidence=None,
+        prefix_lens=None, draft_tokens=None, draft_block=None, sampling_info=None, correct_len=None,
+        cap_trim_lens=None, bonus=None, commit_lens=None, verify_token_budget=None, req_pool_indices=None,
+        verify_tier_num_tokens=-1, dp_tier_num_tokens=None,
+    )
+    raw = torch.zeros(1, GAMMA)
+    DsparkStepObservers.observe_verify_step(observers, proposal_folded=True, **kwargs)
+    assert recorded == []  # as before: the head's last raw tensor is not this folded step's
+    DsparkStepObservers.observe_verify_step(observers, proposal_folded=True, folded_confidence_raw=raw, **kwargs)
+    DsparkStepObservers.observe_verify_step(observers, proposal_folded=False, **kwargs)
+    assert recorded[0] is raw and recorded[1] is None  # the eager step reads the planner's own raw
 
 
 def test_the_expected_accept_length_sums_the_survival_of_the_verified_drafts():
