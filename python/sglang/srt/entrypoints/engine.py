@@ -344,6 +344,10 @@ class Engine(EngineScoreMixin, EngineBase):
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+            # The offline Engine runs no startup warm-up: the scheduler's post-warm-up work (the EXL3 copy engine's
+            # arming) then waits for its first idle moment after enough decodes.
+            if self.tokenizer_manager is not None:
+                self.loop.run_until_complete(self.tokenizer_manager.end_startup_warmup(None))
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""

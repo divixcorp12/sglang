@@ -20,6 +20,7 @@ The pieces, in file order:
 from __future__ import annotations
 
 import atexit
+import functools
 import json
 import logging
 import os
@@ -51,6 +52,12 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
 )
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.copy_engine_quiet import (
+    QuietReport,
+    block_device_inflight_paths,
+    inflight_busy,
+    wait_for_quiet,
+)
 from sglang.srt.layers.moe.cpu_experts.threading_config import ThreadingConfig
 from sglang.srt.layers.moe.exl3_expert_format import (
     EXL3_STREAMED_NAMES,
@@ -875,10 +882,12 @@ class Exl3RamMissService:
     paths' map changes reach the device before the thread runs again. The scheduler's
     fail-stop hook (``fail_stop_check``) does the per-batch upkeep.
 
-    The copy engine is enabled at start but armed only by ``fail_stop_check``, once
-    ``COPY_ENGINE_ARM_DECODES`` decode forwards have run after a copy-engine graph was
-    captured, so the first decode steps load their kernels unarmed. Once armed, an
-    eager forward and a module load first drain the device.
+    The copy engine is enabled at start but armed only by the scheduler
+    (``arm_copy_engine_when_quiet``): after the server's startup warm-up, with the
+    scheduler idle and the box quiet, once ``COPY_ENGINE_ARM_DECODES`` decode forwards
+    have run after a copy-engine graph was captured, so the first decode steps load
+    their kernels unarmed. Once armed, an eager forward and a module load first drain
+    the device.
 
     ``shutdown`` frees the tiers only when it can establish that no GPU reader and no
     service thread still runs; otherwise it quarantines every buffer until process
@@ -1990,13 +1999,12 @@ class Exl3RamMissService:
     def fail_stop_check(self) -> None:
         """The service's per-batch upkeep, run from the scheduler's fail-stop hook.
 
-        Arms the copy engine, retunes and logs CPU experts, and drains the trace. A
-        failed request never reaches here: the host aborts and the device traps
-        (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Fail-stop").
+        Retunes and logs CPU experts, and drains the trace. It does not arm the copy engine: that waits for the
+        scheduler to be idle after its startup warm-up (``arm_copy_engine_when_quiet``). A failed request never
+        reaches here: the host aborts and the device traps (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Fail-stop").
         """
         if self.host is None or self._shut_down:
             return
-        self._arm_copy_engine()
         if self.cpu_experts is not None and self._cpu_retune_batches > 0:
             self._cpu_batches += 1
             if self._cpu_batches >= self._cpu_retune_batches:
@@ -2078,6 +2086,59 @@ class Exl3RamMissService:
                 torch.cuda.synchronize()
         elif self.device_side is not None and self.device_side.copy_engine_captured:
             self._copy_decodes += 1
+
+    @property
+    def copy_engine_arm_pending(self) -> bool:
+        """Whether a started service still has its copy engine to arm."""
+        return (
+            self.copy_engine and not self._copy_armed and self.device_side is not None and not self._shut_down
+        )
+
+    @property
+    def copy_decodes(self) -> int:
+        """The decode forwards counted toward arming since capture."""
+        return self._copy_decodes
+
+    def quiet_probes(self) -> dict[str, Callable[[], bool]]:
+        """Host-side busy probes (no device read) for the box going quiet before calibration: the RAM-miss thread,
+        the copy engine's jobs, the tier's demand and speculative (RAM prefetch) drive reads, and every disk under the
+        expert mirror roots and the Engram table."""
+        host = self.host
+
+        def drive_reads() -> bool:
+            return any(
+                root["demand_inflight_bytes"] or root["spec_inflight_bytes"] for root in host.drive_load()["roots"]
+            )
+
+        probes = {
+            "ram_miss_thread": lambda: host.busy_episode() != 0,
+            "copy_engine_jobs": lambda: not host.copy_engine_idle(0.0),
+            "tier_drive_reads": drive_reads,
+        }
+        dirs = [d for d in envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get().split(os.pathsep) if d]
+        dirs += [d for d in (envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get(),) if d]
+        for disk, path in block_device_inflight_paths(dirs).items():
+            probes[f"{disk}_inflight"] = functools.partial(inflight_busy, path)
+        return probes
+
+    def arm_copy_engine_when_quiet(
+        self, *, deadline: float, busy_s: dict[str, float], warmup_ended_s_ago: Optional[float]
+    ) -> QuietReport:
+        """Arm the copy engine (its CPU split and split model calibrated first) once the box is quiet, or at
+        ``deadline`` (time.monotonic()) anyway. The scheduler calls it idle, after its startup warm-up, with at least
+        COPY_ENGINE_ARM_DECODES decode forwards counted."""
+        torch.cuda.synchronize()
+        report = wait_for_quiet(self.quiet_probes(), deadline=deadline, busy_s=busy_s)
+        since = (
+            "with no startup warm-up" if warmup_ended_s_ago is None else f"{warmup_ended_s_ago:.2f} s after warm-up ended"
+        )
+        log = logger.info if report.quiet else logger.warning
+        log(
+            "exl3 RAM miss copy engine calibration starts %s, %d decode forwards since capture, device drained; %s",
+            since, self._copy_decodes, report.line(),
+        )
+        self._arm_copy_engine()
+        return report
 
     def _arm_copy_engine(self) -> None:
         """Arm the copy engine once enough decode forwards have run since capture."""

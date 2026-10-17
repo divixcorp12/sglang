@@ -1227,6 +1227,20 @@ async def freeze_gc_async():
     )
 
 
+@app.post("/end_startup_warmup")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def end_startup_warmup_async(request: Request):
+    """The startup warm-up runner's last step: the scheduler finishes its post-warm-up work (the EXL3 copy engine's
+    calibration and arming) before this returns, and the server reports ready after it."""
+    body = await request.json()
+    results = await _global_state.tokenizer_manager.end_startup_warmup(
+        body.get("warmup_ended_at")
+    )
+    return ORJSONResponse(
+        {"success": all(r.success for r in results), "messages": [r.message for r in results]}
+    )
+
+
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():
@@ -2362,6 +2376,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             assert res.status_code == 200, f"{res.text}"
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
+                _end_startup_warmup(server_args, warmup_ended_at=time.time())
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -2405,6 +2420,28 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _end_startup_warmup(server_args: ServerArgs, *, warmup_ended_at: Optional[float]):
+    """Tell the scheduler the startup warm-ups are over and wait for its post-warm-up work before the server reports
+    ready, so no serving request runs under the EXL3 copy engine's calibration. A failure warns and the server
+    starts anyway."""
+    key = get_serving().admin_api_key or get_serving().api_key
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        res = requests.post(
+            server_args.url() + "/end_startup_warmup",
+            json={"warmup_ended_at": warmup_ended_at},
+            headers=headers,
+            # The scheduler's quiet wait (30 s) plus the calibration itself.
+            timeout=300,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+        for message in res.json()["messages"]:
+            logger.info(f"Startup warm-up end: {message}")
+    except requests.exceptions.RequestException:
+        logger.warning("end_startup_warmup failed; the server reports ready anyway", exc_info=True)
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2444,6 +2481,8 @@ def _wait_and_warmup(
         if not execute_warmup_func(server_args):
             return
     else:
+        if not envs.SGLANG_RUST_SERVER.get():
+            _end_startup_warmup(server_args, warmup_ended_at=None)
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     _freeze_gc_after_server_warmup(server_args)

@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    EndStartupWarmupReqInput,
+    EndStartupWarmupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -121,6 +123,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("end_startup_warmup", EndStartupWarmupReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -313,6 +316,16 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def end_startup_warmup(
+        self: TokenizerManager, warmup_ended_at: Optional[float]
+    ) -> List[EndStartupWarmupReqOutput]:
+        """Tell the scheduler the startup warm-ups are over; it replies once its post-warm-up work (the EXL3 copy
+        engine's calibration and arming) is done or deferred."""
+        self.auto_create_handle_loop()
+        return await self.end_startup_warmup_communicator(
+            EndStartupWarmupReqInput(warmup_ended_at=warmup_ended_at)
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
