@@ -57,6 +57,7 @@ class DsparkDraftSampler:
         out=None,
         folded_sampling: bool = True,
         record_top_prob: bool = False,
+        record_confidence_raw: bool = False,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -75,6 +76,13 @@ class DsparkDraftSampler:
         self.confidence_out = (
             torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
             if confidence_fn is not None
+            else None
+        )
+        # [bs, gamma] pre-STS confidence-head logits, for STS collection (SGLANG_DSPARK_STS_COLLECT_PATH): the head's
+        # _last_confidence_raw is a tensor of whichever batch size was captured last, so the graph copies it here.
+        self.confidence_raw_out = (
+            torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
+            if record_confidence_raw and confidence_fn is not None
             else None
         )
         # [bs, gamma] softmax top-1 probability of each step's logits, for the top-probability verify gate.
@@ -201,6 +209,11 @@ class DsparkDraftSampler:
                 confidence_tap=confidence_tap,
             )
             self.confidence_out[:bs].copy_(confidence)
+            if self.confidence_raw_out is not None:
+                # Set by apply_sts in the confidence_fn call just above, for this batch size.
+                self.confidence_raw_out[:bs].copy_(
+                    self.model.confidence_head._last_confidence_raw
+                )
 
 
 def _resolve_folded_sampling(
@@ -248,6 +261,7 @@ def maybe_build_draft_sampler(
     confidence_fn=None,
     out=None,
     record_top_prob: bool = False,
+    record_confidence_raw: bool = False,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -286,4 +300,5 @@ def maybe_build_draft_sampler(
         out=out,
         folded_sampling=folded_sampling,
         record_top_prob=record_top_prob,
+        record_confidence_raw=record_confidence_raw,
     )
