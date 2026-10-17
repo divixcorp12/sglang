@@ -1894,6 +1894,10 @@ class Envs:
     # Size in GiB of that native row cache (shared by every Engram layer). 0 keeps no rows: every lookup reads its
     # rows through io_uring.
     SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB = EnvFloat(5.0)
+    # Unset: off. N: that native store holds every Engram layer's scale rows (~2.86 GiB per layer) in locked RAM
+    # bound to NUMA node N, loaded at startup, so a miss reads only its weight page. Startup refuses rather than
+    # falls back if the rows cannot all be placed on N.
+    SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE = EnvInt(None)
     # With the above, capture the decode lookup as a device post kernel and a device
     # wait kernel served by a polling thread instead of a host node; the decode graph
     # then has no host nodes, which is asserted at capture.

@@ -56,6 +56,7 @@ class Ring:
         self.rows = torch.zeros(N, ROW_BYTES, dtype=torch.uint8)
         self.control = torch.zeros(engram_ring.CONTROL_WORDS, dtype=torch.int32)
         self.seq = 0
+        self.table = table
         self.native = native_engram_host_node().RingLookup(
             store, table.path, table.weight_offset, table.scale_offset, table.num_embeddings,
             table.dim, table.dim // table.block, table._tag, N,
@@ -173,6 +174,19 @@ def test_a_dead_row_id_is_served_as_a_zero_row(setup):
     assert ring.status() == 0
     assert torch.equal(ring.rows[[0, 2]], packed[[4, 6]]) and not ring.rows[1].any()
     assert store.stats()["accesses"] == accesses + 2
+
+
+def test_scales_in_ram_serve_the_same_rows_through_the_ring(setup):
+    """SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE: the device-wait path shares the Store, so with the scale rows loaded the
+    ring serves the file's rows bit for bit, -1 still a zero row."""
+    ring, store, packed = setup
+    store.load_scales(ring.table._tag, 0)
+    assert store.stats()["scales_ram_bytes"] == ROWS * (DIM // BLOCK)
+    for ids in ([3, 0, 49], [99, 98, 97]):
+        assert ring.wait(ring.post(ids)) and ring.status() == 0
+        assert torch.equal(ring.rows, packed[ids])
+    assert ring.wait(ring.post([5, -1, 50])) and ring.status() == 0
+    assert torch.equal(ring.rows[[0, 2]], packed[[5, 50]]) and not ring.rows[1].any()
 
 
 def test_a_device_timeout_latches_and_the_service_refuses_later_requests(setup):

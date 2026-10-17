@@ -580,6 +580,37 @@ def test_row_count_mismatch_raises(table):
         EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS + 1, dim=DIM)
 
 
+def test_scales_in_ram_without_the_native_store_refuse_to_open(table, monkeypatch):
+    """SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE holds the scales in the native store; set without it, open() refuses
+    instead of serving from the memmap as if the switch were off."""
+    monkeypatch.delenv("SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING", raising=False)
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE", "0")
+    directory, *_ = table
+    with pytest.raises(ValueError, match="SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING; set both"):
+        EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE", "-1")
+    with pytest.raises(ValueError, match="must be a NUMA node"):
+        EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an NVIDIA CUDA device")
+def test_open_holds_both_layers_scales_in_ram_and_serves_the_reference_rows(table, monkeypatch, caplog):
+    _prime_native_store()
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING", "1")
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE", "0")
+    directory, weight, scale, weight14, scale14 = table
+    with caplog.at_level("INFO"):
+        table1 = EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
+        table14 = EngramFileTable.open(str(directory), layer_id=14, num_embeddings=ROWS, dim=DIM)
+    assert caplog.text.count("Engram scales in RAM") == 2
+    assert table1._native_store.stats()["scales_ram_bytes"] == 2 * ROWS * (DIM // BLOCK)
+    for t, w, s in ((table1, weight, scale), (table14, weight14, scale14)):
+        idx = torch.tensor([[3, 0, 49], [7, 7, 1]])
+        rows = w[idx].float().unflatten(-1, (-1, BLOCK))
+        want = (rows * s[idx].float().unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+        assert torch.equal(t.lookup(idx).cpu(), want)
+
+
 def test_lookup_raises_under_cuda_graph_capture(table, monkeypatch):
     # lookup() makes a host sync (.cpu()) and only works eagerly; under capture
     # it must fail loudly instead of hitting an opaque CUDA capture error.

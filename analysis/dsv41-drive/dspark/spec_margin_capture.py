@@ -187,11 +187,14 @@ def server_argv(arm: str) -> list[str]:
 
 def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
     """The server's env as resolved-env.json records it: the caller's ``keys`` (an arm's assignments) under the
-    capture's env, and the keys the capture would override with another value, which the arm would not get."""
+    capture's env, the keys the capture would override with another value, which the arm would not get, and what
+    that env binds to node 1 beyond the HiCache pools (prelaunch_evict.py --extra-gib)."""
     own = capture_env(a)
     asked = {k: os.environ[k] for k in keys if k in os.environ}
-    return {"env": asked | own, "argv": server_argv(a.arm),
-            "overridden": sorted(k for k, v in asked.items() if k in own and own[k] != v)}
+    env = asked | own
+    return {"env": env, "argv": server_argv(a.arm),
+            "overridden": sorted(k for k, v in asked.items() if k in own and own[k] != v),
+            "node1_extra_gib": both_cpu_ab.node1_extra_gib(env)}
 
 
 def main() -> int:

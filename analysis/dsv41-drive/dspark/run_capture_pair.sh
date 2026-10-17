@@ -11,7 +11,9 @@
 #   CAPTURE_ARGS     passed to spec_margin_capture.py, e.g. --no-verify-split --long-prompt $PWD/SAMPLE_PROMPT_DIVIX01.md
 #                    --decode-seconds 300 --ttft-repeats 3; none serves the default 8-prompt probe.
 #   --worktree       the checkout to run (default: the one holding this script). A dirty one is refused.
-#   --hicache-gib    prelaunch_evict.py's HiCache pools on node 1 (the template's -mergechunk-expseg value).
+#   --hicache-gib    prelaunch_evict.py's HiCache pools on node 1 (the template's -mergechunk-expseg value). Each arm's
+#                    floor also gets its own --extra-gib, from its resolved env (both_cpu_ab.node1_extra_gib: the
+#                    Engram scale rows when SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1).
 #   --dry-run        resolve and print each arm's env, command and outputs; launch and write nothing.
 #
 # Every SGLANG_* variable inherited from the shell is unset, except both_cpu_ab.PASSTHROUGH's build caches, and so is
@@ -73,7 +75,7 @@ fi
 
 arm_assignments() { local i=$1; echo "${COMMON[*]} ${SPECS[$i]}"; }
 
-RESOLVED=()
+RESOLVED=(); EXTRA=()
 for i in "${!NAMES[@]}"; do
   name=${NAMES[$i]}
   read -ra all <<< "$(arm_assignments "$i")"
@@ -81,6 +83,9 @@ for i in "${!NAMES[@]}"; do
   res=$(env "${all[@]}" "$PY" "$CAPTURE" "$OUT/$name" --arm "$BASE" "${CAP[@]}" --resolve-env "$keys") \
     || die "arm $name: spec_margin_capture.py refused its arguments"
   RESOLVED+=("$name" "$res")
+  extra=$("$PY" -c 'import json, sys; print(json.loads(sys.argv[1])["node1_extra_gib"])' "$res") \
+    || die "arm $name: no node1_extra_gib in its resolved env"
+  EXTRA+=("$extra")
 done
 MERGED=$("$PY" -c '
 import json, sys
@@ -103,7 +108,7 @@ if [ "$DRY" = 1 ]; then
     name=${NAMES[$i]}
     echo "ARM $name"
     echo "  env: $(arm_assignments "$i")"
-    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB"
+    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --extra-gib ${EXTRA[$i]}"
     echo "  capture: env $(arm_assignments "$i") taskset -c 0-63 $PY $CAPTURE $OUT/$name --arm $BASE ${CAP[*]}"
     echo "  outputs: $OUT/$name $OUT/$name.memsample.jsonl $OUT/$name.nvme3n1.samples $OUT/$name.gpu-mem.csv $OUT/$name.memstate.txt $OUT/$name.diskstats.before $OUT/$name.diskstats.after $OUT/$name.ready.txt"
   done
@@ -120,7 +125,7 @@ for i in "${!NAMES[@]}"; do
   echo "$name ${all[*]}"
   while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
     echo "waiting for a quiet box $(date)"; sleep 60; done
-  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB; then
+  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --extra-gib ${EXTRA[$i]}; then
     echo "REFUSED $name: node 1 free below the floor $(date)"; echo ALLDONE; exit 3
   fi
   mkdir -p $OUT/$name

@@ -593,11 +593,30 @@ STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
 # fails.
 CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
 ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
+# The cut with both Engram layers' scale rows held in locked RAM on node 1, so an Engram miss reads its weight page alone
+# instead of the weight and the scale pages. Like the HiCache node, the knob has no "off" value, so only this arm names
+# it. Its node-1 floor is ENGRAM_SCALES_GIB higher (node1_extra_gib, run_capture_pair.sh).
+ENGRAM_SCALES_NODE = "SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE"
+ENGRAM_SCALES_ARM = CONFIDENCE_CUT_ARM + "-engramscales"
+ARMS[ENGRAM_SCALES_ARM] = ({**ARMS[CONFIDENCE_CUT_ARM][0], ENGRAM_SCALES_NODE: "1"}, True)
+# The scale rows' locked RAM: [rows, 8] F8_E8M0 per layer, the rows of config.json's engram_num_embeddings (EngramFileTable
+# refuses a header shape that differs), layers 1 and 14: 3,072,049,344 + 3,072,133,456 bytes, each mapping rounded up to
+# whole 4 KiB pages.
+ENGRAM_SCALE_ROWS = (384006168, 384016682)
+ENGRAM_SCALES_GIB = round(sum(-(-(rows * 8) // 4096) * 4096 for rows in ENGRAM_SCALE_ROWS) / 2**30, 2)  # 5.72
+CUT_ARMS = (CONFIDENCE_CUT_ARM, ENGRAM_SCALES_ARM)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, *CUT_ARMS)
 ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
 # An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
-ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
-REFERENCE.update({PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM})
+ARM_SPEC_FLAGS = {arm: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH) for arm in CUT_ARMS}
+REFERENCE.update({PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM,
+                  ENGRAM_SCALES_ARM: CONFIDENCE_CUT_ARM})
+
+
+def node1_extra_gib(env: dict) -> float:
+    """What a server with ``env`` binds to node 1 beyond the HiCache pools prelaunch_evict.py already counts: the Engram
+    scale rows when they are held on node 1."""
+    return ENGRAM_SCALES_GIB if env.get(ENGRAM_SCALES_NODE) == "1" else 0.0
 
 
 def sts_collect_stem(directory: str) -> str:

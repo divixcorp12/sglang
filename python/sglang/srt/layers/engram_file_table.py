@@ -43,14 +43,57 @@ def native_cache_bytes() -> int:
 
 
 def native_stats_line(now: dict, before: Optional[dict]) -> str:
-    """One log line: the window's and the run's accesses, hits, unique misses and hit rate."""
-    def part(acc: int, hits: int, misses: int) -> str:
-        return f"{acc} accesses, {hits} hits, {misses} unique misses, hit rate {hits / acc if acc else 0.0:.3f}"
+    """One log line: the window's and the run's accesses, hits, unique misses, hit rate and NVMe reads (SQEs)."""
+    def part(acc: int, hits: int, misses: int, reads: int) -> str:
+        return (f"{acc} accesses, {hits} hits, {misses} unique misses, hit rate {hits / acc if acc else 0.0:.3f}, "
+                f"{reads} reads")
 
-    keys = ("accesses", "hits", "unique_misses")
+    keys = ("accesses", "hits", "unique_misses", "submitted_sqes")
     window = [now[k] - (before[k] if before else 0) for k in keys]
-    return (f"engram native cache ({now['cache_bytes'] / (1 << 30):.2f} GiB, {now['capacity_rows']} rows): "
+    scales = f", scales {now['scales_ram_bytes'] / (1 << 30):.2f} GiB in RAM" if now["scales_ram_bytes"] else ""
+    return (f"engram native cache ({now['cache_bytes'] / (1 << 30):.2f} GiB, {now['capacity_rows']} rows{scales}): "
             f"window {part(*window)}; total {part(*(now[k] for k in keys))}")
+
+
+# Left free on the node after the scale rows, so a bound populate that would fill the node refuses here rather than
+# reclaiming to the last page (the run's whole node-1 need is prelaunch_evict.py's floor, not this check).
+SCALES_RAM_HEADROOM_BYTES = 1 << 30
+
+
+def engram_scales_ram_node() -> Optional[int]:
+    """SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE: the NUMA node holding the Engram scale rows in RAM, or None (off)."""
+    node = envs.SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE.get()
+    if node is not None and node < 0:
+        raise ValueError(f"SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE must be a NUMA node (>= 0) or unset, got {node}")
+    return node
+
+
+def hold_scales_in_ram(store, table: "EngramFileTable", layer_id: int, node: int) -> dict:
+    """Load ``table``'s scale rows into ``store``, locked in RAM on NUMA ``node``; log one line. Raises, so the
+    server does not start, if the node is missing or short of memory, or if any page lands elsewhere."""
+    from sglang.srt.layers.moe.host_numa import node_memory
+
+    nbytes = table.num_embeddings * (table.dim // table.block)
+    memory = node_memory(node)  # a ValueError naming the node when it does not exist
+    available = memory["free"] + memory["reclaimable"]
+    if nbytes + SCALES_RAM_HEADROOM_BYTES > available:
+        raise ValueError(
+            f"SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE={node}: layer {layer_id}'s scale rows need "
+            f"{nbytes / (1 << 30):.2f} GiB + {SCALES_RAM_HEADROOM_BYTES / (1 << 30):.0f} GiB headroom; node {node} "
+            f"has {memory['free'] / (1 << 30):.2f} GiB free + {memory['reclaimable'] / (1 << 30):.2f} GiB page cache"
+        )
+    result = dict(store.load_scales(table._tag, node))
+    off_node = int(result["off_node_pages"])
+    logger.info(
+        "Engram scales in RAM: layer %d, %.3f GiB on NUMA node %d, loaded in %.1f s, %d of %d pages not on node %d",
+        layer_id, result["bytes"] / (1 << 30), node, result["seconds"], off_node, int(result["pages"]), node,
+    )
+    if off_node:
+        raise RuntimeError(
+            f"SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE={node}: {off_node} of layer {layer_id}'s scale pages landed off "
+            f"node {node}; refusing to start"
+        )
+    return result
 
 
 def log_native_stats(store, interval_s: float = NATIVE_STATS_INTERVAL_S) -> None:
@@ -153,6 +196,12 @@ class EngramFileTable:
                 "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT serves from the native store of "
                 "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING; set both"
             )
+        scales_node = engram_scales_ram_node()
+        if scales_node is not None and not envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get():
+            raise ValueError(
+                "SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE holds the scales in the native store of "
+                "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING; set both"
+            )
         weight_key = f"layers.{layer_id}.engram.embed.weight"
         for path in sorted(glob.glob(os.path.join(table_dir, "*.safetensors"))):
             _, header = read_safetensors_header(path)
@@ -186,6 +235,8 @@ class EngramFileTable:
                         raise RuntimeError(
                             "Engram CUDA host-node io_uring route initialization failed"
                         ) from exc
+                    if scales_node is not None:
+                        hold_scales_in_ram(table._native_store, table, layer_id, scales_node)
                 return table
         raise FileNotFoundError(f"{weight_key} not found in {table_dir}")
 

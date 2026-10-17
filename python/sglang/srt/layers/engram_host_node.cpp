@@ -1,5 +1,6 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <liburing.h>
 
@@ -23,6 +24,11 @@
 #include <unistd.h>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
 
 namespace py = pybind11;
 using CudaHostCallback = void (*)(void*);
@@ -63,7 +69,14 @@ struct Counters {
   uint64_t bounce_bytes_peak=0;
   uint64_t chunks=0;  // read passes; >1 means a request outgrew the bounce buffer
   int64_t pinned_staging_bytes=0, device_staging_bytes=0;
+  uint64_t scales_ram_bytes=0;
 };
+
+// A table's scale rows held in RAM (Store::load_scales). The mapping starts at the file page holding the first scale
+// byte, as O_DIRECT reads it, so rows sits `scale_offset % 4096` bytes into it.
+struct RamScales { uint8_t* map=nullptr; size_t map_bytes=0; const uint8_t* rows=nullptr; size_t bytes=0; };
+
+static std::string errno_text(int e) { return std::string(std::strerror(e)); }
 
 class Store {
  public:
@@ -92,9 +105,83 @@ class Store {
     std::unique_lock<std::mutex> l(mu_); ready_cv_.wait(l,[&]{return ready_;});
     if(!worker_error_.empty()) { l.unlock(); stop(); throw std::runtime_error(worker_error_); }
   }
-  ~Store(){ stop(); std::free(bounce_); if(data_) munmap(data_,nsets_*ways_*row_bytes_); }
+  ~Store(){
+    stop(); std::free(bounce_); if(data_) munmap(data_,nsets_*ways_*row_bytes_);
+    for(auto& p:ram_scales_) munmap(p.second.map,p.second.map_bytes);
+  }
 
-  void register_table(const Table& t) { std::lock_guard<std::mutex> l(mu_); tables_[t.tag]=t; }
+  // Re-registering a tag with the same table (each lookup context does) keeps its RAM scales; another table under the
+  // tag drops them, as they are that table's no longer. Lock order as in process: cache_mu_, stats_mu_, mu_.
+  void register_table(const Table& t) {
+    std::lock_guard<std::mutex> c(cache_mu_);
+    std::lock_guard<std::mutex> s(stats_mu_);
+    std::lock_guard<std::mutex> l(mu_);
+    auto old=tables_.find(t.tag); auto ram=ram_scales_.find(t.tag);
+    if(old!=tables_.end()&&ram!=ram_scales_.end()&&
+       (old->second.path!=t.path||old->second.scale_offset!=t.scale_offset||old->second.rows!=t.rows||old->second.scale_dim!=t.scale_dim)) {
+      stats_.scales_ram_bytes-=ram->second.bytes; munmap(ram->second.map,ram->second.map_bytes); ram_scales_.erase(ram);
+    }
+    tables_[t.tag]=t;
+  }
+  // Holds the scale rows of the table registered under `tag` in RAM bound to NUMA node `node`, so a miss then reads
+  // only its weight page. The mapping is bound before any page is touched, populated, locked (node 0 swaps, and a
+  // swapped-out scale page would cost the read this saves), filled with large O_DIRECT reads (no page cache on
+  // whichever node the reading thread runs), and every page's node is read back. Throws, keeping nothing, if a step
+  // fails. If any page is off the node it keeps nothing either and returns the count in off_node_pages, so the caller
+  // can log it before refusing.
+  std::map<std::string,double> load_scales(int64_t tag, int64_t node) {
+    Table t;
+    {std::lock_guard<std::mutex> l(mu_); auto ti=tables_.find(tag); if(ti==tables_.end()) throw std::invalid_argument("Engram scales: no table is registered under tag "+std::to_string(tag)); t=ti->second;}
+    {std::lock_guard<std::mutex> l(cache_mu_); if(ram_scales_.count(tag)) throw std::logic_error("Engram scales: already held in RAM for tag "+std::to_string(tag));}
+    if(node<0||node>=1024) throw std::invalid_argument("Engram scales: NUMA node "+std::to_string(node)+" is out of range");
+    const auto start=std::chrono::steady_clock::now();
+    const size_t bytes=static_cast<size_t>(t.rows)*static_cast<size_t>(t.scale_dim);
+    const uint64_t head=t.scale_offset&uint64_t(4095), file_start=t.scale_offset-head;
+    const size_t want=head+bytes, map_bytes=(want+4095)&~size_t(4095);
+    const std::string where="Engram scales on NUMA node "+std::to_string(node)+" ("+std::to_string(bytes)+" bytes of "+t.path+"): ";
+    void* p=mmap(nullptr,map_bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if(p==MAP_FAILED) throw std::runtime_error(where+"mmap failed: "+errno_text(errno));
+    RamScales s{static_cast<uint8_t*>(p),map_bytes,static_cast<uint8_t*>(p)+head,bytes};
+    auto fail=[&](const std::string& what,int e){ munmap(s.map,s.map_bytes); throw std::runtime_error(where+what+": "+errno_text(e)); };
+    std::vector<unsigned long> mask(static_cast<size_t>(node)/64+1,0); mask[node/64]=1UL<<(node%64);
+    constexpr int kMpolBind=2;
+    if(syscall(SYS_mbind,s.map,s.map_bytes,kMpolBind,mask.data(),mask.size()*64+1,0)!=0) fail("mbind failed",errno);
+    if(madvise(s.map,s.map_bytes,MADV_POPULATE_WRITE)!=0) {
+      // EINVAL: a kernel without MADV_POPULATE_WRITE; mlock below faults the pages in under the same binding.
+      if(errno!=EINVAL) fail("populating failed",errno);
+    }
+    if(mlock(s.map,s.map_bytes)!=0) fail("mlock failed (RLIMIT_MEMLOCK?)",errno);
+    int fd=open(t.path.c_str(),O_RDONLY|O_CLOEXEC|O_DIRECT); if(fd<0) fail("open failed",errno);
+    constexpr size_t kChunk=size_t(64)<<20;
+    size_t got=0;
+    while(got<want) {
+      const ssize_t n=pread(fd,s.map+got,std::min(kChunk,map_bytes-got),static_cast<off_t>(file_start+got));
+      if(n<0&&errno==EINTR) continue;
+      if(n<0) { const int e=errno; close(fd); fail("read failed",e); }
+      if(n==0) break;
+      got+=static_cast<size_t>(n);
+      if(n%4096) break;  // the file's unaligned end
+    }
+    close(fd);
+    if(got<want) fail("the file ends before its scale rows do",EIO);
+    const size_t pages=map_bytes/4096; size_t off_node=0;
+    constexpr size_t kQuery=65536;
+    std::vector<void*> addrs; std::vector<int> where_now;
+    for(size_t b=0;b<pages;b+=kQuery) {
+      const size_t n=std::min(kQuery,pages-b); addrs.resize(n); where_now.assign(n,-1);
+      for(size_t i=0;i<n;i++) addrs[i]=s.map+(b+i)*4096;
+      if(syscall(SYS_move_pages,0,n,addrs.data(),nullptr,where_now.data(),0)!=0) fail("move_pages query failed",errno);
+      for(int at:where_now) if(at!=node) off_node++;
+    }
+    const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    if(off_node) munmap(s.map,s.map_bytes);
+    else {
+      {std::lock_guard<std::mutex> l(cache_mu_); ram_scales_[tag]=s;}
+      std::lock_guard<std::mutex> l(stats_mu_); stats_.scales_ram_bytes+=bytes;
+    }
+    return {{"bytes",double(bytes)},{"node",double(node)},{"seconds",seconds},{"pages",double(pages)},
+            {"off_node_pages",double(off_node)}};
+  }
   void adjust_staging(int64_t host_bytes, int64_t device_bytes) {
     std::lock_guard<std::mutex> l(stats_mu_);
     stats_.pinned_staging_bytes += host_bytes;
@@ -120,6 +207,7 @@ class Store {
     d["misses"]=stats_.unique_misses; d["capacity_rows"]=nsets_*ways_;
     d["cache_bytes"]=nsets_*ways_*row_bytes_;
     d["cache_metadata_bytes"]=(tags_.size()+ages_.size())*sizeof(int64_t);
+    d["scales_ram_bytes"]=stats_.scales_ram_bytes;
     d["row_bytes"]=row_bytes_; return d;
   }
  private:
@@ -200,6 +288,8 @@ class Store {
     std::lock_guard<std::mutex> stats_guard(stats_mu_);
     Table t;
     {std::lock_guard<std::mutex> l(mu_); auto ti=tables_.find(q.tag); if(ti==tables_.end()) return -ENOENT; t=ti->second;}
+    const RamScales* ram=nullptr;
+    {auto it=ram_scales_.find(q.tag); if(it!=ram_scales_.end()) ram=&it->second;}
     const size_t rb=row_bytes_; if(q.status) *q.status=1;
     std::vector<int64_t> misses; std::vector<std::vector<size_t>> miss_positions;
     std::unordered_map<int64_t,size_t> miss_index;
@@ -227,7 +317,7 @@ class Store {
           for(uint64_t p=first;;p+=4096){fn(p);if(p==last)break;}
         };
         add_range(t.weight_offset+id*t.dim,t.dim);
-        add_range(t.scale_offset+id*t.scale_dim,t.scale_dim);
+        if(!ram) add_range(t.scale_offset+id*t.scale_dim,t.scale_dim);
       };
       // One chunk's reads must fit the fixed bounce buffer, so a request whose misses do
       // not all fit is split into several chunks rather than refused. Reading every miss
@@ -337,7 +427,9 @@ class Store {
             }
             return true;
           };
-          if(!scatter(wo,t.dim,dst)||!scatter(so,t.scale_dim,dst+t.dim))return -EIO;
+          if(!scatter(wo,t.dim,dst))return -EIO;
+          if(ram) memcpy(dst+t.dim,ram->rows+id*t.scale_dim,t.scale_dim);
+          else if(!scatter(so,t.scale_dim,dst+t.dim))return -EIO;
           if(ways_) {
             int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_,base=set*ways_,way=ways_;
             for(size_t w=0;w<ways_;w++)if(tags_[base+w]==key){way=w;break;}
@@ -353,6 +445,7 @@ class Store {
     if(q.status) *q.status=0; return 0;
   }
   std::mutex cache_mu_;
+  std::map<int64_t,RamScales> ram_scales_;  // under cache_mu_
   uint8_t* bounce_=nullptr;
 };
 
@@ -553,6 +646,7 @@ PYBIND11_MODULE(engram_host_node_cpp,m) {
    .def("register_table",[](Store& s,const std::string& path,uint64_t wo,uint64_t so,int64_t n,int64_t d,int64_t sd,int64_t tag){s.register_table(Table{path,wo,so,n,d,sd,tag});})
    .def("lookup",[](Store& s,py::array_t<int64_t,py::array::c_style|py::array::forcecast> ids,int64_t tag){auto in=ids.unchecked<1>();py::array_t<uint8_t> out({in.shape(0),s.stats()["row_bytes"].cast<int64_t>()});auto* p=out.mutable_data();{py::gil_scoped_release release;s.lookup(in.data(0),p,in.shape(0),tag);}return out;})
    .def("stats",&Store::stats)
+   .def("load_scales",&Store::load_scales,py::call_guard<py::gil_scoped_release>())
    .def("adjust_staging",&Store::adjust_staging);
   m.def("get_shared_store",&get_store);
   m.def("create_store",[](size_t budget,int64_t row_bytes){return std::make_shared<Store>(budget,row_bytes);});

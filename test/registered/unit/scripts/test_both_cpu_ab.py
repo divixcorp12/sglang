@@ -402,7 +402,10 @@ PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 # Production's arm (-expseg with production's additions) and the confidence cut's two arms built on it.
 PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
 STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
+ENGRAM_SCALES_ARM = f"{CONFIDENCE_CUT_ARM}-engramscales"
+CUT_ARMS = (CONFIDENCE_CUT_ARM, ENGRAM_SCALES_ARM)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, *CUT_ARMS)
+ENGRAM_SCALES_NODE = "SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE"
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1195,9 +1198,9 @@ def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the
     monkeypatch.setenv(STS_COLLECT, "/shell/sts")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[CONFIDENCE_CUT] == ("1" if arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM) else "0"), arm
+            assert overrides[CONFIDENCE_CUT] == ("1" if arm in (STS_COLLECT_ARM, *CUT_ARMS) else "0"), arm
             assert (overrides[STS_COLLECT] != "") == (arm == STS_COLLECT_ARM), arm
-        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm == CONFIDENCE_CUT_ARM), arm
+        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm in CUT_ARMS), arm
     prod = {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k != CONFIDENCE_CUT}
     for arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM):
         cut = ab.ARMS[arm][0]
@@ -1249,6 +1252,32 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
     for arm in PROD_ARMS:
         assert ab.run_probe(arm, str(tmp_path)) == 1
-    prod, collect, cut = argvs
-    assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    prod, collect, *cuts = argvs
+    for cut in cuts:
+        assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
     assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
+
+
+def test_the_engram_scales_arm_is_the_cut_with_the_node_alone_and_no_other_arm_or_production_names_it(monkeypatch):
+    """-confcut-engramscales is -confcut with SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1 and nothing else, at the cut's
+    flags; no other arm, and not production's env or launch script, names the knob. Its node-1 floor is the scales'
+    5.72 GiB higher. Mutant: the arm changes another knob, another arm or production gets the node, or the floor
+    does not move -- red."""
+    ab = _ab()
+    scales, cut = ab.ARMS[ENGRAM_SCALES_ARM][0], ab.ARMS[CONFIDENCE_CUT_ARM][0]
+    assert ab.ENGRAM_SCALES_ARM == ENGRAM_SCALES_ARM and ab.CUT_ARMS == CUT_ARMS
+    assert scales[ENGRAM_SCALES_NODE] == "1"
+    assert {k: v for k, v in scales.items() if k != ENGRAM_SCALES_NODE} == cut
+    assert ab.ARMS[ENGRAM_SCALES_ARM][1] is True and ab.REFERENCE[ENGRAM_SCALES_ARM] == CONFIDENCE_CUT_ARM
+    assert ab.server_flags(ENGRAM_SCALES_ARM) == ab.server_flags(CONFIDENCE_CUT_ARM)
+    for arm in ab.ARMS:
+        assert (ENGRAM_SCALES_NODE in ab.ARMS[arm][0]) == (arm == ENGRAM_SCALES_ARM), arm
+        assert (ab._overrides(arm, "/out").get(ENGRAM_SCALES_NODE) == "1") == (arm == ENGRAM_SCALES_ARM), arm
+    assert ENGRAM_SCALES_NODE not in ab.arm_env.prod_env()
+    launch = open(os.path.join(ROOT, "benchmarks", "dsv41_baseline", "launch_prod.sh")).read()
+    assert ENGRAM_SCALES_NODE not in launch
+    # Both layers' [rows, 8] scale rows, each mapping rounded to whole pages.
+    assert ab.ENGRAM_SCALES_GIB == 5.72
+    assert ab.node1_extra_gib(ab.arm_env.arm_env(scales)) == 5.72
+    assert ab.node1_extra_gib(ab.arm_env.arm_env(cut)) == 0.0
+    assert ab.node1_extra_gib({ENGRAM_SCALES_NODE: "0"}) == 0.0  # node 0's scales are not node 1's need

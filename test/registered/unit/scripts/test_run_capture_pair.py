@@ -53,6 +53,17 @@ def test_a_dry_run_of_two_arms_resolves_their_envs_commands_and_outputs_and_laun
                                         f"{out}/{name}.gpu-mem.csv"]
 
 
+def test_an_arm_holding_the_engram_scales_on_node_1_gets_their_size_on_its_floor(tmp_path):
+    """Each arm's prelaunch floor takes its own --extra-gib from its resolved env: the Engram scale rows' 5.72 GiB
+    with SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1, none without it or on node 0."""
+    r = _dry(tmp_path, "off=", "on=SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1", "node0=SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=0")
+    assert r.returncode == 0, r.stderr + r.stdout
+    lines = r.stdout.splitlines()
+    for name, extra in (("off", "0.0"), ("on", "5.72"), ("node0", "0.0")):
+        prelaunch = lines[lines.index(f"ARM {name}") + 2]
+        assert prelaunch.endswith(f"--hicache-gib 12.67 --extra-gib {extra}"), prelaunch
+
+
 def test_a_single_arm_with_the_default_probe_is_a_diagnostic(tmp_path):
     r = _dry(tmp_path, "diag=")
     assert r.returncode == 0, r.stderr + r.stdout

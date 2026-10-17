@@ -47,6 +47,18 @@ def test_no_or_an_unusable_previous_sample_falls_back_to_arm_a(tmp_path):
     assert floor["rest_source"].startswith("default") and "unusable" in floor["rest_source"]
 
 
+def test_the_extra_gib_raises_the_floor_and_is_recorded(tmp_path):
+    """--extra-gib (both_cpu_ab.node1_extra_gib: the Engram scales on node 1) adds to the floor: 66 GiB free holds the
+    default 63.99 GiB floor, not the 69.71 GiB one with the scales' 5.72."""
+    floor = pe.node1_floor("", 11.75, 1.0, 5.72)
+    assert floor["extra_gib"] == 5.72 and floor["floor_gib"] == round(11.75 + floor["rest_gib"] + 5.72 + 1.0, 2)
+    assert pe.node1_floor("", 11.75, 1.0)["extra_gib"] == 0.0
+    r, record = _main(tmp_path, 66.0)
+    assert r.returncode == 0 and record["floor_gib"] == 63.99 and record["extra_gib"] == 0.0
+    r, record = _main(tmp_path, 66.0, "--extra-gib", "5.72")
+    assert r.returncode == 3 and record["floor_gib"] == 69.71 and "+ extra 5.72 +" in r.stdout
+
+
 def test_evict_drops_each_file_and_counts_it(tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "x.rows").write_bytes(b"0" * 8192)

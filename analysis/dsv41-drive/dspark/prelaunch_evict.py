@@ -8,7 +8,9 @@ Node-1 floor = HiCache host pools on node 1 (--hicache-gib; 0 when they stay on 
 need + --margin-gib. The rest comes from the arm's previous memsample (--previous, memsample.py's JSONL) where one
 exists: node-1 MemFree at its first sample less its minimum, less the pools it bound there (its peak node-1 Shmem
 rise). Otherwise it is DEFAULT_REST_GIB, from arm A (splitmodel-stream-mem-hicache1, 2026-10-15: 64.69 GiB free at
-start, 1.70 GiB at its lowest, 11.75 GiB of it HiCache). The record says which was used.
+start, 1.70 GiB at its lowest, 11.75 GiB of it HiCache). The record says which was used. --extra-gib adds what the arm
+binds to node 1 beyond arm A (both_cpu_ab.node1_extra_gib: the Engram scale rows held in RAM there); it is for the
+default rest, as a previous memsample of the same arm already counts it.
 
 Production (launch_prod.sh) runs it too, with three more options:
 - --skip-evict-port PORT: while anything listens on PORT (another of our servers reading the same files), check the
@@ -20,6 +22,7 @@ Production (launch_prod.sh) runs it too, with three more options:
 --dry-run evicts nothing and does not wait: it reports the floor, the nodes and the decision it would make.
 
 Usage: prelaunch_evict.py --log OUT.json [--previous RUN.memsample.jsonl] [--hicache-gib 11.75] [--margin-gib 1.0]
+                           [--extra-gib 0]
                            [--wait-min 30] [--skip-evict-port P] [--node0-warn-gib G] [--holders ROOT ...] [--dry-run]
 Exit 0: ready; 3: node 1 stayed below the floor for --wait-min minutes (evicting again each minute).
 PRELAUNCH_NODE_SYSFS and PRELAUNCH_EVICT_PATHS (colon-separated) replace the sysfs node directory and the evicted
@@ -77,7 +80,7 @@ def rest_from_samples(lines) -> tuple[float, float]:
     return need - pools, pools
 
 
-def node1_floor(previous: str, hicache_gib: float, margin_gib: float) -> dict:
+def node1_floor(previous: str, hicache_gib: float, margin_gib: float, extra_gib: float = 0.0) -> dict:
     """The floor and where its non-HiCache part came from."""
     rest, source = DEFAULT_REST_GIB, "default (arm A, 2026-10-15)"
     if previous and os.path.exists(previous):
@@ -87,8 +90,8 @@ def node1_floor(previous: str, hicache_gib: float, margin_gib: float) -> dict:
             source = previous
         except (ValueError, KeyError, json.JSONDecodeError) as error:
             source = f"default (arm A); {previous} unusable: {error}"
-    return {"floor_gib": round(hicache_gib + rest + margin_gib, 2), "rest_gib": round(rest, 2),
-            "hicache_gib": hicache_gib, "margin_gib": margin_gib, "rest_source": source}
+    return {"floor_gib": round(hicache_gib + rest + extra_gib + margin_gib, 2), "rest_gib": round(rest, 2),
+            "hicache_gib": hicache_gib, "extra_gib": extra_gib, "margin_gib": margin_gib, "rest_source": source}
 
 
 def evict(paths=PATHS) -> dict:
@@ -215,6 +218,7 @@ def main() -> int:
     p.add_argument("--log", required=True)
     p.add_argument("--previous", default="", help="the arm's previous memsample.py JSONL, if any")
     p.add_argument("--hicache-gib", type=float, default=DEFAULT_HICACHE_GIB)
+    p.add_argument("--extra-gib", type=float, default=0.0, help="node-1 need beyond arm A's (the Engram scales)")
     p.add_argument("--margin-gib", type=float, default=1.0)
     p.add_argument("--wait-min", type=float, default=30.0)
     p.add_argument("--skip-evict-port", type=int, action="append", default=[])
@@ -223,10 +227,11 @@ def main() -> int:
     p.add_argument("--holders-budget-s", type=float, default=60.0)
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
-    floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib)
+    floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib, a.extra_gib)
     record = {"t": time.time(), **floor, "before": node_meminfo(), "rounds": [], "dry_run": a.dry_run}
+    extra = f" + extra {a.extra_gib}" if a.extra_gib else ""
     print(f"prelaunch: node-1 floor {floor['floor_gib']} GiB = HiCache {a.hicache_gib} + rest {floor['rest_gib']} "
-          f"({floor['rest_source']}) + margin {a.margin_gib}", flush=True)
+          f"({floor['rest_source']}){extra} + margin {a.margin_gib}", flush=True)
     busy = [port for port in a.skip_evict_port if listening(port)]
     record["evict_skipped_for_ports"] = busy
     if busy:
