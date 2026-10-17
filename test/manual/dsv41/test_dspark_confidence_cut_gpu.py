@@ -96,7 +96,9 @@ def test_calibration_times_forced_widths_through_the_verify_events_then_cuts_by_
         cut.end_verify()
     assert sorted(widths) == sorted(list(range(1, TOKENS + 1)) * (CALIBRATION_VERIFIES // TOKENS))
 
-    # The 49th eligible verify reads the last elapsed times lazily and freezes T(w).
+    # T(w) freezes at the first verify after the last end event has completed (read lazily, never waited on), so the
+    # test lets the 48th verify's work finish before the 49th.
+    torch.cuda.synchronize()
     lens = cut.verify_lens(confident)
     assert cut.calibrated and not cut.disabled
     cost = cut.cost_ms()
