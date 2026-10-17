@@ -921,8 +921,15 @@ def test_the_calib_arm_is_expseg_with_the_calibration_and_the_prefill_cuts_alone
     calib, expseg = PIN01_HICACHE_ARMS[6], PIN01_HICACHE_ARMS[5]
     for arm in ab.ARMS:
         overrides = ab._overrides(arm, "/out")
-        # Production's arms calibrate the hot cache without the per-chunk kernels, as production does.
-        want = ("1", "1") if arm == calib else ("1", "0") if arm in PROD_ARMS else ("0", "0")
+        # Production's arms calibrate the hot cache without the per-chunk kernels, as production does; the residency
+        # pair's fixed smaller hot cache does not (test_the_residency_pair_...).
+        residency_pair = (LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
+        want = (
+            ("1", "1") if arm == calib
+            else ("0", "0") if arm in residency_pair
+            else ("1", "0") if arm in PROD_ARMS
+            else ("0", "0")
+        )
         assert (overrides[ab.CALIBRATE], overrides[ab.CHUNK_KERNELS]) == want, arm
     c, e = ab.ARMS[calib][0], ab.ARMS[expseg][0]
     knobs = {ab.CALIBRATE: "1", ab.CHUNK_KERNELS: "1", ab.MERGE_BUDGET: "32", ab.INDEXER_BUDGET: "32"}
