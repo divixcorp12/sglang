@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+from typing import Optional
 
 import torch
 
@@ -46,12 +47,20 @@ def _logit(p: torch.Tensor) -> torch.Tensor:
     return torch.logit(p.clamp(EPS, 1 - EPS))
 
 
-def load(data_glob: str, temperature: float) -> dict[str, torch.Tensor]:
-    shards = [torch.load(path, map_location="cpu") for path in sorted(glob.glob(data_glob))]
-    if not shards or "draft_q" not in shards[0]:
-        raise SystemExit(f"{data_glob!r}: no shards with draft features")
+def _shard_index(path: str) -> int:
+    return int(path.rsplit(".", 2)[-2])
+
+
+def load(data_glob: str, temperature: float, *, need_draft: bool = True) -> dict[str, torch.Tensor]:
+    """The shards' verifies at ``temperature``, in serving order (shards sorted by their index, rows as recorded)."""
+    paths = sorted(glob.glob(data_glob), key=_shard_index)
+    shards = [torch.load(path, map_location="cpu") for path in paths]
+    if not shards or (need_draft and "draft_q" not in shards[0]):
+        raise SystemExit(f"{data_glob!r}: no shards" + (" with draft features" if need_draft else ""))
     data = {key: torch.cat([s[key] for s in shards]) for key in shards[0]}
-    keep = ((data["temperatures"] - temperature).abs() < 1e-3) & torch.isfinite(data["draft_q"]).all(dim=1)
+    keep = (data["temperatures"] - temperature).abs() < 1e-3
+    if "draft_q" in data:
+        keep &= torch.isfinite(data["draft_q"]).all(dim=1)
     data = {key: value[keep] for key, value in data.items()}
     data["taken"] = data["sampled_prefix_mask"].sum(dim=1).to(torch.int64)
     return data
@@ -130,6 +139,176 @@ def survival_ece(confidence: torch.Tensor, prefix_mask: torch.Tensor) -> list[fl
     ]
 
 
+# ---- target-side history features (--history) ------------------------------------------------------------------------
+#
+# What the server knows about the target before step t's width is chosen: earlier verifies' outcomes as the cut saw
+# them. Under a cut of w rows, positions 1..w ran on live rows, so a step's observed accept count is min(m, w) (the
+# capped commit plus cap_trim_lens, up to w), it was "cut short" when every verified position accepted (m >= w), and
+# min(1, p/q) is known at the positions whose accept test ran (1..min(m + 1, w)). Every feature of step t reads steps
+# before t only (HistoryState takes step t's outcome after its features were read), never step t's target p or its
+# accept draws, so it is a constant of step t's verify: c_k still reads only this step's d_1..d_k plus the past, and the
+# stopping-rule proof holds unchanged.
+
+HISTORY_DECAYS = (0.5, 0.8, 0.95)
+HISTORY_NAMES = (
+    "no_history",
+    "prev_accept",
+    "prev_cut_short",
+    "prev_mean_rate",
+    "prev_last_accept_rate",
+    *(f"ewma_accept_{d}" for d in HISTORY_DECAYS),
+    "ewma_mean_rate_0.8",
+)
+
+
+class HistoryState:
+    """The history features of the next step, from the steps fed to update() so far."""
+
+    def __init__(self, decays=HISTORY_DECAYS):
+        self.decays = decays
+        self.steps = 0
+        self.prev = (0.0, 0.0, 0.0, 0.0)
+        self.ewma_accept = [0.0] * len(decays)
+        self.ewma_rate = 0.0
+
+    def features(self) -> list[float]:
+        return [float(self.steps == 0), *self.prev, *self.ewma_accept, self.ewma_rate]
+
+    def update(self, *, taken: int, width: int, rates: list[float]) -> None:
+        observed = min(taken, width)
+        tested = min(taken + 1, width)
+        mean_rate = sum(rates[:tested]) / tested
+        last_rate = rates[observed - 1] if observed >= 1 else 0.0
+        self.prev = (float(observed), float(taken >= width), mean_rate, last_rate)
+        if self.steps == 0:
+            self.ewma_accept = [float(observed)] * len(self.decays)
+            self.ewma_rate = mean_rate
+        else:
+            self.ewma_accept = [d * e + (1 - d) * observed for d, e in zip(self.decays, self.ewma_accept)]
+            self.ewma_rate = 0.8 * self.ewma_rate + 0.2 * mean_rate
+        self.steps += 1
+
+
+def history_features(*, taken: torch.Tensor, widths: torch.Tensor, rates: torch.Tensor) -> torch.Tensor:
+    """[n, len(HISTORY_NAMES)] float64: row t from steps 0..t-1 (their widths ``widths``) only."""
+    state, rows = HistoryState(), []
+    rate_lists = rates.double().tolist()
+    for t in range(taken.shape[0]):
+        rows.append(state.features())
+        state.update(taken=int(taken[t]), width=int(widths[t]), rates=rate_lists[t])
+    return torch.tensor(rows, dtype=torch.float64)
+
+
+def _with_history(x: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+    """[n, gamma, f] step features + [n, h] history -> [n, gamma, f + h]."""
+    n, gamma = x.shape[:2]
+    return torch.cat([x, history[:, None, :].expand(n, gamma, history.shape[1])], dim=-1)
+
+
+def fit_per_position(x: torch.Tensor, y: torch.Tensor) -> list[torch.Tensor]:
+    return [fit_logistic(x[:, k], y[:, k]) for k in range(x.shape[1])]
+
+
+def replay_sequential(
+    *, x: torch.Tensor, betas: list[torch.Tensor], data: dict, cost: torch.Tensor, draft_ms: float
+) -> tuple[dict, torch.Tensor]:
+    """The cut run step by step with history features from its own earlier widths: what a server would see. Returns
+    the replay and the [n, gamma] confidences it read."""
+    n, gamma = x.shape[:2]
+    taken, rate_lists = data["taken"], data["accept_rates"].double().tolist()
+    state = HistoryState()
+    widths = torch.empty(n, dtype=torch.int64)
+    confidences = torch.empty((n, gamma), dtype=torch.float64)
+    objective = (cost + draft_ms).float()
+    for t in range(n):
+        h = torch.tensor(state.features(), dtype=torch.float64)
+        row = torch.cat([x[t], h[None, :].expand(gamma, h.numel())], dim=-1)
+        c = torch.stack([predict(row[k], betas[k]) for k in range(gamma)])
+        confidences[t] = c
+        widths[t] = int(stop_rule_verify_lens(confidence=c[None].float(), cost_ms=objective)[0])
+        state.update(taken=int(taken[t]), width=int(widths[t]), rates=rate_lists[t])
+    return evaluate(widths, taken, cost, draft_ms), confidences
+
+
+def history_report(*, data: dict, other: Optional[dict], shipped_temperatures, cost, draft_ms) -> dict:
+    """The --history rows on the two splits: halves of ``data`` (each predicted by the model fitted on the other), and
+    across runs (fit on ``other``, replay on ``data``) for the features both collections have."""
+    gamma = data["logits"].shape[1]
+    objective = (cost + draft_ms).float()
+
+    def shipped_widths(d):
+        c = torch.sigmoid(d["logits"].double() / shipped_temperatures)
+        return stop_rule_verify_lens(confidence=c.float(), cost_ms=objective), c
+
+    def train(d, names, history_widths):
+        x = features(d, names) if names else torch.empty((d["logits"].shape[0], gamma, 0), dtype=torch.float64)
+        h = history_features(taken=d["taken"], widths=history_widths, rates=d["accept_rates"])
+        return fit_per_position(_with_history(x, h), d["accept_rates"].double())
+
+    def step_x(d, names):
+        return features(d, names) if names else torch.empty((d["logits"].shape[0], gamma, 0), dtype=torch.float64)
+
+    variants = {
+        "history only": (),
+        "history + head": ("head",),
+        "history + head+q+top1+ent": ("head", "q", "top1", "ent"),
+        "head+q+top1+ent (no history)": None,
+    }
+    out = {"halves": {}, "across_runs": {}, "ece": {}}
+    n = data["logits"].shape[0]
+    halves = [torch.arange(n) < n // 2, torch.arange(n) >= n // 2]
+    prefix_mask = data["sampled_prefix_mask"].double()
+
+    def sub(d, mask):
+        return {k: v[mask] for k, v in d.items()}
+
+    # Halves: train on one half with the shipped cut's widths as its history, replay the other half sequentially.
+    for name, names in variants.items():
+        tokens = ms = 0.0
+        confidence = torch.empty((n, gamma), dtype=torch.float64)
+        for test, trn in (halves, halves[::-1]):
+            dtest, dtrain = sub(data, test), sub(data, trn)
+            if names is None:
+                x = features(dtrain, ("head", "q", "top1", "ent"))
+                betas = fit_per_position(x, dtrain["accept_rates"].double())
+                c = torch.stack(
+                    [predict(features(dtest, ("head", "q", "top1", "ent"))[:, k], betas[k]) for k in range(gamma)],
+                    dim=1,
+                )
+                widths = stop_rule_verify_lens(confidence=c.float(), cost_ms=objective)
+            else:
+                betas = train(dtrain, names, shipped_widths(dtrain)[0])
+                _, c = replay_sequential(x=step_x(dtest, names), betas=betas, data=dtest, cost=cost, draft_ms=draft_ms)
+                widths = stop_rule_verify_lens(confidence=c.float(), cost_ms=objective)
+            confidence[test] = c
+            got = torch.minimum(dtest["taken"], widths - 1) + 1
+            tokens += float(got.sum())
+            ms += float((cost[widths - 1] + draft_ms).sum())
+        out["halves"][name] = {"ms_per_token": round(ms / tokens, 2)}
+        out["ece"][name] = survival_ece(confidence, prefix_mask)
+    # The optimistic bound: history as if every earlier verify had run every row (not observable under a cut).
+    tokens = ms = 0.0
+    for test, trn in (halves, halves[::-1]):
+        dtest, dtrain = sub(data, test), sub(data, trn)
+        full = lambda d: torch.full((d["logits"].shape[0],), gamma + 1)  # noqa: E731
+        betas = train(dtrain, ("head", "q", "top1", "ent"), full(dtrain))
+        h = history_features(taken=dtest["taken"], widths=full(dtest), rates=dtest["accept_rates"])
+        xt = _with_history(features(dtest, ("head", "q", "top1", "ent")), h)
+        c = torch.stack([predict(xt[:, k], betas[k]) for k in range(gamma)], dim=1)
+        widths = stop_rule_verify_lens(confidence=c.float(), cost_ms=objective)
+        tokens += float((torch.minimum(dtest["taken"], widths - 1) + 1).sum())
+        ms += float((cost[widths - 1] + draft_ms).sum())
+    out["halves"]["history (uncapped, optimistic) + head+q+top1+ent"] = {"ms_per_token": round(ms / tokens, 2)}
+    if other is not None:
+        for name, names in (("history only", ()), ("history + head", ("head",))):
+            betas = train(other, names, shipped_widths(other)[0])
+            result, _ = replay_sequential(x=step_x(data, names), betas=betas, data=data, cost=cost, draft_ms=draft_ms)
+            out["across_runs"][name] = result
+        result = evaluate(shipped_widths(data)[0], data["taken"], cost, draft_ms)
+        out["across_runs"]["2 head, shipped STS"] = result
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-glob", required=True)
@@ -138,6 +317,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cost", action="append", default=None, help="a,b; repeatable")
     p.add_argument("--draft-ms", type=float, default=0.0)
     p.add_argument("--json", default=None)
+    p.add_argument("--history", action="store_true",
+                   help="also replay the target-side history features (HistoryState), step by step")
+    p.add_argument("--other-glob", default=None,
+                   help="with --history: a second collection to fit on for the across-runs split")
     a = p.parse_args(argv)
     data = load(a.data_glob, a.temperature)
     n, gamma = data["logits"].shape
@@ -177,6 +360,11 @@ def main(argv: list[str] | None = None) -> int:
         for name, confidence in held_out.items():
             rows[name] = replay(confidence, taken, cost, a.draft_ms)
         report["fits"][spec] = rows
+        if a.history:
+            other = load(a.other_glob, a.temperature, need_draft=False) if a.other_glob else None
+            report.setdefault("history", {})[spec] = history_report(
+                data=data, other=other, shipped_temperatures=temperatures, cost=cost, draft_ms=a.draft_ms
+            )
     text = json.dumps(report, indent=1)
     print(text)
     if a.json:
