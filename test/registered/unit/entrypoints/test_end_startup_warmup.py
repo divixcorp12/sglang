@@ -29,6 +29,13 @@ class FakeResponse:
 
 @pytest.fixture
 def server(monkeypatch):
+    from sglang.srt.runtime_context import get_context
+
+    with get_context().override_server_args():
+        yield from _server(monkeypatch)
+
+
+def _server(monkeypatch):
     tokenizer_manager = SimpleNamespace(server_status=ServerStatus.Starting)
     monkeypatch.setattr(http_server, "_global_state", SimpleNamespace(tokenizer_manager=tokenizer_manager))
     monkeypatch.setattr(http_server, "ssl_verify_of", lambda server_args: True)
@@ -45,7 +52,7 @@ def server(monkeypatch):
     monkeypatch.setattr(
         http_server.requests, "get", lambda url, **kwargs: FakeResponse({"is_generation": True})
     )
-    return SimpleNamespace(
+    yield SimpleNamespace(
         args=SimpleNamespace(url=lambda: "http://127.0.0.1:30000"), tokenizer_manager=tokenizer_manager, posts=posts
     )
 
