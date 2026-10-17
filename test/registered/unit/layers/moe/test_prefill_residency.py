@@ -114,8 +114,7 @@ class TestGather(_ClearStaging):
 
 
 class TestPrefillFills(unittest.TestCase):
-    def test_fills_skip_resident_experts(self):
-        _, streamer, _ = _streamer()
+    def _fills(self, streamer, in_tier=()):
         claimed = []
 
         @contextlib.contextmanager
@@ -123,15 +122,40 @@ class TestPrefillFills(unittest.TestCase):
             yield
 
         streamer.pinned_host_cache = SimpleNamespace(
-            row_fills=object(), host_use=host_use, finish_fills=lambda: None,
+            row_fills=object(), host_use=host_use, finish_fills=lambda: None, holds=lambda e: e in in_tier,
             prefetch_rows=lambda experts, protected: claimed.append(experts) or 0,
         )
+        return claimed
+
+    def test_fills_skip_resident_experts(self):
+        _, streamer, _ = _streamer()
+        claimed = self._fills(streamer)
         residency = _residency(streamer)
         residency.activate(streamer)
         residency.adopt(torch.tensor([3, 5]), {"rows": torch.zeros(2, 4, dtype=torch.int32)}, 2)
         with streamer.prefill_fills(torch.tensor([1, 3, 5, 7])):
             pass
         self.assertEqual(claimed, [[1, 7]])
+
+    def test_the_call_records_each_experts_source_for_the_trace(self):
+        _, streamer, _ = _streamer()
+        streamer.hot_cache.expert_to_slot[9] = 0
+        self._fills(streamer, in_tier=(7,))
+        residency = _residency(streamer)
+        residency.activate(streamer)
+        residency.adopt(torch.tensor([3]), {"rows": torch.zeros(1, 4, dtype=torch.int32)}, 1)
+        with streamer.prefill_fills(torch.tensor([1, 3, 7, 9])):
+            pass
+        # 7 is in the pinned tier, so it is the one source none of the lists names.
+        self.assertEqual(streamer.last_prefill_sources, {"hot": [9], "resident": [3], "nvme": [1]})
+
+    def test_without_residency_the_sources_have_no_resident_list_entries(self):
+        _, streamer, _ = _streamer()
+        claimed = self._fills(streamer)
+        with streamer.prefill_fills(torch.tensor([2, 4])):
+            pass
+        self.assertEqual(claimed, [[2, 4]])
+        self.assertEqual(streamer.last_prefill_sources, {"hot": [], "resident": [], "nvme": [2, 4]})
 
 
 class TestHostRowOfSource(unittest.TestCase):

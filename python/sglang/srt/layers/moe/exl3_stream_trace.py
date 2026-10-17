@@ -608,12 +608,15 @@ class Exl3StreamTrace:
         topk_ids: torch.Tensor,
         stats: Optional[Any],
         background_read_rows: int,
+        sources: Optional[dict] = None,
     ) -> None:
         """Count one streamed MoE call and, if tracing, write its line.
 
         ``stats`` is its gather's stats, or None when the call gathered nothing.
         ``background_read_rows`` is the layer's cumulative count of rows read outside
-        gathers (promotions, seeding). Ignored during graph capture.
+        gathers (promotions, seeding). ``sources``, when the call ran prefill fills,
+        splits its experts into hot, resident and NVMe-read lists (the rest came from
+        the pinned tier); the line carries it as ``sources``. Ignored during graph capture.
         """
         if capturing_graphs():
             return
@@ -663,6 +666,8 @@ class Exl3StreamTrace:
                 "background_rows": background,
                 "t": round(time.monotonic(), 6),
             }
+            if sources is not None:
+                line["sources"] = sources
             if self._graph_seq is not None:
                 line["graph_seq"] = self._graph_seq
             if self._meta is not None:

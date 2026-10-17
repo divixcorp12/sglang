@@ -80,6 +80,16 @@ def test_trace_lines_carry_fill_rows_and_residency_hits(tmp_path):
     trace.close()
     line = json.loads(path.read_text())
     assert (line["fill_rows"], line["residency_hits"]) == (3, 5)
+    assert "sources" not in line
+
+
+def test_trace_lines_carry_the_prefill_sources_when_given(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    trace = Exl3StreamTrace(str(path))
+    sources = {"hot": [1], "resident": [], "nvme": [2]}
+    trace.record(0, torch.tensor([[1, 2]]), _stats(1, 1), 0, sources=sources)
+    trace.close()
+    assert json.loads(path.read_text())["sources"] == sources
 
 
 def test_logs_every_n_forwards_and_at_close(caplog):

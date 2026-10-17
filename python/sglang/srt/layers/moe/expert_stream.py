@@ -502,6 +502,10 @@ class ExpertPinnedHostCache:
         self.stats.populated_bytes += len(slots) * self.bytes_per_expert
 
     @_host_use
+    def holds(self, expert_id: int) -> bool:
+        """Whether the tier holds ``expert_id``'s row now (host bookkeeping only)."""
+        return int(expert_id) in self._lru
+
     def prefetch_rows(self, expert_ids: Sequence[int], protected: Iterable[int]) -> int:
         """Start reading the non-resident experts of ``expert_ids``, in that order.
 
@@ -1263,6 +1267,8 @@ class ExpertStreamer:
         self.before_eager_gather = None
         # A layer-major pass's PrefillResidency while this layer is its active one (prefill_residency.py).
         self.prefill_residency = None
+        # prefill_fills' split of its call's experts by source, for the stage trace; taken by its record.
+        self.last_prefill_sources = None
         # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and
         # this layer is a scored prefetch target; see PrefetchPuller.join_target in
         # expert_prediction/serving/runtime.py.
@@ -2212,12 +2218,11 @@ class ExpertStreamer:
         with cache.host_use():
             hot = self.hot_cache
             residency = self.prefill_residency
+            resident_rows = None
             if hot is not None and hot.capacity and residency is not None:
-                # A resident expert is staged from the residency buffer, like a hot one: no fill.
-                slot_of = torch.maximum(
-                    hot.expert_to_slot[ids].long(), residency.lookup(ids)
-                )
-                experts, hot_slots = torch.stack((ids, slot_of)).tolist()
+                experts, hot_slots, resident_rows = torch.stack(
+                    (ids, hot.expert_to_slot[ids].long(), residency.lookup(ids))
+                ).tolist()
             elif hot is not None and hot.capacity:
                 experts, hot_slots = torch.stack(
                     (ids, hot.expert_to_slot[ids].long())
@@ -2225,11 +2230,26 @@ class ExpertStreamer:
             else:
                 experts = ids.tolist()
                 hot_slots = [-1] * len(experts)
-            # The layer's first gather reports the claimed rows as its host_fill_rows.
-            self._pending_fill_rows = cache.prefetch_rows(
-                sorted(expert for expert, slot in zip(experts, hot_slots) if slot < 0),
-                protected=experts,
+            # A resident expert is staged from the residency buffer, like a hot one: no fill.
+            resident = (
+                [e for e, s, r in zip(experts, hot_slots, resident_rows) if s < 0 <= r]
+                if resident_rows is not None
+                else []
             )
+            unhot = sorted(
+                expert for expert, slot in zip(experts, hot_slots) if slot < 0
+            )
+            taken = set(resident)
+            unread = [expert for expert in unhot if expert not in taken]
+            # Where each of this call's experts comes from, for the stage trace (host lists only, no sync): hot,
+            # resident, read from NVMe (not in the pinned tier now), or else the pinned tier.
+            self.last_prefill_sources = {
+                "hot": sorted(e for e, s in zip(experts, hot_slots) if s >= 0),
+                "resident": sorted(resident),
+                "nvme": [e for e in unread if not cache.holds(e)],
+            }
+            # The layer's first gather reports the claimed rows as its host_fill_rows.
+            self._pending_fill_rows = cache.prefetch_rows(unread, protected=experts)
             try:
                 yield
             finally:
