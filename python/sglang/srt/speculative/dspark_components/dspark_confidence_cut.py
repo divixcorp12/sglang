@@ -4,7 +4,44 @@ With c_k the draft's STS-calibrated confidence that draft k is accepted given dr
 is the probability draft k is accepted, and a verify of w rows (the anchor and drafts 1..w-1) yields E(w) =
 1 + S_1 + ... + S_{w-1} expected tokens. The cut verifies w* = argmax_w E(w) / T(w) rows, with T(w) the verify
 milliseconds at w live rows. It feeds the same dead-row mask and accept cap as the top-prob gate
-(dspark_top_prob_gate.py), so it shares that gate's limit to greedy batches of one request.
+(dspark_top_prob_gate.py), so it shares that gate's limit to batches of one request, greedy ones unless
+SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED is on.
+
+Why the cut keeps sampled decoding exact (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED). Rows 0..w-1 are live: the anchor and
+drafts d_1..d_{w-1}. Row j's target distribution p_{j+1} is the one for position j+1, so a w-row verify runs the
+rejection-sampling step for every position k <= w: accept d_k with probability min(1, p_k(d_k) / q_k(d_k)), else draw
+from the residual (p_k - q_k)+ and stop. The accept cap (CapCorrectLen) keeps the first w of those positions: when
+d_1..d_w are all accepted, the bonus is predicts[accept_index[w - 1]], which is d_w, accepted by position w's step, and
+when position w rejects, it is that step's residual draw. Either way the token at position w is position w's ordinary
+rejection-sampling output, whose law given the prefix is p_w, so a cut verify is speculative sampling stopped after
+position w. Stopped sampling is exact if the decision to run position k's step (w >= k) is independent of d_k given
+the prefix d_1..d_{k-1}: d_k is then still distributed as q_k on that event, so the accept/residual step yields p_k,
+and when the step is not run the next verify drafts position k afresh. (A rule that read d_k could run the step only
+for drafts it likes, which is not q_k; that is the bias the distribution tests' mutant shows.)
+
+The cut's rule meets that condition with a draft to spare. Write E(w) = 1 + S_1 + ... + S_{w-1} and
+T(w) = a + b * (w - 1), with a > 0 and b >= 0 (AffineCostFit), and r(w) = E(w) / T(w). Then
+r(w + 1) = (T(w) r(w) + b * (S_w / b)) / (T(w) + b) is a weighted mean of r(w) and S_w / b, so r(w + 1) > r(w) exactly
+when S_w > b r(w) (with b = 0 directly: when S_w > 0). Once that fails at some w, r(w + 1) >= S_w / b >= S_{w+1} / b
+(S_k = c_1 ... c_k is non-increasing because each c_k is in [0, 1]; with b = 0, S_w = 0 makes every later S zero), so
+it fails at every later width too: r rises and then stays or falls, and the argmax (ties to the narrower width) is the
+first w where r stops rising. So w >= k holds exactly when r rose at steps 1..k-1, and those read S_1..S_{k-1}, that
+is c_1..c_{k-1}. c_j is the head's output on the draft's hidden state at position j
+(computed from the anchor and mask tokens only: the draft forward never sees a drafted token) and the Markov
+embedding of the token before draft j (compute_confidence's prev_seq: the anchor, then d_1..d_{j-1}). So w >= k is a
+function of the context, the anchor and d_1..d_{k-2}, never of d_{k-1} or d_k. Sampled verifies take the rule in
+that stopping form (stop_rule_verify_lens), so float rounding in a whole-curve argmax cannot make w read a later
+confidence; greedy verifies keep cut_verify_lens, and the two agree whenever the scores are exact.
+
+Nothing else on the cut verify reads a drawn token past the cut. The dead-row mask and the Engram -1 posts are set from
+w alone; attention is causal, so a dead row cannot change a live row's logits, and the dead rows' logits feed only
+positions past w, which the cap drops; the static graph's folded (greedy-only) epilogue never runs a sampled batch.
+The T(w) calibration's forced widths are a round robin, independent of every token.
+
+A cost model must keep the condition: row r's price may depend on d_1..d_r (row r carries d_r, and keeping it runs
+position r + 1's step), but the decision must be taken row by row. A per-row cost conditioned on a row's own token
+(the "miss-conditioned cost" TODO) makes r(w) non-unimodal, and its whole-curve argmax then reads later rows' tokens
+to decide earlier ones, which breaks the condition.
 
 T(w) is measured on the running server once it is truly serving (CalibrationGate): the first CALIBRATION_VERIFIES
 eligible verifies after that run forced widths 1..gamma+1 round-robin, each timed with CUDA events read lazily at later
@@ -80,10 +117,13 @@ class ConfidenceCut:
         gamma: int,
         device,
         new_event: Optional[Callable[[], object]] = None,
+        cut_sampled: bool = False,
     ):
         self.gamma = gamma
         self.device = device
         self.num_widths = gamma + 1
+        # SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED: sampled bs-1 batches are cut (and calibrate T(w)) too.
+        self.cut_sampled = cut_sampled
         # Any object with CUDA Event's record() / query() / elapsed_time(end); tests inject a CPU fake.
         self._new_event = new_event or (lambda: torch.cuda.Event(enable_timing=True))
         self._num_forced = 0
@@ -113,7 +153,10 @@ class ConfidenceCut:
             from sglang.kernels.ops.speculative.dspark.dspark_accept import preload_cut_accept_kernels
 
             preload_cut_accept_kernels(device=device, verify_num_draft_tokens=gamma + 1)
-        return cls(gamma=gamma, device=device)
+        cut_sampled = envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED.get()
+        if cut_sampled:
+            logger.info("dspark confidence cut: sampled bs-1 verifies are cut too (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED)")
+        return cls(gamma=gamma, device=device, cut_sampled=cut_sampled)
 
     @property
     def calibrated(self) -> bool:
@@ -127,7 +170,7 @@ class ConfidenceCut:
         return self._cost_ms
 
     def applies(self, *, bs: int, sampling_info) -> bool:
-        return bs == 1 and (sampling_info is None or sampling_info.is_all_greedy)
+        return bs == 1 and (self.cut_sampled or sampling_info is None or sampling_info.is_all_greedy)
 
     def admit_calibration(self, gate: CalibrationGate) -> bool:
         """Whether an eligible verify before T(w) froze may run the cut (a forced, timed width). A held verify covers
@@ -144,10 +187,13 @@ class ConfidenceCut:
             )
         return True
 
-    def verify_lens(self, confidence: torch.Tensor) -> torch.Tensor:
-        """[bs] int64 rows to verify in [1, gamma + 1], from the [bs, gamma] per-position confidences."""
+    def verify_lens(self, confidence: torch.Tensor, *, sampled: bool = False) -> torch.Tensor:
+        """[bs] int64 rows to verify in [1, gamma + 1], from the [bs, gamma] per-position confidences. ``sampled``
+        verifies take the rule in its stopping form (module docstring)."""
         bs = confidence.shape[0]
         if self._cost_ms_tensor is not None:
+            if sampled:
+                return stop_rule_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
             return cut_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
         if self._disabled:
             return self._full_width(bs=bs, device=confidence.device)
@@ -240,11 +286,25 @@ class AffineCostFit(msgspec.Struct, frozen=True):
         return [self.base_ms + self.per_row_ms * width_idx for width_idx in range(num_widths)]
 
 
-def cut_verify_lens(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
-    """[bs] int64 w* in [1, gamma + 1] maximising expected tokens per verify ms, from [bs, gamma] confidences and the
-    [gamma + 1] cost table. Ties go to the narrower verify."""
+def _tokens_per_ms(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
+    """[bs, gamma + 1] E(w) / T(w) for w = 1..gamma + 1; column w - 1 reads confidences 1..w-1 only."""
     c = confidence.float()
     # A NaN confidence ends the accepted prefix there instead of poisoning every later width's score.
     accept_prob = torch.cumprod(torch.where(torch.isnan(c), torch.zeros_like(c), c), dim=1)
     expected_tokens = 1.0 + torch.nn.functional.pad(torch.cumsum(accept_prob, dim=1), (1, 0))
-    return torch.argmax(expected_tokens / cost_ms, dim=1) + 1
+    return expected_tokens / cost_ms
+
+
+def cut_verify_lens(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
+    """[bs] int64 w* in [1, gamma + 1] maximising expected tokens per verify ms, from [bs, gamma] confidences and the
+    [gamma + 1] cost table. Ties go to the narrower verify."""
+    return torch.argmax(_tokens_per_ms(confidence=confidence, cost_ms=cost_ms), dim=1) + 1
+
+
+def stop_rule_verify_lens(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
+    """cut_verify_lens's w* as a stopping rule: widen while E(w + 1) / T(w + 1) beats E(w) / T(w), and stop at the first
+    width where it does not. Equal to the argmax for an affine T(w) (module docstring), and by construction width
+    w + 1 is chosen from confidences 1..w only, which is what keeps a sampled verify exact."""
+    rate = _tokens_per_ms(confidence=confidence, cost_ms=cost_ms)
+    rises = (rate[:, 1:] > rate[:, :-1]).to(torch.int64)
+    return 1 + torch.cumprod(rises, dim=1).sum(dim=1)

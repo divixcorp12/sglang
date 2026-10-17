@@ -825,6 +825,9 @@ class Envs:
     # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
     # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
     SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
+    # With the cut on, cut sampled (temperature > 0) bs-1 verifies too, not only greedy ones; their T(w) calibration
+    # admits them as well. Lossless by the stopping-rule argument in dspark_confidence_cut.py's docstring.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

@@ -32,23 +32,25 @@ SAMPLING = SimpleNamespace(is_all_greedy=False)
 
 
 class _FakeCut:
-    def __init__(self, *, lens, disabled=False, calibrated=True, admit=True):
+    def __init__(self, *, lens, disabled=False, calibrated=True, admit=True, cut_sampled=False):
         self._lens = lens
         self.disabled = disabled
         self.calibrated = calibrated
         self._admit = admit
+        self.cut_sampled = cut_sampled
         self.seen = []
+        self.sampled = []
         self.gates = []
 
-    def applies(self, *, bs, sampling_info):
-        return bs == 1 and (sampling_info is None or sampling_info.is_all_greedy)
+    applies = dw_cut.ConfidenceCut.applies
 
     def admit_calibration(self, gate):
         self.gates.append(gate)
         return self._admit
 
-    def verify_lens(self, confidence):
+    def verify_lens(self, confidence, *, sampled=False):
         self.seen.append(confidence)
+        self.sampled.append(sampled)
         return self._lens
 
 
@@ -69,7 +71,19 @@ def test_the_cut_sets_a_greedy_single_request_verify_from_this_steps_confidence(
     cut = _FakeCut(lens=lens)
     confidence = torch.full((1, GAMMA), 0.7)
     assert _cut_lens(cut, confidence=confidence) is lens
-    assert cut.seen == [confidence]
+    assert cut.seen == [confidence] and cut.sampled == [False]
+
+
+def test_with_sampled_cutting_on_a_sampled_single_request_verify_is_cut_by_the_stopping_rule_and_calibrates():
+    """SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED: a sampled bs-1 verify reaches the gate and the cut, asking for the rule's
+    stopping form; a greedy one still takes the argmax. Mutant: the worker passes sampled=False, or the gate is skipped
+    for sampled batches -- red."""
+    lens = torch.tensor([2])
+    cut = _FakeCut(lens=lens, calibrated=False, admit=True, cut_sampled=True)
+    assert _cut_lens(cut, sampling_info=SAMPLING) is lens
+    assert len(cut.gates) == 1 and cut.sampled == [True]
+    assert _cut_lens(cut, sampling_info=GREEDY) is lens and cut.sampled == [True, False]
+    assert _cut_lens(cut, sampling_info=SAMPLING, bs=2) is None
 
 
 def test_every_draft_is_verified_where_the_cut_does_not_apply():

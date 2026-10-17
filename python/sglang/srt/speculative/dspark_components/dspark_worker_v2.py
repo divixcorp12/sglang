@@ -620,7 +620,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._confidence_cut_gate(reqs)
         ):
             return None
-        return cut.verify_lens(confidence)
+        return cut.verify_lens(
+            confidence,
+            sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+        )
 
     @staticmethod
     def _confidence_cut_gate(reqs) -> CalibrationGate:
