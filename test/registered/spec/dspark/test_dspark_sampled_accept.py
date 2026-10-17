@@ -56,8 +56,11 @@ def _chi2_pvalue(observed: torch.Tensor, expected: torch.Tensor) -> float:
     if float(pooled_expected) >= 5:
         observed = torch.cat([observed, pooled_observed.view(1)])
         expected = torch.cat([expected, pooled_expected.view(1)])
-    stat = float(((observed - expected) ** 2 / expected).sum())
     dof = observed.numel() - 1
+    if dof < 1:
+        # One possible outcome, and no draw outside it.
+        return 1.0
+    stat = float(((observed - expected) ** 2 / expected).sum())
     z = ((stat / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
     return 0.5 * math.erfc(z / math.sqrt(2))
 
