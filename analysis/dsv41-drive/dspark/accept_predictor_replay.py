@@ -58,7 +58,7 @@ def load(data_glob: str, temperature: float, *, need_draft: bool = True) -> dict
     if not shards or (need_draft and "draft_q" not in shards[0]):
         raise SystemExit(f"{data_glob!r}: no shards" + (" with draft features" if need_draft else ""))
     data = {key: torch.cat([s[key] for s in shards]) for key in shards[0]}
-    keep = (data["temperatures"] - temperature).abs() < 1e-3
+    keep = ((data["temperatures"] - temperature).abs() < 1e-3) & torch.isfinite(data["logits"]).all(dim=1)
     if "draft_q" in data:
         keep &= torch.isfinite(data["draft_q"]).all(dim=1)
     data = {key: value[keep] for key, value in data.items()}
@@ -170,32 +170,78 @@ class HistoryState:
         self.prev = (0.0, 0.0, 0.0, 0.0)
         self.ewma_accept = [0.0] * len(decays)
         self.ewma_rate = 0.0
+        # With target rows (TARGET_HISTORY_NAMES): the previous bonus row's entropy and top-1, and an EWMA of the entropy.
+        self.prev_bonus = (0.0, 0.0)
+        self.ewma_bonus_entropy = 0.0
 
-    def features(self) -> list[float]:
-        return [float(self.steps == 0), *self.prev, *self.ewma_accept, self.ewma_rate]
+    def features(self, *, with_target: bool = False) -> list[float]:
+        base = [float(self.steps == 0), *self.prev, *self.ewma_accept, self.ewma_rate]
+        return base + [*self.prev_bonus, self.ewma_bonus_entropy] if with_target else base
 
-    def update(self, *, taken: int, width: int, rates: list[float]) -> None:
+    def update(
+        self,
+        *,
+        taken: int,
+        width: int,
+        rates: list[float],
+        target_entropy: Optional[list[float]] = None,
+        target_top1: Optional[list[float]] = None,
+    ) -> None:
         observed = min(taken, width)
         tested = min(taken + 1, width)
         mean_rate = sum(rates[:tested]) / tested
         last_rate = rates[observed - 1] if observed >= 1 else 0.0
         self.prev = (float(observed), float(taken >= width), mean_rate, last_rate)
+        if target_entropy is not None:
+            # The bonus was drawn from row min(m, w - 1), a live row.
+            row = min(taken, width - 1)
+            self.prev_bonus = (target_entropy[row], target_top1[row])
         if self.steps == 0:
             self.ewma_accept = [float(observed)] * len(self.decays)
             self.ewma_rate = mean_rate
+            self.ewma_bonus_entropy = self.prev_bonus[0]
         else:
             self.ewma_accept = [d * e + (1 - d) * observed for d, e in zip(self.decays, self.ewma_accept)]
             self.ewma_rate = 0.8 * self.ewma_rate + 0.2 * mean_rate
+            self.ewma_bonus_entropy = 0.8 * self.ewma_bonus_entropy + 0.2 * self.prev_bonus[0]
         self.steps += 1
 
 
-def history_features(*, taken: torch.Tensor, widths: torch.Tensor, rates: torch.Tensor) -> torch.Tensor:
-    """[n, len(HISTORY_NAMES)] float64: row t from steps 0..t-1 (their widths ``widths``) only."""
+TARGET_HISTORY_NAMES = (*HISTORY_NAMES, "prev_bonus_entropy", "prev_bonus_top1", "ewma_bonus_entropy_0.8")
+
+
+def _target_rows(data: dict, with_target: bool):
+    if not with_target:
+        return None, None
+    return data["target_entropy"].double().tolist(), data["target_top1"].double().tolist()
+
+
+def has_target_rows(data: dict) -> bool:
+    return "target_entropy" in data and bool(torch.isfinite(data["target_entropy"]).all())
+
+
+def history_features(
+    *,
+    taken: torch.Tensor,
+    widths: torch.Tensor,
+    rates: torch.Tensor,
+    target_entropy: Optional[torch.Tensor] = None,
+    target_top1: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """[n, len(HISTORY_NAMES)] float64 (TARGET_HISTORY_NAMES with the target rows): row t from steps 0..t-1 (their
+    widths ``widths``) only."""
+    with_target = target_entropy is not None
     state, rows = HistoryState(), []
     rate_lists = rates.double().tolist()
+    entropy_rows = target_entropy.double().tolist() if with_target else None
+    top1_rows = target_top1.double().tolist() if with_target else None
     for t in range(taken.shape[0]):
-        rows.append(state.features())
-        state.update(taken=int(taken[t]), width=int(widths[t]), rates=rate_lists[t])
+        rows.append(state.features(with_target=with_target))
+        state.update(
+            taken=int(taken[t]), width=int(widths[t]), rates=rate_lists[t],
+            target_entropy=entropy_rows[t] if with_target else None,
+            target_top1=top1_rows[t] if with_target else None,
+        )
     return torch.tensor(rows, dtype=torch.float64)
 
 
@@ -210,23 +256,34 @@ def fit_per_position(x: torch.Tensor, y: torch.Tensor) -> list[torch.Tensor]:
 
 
 def replay_sequential(
-    *, x: torch.Tensor, betas: list[torch.Tensor], data: dict, cost: torch.Tensor, draft_ms: float
+    *,
+    x: torch.Tensor,
+    betas: list[torch.Tensor],
+    data: dict,
+    cost: torch.Tensor,
+    draft_ms: float,
+    with_target: bool = False,
 ) -> tuple[dict, torch.Tensor]:
     """The cut run step by step with history features from its own earlier widths: what a server would see. Returns
     the replay and the [n, gamma] confidences it read."""
     n, gamma = x.shape[:2]
     taken, rate_lists = data["taken"], data["accept_rates"].double().tolist()
+    entropy_rows, top1_rows = _target_rows(data, with_target)
     state = HistoryState()
     widths = torch.empty(n, dtype=torch.int64)
     confidences = torch.empty((n, gamma), dtype=torch.float64)
     objective = (cost + draft_ms).float()
     for t in range(n):
-        h = torch.tensor(state.features(), dtype=torch.float64)
+        h = torch.tensor(state.features(with_target=with_target), dtype=torch.float64)
         row = torch.cat([x[t], h[None, :].expand(gamma, h.numel())], dim=-1)
         c = torch.stack([predict(row[k], betas[k]) for k in range(gamma)])
         confidences[t] = c
         widths[t] = int(stop_rule_verify_lens(confidence=c[None].float(), cost_ms=objective)[0])
-        state.update(taken=int(taken[t]), width=int(widths[t]), rates=rate_lists[t])
+        state.update(
+            taken=int(taken[t]), width=int(widths[t]), rates=rate_lists[t],
+            target_entropy=entropy_rows[t] if with_target else None,
+            target_top1=top1_rows[t] if with_target else None,
+        )
     return evaluate(widths, taken, cost, draft_ms), confidences
 
 
@@ -240,20 +297,30 @@ def history_report(*, data: dict, other: Optional[dict], shipped_temperatures, c
         c = torch.sigmoid(d["logits"].double() / shipped_temperatures)
         return stop_rule_verify_lens(confidence=c.float(), cost_ms=objective), c
 
-    def train(d, names, history_widths):
+    def train(d, names, history_widths, with_target=False):
         x = features(d, names) if names else torch.empty((d["logits"].shape[0], gamma, 0), dtype=torch.float64)
-        h = history_features(taken=d["taken"], widths=history_widths, rates=d["accept_rates"])
+        h = history_features(
+            taken=d["taken"], widths=history_widths, rates=d["accept_rates"],
+            target_entropy=d["target_entropy"] if with_target else None,
+            target_top1=d["target_top1"] if with_target else None,
+        )
         return fit_per_position(_with_history(x, h), d["accept_rates"].double())
 
     def step_x(d, names):
         return features(d, names) if names else torch.empty((d["logits"].shape[0], gamma, 0), dtype=torch.float64)
 
+    # name -> (step features or None for the no-history draft predictor, whether the history has the target rows)
     variants = {
-        "history only": (),
-        "history + head": ("head",),
-        "history + head+q+top1+ent": ("head", "q", "top1", "ent"),
-        "head+q+top1+ent (no history)": None,
+        "history only": ((), False),
+        "history + head": (("head",), False),
+        "history + head+q+top1+ent": (("head", "q", "top1", "ent"), False),
+        "head+q+top1+ent (no history)": (None, False),
     }
+    if has_target_rows(data):
+        variants.update({
+            "target-row history only": ((), True),
+            "target-row history + head+q+top1+ent": (("head", "q", "top1", "ent"), True),
+        })
     out = {"halves": {}, "across_runs": {}, "ece": {}}
     n = data["logits"].shape[0]
     halves = [torch.arange(n) < n // 2, torch.arange(n) >= n // 2]
@@ -263,7 +330,7 @@ def history_report(*, data: dict, other: Optional[dict], shipped_temperatures, c
         return {k: v[mask] for k, v in d.items()}
 
     # Halves: train on one half with the shipped cut's widths as its history, replay the other half sequentially.
-    for name, names in variants.items():
+    for name, (names, with_target) in variants.items():
         tokens = ms = 0.0
         confidence = torch.empty((n, gamma), dtype=torch.float64)
         for test, trn in (halves, halves[::-1]):
@@ -277,8 +344,11 @@ def history_report(*, data: dict, other: Optional[dict], shipped_temperatures, c
                 )
                 widths = stop_rule_verify_lens(confidence=c.float(), cost_ms=objective)
             else:
-                betas = train(dtrain, names, shipped_widths(dtrain)[0])
-                _, c = replay_sequential(x=step_x(dtest, names), betas=betas, data=dtest, cost=cost, draft_ms=draft_ms)
+                betas = train(dtrain, names, shipped_widths(dtrain)[0], with_target=with_target)
+                _, c = replay_sequential(
+                    x=step_x(dtest, names), betas=betas, data=dtest, cost=cost, draft_ms=draft_ms,
+                    with_target=with_target,
+                )
                 widths = stop_rule_verify_lens(confidence=c.float(), cost_ms=objective)
             confidence[test] = c
             got = torch.minimum(dtest["taken"], widths - 1) + 1

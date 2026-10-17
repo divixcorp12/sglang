@@ -56,6 +56,27 @@ def test_step_ts_history_features_read_only_steps_before_t():
     assert not torch.equal(replay.history_features(taken=changed, widths=widths, rates=rates)[11], base[11])
 
 
+def test_the_target_row_history_reads_the_previous_bonus_row_and_nothing_of_step_t():
+    replay = _load()
+    g = torch.Generator().manual_seed(4)
+    n, gamma = 200, 5
+    taken = torch.randint(0, gamma + 1, (n,), generator=g)
+    widths = torch.randint(1, gamma + 2, (n,), generator=g)
+    rates = torch.rand((n, gamma), generator=g)
+    entropy, top1 = torch.rand((n, gamma + 1), generator=g), torch.rand((n, gamma + 1), generator=g)
+    base = replay.history_features(taken=taken, widths=widths, rates=rates, target_entropy=entropy, target_top1=top1)
+    assert base.shape == (n, len(replay.TARGET_HISTORY_NAMES))
+    names = list(replay.TARGET_HISTORY_NAMES)
+    row = min(int(taken[9]), int(widths[9]) - 1)  # step 9's bonus row
+    assert base[10, names.index("prev_bonus_entropy")] == entropy[9, row]
+    assert base[10, names.index("prev_bonus_top1")] == top1[9, row]
+    t = 80
+    entropy2, top12 = entropy.clone(), top1.clone()
+    entropy2[t:], top12[t:] = torch.rand((n - t, gamma + 1), generator=g), torch.rand((n - t, gamma + 1), generator=g)
+    again = replay.history_features(taken=taken, widths=widths, rates=rates, target_entropy=entropy2, target_top1=top12)
+    assert torch.equal(again[: t + 1], base[: t + 1])
+
+
 def test_the_history_sees_only_what_a_cut_verify_observed():
     replay = _load()
     state = replay.HistoryState()
