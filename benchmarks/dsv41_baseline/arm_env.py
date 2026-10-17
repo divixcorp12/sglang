@@ -24,10 +24,13 @@ needed exactly two flags beyond the resolved `server_args`:
 caching without it) and
 `--disable-shared-experts-fusion`, both included below.
 
-`--reasoning-parser` / `--tool-call-parser` are deliberately NOT passed: the smoke
-launch's `/v1/chat/completions` request returned 200 without them, confirming the
-static-code reasoning (`resolve_chat_encoding_spec` selects the `dsv41` chat encoder
-from `hf_config.model_type == "deepseek_v41"`, independent of either flag).
+`--reasoning-parser deepseek-v41` and `--tool-call-parser deepseekv41` are passed since
+2026-10-16 (owner). The chat encoder never needed them (`resolve_chat_encoding_spec`
+selects `dsv41` from `hf_config.model_type == "deepseek_v41"`). They split the thinking
+into `reasoning_content` and return tool calls as `tool_calls` instead of raw DSML text.
+`run_capture_sessions.py` and `long_prompt.py` read both delta fields and take token
+counts from `usage`. A multi-turn session's history now carries only `content`, so
+later-turn prompts differ from the pre-2026-10-16 runs: don't compare across the change.
 """
 
 from __future__ import annotations
@@ -527,6 +530,11 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "page_first_direct",
             # The checkpoint has no vision weights; without this the ViT and aligner are built empty in VRAM.
             "--language-model-only",
+            "--reasoning-parser",
+            "deepseek-v41",
+            # V4.1's DSML tags carry a leading space (" calls", " invoke"); this detector builds its own grammar.
+            "--tool-call-parser",
+            "deepseekv41",
             # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).
             "--warmups",
             "dsv41_prefill_shapes",
