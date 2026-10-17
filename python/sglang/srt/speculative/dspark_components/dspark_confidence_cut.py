@@ -107,6 +107,12 @@ class ConfidenceCut:
             # not valid, so a collect launch builds the head but verifies every row.
             logger.info("dspark confidence cut: STS collect mode, the cut is off and every row is verified")
             return None
+        if torch.device(device).type == "cuda":
+            # A cut verify's accept kernels first run at T(w) calibration, after the warm-ups (which never cut), so
+            # they would device-load mid-serving; load them now, at worker init.
+            from sglang.kernels.ops.speculative.dspark.dspark_accept import preload_cut_accept_kernels
+
+            preload_cut_accept_kernels(device=device, verify_num_draft_tokens=gamma + 1)
         return cls(gamma=gamma, device=device)
 
     @property

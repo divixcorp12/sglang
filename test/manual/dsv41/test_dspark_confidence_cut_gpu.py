@@ -156,3 +156,38 @@ def test_the_static_epilogue_stops_the_accept_at_the_cuts_width():
     assert accept(torch.tensor([2], device="cuda", dtype=torch.int64)) == (1, 3, 2)
     assert accept(torch.tensor([1], device="cuda", dtype=torch.int64)) == (0, 7, 1)
     assert accept(torch.tensor([TOKENS], device="cuda", dtype=torch.int64)) == (5, 11, 6)
+
+
+def test_the_cut_accept_preload_covers_the_variants_a_cut_verify_runs():
+    """preload_cut_accept_kernels loads the capped greedy accept's kernels with the dtypes a cut verify passes, so the
+    first cut verify (accept_greedy_triton at bs 1, int64 candidates, float32 logits, int64 verify lens) device-loads
+    neither. Mutant: the preload passes another dtype or shape -- the accept then loads a second variant, red."""
+    import triton.knobs as knobs
+
+    from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_greedy_triton, preload_cut_accept_kernels
+
+    names = ("_cap_correct_len_kernel", "_gather_row_bonus_kernel")
+    loads = []
+
+    def hook(module, function, name, metadata_group, hash):
+        loads.append(name)
+
+    knobs.runtime.kernel_load_start_hook.add(hook)
+    try:
+        preload_cut_accept_kernels(device="cuda", verify_num_draft_tokens=TOKENS)
+        torch.cuda.synchronize()
+        preloaded = [n for n in loads if n in names]
+        loads.clear()
+        for width in range(1, TOKENS + 1):
+            accept_greedy_triton(
+                candidates=torch.zeros((1, TOKENS), dtype=torch.int64, device="cuda"),
+                target_logits=torch.randn((TOKENS, VOCAB), dtype=torch.float32, device="cuda"),
+                verify_num_draft_tokens=TOKENS,
+                cutoff_verify_lens=torch.tensor([width], dtype=torch.int64, device="cuda"),
+                fused_argmax=True,
+            )
+        torch.cuda.synchronize()
+    finally:
+        knobs.runtime.kernel_load_start_hook.remove(hook)
+    print("preloaded", preloaded)
+    assert [n for n in loads if n in names] == []

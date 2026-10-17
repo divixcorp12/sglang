@@ -291,3 +291,21 @@ def test_from_envs_builds_the_cut_only_when_the_flag_is_on_and_no_sts_data_is_co
         assert isinstance(ConfidenceCut.from_envs(gamma=GAMMA, device="cpu"), ConfidenceCut)
     with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/x/sts"):
         assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu") is None
+
+
+def test_from_envs_preloads_the_cut_accept_kernels_on_cuda_only_when_the_cut_is_built(monkeypatch):
+    """A cut verify's accept kernels first run at T(w) calibration, after the warm-ups, so the worker loads them at
+    init. Mutant: the preload is dropped, runs with the cut off or in STS collect mode, or on a CPU device -- red."""
+    from sglang.kernels.ops.speculative.dspark import dspark_accept
+
+    calls = []
+    monkeypatch.setattr(dspark_accept, "preload_cut_accept_kernels", lambda **kwargs: calls.append(kwargs))
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(False):
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cuda") is None
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/x/sts"):
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cuda") is None
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(""):
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu") is not None
+        assert calls == []
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cuda") is not None
+    assert calls == [{"device": "cuda", "verify_num_draft_tokens": GAMMA + 1}]
