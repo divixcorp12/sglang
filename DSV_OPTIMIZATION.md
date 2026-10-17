@@ -1477,7 +1477,7 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - divix01 has ccache 4.11.3 system-wide (`/etc/profile.d/ccache.sh`), `~/.config/ccache/ccache.conf` max_size 50G.
   Build-time measurements must set `CCACHE_DISABLE=1`.
 
-### 3.12 DSpark confidence-head verify cut — branch `confidence-cut` (`90d428f5fa`), NOT merged, off by default
+### 3.12 DSpark confidence-head verify cut — branch `confidence-cut` (`60852853fd`), NOT merged, off by default
 
 - **What it does.** At batch size 1 with greedy sampling, each verify keeps the w* rows that maximise
   (1 + sum_{k<w} S_k) / T(w). S_k is the STS-calibrated cumulative product of the draft's trained Markov confidence
@@ -1494,13 +1494,17 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   - w* 3.7-4.0; E(w*) 2.37-2.59 against accept 2.38-2.58, so the calibration holds.
   - Greedy text matched the all-rows run for 57 tokens, then split at a near-tie wording choice (ordinary on this stack).
   - Not an A/B: in the windows clean in both runs (60-180 s), 64-66 vs 75-79 ms/token, wait per verify 80 vs 90-119 ms.
-- **In progress (owner, 2026-10-16):**
-  - an affine least-squares T(w) instead of per-width medians;
-  - fixing dead-row side effects: the prefetch scorer's live-token count (baked at 6), and dead routes inflating row 0's
-    experts' hot-cache scores;
-  - a complete audit of the work dead rows still do (attention, shared experts, Engram lookups and more), then skipping
-    the Engram lookups for dead rows. Engram tables are almost entirely on disk, so each dead row's lookups are
-    expensive.
+- **Follow-ups merged into `confidence-cut` (owner, 2026-10-16; test run pending):**
+  - T(w) is an affine least-squares fit over every calibration sample instead of per-width medians.
+  - Prefetch scorers rank only live rows. The post kernel writes a device-side live count into spare bytes of the
+    token-table header (offset 4), and the GPU select kernel reads the routes. Picks were already unchanged, because a
+    dead row duplicates row 0; this saves ranking work and CPU-scorer dot products. The learned head still uses the
+    token count fixed when the graph is captured.
+  - Dead routes no longer add to the hot-cache route counts. They still count in the graph, unique and outcome counters,
+    the GPU residency updater's decay clock still counts all 6 rows, and the eager streamed path still records them as
+    row 0's experts. Production uses the static graph, so the eager path is moot.
+  - Dead rows' Engram lookups post -1, which the native store serves as a zero row: no access, read or insert. Any other
+    negative id is still fatal. This covers the in-graph device wait (the default) only.
 - **Dead-row audit** (2026-10-16, read-only; confcut smoke server.log Engram stats against verify.jsonl, prefill-free
   60 s windows only):
   - **Engram lookups are the only disk/host work a dead row still causes.** Both runs do 288 accesses per verify
@@ -1508,7 +1512,8 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
     about 101 accesses and 65 unique misses per verify, which is about 130 4 KiB O_DIRECT reads (0.5 MiB) on nvme2n1.
     nvme2n1 is also an expert mirror root, and it served 2.4x nvme0n1's read count for the same MiB. Estimated
     0.3-1 ms per verify; not measured, because ring wait stats are not logged. Fix in progress: a -1 sentinel that the
-    native Store skips (zero row, no access counted), applied in graph from `VerifyDeadRows.dead`.
+    native Store skips (zero row, no access counted), applied in graph from `VerifyDeadRows.dead`. Expected effect:
+    about 288 x live/6 accesses per verify in the "engram native cache" log line, instead of 288.
   - **Everything else a dead row runs is GPU work at about 0 marginal cost at 6 rows**: indexer scoring and top-k (under
     0.05 ms at 3K context, growing with context), the sparse MLA gather (about 0.02 ms), KV and compressor-state writes
     (position-keyed, every ring has margin, never read back), shared expert, projections and lm_head. A static graph
