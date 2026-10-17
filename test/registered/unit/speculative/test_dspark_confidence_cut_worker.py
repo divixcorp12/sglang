@@ -86,6 +86,21 @@ def test_with_sampled_cutting_on_a_sampled_single_request_verify_is_cut_by_the_s
     assert _cut_lens(cut, sampling_info=SAMPLING, bs=2) is None
 
 
+def test_the_worker_hands_the_cut_re_tempered_confidences_only_where_the_cut_applies():
+    cut = dw_cut.ConfidenceCut(
+        gamma=GAMMA, device="cpu", cut_sampled=True, sampled_rescale=torch.full((GAMMA,), 2.0)
+    )
+    worker = SimpleNamespace(_confidence_cut=cut)
+    confidence = torch.full((1, GAMMA), 0.7)
+    retempered = dw.DSparkWorkerV2._cut_confidence(worker, confidence, bs=1, sampling_info=SAMPLING)
+    assert torch.allclose(retempered, dw_cut.rescale_confidence(confidence, torch.full((GAMMA,), 2.0)))
+    assert dw.DSparkWorkerV2._cut_confidence(worker, confidence, bs=1, sampling_info=GREEDY) is confidence
+    wide = torch.full((2, GAMMA), 0.7)
+    assert dw.DSparkWorkerV2._cut_confidence(worker, wide, bs=2, sampling_info=SAMPLING) is wide
+    assert dw.DSparkWorkerV2._cut_confidence(SimpleNamespace(_confidence_cut=None), confidence, bs=1,
+                                             sampling_info=SAMPLING) is confidence
+
+
 def test_every_draft_is_verified_where_the_cut_does_not_apply():
     lens = torch.tensor([3])
     assert _cut_lens(None) is None  # the flag off

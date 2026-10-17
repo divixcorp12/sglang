@@ -604,10 +604,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         return self._top_prob_gate.verify_lens(draft_block.top_probs)
 
     def _cut_confidence(
-        self, confidence: Optional[torch.Tensor], sampling_info
+        self, confidence: Optional[torch.Tensor], *, bs: int, sampling_info
     ) -> Optional[torch.Tensor]:
-        """The confidences the cut and its stats read: a sampled verify's re-tempered to the sampled STS file."""
-        if self._confidence_cut is None or confidence is None:
+        """The confidences the cut and its stats read: a sampled verify's re-tempered to the sampled STS file, and
+        either raised by the online refit; the head's where the cut does not apply."""
+        if (
+            self._confidence_cut is None
+            or confidence is None
+            or not self._confidence_cut.applies(bs=bs, sampling_info=sampling_info)
+        ):
             return confidence
         return self._confidence_cut.cut_confidence(
             confidence,
@@ -1064,7 +1069,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         # The confidence cut reads this step's own confidence, on the device: the folded proposal's confidence_out,
         # or the eager compute above. Its lengths take the top-probability gate's place (the two never run together).
-        cut_confidence = self._cut_confidence(confidence, sampling_info)
+        cut_confidence = self._cut_confidence(confidence, bs=bs, sampling_info=sampling_info)
         cut_verify_lens = self._cut_verify_lens(
             bs=bs, sampling_info=sampling_info, confidence=cut_confidence, reqs=batch.reqs
         )
