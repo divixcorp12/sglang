@@ -118,6 +118,21 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
+. "$(dirname "${BASH_SOURCE[0]}")/reap_group.sh"
+SERVER_PORT=30032  # spec_margin_capture.PORT
+CUR_CAP=""; CUR_NAME=""
+# Killed or interrupted (also on a plain exit): stop the capture by PID, give it 40 s to stop its server, then clear the
+# server's group and the sampler loops it left.
+stop_all() {
+  if [ -n "$CUR_CAP" ] && kill -0 "$CUR_CAP" 2>/dev/null; then
+    echo "stopping capture $CUR_CAP ($CUR_NAME)"; kill -TERM "$CUR_CAP"
+    for ((i = 0; i < 400; i++)); do kill -0 "$CUR_CAP" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$CUR_CAP" 2>/dev/null && kill -KILL "$CUR_CAP"
+  fi
+  [ -n "$CUR_NAME" ] && { reap_server_group "$OUT/$CUR_NAME/server.pgid" "$CUR_NAME"; touch "$OUT/$CUR_NAME.disk.stop" "$OUT/$CUR_NAME.memsample.stop"; }
+}
+trap 'stop_all; echo ALLDONE; exit 130' INT TERM
+trap 'stop_all' EXIT
 mkdir -p "$OUT" "$TMPDIR"
 echo "$MERGED" > "$OUT/resolved-env.json"
 for i in "${!NAMES[@]}"; do
@@ -141,6 +156,7 @@ for i in "${!NAMES[@]}"; do
   echo "START $name $BASE $(date)"
   env "${all[@]}" taskset -c 0-63 "$PY" "$CAPTURE" "$OUT/$name" --arm "$BASE" "${CAP[@]}" &
   cap=$!
+  CUR_CAP=$cap; CUR_NAME=$name
   minfree=999999999
   while kill -0 $cap 2>/dev/null && ! grep -q "fired up and ready" $OUT/$name/server.log 2>/dev/null; do
     read free min < <(awk "/^Node 0, zone +Normal/{z=1} z&&/pages free/{f=\$3} z&&/^ +min /{print f, \$2; exit}" /proc/zoneinfo)
@@ -154,6 +170,16 @@ for i in "${!NAMES[@]}"; do
   grep -m1 -n "fired up and ready" $OUT/$name/server.log | cut -c1-40 > $OUT/$name.ready.txt
   wait $cap; rc=$?
   echo "RC $name $rc $(date)"
+  CUR_CAP=""
+  # The capture stops its own server on every exit it can handle (spec_margin_capture); this clears what a crash or a
+  # SIGKILL left, and does not go on while the port or the GPU is still held.
+  cleared=1
+  reap_server_group "$OUT/$name/server.pgid" "$name" || cleared=0
+  server_clear "$SERVER_PORT" "$name" || cleared=0
+  if [ "$cleared" = 0 ]; then
+    touch $OUT/$name.disk.stop $OUT/$name.memsample.stop; kill $smi 2>/dev/null
+    echo "ARM FAILED $name: its server is still up"; echo ALLDONE; exit 1
+  fi
   cat /proc/diskstats > $OUT/$name.diskstats.after; touch $OUT/$name.disk.stop
   sleep 10; touch $OUT/$name.memsample.stop; kill $smi; sleep 15
   journalctl -k --since "$start" 2>/dev/null | grep -E "Killed process|oom-kill:" | tail -3

@@ -99,10 +99,46 @@ def counter_summary(log_path: str) -> dict:
     return out
 
 
+class Interrupted(SystemExit):
+    """SIGTERM or SIGHUP, raised in the main thread so the finally blocks run: the default action ends the process at
+    once, and a server started under it would outlive it (reparented to PID 1, holding the GPU)."""
+
+
+def raise_on_signal() -> None:
+    def handler(signum, frame):
+        raise Interrupted(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
+def launch_server(argv, env, out_dir: str, log, cwd: str = REPO) -> subprocess.Popen:
+    """Start the server as the leader of its own session and record its process group in OUT/server.pgid, so a wrapper
+    can clear the group if this process dies before it can."""
+    server = subprocess.Popen(argv, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=cwd, start_new_session=True)
+    with open(os.path.join(out_dir, "server.pgid"), "w") as f:
+        f.write(f"{server.pid}\n")
+    return server
+
+
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def stop_server(server: subprocess.Popen, timeout: float = 300) -> None:
     """SIGTERM the launcher alone so the scheduler shuts down and the engines write their event files; a group
-    SIGTERM kills the scheduler first and loses them."""
-    os.kill(server.pid, signal.SIGTERM)
+    SIGTERM kills the scheduler first and loses them. Then SIGKILL the whole group (children outlive the launcher) and
+    wait until no member is left."""
+    try:
+        os.kill(server.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     try:
         server.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -112,6 +148,9 @@ def stop_server(server: subprocess.Popen, timeout: float = 300) -> None:
         os.killpg(server.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    deadline = time.monotonic() + 30
+    while group_alive(server.pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
 
 
 def _healthy(port: int, deadline: float) -> bool:
@@ -199,17 +238,24 @@ def main() -> int:
     os.makedirs(a.out_dir, exist_ok=True)
     env = os.environ | capture_env(a) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = server_argv(a.arm)
+    raise_on_signal()
     with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
-        with open(os.path.join(a.out_dir, "server.log"), "w") as log:
-            server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
-                                      stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
+        server = None
+        interrupted = False
         rc = 1
         try:
+            with open(os.path.join(a.out_dir, "server.log"), "w") as log:
+                server = launch_server(["taskset", "-c", arm_env.SERVER_CORES, *argv], env, a.out_dir, log)
             if not _healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
                 return 1
             rc = subprocess.run(["taskset", "-c", arm_env.DRIVER_CORES, *client_argv(a)], cwd=REPO).returncode
+        except BaseException:
+            interrupted = True
+            raise
         finally:
-            stop_server(server)
+            if server is not None:
+                # Aborted (the wrapper's load watchdog): give the launcher 30 s to shut down, then kill the group.
+                stop_server(server, 30 if interrupted else 300)
     if rc != 0:
         return rc
     events = os.path.join(a.out_dir, "events.*.jsonl")
