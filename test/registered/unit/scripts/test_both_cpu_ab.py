@@ -402,7 +402,8 @@ PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 # Production's arm (-expseg with production's additions) and the confidence cut's two arms built on it.
 PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
 STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
+LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1207,6 +1208,23 @@ def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the
     flags = ab.server_flags(CONFIDENCE_CUT_ARM)
     assert flags[:-2] == ab.server_flags(PROD_ARM)
     assert flags[-2:] == (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+
+
+def test_the_layer_major_arm_is_prod_with_layer_major_prefill_and_every_other_arm_keeps_it_off():
+    """-prod-layermajor is -prod with the 8192-token threshold and the DSpark switch alone, and no other arm sets
+    either (dspark_env() keeps the threshold 0 beneath them). Mutant: another arm turns it on, or the arm changes
+    another knob -- red."""
+    ab = _ab()
+    threshold, switch = "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS", "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"
+    for arm, (overrides, _) in ab.ARMS.items():
+        if arm != LAYER_MAJOR_ARM:
+            assert overrides.get(threshold, "0") == "0" and switch not in overrides, arm
+    assert ab.arm_env.dspark_env()[threshold] == "0"
+    lm = ab.ARMS[LAYER_MAJOR_ARM][0]
+    assert (lm[threshold], lm[switch]) == ("8192", "1")
+    assert {k: v for k, v in lm.items() if k not in (threshold, switch)} == ab.ARMS[PROD_ARM][0]
+    assert ab.ARMS[LAYER_MAJOR_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_ARM] == PROD_ARM
+    assert ab.server_flags(LAYER_MAJOR_ARM) == ab.server_flags(PROD_ARM)
 
 
 def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_own(monkeypatch):
