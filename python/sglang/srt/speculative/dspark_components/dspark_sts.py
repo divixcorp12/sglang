@@ -51,9 +51,20 @@ class StsDataRecorder:
     - ``temperatures``: the request's sampling temperature (0 for greedy; NaN when the caller passed none).
     - ``draft_q``, ``draft_top1``, ``draft_entropy``: the draft's step distribution q_k at draft k (the one d_k was
       drawn from): q_k(d_k), max q_k and its entropy in nats. NaN when the caller passed none.
+    - ``target_entropy``, ``target_top1`` [n, gamma + 1]: the target's sampling distribution per verify row 0..gamma
+      (after temperature and top-k/top-p, as AcceptSampling builds it): its entropy in nats and top-1 probability; the
+      bonus of a verify that accepted m drafts was drawn from row m. ``target_p`` [n, gamma]: p_k(d_k). NaN for a
+      greedy verify or when the caller passed none.
+    - ``markov_prev_tokens`` [n, gamma] int64: the tokens the head's Markov embedding reads (the anchor, then drafts
+      1..gamma-1); -1 when the caller passed none.
+    - ``head_hidden`` [n, gamma, hidden] float16: the confidence head's hidden input, for retraining the head offline.
+      Written for at most HEAD_HIDDEN_MAX_VERIFIES verifies per launch, and only in a shard where every verify has it.
     """
 
     DRAFT_FEATURES = ("draft_q", "draft_top1", "draft_entropy")
+    TARGET_FEATURES = ("target_entropy", "target_top1", "target_p")
+    # 16,384 verifies x gamma 5 x hidden 5,120 x 2 bytes = 0.78 GiB per launch at most.
+    HEAD_HIDDEN_MAX_VERIFIES = 16384
 
     def __init__(self, *, path_stem: str, gamma: int, flush_every: int) -> None:
         self.path_stem = path_stem
@@ -68,9 +79,16 @@ class StsDataRecorder:
                 "accept_rates",
                 "temperatures",
                 *self.DRAFT_FEATURES,
+                *self.TARGET_FEATURES,
+                "markov_prev_tokens",
             )
         }
+        self._head_hidden: list[Optional[torch.Tensor]] = []
+        self.head_hidden_ct = 0
         self._shard_ct = 0
+
+    def records_head_hidden(self) -> bool:
+        return self.head_hidden_ct < self.HEAD_HIDDEN_MAX_VERIFIES
 
     def _prefix_mask(self, counts: torch.Tensor) -> torch.Tensor:
         positions = torch.arange(self.gamma).view(1, -1)
@@ -86,6 +104,9 @@ class StsDataRecorder:
         accept_rates: Optional[torch.Tensor] = None,
         temperatures: Optional[torch.Tensor] = None,
         draft_features: Optional[dict[str, torch.Tensor]] = None,
+        target_features: Optional[dict[str, torch.Tensor]] = None,
+        head_hidden: Optional[torch.Tensor] = None,
+        markov_prev_tokens: Optional[torch.Tensor] = None,
     ) -> None:
         logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32)
         bs = logits.shape[0]
@@ -113,6 +134,23 @@ class StsDataRecorder:
                 if draft_features is None
                 else draft_features[key].detach().to(device="cpu", dtype=torch.float32)
             )
+        for key in self.TARGET_FEATURES:
+            width = self.gamma if key == "target_p" else self.gamma + 1
+            self._buffers[key].append(
+                torch.full((bs, width), float("nan"))
+                if target_features is None
+                else target_features[key].detach().to(device="cpu", dtype=torch.float32)
+            )
+        self._buffers["markov_prev_tokens"].append(
+            torch.full((bs, self.gamma), -1, dtype=torch.int64)
+            if markov_prev_tokens is None
+            else markov_prev_tokens.detach().to(device="cpu", dtype=torch.int64)
+        )
+        if head_hidden is not None and self.records_head_hidden():
+            self._head_hidden.append(head_hidden.detach().to(device="cpu", dtype=torch.float16))
+            self.head_hidden_ct += bs
+        else:
+            self._head_hidden.append(None)
         if len(self._buffers["logits"]) >= self.flush_every:
             self.flush()
 
@@ -121,10 +159,11 @@ class StsDataRecorder:
             return
         shard_path = Path(f"{self.path_stem}.{self._shard_ct}.pt")
         shard_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {key: torch.cat(values, dim=0) for key, values in self._buffers.items()},
-            shard_path,
-        )
+        shard = {key: torch.cat(values, dim=0) for key, values in self._buffers.items()}
+        if self._head_hidden and all(h is not None for h in self._head_hidden):
+            shard["head_hidden"] = torch.cat(self._head_hidden, dim=0)
+        torch.save(shard, shard_path)
         for values in self._buffers.values():
             values.clear()
+        self._head_hidden.clear()
         self._shard_ct += 1

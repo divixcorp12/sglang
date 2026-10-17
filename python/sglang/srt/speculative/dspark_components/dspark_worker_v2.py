@@ -1069,6 +1069,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         # The confidence cut reads this step's own confidence, on the device: the folded proposal's confidence_out,
         # or the eager compute above. Its lengths take the top-probability gate's place (the two never run together).
+        # STS collection's head-retraining data: the confidence head's hidden input (the V4 draft's collapsed hidden
+        # tap, else the draft hidden), copied now because the draft graph's outputs are only live until the verify.
+        head_hidden = None
+        if self._observers.records_head_hidden:
+            tap = proposal.confidence_tap if proposal.confidence_tap is not None else proposal.draft_hidden
+            head_hidden = None if tap is None else tap.to(torch.float16, copy=True)
         cut_confidence = self._cut_confidence(confidence, bs=bs, sampling_info=sampling_info)
         cut_verify_lens = self._cut_verify_lens(
             bs=bs, sampling_info=sampling_info, confidence=cut_confidence, reqs=batch.reqs
@@ -1276,6 +1282,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             cut_calibrated=cut_calibrated,
             cut_confidence=cut_confidence,
             folded_confidence_raw=self._folded_confidence_raw(proposal, bs),
+            confidence_hidden=head_hidden,
         )
         if draft_probs is not None:
             self._draft_top_prob_log.record(

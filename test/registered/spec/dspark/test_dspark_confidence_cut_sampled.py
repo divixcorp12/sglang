@@ -202,6 +202,44 @@ def test_the_collection_records_the_drafts_own_step_probability_top1_and_entropy
     assert torch.allclose(shard["draft_q"][0], features["draft_q"][0]) and torch.isnan(shard["draft_q"][1]).all()
 
 
+def test_the_collection_records_target_rows_markov_tokens_and_the_heads_hidden_input(tmp_path, monkeypatch):
+    from sglang.srt.speculative.dspark_components.dspark_observability import target_row_features
+    from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
+
+    gamma, vocab = 2, 3
+    probs = torch.tensor([[0.5, 0.3, 0.2], [0.1, 0.1, 0.8], [1.0, 0.0, 0.0]])
+    sampling = SimpleNamespace(
+        is_all_greedy=False, need_top_k_sampling=False, need_top_p_sampling=False, temperatures=torch.ones(1, 1)
+    )
+    features = target_row_features(
+        candidates=torch.tensor([[9, 1, 2]]), target_logits=torch.log(probs.clamp_min(1e-30)),
+        sampling_info=sampling, verify_num_draft_tokens=gamma + 1,
+    )
+    entropy = [-(p[p > 0] * p[p > 0].log()).sum().item() for p in probs]
+    assert torch.allclose(features["target_entropy"], torch.tensor([entropy]), atol=1e-5)
+    assert torch.allclose(features["target_top1"], torch.tensor([[0.5, 0.8, 1.0]]), atol=1e-6)
+    assert torch.allclose(features["target_p"], torch.tensor([[0.3, 0.8]]), atol=1e-6)  # p_1(d_1 = 1), p_2(d_2 = 2)
+    assert target_row_features(candidates=torch.tensor([[9, 1, 2]]), target_logits=probs, sampling_info=None,
+                               verify_num_draft_tokens=3) is None
+
+    monkeypatch.setattr(StsDataRecorder, "HEAD_HIDDEN_MAX_VERIFIES", 2)
+    recorder = StsDataRecorder(path_stem=str(tmp_path / "s"), gamma=gamma, flush_every=10)
+    hidden = torch.randn(1, gamma, 4)
+    for _ in range(2):
+        recorder.record(confidence_raw=torch.zeros(1, gamma), num_correct_drafts=torch.tensor([1]),
+                        target_features=features, head_hidden=hidden, markov_prev_tokens=torch.tensor([[9, 1]]))
+    assert not recorder.records_head_hidden()
+    recorder.flush()
+    shard = torch.load(tmp_path / "s.0.pt")
+    assert shard["head_hidden"].dtype == torch.float16 and shard["head_hidden"].shape == (2, gamma, 4)
+    assert shard["markov_prev_tokens"].tolist() == [[9, 1], [9, 1]] and shard["target_top1"].shape == (2, 3)
+    # Past the cap: the next shard has no hidden states (a shard keeps them only when every verify has them).
+    recorder.record(confidence_raw=torch.zeros(1, gamma), num_correct_drafts=torch.tensor([1]), head_hidden=hidden)
+    recorder.flush()
+    assert "head_hidden" not in torch.load(tmp_path / "s.1.pt")
+    assert torch.isnan(torch.load(tmp_path / "s.1.pt")["target_p"]).all()
+
+
 def _decode(verify_lens_fn, *, seed):
     toy = dist.MarkovToy(vocab=VOCAB, gamma=GAMMA, temperature=TEMPERATURE, seed=0)
     generator = torch.Generator().manual_seed(seed)

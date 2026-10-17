@@ -818,6 +818,45 @@ class ConfidenceCutStats:
         )
 
 
+def verify_target_probs(*, target_logits: torch.Tensor, sampling_info, verify_num_draft_tokens: int) -> torch.Tensor:
+    """[bs, rows, vocab] the target's sampling distribution per verify row, built as AcceptSampling builds it
+    (temperature, then top-k/top-p). The top-k path reads its max k on the host: STS collection only."""
+    from sglang.kernels.ops.speculative.dspark.dspark_accept import SoftmaxTemp
+    from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
+
+    rows = verify_num_draft_tokens
+    bs = target_logits.shape[0] // rows
+    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
+        target_probs = SoftmaxTemp.execute(
+            logits=target_logits, temperatures=sampling_info.temperatures, rows_per_request=rows
+        )
+    else:
+        target_probs = build_dflash_verify_target_probs(
+            next_token_logits=target_logits, sampling_info=sampling_info, draft_token_num=rows, bs=bs
+        )
+    return target_probs.view(bs, rows, -1)
+
+
+def target_row_features(
+    *, candidates: torch.Tensor, target_logits: torch.Tensor, sampling_info, verify_num_draft_tokens: int
+) -> Optional[dict[str, torch.Tensor]]:
+    """From the target's sampling distribution p per verify row (verify_target_probs): its entropy in nats and its
+    top-1 probability per row 0..gamma ([bs, gamma + 1]; row r's p is position r + 1's, so the bonus of a verify that
+    accepted m drafts was drawn from row m), and p_k(d_k) for each draft ([bs, gamma]). None for a greedy batch,
+    which samples no distribution. For STS collection only."""
+    if sampling_info is None or sampling_info.is_all_greedy:
+        return None
+    probs = verify_target_probs(
+        target_logits=target_logits, sampling_info=sampling_info, verify_num_draft_tokens=verify_num_draft_tokens
+    ).float()
+    drafts = candidates[:, 1:].to(torch.int64)
+    return {
+        "target_entropy": -(probs * torch.log(probs.clamp_min(1e-30))).sum(dim=-1),
+        "target_top1": probs.max(dim=-1).values,
+        "target_p": probs[:, : drafts.shape[1]].gather(-1, drafts[..., None]).squeeze(-1),
+    }
+
+
 def draft_accept_rates(
     *,
     candidates: torch.Tensor,
@@ -831,7 +870,6 @@ def draft_accept_rates(
     temperature softmax of its corrected logits; for a greedy request 1 or 0 (draft == target argmax). A non-positive
     q is a rejection, as in the kernel. For STS collection only: the top-k path reads its max k on the host."""
     from sglang.kernels.ops.speculative.dspark.dspark_accept import SoftmaxTemp
-    from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
 
     bs = candidates.shape[0]
     rows = verify_num_draft_tokens
@@ -841,15 +879,9 @@ def draft_accept_rates(
     greedy_rates = (drafts == target_argmax).to(torch.float32)
     if sampling_info is None or sampling_info.is_all_greedy:
         return greedy_rates
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
-        target_probs = SoftmaxTemp.execute(
-            logits=target_logits, temperatures=sampling_info.temperatures, rows_per_request=rows
-        )
-    else:
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=target_logits, sampling_info=sampling_info, draft_token_num=rows, bs=bs
-        )
-    target_probs = target_probs.view(bs, rows, -1)
+    target_probs = verify_target_probs(
+        target_logits=target_logits, sampling_info=sampling_info, verify_num_draft_tokens=rows
+    )
     corrected = draft_block.corrected_logits
     draft_probs = SoftmaxTemp.execute(
         logits=corrected.reshape(bs * gamma, corrected.shape[-1]),
@@ -973,6 +1005,13 @@ class DsparkStepObservers:
             else None
         )
 
+    @property
+    def records_head_hidden(self) -> bool:
+        """Whether this step's confidence-head hidden input is wanted: STS collection, under its per-launch cap."""
+        if not self._sts_collect_path or not self._planner.carries_confidence:
+            return False
+        return self._sts_recorder is None or self._sts_recorder.records_head_hidden()
+
     # --- step lifecycle -------------------------------------------------
 
     def begin_step(self) -> None:
@@ -1051,6 +1090,7 @@ class DsparkStepObservers:
         cut_calibrated: bool = False,
         cut_confidence: Optional[torch.Tensor] = None,
         folded_confidence_raw: Optional[torch.Tensor] = None,
+        confidence_hidden: Optional[torch.Tensor] = None,
     ) -> None:
         """``cut_verify_lens`` is the confidence cut's [bs] verify widths when it set this verify's (forced widths
         while it calibrates, then ``cut_calibrated``), else None; ``cut_confidence`` the confidences it read (a sampled
@@ -1070,6 +1110,7 @@ class DsparkStepObservers:
                 draft_block=draft_block,
                 sampling_info=sampling_info,
                 correct_len=correct_len,
+                confidence_hidden=confidence_hidden,
             )
         if not proposal_folded:
             self._confidence_probe.maybe_observe(
@@ -1184,6 +1225,7 @@ class DsparkStepObservers:
         draft_block=None,
         sampling_info=None,
         correct_len: Optional[torch.Tensor] = None,
+        confidence_hidden: Optional[torch.Tensor] = None,
     ) -> None:
         """Collect mode verifies every row, so ``correct_len`` is the verify's own uncapped accept: under sampling, the
         rejection-sampling outcome the sampled STS fit labels with (dspark_sts_fit --label)."""
@@ -1209,6 +1251,12 @@ class DsparkStepObservers:
             target_predict=target_predict,
         )
         accept_rates = temperatures = draft_features = None
+        target_features = target_row_features(
+            candidates=verify_ids_2d,
+            target_logits=target_logits,
+            sampling_info=sampling_info,
+            verify_num_draft_tokens=self._verify_num_draft_tokens,
+        )
         if draft_block is not None:
             draft_features = draft_step_features(
                 draft_tokens=verify_ids_2d[:, 1:], draft_block=draft_block
@@ -1230,4 +1278,12 @@ class DsparkStepObservers:
             accept_rates=accept_rates,
             temperatures=temperatures,
             draft_features=draft_features,
+            target_features=target_features,
+            head_hidden=(
+                None
+                if confidence_hidden is None
+                else confidence_hidden.reshape(bs, self._gamma, -1)
+            ),
+            # The tokens the head's Markov embedding reads: the anchor, then drafts 1..gamma-1.
+            markov_prev_tokens=verify_ids_2d[:, : self._gamma],
         )
