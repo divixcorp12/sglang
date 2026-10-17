@@ -51,7 +51,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
+    CalibrationGate,
     ConfidenceCut,
+    is_serving_rid,
+    ram_miss_copy_engine_state,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
@@ -110,6 +113,7 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
+from sglang.srt.utils import triton_load_watch
 
 logger = logging.getLogger(__name__)
 
@@ -600,10 +604,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         return self._top_prob_gate.verify_lens(draft_block.top_probs)
 
     def _cut_verify_lens(
-        self, *, bs: int, sampling_info, confidence: Optional[torch.Tensor]
+        self, *, bs: int, sampling_info, confidence: Optional[torch.Tensor], reqs
     ) -> Optional[torch.Tensor]:
         """This step's [bs] verify lengths under the confidence cut (forced widths while it calibrates T(w)), or
-        None when every draft is verified."""
+        None when every draft is verified, as before the calibration gate opens."""
         cut = self._confidence_cut
         if (
             cut is None
@@ -612,7 +616,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             or not cut.applies(bs=bs, sampling_info=sampling_info)
         ):
             return None
+        if not cut.calibrated and not cut.admit_calibration(
+            self._confidence_cut_gate(reqs)
+        ):
+            return None
         return cut.verify_lens(confidence)
+
+    @staticmethod
+    def _confidence_cut_gate(reqs) -> CalibrationGate:
+        """The T(w) calibration gate from host-side state only: no device read on the verify path."""
+        return CalibrationGate(
+            engine_ready=triton_load_watch.serving_started(),
+            copy_engine=ram_miss_copy_engine_state(),
+            serving_request=all(is_serving_rid(req.rid) for req in reqs),
+        )
 
     def _folded_confidence_raw(self, proposal, bs: int) -> Optional[torch.Tensor]:
         """The folded proposal's [bs, gamma] pre-STS confidence logits when the draft graph records them, else None."""
@@ -1031,7 +1048,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The confidence cut reads this step's own confidence, on the device: the folded proposal's confidence_out,
         # or the eager compute above. Its lengths take the top-probability gate's place (the two never run together).
         cut_verify_lens = self._cut_verify_lens(
-            bs=bs, sampling_info=sampling_info, confidence=confidence
+            bs=bs, sampling_info=sampling_info, confidence=confidence, reqs=batch.reqs
         )
         cut_calibrated = False
         if cut_verify_lens is not None:

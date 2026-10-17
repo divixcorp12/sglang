@@ -65,7 +65,7 @@ from fastapi.routing import APIRoute
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, WARMUP_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -2345,6 +2345,8 @@ def _execute_server_warmup(server_args: ServerArgs):
             get_observability().debug_tensor_dump_input_file
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
+    # A batch's string rid gets per-item suffixes, so every item keeps the prefix.
+    json_data["rid"] = f"{WARMUP_RID_PREFIX}_{uuid.uuid4().hex}"
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()

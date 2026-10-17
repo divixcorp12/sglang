@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 GAMMA, VOCAB, HIDDEN = 5, 4096, 64
 TOKENS = GAMMA + 1
 SINGLE_RANK = SimpleNamespace(world_size=1)
-CALIBRATION_VERIFIES = 48
+CALIBRATION_VERIFIES = 96
 
 
 class _ToyDraft:
@@ -79,12 +79,27 @@ def _cut():
 
 
 def test_calibration_times_forced_widths_through_the_verify_events_then_cuts_by_confidence():
+    from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
+        COPY_ENGINE_ARMED,
+        COPY_ENGINE_PENDING,
+        CalibrationGate,
+    )
+
     cut = _cut()
     work, scratch = torch.randn((2048, 2048), device="cuda"), torch.empty((2048, 2048), device="cuda")
     confident = torch.full((1, GAMMA), 0.99, device="cuda")
+    # Warm-up: the copy engine not armed yet, then a warm-up request. Held back, so no event is recorded.
+    for gate in (
+        CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_PENDING, serving_request=True),
+        CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_ARMED, serving_request=False),
+    ):
+        assert not cut.admit_calibration(gate)
+    assert cut._pending == [] and cut._start_event is None
+    serving = CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_ARMED, serving_request=True)
     widths = []
     for _ in range(CALIBRATION_VERIFIES):
         assert cut.applies(bs=1, sampling_info=None) and not cut.calibrated
+        assert cut.admit_calibration(serving)
         lens = cut.verify_lens(confident)
         assert lens.device.type == "cuda" and lens.dtype == torch.int64 and lens.shape == (1,)
         width = int(lens.item())  # the test's own read; the worker never reads it
@@ -97,8 +112,9 @@ def test_calibration_times_forced_widths_through_the_verify_events_then_cuts_by_
     assert sorted(widths) == sorted(list(range(1, TOKENS + 1)) * (CALIBRATION_VERIFIES // TOKENS))
 
     # T(w) freezes at the first verify after the last end event has completed (read lazily, never waited on), so the
-    # test lets the 48th verify's work finish before the 49th.
+    # test lets the 96th verify's work finish before the 97th.
     torch.cuda.synchronize()
+    assert cut.admit_calibration(serving)
     lens = cut.verify_lens(confident)
     assert cut.calibrated and not cut.disabled
     cost = cut.cost_ms()

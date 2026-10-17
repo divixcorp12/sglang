@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, List
 
 import numpy as np
 import tqdm
 
+from sglang.srt.constants import WARMUP_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -15,6 +17,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__file__)
 
 _warmup_registry = {}
+
+
+def warmup_rid() -> str:
+    """A warm-up request's rid: the scheduler tells it from a serving request by its prefix."""
+    return f"{WARMUP_RID_PREFIX}_{uuid.uuid4().hex}"
 
 
 def warmup(name: str):
@@ -79,6 +86,7 @@ async def whisper_autodetect(
             variant_name,
         )
         req = GenerateReqInput(
+            rid=warmup_rid(),
             text="",
             audio_data=audio_data_uri,
             sampling_params={
@@ -112,6 +120,7 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
     for i in tqdm.trange(1, 512):
         size = i * 4
         generate_req_input = GenerateReqInput(
+            rid=warmup_rid(),
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 30,
@@ -148,6 +157,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
         generate_req_input = GenerateReqInput(
+            rid=warmup_rid(),
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 1,
@@ -184,6 +194,7 @@ async def dsv41_prefill_shapes(
     rng = np.random.default_rng(0)
     for size in tqdm.tqdm(DSV41_PREFILL_WARMUP_SIZES, desc="Warmup DSV4.1 prefill"):
         req = GenerateReqInput(
+            rid=warmup_rid(),
             input_ids=rng.integers(2**16, size=size).tolist(),
             sampling_params={"max_new_tokens": 1, "temperature": 0.0},
         )
@@ -194,6 +205,7 @@ async def dsv41_prefill_shapes(
             pass
     # A grammar request loads xgrammar's bitmask kernel and runs the sampler's grammar token sync.
     req = GenerateReqInput(
+        rid=warmup_rid(),
         input_ids=rng.integers(2**16, size=16).tolist(),
         sampling_params={"max_new_tokens": 2, "temperature": 0.0, "regex": "(yes|no)"},
     )
