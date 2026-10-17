@@ -177,3 +177,61 @@ Source of truth: `git merge-tree --write-tree --name-only origin/master upstream
 - Tests deleted: `test/registered/unit/layers/attention/test_dsv4_candidate_indexer.py` and `test/registered/unit/kernels/test_dsv41_torch_indexer_chunking.py`. They tested the removed `candidate_indexer` module and the mask-based tail publish. Lost coverage: tail-only publish equivalence and chunking-equals-single-pass for the torch indexer. Replaced by `test_dsv41_torch_score_budget.py` and the new gating case. Worth re-adding against `v41_indexer` after the re-sync.
 - Tests added: `test/registered/unit/kernels/test_dsv41_torch_score_budget.py`.
 - Merged cleanly by git but worth a glance because they sit next to the above: `kernels/ops/gemm/hc_mix.py` (renamed from `srt/layers/hc_mix_triton.py`), `kernels/ops/gemm/dsv4_wo_a.py`, `srt/mem_cache/memory_pool_host.py`.
+
+## 11. Preserve layer-major prefill
+
+Requirement: layer-major prefill must survive the merge intact. It reads far fewer MoE experts from disk during long prefills.
+
+Context, not a change: production is `PROD_DSPARK = True` (`benchmarks/dsv41_baseline/arm_env.py:161`), which runs `dspark_env()` with `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0` (:330). `layer_major/gate.py` `launch_refusal` refuses speculative decoding. So layer-major is off in production today and runs only under the base recipe (`base_env()`, MIN_TOKENS=8192 at :272). The merge must not change either fact.
+
+### 11.1 Inventory and state after the merge
+
+State is measured against `origin/master` (`f111be253d`) with `git diff origin/master HEAD`.
+
+| Piece | State | Verify |
+|---|---|---|
+| `srt/layer_major/` (`gate.py`, `driver.py`, `worker_entry.py`, `state_store.py`, `heartbeat.py`, `protocols.py`, `tensor_tree.py`, `__init__.py`) | **unchanged**, byte-identical to master | `test/registered/unit/layer_major/` all files (CPU) |
+| `srt/models/deepseek_v4_layer_major.py` (the adapter: chunk plan, span store, `install_forward_metadata`, `layer_major_skip_candidates`) | **unchanged** | `test_dsv4_chunk_plan.py`, `test_dsv4_backend_install.py`, `test_c1_late_layer_*_coverage.py` |
+| Adapter's contract with the backend: `DeepseekV4AttnBackend.install_forward_metadata` (`deepseek_v4_backend.py:2619`), `DSV4Metadata.layer_major_skip_candidates` (:1000) and its branch (:3503) | **ported** onto upstream's `v41_indexer` (source layer runs `full_topk_indexer.topk_prefill` instead of publishing masks on a non-final chunk) | `test_dsv4_backend_install.py`; box: item 3 below |
+| `models/deepseek_v4.py` `forward_late_tail` (:4649), `make_layer_major_adapter` (:4684), `_forward_layers_hc_pre_from_prev(layer_ids, prev_pre_in, hash_ids_in)` | **ported** onto `HcState(hidden_states, prev_pre_in)` and the `residual_batch`/`hc_boundary` flow. NEEDS REVIEW 2 | box: item 3.2 below |
+| Window ring on the paged SWA allocator: `mem_cache/allocation.py:500` (`swa_ring_tokens=batch.layer_major_ring_tokens`), `allocator/swa.py` (`is_swa_req_ring`), `memory_pool.py`, `unified_memory_pool.py`, `prefill_budget.py:271` (`check_prefill_ring`) | **auto-merged** with upstream changes (these files differ from master by 50-640 lines, none conflicted). No conflict does not mean unchanged. | `test_window_ring.py`, `test_layer_major_admission.py`; box: ring sizing log, no allocator assertion |
+| Scheduler hooks (one blocking pass per request): `init_layer_major_gate` (`scheduler.py:1468`), gate passed to the prefill adder (:4177), `layer_major_ring_size` to `ScheduleBatch` (:4349), `run_batch` exception containment (:4627-4645), empty-batch early return (:5131) | **combined** (scheduler imports and ctor merged; gate now reads `get_parallel().attn_dp_enabled` at :1482). Upstream's `Scheduler(server_args, port_args)` signature does not affect it. | `test_scheduler_layer_major_exception.py`, `test_layer_major_env.py` |
+| Admission: `schedule_policy.py` `layer_major_admission` (:587), `_PrefillAdmission.is_layer_major` (:584), `req.layer_major` set only in `_commit_prefill_admission` (:1667) | **combined** with upstream's `req.lock = tree_cache.lock(...)` model | `test_layer_major_admission.py`, `test_layer_major_radix_insert.py` (this is the radix crash from DSV41_REFERENCE.md 27.19) |
+| `schedule_batch.py` (`Req.layer_major` :1246, `ScheduleBatch.layer_major_ring_tokens` :2558-2639), `batch_result_processor.py:270`, `invariant_checker.py:19` | **auto-merged** | `test_schedule_batch_layer_major_decode.py`, `test_watchdog_heartbeat.py` |
+| Worker hook: `tp_worker.py:27-30,324,664-666` (`takes_layer_major_path`, `run_layer_major_prefill`) | **auto-merged** (file differs from master by 67 lines; upstream rewrote parts of `tp_worker`) | `test_worker_entry.py`; box: "layer-major prefill: N tokens in M chunks" log line |
+| Launch gate: `arg_groups/deepseek_v4_hook.py` `dsv41_layer_major_refusal` (:237), `validate_deepseek_v41_layer_major_prefill` (:263), calls at :439, :443, :458. NEEDS REVIEW 5 | **combined** with upstream's auto-resolved decoder SWA replay | section 11.2 |
+| Expert-distribution observers and recorder (`eplb/expert_distribution.py`), used to count prefill expert reads | **combined** (NEEDS REVIEW file 6) | box: item 3.3 |
+
+Rule for the re-sync merge (section 2): any conflict in a row above is resolved so that the master behaviour in this table stays. `layer_major/*` and `deepseek_v4_layer_major.py` should not need edits; if a branch edits them, keep its edit.
+
+### 11.2 Gate check (CPU unit-test plan)
+
+Merged gate must accept the base-recipe launch exactly as master does, and stay off under `dspark_env()`.
+
+Base recipe (`base_env()` + argv in `arm_env.py` ~:490-508): `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=8192`, `--enable-decoder-swa-bounded-replay` explicit, `--cuda-graph-backend-prefill disabled`, `--max-running-requests 1`, no `--speculative-algorithm`, no DP attention, no CP, no TBO, pp 1. `dspark_env()` (:321-330): `MIN_TOKENS=0` and DSPARK argv.
+
+Existing tests to keep green: `test/registered/unit/layer_major/test_gate.py` (`launch_refusal`, `scheduler_layer_major_refusal`), `test_deepseek_v4_hook_layer_major.py` (hook refusal), `test_layer_major_env.py`. Add (new CPU tests in `test/registered/unit/layer_major/test_deepseek_v4_hook_layer_major.py`; build `ServerArgs` the way the existing tests do):
+
+1. `test_base_recipe_accepted_with_explicit_replay`: MIN_TOKENS=8192, `enable_decoder_swa_bounded_replay=True`, encoder replay False, mrr 1, no spec, prefill graph disabled; `validate_deepseek_v41_features(server_args)` does not raise.
+2. `test_base_recipe_accepted_with_replay_auto`: same but replay `None`; the auto-resolution yields True for CUDA with no CP/DCP/DP and the layer-major check then passes (this is the new path from NEEDS REVIEW 5).
+3. `test_replay_off_refused`: replay False and MIN_TOKENS>0 raises "requires --enable-decoder-swa-bounded-replay".
+4. `test_encoder_replay_refused`: encoder replay True and MIN_TOKENS>0 raises "cannot be combined with --enable-encoder-swa-bounded-replay".
+5. `test_dspark_env_leaves_layer_major_off`: MIN_TOKENS=0 with DSPARK args and replay on or off: no raise, `gate_from_env` returns None, and `Scheduler.init_layer_major_gate` path leaves `layer_major_gate is None`.
+6. `test_min_tokens_with_speculative_refused`: MIN_TOKENS=8192 with a speculative algorithm raises the `launch_refusal` message.
+7. Also run `arm_env`'s own tests (`benchmarks/dsv41_baseline`) that render `base_env()` and `dspark_env()` argv; they must still produce MIN_TOKENS 8192 and 0.
+
+Compare with master: run the same selection on master (old venv) first and diff the counts.
+
+### 11.3 Parity checks on the box (OWNER GO, new venv, GPU locks)
+
+Existing proof to reuse: DSV41_REFERENCE.md 27.19 and 27.20, produced by `analysis/dsv41-drive/layer-major/drive_equiv.sh` (arm, worktree, min_tokens, out_root; runs `equiv.py`'s case list against one cold server) and compared with `compare chunked.jsonl layer-major-8k.jsonl`. The reference table is `/mnt/nvme1/layer-major/equiv-t12fix/`. `drive_equiv.sh` hardcodes `PY=/data/models/slang/.venv/bin/python`; set it to the new venv's python for the merged arm and keep master's on the old one. It takes `rowimg-disk.lock` then `cc-gpu.lock`, refuses when port 7867 is up, and never starts production.
+
+1. **Layer-major vs chunked, token 0 identical at 8k-33k.** On the merged branch: `drive_equiv.sh chunked <wt> 0 /mnt/nvme1/layer-major/equiv-merge` then `drive_equiv.sh layer-major-8k <wt> 8192 /mnt/nvme1/layer-major/equiv-merge`; then `compare` the two jsonl files (same root, same head). Pass: token 0 identical for every case that ran layer-major (`len8192`, `len16384`, `len32768`, `len33000`, `len32868`, `prefix`, `chain-32768`); 0 allocation OOMs in the layer-major arm; the `server.log` contains `layer-major prefill: N tokens in M chunks` for those cases and not for the sub-8192 cases. Do the same pair on master (old venv) once and compare the two result tables (e2e seconds per case too; in 27.19 one case, `chain-32768`, ran slower under layer-major, so expect noise there).
+2. **residual_batch CUDA path during resume (NEEDS REVIEW 2).** In the 1. run, the cases with a cached prefix (`prefix`, `chain-*`) and the final-chunk tail are the ones that call `forward_late_tail`. Also run once with `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=8192` and Engram on (the base recipe has it) to cover `post_engram_device_lookups` on the resume. Failure signature: a hang or assertion in `residual_batch.start/set_written/clear`, or logits that differ from chunked beyond token 0. If it fails, first check `_forward_layers_hc_pre_from_prev` (`deepseek_v4.py` loop start) against `forward_late_tail` (:4649).
+3. **Served base-recipe arm, long prompt, merged vs master.** Same argv and env as `base_env()` (not production; non-7867 port), one prompt > 8192 tokens (use `len16384` and `len32768` from `equiv.py`), cold and with a prefix hit. Record per arm: TTFT, ms/token, expert bytes read from disk during prefill (the expert-distribution `per_pass` recorder is on in the recipe, `--expert-distribution-recorder-mode per_pass`; read `expert reads` from the RAM-miss service counters / row-image reader stats the recipe already logs), peak VRAM, window-ring size log, and the `layer-major` log lines. Pass: merged within noise of master on TTFT and expert reads, same log lines, no new OOM retries.
+4. **Chunked fallback unchanged.** Repeat 3. with `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0`; compare to master the same way (this is what production-style recipes exercise).
+5. **Production-shaped arm stays off.** One `dspark_env()` launch on the merged venv: the log must not contain `layer-major prefill:` and the gate must not raise.
+
+### 11.4 Checkpoint
+
+Add to the owner-go list (section 9): running 11.3 (it takes the disk and GPU locks and a cold server for each arm).
