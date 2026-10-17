@@ -151,8 +151,8 @@ def _live_drafts(verify_lens: Optional[torch.Tensor], bs: int, num_slots: int, d
 
 def _inverse_cdf(weights: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """Per row, the first index whose running sum exceeds u * total; the last positive index if rounding leaves none."""
-    cums = weights.cumsum(-1)
-    target = u * cums[:, -1]
+    cums = weights.double().cumsum(-1)
+    target = u.double() * cums[:, -1]
     hit = cums > target[:, None]
     vocab = weights.shape[-1]
     idx = torch.arange(vocab, device=weights.device)
@@ -171,6 +171,26 @@ def sampled_chain_accept(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Torch reference. ``candidates`` [bs, S] (slot 0 the anchor), ``target_probs`` [bs, S, V], ``draft_probs``
     [bs, S - 1, V] or None for a one-hot draft at each candidate, ``uniforms`` [bs, S]."""
+    correct_len, weights = sampled_chain_bonus_weights(
+        candidates=candidates,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        verify_lens=verify_lens,
+        uniforms=uniforms,
+    )
+    bonus = _inverse_cdf(weights, uniforms[:, -1])
+    return correct_len.to(torch.int32), bonus.to(torch.int64)
+
+
+def sampled_chain_bonus_weights(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: Optional[torch.Tensor],
+    verify_lens: Optional[torch.Tensor],
+    uniforms: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The reference's correct_len [bs] and the unnormalized [bs, V] distribution its bonus is drawn from."""
     bs, num_slots, vocab = target_probs.shape
     device = target_probs.device
     target_probs = target_probs.float()
@@ -201,8 +221,7 @@ def sampled_chain_accept(
     weights = torch.where((correct_len < live_drafts)[:, None], residual, p_row)
     # A residual with no mass (p == q on the rejected row) falls back to p.
     weights = torch.where((weights.sum(-1) > 0)[:, None], weights, p_row)
-    bonus = _inverse_cdf(weights, uniforms[:, num_slots - 1])
-    return correct_len.to(torch.int32), bonus.to(torch.int64)
+    return correct_len, weights
 
 
 @triton.jit

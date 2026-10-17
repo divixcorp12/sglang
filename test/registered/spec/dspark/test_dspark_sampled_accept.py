@@ -15,6 +15,7 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_sampled_accept import (
     sampled_chain_accept,
+    sampled_chain_bonus_weights,
     sampled_chain_accept_triton,
     sampled_verify_target_probs,
 )
@@ -33,6 +34,7 @@ DEVICE = torch.device("cuda")
 VOCAB = 4
 NUM_SLOTS = 6  # speculative_num_draft_tokens: the anchor and five drafts.
 NUM_SAMPLES = 1 << 21
+_CHUNK = 1 << 15
 TEMPERATURE = 0.8
 # Per-test false-alarm rate; a 1% shift at these sample counts sits far beyond it (test_detects_a_one_percent_shift).
 P_VALUE_FLOOR = 1e-6
@@ -175,13 +177,19 @@ class _Chain:
                 torch.softmax(torch.randn_like(draft_probs) * 4, -1),
                 draft_probs,
             )
-        correct_len, bonus = self.accept(
-            candidates,
-            draft_probs,
-            target_logits.reshape(n * NUM_SLOTS, VOCAB),
-            verify_lens,
-            **accept_kwargs,
-        )
+        # flashinfer's top-p renorm scratch grows with the row count; chunk below it.
+        chunks = [
+            self.accept(
+                candidates[s : s + _CHUNK],
+                draft_probs[s : s + _CHUNK],
+                target_logits[s : s + _CHUNK].reshape(-1, VOCAB),
+                None if verify_lens is None else verify_lens[s : s + _CHUNK],
+                **accept_kwargs,
+            )
+            for s in range(0, n, _CHUNK)
+        ]
+        correct_len = torch.cat([c[0] for c in chunks])
+        bonus = torch.cat([c[1] for c in chunks])
         if verify_lens is not None:
             assert bool((correct_len <= verify_lens - 1).all())
         slots = torch.arange(NUM_SLOTS, device=DEVICE)
@@ -329,12 +337,23 @@ class TestSampledChainParity(CustomTestCase):
                 inputs = self._inputs(bs=256, vocab=129280, one_hot=one_hot, seed=5)
                 want_len, want_bonus = sampled_chain_accept(**inputs)
                 got_len, got_bonus = sampled_chain_accept_triton(**inputs)
-                torch.testing.assert_close(got_len, want_len)
+                torch.testing.assert_close(got_len, want_len.to(torch.int32))
                 self.assertGreater(int(want_len.max()), 1)
-                # Float summation order differs between the blocked and the flat cumsum, so a draw within
-                # rounding of a token boundary may land on its neighbour.
+                self.assertGreater(int((want_len == 0).sum()), 0)
+                # The triton bonus is the inverse-CDF draw of the reference's distribution, up to float32
+                # summation order: its token holds the draw within a 1e-5 band of the float64 CDF.
+                _, weights = sampled_chain_bonus_weights(**inputs)
+                cdf = weights.double().cumsum(-1)
+                total = cdf[:, -1]
+                draw = inputs["uniforms"][:, -1].double() * total
+                rows = torch.arange(weights.shape[0], device=DEVICE)
+                hi = cdf[rows, got_bonus]
+                lo = hi - weights[rows, got_bonus].double()
+                eps = 1e-5 * total
+                self.assertTrue(bool((weights[rows, got_bonus] > 0).all()))
+                self.assertTrue(bool(((lo - eps <= draw) & (draw <= hi + eps)).all()))
                 agree = float((got_bonus == want_bonus).float().mean())
-                self.assertGreaterEqual(agree, 0.995)
+                self.assertGreaterEqual(agree, 0.95)
 
 
 class _BlockHead:
