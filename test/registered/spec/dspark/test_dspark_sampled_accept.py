@@ -43,10 +43,17 @@ def _chi2_pvalue(observed: torch.Tensor, expected: torch.Tensor) -> float:
     quantile (accurate to well below the floor used here at these degrees of freedom)."""
     observed = observed.double().flatten()
     expected = expected.double().flatten()
+    # A draw in a cell the target cannot produce (filtered out by top-k/top-p) fails outright.
+    impossible = expected == 0
+    if float(observed[impossible].sum()) > 0:
+        return 0.0
+    observed, expected = observed[~impossible], expected[~impossible]
     small = expected < 5
-    if bool(small.any()):
-        observed = torch.cat([observed[~small], observed[small].sum().view(1)])
-        expected = torch.cat([expected[~small], expected[small].sum().view(1)])
+    pooled_observed, pooled_expected = observed[small].sum(), expected[small].sum()
+    observed, expected = observed[~small], expected[~small]
+    if float(pooled_expected) >= 5:
+        observed = torch.cat([observed, pooled_observed.view(1)])
+        expected = torch.cat([expected, pooled_expected.view(1)])
     stat = float(((observed - expected) ** 2 / expected).sum())
     dof = observed.numel() - 1
     z = ((stat / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
