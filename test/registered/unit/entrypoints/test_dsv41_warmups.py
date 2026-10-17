@@ -4,6 +4,7 @@ greedy prompt, then sampled ones, so the decode-only Triton kernels load before 
 import asyncio
 from types import SimpleNamespace
 
+from sglang.srt.constants import WARMUP_RID_PREFIX
 from sglang.srt.entrypoints import warmup
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -31,6 +32,7 @@ def test_prefill_shapes_prefill_each_size_then_one_grammar_request():
     assert sizes == warmup.DSV41_PREFILL_WARMUP_SIZES + (16,)
     assert all(r.sampling_params["max_new_tokens"] == 1 for r in sent[:-1])
     assert sent[-1].sampling_params["regex"] == "(yes|no)"
+    assert all(r.rid.startswith(WARMUP_RID_PREFIX) for r in sent)
 
 
 def test_decode_paths_decode_a_two_chunk_greedy_prompt_then_sampled_ones():
@@ -39,6 +41,9 @@ def test_decode_paths_decode_a_two_chunk_greedy_prompt_then_sampled_ones():
     for r in sent:
         assert r.sampling_params["max_new_tokens"] >= 8
         assert r.sampling_params["ignore_eos"] is True
+        # The confidence cut's T(w) calibration skips WARMUP_ rids; these requests' verifies must not reach it.
+        assert r.rid.startswith(WARMUP_RID_PREFIX)
+    assert len({r.rid for r in sent}) == len(sent)
     greedy, *sampled = sent
     # Two prefill chunks, the first a full one, which has to evict the SWA KV that dsv41_prefill_shapes left cached.
     assert CHUNK < len(greedy.input_ids) <= 2 * CHUNK

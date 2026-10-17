@@ -254,6 +254,7 @@ async def dsv41_decode_paths(
                 "max_new_tokens": DSV41_DECODE_WARMUP_NEW_TOKENS,
                 "ignore_eos": True,
             },
+            rid=warmup_rid(),
         )
         if disaggregation_mode != "null":
             req.bootstrap_room = 0

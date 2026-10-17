@@ -2454,6 +2454,12 @@ class Exl3RamMissService:
             "an earlier shutdown did not complete" if self._shut_down else None
         )
         self._shut_down = True
+        # Each counted load drained the device first; 0 means every module loaded before the copy engine armed.
+        logger.info(
+            "exl3 RAM miss: copy_engine_module_loads=%d (module loads after the copy engine armed; armed: %s)",
+            self.copy_engine_module_loads,
+            self._copy_armed,
+        )
         stop_error: Optional[BaseException] = None
         # A KeyboardInterrupt or SystemExit: re-raised once the slabs are safe.
         interrupt: Optional[BaseException] = None
