@@ -140,8 +140,9 @@ def test_a_retry_below_the_floor_says_so_and_names_the_holders_once(tmp_path, mo
     evictable = tmp_path / "evictable"
     evictable.mkdir()
     free1 = iter([20.0, 20.0, 20.0, 80.0])  # the first read, two rounds below the floor, then ready
-    meminfo = lambda: {n: {"MemFree": 80.0, "FilePages": 1.0} for n in "01"}
-    monkeypatch.setattr(pe, "node_meminfo", lambda: {**meminfo(), "1": {"MemFree": next(free1), "FilePages": 1.0}})
+    meminfo = lambda: {n: {"MemFree": 80.0, "FilePages": 1.0, "SReclaimable": 0.0} for n in "01"}
+    monkeypatch.setattr(pe, "node_meminfo",
+                        lambda: {**meminfo(), "1": {"MemFree": next(free1), "FilePages": 1.0, "SReclaimable": 0.0}})
     monkeypatch.setattr(pe, "evict", lambda: {"files": 0, "bytes": 0, "failed": 0})
     monkeypatch.setattr(pe.time, "sleep", lambda s: None)
     log = tmp_path / "prelaunch.json"
