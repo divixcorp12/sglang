@@ -176,14 +176,15 @@ def shipped_confidence(data: dict, w_shipped: torch.Tensor) -> torch.Tensor:
 
 
 def run_split(replay, *, name: str, train_data: dict, test_data: dict, w_shipped, cost, draft_ms, label_kind, epochs,
-              out_dir: Optional[str]) -> dict:
+              out_dir: Optional[str], lr: float = 1e-3) -> dict:
     shipped = evaluate(replay, confidence=shipped_confidence(test_data, w_shipped), data=test_data, cost=cost,
                        draft_ms=draft_ms)
     oracle = evaluate(replay, confidence=test_data["accept_rates"].double(), data=test_data, cost=cost,
                       draft_ms=draft_ms)
     rows = {"shipped head": shipped, "expected oracle": oracle}
     for model in MODELS:
-        head, fit = train(model=model, data=train_data, w_shipped=w_shipped, label_kind=label_kind, epochs=epochs)
+        head, fit = train(model=model, data=train_data, w_shipped=w_shipped, label_kind=label_kind, epochs=epochs,
+                          lr=lr)
         with torch.no_grad():
             c_test = torch.sigmoid(head(test_data["x"])).double()
             y, wgt = labels(test_data, label_kind)
@@ -205,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--draft-ms", type=float, default=5.8)
     p.add_argument("--labels", choices=("soft", "realized"), default="soft")
     p.add_argument("--epochs", type=int, default=400)
+    p.add_argument("--lr", type=float, default=1e-3)
     a = p.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     replay = _replay_module()
@@ -222,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     gamma = next(iter(sets.values()))["x"].shape[1]
     cost = torch.tensor([base + per_row * w for w in range(gamma + 1)], dtype=torch.float64)
     common = dict(w_shipped=w_shipped, cost=cost, draft_ms=a.draft_ms, label_kind=a.labels, epochs=a.epochs,
-                  out_dir=a.out)
+                  out_dir=a.out, lr=a.lr)
 
     def halves(d):
         n = d["x"].shape[0]

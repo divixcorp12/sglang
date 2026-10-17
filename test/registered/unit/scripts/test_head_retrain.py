@@ -40,12 +40,13 @@ def _synthetic(n, *, seed):
 def test_the_refits_beat_a_miscalibrated_shipped_head_and_report_train_and_validation_losses():
     retrain = _load()
     replay = retrain._replay_module()
-    train_data, w_shipped = _synthetic(3000, seed=0)
-    test_data, _ = _synthetic(2000, seed=0)
-    test_data = {k: v[1000:] for k, v in _synthetic(4000, seed=0)[0].items()}  # same w_true, fresh rows
+    everything, w_shipped = _synthetic(6000, seed=0)
+    train_data = {k: v[:3000] for k, v in everything.items()}
+    test_data = {k: v[3000:] for k, v in everything.items()}
     cost = torch.tensor([100.0 + 20 * w for w in range(GAMMA + 1)], dtype=torch.float64)
     rows = retrain.run_split(replay, name="t", train_data=train_data, test_data=test_data, w_shipped=w_shipped,
-                             cost=cost, draft_ms=5.0, label_kind="soft", epochs=300, out_dir=None)
+                             cost=cost, draft_ms=5.0, label_kind="soft", epochs=400, out_dir=None, lr=0.05)
+    print({m: rows[m].get("recovered") for m in retrain.MODELS})
     shipped, oracle = rows["shipped head"]["ms_per_token"], rows["expected oracle"]["ms_per_token"]
     assert oracle < shipped
     # The fine-tune from the shipped weights and the fresh probe both recover most of the gap; recalibration alone
