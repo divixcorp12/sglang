@@ -1542,6 +1542,14 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   NUMA move unless arm A leaves node 0 short.
 - In-server interleaved A/B harness for noise (offered; owner chose other work).
 - RAM prefetch `promote_landed`: ~42 rows land and ~20 are used per verify; a RAM-tier precision concern.
+- **TODO (owner, 2026-10-17): FP4 C4 indexer arm** (`--enable-deepseek-v4-fp4-indexer`, off in prod).
+  - What it changes: the C4 indexer K cache is stored in FP4 (per-32 UE8M0) instead of FP8 (`set_index_k_fp4`), the
+    query is quantized to FP4, and scoring uses DeepGEMM `fp8_fp4` kernels. So it changes which compressed tokens
+    attention selects; it is an accuracy change, not a pure speed knob. sglang labels it experimental.
+  - Platform: the launch gate (`serving_hook.py`) admits SM100/SM120/gfx95, so it starts on the 5090.
+  - Open: whether production's torch prefill indexer (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`) reads FP4 K pages.
+  - Plan: an arm `-prod-confcut-fp4idx` (`-prod-confcut` + the flag), long prompt against `-prod-confcut`. Compare
+    ms/token, accept length (the first sign of worse attention), where the text diverges, and VRAM freed.
 
 ## 4a. Consolidation review (2026-10-16, before the merge to master)
 
