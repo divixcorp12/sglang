@@ -202,3 +202,49 @@ async def dsv41_prefill_shapes(
         req.bootstrap_host = FAKE_BOOTSTRAP_HOST
     async for _ in tokenizer_manager.generate_request(req, None):
         pass
+
+
+# (prompt tokens, sampling params) of the decode warm-up, in order. The greedy prompt takes two prefill chunks at
+# production's 4096; the second is short because a chunk costs about the experts it routes to (64 tokens ~5 s, 4096
+# ~20 s). The sampled prompts are short too: their kernels do not depend on the prompt.
+DSV41_DECODE_WARMUP_REQUESTS = (
+    (4096 + 64, {"temperature": 0.0}),
+    (16, {"temperature": 0.6}),
+    (16, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
+)
+DSV41_DECODE_WARMUP_NEW_TOKENS = 16
+
+
+@warmup("dsv41_decode_paths")
+async def dsv41_decode_paths(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Load the Triton kernels that only decoding and SWA eviction reach, which dsv41_prefill_shapes never runs.
+
+    Run it after dsv41_prefill_shapes. That warm-up leaves its prompts' SWA KV cached in the radix tree (8,704 tokens
+    of the 11,264-token SWA pool), so the long prompt's first chunk has to evict it. Tree values are int64, unlike
+    the int32 request rows every earlier free passed, so the eviction loads the int64 variant of
+    get_and_clear_swa_pages_kernel. The sampled requests take DSpark's sampling draft (_online_partial_kernel,
+    _online_combine_kernel, _build_step_local_kernel) and its rejection-sampling accept
+    (speculative_sampling_classic_kernel, _gather_two_level_bonus_kernel); a greedy batch reaches none of them.
+    ignore_eos keeps every request decoding for its full length.
+
+    hot_cache_calibration.calibration_shapes does not replay these: no extend here exceeds the 4096-token chunk
+    dsv41_prefill_shapes already ran, and the calibration is compared with that warm-up's first 4096 prefill, which
+    comes before this one.
+    """
+    rng = np.random.default_rng(1)
+    for size, params in tqdm.tqdm(DSV41_DECODE_WARMUP_REQUESTS, desc="Warmup DSV4.1 decode"):
+        req = GenerateReqInput(
+            input_ids=rng.integers(2**16, size=size).tolist(),
+            sampling_params={
+                **params,
+                "max_new_tokens": DSV41_DECODE_WARMUP_NEW_TOKENS,
+                "ignore_eos": True,
+            },
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass

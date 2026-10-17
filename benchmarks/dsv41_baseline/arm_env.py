@@ -463,11 +463,13 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     mem_fraction_static: str | None = None
     max_total_tokens: int | None = None
     drop_cache_after_load: bool = False
+    # Production's warm-up also runs dsv41_decode_paths (~35 s); the arms keep the prefill-only one they measured with.
+    decode_warmup: bool = False
 
     @classmethod
     def prod(cls) -> "ServerArgs":
         if not PROD_DSPARK:
-            return cls(port=PROD_PORT, host=PROD_HOST)
+            return cls(port=PROD_PORT, host=PROD_HOST, decode_warmup=True)
         return cls(
             port=PROD_PORT,
             host=PROD_HOST,
@@ -475,6 +477,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             mem_fraction_static=PROD_DSPARK_MEM_FRACTION_STATIC,
             max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
             drop_cache_after_load=True,
+            decode_warmup=True,
         )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
@@ -536,8 +539,10 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--tool-call-parser",
             "deepseekv41",
             # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).
+            # Production also decodes, greedy and sampled, after a two-chunk prompt: its first long request otherwise
+            # loaded the SWA eviction and DSpark sampling kernels mid-serving (prod-20261016-180932/server.log).
             "--warmups",
-            "dsv41_prefill_shapes",
+            "dsv41_prefill_shapes,dsv41_decode_paths" if self.decode_warmup else "dsv41_prefill_shapes",
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]

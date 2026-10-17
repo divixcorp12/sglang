@@ -167,6 +167,18 @@ def test_prod_and_every_arm_pass_the_v41_reasoning_and_tool_call_parsers():
         assert ns.language_model_only is True
 
 
+def test_prod_warms_decode_after_the_prefill_shapes_and_the_arms_keep_prefill_only():
+    from sglang.srt.entrypoints.warmup import _warmup_registry
+
+    argv = arm_env.ServerArgs.prod().argv()
+    # Order matters: the decode warm-up's long prompt evicts the SWA KV that the prefill warm-up left cached.
+    assert argv[argv.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths"
+    assert {"dsv41_prefill_shapes", "dsv41_decode_paths"} <= set(_warmup_registry)
+    for args in (arm_env.ServerArgs(port=1), arm_env.ServerArgs(port=1, dspark=True)):
+        argv = args.argv()
+        assert argv[argv.index("--warmups") + 1] == "dsv41_prefill_shapes"
+
+
 def test_prod_and_every_arm_bound_the_prefill_share_with_the_recorder_it_needs():
     # The service refuses SGLANG_DSV41_ENABLE_PREFILL_SHARE under the no-op recorder, so the share is on only where
     # argv also names a recorder mode.
