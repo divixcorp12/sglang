@@ -862,6 +862,23 @@ def draft_accept_rates(
     return torch.where(draft_block.greedy_mask.view(bs, 1), greedy_rates, sampled_rates)
 
 
+def draft_step_features(*, draft_tokens: torch.Tensor, draft_block) -> Optional[dict[str, torch.Tensor]]:
+    """[bs, gamma] features of the draft's own step distributions q_j (the temperature softmax of its corrected logits,
+    the distribution each draft was drawn from): q_j(d_j) for the drawn token, max q_j, and the entropy of q_j in nats.
+    None when the proposal kept no corrected logits (a folded greedy one). For STS collection only."""
+    corrected = draft_block.corrected_logits
+    if corrected is None:
+        return None
+    temperatures = draft_block.temperatures.view(-1, 1, 1).to(torch.float32)
+    log_q = torch.log_softmax(corrected.float() / temperatures, dim=-1)
+    q = log_q.exp()
+    return {
+        "draft_q": q.gather(-1, draft_tokens.to(torch.int64)[..., None]).squeeze(-1),
+        "draft_top1": q.max(dim=-1).values,
+        "draft_entropy": -(q * log_q).sum(dim=-1),
+    }
+
+
 def request_temperatures(*, bs: int, sampling_info, greedy_mask: torch.Tensor) -> torch.Tensor:
     """[bs] each request's sampling temperature, 0 for a greedy one."""
     if sampling_info is None:
@@ -1191,8 +1208,11 @@ class DsparkStepObservers:
             candidates=verify_ids_2d,
             target_predict=target_predict,
         )
-        accept_rates = temperatures = None
+        accept_rates = temperatures = draft_features = None
         if draft_block is not None:
+            draft_features = draft_step_features(
+                draft_tokens=verify_ids_2d[:, 1:], draft_block=draft_block
+            )
             accept_rates = draft_accept_rates(
                 candidates=verify_ids_2d,
                 target_logits=target_logits,
@@ -1209,4 +1229,5 @@ class DsparkStepObservers:
             sampled_num_correct_drafts=correct_len,
             accept_rates=accept_rates,
             temperatures=temperatures,
+            draft_features=draft_features,
         )

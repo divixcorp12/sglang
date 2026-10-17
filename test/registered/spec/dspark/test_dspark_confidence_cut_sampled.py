@@ -176,6 +176,32 @@ def test_the_draft_accept_rates_are_min_one_p_over_q_for_sampled_rows_and_matche
     assert greedy_only.tolist() == [[0.0, 1.0], [0.0, 1.0]]
 
 
+def test_the_collection_records_the_drafts_own_step_probability_top1_and_entropy(tmp_path):
+    import math
+
+    from sglang.srt.speculative.dspark_components.dspark_observability import draft_step_features
+    from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
+
+    # Temperature 0.5 turns logits log([0.25, 0.5, 0.25]) into q = [1/6, 2/3, 1/6].
+    corrected = torch.log(torch.tensor([[[0.25, 0.5, 0.25], [0.25, 0.5, 0.25]]]))
+    block = SimpleNamespace(corrected_logits=corrected, temperatures=torch.tensor([0.5]))
+    features = draft_step_features(draft_tokens=torch.tensor([[1, 0]]), draft_block=block)
+    q = torch.tensor([1 / 6, 2 / 3, 1 / 6])
+    assert torch.allclose(features["draft_q"], torch.tensor([[2 / 3, 1 / 6]]), atol=1e-6)
+    assert torch.allclose(features["draft_top1"], torch.tensor([[2 / 3, 2 / 3]]), atol=1e-6)
+    entropy = -float((q * q.log()).sum())
+    assert torch.allclose(features["draft_entropy"], torch.full((1, 2), entropy), atol=1e-5) and entropy < math.log(3)
+    assert draft_step_features(draft_tokens=torch.tensor([[1, 0]]),
+                               draft_block=SimpleNamespace(corrected_logits=None)) is None
+
+    recorder = StsDataRecorder(path_stem=str(tmp_path / "s"), gamma=2, flush_every=10)
+    recorder.record(confidence_raw=torch.zeros(1, 2), num_correct_drafts=torch.tensor([1]), draft_features=features)
+    recorder.record(confidence_raw=torch.zeros(1, 2), num_correct_drafts=torch.tensor([1]))
+    recorder.flush()
+    shard = torch.load(tmp_path / "s.0.pt")
+    assert torch.allclose(shard["draft_q"][0], features["draft_q"][0]) and torch.isnan(shard["draft_q"][1]).all()
+
+
 def _decode(verify_lens_fn, *, seed):
     toy = dist.MarkovToy(vocab=VOCAB, gamma=GAMMA, temperature=TEMPERATURE, seed=0)
     generator = torch.Generator().manual_seed(seed)

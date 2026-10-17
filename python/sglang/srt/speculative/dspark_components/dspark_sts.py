@@ -49,7 +49,11 @@ class StsDataRecorder:
       sampled request (1 or 0 for a greedy one), so cumprod over k is the expected ``sampled_prefix_mask``. NaN when
       the caller passed none.
     - ``temperatures``: the request's sampling temperature (0 for greedy; NaN when the caller passed none).
+    - ``draft_q``, ``draft_top1``, ``draft_entropy``: the draft's step distribution q_k at draft k (the one d_k was
+      drawn from): q_k(d_k), max q_k and its entropy in nats. NaN when the caller passed none.
     """
+
+    DRAFT_FEATURES = ("draft_q", "draft_top1", "draft_entropy")
 
     def __init__(self, *, path_stem: str, gamma: int, flush_every: int) -> None:
         self.path_stem = path_stem
@@ -63,6 +67,7 @@ class StsDataRecorder:
                 "sampled_prefix_mask",
                 "accept_rates",
                 "temperatures",
+                *self.DRAFT_FEATURES,
             )
         }
         self._shard_ct = 0
@@ -80,6 +85,7 @@ class StsDataRecorder:
         sampled_num_correct_drafts: Optional[torch.Tensor] = None,
         accept_rates: Optional[torch.Tensor] = None,
         temperatures: Optional[torch.Tensor] = None,
+        draft_features: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
         logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32)
         bs = logits.shape[0]
@@ -101,6 +107,12 @@ class StsDataRecorder:
             if temperatures is None
             else temperatures.detach().to(device="cpu", dtype=torch.float32).view(-1)
         )
+        for key in self.DRAFT_FEATURES:
+            self._buffers[key].append(
+                torch.full((bs, self.gamma), float("nan"))
+                if draft_features is None
+                else draft_features[key].detach().to(device="cpu", dtype=torch.float32)
+            )
         if len(self._buffers["logits"]) >= self.flush_every:
             self.flush()
 
