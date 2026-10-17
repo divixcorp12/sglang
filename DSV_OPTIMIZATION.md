@@ -1505,6 +1505,27 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
     row 0's experts. Production uses the static graph, so the eager path is moot.
   - Dead rows' Engram lookups post -1, which the native store serves as a zero row: no access, read or insert. Any other
     negative id is still fatal. This covers the in-graph device wait (the default) only.
+- **Served pair, -prod vs -prod-confcut** (2026-10-16 21:55-22:29, `confidence-cut` @ `5158aa38d3` incl. the dead-row
+  follow-ups and the V4.1 parsers; long prompt, 420 s decode each, one sample each, prod first, instr build in both;
+  `/mnt/nvme1/confcut-ab-20261017`, `long_compare.txt`):
+
+  | | -prod | -prod-confcut | delta |
+  |---|---:|---:|---:|
+  | tokens in 420 s | 6,309 | 6,725 | +6.6% |
+  | ms/token, whole decode | 66.6 | 62.5 | -6.2% |
+  | ms/token, 60-360 s | 70.8 | 60.8 | -14% |
+  | ms per verify, 60-360 s | 180.4 | 158.4 | -12% |
+  | tokens per verify, 60-360 s | 2.55 | 2.61 | +2% |
+  | wait per verify, 120-300 s | 107-123 | 53-84 | |
+  | TTFT | 16.44 s | 17.07 s | +0.63 s |
+
+  - The verify is cheaper and accept did not fall. Texts diverged at token 41, so tokens/verify is content-dependent;
+    ms per verify is the cleaner number.
+  - Cold GPU lanes per verify rose by about 3 (1.9-2.3 -> 3.2-5.2), and stream per verify rose 5.8 -> 9.8-13.4. Not
+    explained yet.
+  - Noise: the cut arm's 0-30 s and 300-360 s windows had swap-in spikes (CPUSLOW), and 360-420 s was a disk stall
+    (x10.8) and is truncated (the copy engine's job trace overflowed at 414.8 s, which is why the capture reported
+    rc=1). All excluded from the 60-360 s rows.
 - **Dead-row audit** (2026-10-16, read-only; confcut smoke server.log Engram stats against verify.jsonl, prefill-free
   60 s windows only):
   - **Engram lookups are the only disk/host work a dead row still causes.** Both runs do 288 accesses per verify
