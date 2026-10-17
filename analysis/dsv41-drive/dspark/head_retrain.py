@@ -27,7 +27,12 @@ import json
 import os
 from typing import Optional
 
-import torch
+# CPU only: run as a script, hide the GPU before torch (and sglang's imports) can open a CUDA context, which would
+# take VRAM outside cc-gpu.lock from a serving run. (Imported by a test, the caller's devices are left alone.)
+if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+import torch  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HEAD_WEIGHT = "mtp.2.confidence_head.proj.weight"

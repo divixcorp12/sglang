@@ -17,8 +17,14 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 
-import torch
+# CPU only: run as a script, hide the GPU before torch (and sglang's imports) can open a CUDA context outside
+# cc-gpu.lock. (Imported by a test, the caller's devices are left alone.)
+if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+import torch  # noqa: E402
 
 from sglang.srt.speculative.dspark_components.dspark_confidence_cut import stop_rule_verify_lens
 from sglang.srt.speculative.dspark_components.dspark_sts import load_sts_calibration_from_path
