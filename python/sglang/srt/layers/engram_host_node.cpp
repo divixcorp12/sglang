@@ -68,6 +68,8 @@ struct Counters {
 class Store {
  public:
   static constexpr size_t kBounceBytes = 16 << 20;
+  // A dead verify row's id (engram.py DEAD_ROW_ID): a zero row, no access, no read, no insert. Other negatives fail.
+  static constexpr int64_t kDeadRowId = -1;
   // A budget of 0 is no cache: every lookup misses and reads its rows through io_uring, and nothing is kept.
   Store(size_t budget, int64_t row_bytes) : row_bytes_(row_bytes) {
     if (row_bytes <= 0 || (budget != 0 && budget < static_cast<size_t>(row_bytes)))
@@ -201,9 +203,12 @@ class Store {
     const size_t rb=row_bytes_; if(q.status) *q.status=1;
     std::vector<int64_t> misses; std::vector<std::vector<size_t>> miss_positions;
     std::unordered_map<int64_t,size_t> miss_index;
-    ++clock_; stats_.accesses+=q.n;
+    ++clock_;
     for(int64_t i=0;i<q.n;i++) {
-      int64_t id=q.ids[i]; if(id<0||id>=t.rows) { if(q.status)*q.status=2; return -EINVAL; }
+      int64_t id=q.ids[i];
+      if(id==kDeadRowId) { std::memset(q.out+i*rb,0,rb); continue; }
+      if(id<0||id>=t.rows) { if(q.status)*q.status=2; return -EINVAL; }
+      stats_.accesses++;
       int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_, base=set*ways_, way=ways_;
       for(size_t w=0;w<ways_;w++) if(tags_[base+w]==key){way=w;break;}
       if(way<ways_) { std::memcpy(q.out+i*rb,data_+(base+way)*rb,rb); ages_[base+way]=clock_; stats_.hits++; }
