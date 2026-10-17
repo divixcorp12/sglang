@@ -278,12 +278,14 @@ def test_the_cut_stats_report_each_log_intervals_verifies_and_reset():
     assert stats.log_suffix() is None
     confidence = torch.tensor([[0.5, 0.5, 1.0, 1.0, 1.0]])
     stats.observe(confidence=confidence, verify_lens=torch.tensor([2]), commit_lens=torch.tensor([2]))
-    stats.observe(confidence=confidence, verify_lens=torch.tensor([6]), commit_lens=torch.tensor([3]))
+    stats.observe(confidence=confidence, verify_lens=torch.tensor([6]), commit_lens=torch.tensor([3]), sampled=True)
     assert stats.log_suffix() == (
-        "conf cut: verifies 2, w* 4.00, E(w*) 2.00, accept len 2.50, cut rows 4 (total 4)"
+        "conf cut: verifies 2, w* 4.00, E(w*) 2.00, accept len 2.50, cut rows 4 (total 4), "
+        "widths [0, 1, 0, 0, 0, 1], sampled 1"
     )
     assert stats.log_suffix() is None
     stats.observe(confidence=confidence, verify_lens=torch.tensor([1]), commit_lens=torch.tensor([1]))
     assert stats.log_suffix() == (
-        "conf cut: verifies 1, w* 1.00, E(w*) 1.00, accept len 1.00, cut rows 5 (total 9)"
+        "conf cut: verifies 1, w* 1.00, E(w*) 1.00, accept len 1.00, cut rows 5 (total 9), "
+        "widths [1, 0, 0, 0, 0, 0], sampled 0"
     )

@@ -50,6 +50,41 @@ def test_the_capture_runs_the_long_prompt_client_with_its_window_and_repeats(tmp
     assert int(cap.LONG_TRACE_CAPACITY) == 1048576
 
 
+def test_the_capture_passes_a_sampled_long_prompts_temperature_and_top_p(tmp_path):
+    cap = _load("spec_margin_capture")
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    a = cap.parse_args(["/out", "--long-prompt", str(prompt), "--temperature", "0.6", "--top-p", "0.95"])
+    assert cap.client_argv(a)[-4:] == ["--temperature", "0.6", "--top-p", "0.95"]
+    lp = _load("long_prompt")
+    body = lp.request_body("hi", "rid-1", temperature=0.6, top_p=0.95)
+    assert body["temperature"] == 0.6 and body["top_p"] == 0.95
+    assert "top_p" not in lp.request_body("hi", "rid-1")
+    for bad in (["--top-p", "0.95"], ["--temperature", "-1"], ["--temperature", "0.6", "--top-p", "0"]):
+        with pytest.raises(SystemExit):
+            cap.parse_args(["/out", "--long-prompt", str(prompt), *bad])
+    with pytest.raises(SystemExit):
+        cap.parse_args(["/out", "--temperature", "0.6"])
+
+
+def test_a_sampled_run_sends_the_sampling_arguments_and_records_them(tmp_path):
+    lp = _load("long_prompt")
+    prompt = tmp_path / "p.md"
+    prompt.write_text("PROMPT")
+    sent = []
+
+    def request(port, text, rid, seconds, **sampling):
+        sent.append(sampling)
+        return {"rid": rid, "ttft_s": 0.1, "first_token_ns": 5, "cut": True, "finish_reason": None,
+                "abort_status": 200, "chunks": []}
+
+    assert lp.run(1, str(prompt), str(tmp_path), 300, 1, request=request, sleep=lambda s: None,
+                  temperature=0.6, top_p=0.95) == 0
+    assert sent == [{"temperature": 0.6, "top_p": 0.95}] * 2
+    record = json.load(open(tmp_path / "long_prompt.json"))
+    assert (record["temperature"], record["top_p"]) == (0.6, 0.95)
+
+
 @pytest.mark.parametrize("argv", [
     ["/out", "--decode-seconds", "60"],
     ["/out", "--ttft-repeats", "2"],

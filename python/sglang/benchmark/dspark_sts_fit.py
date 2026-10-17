@@ -140,14 +140,59 @@ def load_collected_shards(*, data_glob: str) -> tuple[torch.Tensor, torch.Tensor
     return torch.cat(logits_shards, dim=0), torch.cat(prefix_mask_shards, dim=0)
 
 
+# The survival label a fit calibrates against (StsDataRecorder's shard keys):
+#   argmax  -- prefix_mask: the drafts matched the target's argmax (the greedy cut's label);
+#   sampled -- sampled_prefix_mask: the verify's own accept took them (rejection sampling for a sampled request);
+#   soft    -- cumprod of accept_rates, the sampled label's expectation given the drafts (min(1, p/q) per draft), the
+#              same target with the accept's coin noise taken out.
+STS_LABELS = ("argmax", "sampled", "soft")
+
+
+def load_collected_labels(
+    *, data_glob: str, label: str, temperature: Optional[float] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[n, gamma] pre-STS logits and the ``label`` survival targets from every shard, keeping only verifies at
+    ``temperature`` (within 1e-3) when it is given. The sampled labels need shards from a collector that recorded them."""
+    if label not in STS_LABELS:
+        raise ValueError(f"label {label!r} is not one of {STS_LABELS}")
+    shard_paths = sorted(glob.glob(data_glob))
+    if not shard_paths:
+        raise ValueError(f"No STS data shards matched {data_glob!r}.")
+    logits_shards, target_shards = [], []
+    for shard_path in shard_paths:
+        shard = torch.load(shard_path, map_location="cpu")
+        if label == "argmax":
+            target = shard["prefix_mask"]
+        elif "sampled_prefix_mask" not in shard:
+            raise ValueError(f"Shard {shard_path!r} has no sampled labels (collected before they were recorded).")
+        elif label == "sampled":
+            target = shard["sampled_prefix_mask"]
+        else:
+            target = torch.cumprod(shard["accept_rates"].to(torch.float64), dim=1)
+        keep = torch.ones(shard["logits"].shape[0], dtype=torch.bool)
+        if temperature is not None:
+            if "temperatures" not in shard:
+                raise ValueError(f"Shard {shard_path!r} records no temperatures.")
+            keep = (shard["temperatures"] - temperature).abs() < 1e-3
+        keep &= ~torch.isnan(target).any(dim=1)
+        logits_shards.append(shard["logits"][keep])
+        target_shards.append(target[keep].to(torch.float64))
+    logits = torch.cat(logits_shards, dim=0)
+    if logits.shape[0] == 0:
+        raise ValueError(f"No verifies in {data_glob!r} at temperature {temperature} with {label} labels.")
+    return logits, torch.cat(target_shards, dim=0)
+
+
 def fit(
     *,
     data_glob: str,
     out: Path,
     num_bins: int = 15,
     gamma: Optional[int] = None,
+    label: str = "argmax",
+    temperature: Optional[float] = None,
 ) -> None:
-    logits, prefix_mask = load_collected_shards(data_glob=data_glob)
+    logits, prefix_mask = load_collected_labels(data_glob=data_glob, label=label, temperature=temperature)
     resolved_gamma = int(logits.shape[1])
     if gamma is not None and gamma != resolved_gamma:
         raise ValueError(
@@ -161,9 +206,12 @@ def fit(
         grid=default_temperature_grid(),
         num_bins=num_bins,
     )
+    dataset = data_glob if label == "argmax" else f"{data_glob} (labels {label})"
+    if temperature is not None:
+        dataset += f" at temperature {temperature}"
     calibration = DSparkStsCalibration(
         temperatures=result["temperatures"],
-        dataset=data_glob,
+        dataset=dataset,
         num_samples=num_samples,
         ece_before=result["ece_before"],
         ece_after=result["ece_after"],
@@ -171,8 +219,8 @@ def fit(
     out.write_text(calibration.to_json(), encoding="utf-8")
 
     print(
-        f"Fit STS temperatures over {num_samples} samples (gamma={resolved_gamma}) "
-        f"-> {out}"
+        f"Fit STS temperatures over {num_samples} samples (gamma={resolved_gamma}, "
+        f"labels {label}) -> {out}"
     )
     print("pos  temperature  ece_before  ece_after")
     for position in range(resolved_gamma):
@@ -213,6 +261,20 @@ def main() -> None:
         default=None,
         help="Optional gamma override to validate the shards against.",
     )
+    parser.add_argument(
+        "--label",
+        choices=STS_LABELS,
+        default="argmax",
+        help="Survival label to calibrate against: argmax (greedy, the default), "
+        "sampled (the accept's own outcome) or soft (its expectation, cumprod of "
+        "min(1, p/q)); the last two are for the sampled cut's STS file.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Fit only the verifies collected at this sampling temperature.",
+    )
     args = parser.parse_args()
 
     fit(
@@ -220,6 +282,8 @@ def main() -> None:
         out=args.out,
         num_bins=args.num_bins,
         gamma=args.gamma,
+        label=args.label,
+        temperature=args.temperature,
     )
 
 

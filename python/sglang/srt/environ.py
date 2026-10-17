@@ -828,6 +828,10 @@ class Envs:
     # With the cut on, cut sampled (temperature > 0) bs-1 verifies too, not only greedy ones; their T(w) calibration
     # admits them as well. Lossless by the stopping-rule argument in dspark_confidence_cut.py's docstring.
     SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED = EnvBool(False)
+    # The sampled cut's own STS file (dspark_sts_fit --label soft at the serving temperature): sampled verifies re-temper
+    # the head's output from --speculative-dspark-confidence-sts-path's temperatures to these. Empty: they use the
+    # greedy file's, fitted on argmax labels.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH = EnvStr("")
 
     # ===================================================================
     # Memory pools and KV-cache sizing

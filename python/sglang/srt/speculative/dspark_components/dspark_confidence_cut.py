@@ -118,12 +118,15 @@ class ConfidenceCut:
         device,
         new_event: Optional[Callable[[], object]] = None,
         cut_sampled: bool = False,
+        sampled_rescale: Optional[torch.Tensor] = None,
     ):
         self.gamma = gamma
         self.device = device
         self.num_widths = gamma + 1
         # SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED: sampled bs-1 batches are cut (and calibrate T(w)) too.
         self.cut_sampled = cut_sampled
+        # [gamma] T_head / T_sampled per position (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH), or None.
+        self._sampled_rescale = sampled_rescale
         # Any object with CUDA Event's record() / query() / elapsed_time(end); tests inject a CPU fake.
         self._new_event = new_event or (lambda: torch.cuda.Event(enable_timing=True))
         self._num_forced = 0
@@ -154,9 +157,33 @@ class ConfidenceCut:
 
             preload_cut_accept_kernels(device=device, verify_num_draft_tokens=gamma + 1)
         cut_sampled = envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED.get()
+        sampled_sts_path = envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH.get()
+        if sampled_sts_path and not cut_sampled:
+            raise ValueError(
+                "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH needs SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED=1; set it or "
+                "unset the path."
+            )
+        sampled_rescale = None
+        if sampled_sts_path:
+            from sglang.srt.runtime_context import get_spec
+
+            sampled_rescale = sampled_sts_rescale(
+                gamma=gamma,
+                head_sts_path=get_spec().speculative_dspark_confidence_sts_path,
+                sampled_sts_path=sampled_sts_path,
+                device=device,
+            )
         if cut_sampled:
-            logger.info("dspark confidence cut: sampled bs-1 verifies are cut too (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED)")
-        return cls(gamma=gamma, device=device, cut_sampled=cut_sampled)
+            logger.info(
+                "dspark confidence cut: sampled bs-1 verifies are cut too (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED), "
+                + (
+                    f"re-tempered by T_head / T_sampled = {[round(float(f), 4) for f in sampled_rescale]} "
+                    f"({sampled_sts_path})"
+                    if sampled_rescale is not None
+                    else "with the head's STS temperatures"
+                )
+            )
+        return cls(gamma=gamma, device=device, cut_sampled=cut_sampled, sampled_rescale=sampled_rescale)
 
     @property
     def calibrated(self) -> bool:
@@ -171,6 +198,13 @@ class ConfidenceCut:
 
     def applies(self, *, bs: int, sampling_info) -> bool:
         return bs == 1 and (self.cut_sampled or sampling_info is None or sampling_info.is_all_greedy)
+
+    def cut_confidence(self, confidence: torch.Tensor, *, sampled: bool) -> torch.Tensor:
+        """The [bs, gamma] confidences the cut reads: the head's, re-tempered to the sampled STS file's temperatures for
+        a sampled verify when one is loaded. A per-position monotone map, so the stopping form's argument holds."""
+        if sampled and self._sampled_rescale is not None:
+            return rescale_confidence(confidence, self._sampled_rescale)
+        return confidence
 
     def admit_calibration(self, gate: CalibrationGate) -> bool:
         """Whether an eligible verify before T(w) froze may run the cut (a forced, timed width). A held verify covers
@@ -284,6 +318,27 @@ class AffineCostFit(msgspec.Struct, frozen=True):
 
     def cost_ms(self, *, num_widths: int) -> list[float]:
         return [self.base_ms + self.per_row_ms * width_idx for width_idx in range(num_widths)]
+
+
+def rescale_confidence(confidence: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
+    """sigmoid(logit(c) * factor) per position: a head output c = sigmoid(raw / T_head) re-tempered to
+    sigmoid(raw / T) when factor = T_head / T. 0 and 1 stay put, and a NaN stays NaN (the cut reads it as 0)."""
+    return torch.sigmoid(torch.logit(confidence.float()) * factor)
+
+
+def sampled_sts_rescale(*, gamma: int, head_sts_path: Optional[str], sampled_sts_path: str, device) -> torch.Tensor:
+    """[gamma] T_head / T_sampled: the head applies ``head_sts_path``'s temperatures (none: 1), and a sampled verify
+    wants ``sampled_sts_path``'s."""
+    from sglang.srt.speculative.dspark_components.dspark_sts import load_sts_calibration_from_path
+
+    head = load_sts_calibration_from_path(head_sts_path).temperatures if head_sts_path else [1.0] * gamma
+    sampled = load_sts_calibration_from_path(sampled_sts_path).temperatures
+    if len(head) != gamma or len(sampled) != gamma:
+        raise ValueError(
+            f"dspark confidence cut: STS files fit for gamma {len(head)} ({head_sts_path}) and {len(sampled)} "
+            f"({sampled_sts_path}), the runtime gamma is {gamma}"
+        )
+    return torch.tensor([h / s for h, s in zip(head, sampled)], dtype=torch.float32, device=device)
 
 
 def _tokens_per_ms(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:

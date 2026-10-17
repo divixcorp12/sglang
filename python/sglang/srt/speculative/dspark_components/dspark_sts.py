@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import msgspec
 import torch
@@ -37,40 +38,81 @@ def load_sts_calibration_from_path(path: str) -> DSparkStsCalibration:
 
 
 class StsDataRecorder:
+    """Shards of a collection launch's verifies, ``<path_stem>.<n>.pt``, each a dict of [n, gamma] tensors (and [n]
+    temperatures):
+
+    - ``logits``: the confidence head's pre-STS logits.
+    - ``prefix_mask``: draft k matched the target's argmax and so did every draft before it (the greedy label).
+    - ``sampled_prefix_mask``: the verify's own accept took draft k (the label under the request's sampling: for a
+      sampled request, the rejection-sampling outcome; for a greedy one, ``prefix_mask``).
+    - ``accept_rates``: draft k's acceptance probability given the drafts before it were accepted, min(1, p/q) for a
+      sampled request (1 or 0 for a greedy one), so cumprod over k is the expected ``sampled_prefix_mask``. NaN when
+      the caller passed none.
+    - ``temperatures``: the request's sampling temperature (0 for greedy; NaN when the caller passed none).
+    """
+
     def __init__(self, *, path_stem: str, gamma: int, flush_every: int) -> None:
         self.path_stem = path_stem
         self.gamma = int(gamma)
         self.flush_every = int(flush_every)
-        self._logits_buffer: list[torch.Tensor] = []
-        self._prefix_mask_buffer: list[torch.Tensor] = []
+        self._buffers: dict[str, list[torch.Tensor]] = {
+            key: []
+            for key in (
+                "logits",
+                "prefix_mask",
+                "sampled_prefix_mask",
+                "accept_rates",
+                "temperatures",
+            )
+        }
         self._shard_ct = 0
 
+    def _prefix_mask(self, counts: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(self.gamma).view(1, -1)
+        counts = counts.detach().to(device="cpu", dtype=torch.int64).view(-1, 1)
+        return (positions < counts).to(torch.float32)
+
     def record(
-        self, *, confidence_raw: torch.Tensor, num_correct_drafts: torch.Tensor
+        self,
+        *,
+        confidence_raw: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        sampled_num_correct_drafts: Optional[torch.Tensor] = None,
+        accept_rates: Optional[torch.Tensor] = None,
+        temperatures: Optional[torch.Tensor] = None,
     ) -> None:
         logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32)
-        positions = torch.arange(self.gamma).view(1, -1)
-        counts = (
-            num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1, 1)
+        bs = logits.shape[0]
+        prefix_mask = self._prefix_mask(num_correct_drafts)
+        self._buffers["logits"].append(logits)
+        self._buffers["prefix_mask"].append(prefix_mask)
+        self._buffers["sampled_prefix_mask"].append(
+            prefix_mask
+            if sampled_num_correct_drafts is None
+            else self._prefix_mask(sampled_num_correct_drafts)
         )
-        prefix_mask = (positions < counts).to(torch.float32)
-        self._logits_buffer.append(logits)
-        self._prefix_mask_buffer.append(prefix_mask)
-        if len(self._logits_buffer) >= self.flush_every:
+        self._buffers["accept_rates"].append(
+            torch.full((bs, self.gamma), float("nan"))
+            if accept_rates is None
+            else accept_rates.detach().to(device="cpu", dtype=torch.float32)
+        )
+        self._buffers["temperatures"].append(
+            torch.full((bs,), float("nan"))
+            if temperatures is None
+            else temperatures.detach().to(device="cpu", dtype=torch.float32).view(-1)
+        )
+        if len(self._buffers["logits"]) >= self.flush_every:
             self.flush()
 
     def flush(self) -> None:
-        if not self._logits_buffer:
+        if not self._buffers["logits"]:
             return
         shard_path = Path(f"{self.path_stem}.{self._shard_ct}.pt")
         shard_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
-            {
-                "logits": torch.cat(self._logits_buffer, dim=0),
-                "prefix_mask": torch.cat(self._prefix_mask_buffer, dim=0),
-            },
+            {key: torch.cat(values, dim=0) for key, values in self._buffers.items()},
             shard_path,
         )
-        self._logits_buffer.clear()
-        self._prefix_mask_buffer.clear()
+        for values in self._buffers.values():
+            values.clear()
         self._shard_ct += 1

@@ -136,6 +136,54 @@ class TestStsDataRecorder(CustomTestCase):
             shard = torch.load(f"{stem}.0.pt")
         self.assertTrue(torch.equal(shard["prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.equal(shard["logits"], confidence_raw.to(torch.float32)))
+        # A caller with no sampled labels: the accept's outcome is the argmax one, rates and temperatures unknown.
+        self.assertTrue(torch.equal(shard["sampled_prefix_mask"], expected_prefix_mask))
+        self.assertTrue(torch.isnan(shard["accept_rates"]).all())
+        self.assertTrue(torch.isnan(shard["temperatures"]).all())
+
+    def test_records_the_sampled_accepts_outcome_rates_and_temperatures(self):
+        gamma = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=gamma, flush_every=10)
+            recorder.record(
+                confidence_raw=torch.zeros(2, gamma),
+                num_correct_drafts=torch.tensor([0, 3]),
+                sampled_num_correct_drafts=torch.tensor([2, 1]),
+                accept_rates=torch.tensor([[0.9, 0.5, 0.1], [1.0, 0.2, 0.0]]),
+                temperatures=torch.tensor([0.6, 0.6]),
+            )
+            recorder.flush()
+            shard = torch.load(f"{stem}.0.pt")
+            self.assertTrue(torch.equal(shard["prefix_mask"], torch.tensor([[0.0, 0, 0], [1, 1, 1]])))
+            self.assertTrue(torch.equal(shard["sampled_prefix_mask"], torch.tensor([[1.0, 1, 0], [1, 0, 0]])))
+            self.assertTrue(torch.equal(shard["temperatures"], torch.tensor([0.6, 0.6])))
+
+            from sglang.benchmark.dspark_sts_fit import load_collected_labels
+
+            glob = f"{stem}.*.pt"
+            _, argmax = load_collected_labels(data_glob=glob, label="argmax")
+            _, sampled = load_collected_labels(data_glob=glob, label="sampled")
+            _, soft = load_collected_labels(data_glob=glob, label="soft")
+            self.assertTrue(torch.equal(argmax, shard["prefix_mask"].double()))
+            self.assertTrue(torch.equal(sampled, shard["sampled_prefix_mask"].double()))
+            self.assertTrue(torch.allclose(soft, torch.tensor([[0.9, 0.45, 0.045], [1.0, 0.2, 0.0]]).double()))
+            with self.assertRaises(ValueError):
+                load_collected_labels(data_glob=glob, label="soft", temperature=1.0)
+            logits, _ = load_collected_labels(data_glob=glob, label="soft", temperature=0.6)
+            self.assertEqual(logits.shape[0], 2)
+
+    def test_a_shard_without_sampled_labels_refuses_a_sampled_fit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.0.pt"
+            torch.save({"logits": torch.zeros(1, 2), "prefix_mask": torch.ones(1, 2)}, path)
+            from sglang.benchmark.dspark_sts_fit import load_collected_labels
+
+            _, argmax = load_collected_labels(data_glob=str(Path(tmp) / "old.*.pt"), label="argmax")
+            self.assertEqual(argmax.tolist(), [[1.0, 1.0]])
+            for label in ("sampled", "soft"):
+                with self.assertRaises(ValueError):
+                    load_collected_labels(data_glob=str(Path(tmp) / "old.*.pt"), label=label)
 
 
 if __name__ == "__main__":

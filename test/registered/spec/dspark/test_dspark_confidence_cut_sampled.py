@@ -97,6 +97,85 @@ def test_the_sampled_flag_makes_the_cut_apply_to_sampled_single_request_batches(
             assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu").cut_sampled
 
 
+def test_re_tempering_a_head_output_gives_the_sampled_files_survival():
+    from sglang.srt.speculative.dspark_components.dspark_confidence_cut import rescale_confidence
+
+    raw = torch.randn((64, GAMMA)) * 4
+    head_t = torch.tensor([0.89, 0.79, 1.26, 0.89, 0.63])
+    sampled_t = torch.tensor([1.3, 0.5, 2.0, 1.0, 0.9])
+    got = rescale_confidence(torch.sigmoid(raw / head_t), head_t / sampled_t)
+    assert torch.allclose(got, torch.sigmoid(raw / sampled_t), atol=1e-5)
+    edge = torch.tensor([[0.0, 1.0, float("nan"), 0.5, 0.5]])
+    out = rescale_confidence(edge, torch.full((GAMMA,), 2.0))
+    assert out[0, 0] == 0.0 and out[0, 1] == 1.0 and torch.isnan(out[0, 2]) and out[0, 3] == 0.5
+
+
+def _sts_file(path, temperatures):
+    from sglang.srt.speculative.dspark_components.dspark_sts import DSparkStsCalibration
+
+    path.write_text(DSparkStsCalibration(temperatures=temperatures).to_json())
+    return str(path)
+
+
+def test_a_sampled_sts_file_re_tempers_sampled_verifies_only(tmp_path, monkeypatch):
+    from sglang.srt.speculative.dspark_components import dspark_confidence_cut as cc
+
+    head = _sts_file(tmp_path / "head.json", [1.0, 2.0, 1.0, 1.0, 1.0])
+    sampled = _sts_file(tmp_path / "sampled.json", [2.0, 1.0, 1.0, 1.0, 4.0])
+    rescale = cc.sampled_sts_rescale(gamma=GAMMA, head_sts_path=head, sampled_sts_path=sampled, device="cpu")
+    assert rescale.tolist() == [0.5, 2.0, 1.0, 1.0, 0.25]
+    assert cc.sampled_sts_rescale(gamma=GAMMA, head_sts_path=None, sampled_sts_path=sampled, device="cpu").tolist() == [
+        0.5, 1.0, 1.0, 1.0, 0.25
+    ]
+    with pytest.raises(ValueError):
+        cc.sampled_sts_rescale(gamma=4, head_sts_path=head, sampled_sts_path=sampled, device="cpu")
+
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", cut_sampled=True, sampled_rescale=rescale)
+    confidence = torch.full((1, GAMMA), 0.8)
+    assert cut.cut_confidence(confidence, sampled=False) is confidence
+    assert torch.allclose(cut.cut_confidence(confidence, sampled=True), cc.rescale_confidence(confidence, rescale))
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_spec", lambda: SimpleNamespace(speculative_dspark_confidence_sts_path=head)
+    )
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(""):
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH.override(sampled):
+            with envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED.override(False), pytest.raises(ValueError):
+                ConfidenceCut.from_envs(gamma=GAMMA, device="cpu")
+            with envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED.override(True):
+                built = ConfidenceCut.from_envs(gamma=GAMMA, device="cpu")
+        assert built._sampled_rescale.tolist() == rescale.tolist()
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED.override(True):
+            assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu")._sampled_rescale is None
+
+
+def test_the_draft_accept_rates_are_min_one_p_over_q_for_sampled_rows_and_matches_for_greedy_ones():
+    from sglang.srt.speculative.dspark_components.dspark_observability import draft_accept_rates
+
+    gamma, vocab = 2, 3
+    target_logits = torch.log(torch.tensor([[0.5, 0.3, 0.2], [0.1, 0.1, 0.8], [0.3, 0.3, 0.4]] * 2))
+    corrected = torch.log(torch.tensor([[[0.25, 0.5, 0.25], [0.1, 0.2, 0.7]]] * 2))
+    candidates = torch.tensor([[9, 1, 2]] * 2)
+    block = SimpleNamespace(
+        corrected_logits=corrected, temperatures=torch.ones(2), greedy_mask=torch.tensor([False, True])
+    )
+    sampling = SimpleNamespace(
+        is_all_greedy=False, need_top_k_sampling=False, need_top_p_sampling=False, temperatures=torch.ones(2, 1)
+    )
+    rates = draft_accept_rates(
+        candidates=candidates, target_logits=target_logits, draft_block=block, sampling_info=sampling,
+        verify_num_draft_tokens=gamma + 1,
+    )
+    # Row 0 sampled: p/q = 0.3/0.5 and min(1, 0.8/0.7). Row 1 greedy: draft 1 (token 1) is not row 0's argmax (0);
+    # draft 2 (token 2) is row 1's argmax.
+    assert torch.allclose(rates, torch.tensor([[0.6, 1.0], [0.0, 1.0]]), atol=1e-5)
+    greedy_only = draft_accept_rates(
+        candidates=candidates, target_logits=target_logits, draft_block=block, sampling_info=None,
+        verify_num_draft_tokens=gamma + 1,
+    )
+    assert greedy_only.tolist() == [[0.0, 1.0], [0.0, 1.0]]
+
+
 def _decode(verify_lens_fn, *, seed):
     toy = dist.MarkovToy(vocab=VOCAB, gamma=GAMMA, temperature=TEMPERATURE, seed=0)
     generator = torch.Generator().manual_seed(seed)
