@@ -13,7 +13,10 @@ The routing kernels index expert tables by id without a bounds check, so a dead 
 
 The fused graph plan reads the mask (``ExpertStreamer.verify_dead``) and leaves dead routes out of its route counts
 (the residency scores). A dead route still counts in the graph and outcome counters, the residency updater's token
-clock counts every row, and dead rows still run attention, the shared experts and Engram lookups.
+clock counts every row, and dead rows still run attention and the shared experts.
+
+A dead row's Engram lookups post -1 ids, which the native Engram store serves as zero rows with no access, read or
+insert (layers/engram.py, mask_dead_lookup_rows).
 
 Outside a gated verify every row is live, so the masking is an identity wherever it is captured or run.
 """
@@ -149,13 +152,17 @@ def _mask_dead_rows_kernel(
 
 
 def attach_verify_dead_rows(model: torch.nn.Module, dead_rows: VerifyDeadRows) -> int:
-    """Point every expert-streamed EXL3 MoE layer of ``model`` at ``dead_rows``; returns how many it reached."""
+    """Point every expert-streamed EXL3 MoE layer and every Engram embedding of ``model`` at ``dead_rows``; returns
+    how many EXL3 layers it reached."""
+    from sglang.srt.layers.engram import EngramEmbedding
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization.exl3.exl3 import Exl3MoEMethod
 
     attached = 0
     for module in model.modules():
-        if (
+        if isinstance(module, EngramEmbedding):
+            module.verify_dead_rows = dead_rows.dead
+        elif (
             isinstance(module, FusedMoE)
             and isinstance(module.quant_method, Exl3MoEMethod)
             and not module.quant_method.draft

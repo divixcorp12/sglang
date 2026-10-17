@@ -72,7 +72,9 @@ def _layer(directory, layer_id, store):
     table = EngramFileTable.open(str(directory), layer_id=layer_id, num_embeddings=ROWS, dim=DIM)
     # A private store: the shared one keeps rows cached by (layer, id) across tests whose tables differ.
     table._native_store = store
-    return types.SimpleNamespace(file_table=table, dim=DIM, layer_id=layer_id, tp_size=1, _posted_lookup=None)
+    return types.SimpleNamespace(
+        file_table=table, dim=DIM, layer_id=layer_id, tp_size=1, _posted_lookup=None, verify_dead_rows=None
+    )
 
 
 def _private_store():
@@ -291,6 +293,47 @@ def test_a_verify_is_captured_whole_only_with_the_verify_flag(tmp_path, monkeypa
             stream.synchronize()
             for layer, index, out in ((1, 0, out1), (14, 1, out14)):
                 assert torch.equal(out.cpu(), _want(*weights[layer], step_ids[:, index].tolist())), layer
+
+
+@pytest.mark.parametrize("early_post", [True, False])
+def test_a_verifys_dead_rows_read_nothing_and_its_live_rows_are_exact(tmp_path, monkeypatch, early_post):
+    """The captured verify reads VerifyDeadRows.dead at replay: rows past the cut post -1, so the store counts and
+    reads nothing for them and they dequantize to zeros, while the live rows replay the exact rows; a cleared mask
+    serves every row again. Mutant: the post ignoring the mask, or the store counting a -1 -- red."""
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows
+
+    weights = _make_table(tmp_path)
+    layer1, layer14 = _open(tmp_path, monkeypatch, device_wait=True)
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH", "1")
+    dead_rows = VerifyDeadRows(max_rows=VERIFY_TOKENS, device="cuda")
+    layer1.verify_dead_rows = layer14.verify_dead_rows = dead_rows.dead
+    store = layer1.file_table._native_store
+    g = torch.Generator().manual_seed(5)
+    ids = torch.randint(0, ROWS, (VERIFY_TOKENS, 2, 3), generator=g).cuda()
+    graph, out1, out14 = _capture_two_layers(
+        layer1, layer14, ids, early_post=early_post, forbid_host_nodes=True, batch=_verify_batch()
+    )
+    assert len(graph._segments) == 1 and not graph._break_fns
+    contexts = dict(zip((1, 14), graph._retained_host_callbacks))
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for live in (2, 6, 1, 4):
+            step_ids = torch.randint(0, ROWS, ids.shape, generator=g)
+            ids.copy_(step_ids.cuda())
+            dead_rows.set_live_rows(torch.tensor([live], device="cuda"))
+            accesses = store.stats()["accesses"]
+            graph.replay()
+            stream.synchronize()
+            assert store.stats()["accesses"] - accesses == live * 3 * 2, live
+            for layer, index, out in ((1, 0, out1), (14, 1, out14)):
+                where = f"layer {layer} live {live}"
+                posted = contexts[layer].ids.view(VERIFY_TOKENS, 3)
+                assert torch.equal(posted[:live], step_ids[:live, index]), where
+                assert (posted[live:] == engram.DEAD_ROW_ID).all(), where
+                want = _want(*weights[layer], step_ids[:live, index].tolist())
+                assert torch.equal(out.cpu()[:live], want), where
+                assert not out[live:].any(), where
+    dead_rows.clear()
 
 
 def test_the_flag_needs_the_native_store(tmp_path, monkeypatch):
