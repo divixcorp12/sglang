@@ -341,11 +341,13 @@ def test_a_launch_off_the_training_distribution_is_refused():
         format_version=1, layer_ids=(0,), hidden=16, rank=16, experts=8, features=lh.FEATURES, pca_proj_dtype="fp32",
         score_decay=0.98, constant_features={"odds": 1.0}, training={},
     )
-    lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.0)
+    lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.0, confidence_cut=False)
     with pytest.raises(ValueError, match="SGLANG_DSPARK_TOP_PROB_GATE=0.4"):
-        lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.4)
+        lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.4, confidence_cut=False)
+    with pytest.raises(ValueError, match="SGLANG_DSPARK_CONFIDENCE_CUT"):
+        lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.0, confidence_cut=True)
     with pytest.raises(ValueError, match="SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is 0.995"):
-        lh.check_serving_matches_training(meta, insert_decay=0.995, top_prob_gate=0.0)
+        lh.check_serving_matches_training(meta, insert_decay=0.995, top_prob_gate=0.0, confidence_cut=False)
 
 
 def test_every_prefill_starts_a_request_for_the_heads_state():

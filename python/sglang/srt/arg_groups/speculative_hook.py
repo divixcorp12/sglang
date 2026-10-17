@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -225,6 +226,45 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # itself: handed the stand-in, its `declare_resolution` calls would
             # stash on that instead.
             algo.handle_server_args(server_args)
+
+    _check_dspark_confidence_cut(
+        speculative_algorithm=cfg.speculative_algorithm,
+        sts_path=cfg.speculative_dspark_confidence_sts_path,
+    )
+
+
+def _check_dspark_confidence_cut(
+    *, speculative_algorithm: Optional[str], sts_path: Optional[str]
+) -> None:
+    """Refuse a launch SGLANG_DSPARK_CONFIDENCE_CUT cannot serve; off, nothing is checked."""
+    if not envs.SGLANG_DSPARK_CONFIDENCE_CUT.get():
+        return
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if speculative_algorithm != "DSPARK":
+        raise ValueError(
+            "SGLANG_DSPARK_CONFIDENCE_CUT needs --speculative-algorithm DSPARK, got "
+            f"{speculative_algorithm!r}; unset the flag."
+        )
+    if float(envs.SGLANG_DSPARK_TOP_PROB_GATE.get()) != 0:
+        raise ValueError(
+            "SGLANG_DSPARK_CONFIDENCE_CUT and SGLANG_DSPARK_TOP_PROB_GATE are both on, but a verify "
+            "has one cut source; set SGLANG_DSPARK_TOP_PROB_GATE=0 or unset the confidence cut."
+        )
+    if not sts_path:
+        raise ValueError(
+            "SGLANG_DSPARK_CONFIDENCE_CUT needs calibrated confidences; pass "
+            "--speculative-dspark-confidence-sts-path with the fitted STS file."
+        )
+    ragged_mode = read_ragged_verify_mode()
+    if ragged_mode is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "SGLANG_DSPARK_CONFIDENCE_CUT drives the static verify's dead-row mask, but "
+            f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value}; set SGLANG_RAGGED_VERIFY_MODE=static."
+        )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
