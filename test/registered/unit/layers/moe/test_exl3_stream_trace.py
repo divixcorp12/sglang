@@ -68,6 +68,7 @@ def test_trace_lines_carry_route_counts_and_background_reads(tmp_path):
         {"forward": 2, "layer": 0, "tokens": 1, "experts": [0, 1], "counts": [1, 1],
          "vram_miss": 0, "ram_miss": 0, **no_fill, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 2},
     ]
+    assert trace.stats()["background_read_rows"] == 7
 
 
 def test_trace_lines_carry_fill_rows_and_residency_hits(tmp_path):
@@ -79,7 +80,6 @@ def test_trace_lines_carry_fill_rows_and_residency_hits(tmp_path):
     trace.close()
     line = json.loads(path.read_text())
     assert (line["fill_rows"], line["residency_hits"]) == (3, 5)
-    assert trace.stats()["background_read_rows"] == 7
 
 
 def test_logs_every_n_forwards_and_at_close(caplog):

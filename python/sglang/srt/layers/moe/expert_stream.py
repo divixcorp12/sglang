@@ -2049,7 +2049,9 @@ class ExpertStreamer:
         copy_engine_bytes = 0
         pinned_cache = self.pinned_host_cache
         source_bytes = miss_rows * self.bytes_per_expert
-        if (
+        if not miss_rows:
+            pass  # every row is a hot or resident hit: nothing to read
+        elif (
             pinned_cache is not None
             and pinned_cache.capacity
             and self.file_source_bytes_per_expert is not None
