@@ -570,7 +570,11 @@ class DSparkV4MarkovHead(nn.Module):
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
 ) -> Optional[DSparkConfidenceHead]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    # Static verifies every row unless the confidence cut, the head's only static consumer, is on.
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and not envs.SGLANG_DSPARK_CONFIDENCE_CUT.get()
+    ):
         return None
     if not hasattr(config, "enable_confidence_head"):
         logger.warning(

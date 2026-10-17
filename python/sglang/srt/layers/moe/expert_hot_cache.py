@@ -1626,6 +1626,7 @@ class ExpertHotCacheManager:
                 head_file.meta,
                 insert_decay=updater.insert_on_miss_decay,
                 top_prob_gate=envs.SGLANG_DSPARK_TOP_PROB_GATE.get(),
+                confidence_cut=envs.SGLANG_DSPARK_CONFIDENCE_CUT.get(),
             )
             manager.lane_head = LaneHead(head_file, updater.device)
             updater.lane_head = manager.lane_head

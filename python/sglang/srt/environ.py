@@ -822,6 +822,9 @@ class Envs:
     # first draft where the running product of the draft's top-1 softmax probabilities falls below this, and the
     # target routes no experts for the positions past it. 0 is off. 0.4 was the offline replay's best.
     SGLANG_DSPARK_TOP_PROB_GATE = EnvFloat(0.0)
+    # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
+    # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
+    SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
