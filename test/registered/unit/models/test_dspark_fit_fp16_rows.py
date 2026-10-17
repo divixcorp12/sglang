@@ -34,7 +34,7 @@ def _draft(weight: torch.Tensor):
 def _rows(dtype):
     torch.manual_seed(0)
     x = (torch.randn(4, 256) * 20).to(dtype)
-    x[1, 7] = 65504.0  # the largest fp16 value: in range, untouched
+    x[1, 7] = 65280.0  # the largest bf16 value an fp16 cast keeps finite: in range, untouched
     x[2, 3] = _BOS_PEAK
     return x
 
