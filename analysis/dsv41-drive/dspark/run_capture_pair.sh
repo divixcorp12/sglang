@@ -26,6 +26,9 @@ OUT=""; BASE=""; WT=""; PY=/data/models/slang/.venv/bin/python; HICACHE_GIB=12.6
 # The roots prelaunch_evict.py searches for page-cache holders when evicting its listed files leaves node 1 short (the
 # same as arm_env.PROD_PAGE_CACHE_ROOTS).
 HOLDERS="--holders /mnt/nvme0 --holders /mnt/nvme1 --holders /mnt/nvme2 --holders /mnt/nvme4 --holders /data/models"
+# PRELAUNCH_EVICT_HOLDERS=1 also drops the page cache of those holders at the first retry (prelaunch_evict.py
+# --evict-holders; clean pages of files not open for writing). Off by default.
+[ "${PRELAUNCH_EVICT_HOLDERS:-0}" = 1 ] && HOLDERS="$HOLDERS --evict-holders"
 COMMON=(); NAMES=(); SPECS=(); CAP=()
 while [ $# -gt 0 ]; do
   case "$1" in
