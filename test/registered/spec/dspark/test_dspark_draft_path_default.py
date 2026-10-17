@@ -147,6 +147,17 @@ class TestDsparkConfidenceCutRefusals(CustomTestCase):
         ), envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             handle_speculative_decoding(self._cut_server_args())
 
+    def test_collect_mode_needs_no_sts_file(self):
+        """Collecting STS data builds the head with no table; the cut stays off, so the launch is admitted."""
+        server_args = self._cut_server_args()
+        server_args.speculative_dspark_confidence_sts_path = None
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+            True
+        ), envs.SGLANG_RAGGED_VERIFY_MODE.override(
+            "static"
+        ), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/captures/sts.jsonl"):
+            handle_speculative_decoding(server_args)
+
     def test_each_refusal_names_its_fix(self):
         refusals = {
             "speculative-algorithm DSPARK": dict(speculative_algorithm=None),

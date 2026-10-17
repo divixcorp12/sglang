@@ -254,10 +254,12 @@ def _check_dspark_confidence_cut(
             "SGLANG_DSPARK_CONFIDENCE_CUT and SGLANG_DSPARK_TOP_PROB_GATE are both on, but a verify "
             "has one cut source; set SGLANG_DSPARK_TOP_PROB_GATE=0 or unset the confidence cut."
         )
-    if not sts_path:
+    # Collect mode (STS collect path, no table) builds the head only to record raw scores; the cut stays off.
+    if not sts_path and not envs.SGLANG_DSPARK_STS_COLLECT_PATH.get():
         raise ValueError(
             "SGLANG_DSPARK_CONFIDENCE_CUT needs calibrated confidences; pass "
-            "--speculative-dspark-confidence-sts-path with the fitted STS file."
+            "--speculative-dspark-confidence-sts-path with the fitted STS file "
+            "(or set SGLANG_DSPARK_STS_COLLECT_PATH to collect them)."
         )
     ragged_mode = read_ragged_verify_mode()
     if ragged_mode is not RaggedVerifyMode.STATIC:
