@@ -54,6 +54,15 @@ struct Table {
   uint64_t weight_offset, scale_offset;
   int64_t rows, dim, scale_dim;
   int64_t tag;
+  // 0: the checkpoint's split layout, row id at weight_offset + id*dim and scale_offset + id*scale_dim. N: the packed
+  // layout (engram_packed.py), N rows of dim+scale_dim bytes per 4 KiB page; weight_offset is page 0 and
+  // scale_offset page 0 + dim, so both ranges of a row lie in its one page.
+  int64_t rows_per_page = 0;
+  uint64_t weight_pos(int64_t id) const { return weight_offset + (rows_per_page ? packed_pos(id) : uint64_t(id) * dim); }
+  uint64_t scale_pos(int64_t id) const { return scale_offset + (rows_per_page ? packed_pos(id) : uint64_t(id) * scale_dim); }
+  uint64_t packed_pos(int64_t id) const {
+    return uint64_t(id / rows_per_page) * 4096 + uint64_t(id % rows_per_page) * uint64_t(dim + scale_dim);
+  }
 };
 
 struct Counters {
@@ -94,7 +103,16 @@ class Store {
   }
   ~Store(){ stop(); std::free(bounce_); if(data_) munmap(data_,nsets_*ways_*row_bytes_); }
 
-  void register_table(const Table& t) { std::lock_guard<std::mutex> l(mu_); tables_[t.tag]=t; }
+  void register_table(const Table& t) {
+    if (t.rows_per_page < 0 || t.rows_per_page * (t.dim + t.scale_dim) > 4096)
+      throw std::invalid_argument("invalid Engram rows per page");
+    std::lock_guard<std::mutex> l(mu_);
+    // A lookup context registers its table again; one built without the file's layout would read wrong rows.
+    auto it=tables_.find(t.tag);
+    if (it!=tables_.end() && it->second.path==t.path && it->second.rows_per_page!=t.rows_per_page)
+      throw std::invalid_argument("Engram table "+t.path+" registered again with another layout");
+    tables_[t.tag]=t;
+  }
   void adjust_staging(int64_t host_bytes, int64_t device_bytes) {
     std::lock_guard<std::mutex> l(stats_mu_);
     stats_.pinned_staging_bytes += host_bytes;
@@ -226,8 +244,8 @@ class Store {
           uint64_t first=off&~uint64_t(4095), last=(off+length-1)&~uint64_t(4095);
           for(uint64_t p=first;;p+=4096){fn(p);if(p==last)break;}
         };
-        add_range(t.weight_offset+id*t.dim,t.dim);
-        add_range(t.scale_offset+id*t.scale_dim,t.scale_dim);
+        add_range(t.weight_pos(id),t.dim);
+        add_range(t.scale_pos(id),t.scale_dim);
       };
       // One chunk's reads must fit the fixed bounce buffer, so a request whose misses do
       // not all fit is split into several chunks rather than refused. Reading every miss
@@ -322,7 +340,7 @@ class Store {
         };
         for(size_t j=chunk_begin;j<chunk_end;j++) {
           int64_t id=misses[j]; uint8_t* dst=q.out+miss_positions[j][0]*rb;
-          uint64_t wo=t.weight_offset+id*t.dim, so=t.scale_offset+id*t.scale_dim;
+          uint64_t wo=t.weight_pos(id), so=t.scale_pos(id);
           auto scatter=[&](uint64_t off,size_t len,uint8_t* out)->bool {
             size_t done=0;
             while(done<len) {
@@ -372,9 +390,9 @@ class EngramHostLookup {
                    int64_t num_embeddings, int64_t dim, int64_t scale_dim,
                    int64_t tag, int64_t n, uintptr_t ids, uintptr_t rows,
                    uintptr_t status, int64_t host_stage_bytes,
-                   int64_t device_stage_bytes)
+                   int64_t device_stage_bytes, int64_t rows_per_page = 0)
     : store_(std::move(store)),
-      table_{path, weight_offset, scale_offset, num_embeddings, dim, scale_dim, tag},
+      table_{path, weight_offset, scale_offset, num_embeddings, dim, scale_dim, tag, rows_per_page},
       n_(n),ids_(ids),rows_(rows),status_(status),
       host_stage_bytes_(host_stage_bytes),device_stage_bytes_(device_stage_bytes) {
     store_->register_table(table_);
@@ -455,9 +473,9 @@ class RingLookup {
  public:
   RingLookup(std::shared_ptr<Store> store, const std::string& path, uint64_t weight_offset, uint64_t scale_offset,
              int64_t num_embeddings, int64_t dim, int64_t scale_dim, int64_t tag, int64_t n, uintptr_t ids,
-             uintptr_t rows, uintptr_t control)
+             uintptr_t rows, uintptr_t control, int64_t rows_per_page = 0)
     : store_(std::move(store)),
-      table_{path, weight_offset, scale_offset, num_embeddings, dim, scale_dim, tag},
+      table_{path, weight_offset, scale_offset, num_embeddings, dim, scale_dim, tag, rows_per_page},
       n_(n), ids_(ids), rows_(rows), control_(reinterpret_cast<int32_t*>(control)) {
     if (n <= 0) throw std::invalid_argument("Engram ring lookup needs at least one id");
     store_->register_table(table_);
@@ -550,7 +568,9 @@ void RingService::loop() {
 
 PYBIND11_MODULE(engram_host_node_cpp,m) {
   py::class_<Store,std::shared_ptr<Store>>(m,"Store")
-   .def("register_table",[](Store& s,const std::string& path,uint64_t wo,uint64_t so,int64_t n,int64_t d,int64_t sd,int64_t tag){s.register_table(Table{path,wo,so,n,d,sd,tag});})
+   // The trailing rows_per_page (Table) defaults to 0, the split layout, in every binding.
+   .def("register_table",[](Store& s,const std::string& path,uint64_t wo,uint64_t so,int64_t n,int64_t d,int64_t sd,int64_t tag,int64_t rpp){s.register_table(Table{path,wo,so,n,d,sd,tag,rpp});},
+        py::arg("path"),py::arg("weight_offset"),py::arg("scale_offset"),py::arg("rows"),py::arg("dim"),py::arg("scale_dim"),py::arg("tag"),py::arg("rows_per_page")=0)
    .def("lookup",[](Store& s,py::array_t<int64_t,py::array::c_style|py::array::forcecast> ids,int64_t tag){auto in=ids.unchecked<1>();py::array_t<uint8_t> out({in.shape(0),s.stats()["row_bytes"].cast<int64_t>()});auto* p=out.mutable_data();{py::gil_scoped_release release;s.lookup(in.data(0),p,in.shape(0),tag);}return out;})
    .def("stats",&Store::stats)
    .def("adjust_staging",&Store::adjust_staging);
@@ -558,10 +578,12 @@ PYBIND11_MODULE(engram_host_node_cpp,m) {
   m.def("create_store",[](size_t budget,int64_t row_bytes){return std::make_shared<Store>(budget,row_bytes);});
   py::class_<EngramHostLookup>(m,"EngramHostLookup")
    .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t,int64_t,int64_t>())
+   .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t,int64_t,int64_t,int64_t>())
    .def("enqueue",&EngramHostLookup::enqueue).def("run",&EngramHostLookup::run);
   py::class_<Table>(m,"Table");
   py::class_<RingLookup>(m,"RingLookup")
    .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t>())
+   .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t,int64_t>())
    .def("close",&RingLookup::close,py::call_guard<py::gil_scoped_release>())
    .def("set_test_delay_us",&RingLookup::set_test_delay_us)
    .def("served",&RingLookup::served)

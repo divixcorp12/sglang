@@ -94,6 +94,7 @@ class _EngramHostLookupContext:
             + self.status.numel() * self.status.element_size(),
             indices.numel() * (file_table.dim + file_table.dim // file_table.block)
             + self.status.element_size(),
+            file_table.rows_per_page,
         )
         self.packed_gpu = torch.empty(
             self.rows.shape, dtype=torch.uint8, device=indices.device
@@ -247,6 +248,7 @@ class _EngramDeviceWaitLookup:
             self.ids.data_ptr(),
             self.rows.data_ptr(),
             self.control.data_ptr(),
+            file_table.rows_per_page,
         )
 
     def post(self, indices: torch.Tensor) -> None:

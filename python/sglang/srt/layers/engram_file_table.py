@@ -5,6 +5,8 @@ touches 24 rows per token. Rows are gathered on the CPU, copied to the device
 and dequantized there. Eager, or an eager break of a breakable graph. By default rows come from an np.memmap and
 the page cache does the caching; with SGLANG_DSV41_ENGRAM_RAM_GIB set, a bounded
 RAM row cache shared by every Engram layer does, and misses read with O_DIRECT.
+A shard holds the checkpoint's split weight/scale tensors or one page-packed tensor
+(engram_packed.py); the table directory decides which, per layer.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+from sglang.srt.layers import engram_packed
 from sglang.srt.layers.moe.exl3_expert_layout import read_safetensors_header
 from sglang.srt.layers.quantization.exl3.ops import assert_not_capturing
 from sglang.srt.environ import envs
@@ -90,24 +93,34 @@ class EngramFileTable:
         direct: bool = True,
     ):
         data_start, header = read_safetensors_header(path)
-        w, s = header[weight_key], header[scale_key]
-        if (w["dtype"], s["dtype"]) != ("F8_E4M3", "F8_E8M0"):
-            raise ValueError(f"{path}: expected F8_E4M3/F8_E8M0, got {w['dtype']}/{s['dtype']}")
-        if w["shape"] != [num_embeddings, dim] or s["shape"] != [num_embeddings, dim // block]:
-            raise ValueError(
-                f"{path}: rows/shape {w['shape']} {s['shape']} != [{num_embeddings}, {dim}]"
-            )
         self.dim, self.block = dim, block
         self.path = path
-        self.weight_offset = data_start + w["data_offsets"][0]
-        self.scale_offset = data_start + s["data_offsets"][0]
         self.num_embeddings = num_embeddings
         self._host_node_extension = None
         self._native_store = None
-        self.weight = np.memmap(path, np.uint8, "r", data_start + w["data_offsets"][0], (num_embeddings, dim))
-        self.scale = np.memmap(
-            path, np.uint8, "r", data_start + s["data_offsets"][0], (num_embeddings, dim // block)
-        )
+        # 0: the checkpoint's split layout. N: the packed layout (engram_packed.py), N rows per 4 KiB page, where
+        # weight_offset is page 0 and scale_offset is page 0 + dim, so a row's two ranges are offset + its row offset.
+        self.rows_per_page = 0
+        if engram_packed.is_packed(header, weight_key):
+            offset, geometry = engram_packed.read_packed_geometry(path, weight_key, num_embeddings, dim, block)
+            self.rows_per_page = geometry.rows_per_page
+            self.weight_offset, self.scale_offset = offset, offset + dim
+            self.weight = self.scale = None
+            self._packed = engram_packed.packed_rows_view(
+                np.memmap(path, np.uint8, "r", offset, (geometry.pages, engram_packed.PAGE_BYTES)), dim, dim // block
+            )
+        else:
+            w, s = header[weight_key], header[scale_key]
+            if (w["dtype"], s["dtype"]) != ("F8_E4M3", "F8_E8M0"):
+                raise ValueError(f"{path}: expected F8_E4M3/F8_E8M0, got {w['dtype']}/{s['dtype']}")
+            if w["shape"] != [num_embeddings, dim] or s["shape"] != [num_embeddings, dim // block]:
+                raise ValueError(
+                    f"{path}: rows/shape {w['shape']} {s['shape']} != [{num_embeddings}, {dim}]"
+                )
+            self.weight_offset = data_start + w["data_offsets"][0]
+            self.scale_offset = data_start + s["data_offsets"][0]
+            self.weight = np.memmap(path, np.uint8, "r", self.weight_offset, (num_embeddings, dim))
+            self.scale = np.memmap(path, np.uint8, "r", self.scale_offset, (num_embeddings, dim // block))
         self.cache = cache
         # Row ids of different layers share one cache; the tag keeps them apart.
         self._tag = cache_tag << 40
@@ -118,6 +131,12 @@ class EngramFileTable:
             )
 
             reader = reader if reader is not None else shared_uring_file_reader()
+            if self.rows_per_page:
+                self._page_rows = PagedRowSource(
+                    reader, path, engram_packed.PAGE_BYTES, self._packed.shape[0], direct=direct,
+                    base_offset=self.weight_offset,
+                )
+                return
             self._weight_rows = PagedRowSource(
                 reader, path, dim, num_embeddings, direct=direct,
                 base_offset=self.weight_offset,
@@ -131,6 +150,11 @@ class EngramFileTable:
         ids = torch.from_numpy(keys - self._tag)
         # The file reader needs CPU destinations; a default device (the reference
         # oracle sets "cuda") must not move them.
+        if self.rows_per_page:
+            pages = torch.empty((ids.numel(), engram_packed.PAGE_BYTES), dtype=torch.uint8, device="cpu")
+            self._page_rows.read_rows(ids // self.rows_per_page, pages)
+            slots = engram_packed.packed_rows_view(pages.numpy(), self.dim, self.dim // self.block)
+            return slots[np.arange(ids.numel()), (ids % self.rows_per_page).numpy()]
         weight = torch.empty((ids.numel(), self.dim), dtype=torch.uint8, device="cpu")
         scale = torch.empty((ids.numel(), self.dim // self.block), dtype=torch.uint8, device="cpu")
         self._weight_rows.read_rows(ids, weight)
@@ -138,6 +162,9 @@ class EngramFileTable:
         return torch.cat([weight, scale], dim=1).numpy()
 
     def _rows(self, flat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self.cache is None and self.rows_per_page:
+            rows = self._packed[flat // self.rows_per_page, flat % self.rows_per_page]
+            return np.ascontiguousarray(rows[:, : self.dim]), np.ascontiguousarray(rows[:, self.dim :])
         if self.cache is None:
             return self.weight[flat], self.scale[flat]
         rows = self.cache.lookup(flat.astype(np.int64) + self._tag, self._fetch)
@@ -156,7 +183,7 @@ class EngramFileTable:
         weight_key = f"layers.{layer_id}.engram.embed.weight"
         for path in sorted(glob.glob(os.path.join(table_dir, "*.safetensors"))):
             _, header = read_safetensors_header(path)
-            if weight_key in header:
+            if weight_key in header or engram_packed.is_packed(header, weight_key):
                 from sglang.srt.layers.engram_row_cache import shared_engram_row_cache
 
                 scale_key = f"layers.{layer_id}.engram.embed.scale"
@@ -180,7 +207,7 @@ class EngramFileTable:
                         log_native_stats(table._native_store)
                         table._native_store.register_table(
                             path, table.weight_offset, table.scale_offset,
-                            num_embeddings, dim, dim // table.block, layer_id << 40,
+                            num_embeddings, dim, dim // table.block, layer_id << 40, table.rows_per_page,
                         )
                     except Exception as exc:
                         raise RuntimeError(
