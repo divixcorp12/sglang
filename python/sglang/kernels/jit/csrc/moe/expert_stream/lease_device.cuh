@@ -83,6 +83,17 @@ SGL_DEVICE bool listed(const int32_t* ids, int count, int32_t id) {
   return false;
 }
 
+// The live tokens of `tokens` rows of `top_k` routes each: through the last row with a route >= 0, at least 1 (the
+// anchor). A verify's dead rows hold only -1 routes and are a suffix (layers/moe/verify_dead_rows.py), so with none
+// dead this is `tokens`. Routes at or past route_count count as -1.
+SGL_DEVICE int64_t live_route_tokens(const int64_t* routes, int64_t route_count, int64_t tokens, int64_t top_k) {
+  int64_t live = 1;
+  for (int64_t t = 1; t < tokens; ++t)
+    for (int64_t k = 0; k < top_k && t * top_k + k < route_count; ++k)
+      if (routes[t * top_k + k] >= 0) live = t + 1;
+  return live;
+}
+
 // The generation G of the request the chain serves. kPending and kPendingEpoch change only at the next post,
 // stream-ordered after the chain's last kernel, so every kernel of the chain reads the same value.
 SGL_DEVICE uint64_t pending_generation(const int32_t* state) {

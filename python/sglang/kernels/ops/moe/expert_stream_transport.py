@@ -3190,11 +3190,13 @@ def run_spec_score(x, w, bias, scores, *, module=None) -> None:
 
 def run_spec_select(
     scores, tokens, *, top_k, per_token, top_k_only, hot_slots, hot_capacity, ram_slot, target, state, candidates,
-    module=None,
+    routes=None, route_top_k=0, module=None,
 ) -> None:
     """The GPU scorer's select kernel: ranks ``scores``' first ``tokens`` rows past ``hot_slots[:hot_capacity]`` and
     the experts ``ram_slot[target]`` maps, and publishes up to CAND_MAX candidates to the slot of ``state``'s posted
-    seq in the pinned ``candidates`` page; count 0 when ``tokens`` is outside 1..scores' rows."""
+    seq in the pinned ``candidates`` page; count 0 when ``tokens`` is outside 1..scores' rows. With ``routes`` (int64
+    flat, ``route_top_k`` per token) it ranks only the rows through the last with a route >= 0: a verify's dead rows
+    (layers/moe/verify_dead_rows.py) take no picks."""
     (module or _device_module()).expert_stream_spec_select(
         scores,
         int(tokens),
@@ -3207,6 +3209,8 @@ def run_spec_select(
         int(target),
         state,
         int(candidates.data_ptr()),
+        routes,
+        int(route_top_k),
     )
 
 
@@ -3820,8 +3824,9 @@ class ExpertStreamDevice:
                 scores = self.spec_head.workspace.block_scores.view(1, -1)
                 self._spec_drip_launch(entry, scores, 1 if in_range else 0, module)
             return
-        self._spec_select_launch(entry, x, tokens, module)
+        self._spec_select_launch(entry, x, tokens, module, routes=routes, route_weights=route_weights)
         if self.drip_picks:
+            # A dead row's scores are the anchor's (its input is), so the rows' max is the live rows'.
             rows = tokens if 1 <= tokens <= self.cpu_tokens_max else 0
             self._spec_drip_launch(entry, self.spec_scores, rows, module)
 
@@ -3839,10 +3844,14 @@ class ExpertStreamDevice:
             module=module,
         )
 
-    def _spec_select_launch(self, entry, x, tokens: int, module) -> None:
+    def _spec_select_launch(self, entry, x, tokens: int, module, *, routes=None, route_weights=None) -> None:
         top_k, per_token, top_k_only = self._spec
         if 1 <= tokens <= self.cpu_tokens_max:
             run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
+        # The post's routes per token, as the post kernel derives them (cpu_weights_count / cpu_tokens).
+        route_top_k = (
+            route_weights.numel() // tokens if routes is not None and route_weights is not None and tokens else 0
+        )
         run_spec_select(
             self.spec_scores,
             tokens,
@@ -3855,6 +3864,8 @@ class ExpertStreamDevice:
             target=entry.target,
             state=self.state,
             candidates=self.spec_candidates,
+            routes=routes if route_top_k else None,
+            route_top_k=route_top_k,
             module=module,
         )
 

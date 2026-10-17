@@ -5,13 +5,15 @@ position, but the verify still runs every row of its one captured graph. The row
 expert-stream MoE gives a dead row the first row's experts at weight 0, so the route planner, which dedupes an expert's
 routes onto its first, opens no lane, miss read or CPU job for it. It also writes -1 for a dead row into the RAM-miss
 backend's routes, which a CPU expert job's token mask, the protect set and the prefetch scorer read. The scorer's input
-rows of a dead row are the first row's.
+rows of a dead row are the first row's; the post derives the live tokens from the -1 routes (dead rows are a suffix),
+and both prefetch scorers rank only those (the token table's live count, the GPU select kernel's routes).
 
 The routing kernels index expert tables by id without a bounds check, so a dead route must stay a valid expert id;
 -1 only goes into ``routes``, whose readers skip it. Row 0 (the anchor) is never dead.
 
-A dead route still counts toward the first row's experts in the planner's route counts (the residency scores) and the
-graph counters, and dead rows still run attention, the shared experts and Engram lookups.
+The fused graph plan reads the mask (``ExpertStreamer.verify_dead``) and leaves dead routes out of its route counts
+(the residency scores). A dead route still counts in the graph and outcome counters, the residency updater's token
+clock counts every row, and dead rows still run attention, the shared experts and Engram lookups.
 
 Outside a gated verify every row is live, so the masking is an identity wherever it is captured or run.
 """
