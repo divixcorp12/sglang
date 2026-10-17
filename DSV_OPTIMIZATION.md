@@ -1501,6 +1501,25 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   - a complete audit of the work dead rows still do (attention, shared experts, Engram lookups and more), then skipping
     the Engram lookups for dead rows. Engram tables are almost entirely on disk, so each dead row's lookups are
     expensive.
+- **Dead-row audit** (2026-10-16, read-only; confcut smoke server.log Engram stats against verify.jsonl, prefill-free
+  60 s windows only):
+  - **Engram lookups are the only disk/host work a dead row still causes.** Both runs do 288 accesses per verify
+    (6 rows x 24 hash columns x layers 1 and 14), so the cut saves none today. At cap len 3.90, 2.1 of 6 rows are dead,
+    about 101 accesses and 65 unique misses per verify, which is about 130 4 KiB O_DIRECT reads (0.5 MiB) on nvme2n1.
+    nvme2n1 is also an expert mirror root, and it served 2.4x nvme0n1's read count for the same MiB. Estimated
+    0.3-1 ms per verify; not measured, because ring wait stats are not logged. Fix in progress: a -1 sentinel that the
+    native Store skips (zero row, no access counted), applied in graph from `VerifyDeadRows.dead`.
+  - **Everything else a dead row runs is GPU work at about 0 marginal cost at 6 rows**: indexer scoring and top-k (under
+    0.05 ms at 3K context, growing with context), the sparse MLA gather (about 0.02 ms), KV and compressor-state writes
+    (position-keyed, every ring has margin, never read back), shared expert, projections and lm_head. A static graph
+    cannot shrink M, so none of it is worth skipping now. The indexer is the one to revisit at long context.
+  - **No functional consumer reads a dead row**: accept, bonus (correct_len is capped at L-1), KV/state, the draft
+    hidden inject and the Engram/n-gram history all key off commit_lens. Three metrics do read dead rows, and are
+    already counterfactual because those rows route no experts:
+    - `cap_trim_lens` reads the uncapped correct_len and feeds `block_accept_lens`;
+    - the debug confidence metrics and `block_accept_recorder` read every row's logits;
+    - dead routes count toward row 0's experts in the planner route counts.
+    Outputs are unaffected. Fix them if any of those metrics gets used for a decision.
 - **TODO (owner, 2026-10-16):**
   - Broaden the STS calibration data: collect a few more prompt types (code, chat, short answers) and refit.
     Positions 4-5 have the fewest samples.
