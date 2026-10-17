@@ -1,4 +1,5 @@
-"""The scheduler's end of the server's startup warm-up: arm the EXL3 RAM-miss copy engine once it is over.
+"""The scheduler's end of the server's startup warm-up: arm the Triton load watcher and the EXL3 RAM-miss copy engine
+once it is over.
 
 The HTTP process sends ``EndStartupWarmupReqInput`` after its last warm-up request and before it reports ready, and
 waits for the reply. The copy engine's arming calibrates the CPU split and split model, whose timings any other CPU,
@@ -14,11 +15,13 @@ import sys
 import time
 from typing import Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.copy_engine_quiet import QUIET_TIMEOUT_S
 from sglang.srt.managers.io_struct import (
     EndStartupWarmupReqInput,
     EndStartupWarmupReqOutput,
 )
+from sglang.srt.utils import triton_load_watch
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,8 @@ class SchedulerStartupWarmupEnd:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         timeout_s: float = QUIET_TIMEOUT_S,
+        mark_serving_started: Callable[[], None] = triton_load_watch.mark_serving_started,
+        rust_server: Callable[[], bool] = envs.SGLANG_RUST_SERVER.get,
     ) -> None:
         self._is_fully_idle = is_fully_idle
         self._send_output = send_output
@@ -60,12 +65,21 @@ class SchedulerStartupWarmupEnd:
         self._due_at: Optional[float] = None
         self._busy_since: Optional[float] = None
         self._scheduler_busy_s = 0.0
+        self._mark_serving_started = mark_serving_started
+        self._rust_server = rust_server
+
+    def on_event_loop_start(self) -> None:
+        """The Rust server sends no warm-up end, so its load watcher arms here, as before the signal existed."""
+        if self._rust_server():
+            self._mark_serving_started()
 
     def handle(self, recv_req: EndStartupWarmupReqInput) -> Optional[EndStartupWarmupReqOutput]:
         if self._warmup_ended:
             return EndStartupWarmupReqOutput(success=True, message="startup warm-up already ended")
         self._warmup_ended = True
         self._warmup_ended_at = recv_req.warmup_ended_at
+        # Before the calibration and the ready: a Triton load from here on is a serving-time first use.
+        self._mark_serving_started()
         self._pending = recv_req
         return self._step(reply_inline=True)
 

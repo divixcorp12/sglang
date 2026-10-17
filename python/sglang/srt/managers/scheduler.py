@@ -1971,10 +1971,10 @@ class Scheduler(
 
         The event loop blocks until shutdown.
         """
-        # Engine init (graph capture, warmups) is done; from here on any
-        # Triton kernel device-load is a lazy first-use at serving time.
+        # Engine init (graph capture) is done. The load watcher arms when the
+        # HTTP startup warm-ups end (startup_warmup_end), since they run after this.
         triton_load_watch.install()
-        triton_load_watch.mark_serving_started()
+        self.startup_warmup_end.on_event_loop_start()
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
