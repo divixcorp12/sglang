@@ -1155,8 +1155,11 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
     }
     calibrations = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": ("0", "1"),
                     "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
+    # Layer-major prefill under DSpark: production since 2026-10-17 (owner), never served on the best arm.
+    layer_major = {"SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": ("0", "8192"),
+                   "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1")}
     rest = {k: v for k, v in differs.items() if k not in prefetch}
-    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
     argv = arm_env.ServerArgs.prod().argv()
     flags = ab.server_flags(arm)
@@ -1219,19 +1222,20 @@ def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the
     assert flags[-2:] == (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
 
 
-def test_the_layer_major_arm_is_prod_with_layer_major_prefill_and_every_other_arm_keeps_it_off():
-    """-prod-layermajor is -prod with the 8192-token threshold and the DSpark switch alone, and no other arm sets
-    either (dspark_env() keeps the threshold 0 beneath them). Mutant: another arm turns it on, or the arm changes
-    another knob -- red."""
+def test_the_production_arms_prefill_layer_major_and_every_other_arm_keeps_it_off():
+    """Production prefills layer-major under DSpark since 2026-10-17 (arm_env.prod_dspark_env), so -prod and every arm
+    built on it carry the 8192-token threshold and the DSpark switch, and -prod-layermajor now equals -prod. No other
+    arm sets either (dspark_env() keeps the threshold 0 beneath them). Mutant: another arm turns it on, or production
+    drops it -- red."""
     ab = _ab()
     threshold, switch = "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS", "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"
     for arm, (overrides, _) in ab.ARMS.items():
-        if arm not in LAYER_MAJOR_ARMS:
+        if arm in PROD_ARMS:
+            assert (overrides[threshold], overrides[switch]) == ("8192", "1"), arm
+        else:
             assert overrides.get(threshold, "0") == "0" and switch not in overrides, arm
     assert ab.arm_env.dspark_env()[threshold] == "0"
-    lm = ab.ARMS[LAYER_MAJOR_ARM][0]
-    assert (lm[threshold], lm[switch]) == ("8192", "1")
-    assert {k: v for k, v in lm.items() if k != switch} == {**ab.ARMS[PROD_ARM][0], threshold: "8192"}
+    assert ab.ARMS[LAYER_MAJOR_ARM][0] == ab.ARMS[PROD_ARM][0]
     assert ab.ARMS[LAYER_MAJOR_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_ARM] == PROD_ARM
     assert ab.server_flags(LAYER_MAJOR_ARM) == ab.server_flags(PROD_ARM)
 

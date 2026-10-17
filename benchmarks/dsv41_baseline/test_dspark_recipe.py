@@ -55,6 +55,23 @@ def test_prod_env_carries_the_best_arms_settings_and_both_startup_calibrations()
     assert {k: env.get(k) for k in PROD_DSPARK_SETTINGS} == PROD_DSPARK_SETTINGS
 
 
+def test_prod_prefills_layer_major_under_dspark_and_the_arms_do_not():
+    # Owner decision 2026-10-17: production turns layer-major prefill on under DSpark (threshold and the DSpark switch,
+    # which layer_major/gate.py needs under speculative decoding); residency stays off. dspark_env() keeps it off for
+    # every arm built on it.
+    env = arm_env.prod_env()
+    assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "8192"
+    assert env["SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"] == "1"
+    assert "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS" not in env
+    assert arm_env.dspark_env()["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
+    assert "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK" not in arm_env.dspark_env()
+    # The gate's launch checks production meets: one running request and the DSpark algorithm.
+    argv = arm_env.ServerArgs.prod().argv()
+    assert argv[argv.index("--max-running-requests") + 1] == "1"
+    assert argv[argv.index("--speculative-algorithm") + 1] == "DSPARK"
+    assert int(env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"]) > arm_env.CHUNKED_PREFILL_SIZE  # above the ring
+
+
 def test_prod_leaves_the_pending_and_held_flags_off():
     env = arm_env.prod_env()
     # The side stream waits on its own A/B; the lane head is held; the rest measured neutral or not served.

@@ -332,7 +332,8 @@ def dspark_env() -> dict[str, str]:
         # the first 8 VRAM victims; the rest are CPU lanes, a miss among them read into a RAM victim (Owner decision 3).
         "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "8",
         "SGLANG_RAGGED_VERIFY_MODE": "static",
-        # Layer-major prefill refuses speculative decoding (layer_major/gate.py).
+        # Layer-major prefill off for the arms: under speculative decoding it needs SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK
+        # as well (layer_major/gate.py refuses the launch otherwise). Production turns both on in prod_dspark_env().
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
         # The draft's CPU experts as a second job source of node 0's CPU expert team (one team per node), on the
         # optimized build (its gate names both defines).
@@ -418,6 +419,12 @@ def prod_dspark_env() -> dict[str, str]:
         "SGLANG_DSV41_RAM_PREFETCH_PROMOTE": "1",
         "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE": "1",
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",  # the older GPU-side expert prefetch stays off (base_env's, stated)
+        # Layer-major prefill under DSpark: every uncached suffix of 8192+ tokens is prefilled layer by layer, as
+        # base_env() does for the non-DSpark recipe (token 0 identical to chunked at 8k-33k, DSV41_REFERENCE.md 27.19,
+        # 27.20). Owner decision 2026-10-17, with no served A/B first (both_cpu_ab's -prod-layermajor is that arm). The
+        # expert residency (SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS) stays off.
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
+        "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": "1",
     }
 
 

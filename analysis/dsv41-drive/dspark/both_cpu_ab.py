@@ -593,8 +593,9 @@ STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
 # fails.
 CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
 ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
-# Layer-major prefill under DSpark (prototype, branch layer-major-dspark): production with every uncached suffix of
-# 8192+ tokens prefilled layer by layer. dspark_env() keeps the threshold at 0 for every other arm.
+# Layer-major prefill under DSpark (branch layer-major-dspark): production with every uncached suffix of 8192+ tokens
+# prefilled layer by layer. Production itself has it on since 2026-10-17 (arm_env.prod_dspark_env), so -prod and the
+# arms built on it carry it and this arm now equals -prod; dspark_env() keeps the threshold at 0 for every other arm.
 LAYER_MAJOR_ARM = PROD_ARM + "-layermajor"
 ARMS[LAYER_MAJOR_ARM] = (
     {
