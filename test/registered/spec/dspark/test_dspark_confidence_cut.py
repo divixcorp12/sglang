@@ -187,7 +187,7 @@ def test_no_verify_is_forced_or_timed_before_the_gate_opens_then_calibration_sta
     starts = [r.getMessage() for r in caplog.records if "calibration starts" in r.getMessage()]
     assert starts == [
         "dspark confidence cut: T(w) calibration starts at eligible verify 8, after 7 held back (engine init and "
-        "CUDA graph capture done True, RAM-miss copy engine armed, serving request True): 96 verifies, widths 1..6 "
+        "startup warm-up done True, RAM-miss copy engine armed, serving request True): 96 verifies, widths 1..6 "
         "round robin"
     ]
     assert len(timings.events) == 2

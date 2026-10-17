@@ -35,11 +35,12 @@ class FakeService:
 
 
 class Harness:
-    def __init__(self, service, *, idle=True):
+    def __init__(self, service, *, idle=True, rust_server=False, mark=None):
         self.service = service
         self.idle = idle
         self.now = 1000.0
         self.sent = []
+        self.marks = []
         self.end = swe.SchedulerStartupWarmupEnd(
             is_fully_idle=lambda: self.idle,
             send_output=lambda output, req: self.sent.append((output, req)),
@@ -47,6 +48,8 @@ class Harness:
             clock=lambda: self.now,
             wall_clock=lambda: 5000.0,
             timeout_s=30.0,
+            mark_serving_started=mark or (lambda: self.marks.append(len(getattr(self.service, "calls", [])))),
+            rust_server=lambda: rust_server,
         )
 
 
@@ -126,3 +129,66 @@ def test_no_copy_engine_replies_at_once():
     assert h.end.handle(EndStartupWarmupReqInput()).message == "no copy engine to arm"
     h.end.check_pending()
     assert h.service.calls == []
+
+
+def test_the_load_watcher_arms_at_the_signal_before_the_calibration():
+    h = Harness(FakeService())
+    h.end.on_event_loop_start()
+    h.end.check_pending()
+    assert h.marks == []
+    h.end.handle(EndStartupWarmupReqInput(warmup_ended_at=4999.0))
+    assert h.marks == [0] and len(h.service.calls) == 1, "the watcher armed after the calibration, or not at all"
+    h.end.handle(EndStartupWarmupReqInput(warmup_ended_at=None))
+    assert h.marks == [0]
+    # A server that skips its warm-ups sends the signal at once, with no end time: the watcher arms then.
+    skipped = Harness(None)
+    skipped.end.handle(EndStartupWarmupReqInput(warmup_ended_at=None))
+    assert skipped.marks == [0]
+
+
+def test_the_rust_server_sends_no_signal_so_its_watcher_arms_at_event_loop_start():
+    h = Harness(None, rust_server=True)
+    h.end.on_event_loop_start()
+    assert h.marks == [0]
+
+
+@pytest.fixture
+def watcher(monkeypatch):
+    """The real load watcher, unarmed, with a device whose free memory is below the warning threshold."""
+    import torch
+
+    from sglang.srt.utils import triton_load_watch
+
+    monkeypatch.setattr(triton_load_watch, "_serving_started", False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(triton_load_watch, "get_available_gpu_memory", lambda *args, **kwargs: 0.1)
+
+    def load(name):
+        triton_load_watch._on_kernel_load(None, None, name, None, None)
+
+    return SimpleNamespace(load=load, mark=triton_load_watch.mark_serving_started)
+
+
+def test_a_warm_up_load_does_not_warn_and_a_load_after_the_signal_does(watcher, caplog):
+    h = Harness(None, mark=watcher.mark)
+    h.end.on_event_loop_start()
+    with caplog.at_level("WARNING"):
+        watcher.load("warmup_kernel")
+        assert not any("device-loaded after serving started" in r.getMessage() for r in caplog.records)
+        h.end.handle(EndStartupWarmupReqInput(warmup_ended_at=4999.0))
+        watcher.load("serving_kernel")
+    warned = [r.getMessage() for r in caplog.records if "device-loaded after serving started" in r.getMessage()]
+    assert len(warned) == 1 and "'serving_kernel'" in warned[0]
+
+
+def test_the_crash_mode_raises_only_after_the_signal(watcher):
+    from sglang.srt.environ import envs
+
+    h = Harness(None, mark=watcher.mark)
+    with envs.SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY.override(True):
+        h.end.on_event_loop_start()
+        watcher.load("warmup_kernel")
+        h.end.handle(EndStartupWarmupReqInput(warmup_ended_at=4999.0))
+        with pytest.raises(RuntimeError, match="'serving_kernel' device-loaded after serving started"):
+            watcher.load("serving_kernel")

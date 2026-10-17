@@ -41,7 +41,7 @@ class CalibrationGate(msgspec.Struct, frozen=True):
     """Whether a verify may be timed for T(w). Every condition must hold, so a warm-up verify (tiny context, cold
     caches, the copy engine and its split model not yet armed) never enters the fit."""
 
-    # This process's scheduler entered its event loop: engine init, CUDA graph capture included, is done.
+    # Engine init (CUDA graph capture included) and the startup warm-ups are done (triton_load_watch.serving_started).
     engine_ready: bool
     # The EXL3 RAM-miss copy engine: COPY_ENGINE_OFF when not in use, else pending or armed. It arms after its CPU
     # split and split model calibrate.
@@ -55,7 +55,7 @@ class CalibrationGate(msgspec.Struct, frozen=True):
 
     def describe(self) -> str:
         return (
-            f"engine init and CUDA graph capture done {self.engine_ready}, "
+            f"engine init and startup warm-up done {self.engine_ready}, "
             f"RAM-miss copy engine {self.copy_engine}, serving request {self.serving_request}"
         )
 
