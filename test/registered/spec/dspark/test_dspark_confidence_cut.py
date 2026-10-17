@@ -9,6 +9,7 @@ from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
     ConfidenceCut,
     cut_verify_lens,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -163,3 +164,12 @@ def test_the_cut_applies_to_greedy_single_request_batches_only():
     assert cut.applies(bs=1, sampling_info=SimpleNamespace(is_all_greedy=True))
     assert not cut.applies(bs=2, sampling_info=SimpleNamespace(is_all_greedy=True))
     assert not cut.applies(bs=1, sampling_info=SimpleNamespace(is_all_greedy=False))
+
+
+def test_from_envs_builds_the_cut_only_when_the_flag_is_on_and_no_sts_data_is_collected():
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(False):
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu") is None
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(""):
+        assert isinstance(ConfidenceCut.from_envs(gamma=GAMMA, device="cpu"), ConfidenceCut)
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/x/sts"):
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu") is None

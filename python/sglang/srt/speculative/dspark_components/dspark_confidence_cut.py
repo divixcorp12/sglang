@@ -52,8 +52,13 @@ class ConfidenceCut:
 
     @classmethod
     def from_envs(cls, *, gamma: int, device) -> Optional[ConfidenceCut]:
-        """The configured cut, or None when it is off."""
+        """The configured cut, or None when it is off or the launch collects STS data."""
         if not envs.SGLANG_DSPARK_CONFIDENCE_CUT.get():
+            return None
+        if envs.SGLANG_DSPARK_STS_COLLECT_PATH.get():
+            # STS collection labels every draft position against the target's argmax, and a cut row's logits are
+            # not valid, so a collect launch builds the head but verifies every row.
+            logger.info("dspark confidence cut: STS collect mode, the cut is off and every row is verified")
             return None
         return cls(gamma=gamma, device=device)
 
