@@ -264,3 +264,54 @@ def iter_time():
         return state["t"]
 
     return now
+
+
+def _two_nodes(tmp_path, free0, slab0, free1, slab1, file0=2.0):
+    root = tmp_path / "sysfs"
+    for node, free, slab, file in ((0, free0, slab0, file0), (1, free1, slab1, 1.0)):
+        (root / f"node{node}").mkdir(parents=True, exist_ok=True)
+        (root / f"node{node}" / "meminfo").write_text(
+            f"Node {node} MemFree:        {int(free * GIB)} kB\nNode {node} FilePages:      {int(file * GIB)} kB\n"
+            f"Node {node} Shmem:          0 kB\nNode {node} SReclaimable:   {int(slab * GIB)} kB\n"
+        )
+    return root
+
+
+def test_both_nodes_above_their_floors_passes_and_shows_node_0s_file_cache(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pe, "NODE_SYSFS", str(_two_nodes(tmp_path, 85.0, 0.0, 80.0, 0.0, file0=3.5)))
+    assert _run_main(monkeypatch, tmp_path, "--node0-floor-gib", "80.6") == 0
+    out = capsys.readouterr().out
+    assert "node 0 free 85.0 + slab 0.0 = 85.0 File 3.5 GiB" in out and "node-0 floor 80.6" in out
+
+
+def test_node_0_short_refuses_naming_node_0_and_slab_counts_there(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pe, "NODE_SYSFS", str(_two_nodes(tmp_path, 70.0, 5.0, 80.0, 0.0)))
+    assert _run_main(monkeypatch, tmp_path, "--node0-floor-gib", "80.6") == 3
+    err = capsys.readouterr().err
+    assert "refusing to start: node 0 has 70.0 GiB free + 5.0 GiB reclaimable slab = 75.0 available" in err
+    assert "below its floor of 80.6 GiB, short by 5.6 GiB" in err
+    assert "node 1 has 80.0 GiB free" in err and "refusing to start: node 1" not in err
+    # slab alone closes the gap on node 0 as it does on node 1
+    monkeypatch.setattr(pe, "NODE_SYSFS", str(_two_nodes(tmp_path, 70.0, 11.0, 80.0, 0.0)))
+    assert _run_main(monkeypatch, tmp_path, "--node0-floor-gib", "80.6") == 0
+
+
+def test_node_0_check_is_off_unless_asked(tmp_path, monkeypatch):
+    monkeypatch.setattr(pe, "NODE_SYSFS", str(_two_nodes(tmp_path, 1.0, 0.0, 80.0, 0.0)))
+    assert _run_main(monkeypatch, tmp_path) == 0
+
+
+def test_a_node_0_retry_names_node_0_and_scans_the_holders(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pe, "NODE_SYSFS", str(_two_nodes(tmp_path, 70.0, 5.0, 80.0, 0.0)))
+    monkeypatch.setattr(pe.time, "sleep", lambda s: (_ for _ in ()).throw(RuntimeError("slept")))
+    monkeypatch.setattr(pe, "page_cache_holders", lambda roots, budget: {"complete": True, "holders": [{"path": "/x/y", "gib": 9.0}]})
+    monkeypatch.setattr(sys, "argv", ["prelaunch_evict.py", "--log", str(tmp_path / "log.json"), "--wait-min", "5",
+                                      "--hicache-gib", "12.67", "--node0-floor-gib", "80.6", "--holders", str(tmp_path)])
+    monkeypatch.setattr(pe, "evict", lambda: {"files": 0, "bytes": 0, "failed": 0})
+    try:
+        pe.main()
+    except RuntimeError:
+        pass
+    out = capsys.readouterr().out
+    assert "node 0 free 70.0 + reclaimable slab 5.0 = available 75.0 GiB against the floor 80.6 GiB" in out
+    assert "against the floor 64.91" not in out and "/x/y" in out

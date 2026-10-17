@@ -14,6 +14,8 @@ Production (launch_prod.sh) runs it too, with three more options:
 - --skip-evict-port PORT: while anything listens on PORT (another of our servers reading the same files), check the
   floor without evicting;
 - --node0-warn-gib: warn, never refuse, when node 0 starts below it;
+- --node0-floor-gib: refuse like node 1 (same retry, holders and --evict-holders) while node 0's MemFree + SReclaimable is
+  below it; 0 (default) checks nothing. run_capture_pair.sh passes NODE0_FLOOR_GIB (see there for its derivation);
 - --holders ROOT: name the directories under each ROOT holding the most page cache, within --holders-budget-s: once at
   the first retry below the floor (the files evicted each round are only the listed PATHS, so what is left belongs to
   something else) and again on a refusal. Whole box (which node a cached page sits on needs root), and only files this user may write:
@@ -76,6 +78,11 @@ def available_gib(node: dict) -> float:
     """What the floor is checked against: MemFree plus the reclaimable slab (dentries and inodes), which the kernel gives
     back under allocation pressure. A fincore sweep of a big tree leaves ~10 GiB of it."""
     return round(node["MemFree"] + node.get("SReclaimable", 0.0), 2)
+
+
+def short_nodes(meminfo: dict, floors: dict) -> list:
+    """The nodes whose available memory is below their floor; a floor of 0 checks nothing."""
+    return [n for n in ("0", "1") if floors[n] and available_gib(meminfo[n]) < floors[n]]
 
 
 def split_line(node: dict, floor_gib: float) -> str:
@@ -317,6 +324,8 @@ def main() -> int:
     p.add_argument("--wait-min", type=float, default=30.0)
     p.add_argument("--skip-evict-port", type=int, action="append", default=[])
     p.add_argument("--node0-warn-gib", type=float, default=0.0)
+    p.add_argument("--node0-floor-gib", type=float, default=0.0,
+                   help="refuse (like node 1) while node 0's MemFree + SReclaimable is below this; 0 checks nothing")
     p.add_argument("--holders", action="append", default=[], help="a root whose page-cache holders a refusal names")
     p.add_argument("--holders-budget-s", type=float, default=60.0)
     p.add_argument("--evict-holders", action="store_true",
@@ -326,9 +335,12 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
     floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib)
-    record = {"t": time.time(), **floor, "before": node_meminfo(), "rounds": [], "dry_run": a.dry_run}
+    floors = {"0": a.node0_floor_gib, "1": floor["floor_gib"]}
+    record = {"node0_floor_gib": a.node0_floor_gib,"t": time.time(), **floor, "before": node_meminfo(), "rounds": [], "dry_run": a.dry_run}
     print(f"prelaunch: node-1 floor {floor['floor_gib']} GiB = HiCache {a.hicache_gib} + rest {floor['rest_gib']} "
           f"({floor['rest_source']}) + margin {a.margin_gib}", flush=True)
+    if a.node0_floor_gib:
+        print(f"prelaunch: node-0 floor {a.node0_floor_gib} GiB (free + reclaimable slab)", flush=True)
     busy = [port for port in a.skip_evict_port if listening(port)]
     record["evict_skipped_for_ports"] = busy
     if busy:
@@ -340,9 +352,12 @@ def main() -> int:
         after = node_meminfo()
         record["rounds"].append({"t": time.time(), "evicted": result, "after": after})
         print(f"prelaunch: evicted {result['files']} files ({result['bytes'] / 2**30:.0f} GiB scanned, "
-              f"{result['failed']} failed); node 0 free {after['0']['MemFree']} File {after['0']['FilePages']} GiB, "
-              f"node 1 free {after['1']['MemFree']} File {after['1']['FilePages']} GiB", flush=True)
-        if available_gib(after["1"]) >= floor["floor_gib"]:
+              f"{result['failed']} failed); node 0 free {after['0']['MemFree']} + slab {after['0']['SReclaimable']} = "
+              f"{available_gib(after['0'])} File {after['0']['FilePages']} GiB, node 1 free {after['1']['MemFree']} + "
+              f"slab {after['1']['SReclaimable']} = {available_gib(after['1'])} File {after['1']['FilePages']} GiB",
+              flush=True)
+        short = short_nodes(after, floors)
+        if not short:
             record["ready"] = True
             break
         if a.dry_run or time.time() > deadline:
@@ -350,8 +365,9 @@ def main() -> int:
             break
         # Evicting the listed files did not reach the floor, so the cache is held by files not on the list. Say so
         # once, with who holds it, instead of repeating the line above silently until the deadline.
-        print(f"prelaunch: node 1 {split_line(after['1'], floor['floor_gib'])}; evicting again in 60 s, refusing in "
-              f"{max(0.0, deadline - time.time()) / 60:.0f} min", flush=True)
+        for n in short:
+            print(f"prelaunch: node {n} {split_line(after[n], floors[n])}; evicting again in 60 s, refusing in "
+                  f"{max(0.0, deadline - time.time()) / 60:.0f} min", flush=True)
         if a.holders and "page_cache_holders_first" not in record:
             record["page_cache_holders_first"] = holders = page_cache_holders(a.holders, a.holders_budget_s)
             print("\n".join(holder_lines(holders)), flush=True)
@@ -373,18 +389,24 @@ def main() -> int:
         holders = page_cache_holders(a.holders, a.holders_budget_s) if a.holders else {"complete": True, "holders": []}
         record["page_cache_holders"] = holders
         verb = "would refuse" if a.dry_run else "refusing to start"
-        lines = [
-            f"prelaunch: {verb}: node 1 has {after['1']['MemFree']} GiB free + {after['1']['SReclaimable']} GiB "
-            f"reclaimable slab = {available_gib(after['1'])} available (file cache {after['1']['FilePages']} GiB), "
-            f"below its floor of {floor['floor_gib']} GiB, {short_part(after['1'], floor['floor_gib'])}; node 0 has {after['0']['MemFree']} GiB free (file cache "
-            f"{after['0']['FilePages']} GiB)."
-        ]
+        short = short_nodes(after, floors)
+        lines = []
+        for n in short:
+            lines.append(
+                f"prelaunch: {verb}: node {n} has {after[n]['MemFree']} GiB free + {after[n]['SReclaimable']} GiB "
+                f"reclaimable slab = {available_gib(after[n])} available (file cache {after[n]['FilePages']} GiB), "
+                f"below its floor of {floors[n]} GiB, {short_part(after[n], floors[n])}."
+            )
+        for n in ("0", "1"):
+            if n not in short:
+                lines.append(f"prelaunch: node {n} has {after[n]['MemFree']} GiB free + {after[n]['SReclaimable']} GiB "
+                             f"reclaimable slab = {available_gib(after[n])} available (file cache {after[n]['FilePages']} GiB).")
         lines += holder_lines(holders)
-        lines.append("prelaunch: free node 1 (as root: sync; echo 1 > /proc/sys/vm/drop_caches; or stop the co-tenant "
-                     "filling it), then start again.")
+        lines.append(f"prelaunch: free node {' and node '.join(short)} (as root: sync; echo 1 > /proc/sys/vm/drop_caches; "
+                     "or stop the co-tenant filling it), then start again.")
         print("\n".join(lines), file=sys.stderr, flush=True)
     elif a.dry_run:
-        print("prelaunch: would start: node 1 is above its floor", flush=True)
+        print("prelaunch: would start: every checked node is above its floor", flush=True)
     with open(a.log, "w") as f:
         json.dump(record, f, indent=1)
     return 0 if record["ready"] else 3

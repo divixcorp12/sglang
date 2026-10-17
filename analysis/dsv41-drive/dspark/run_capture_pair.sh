@@ -26,6 +26,13 @@ OUT=""; BASE=""; WT=""; PY=/data/models/slang/.venv/bin/python; HICACHE_GIB=12.6
 # The roots prelaunch_evict.py searches for page-cache holders when evicting its listed files leaves node 1 short (the
 # same as arm_env.PROD_PAGE_CACHE_ROOTS).
 HOLDERS="--holders /mnt/nvme0 --holders /mnt/nvme1 --holders /mnt/nvme2 --holders /mnt/nvme4 --holders /data/models"
+# Node 0's floor for the prelaunch (MemFree + reclaimable slab at the start). A served arm takes every free page of node 0
+# during load: in the 13 completed arms of 2026-10-16/17 (memsample.jsonl) node-0 anonymous memory rose 81.6-83.7 GiB and
+# MemFree bottomed at 0.5-0.9 GiB, because the kernel gives the page cache back. What differs between a start that loads
+# and one that trips the watchdog is the start: the lowest start of a completed arm was 81.6 GiB (engram-spin, prod arm),
+# so 80.6 = that less 1 GiB. A hard floor at the anonymous peak (83.7) would refuse three of those completed starts (81.6, 81.9, 83.2).
+# Override with NODE0_FLOOR_GIB; 0 turns the node-0 check off.
+HOLDERS="$HOLDERS --node0-floor-gib ${NODE0_FLOOR_GIB:-80.6}"
 # PRELAUNCH_EVICT_HOLDERS=1 also drops the page cache of those holders at the first retry (prelaunch_evict.py
 # --evict-holders; clean pages of files not open for writing). Off by default.
 [ "${PRELAUNCH_EVICT_HOLDERS:-0}" = 1 ] && HOLDERS="$HOLDERS --evict-holders"
