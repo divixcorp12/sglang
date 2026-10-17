@@ -143,6 +143,19 @@ def test_the_prod_argv_parses_with_its_memory_flags():
     assert ns.weight_loader_drop_cache_after_load is True
 
 
+def test_prod_and_every_arm_pass_the_v41_reasoning_and_tool_call_parsers():
+    from sglang.srt.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    for args in (arm_env.ServerArgs.prod(), arm_env.ServerArgs(port=1), arm_env.ServerArgs(port=1, dspark=True)):
+        # parse_args rejects a name outside each flag's registered choices ("deepseek_v41" is not one).
+        ns = parser.parse_args(args.argv()[3:])
+        assert ns.reasoning_parser == "deepseek-v41"
+        assert ns.tool_call_parser == "deepseekv41"
+        assert ns.language_model_only is True
+
+
 def test_prod_and_every_arm_bound_the_prefill_share_with_the_recorder_it_needs():
     # The service refuses SGLANG_DSV41_ENABLE_PREFILL_SHARE under the no-op recorder, so the share is on only where
     # argv also names a recorder mode.
