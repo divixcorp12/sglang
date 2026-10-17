@@ -803,6 +803,12 @@ class Envs:
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    # Sampled requests draft greedily, through the greedy draft graph, and verify against the one-hot draft
+    # distribution that proposal has (dspark_sampled_accept.py), which keeps the accept lossless.
+    SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT = EnvBool(False)
+    # Sampled requests verify their draft chain with block verification (Sun et al. 2024) instead of token-by-token
+    # rejection: lossless, and at least as many accepted drafts in expectation (dspark_sampled_accept.py).
+    SGLANG_DSPARK_SAMPLED_BLOCK_VERIFY = EnvBool(False)
     # Test only: re-run every graphed DSpark verify eagerly, as an overflowed one is. Its output must equal an eager
     # verify's (D2-3's end-to-end check of the re-run path).
     SGLANG_TEST_DSPARK_FORCE_REVERIFY = EnvBool(False)
@@ -825,12 +831,6 @@ class Envs:
     # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
     # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
     SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
-    # Sampled requests draft greedily, through the greedy draft graph, and verify against the one-hot draft
-    # distribution that proposal has (dspark_sampled_accept.py), which keeps the accept lossless.
-    SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT = EnvBool(False)
-    # Sampled requests verify their draft chain with block verification (Sun et al. 2024) instead of token-by-token
-    # rejection: lossless, and at least as many accepted drafts in expectation (dspark_sampled_accept.py).
-    SGLANG_DSPARK_SAMPLED_BLOCK_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
