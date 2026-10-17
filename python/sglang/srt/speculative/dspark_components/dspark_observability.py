@@ -91,6 +91,8 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     rid: Optional[str] = None
     confidence: Optional[list[float]] = None
     survival: Optional[list[float]] = None
+    # The confidence cut's expected accept length E(w) at the verified width w (verify_len), bonus included.
+    expect_accept_length: Optional[float] = None
 
 
 class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
@@ -135,6 +137,7 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    expect_accept_lengths: Optional[torch.Tensor] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -331,6 +334,8 @@ class DsparkInfoDumper:
             tensors["verify_lens"] = obs.verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
+        if obs.expect_accept_lengths is not None:
+            tensors["expect_accept_lengths"] = obs.expect_accept_lengths
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -452,6 +457,11 @@ class DsparkInfoDumper:
         else:
             conf_rows = None
             survival_rows = None
+        expect_accept = (
+            host["expect_accept_lengths"].tolist()
+            if "expect_accept_lengths" in host
+            else None
+        )
 
         reqs: list[ReqDetail] = []
         for row in range(bs):
@@ -480,6 +490,11 @@ class DsparkInfoDumper:
                         None
                         if survival_rows is None
                         else [round(float(p), 4) for p in survival_rows[row]]
+                    ),
+                    expect_accept_length=(
+                        None
+                        if expect_accept is None
+                        else round(float(expect_accept[row]), 4)
                     ),
                 )
             )
@@ -724,6 +739,67 @@ class ConfidenceMetricsProbe:
 _STS_COLLECT_FLUSH_EVERY: int = 256
 
 
+def expect_accept_lengths(
+    *, confidence: torch.Tensor, verify_lens: torch.Tensor
+) -> torch.Tensor:
+    """[bs] float64 E(w) = 1 + S_1 + ... + S_{w-1}, the expected accept length (bonus included) of a verify of w
+    rows, with S_k the cumulative product of the [bs, gamma] calibrated confidence."""
+    survival = torch.cumprod(confidence.to(torch.float64), dim=1)
+    positions = torch.arange(survival.shape[1], device=survival.device)
+    live = positions.view(1, -1) < (verify_lens.view(-1, 1) - 1)
+    return 1.0 + (survival * live).sum(dim=1)
+
+
+class ConfidenceCutStats:
+    """Totals of the confidence cut's verifies since the last decode log line: the cut rows, the chosen widths w*,
+    their expected accept lengths E(w*) and the accept lengths. Calibration's forced widths are not counted.
+
+    The sums stay on the device, accumulated without a host read; the log line reads them once."""
+
+    def __init__(self, *, verify_num_draft_tokens: int, device) -> None:
+        self._verify_num_draft_tokens = int(verify_num_draft_tokens)
+        # cut rows, w*, E(w*), accept lengths
+        self._sums = torch.zeros(4, dtype=torch.float64, device=device)
+        self.verify_ct = 0
+        self.cut_rows_ct = 0
+
+    def observe(
+        self,
+        *,
+        confidence: torch.Tensor,
+        verify_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        widths = verify_lens.to(torch.float64)
+        step = torch.stack(
+            [
+                (self._verify_num_draft_tokens - widths).sum(),
+                widths.sum(),
+                expect_accept_lengths(
+                    confidence=confidence, verify_lens=verify_lens
+                ).sum(),
+                commit_lens.to(torch.float64).sum(),
+            ]
+        )
+        self._sums.add_(step)
+        self.verify_ct += int(verify_lens.shape[0])
+
+    def log_suffix(self) -> Optional[str]:
+        """The decode log line's summary of the verifies since the last one, or None when there were none."""
+        if self.verify_ct == 0:
+            return None
+        cut_rows, widths, expect, accept = self._sums.tolist()
+        n = self.verify_ct
+        self.cut_rows_ct += int(round(cut_rows))
+        self._sums.zero_()
+        self.verify_ct = 0
+        return (
+            f"conf cut: verifies {n}, w* {widths / n:.2f}, E(w*) {expect / n:.2f}, "
+            f"accept len {accept / n:.2f}, cut rows {int(round(cut_rows))} "
+            f"(total {self.cut_rows_ct})"
+        )
+
+
 class VerifyMarkers:
     """verify_begin and verify_end lines beside the expert job trace (``<prefix>.<pid>.verify.jsonl``), in its event
     format and CLOCK_MONOTONIC clock, so a trace can be cut into verifies exactly. gen = the batch's forward_iter,
@@ -769,6 +845,7 @@ class DsparkStepObservers:
         tp_rank: int,
         device,
         simulate_acc_len: float,
+        confidence_cut: bool = False,
     ) -> None:
         self._planner = planner
         self._gamma = int(gamma)
@@ -801,6 +878,13 @@ class DsparkStepObservers:
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
         self._verify_markers = VerifyMarkers.from_env(tp_rank)
+        self._confidence_cut_stats = (
+            ConfidenceCutStats(
+                verify_num_draft_tokens=verify_num_draft_tokens, device=device
+            )
+            if confidence_cut
+            else None
+        )
 
     # --- step lifecycle -------------------------------------------------
 
@@ -835,9 +919,14 @@ class DsparkStepObservers:
         self._info_dumper.clear()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
-        if self._block_accept_recorder is None:
-            return None
-        return self._block_accept_recorder.estimate_log_suffix()
+        """The decode log line's DSpark suffix: the block-accept estimate, and the confidence cut's summary."""
+        suffixes = []
+        if self._block_accept_recorder is not None:
+            suffixes.append(self._block_accept_recorder.estimate_log_suffix())
+        if self._confidence_cut_stats is not None:
+            suffixes.append(self._confidence_cut_stats.log_suffix())
+        suffixes = [suffix for suffix in suffixes if suffix]
+        return ", ".join(suffixes) if suffixes else None
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         if self._block_accept_recorder is None:
@@ -871,7 +960,11 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        cut_verify_lens: Optional[torch.Tensor] = None,
+        cut_calibrated: bool = False,
     ) -> None:
+        """``cut_verify_lens`` is the confidence cut's [bs] verify widths when it set this verify's (forced widths
+        while it calibrates, then ``cut_calibrated``), else None."""
         if self._verify_markers is not None:
             self._verify_markers.end(forward_ct=forward_ct, bs=bs)
         planner = self._planner
@@ -919,6 +1012,16 @@ class DsparkStepObservers:
                 prefix_lens=prefix_lens,
                 layout=layout,
             )
+        if (
+            self._confidence_cut_stats is not None
+            and cut_verify_lens is not None
+            and cut_calibrated
+        ):
+            self._confidence_cut_stats.observe(
+                confidence=confidence,
+                verify_lens=cut_verify_lens,
+                commit_lens=commit_lens,
+            )
         if self._info_dumper.enabled:
             budget_decision = planner.take_budget_decision()
             predicted_step_ms = (
@@ -950,7 +1053,9 @@ class DsparkStepObservers:
                     verify_tokens_graph_key=num_verify_tokens,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
-                    verify_lens=layout.verify_lens if layout is not None else None,
+                    verify_lens=(
+                        layout.verify_lens if layout is not None else cut_verify_lens
+                    ),
                     confidence=confidence,
                     req_pool_indices=req_pool_indices,
                     prefix_lens=prefix_lens,
@@ -960,6 +1065,13 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    expect_accept_lengths=(
+                        None
+                        if cut_verify_lens is None or confidence is None
+                        else expect_accept_lengths(
+                            confidence=confidence, verify_lens=cut_verify_lens
+                        )
+                    ),
                 )
             )
 
