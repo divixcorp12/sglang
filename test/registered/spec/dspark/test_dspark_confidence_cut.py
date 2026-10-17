@@ -1,0 +1,165 @@
+"""DSpark's confidence-head verify cut: the w* rule, and the startup T(w) calibration that feeds it (CPU)."""
+
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
+    CALIBRATION_VERIFIES,
+    ConfidenceCut,
+    cut_verify_lens,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+GAMMA = 5
+NAN = float("nan")
+
+
+class FakeEvent:
+    """A CUDA event stand-in: an end event carries the elapsed ms of its verify and completes when the test says."""
+
+    def __init__(self, timings):
+        self.timings = timings
+        self.ms = None
+        self.ready = False
+
+    def record(self):
+        self.ms = self.timings.next_ms()
+
+    def query(self):
+        return self.ready
+
+    def elapsed_time(self, end):
+        return end.ms
+
+
+class FakeTimings:
+    def __init__(self, ms_for_width):
+        self.ms_for_width = ms_for_width
+        self.width = None
+        self.events = []
+
+    def next_ms(self):
+        return self.ms_for_width(self.width)
+
+    def new_event(self):
+        event = FakeEvent(self)
+        self.events.append(event)
+        return event
+
+    def complete_all(self):
+        for event in self.events:
+            event.ready = True
+
+
+def run_verify(cut, timings, confidence):
+    lens = cut.verify_lens(confidence)
+    timings.width = int(lens[0])
+    cut.begin_verify()
+    cut.end_verify()
+    return int(lens[0])
+
+
+def test_the_cut_verifies_every_draft_at_flat_cost_and_only_the_anchor_when_width_is_expensive():
+    confident = torch.full((1, GAMMA), 0.95)
+    flat = torch.ones(GAMMA + 1)
+    assert cut_verify_lens(confidence=confident, cost_ms=flat).tolist() == [GAMMA + 1]
+    # E(6) / E(1) is at most 6, so a T(6) / T(1) of 10 makes the anchor alone the best rate.
+    steep = torch.tensor([1.0, 2.0, 4.0, 6.0, 8.0, 10.0])
+    assert cut_verify_lens(confidence=confident, cost_ms=steep).tolist() == [1]
+
+
+def test_the_cut_picks_the_best_expected_tokens_per_ms_and_ends_the_prefix_at_a_nan():
+    confidence = torch.tensor(
+        [
+            [0.9, 0.5, 0.2, 0.9, 0.9],  # E = 1, 1.9, 2.35, 2.44, ...; at T = 1, 1.2, 1.4, ... w = 3 wins
+            [0.9, NAN, 0.99, 0.99, 0.99],  # E stops growing after draft 1: w = 2
+            [NAN, 0.99, 0.99, 0.99, 0.99],  # the anchor alone
+            [0.0, 0.0, 0.0, 0.0, 0.0],  # a tie at E = 1 goes to the narrowest verify
+        ]
+    )
+    cost = torch.tensor([1.0, 1.2, 1.4, 1.6, 1.8, 2.0])
+    lens = cut_verify_lens(confidence=confidence, cost_ms=cost)
+    assert lens.dtype == torch.int64
+    assert lens.tolist() == [3, 2, 1, 1]
+
+
+def test_calibration_forces_widths_round_robin_then_freezes_a_monotone_median_table():
+    # Width 3 runs faster than width 2 (a noisy measurement); the running max lifts it back to width 2's time.
+    base = {1: 1.0, 2: 2.0, 3: 1.5, 4: 3.0, 5: 3.5, 6: 4.0}
+    timings = FakeTimings(lambda width: base[width])
+
+    def ms_for_width(width):
+        # One outlier per width, in the first round; the median ignores it.
+        return base[width] * (50.0 if len(timings.events) <= 2 * (GAMMA + 1) else 1.0)
+
+    timings.ms_for_width = ms_for_width
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.99)
+    widths = [run_verify(cut, timings, confident) for _ in range(CALIBRATION_VERIFIES)]
+    assert widths == [i % (GAMMA + 1) + 1 for i in range(CALIBRATION_VERIFIES)]
+    assert not cut.calibrated
+
+    # The timings are still in flight: no host wait, every row verified, no table yet.
+    assert run_verify(cut, timings, confident) == GAMMA + 1
+    assert not cut.calibrated
+    timings.complete_all()
+    cut.verify_lens(confident)
+    assert cut.calibrated and not cut.disabled
+    assert cut.cost_ms() == [1.0, 2.0, 2.0, 3.0, 3.5, 4.0]
+    # Calibrated: the cut, not a forced width, and no further timing. E(w) / T(w) at c = 0.99 peaks at w = 3
+    # (2.97 / 2.0), where the monotone table makes width 3 cost no less than width 2.
+    num_events = len(timings.events)
+    assert run_verify(cut, timings, confident) == 3
+    assert len(timings.events) == num_events
+
+
+def test_calibration_drains_only_completed_timings_in_order():
+    timings = FakeTimings(lambda width: float(width))
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.99)
+    for _ in range(CALIBRATION_VERIFIES):
+        run_verify(cut, timings, confident)
+    # All but the last end event completed: the table must wait for the last sample.
+    for event in timings.events[:-1]:
+        event.ready = True
+    cut.verify_lens(confident)
+    assert not cut.calibrated
+    timings.events[-1].ready = True
+    cut.verify_lens(confident)
+    assert cut.cost_ms() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_a_width_without_a_valid_time_disables_the_cut_and_verifies_every_row():
+    timings = FakeTimings(lambda width: NAN if width == 4 else 1.0)
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.1)
+    for _ in range(CALIBRATION_VERIFIES):
+        run_verify(cut, timings, confident)
+    timings.complete_all()
+    assert cut.verify_lens(confident).tolist() == [GAMMA + 1]
+    assert cut.disabled and not cut.calibrated and cut.cost_ms() is None
+    num_events = len(timings.events)
+    assert run_verify(cut, timings, confident) == GAMMA + 1
+    assert len(timings.events) == num_events
+
+
+def test_a_non_positive_time_disables_the_cut():
+    timings = FakeTimings(lambda width: 0.0 if width == 1 else 1.0)
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.1)
+    for _ in range(CALIBRATION_VERIFIES):
+        run_verify(cut, timings, confident)
+    timings.complete_all()
+    cut.verify_lens(confident)
+    assert cut.disabled
+
+
+def test_the_cut_applies_to_greedy_single_request_batches_only():
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=FakeTimings(lambda w: 1.0).new_event)
+    assert cut.applies(bs=1, sampling_info=None)
+    assert cut.applies(bs=1, sampling_info=SimpleNamespace(is_all_greedy=True))
+    assert not cut.applies(bs=2, sampling_info=SimpleNamespace(is_all_greedy=True))
+    assert not cut.applies(bs=1, sampling_info=SimpleNamespace(is_all_greedy=False))
