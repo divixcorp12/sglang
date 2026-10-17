@@ -365,7 +365,9 @@ def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
 
 def _spec_cores(plan: NodePlan, topology: Topology, affinity: frozenset[int], assigned: set[int]) -> tuple[int, ...]:
     """A group's speculative-thread cores: the server's affinity on its node less every assigned core and its SMT
-    sibling. With none spare it shares the RAM thread's core (spec 2026-10-08-dsv41-ram-prefetch-design)."""
+    sibling. A node the server's affinity does not reach (divix01's node 1) has none, so the thread takes the node's
+    highest physical core that nothing else holds: the thread is native, so it needs no place in the server's
+    affinity. Only with no such core does it share the RAM thread's core (spec 2026-10-08-dsv41-ram-prefetch-design)."""
     spare = tuple(
         c
         for c in topology.node_cpus[plan.node]
@@ -373,6 +375,13 @@ def _spec_cores(plan: NodePlan, topology: Topology, affinity: frozenset[int], as
     )
     if spare or plan.ram is None:
         return spare
+    own = [
+        c
+        for c in reversed(topology.physical(plan.node))
+        if c not in RESERVED_CORES and not (topology.siblings[c] & assigned)
+    ]
+    if own:
+        return (own[0],)
     if (plan.node, plan.ram) not in _warned_shared_spec_cores:
         _warned_shared_spec_cores.add((plan.node, plan.ram))
         logger.warning(

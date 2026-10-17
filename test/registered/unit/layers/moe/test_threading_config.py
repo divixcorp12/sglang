@@ -339,14 +339,24 @@ def test_a_draft_only_launch_still_derives_the_draft_cores(divix01):
 
 def test_ram_prefetch_takes_each_nodes_spare_affinity_cores_or_its_ram_core(divix01):
     """Spare: the server's affinity on the node less every assigned core and its SMT sibling (CPU experts 8-14 take
-    44-50 with them, the copy core 15 takes 51). Node 1 has no affinity core, so its thread shares the RAM core."""
+    44-50 with them, the copy core 15 takes 51). Node 1 has no affinity core, so its thread takes the node's highest
+    unassigned physical core, 34, not the RAM core 35."""
     config = resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
     assert config.plans[0].spec == (*range(0, 8), 16, *range(36, 44), 52)
-    assert config.plans[1].spec == (35,)
+    assert config.plans[1].spec == (34,)
     assert config.log_lines()[:2] == [
         "numa node0: ram=17 cpu=8-14 (7) sq=- spec=0-7,16,36-43,52",
-        "numa node1: ram=35 cpu=18-33 (16) sq=- spec=35",
+        "numa node1: ram=35 cpu=18-33 (16) sq=- spec=34",
     ]
+
+
+def test_a_node_outside_the_servers_affinity_gives_its_spec_thread_its_own_core(divix01, caplog):
+    """The production layout: 10 CPU experts a node leave node 1's 28-34 free, and the thread takes 34, not RAM core 35."""
+    with caplog.at_level(logging.WARNING, logger=tc.__name__):
+        config = resolve(divix01, cpu_experts=True, threads=10, ram_prefetch=True)
+    assert config.plans[1].spec == (34,)
+    assert config.plans[1].ram not in config.plans[1].spec
+    assert [r for r in caplog.records if r.name == tc.__name__] == []
 
 
 def test_without_ram_prefetch_no_plan_names_spec_cores(divix01):
@@ -356,9 +366,10 @@ def test_without_ram_prefetch_no_plan_names_spec_cores(divix01):
 
 
 def test_a_spec_thread_sharing_the_ram_core_is_warned_naming_the_node_and_core(divix01, caplog):
-    """Node 1 has no spare core, so its speculative thread time-slices the busy-polling RAM core 35; node 0 has spares."""
+    """Node 1's CPU experts (18-34) take every core, so its speculative thread time-slices the busy-polling RAM core
+    35; node 0 has spares."""
     with caplog.at_level(logging.WARNING, logger=tc.__name__):
-        resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+        resolve(divix01, cpu_experts=True, threads=17, ram_prefetch=True)
     warnings = [r.getMessage() for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "node1" in warnings[0] and "core 35" in warnings[0] and "node0" not in warnings[0]
@@ -367,7 +378,7 @@ def test_a_spec_thread_sharing_the_ram_core_is_warned_naming_the_node_and_core(d
 def test_a_shared_spec_core_is_warned_once_per_node_and_core_across_resolves(divix01, caplog):
     with caplog.at_level(logging.WARNING, logger=tc.__name__):
         for _ in range(3):
-            resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+            resolve(divix01, cpu_experts=True, threads=17, ram_prefetch=True)
     warnings = [r for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
     assert len(warnings) == 1
 
@@ -380,7 +391,8 @@ def test_ram_prefetch_without_a_shared_core_warns_nothing(divix01, caplog):
 
 
 def test_ram_prefetch_spec_cores_leave_out_the_reserved_cores(divix01):
-    """An affinity spanning 64-71: node 1's only spare would be a reserved core, so its thread shares the RAM core."""
-    config = resolve(divix01, affinity=SERVER | set(range(64, 72)), cpu_experts=True, threads=16, ram_prefetch=True)
+    """An affinity spanning 64-71: node 1's only spare would be a reserved core, so with its CPU experts on 18-34 its
+    thread shares the RAM core."""
+    config = resolve(divix01, affinity=SERVER | set(range(64, 72)), cpu_experts=True, threads=17, ram_prefetch=True)
     assert config.plans[1].spec == (config.plans[1].ram,)
     assert not set(config.plans[0].spec) & tc.RESERVED_CORES
