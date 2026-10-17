@@ -52,6 +52,22 @@ Branch: `upstream-merge-20261017` (worktree `/Users/dnikolaidis/Desktop/divix/wt
    - `SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV`: a one-row step of `SGLANG_DSPARK_USE_GREEDY_DRAFT` on a vanilla markov head fuses the bias GEMV (`MarkovGreedyStep`).
    - `git grep` the arm scripts (`benchmarks/dsv41_baseline/arm_env.py`, `launch_prod.sh`) for these three before the first served run.
 
+### 2a. sampled-accept: owner's decision and what to port
+
+Owner decision: take upstream's `SGLANG_DSPARK_USE_GREEDY_DRAFT` and `--speculative-use-block-verification`, and drop our versions. Full table: `SAMPLED_ACCEPT_MERGE_NOTES.md` on `origin/sampled-accept` (`909cb55475`). Source: the sampled-accept agent.
+
+**Port onto upstream:**
+1. **Preload.** Upstream device-loads `speculative_sampling_classic_kernel` (plain and block variant) on the first sampled verify after serving starts. Carry warmup-preload's decode warm-up (sampled `dsv41_decode_paths` requests). Also add a worker-init preload next to `preload_cut_accept_kernels` in `dspark_accept.py`: one bs-1 `chain_speculative_sampling_triton(..., block_verification=<arg>)` on CUDA dummies at the real vocab and S, with int32 buffers from `_get_or_create_chain_verify_buffers`, called from `TargetVerifyExecutor.__init__`. Check: zero "device-loaded after serving started" log lines in a sampled served run.
+2. **Dead-row NaN guard.** Block verification reads rows past the cut; a NaN dead row L means it never stops at L-1 and biases the output. In `_accept_sampling_core`, when `block_verification` and `cutoff_verify_lens` are both set, replace target-prob rows at or past `verify_len` with a valid distribution (`torch.where` to uniform) before the kernel. Token-by-token does not need it.
+3. **Ragged-candidate guard.** The sampled accept is lossless only on real candidates. `accept_and_finalize` passes `verify_ids_2d` (real drafts) and `run_compact` fills dead logits with 0: fine. `DsparkVerifyEpilogue.__call__` scatters candidates with fill 0, and on those the sampled accept (classic and block) is biased (scratch chi-square p=0). Add an assert, or a ragged `cutoff_layout` case in the distribution test, so a future fold of the sampled accept into the epilogue fails loudly.
+4. **Distribution test as the correctness gate.** Retarget `test/registered/spec/dspark/test_dspark_sampled_accept.py` (`TestSampledAcceptDistribution` and its harness `_Chain`, `_chi2_pvalue`, `_filter`, `_pvalues`) at upstream's path: pass `block_verification=` not `block_verify=`; build `DraftBlockResult` with upstream's fields (`greedy_draft`, `top_probs`); give dead rows real candidates and garbage logits; keep the 1% power self-check and the block >= token-by-token mean-length check; rerun the two mutants (acceptance +0.05, block h +0.05). Upstream's kernel already passes this harness (`/mnt/nvme1/sampled-accept/logs/upstream-dist.log`).
+
+**Keep as is:** `3b69a95037`, the `long_prompt.py` / `spec_margin_capture.py` `--temperature` / `--top-p` options (analysis only, greedy by default). Needed to serve-test upstream's flags at production sampling.
+
+**Drop:** everything else from the branch (our flags, draft wiring, `dspark_sampled_accept.py` kernels, parity and draft tests). Our kernel costs 7-10 us GPU per verify vs upstream's 35-54 us, but about 60 us more host time eager; it stays a possible later adapter, unmeasured served.
+
+**Served-test note:** block verification gains nothing with a greedy draft (offline mean accept is equal). Test it with `SGLANG_DSPARK_USE_GREEDY_DRAFT` off.
+
 ## 3. Environment on divix01 (OWNER GO)
 
 - New venv: `/data/models/slang/.venv-upstream`, Python >= 3.11 (the merged `requires-python`). Never touch `/data/models/slang/.venv` or its `main-port-probe-*` import path.
