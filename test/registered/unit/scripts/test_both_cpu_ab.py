@@ -1222,7 +1222,7 @@ def test_the_layer_major_arm_is_prod_with_layer_major_prefill_and_every_other_ar
     assert ab.arm_env.dspark_env()[threshold] == "0"
     lm = ab.ARMS[LAYER_MAJOR_ARM][0]
     assert (lm[threshold], lm[switch]) == ("8192", "1")
-    assert {k: v for k, v in lm.items() if k not in (threshold, switch)} == ab.ARMS[PROD_ARM][0]
+    assert {k: v for k, v in lm.items() if k != switch} == {**ab.ARMS[PROD_ARM][0], threshold: "8192"}
     assert ab.ARMS[LAYER_MAJOR_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_ARM] == PROD_ARM
     assert ab.server_flags(LAYER_MAJOR_ARM) == ab.server_flags(PROD_ARM)
 
@@ -1272,7 +1272,7 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
     for arm in PROD_ARMS:
         assert ab.run_probe(arm, str(tmp_path)) == 1
-    prod, collect, cut = argvs
+    prod, collect, cut, layer_major = argvs
     assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
     assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
-    assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
+    assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect and STS_PATH_FLAG not in layer_major
