@@ -75,6 +75,66 @@ def log_native_stats(store, interval_s: float = NATIVE_STATS_INTERVAL_S) -> None
     atexit.register(emit)
 
 
+_LOGGED_RING_EXTENSIONS: set = set()
+_RING_KEYS = ("waits", "spins", "spin_ns")
+
+
+def ring_layer_totals(lookups) -> dict:
+    """ring_stats() summed per Engram layer. It has one row per device-wait lookup, so one per captured graph that
+    holds the layer; spin_us_max is the largest of them."""
+    totals: dict = {}
+    for row in lookups:
+        t = totals.setdefault(int(row["layer"]), dict.fromkeys(_RING_KEYS + ("spin_us_max",), 0))
+        for k in _RING_KEYS:
+            t[k] += int(row[k])
+        t["spin_us_max"] = max(t["spin_us_max"], int(row["spin_us_max"]))
+    return totals
+
+
+def ring_stats_line(layer: int, now: dict, before: Optional[dict], seconds: float) -> str:
+    """One layer's device-wait line: over the window since ``before``, or the run total when it is None. A
+    spinning wait found the lookup unserved; spin_us_max is the longest spin since start (not per window)."""
+    waits, spins, spin_ns = (now[k] - (before[k] if before else 0) for k in _RING_KEYS)
+    return (f"engram ring stats layer {layer}{'' if before else ' (run total)'}: waits {waits}, spinning waits "
+            f"{spins}, spin_ns {spin_ns}, mean {spin_ns / waits if waits else 0.0:.0f} ns per wait "
+            f"({spin_ns / spins if spins else 0.0:.0f} per spinning wait), max {now['spin_us_max']} us since start, "
+            f"over {seconds:.1f} s")
+
+
+def log_ring_stats(extension, interval_s: float = NATIVE_STATS_INTERVAL_S) -> None:
+    """Log each Engram layer's device-wait counters every interval_s (a daemon thread), and the run total at exit;
+    once per extension. The device wait kernel writes them into each lookup's pinned control block, and
+    ring_stats() reads them there with host loads: no CUDA call, no device sync, nothing on the batch path."""
+    if id(extension) in _LOGGED_RING_EXTENSIONS:
+        return
+    _LOGGED_RING_EXTENSIONS.add(id(extension))
+    start = time.monotonic()
+    state = {"before": {}, "at": start}
+
+    def emit_window() -> None:
+        now, at = ring_layer_totals(extension.ring_stats()), time.monotonic()
+        for layer, totals in sorted(now.items()):
+            before = state["before"].get(layer, dict.fromkeys(_RING_KEYS, 0))
+            if totals["waits"] > before["waits"]:
+                logger.info(ring_stats_line(layer, totals, before, at - state["at"]))
+        if now:
+            state["before"], state["at"] = now, at
+
+    def emit_total() -> None:
+        # The last window's snapshot stands in if the lookups were already closed.
+        now = ring_layer_totals(extension.ring_stats()) or state["before"]
+        for layer, totals in sorted(now.items()):
+            logger.info(ring_stats_line(layer, totals, None, time.monotonic() - start))
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval_s)
+            emit_window()
+
+    threading.Thread(target=loop, name="engram-ring-stats", daemon=True).start()
+    atexit.register(emit_total)
+
+
 class EngramFileTable:
     def __init__(
         self,
@@ -178,6 +238,7 @@ class EngramFileTable:
                             native_cache_bytes(), dim + dim // 32
                         )
                         log_native_stats(table._native_store)
+                        log_ring_stats(table._host_node_extension)
                         table._native_store.register_table(
                             path, table.weight_offset, table.scale_offset,
                             num_embeddings, dim, dim // table.block, layer_id << 40,
