@@ -1,5 +1,6 @@
 """A long-prompt, time-boxed served request, for spec_margin_capture.py's --long-prompt mode: one streaming
-/v1/chat/completions request with thinking on, greedy, cancelled DECODE_SECONDS after its first streamed token, so a
+/v1/chat/completions request with thinking on, greedy unless --temperature (and --top-p) say otherwise, cancelled
+DECODE_SECONDS after its first streamed token, so a
 capture measures decode past the ~900-token break-even of a TTFT cost (DSV_OPTIMIZATION.md, share 28 vs 64) on the
 same collectors as the 8 x 128-token probe.
 
@@ -14,6 +15,7 @@ entry per request, its "tokens" one per completion token, a chunk's text on its 
 lane_tier_replay.py read the run as K+1 serving prompts.
 
 Usage: long_prompt.py --port PORT --prompt PATH --out-dir DIR [--decode-seconds 300] [--ttft-repeats 0]
+                      [--temperature 0.6 [--top-p 0.95]]
 """
 
 from __future__ import annotations
@@ -35,11 +37,16 @@ GAP_SECONDS = 3.0
 REQUEST_TIMEOUT_S = 900
 
 
-def request_body(prompt: str, rid: str, max_tokens: int = MAX_TOKENS) -> dict:
+def sampling_params(temperature: float = 0.0, top_p: float | None = None) -> dict:
+    """The body's sampling fields: greedy by default, else this temperature (and top_p when given)."""
+    return {"temperature": temperature, **({} if top_p is None else {"top_p": top_p})}
+
+
+def request_body(prompt: str, rid: str, max_tokens: int = MAX_TOKENS, sampling: dict | None = None) -> dict:
     return {
         "model": "default",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        **(sampling or sampling_params()),
         "max_tokens": max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True, "continuous_usage_stats": True},
@@ -103,11 +110,12 @@ def abort(port: int, rid: str) -> int:
 
 def run_request(port: int, prompt: str, rid: str, decode_seconds: float, max_tokens: int = MAX_TOKENS,
                 connect: Callable[..., http.client.HTTPConnection] = http.client.HTTPConnection,
-                abort_fn: Callable[[int, str], int] = abort) -> dict:
+                abort_fn: Callable[[int, str], int] = abort, sampling: dict | None = None) -> dict:
     conn = connect("127.0.0.1", port, timeout=REQUEST_TIMEOUT_S)
     sent_ns, sent_epoch_ns = time.monotonic_ns(), time.time_ns()
     try:
-        conn.request("POST", "/v1/chat/completions", body=json.dumps(request_body(prompt, rid, max_tokens)),
+        conn.request("POST", "/v1/chat/completions",
+                     body=json.dumps(request_body(prompt, rid, max_tokens, sampling)),
                      headers={"Content-Type": "application/json"})
         response = conn.getresponse()
         if response.status != 200:
@@ -147,20 +155,24 @@ def ttft_prompt(prompt: str, i: int) -> str:
 
 
 def run(port: int, prompt_path: str, out_dir: str, decode_seconds: float = DECODE_SECONDS, ttft_repeats: int = 0,
-        request: Callable[..., dict] = run_request, sleep: Callable[[float], None] = time.sleep) -> int:
+        request: Callable[..., dict] = run_request, sleep: Callable[[float], None] = time.sleep,
+        sampling: dict | None = None) -> int:
     with open(prompt_path, "rb") as f:
         raw = f.read()
     prompt = raw.decode()
+    sampling = sampling or sampling_params()
     tag = f"long-prompt-{os.getpid()}"
     requests = []
     for i in range(ttft_repeats):
-        requests.append({"kind": "ttft", **request(port, ttft_prompt(prompt, i), f"{tag}-ttft{i}", TTFT_DECODE_SECONDS)})
+        requests.append({"kind": "ttft", **request(port, ttft_prompt(prompt, i), f"{tag}-ttft{i}", TTFT_DECODE_SECONDS,
+                                                   sampling=sampling)})
         sleep(GAP_SECONDS)
-    requests.append({"kind": "long", **request(port, prompt, f"{tag}-long", decode_seconds)})
+    requests.append({"kind": "long", **request(port, prompt, f"{tag}-long", decode_seconds, sampling=sampling)})
     sleep(GAP_SECONDS)
     record = {
         "prompt": os.path.abspath(prompt_path),
         "prompt_sha256": hashlib.sha256(raw).hexdigest(),
+        "sampling": sampling,
         "decode_seconds": decode_seconds,
         "ttft_repeats": ttft_repeats,
         "ttft_decode_seconds": TTFT_DECODE_SECONDS,
@@ -185,10 +197,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--decode-seconds", type=float, default=DECODE_SECONDS)
     p.add_argument("--ttft-repeats", type=int, default=0)
+    p.add_argument("--temperature", type=float, default=0.0, help="sample at this temperature (0, the default, is greedy)")
+    p.add_argument("--top-p", type=float, help="with --temperature: nucleus sampling at this top_p")
     a = p.parse_args(argv)
     if a.decode_seconds <= 0 or a.ttft_repeats < 0:
         p.error("--decode-seconds must be positive and --ttft-repeats non-negative")
-    return run(a.port, a.prompt, a.out_dir, a.decode_seconds, a.ttft_repeats)
+    if a.top_p is not None and a.temperature <= 0:
+        p.error("--top-p needs a positive --temperature")
+    return run(a.port, a.prompt, a.out_dir, a.decode_seconds, a.ttft_repeats,
+               sampling=sampling_params(a.temperature, a.top_p))
 
 
 if __name__ == "__main__":

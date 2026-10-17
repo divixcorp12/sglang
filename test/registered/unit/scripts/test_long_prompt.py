@@ -50,9 +50,21 @@ def test_the_capture_runs_the_long_prompt_client_with_its_window_and_repeats(tmp
     assert int(cap.LONG_TRACE_CAPACITY) == 1048576
 
 
+def test_the_capture_passes_the_long_prompt_sampling_on(tmp_path):
+    cap = _load("spec_margin_capture")
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    a = cap.parse_args(["/out", "--long-prompt", str(prompt), "--temperature", "0.6", "--top-p", "0.95"])
+    assert cap.client_argv(a)[-4:] == ["--temperature", "0.6", "--top-p", "0.95"]
+    assert "--temperature" not in cap.client_argv(cap.parse_args(["/out", "--long-prompt", str(prompt)]))
+    with pytest.raises(SystemExit):
+        cap.parse_args(["/out", "--long-prompt", str(prompt), "--top-p", "0.9"])
+
+
 @pytest.mark.parametrize("argv", [
     ["/out", "--decode-seconds", "60"],
     ["/out", "--ttft-repeats", "2"],
+    ["/out", "--temperature", "0.6"],
     ["/out", "--long-prompt", "/no/such/prompt.md"],
 ])
 def test_the_capture_refuses_long_prompt_options_it_cannot_honour(argv):
@@ -79,6 +91,13 @@ def test_the_request_is_greedy_streaming_with_thinking_on_and_per_chunk_usage():
     assert body["chat_template_kwargs"] == {"thinking": True}
     assert body["stream_options"] == {"include_usage": True, "continuous_usage_stats": True}
     assert body["rid"] == "rid-1"
+
+
+def test_the_request_samples_when_given_a_temperature():
+    lp = _load("long_prompt")
+    body = lp.request_body("hi", "rid-1", sampling=lp.sampling_params(0.6, 0.95))
+    assert (body["temperature"], body["top_p"]) == (0.6, 0.95)
+    assert "top_p" not in lp.request_body("hi", "rid-1", sampling=lp.sampling_params(0.6))
 
 
 def test_the_dsv41_encoder_reads_the_thinking_key_the_client_sends():
@@ -196,8 +215,8 @@ def test_the_run_sends_tagged_ttft_samples_then_the_prompt_and_writes_both_files
     prompt.write_text("PROMPT")
     sent = []
 
-    def request(port, text, rid, seconds):
-        sent.append((text, rid, seconds))
+    def request(port, text, rid, seconds, sampling):
+        sent.append((text, rid, seconds, sampling))
         chunks = [{"ns": 5, "epoch_ns": 5, "completion_tokens": 2, "reasoning_tokens": None, "prompt_tokens": 1,
                    "cached_tokens": 0, "content": "xy", "reasoning": ""}]
         return {"rid": rid, "ttft_s": 0.1, "first_token_ns": 5, "cut": True, "finish_reason": None,
@@ -208,6 +227,7 @@ def test_the_run_sends_tagged_ttft_samples_then_the_prompt_and_writes_both_files
     assert sent[-1][0] == "PROMPT" and len({s[0] for s in sent}) == 3
     record = json.load(open(tmp_path / "long_prompt.json"))
     assert [r["kind"] for r in record["requests"]] == ["ttft", "ttft", "long"]
+    assert record["sampling"] == {"temperature": 0.0} and all(s[3] == {"temperature": 0.0} for s in sent)
     probe = json.load(open(tmp_path / "probe.json"))
     assert len(probe) == 3 and all(len(p["tokens"]) == 2 for p in probe)
 

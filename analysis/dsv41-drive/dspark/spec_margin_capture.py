@@ -132,9 +132,12 @@ def _healthy(port: int, deadline: float) -> bool:
 def client_argv(a: argparse.Namespace) -> list[str]:
     """The serving client: logprob_probe.py over the A/B's sessions, or long_prompt.py with --long-prompt."""
     if a.long_prompt:
+        sampling = [] if a.temperature == 0 else ["--temperature", str(a.temperature)]
+        if a.top_p is not None:
+            sampling += ["--top-p", str(a.top_p)]
         return [arm_env.PYTHON, LONG_PROMPT, "--port", str(PORT), "--prompt", os.path.abspath(a.long_prompt),
                 "--decode-seconds", str(a.decode_seconds), "--ttft-repeats", str(a.ttft_repeats),
-                "--out-dir", a.out_dir]
+                "--out-dir", a.out_dir, *sampling]
     return [arm_env.PYTHON, PROBE, "--port", str(PORT), "--sessions", both_cpu_ab.SESSIONS, "--prompts", str(a.prompts),
             "--max-tokens", str(a.max_tokens), "--top-logprobs", "1", "--out", os.path.join(a.out_dir, "probe.json")]
 
@@ -158,6 +161,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with --long-prompt: cancel the request this long after its first streamed token")
     p.add_argument("--ttft-repeats", type=int, default=0,
                    help="with --long-prompt: first send it this many times with 20 s of decode, for TTFT samples")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="with --long-prompt: sample its requests at this temperature (0, the default, is greedy)")
+    p.add_argument("--top-p", type=float, help="with --long-prompt and --temperature: nucleus sampling at this top_p")
     p.add_argument("--then-generate", metavar="JSON",
                    help="after the client succeeds and before the shutdown, POST this /generate body once and save the "
                         "reply as OUT_DIR/then_generate.json (e.g. a sampled request outside the timed windows)")
@@ -165,8 +171,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="launch nothing: print the server's env (the comma-separated KEYS from the caller's env under "
                         "the capture's own), its argv, and which of KEYS the capture overrides, as JSON")
     a = p.parse_args(argv)
-    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats):
-        p.error("--decode-seconds and --ttft-repeats need --long-prompt")
+    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats or a.temperature or a.top_p is not None):
+        p.error("--decode-seconds, --ttft-repeats, --temperature and --top-p need --long-prompt")
+    if a.top_p is not None and a.temperature <= 0:
+        p.error("--top-p needs a positive --temperature")
     if a.long_prompt and not os.path.isfile(a.long_prompt):
         p.error(f"--long-prompt {a.long_prompt}: no such file")
     if a.decode_seconds <= 0 or a.ttft_repeats < 0:
