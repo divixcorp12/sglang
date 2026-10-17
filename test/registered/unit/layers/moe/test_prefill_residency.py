@@ -85,11 +85,13 @@ class TestGather(_ClearStaging):
         self.assertEqual(reads, [[1, 3, 5], [5]])
 
     def test_without_residency_every_chunk_reads_again(self):
-        _, streamer, reads = _streamer()
-        self._gather(streamer, [1, 3])
-        self._gather(streamer, [1, 3])
-        self.assertEqual(reads, [[1, 3], [1, 3]])
-        self.assertEqual(streamer.last_gather_stats.residency_hit_rows, 0)
+        layer, streamer, reads = _streamer()
+        for gather in (self._gather, self._gather_host):
+            reads.clear()
+            self.assertTrue(torch.equal(gather(streamer, [1, 3]), layer.rows[[1, 3]]), gather.__name__)
+            self.assertTrue(torch.equal(gather(streamer, [1, 3]), layer.rows[[1, 3]]), gather.__name__)
+            self.assertEqual(reads, [[1, 3], [1, 3]])
+            self.assertEqual(streamer.last_gather_stats.residency_hit_rows, 0)
 
     def test_activating_another_layer_forgets_the_previous_layers_rows(self):
         layer0, streamer0, _ = _streamer(0)

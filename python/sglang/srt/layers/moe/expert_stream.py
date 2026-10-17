@@ -1968,8 +1968,13 @@ class ExpertStreamer:
                     (slots.long(), hit_mask.long(), resident_mask.long())
                 ).tolist()
                 resident_rows = sum(resident_host)
+            # in_place: None reads every-source-hits off the hits; resident hits are staged, never read in place.
             hot_out.extend(
-                (slots_host, [bool(hit) for hit in hits_host], resident_rows == 0)
+                (
+                    slots_host,
+                    [bool(hit) for hit in hits_host],
+                    None if resident_rows == 0 else False,
+                )
             )
             hit_rows = routed_hit_rows = sum(hot_out[1])
         elif routed_rows == row_count:
