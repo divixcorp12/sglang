@@ -246,6 +246,35 @@ def verify(src: Source, layer: int, out: str, chunk_pages: int, pool, direct: bo
     }
 
 
+def check_lookups(src: Source, layer: int, out: str, n: int, seed: int = 0) -> dict:
+    """``n`` random rows through the serving reader: the native store (no cache, O_DIRECT, io_uring) on the source
+    shard and on the packed file, compared bit for bit, with each one's reads and bytes per miss."""
+    from sglang.srt.layers.engram_file_table import EngramFileTable
+    from sglang.srt.layers.engram_host_node import native_engram_host_node
+
+    key = f"layers.{layer}.engram.embed.weight"
+    block = src.dim // src.scale_dim
+    old = EngramFileTable(src.path, key, key.replace(".weight", ".scale"), src.total_rows, src.dim, block, cache_tag=layer)
+    new = EngramFileTable(out, key, key.replace(".weight", ".scale"), src.rows, src.dim, block, cache_tag=layer)
+    ids = np.random.default_rng(seed).choice(src.rows, size=min(n, src.rows), replace=False).astype(np.int64)
+    result = {"rows_looked_up": int(ids.size)}
+    rows = {}
+    for name, t in (("split", old), ("packed", new)):
+        store = native_engram_host_node().create_store(0, src.dim + src.scale_dim)
+        store.register_table(t.path, t.weight_offset, t.scale_offset, t.num_embeddings, t.dim, t.dim // t.block,
+                             t._tag, t.rows_per_page)
+        t0 = time.monotonic()
+        rows[name] = np.concatenate([store.lookup(ids[i : i + 256], t._tag) for i in range(0, ids.size, 256)])
+        s = dict(store.stats())
+        result[name] = {
+            "sqes_per_miss": round(s["submitted_sqes"] / s["unique_misses"], 4),
+            "bytes_per_miss": round(s["direct_read_bytes"] / s["unique_misses"], 1),
+            "us_per_row": round((time.monotonic() - t0) / ids.size * 1e6, 2),
+        }
+    result["bit_identical"] = bool(np.array_equal(rows["split"], rows["packed"]))
+    return result
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True)
@@ -258,6 +287,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-direct", action="store_true", help="buffered I/O (tests on tmpfs)")
     p.add_argument("--no-verify", action="store_true")
     p.add_argument("--verify-only", action="store_true", help="verify an existing --out against --source")
+    p.add_argument("--check-lookups", type=int, default=0, help="after verifying, compare N random rows through "
+                   "the native store, source against packed (default 0: skip)")
     p.add_argument("--same-drive", action="store_true", help="allow --out on the source's drive")
     p.add_argument("--lock", default=DEFAULT_LOCK, help="flock held for the run ('' for none)")
     a = p.parse_args(argv)
@@ -303,6 +334,10 @@ def main(argv=None) -> int:
             manifest["verify"] = v = verify(src, a.layer, a.out, a.chunk_pages, pool, not a.no_direct, Throttle(a.max_mib_s))
             print(f"verified: {v}", flush=True)
             rc = 0 if v["rows_differing"] == 0 and v["checksum_matches"] else 1
+    if a.check_lookups:
+        manifest["lookups"] = c = check_lookups(src, a.layer, a.out, a.check_lookups)
+        print(f"lookups: {c}", flush=True)
+        rc = rc or (0 if c["bit_identical"] else 1)
     os.close(src.fd)
     suffix = ".verify.json" if a.verify_only else ".manifest.json"
     with open(a.out + suffix, "w") as f:

@@ -84,7 +84,7 @@ def tables(tmp_path_factory, monkeypatch_module):
     # Small chunks, so the conversion and the verify each run several chunks and a partial last one.
     rc = relayout.main([
         "--source", str(split), "--layer", "1", "--out", str(packed), "--chunk-pages", "4",
-        "--same-drive", "--lock", "", "--hash-threads", "2",
+        "--same-drive", "--lock", "", "--hash-threads", "2", "--check-lookups", "300",
     ])
     assert rc == 0
     expected = torch.cat([weight.view(torch.uint8), scale.view(torch.uint8)], dim=1).numpy()
@@ -120,6 +120,7 @@ def test_the_converted_file_is_page_aligned_padded_and_verified(tables):
     assert not pages[-1, (ROWS % 15) * ROW_BYTES :].any()
     manifest = json.load(open(str(packed) + ".manifest.json"))
     assert manifest["verify"]["rows_differing"] == 0 and manifest["verify"]["checksum_matches"]
+    assert manifest["lookups"]["bit_identical"] and manifest["lookups"]["rows_looked_up"] == 300
     assert header["__metadata__"]["data_sha256"] == manifest["convert"]["data_sha256"]
     assert not os.path.exists(str(packed) + ".partial")
 
@@ -236,6 +237,22 @@ def test_open_finds_a_packed_table_in_the_table_dir(tables):
     assert t.rows_per_page == 15
     w, s = t._rows(np.arange(ROWS))
     assert np.array_equal(np.concatenate([w, s], axis=1), expected)
+
+
+def test_verify_finds_one_flipped_byte(tables, tmp_path, monkeypatch):
+    old, _, _, packed = tables
+    monkeypatch.setattr(relayout, "capture_running", lambda: [])
+    bad = tmp_path / "flipped.safetensors"
+    shutil.copy(packed, bad)
+    g = engram_packed.PackedGeometry(ROWS, DIM, DIM // BLOCK)
+    with open(bad, "r+b") as f:
+        f.seek(4096 + g.row_offset(500) + DIM + 3)  # row 500's fourth scale byte
+        byte = f.read(1)
+        f.seek(-1, 1)
+        f.write(bytes([byte[0] ^ 1]))
+    assert relayout.main(["--source", old.path, "--layer", "1", "--out", str(bad), "--verify-only", "--lock", ""]) == 1
+    v = json.load(open(str(bad) + ".verify.json"))["verify"]
+    assert v["rows_differing"] == 1 and not v["checksum_matches"]
 
 
 def test_the_converter_refuses_to_overwrite(tables):
