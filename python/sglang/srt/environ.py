@@ -2185,6 +2185,10 @@ class Envs:
     # Lets layer-major prefill run under DSpark: the late-layer tail captures the draft's aux hiddens and the pass
     # reports them at whole-extend row indices for the KV injection. Off: launch_refusal refuses DSpark as before.
     SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK = EnvBool(False)
+    # Layer-major expert residency (layers/moe/prefill_residency.py): a buffer of this many expert rows keeps the experts
+    # one chunk of a layer read for the layer's later chunks, so each is read once per prompt. 0 turns it off. Stage 0:
+    # a plain allocation at the first layer-major pass, so the launch must leave it free (a smaller hot cache).
+    SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS = EnvInt(0)
     # NUMA node for the layer-major host state store; node 0 is kept near full by the expert tier (DSV41_REFERENCE
     # §25.4, 27.17).
     SGLANG_LAYER_MAJOR_STATE_NUMA_NODE = EnvInt(1)

@@ -392,6 +392,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     f"{feature} yet; disable one of them."
                 )
 
+    if (
+        envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.get() > 0
+        and envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.get() <= 0
+    ):
+        raise ValueError(
+            "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS keeps experts across a layer-major pass's chunks; "
+            "it needs SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS > 0"
+        )
     if envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.get() > 0:
         from sglang.srt.layer_major.gate import launch_refusal
 

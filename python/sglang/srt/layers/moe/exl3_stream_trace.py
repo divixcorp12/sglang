@@ -655,6 +655,9 @@ class Exl3StreamTrace:
                 "counts": counts.tolist(),
                 "vram_miss": vram_miss,
                 "ram_miss": ram_miss,
+                # Rows prefill_fills read before the gather (not in ram_miss), and layer-major residency hits.
+                "fill_rows": int(getattr(stats, "host_fill_rows", 0)),
+                "residency_hits": int(getattr(stats, "residency_hit_rows", 0)),
                 "read_ms": round(read_ms, 4),
                 "split_ms": round(split_ms, 4),
                 "background_rows": background,

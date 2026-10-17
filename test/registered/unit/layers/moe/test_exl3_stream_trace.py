@@ -59,14 +59,26 @@ def test_trace_lines_carry_route_counts_and_background_reads(tmp_path):
     lines = [json.loads(line) for line in path.read_text().splitlines()]
     stamps = [line.pop("t") for line in lines]
     assert stamps == sorted(stamps)
+    no_fill = {"fill_rows": 0, "residency_hits": 0}
     assert lines == [
         {"forward": 1, "layer": 0, "tokens": 2, "experts": [1, 3], "counts": [3, 1],
-         "vram_miss": 2, "ram_miss": 1, "read_ms": 2.0, "split_ms": 0.5, "background_rows": 5},
+         "vram_miss": 2, "ram_miss": 1, **no_fill, "read_ms": 2.0, "split_ms": 0.5, "background_rows": 5},
         {"forward": 1, "layer": 1, "tokens": 1, "experts": [2], "counts": [2],
-         "vram_miss": 1, "ram_miss": 0, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 0},
+         "vram_miss": 1, "ram_miss": 0, **no_fill, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 0},
         {"forward": 2, "layer": 0, "tokens": 1, "experts": [0, 1], "counts": [1, 1],
-         "vram_miss": 0, "ram_miss": 0, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 2},
+         "vram_miss": 0, "ram_miss": 0, **no_fill, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 2},
     ]
+
+
+def test_trace_lines_carry_fill_rows_and_residency_hits(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    trace = Exl3StreamTrace(str(path))
+    stats = SimpleNamespace(miss_rows=1, host_read_rows=0, host_read_ns=0, host_split_ns=0, host_fill_rows=3,
+                            residency_hit_rows=5)
+    trace.record(0, torch.tensor([[1, 2]]), stats, 0)
+    trace.close()
+    line = json.loads(path.read_text())
+    assert (line["fill_rows"], line["residency_hits"]) == (3, 5)
     assert trace.stats()["background_read_rows"] == 7
 
 
