@@ -1197,6 +1197,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             gate_verify_lens=gate_verify_lens,
         )
+        if cut_verify_lens is not None:
+            # The online refit's sample: a non-blocking copy of this verify's confidences and accept, read later.
+            self._confidence_cut.observe_outcome(
+                confidence=confidence,
+                verify_lens=cut_verify_lens,
+                correct_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
+                sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,

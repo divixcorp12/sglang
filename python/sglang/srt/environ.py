@@ -835,6 +835,9 @@ class Envs:
     # The cut's rule maximises E(w) / (draft ms + T(w)), the draft ms timed on the T(w) calibration's verifies, not
     # E(w) / T(w). The draft ms is timed and logged either way.
     SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST = EnvBool(False)
+    # Refit the cut's per-position calibration from the server's own accepts every this many cut verifies (greedy and
+    # sampled apart; dspark_confidence_refit.py). The cut reads max(offline, refit), so it never cuts harder. 0 is off.
+    SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

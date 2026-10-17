@@ -120,6 +120,7 @@ class ConfidenceCut:
         cut_sampled: bool = False,
         sampled_rescale: Optional[torch.Tensor] = None,
         draft_cost: bool = False,
+        refit=None,
     ):
         self.gamma = gamma
         self.device = device
@@ -130,6 +131,8 @@ class ConfidenceCut:
         self._sampled_rescale = sampled_rescale
         # SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST: the rule divides by draft ms + T(w), not T(w) alone.
         self.draft_cost = draft_cost
+        # SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL: a dspark_confidence_refit.OnlineRefit, or None.
+        self.refit = refit
         # Any object with CUDA Event's record() / query() / elapsed_time(end); tests inject a CPU fake.
         self._new_event = new_event or (lambda: torch.cuda.Event(enable_timing=True))
         self._num_forced = 0
@@ -192,12 +195,26 @@ class ConfidenceCut:
                 )
             )
         draft_cost = envs.SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST.get()
+        refit_interval = envs.SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL.get()
+        refit = None
+        if refit_interval > 0:
+            from sglang.srt.speculative.dspark_components.dspark_confidence_refit import (
+                REFIT_BUFFER_VERIFIES,
+                OnlineRefit,
+            )
+
+            refit = OnlineRefit(gamma=gamma, device=device, interval=refit_interval)
+            logger.info(
+                f"dspark confidence cut: online refit every {refit_interval} verifies over the last "
+                f"{REFIT_BUFFER_VERIFIES}, greedy and sampled apart (SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL)"
+            )
         return cls(
             gamma=gamma,
             device=device,
             cut_sampled=cut_sampled,
             sampled_rescale=sampled_rescale,
             draft_cost=draft_cost,
+            refit=refit,
         )
 
     @property
@@ -223,12 +240,40 @@ class ConfidenceCut:
     def applies(self, *, bs: int, sampling_info) -> bool:
         return bs == 1 and (self.cut_sampled or sampling_info is None or sampling_info.is_all_greedy)
 
-    def cut_confidence(self, confidence: torch.Tensor, *, sampled: bool) -> torch.Tensor:
-        """The [bs, gamma] confidences the cut reads: the head's, re-tempered to the sampled STS file's temperatures for
-        a sampled verify when one is loaded. A per-position monotone map, so the stopping form's argument holds."""
+    def offline_confidence(self, confidence: torch.Tensor, *, sampled: bool) -> torch.Tensor:
+        """The head's [bs, gamma] confidences, re-tempered to the sampled STS file's temperatures for a sampled verify
+        when one is loaded: what the offline calibration says."""
         if sampled and self._sampled_rescale is not None:
             return rescale_confidence(confidence, self._sampled_rescale)
         return confidence
+
+    def cut_confidence(self, confidence: torch.Tensor, *, sampled: bool) -> torch.Tensor:
+        """The [bs, gamma] confidences the cut reads: the offline ones, raised by the online refit where it says more
+        (never lowered). Per-position maps of this step's confidences only, so the stopping form's argument holds."""
+        offline = self.offline_confidence(confidence, sampled=sampled)
+        if self.refit is None:
+            return offline
+        return self.refit.apply(offline, sampled=sampled)
+
+    def observe_outcome(
+        self,
+        *,
+        confidence: torch.Tensor,
+        verify_lens: torch.Tensor,
+        correct_len: torch.Tensor,
+        cap_trim_lens: torch.Tensor,
+        sampled: bool,
+    ) -> None:
+        """A bs-1 cut verify's accept, for the online refit (no-op without one). ``confidence`` is the head's."""
+        if self.refit is None:
+            return
+        self.refit.observe(
+            confidence=self.offline_confidence(confidence, sampled=sampled),
+            verify_lens=verify_lens,
+            correct_len=correct_len,
+            cap_trim_lens=cap_trim_lens,
+            sampled=sampled,
+        )
 
     def admit_calibration(self, gate: CalibrationGate) -> bool:
         """Whether an eligible verify before T(w) froze may run the cut (a forced, timed width). A held verify covers

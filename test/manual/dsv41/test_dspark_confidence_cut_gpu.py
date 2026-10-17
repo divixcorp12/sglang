@@ -198,6 +198,47 @@ def test_the_cut_accept_preload_covers_the_variants_a_cut_verify_runs():
     assert [n for n in loads if n in names] == []
 
 
+def test_the_sampled_cut_draft_timing_and_online_refit_add_no_device_sync():
+    """A calibrated sampled cut verify as the worker runs it -- begin_draft, re-tempered and refitted confidences, the
+    stopping rule, the outcome's ring copy, the refit's pick-up -- under torch's sync debug mode set to error: any
+    synchronizing call raises. Mutant: a .item()/.tolist() on a device tensor, or a pageable copy, in that path -- red."""
+    import concurrent.futures
+
+    from sglang.srt.speculative.dspark_components.dspark_confidence_refit import RING_SLOTS, OnlineRefit
+    from sglang.test import dspark_cut_distribution as dist
+
+    class Now:
+        def submit(self, fn, **kwargs):
+            future = concurrent.futures.Future()
+            future.set_result(fn(**kwargs))
+            return future
+
+    refit = OnlineRefit(gamma=GAMMA, device="cuda", interval=32, executor=Now())
+    cut = dist.calibrated_cut(
+        gamma=GAMMA, base_ms=96.5, per_row_ms=18.3, device="cuda", cut_sampled=True, draft_cost=True,
+        sampled_rescale=torch.tensor([1.1, 0.9, 1.0, 1.2, 0.8], device="cuda"), refit=refit,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3 * RING_SLOTS):
+            cut.begin_draft()
+            confidence = torch.rand((1, GAMMA), device="cuda", generator=generator)
+            cut_confidence = cut.cut_confidence(confidence, sampled=True)
+            lens = cut.verify_lens(cut_confidence, sampled=True)
+            correct_len = torch.minimum(lens - 1, torch.randint(0, GAMMA + 1, (1,), device="cuda", generator=generator))
+            cut.observe_outcome(
+                confidence=confidence, verify_lens=lens, correct_len=correct_len.to(torch.int32),
+                cap_trim_lens=torch.zeros(1, dtype=torch.int32, device="cuda"), sampled=True,
+            )
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    torch.cuda.synchronize()
+    assert refit._modes["sampled"].refit_ct >= 1 and refit._modes["sampled"].slopes.device.type == "cuda"
+    assert len(refit._modes["sampled"].buffer) > RING_SLOTS
+
+
 # The sampled cut's distribution test on the real accept: AcceptSampling (temperature softmax, the chain rejection
 # sampling kernel, CapCorrectLen and the bonus gather) with widths from the real rule (ConfidenceCut.verify_lens,
 # sampled). sglang.test.dspark_cut_distribution has the toy; its CPU twin is test_dspark_confidence_cut_sampled.py.
