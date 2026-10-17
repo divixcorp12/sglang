@@ -306,6 +306,12 @@ PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4",
 # file is there with this SHA256 (check_prod_assets).
 PROD_RAM_PREFETCH_LEARNED_HEAD = "/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors"
 PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309"
+# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the cut arm
+# only (both_cpu_ab's -prod-confcut); production stays off and loads neither. A placeholder until the file is fitted:
+# both_cpu_ab's -prod-stscollect arm collects the data and its comment gives the fit command. The SHA256 is pinned once
+# the file exists.
+PROD_DSPARK_STS_PATH = "/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json"
+PROD_DSPARK_STS_SHA256 = None
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:

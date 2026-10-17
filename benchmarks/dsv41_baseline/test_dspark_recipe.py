@@ -67,6 +67,17 @@ def test_prod_leaves_the_pending_and_held_flags_off():
     assert not any("TRACE" in k for k in env) and "SGLANG_MOE_HOT_METRICS_FILE" not in env
 
 
+def test_prod_leaves_the_confidence_cut_and_its_sts_collection_off():
+    # docs/hx/compact-verify-exl3.draft.md: off by default; the cut and its STS file belong to both_cpu_ab's cut arm.
+    env = arm_env.prod_env()
+    assert "SGLANG_DSPARK_CONFIDENCE_CUT" not in env and "SGLANG_DSPARK_STS_COLLECT_PATH" not in env
+    assert "--speculative-dspark-confidence-sts-path" not in arm_env.ServerArgs.prod().argv()
+    assert not any("DSPARK_STS" in k or "CONFIDENCE_CUT" in k for k in arm_env.dspark_env())
+    # A placeholder for the arm until the file is fitted: a production asset path, its digest not yet pinned.
+    assert arm_env.PROD_DSPARK_STS_PATH.startswith("/data/models/slang/prod-assets/dspark-sts/")
+    assert arm_env.PROD_DSPARK_STS_SHA256 is None
+
+
 # The best arm's prefetch keys, from divix01:/mnt/nvme1/share64-ab-20261016/resolved-env.json "on" (its head was
 # nvfp4-work/ram-prefetch/l2-t3-head/t3-f109-calib-b075.safetensors, production's is the checksummed copy).
 SERVED_PREFETCH = {

@@ -50,9 +50,12 @@ def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: s
                verify_split: bool = True) -> dict:
     """The arm's env with the job trace on; ``top_k_only`` and ``scorer`` override the arm's only when given. With
     ``verify_split`` it also writes the stage trace's route log, the router capture and the per-verify accept log,
-    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs."""
+    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs. An
+    STS collection arm writes its shards under OUT_DIR (both_cpu_ab.sts_collect_stem)."""
     overrides, _ = both_cpu_ab.ARMS[arm]
     asked = {}
+    if arm in both_cpu_ab.STS_COLLECT_ARMS:
+        asked[both_cpu_ab.STS_COLLECT] = both_cpu_ab.sts_collect_stem(out_dir)
     if top_k_only:
         asked["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] = "1"
     if scorer is not None:
