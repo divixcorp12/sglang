@@ -70,7 +70,7 @@ def test_evict_drops_each_file_and_counts_it(tmp_path):
 def _nodes(tmp_path, free0_gib, free1_gib):
     root = tmp_path / "sysfs"
     for node, free in ((0, free0_gib), (1, free1_gib)):
-        (root / f"node{node}").mkdir(parents=True)
+        (root / f"node{node}").mkdir(parents=True, exist_ok=True)
         (root / f"node{node}" / "meminfo").write_text(
             f"Node {node} MemFree:        {int(free * GIB)} kB\nNode {node} FilePages:      {GIB} kB\n"
             f"Node {node} Shmem:          0 kB\n"

@@ -154,7 +154,8 @@ def paged_table(tmp_path):
     torch.manual_seed(2)
     weight = (torch.randn(PAGED_ROWS, PAGED_DIM) * 4).to(torch.float8_e4m3fn)
     scale = torch.randint(118, 130, (PAGED_ROWS, PAGED_DIM // BLOCK), dtype=torch.uint8).view(torch.float8_e8m0fnu)
-    path = tmp_path / "model-00047-of-00048.safetensors"
+    # Its own name: a test taking both fixtures would otherwise have `table` overwrite this file in the same tmp_path.
+    path = tmp_path / "paged-model-00047-of-00048.safetensors"
     raw_w, raw_s = (x.view(torch.uint8).numpy().tobytes() for x in (weight, scale))
     header = {
         "layers.1.engram.embed.weight": {"dtype": "F8_E4M3", "shape": [PAGED_ROWS, PAGED_DIM],
