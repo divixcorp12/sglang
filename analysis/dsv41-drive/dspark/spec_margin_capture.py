@@ -158,6 +158,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with --long-prompt: cancel the request this long after its first streamed token")
     p.add_argument("--ttft-repeats", type=int, default=0,
                    help="with --long-prompt: first send it this many times with 20 s of decode, for TTFT samples")
+    p.add_argument("--then-generate", metavar="JSON",
+                   help="after the client succeeds and before the shutdown, POST this /generate body once and save the "
+                        "reply as OUT_DIR/then_generate.json (e.g. a sampled request outside the timed windows)")
     p.add_argument("--resolve-env", metavar="KEYS",
                    help="launch nothing: print the server's env (the comma-separated KEYS from the caller's env under "
                         "the capture's own), its argv, and which of KEYS the capture overrides, as JSON")
@@ -197,6 +200,24 @@ def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
             "overridden": sorted(k for k, v in asked.items() if k in own and own[k] != v)}
 
 
+def then_generate(body_path: str, out_path: str, timeout_s: float = 600.0) -> int:
+    """POST ``body_path`` to the server's /generate once; the reply goes to ``out_path``. 0 on HTTP 200."""
+    with open(body_path, "rb") as f:
+        body = f.read()
+    request = urllib.request.Request(f"http://127.0.0.1:{PORT}/generate", data=body,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as r:
+            reply = r.read()
+    except OSError as error:
+        print(f"then-generate failed: {error!r}")
+        return 1
+    with open(out_path, "wb") as f:
+        f.write(reply)
+    print(f"then-generate: {len(reply)} bytes -> {out_path}")
+    return 0
+
+
 def main() -> int:
     a = parse_args()
     if a.resolve_env is not None:
@@ -214,6 +235,8 @@ def main() -> int:
             if not _healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
                 return 1
             rc = subprocess.run(["taskset", "-c", arm_env.DRIVER_CORES, *client_argv(a)], cwd=REPO).returncode
+            if rc == 0 and a.then_generate:
+                rc = then_generate(a.then_generate, os.path.join(a.out_dir, "then_generate.json"))
         finally:
             stop_server(server)
     if rc != 0:
