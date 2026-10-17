@@ -33,7 +33,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HEAD_WEIGHT = "mtp.2.confidence_head.proj.weight"
 EMBED_WEIGHT = "mtp.2.markov_head.embed.weight"
 SHIPPED_STS = (0.8912509083747864, 0.7943282127380371, 1.258925437927246, 0.8912509083747864, 0.6309573650360107)
-LAMBDAS = (1e-4, 1e-3, 1e-2, 1e-1)
+LAMBDAS = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
+RECAL_LR = 0.02
 MODELS = ("recal", "finetune", "probe")
 
 
@@ -129,7 +130,8 @@ def train(*, model: str, data: dict, w_shipped: torch.Tensor, label_kind: str, e
     for lam in lambdas if model != "recal" else (0.0,):
         torch.manual_seed(0)
         head = Head(model=model, w_shipped=w_shipped, gamma=gamma)
-        opt = torch.optim.Adam([p for p in head.parameters() if p.requires_grad], lr=lr)
+        # recal fits 2 x gamma scalars of order 1; the weight models' steps are sized for weights of order |w|.
+        opt = torch.optim.Adam([p for p in head.parameters() if p.requires_grad], lr=RECAL_LR if model == "recal" else lr)
         state, best_val = None, float("inf")
         for epoch in range(epochs):
             opt.zero_grad()
