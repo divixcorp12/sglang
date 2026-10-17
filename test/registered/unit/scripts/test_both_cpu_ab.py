@@ -403,7 +403,9 @@ PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
 STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
 LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM)
+LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM = f"{LAYER_MAJOR_ARM}-smallhot", f"{LAYER_MAJOR_ARM}-res"
+LAYER_MAJOR_ARMS = (LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1217,7 +1219,7 @@ def test_the_layer_major_arm_is_prod_with_layer_major_prefill_and_every_other_ar
     ab = _ab()
     threshold, switch = "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS", "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"
     for arm, (overrides, _) in ab.ARMS.items():
-        if arm != LAYER_MAJOR_ARM:
+        if arm not in LAYER_MAJOR_ARMS:
             assert overrides.get(threshold, "0") == "0" and switch not in overrides, arm
     assert ab.arm_env.dspark_env()[threshold] == "0"
     lm = ab.ARMS[LAYER_MAJOR_ARM][0]
@@ -1225,6 +1227,27 @@ def test_the_layer_major_arm_is_prod_with_layer_major_prefill_and_every_other_ar
     assert {k: v for k, v in lm.items() if k != switch} == {**ab.ARMS[PROD_ARM][0], threshold: "8192"}
     assert ab.ARMS[LAYER_MAJOR_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_ARM] == PROD_ARM
     assert ab.server_flags(LAYER_MAJOR_ARM) == ab.server_flags(PROD_ARM)
+
+
+def test_the_residency_pair_differs_only_in_the_residency_rows_and_both_give_up_that_much_hot_cache():
+    """-smallhot is -layermajor with the hot cache RESIDENCY_ROWS slots smaller and the startup calibration off (it
+    would grow back into the buffer's memory); -res adds the rows alone. No other arm sets the rows. Mutant: the pair
+    differs in another knob, or the hot cache keeps the memory the buffer needs -- red."""
+    ab = _ab()
+    residency, hot = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS", "SGLANG_MOE_HOT_GPU_MB"
+    for arm, (overrides, _) in ab.ARMS.items():
+        assert (residency in overrides) == (arm == LAYER_MAJOR_RESIDENCY_ARM), arm
+    lm, small, res = (ab.ARMS[a][0] for a in LAYER_MAJOR_ARMS)
+    assert {k: v for k, v in res.items() if k != residency} == small
+    assert res[residency] == str(ab.RESIDENCY_ROWS)
+    assert {k: v for k, v in small.items() if k not in (hot, ab.CALIBRATE)} == {
+        k: v for k, v in lm.items() if k not in (hot, ab.CALIBRATE)
+    }
+    assert small[ab.CALIBRATE] == "0"
+    given_up = (int(lm[hot]) - int(small[hot])) * 2**20
+    assert ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES <= given_up < ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES + 2**20
+    assert ab.REFERENCE[LAYER_MAJOR_RESIDENCY_ARM] == LAYER_MAJOR_SMALL_HOT_ARM
+    assert all(ab.server_flags(a) == ab.server_flags(PROD_ARM) for a in LAYER_MAJOR_ARMS)
 
 
 def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_own(monkeypatch):
@@ -1272,7 +1295,8 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
     for arm in PROD_ARMS:
         assert ab.run_probe(arm, str(tmp_path)) == 1
-    prod, collect, cut, layer_major = argvs
+    prod, collect, cut, *layer_major = argvs
     assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
     assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
-    assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect and STS_PATH_FLAG not in layer_major
+    assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
+    assert len(layer_major) == len(LAYER_MAJOR_ARMS) and all(STS_PATH_FLAG not in a for a in layer_major)
