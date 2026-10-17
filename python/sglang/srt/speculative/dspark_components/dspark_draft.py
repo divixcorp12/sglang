@@ -74,6 +74,9 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     temperatures: torch.Tensor
     # [bs, gamma] softmax top-1 probability per draft step; only recorded for the top-probability verify gate.
     top_probs: Optional[torch.Tensor] = None
+    # Every row's draft is the argmax, so a sampled row's draft distribution is one-hot at its token
+    # (SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT); its accept needs no corrected_logits.
+    greedy_draft: bool = False
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -143,7 +146,9 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
     record_top_prob: bool = False,
+    greedy_draft_sampled: bool = False,
 ) -> DraftBlockResult:
+    """``greedy_draft_sampled`` drafts sampled rows by argmax too (SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT)."""
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
@@ -156,7 +161,7 @@ def sample_draft_block(
             sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
         )
 
-    if not any_sampling:
+    if not any_sampling or greedy_draft_sampled:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
@@ -211,6 +216,7 @@ def sample_draft_block(
         greedy_mask=greedy_mask,
         temperatures=temperatures,
         top_probs=top_probs,
+        greedy_draft=greedy_draft_sampled or not any_sampling,
     )
 
 
@@ -237,6 +243,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
         self._draft_sampler = None
+        self._greedy_draft_sampled = envs.SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT.get()
         self._dp_moe_sync = dp_moe_sync
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
@@ -292,7 +299,11 @@ class DraftBlockProposer:
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
-            and (all_greedy or draft_sampler.folded_sampling)
+            and (
+                all_greedy
+                or draft_sampler.folded_sampling
+                or self._greedy_draft_sampled
+            )
         ):
             folded = True
             if draft_sampler.folded_sampling:
@@ -332,6 +343,8 @@ class DraftBlockProposer:
                     if draft_sampler.top_prob_out is None
                     else draft_sampler.top_prob_out[:bs]
                 ),
+                # The greedy-only fold argmaxed every row, sampled ones included.
+                greedy_draft=all_greedy or not draft_sampler.folded_sampling,
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
@@ -350,6 +363,7 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
                 record_top_prob=self._record_top_prob,
+                greedy_draft_sampled=self._greedy_draft_sampled,
             )
         proposal_block_ids = (
             draft_block_ids

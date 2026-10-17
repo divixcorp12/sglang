@@ -825,6 +825,9 @@ class Envs:
     # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
     # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
     SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
+    # Sampled requests draft greedily, through the greedy draft graph, and verify against the one-hot draft
+    # distribution that proposal has (dspark_sampled_accept.py), which keeps the accept lossless.
+    SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

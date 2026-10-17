@@ -17,6 +17,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_greedy_triton,
     finalize_accept_lens_triton,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_sampled_accept import (
+    AcceptSampledChain,
+    preload_sampled_accept_kernels,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     BuildOutTokens,
@@ -26,6 +30,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -135,6 +140,15 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        if (
+            envs.SGLANG_DSPARK_SAMPLED_GREEDY_DRAFT.get()
+            and torch.device(model_runner.device).type == "cuda"
+        ):
+            preload_sampled_accept_kernels(
+                device=model_runner.device,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                vocab=target_worker.model_runner.model_config.vocab_size,
+            )
 
     def accept_and_finalize(
         self,
@@ -858,40 +872,24 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
-    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    sampling_len, sampling_bonus, sampling_trim = _accept_sampled_rows(
+        candidates=candidates,
+        target_logits=target_logits,
+        draft_block=draft_block,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        gamma=gamma,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        cutoff_verify_lens=cutoff_verify_lens,
+    )
     if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
-            candidates=candidates,
-            target_logits=target_logits,
-            draft_probs=draft_probs,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            gamma=gamma,
-            verify_num_draft_tokens=verify_num_draft_tokens,
-            cutoff_verify_lens=cutoff_verify_lens,
-        )
+        return sampling_len, sampling_bonus, sampling_trim
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         fused_argmax=fused_argmax,
-    )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
-        sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
     )
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,
@@ -903,3 +901,46 @@ def accept_draft_tokens(
         sampling_trim=sampling_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens
+
+
+def _accept_sampled_rows(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_block: DraftBlockResult,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The sampled rows' rejection-sampling accept. A greedy draft's q is one-hot at its token, which the chain
+    accept in dspark_sampled_accept.py takes without materializing it; a sampled draft's q is its corrected logits'
+    softmax at the request temperature."""
+    if draft_block.greedy_draft:
+        return AcceptSampledChain.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=None,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    draft_probs = SoftmaxTemp.execute(
+        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+        temperatures=draft_block.temperatures,
+        rows_per_request=gamma_rows,
+    ).view(bs, gamma_rows, vocab)
+    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    return AcceptSampling.execute(
+        candidates=candidates,
+        target_logits=target_logits,
+        draft_probs=draft_probs,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        gamma=gamma,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        cutoff_verify_lens=cutoff_verify_lens,
+    )
