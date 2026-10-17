@@ -1526,6 +1526,20 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   - Noise: the cut arm's 0-30 s and 300-360 s windows had swap-in spikes (CPUSLOW), and 360-420 s was a disk stall
     (x10.8) and is truncated (the copy engine's job trace overflowed at 414.8 s, which is why the capture reported
     rc=1). All excluded from the 60-360 s rows.
+- **The startup T(w) fit is noise-dominated** (found 2026-10-16 in the two cut arms below and above). The affine fit
+  over the 48 calibration verifies gave a = 226.6, b = 16.8 ms/row (r^2 = 0.015) in the confcut arm, and a = 271.0,
+  b = 4.7 ms/row (r^2 = 0.0009) in the engramscales arm. With the shallower slope the cut is much weaker: w* 4.4-5.3
+  and about 50 cut rows per 40 verifies, against w* 3.4-4.1 and about 90. So how hard the cut bites is set by
+  calibration noise at each launch. Needs a decision (owner) before the cut ships.
+- **Engram scales in node-1 RAM, served** (`engram-scales-ram` @ `e9fb5bbd2d`, `-prod-confcut` +
+  `SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1`; owner skipped the off arm; compared with the confcut arm above;
+  `/mnt/nvme1/engramscales-20261017`):
+  - Works: 2 x 2.861 GiB loaded in 1.9 s each, 0 pages off node 1. Engram NVMe reads per unique miss fell from 2 to
+    1.0 (for example 48,370 reads for 48,370 misses in one 60 s window).
+  - Node 1 free in decode 14.35 -> 8.21 GiB (median); node 0 and swap unchanged.
+  - Throughput is not comparable: the T(w) fit above made this arm cut far less, so it verified more rows (about 226
+    Engram accesses per verify against 174) and waited longer. 60-360 s: 166.2 vs 158.4 ms per verify, 65.9 vs 60.8
+    ms/token. A clean read needs a fixed-width base (for example `-prod` vs `-prod` + scales).
 - **Dead-row audit** (2026-10-16, read-only; confcut smoke server.log Engram stats against verify.jsonl, prefill-free
   60 s windows only):
   - **Engram lookups are the only disk/host work a dead row still causes.** Both runs do 288 accesses per verify
