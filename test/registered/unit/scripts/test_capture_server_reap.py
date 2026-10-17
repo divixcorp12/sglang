@@ -33,7 +33,7 @@ def _orphan_group(tmp_path, children: str) -> int:
     """A session whose leader has exited and whose children live on (reparented to init), as after an abort. Returns the
     group id, which is the leader's pid; records it in tmp_path/server.pgid."""
     pgfile = tmp_path / "server.pgid"
-    subprocess.run(["setsid", "bash", "-c", f"echo $$ > {pgfile}; {children}; exit 0"], check=True, timeout=30)
+    subprocess.run(["setsid", "bash", "-c", f"echo $$ > {pgfile}\n{children}\nexit 0"], check=True, timeout=30)
     deadline = time.monotonic() + 10
     while not pgfile.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
