@@ -69,12 +69,12 @@ def load(data_glob: str, temperature: float, *, need_draft: bool = True) -> dict
 def features(data: dict, names: tuple[str, ...]) -> torch.Tensor:
     """[n, gamma, len(names)] float64."""
     columns = {
-        "head": data["logits"].double(),
-        "q": _logit(data["draft_q"].double()),
-        "top1": _logit(data["draft_top1"].double()),
-        "ent": data["draft_entropy"].double(),
+        "head": lambda: data["logits"].double(),
+        "q": lambda: _logit(data["draft_q"].double()),
+        "top1": lambda: _logit(data["draft_top1"].double()),
+        "ent": lambda: data["draft_entropy"].double(),
     }
-    return torch.stack([columns[name] for name in names], dim=-1)
+    return torch.stack([columns[name]() for name in names], dim=-1)
 
 
 def fit_logistic(x: torch.Tensor, y: torch.Tensor, ridge: float = 1e-3, steps: int = 50) -> torch.Tensor:
