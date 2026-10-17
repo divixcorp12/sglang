@@ -1540,6 +1540,9 @@ class ExpertStreamer:
         # lane_head.LaneHeadGather when SGLANG_OPT_LANE_HEAD_PATH is set: writes _plan_miss_keys at each gather,
         # right before the fused plan reads them. None: the keys are the residency ranking's.
         self.lane_head_hook = None
+        # A verify's dead rows ([max_rows, 1] bool, layers/moe/verify_dead_rows.py) during Exl3MoEMethod._apply_graph's
+        # gather: the fused plan leaves their routes out of the residency route counts. None: every row is live.
+        self.verify_dead = None
         self._graph_fused_slots_scratch = (
             torch.empty(max_rows, dtype=torch.int32, device=device)
             if self._fused_plan_enabled
@@ -1654,6 +1657,12 @@ class ExpertStreamer:
                 remap_out=self._graph_fused_remaps[flat.dtype][:count],
                 miss_keys=self._plan_miss_keys,
                 dedup=topk_ids.shape[0] != 1,
+                dead_rows=(
+                    self.verify_dead
+                    if self.verify_dead is not None and topk_ids.ndim == 2 and topk_ids.shape[0] != 1
+                    else None
+                ),
+                row_top_k=topk_ids.shape[-1],
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]

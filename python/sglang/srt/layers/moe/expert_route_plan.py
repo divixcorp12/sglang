@@ -186,6 +186,8 @@ def plan_graph_routes_fused(
     remap_out: Optional[torch.Tensor] = None,
     miss_keys: Optional[torch.Tensor] = None,
     dedup: bool = False,
+    dead_rows: Optional[torch.Tensor] = None,
+    row_top_k: int = 0,
 ) -> torch.Tensor:
     """`plan_graph_routes` in one fused kernel launch: one token's unique ids, or several tokens' with ``dedup``.
 
@@ -217,6 +219,9 @@ def plan_graph_routes_fused(
     residual rows by key, highest first; ``plan_graph_routes`` has no such mode.
 
     ``dedup``: the routes are several tokens' (`supports_fused_graph_routes`), planned by the dedup kernel.
+
+    ``dead_rows`` (dedup only): a verify's dead-row mask (layers/moe/verify_dead_rows.py) over rows of ``row_top_k``
+    routes; a dead row's routes add nothing to ``route_counts``. The plan and the other counters are unchanged.
     """
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
@@ -251,5 +256,7 @@ def plan_graph_routes_fused(
         outcome_counters,
         miss_keys,
         dedup=dedup,
+        dead_rows=dead_rows,
+        row_top_k=row_top_k,
     )
     return remap_out

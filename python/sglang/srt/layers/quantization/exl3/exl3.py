@@ -742,9 +742,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             backend.cpu_input = (cpu_x, topk_weights)
             # The lane head (SGLANG_OPT_LANE_HEAD_PATH) counts live rows only; a dead row repeats row 0's routes.
             backend.verify_dead = dead
+        # The fused plan leaves a dead row's routes out of the residency route counts.
+        streamer.verify_dead = dead
         try:
             remap, _ = streamer.gather(topk_ids)
         finally:
+            streamer.verify_dead = None
             if cpu_experts:
                 backend.cpu_input = None
                 backend.verify_dead = None

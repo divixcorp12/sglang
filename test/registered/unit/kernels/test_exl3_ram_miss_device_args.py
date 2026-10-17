@@ -619,3 +619,28 @@ def test_the_gpu_scorer_sizes_its_scratch_by_the_rows_tokens():
 def test_scoring_before_the_gpu_scorer_is_enabled_is_refused():
     with pytest.raises(RuntimeError, match="enable_spec_scorer"):
         _device().spec_score(SimpleNamespace(target=0), None)
+
+
+@pytest.mark.parametrize("with_weights", [True, False])
+def test_the_gpu_scorer_hands_the_posts_routes_to_the_select_kernel(with_weights):
+    """The select kernel ranks only a verify's live rows, which it finds in the post's routes (a dead row's are -1), so
+    the scoring passes them with the post's routes per token: the weights' count over the tokens, as the post kernel
+    derives it. Without the weights it passes none and ranks every row. Mutant: drop the routes -- red."""
+    dev = _device()
+    dev.cpu_tokens_max = 3  # a verify's rows, as enable_cpu_experts sets it
+    dev.enable_spec_scorer(ram_miss.new_candidate_page(pin=False), top_k=2, per_token=1, top_k_only=False)
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    entry = SimpleNamespace(
+        target=1, weight=torch.zeros(4, 8), bias=torch.zeros(4), hot_slots=torch.full((1,), -1), hot_capacity=0
+    )
+    routes = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1], dtype=torch.int64)
+    weights = torch.ones(3, 2) if with_weights else None
+    dev.spec_score(entry, torch.zeros(3, 8, dtype=torch.bfloat16), routes=routes, route_weights=weights)
+    assert [name for name, _ in recorder.calls] == ["expert_stream_spec_score", "expert_stream_spec_select"]
+    _, args = recorder.calls[1]
+    assert args[1] == 3
+    if with_weights:
+        assert args[-2] is routes and args[-1] == 2
+    else:
+        assert (args[-2], args[-1]) == (None, 0)

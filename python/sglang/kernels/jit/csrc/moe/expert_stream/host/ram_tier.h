@@ -20,6 +20,7 @@
 #include <future>
 #include <limits>
 
+#include "../cpu_token_table.h"
 #include "../row_layout.h"
 #include "../spec_candidates.h"
 #include "copy_engine.h"
@@ -2646,8 +2647,10 @@ class RamTier {
         staged |= lane.kind == Wire::kKindHitCpu || lane.kind == Wire::kKindMissCpu;
       if (!staged) return;
       if (spec_->tokens_max > 1) {
+        // The live tokens, not the record's: a verify's dead rows are copies of the anchor's input.
+        const uint8_t* table = spec_->x_base + request.row * spec_->x_stride + spec_->tokens_max * spec_->x_token_bytes;
         uint32_t live;
-        std::memcpy(&live, spec_->x_base + request.row * spec_->x_stride + spec_->tokens_max * spec_->x_token_bytes, 4);
+        std::memcpy(&live, table + CpuTokenTable::kLiveTokens, 4);
         tokens = live;
         if (tokens < 1 || tokens > spec_->tokens_max) {
           count<kSpecDropped>(group);
