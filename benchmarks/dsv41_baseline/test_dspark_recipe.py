@@ -73,9 +73,9 @@ def test_prod_leaves_the_confidence_cut_and_its_sts_collection_off():
     assert "SGLANG_DSPARK_CONFIDENCE_CUT" not in env and "SGLANG_DSPARK_STS_COLLECT_PATH" not in env
     assert "--speculative-dspark-confidence-sts-path" not in arm_env.ServerArgs.prod().argv()
     assert not any("DSPARK_STS" in k or "CONFIDENCE_CUT" in k for k in arm_env.dspark_env())
-    # A placeholder for the arm until the file is fitted: a production asset path, its digest not yet pinned.
+    # The arm's fitted STS file: a production asset path with its digest pinned.
     assert arm_env.PROD_DSPARK_STS_PATH.startswith("/data/models/slang/prod-assets/dspark-sts/")
-    assert arm_env.PROD_DSPARK_STS_SHA256 is None
+    assert len(arm_env.PROD_DSPARK_STS_SHA256) == 64
 
 
 # The best arm's prefetch keys, from divix01:/mnt/nvme1/share64-ab-20261016/resolved-env.json "on" (its head was
