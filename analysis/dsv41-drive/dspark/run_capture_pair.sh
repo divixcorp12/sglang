@@ -23,6 +23,9 @@
 die() { echo "run_capture_pair: $*" >&2; exit 2; }
 
 OUT=""; BASE=""; WT=""; PY=/data/models/slang/.venv/bin/python; HICACHE_GIB=12.67; DRY=0
+# The roots prelaunch_evict.py searches for page-cache holders when evicting its listed files leaves node 1 short (the
+# same as arm_env.PROD_PAGE_CACHE_ROOTS).
+HOLDERS="--holders /mnt/nvme0 --holders /mnt/nvme1 --holders /mnt/nvme2 --holders /mnt/nvme4 --holders /data/models"
 COMMON=(); NAMES=(); SPECS=(); CAP=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -103,7 +106,7 @@ if [ "$DRY" = 1 ]; then
     name=${NAMES[$i]}
     echo "ARM $name"
     echo "  env: $(arm_assignments "$i")"
-    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB"
+    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB $HOLDERS"
     echo "  capture: env $(arm_assignments "$i") taskset -c 0-63 $PY $CAPTURE $OUT/$name --arm $BASE ${CAP[*]}"
     echo "  outputs: $OUT/$name $OUT/$name.memsample.jsonl $OUT/$name.nvme3n1.samples $OUT/$name.gpu-mem.csv $OUT/$name.memstate.txt $OUT/$name.diskstats.before $OUT/$name.diskstats.after $OUT/$name.ready.txt"
   done
@@ -120,7 +123,7 @@ for i in "${!NAMES[@]}"; do
   echo "$name ${all[*]}"
   while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
     echo "waiting for a quiet box $(date)"; sleep 60; done
-  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB; then
+  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB $HOLDERS; then
     echo "REFUSED $name: node 1 free below the floor $(date)"; echo ALLDONE; exit 3
   fi
   mkdir -p $OUT/$name

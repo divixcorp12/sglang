@@ -14,8 +14,9 @@ Production (launch_prod.sh) runs it too, with three more options:
 - --skip-evict-port PORT: while anything listens on PORT (another of our servers reading the same files), check the
   floor without evicting;
 - --node0-warn-gib: warn, never refuse, when node 0 starts below it;
-- --holders ROOT: on a refusal, name the directories under each ROOT holding the most page cache, within
-  --holders-budget-s. Whole box (which node a cached page sits on needs root), and only files this user may write:
+- --holders ROOT: name the directories under each ROOT holding the most page cache, within --holders-budget-s: once at
+  the first retry below the floor (the files evicted each round are only the listed PATHS, so what is left belongs to
+  something else) and again on a refusal. Whole box (which node a cached page sits on needs root), and only files this user may write:
   the kernel reports any other file as fully cached.
 --dry-run evicts nothing and does not wait: it reports the floor, the nodes and the decision it would make.
 
@@ -197,6 +198,15 @@ def page_cache_holders(roots, budget_s: float, top: int = 10) -> dict:
     return {"complete": complete, "holders": [{"path": p, "gib": round(b / 2**30, 2)} for p, b in ranked]}
 
 
+def holder_lines(holders: dict) -> list:
+    """The report lines for page_cache_holders' result; none when it found no holder."""
+    if not holders["holders"]:
+        return []
+    return ["prelaunch: largest page-cache holders among files this user may write (whole box; other users' files and "
+            "per-node attribution need root)" + ("" if holders["complete"] else ", scan cut short by its time budget")
+            + ":"] + [f"prelaunch:   {h['gib']:8.2f} GiB  {h['path']}" for h in holders["holders"]]
+
+
 def _cached_or_zero(path: str) -> int:
     try:
         if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -246,6 +256,13 @@ def main() -> int:
         if a.dry_run or time.time() > deadline:
             record["ready"] = False
             break
+        # Evicting the listed files did not reach the floor, so the cache is held by files not on the list. Say so
+        # once, with who holds it, instead of repeating the line above silently until the deadline.
+        print(f"prelaunch: node 1 has {after['1']['MemFree']} GiB free, below its floor of {floor['floor_gib']} GiB; "
+              f"evicting again in 60 s, refusing in {max(0.0, deadline - time.time()) / 60:.0f} min", flush=True)
+        if a.holders and "page_cache_holders_first" not in record:
+            record["page_cache_holders_first"] = holders = page_cache_holders(a.holders, a.holders_budget_s)
+            print("\n".join(holder_lines(holders)), flush=True)
         time.sleep(60)
     after = record["rounds"][-1]["after"]
     if a.node0_warn_gib and after["0"]["MemFree"] < a.node0_warn_gib:
@@ -261,11 +278,7 @@ def main() -> int:
             f" below its floor of {floor['floor_gib']} GiB; node 0 has {after['0']['MemFree']} GiB free (file cache "
             f"{after['0']['FilePages']} GiB)."
         ]
-        if holders["holders"]:
-            lines.append("prelaunch: largest page-cache holders among files this user may write (whole box; other users' "
-                         "files and per-node attribution need root)"
-                         + ("" if holders["complete"] else ", scan cut short by its time budget") + ":")
-            lines += [f"prelaunch:   {h['gib']:8.2f} GiB  {h['path']}" for h in holders["holders"]]
+        lines += holder_lines(holders)
         lines.append("prelaunch: free node 1 (as root: sync; echo 1 > /proc/sys/vm/drop_caches; or stop the co-tenant "
                      "filling it), then start again.")
         print("\n".join(lines), file=sys.stderr, flush=True)

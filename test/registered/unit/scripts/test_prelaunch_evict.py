@@ -131,3 +131,24 @@ def test_cached_bytes_counts_a_just_written_file_and_less_once_it_is_dropped(tmp
     finally:
         os.close(fd)
     assert pe.cached_bytes(str(path)) < 1 << 20
+
+
+def test_a_retry_below_the_floor_says_so_and_names_the_holders_once(tmp_path, monkeypatch, capsys):
+    holders = tmp_path / "holders"
+    (holders / "co-tenant").mkdir(parents=True)
+    (holders / "co-tenant" / "w.bin").write_bytes(os.urandom(1 << 20))
+    evictable = tmp_path / "evictable"
+    evictable.mkdir()
+    free1 = iter([20.0, 20.0, 20.0, 80.0])  # the first read, two rounds below the floor, then ready
+    meminfo = lambda: {n: {"MemFree": 80.0, "FilePages": 1.0} for n in "01"}
+    monkeypatch.setattr(pe, "node_meminfo", lambda: {**meminfo(), "1": {"MemFree": next(free1), "FilePages": 1.0}})
+    monkeypatch.setattr(pe, "evict", lambda: {"files": 0, "bytes": 0, "failed": 0})
+    monkeypatch.setattr(pe.time, "sleep", lambda s: None)
+    log = tmp_path / "prelaunch.json"
+    monkeypatch.setattr(sys, "argv", ["prelaunch_evict.py", "--log", str(log), "--wait-min", "5", "--holders", str(holders)])
+    assert pe.main() == 0
+    out = capsys.readouterr().out
+    assert out.count("evicting again in 60 s") == 2
+    assert out.count("largest page-cache holders") == 1 and str(holders / "co-tenant") in out
+    record = json.loads(log.read_text())
+    assert record["ready"] is True and record["page_cache_holders_first"]["holders"][0]["path"] == str(holders / "co-tenant")
