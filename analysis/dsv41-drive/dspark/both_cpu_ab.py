@@ -593,11 +593,24 @@ STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
 # fails.
 CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
 ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM)
+# Layer-major prefill under DSpark (prototype, branch layer-major-dspark): production with every uncached suffix of
+# 8192+ tokens prefilled layer by layer. dspark_env() keeps the threshold at 0 for every other arm.
+LAYER_MAJOR_ARM = PROD_ARM + "-layermajor"
+ARMS[LAYER_MAJOR_ARM] = (
+    {
+        **ARMS[PROD_ARM][0],
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
+        "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": "1",
+    },
+    True,
+)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM)
 ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
 # An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
 ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
-REFERENCE.update({PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM})
+REFERENCE.update(
+    {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM, LAYER_MAJOR_ARM: PROD_ARM}
+)
 
 
 def sts_collect_stem(directory: str) -> str:
