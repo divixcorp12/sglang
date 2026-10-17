@@ -107,8 +107,9 @@ def test_the_refit_runs_every_interval_samples_per_mode_and_logs_its_parameters(
     lines = [r.getMessage() for r in caplog.records if "online refit" in r.getMessage()]
     assert len(lines) == 2 and "online refit 2 (sampled) over the last 1000 verifies" in lines[1]
     assert "slopes [" in lines[1] and "samples per position [1000," in lines[1] and "log loss" in lines[1]
-    slopes = refit._modes["sampled"].slopes
-    assert slopes.tolist() == pytest.approx(true, rel=0.25)
+    slopes = refit._modes["sampled"].slopes.tolist()
+    # Position 5 is reached by fewer than REFIT_MIN_SAMPLES of 1,000 verifies, so it keeps the offline slope.
+    assert slopes[:4] == pytest.approx(true[:4], rel=0.25) and slopes[4] == 1.0
     assert refit._modes["greedy"].slopes is None  # greedy verifies have their own buffer, still short
     # The guard: the refit raises a confidence where it says more, and never lowers one.
     c = torch.tensor([[0.9, 0.2, 0.5, 0.99, 0.01]])
