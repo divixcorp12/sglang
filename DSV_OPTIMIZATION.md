@@ -1477,6 +1477,40 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - divix01 has ccache 4.11.3 system-wide (`/etc/profile.d/ccache.sh`), `~/.config/ccache/ccache.conf` max_size 50G.
   Build-time measurements must set `CCACHE_DISABLE=1`.
 
+### 3.12 DSpark confidence-head verify cut — branch `confidence-cut` (`90d428f5fa`), NOT merged, off by default
+
+- **What it does.** At batch size 1 with greedy sampling, each verify keeps the w* rows that maximise
+  (1 + sum_{k<w} S_k) / T(w). S_k is the STS-calibrated cumulative product of the draft's trained Markov confidence
+  head (DSpark paper eq. 7). T(w) is verify ms with w live rows, measured at startup from 48 interleaved forced-width
+  verifies. Cut rows go through the existing static-graph dead-row mask (no experts routed) and the accept cap.
+  Switch: `SGLANG_DSPARK_CONFIDENCE_CUT=1` plus `--speculative-dspark-confidence-sts-path`. Spec:
+  `docs/hx/compact-verify-exl3.draft.md`. Real `compact` mode was dropped: at bs 1 its tier grid is [6], and its
+  padding rows still route experts.
+- **STS.** Fitted from `/mnt/nvme1/sts-collect-20261016` (one long prompt, 2,048 verifies). Temperatures
+  0.89/0.79/1.26/0.89/0.63, ECE 2.9-3.8% -> 2.1-3.0%. Installed read-only at
+  `/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json`, sha256 `a0f2fc7c...bcd5`.
+- **Smoke** (`/mnt/nvme1/confcut-smoke-20261016`, instr build, long prompt, 300 s):
+  - T(w) = [126, 187, 187, 187, 207, 257] ms.
+  - w* 3.7-4.0; E(w*) 2.37-2.59 against accept 2.38-2.58, so the calibration holds.
+  - Greedy text matched the all-rows run for 57 tokens, then split at a near-tie wording choice (ordinary on this stack).
+  - Not an A/B: in the windows clean in both runs (60-180 s), 64-66 vs 75-79 ms/token, wait per verify 80 vs 90-119 ms.
+- **In progress (owner, 2026-10-16):**
+  - an affine least-squares T(w) instead of per-width medians;
+  - fixing dead-row side effects: the prefetch scorer's live-token count (baked at 6), and dead routes inflating row 0's
+    experts' hot-cache scores;
+  - a complete audit of the work dead rows still do (attention, shared experts, Engram lookups and more), then skipping
+    the Engram lookups for dead rows. Engram tables are almost entirely on disk, so each dead row's lookups are
+    expensive.
+- **TODO (owner, 2026-10-16):**
+  - Broaden the STS calibration data: collect a few more prompt types (code, chat, short answers) and refit.
+    Positions 4-5 have the fewest samples.
+  - Drive-pressure-aware cost: scale T(w)'s slope by a live NVMe pressure signal (e.g. recent NVMe wait per row), so
+    the cut is harder while the SPCC stalls. Check it against the owner's startup-calibration rule first.
+  - A per-row cost conditioned on predicted misses: price each extra row by the likelihood that its experts miss
+    VRAM/RAM. Needs a per-row miss predictor; the parked lane head (4a) is the foundation.
+  - Use the calibrated S_k beyond the cut: weight RAM prefetch candidates toward likely-accepted positions, and feed the
+    split model's CPU/GPU decisions.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.
