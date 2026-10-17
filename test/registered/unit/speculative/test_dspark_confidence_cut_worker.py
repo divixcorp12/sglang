@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
+from sglang.srt.speculative.dspark_components import dspark_confidence_cut as dw_cut
 from sglang.srt.speculative.dspark_components import dspark_worker_v2 as dw
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
@@ -31,26 +32,35 @@ SAMPLING = SimpleNamespace(is_all_greedy=False)
 
 
 class _FakeCut:
-    def __init__(self, *, lens, disabled=False, calibrated=True):
+    def __init__(self, *, lens, disabled=False, calibrated=True, admit=True):
         self._lens = lens
         self.disabled = disabled
         self.calibrated = calibrated
+        self._admit = admit
         self.seen = []
+        self.gates = []
 
     def applies(self, *, bs, sampling_info):
         return bs == 1 and (sampling_info is None or sampling_info.is_all_greedy)
+
+    def admit_calibration(self, gate):
+        self.gates.append(gate)
+        return self._admit
 
     def verify_lens(self, confidence):
         self.seen.append(confidence)
         return self._lens
 
 
-def _cut_lens(cut, *, bs=1, sampling_info=GREEDY, confidence=None):
-    worker = SimpleNamespace(_confidence_cut=cut)
+SERVING = [SimpleNamespace(rid="0a1b2c")]
+
+
+def _cut_lens(cut, *, bs=1, sampling_info=GREEDY, confidence=None, reqs=SERVING):
+    worker = SimpleNamespace(_confidence_cut=cut, _confidence_cut_gate=dw.DSparkWorkerV2._confidence_cut_gate)
     if confidence is None:
         confidence = torch.full((bs, GAMMA), 0.5)
     return dw.DSparkWorkerV2._cut_verify_lens(
-        worker, bs=bs, sampling_info=sampling_info, confidence=confidence
+        worker, bs=bs, sampling_info=sampling_info, confidence=confidence, reqs=reqs
     )
 
 
@@ -71,7 +81,37 @@ def test_every_draft_is_verified_where_the_cut_does_not_apply():
     disabled = _FakeCut(lens=lens, disabled=True)
     assert _cut_lens(disabled) is None and disabled.seen == []
     worker = SimpleNamespace(_confidence_cut=_FakeCut(lens=lens))
-    assert dw.DSparkWorkerV2._cut_verify_lens(worker, bs=1, sampling_info=GREEDY, confidence=None) is None
+    assert dw.DSparkWorkerV2._cut_verify_lens(
+        worker, bs=1, sampling_info=GREEDY, confidence=None, reqs=SERVING
+    ) is None
+
+
+def test_before_t_w_freezes_the_gate_decides_and_a_held_verify_covers_every_row():
+    lens = torch.tensor([3])
+    held = _FakeCut(lens=lens, calibrated=False, admit=False)
+    assert _cut_lens(held) is None and held.seen == [] and len(held.gates) == 1
+    admitted = _FakeCut(lens=lens, calibrated=False, admit=True)
+    assert _cut_lens(admitted) is lens and len(admitted.gates) == 1
+    # Frozen: the gate is not read again.
+    frozen = _FakeCut(lens=lens, calibrated=True, admit=False)
+    assert _cut_lens(frozen) is lens and frozen.gates == []
+
+
+def test_the_gate_reads_engine_init_the_copy_engine_and_the_batchs_rids(monkeypatch):
+    monkeypatch.setattr(dw.triton_load_watch, "_serving_started", False)
+    monkeypatch.setattr(dw, "ram_miss_copy_engine_state", lambda: dw_cut.COPY_ENGINE_PENDING)
+    gate = dw.DSparkWorkerV2._confidence_cut_gate(SERVING)
+    assert gate == dw.CalibrationGate(engine_ready=False, copy_engine="pending", serving_request=True)
+    assert not gate.open
+    monkeypatch.setattr(dw.triton_load_watch, "_serving_started", True)
+    assert not dw.DSparkWorkerV2._confidence_cut_gate(SERVING).open
+    monkeypatch.setattr(dw, "ram_miss_copy_engine_state", lambda: dw_cut.COPY_ENGINE_ARMED)
+    assert dw.DSparkWorkerV2._confidence_cut_gate(SERVING).open
+    from sglang.srt.entrypoints.warmup import warmup_rid
+
+    for warm_up_rid in (warmup_rid(), f"{warmup_rid()}_0", "HEALTH_CHECK_0a1b2c"):
+        gate = dw.DSparkWorkerV2._confidence_cut_gate([SimpleNamespace(rid=warm_up_rid)])
+        assert not gate.serving_request and not gate.open
 
 
 def test_the_cut_refuses_the_top_probability_gate_and_a_draft_without_a_confidence_head():

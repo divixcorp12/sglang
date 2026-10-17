@@ -1025,6 +1025,11 @@ class Exl3RamMissService:
         """The started build's lane count; raises before ``ensure_started``."""
         return self.wire.lanes
 
+    @property
+    def copy_engine_armed(self) -> bool:
+        """Whether the copy engine armed; with CPU experts, their split and split model calibrated first."""
+        return self._copy_armed
+
     def resolved_lanes(self) -> int:
         """The lane count the service builds for: the widest planned gather, rounded up to 8."""
         return wire_layout(self._gather_planned or 1).lanes

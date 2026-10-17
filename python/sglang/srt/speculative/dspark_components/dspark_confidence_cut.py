@@ -6,9 +6,10 @@ is the probability draft k is accepted, and a verify of w rows (the anchor and d
 milliseconds at w live rows. It feeds the same dead-row mask and accept cap as the top-prob gate
 (dspark_top_prob_gate.py), so it shares that gate's limit to greedy batches of one request.
 
-T(w) is measured on the running server: the first CALIBRATION_VERIFIES eligible verifies run forced widths 1..gamma+1
-round-robin, each timed with CUDA events read lazily at later verifies, so the hot path never waits on the host, and
-T(w) is the affine least-squares fit over all of them. A forced width is safe for the same reason any cut is: the
+T(w) is measured on the running server once it is truly serving (CalibrationGate): the first CALIBRATION_VERIFIES
+eligible verifies after that run forced widths 1..gamma+1 round-robin, each timed with CUDA events read lazily at later
+verifies, so the hot path never waits on the host, and T(w) is the affine least-squares fit over all of them. Until
+then the cut does not apply and every row is verified. A forced width is safe for the same reason any cut is: the
 accept is capped at it.
 """
 
@@ -16,17 +17,60 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
+import sys
 from typing import Callable, Optional
 
 import msgspec
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, WARMUP_RID_PREFIX
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-# Lead's choice, 8 samples per width at gamma 5; not tuned.
-CALIBRATION_VERIFIES = 48
+# Lead's choice, 16 samples per width at gamma 5; not tuned.
+CALIBRATION_VERIFIES = 96
+
+COPY_ENGINE_OFF = "off"
+COPY_ENGINE_PENDING = "pending"
+COPY_ENGINE_ARMED = "armed"
+
+
+class CalibrationGate(msgspec.Struct, frozen=True):
+    """Whether a verify may be timed for T(w). Every condition must hold, so a warm-up verify (tiny context, cold
+    caches, the copy engine and its split model not yet armed) never enters the fit."""
+
+    # This process's scheduler entered its event loop: engine init, CUDA graph capture included, is done.
+    engine_ready: bool
+    # The EXL3 RAM-miss copy engine: COPY_ENGINE_OFF when not in use, else pending or armed. It arms after its CPU
+    # split and split model calibrate.
+    copy_engine: str
+    # Every request in the batch is a serving request, not a startup warm-up or a health check.
+    serving_request: bool
+
+    @property
+    def open(self) -> bool:
+        return self.engine_ready and self.copy_engine != COPY_ENGINE_PENDING and self.serving_request
+
+    def describe(self) -> str:
+        return (
+            f"engine init and CUDA graph capture done {self.engine_ready}, "
+            f"RAM-miss copy engine {self.copy_engine}, serving request {self.serving_request}"
+        )
+
+
+def is_serving_rid(rid) -> bool:
+    return isinstance(rid, str) and not rid.startswith((WARMUP_RID_PREFIX, HEALTH_CHECK_RID_PREFIX))
+
+
+def ram_miss_copy_engine_state() -> str:
+    """The EXL3 RAM-miss copy engine's state, read off the service singleton without importing its module."""
+    module = sys.modules.get("sglang.srt.layers.moe.exl3_ram_miss")
+    service = None if module is None else module.Exl3RamMissService._instance
+    if service is None or not service.copy_engine:
+        return COPY_ENGINE_OFF
+    return COPY_ENGINE_ARMED if service.copy_engine_armed else COPY_ENGINE_PENDING
 
 
 class ConfidenceCut:
@@ -50,6 +94,8 @@ class ConfidenceCut:
         self._cost_ms: Optional[list[float]] = None
         self._cost_ms_tensor: Optional[torch.Tensor] = None
         self._disabled = False
+        self._calibration_started = False
+        self._num_held_verifies = 0
 
     @classmethod
     def from_envs(cls, *, gamma: int, device) -> Optional[ConfidenceCut]:
@@ -76,6 +122,21 @@ class ConfidenceCut:
 
     def applies(self, *, bs: int, sampling_info) -> bool:
         return bs == 1 and (sampling_info is None or sampling_info.is_all_greedy)
+
+    def admit_calibration(self, gate: CalibrationGate) -> bool:
+        """Whether an eligible verify before T(w) froze may run the cut (a forced, timed width). A held verify covers
+        every row and is not timed."""
+        if not gate.open:
+            self._num_held_verifies += 1
+            return False
+        if not self._calibration_started:
+            self._calibration_started = True
+            logger.info(
+                f"dspark confidence cut: T(w) calibration starts at eligible verify {self._num_held_verifies + 1}, "
+                f"after {self._num_held_verifies} held back ({gate.describe()}): {CALIBRATION_VERIFIES} verifies, "
+                f"widths 1..{self.num_widths} round robin"
+            )
+        return True
 
     def verify_lens(self, confidence: torch.Tensor) -> torch.Tensor:
         """[bs] int64 rows to verify in [1, gamma + 1], from the [bs, gamma] per-position confidences."""
@@ -132,9 +193,11 @@ class ConfidenceCut:
         cost_ms = fit.cost_ms(num_widths=self.num_widths)
         self._cost_ms = cost_ms
         self._cost_ms_tensor = torch.tensor(cost_ms, dtype=torch.float32, device=self.device)
+        medians = [round(statistics.median(samples), 4) for samples in self._samples]
         logger.info(
             f"dspark confidence cut: T(w) ms = {[round(ms, 4) for ms in cost_ms]} "
-            f"(a={fit.base_ms:.4f}, b={fit.per_row_ms:.4f}/row, r2={fit.r2:.4f})"
+            f"(a={fit.base_ms:.4f}, b={fit.per_row_ms:.4f}/row, r2={fit.r2:.4f}; "
+            f"per-width median ms {medians}, counts {[len(samples) for samples in self._samples]})"
         )
 
     def _disable(self, *, reason: str) -> None:

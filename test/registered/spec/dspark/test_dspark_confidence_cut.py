@@ -1,14 +1,24 @@
-"""DSpark's confidence-head verify cut: the w* rule, and the startup T(w) calibration that feeds it (CPU)."""
+"""DSpark's confidence-head verify cut: the w* rule, and the T(w) calibration that feeds it once the server is truly
+serving (CPU)."""
 
+import logging
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from sglang.srt.speculative.dspark_components import dspark_confidence_cut as cc
 from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
     CALIBRATION_VERIFIES,
+    COPY_ENGINE_ARMED,
+    COPY_ENGINE_OFF,
+    COPY_ENGINE_PENDING,
+    CalibrationGate,
     ConfidenceCut,
     cut_verify_lens,
+    is_serving_rid,
+    ram_miss_copy_engine_state,
 )
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,6 +27,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 GAMMA = 5
 NAN = float("nan")
+OPEN = CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_ARMED, serving_request=True)
 
 
 class FakeEvent:
@@ -56,7 +67,10 @@ class FakeTimings:
             event.ready = True
 
 
-def run_verify(cut, timings, confidence):
+def run_verify(cut, timings, confidence, gate=OPEN):
+    """One eligible verify as the worker runs it; None when the gate held it back (every row verified, untimed)."""
+    if not cut.calibrated and not cut.admit_calibration(gate):
+        return None
     lens = cut.verify_lens(confidence)
     timings.width = int(lens[0])
     cut.begin_verify()
@@ -129,6 +143,96 @@ def test_calibration_forces_widths_round_robin_then_freezes_an_affine_fit_over_e
     assert run_verify(cut, timings, confident) == GAMMA + 1
     assert run_verify(cut, timings, torch.full((1, GAMMA), 0.01)) == 1
     assert len(timings.events) == num_events
+
+
+def test_calibration_takes_96_verifies_16_per_width_and_logs_the_fit_with_per_width_medians(caplog):
+    assert CALIBRATION_VERIFIES == 96
+    timings = FakeTimings(lambda width: 100.0 + 20.0 * (width - 1))
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.99)
+    widths = [run_verify(cut, timings, confident) for _ in range(CALIBRATION_VERIFIES)]
+    assert [widths.count(width) for width in range(1, GAMMA + 2)] == [16] * (GAMMA + 1)
+    assert len(timings.events) == 2 * CALIBRATION_VERIFIES
+    timings.complete_all()
+    with caplog.at_level(logging.INFO, logger=cc.__name__):
+        cut.verify_lens(confident)
+    assert cut.calibrated
+    lines = [r.getMessage() for r in caplog.records if "T(w) ms" in r.getMessage()]
+    assert len(lines) == 1
+    assert "a=100.0000, b=20.0000/row, r2=1.0000" in lines[0]
+    assert "per-width median ms [100.0, 120.0, 140.0, 160.0, 180.0, 200.0]" in lines[0]
+    assert "counts [16, 16, 16, 16, 16, 16]" in lines[0]
+
+
+@pytest.mark.parametrize(
+    "closed",
+    [
+        CalibrationGate(engine_ready=False, copy_engine=COPY_ENGINE_OFF, serving_request=True),
+        CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_PENDING, serving_request=True),
+        CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_ARMED, serving_request=False),
+    ],
+    ids=["engine-init", "copy-engine-pending", "warm-up-request"],
+)
+def test_no_verify_is_forced_or_timed_before_the_gate_opens_then_calibration_starts_at_width_1(closed, caplog):
+    timings = FakeTimings(lambda width: float(width))
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.99)
+    assert not closed.open
+    with caplog.at_level(logging.INFO, logger=cc.__name__):
+        assert [run_verify(cut, timings, confident, gate=closed) for _ in range(7)] == [None] * 7
+        assert timings.events == [] and not cut.calibrated
+        assert not any("calibration starts" in r.getMessage() for r in caplog.records)
+        # The held verifies used none of the round robin: the first admitted verify forces width 1.
+        assert run_verify(cut, timings, confident) == 1
+    starts = [r.getMessage() for r in caplog.records if "calibration starts" in r.getMessage()]
+    assert starts == [
+        "dspark confidence cut: T(w) calibration starts at eligible verify 8, after 7 held back (engine init and "
+        "CUDA graph capture done True, RAM-miss copy engine armed, serving request True): 96 verifies, widths 1..6 "
+        "round robin"
+    ]
+    assert len(timings.events) == 2
+
+
+def test_a_health_check_mid_calibration_is_held_back_and_logs_no_second_start(caplog):
+    timings = FakeTimings(lambda width: 100.0 + 20.0 * (width - 1))
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", new_event=timings.new_event)
+    confident = torch.full((1, GAMMA), 0.99)
+    health_check = CalibrationGate(engine_ready=True, copy_engine=COPY_ENGINE_OFF, serving_request=False)
+    widths = []
+    with caplog.at_level(logging.INFO, logger=cc.__name__):
+        for i in range(CALIBRATION_VERIFIES + 3):
+            widths.append(run_verify(cut, timings, confident, gate=health_check if i in (2, 50, 51) else OPEN))
+    assert [w for w in widths if w is None] == [None] * 3
+    assert [w for w in widths if w is not None] == [i % (GAMMA + 1) + 1 for i in range(CALIBRATION_VERIFIES)]
+    assert len(timings.events) == 2 * CALIBRATION_VERIFIES
+    assert sum("calibration starts" in r.getMessage() for r in caplog.records) == 1
+    timings.complete_all()
+    cut.verify_lens(confident)
+    assert cut.cost_ms() == pytest.approx([100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
+
+
+def test_serving_rids_exclude_warm_up_and_health_check_requests():
+    assert is_serving_rid("0a1b2c")
+    assert not is_serving_rid("WARMUP_0a1b2c_0")
+    assert not is_serving_rid("HEALTH_CHECK_0a1b2c")
+    assert not is_serving_rid(None)
+
+
+def test_the_copy_engine_state_reads_the_ram_miss_service_without_importing_it(monkeypatch):
+    name = "sglang.srt.layers.moe.exl3_ram_miss"
+
+    def with_service(service):
+        module = SimpleNamespace(Exl3RamMissService=SimpleNamespace(_instance=service))
+        monkeypatch.setitem(sys.modules, name, module)
+        return ram_miss_copy_engine_state()
+
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    assert ram_miss_copy_engine_state() == COPY_ENGINE_OFF
+    assert name not in sys.modules
+    assert with_service(None) == COPY_ENGINE_OFF
+    assert with_service(SimpleNamespace(copy_engine=False, copy_engine_armed=False)) == COPY_ENGINE_OFF
+    assert with_service(SimpleNamespace(copy_engine=True, copy_engine_armed=False)) == COPY_ENGINE_PENDING
+    assert with_service(SimpleNamespace(copy_engine=True, copy_engine_armed=True)) == COPY_ENGINE_ARMED
 
 
 def test_a_negative_fitted_slope_clamps_to_a_flat_table_at_the_mean():
