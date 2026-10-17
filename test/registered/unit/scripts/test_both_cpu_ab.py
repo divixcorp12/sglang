@@ -1198,9 +1198,10 @@ def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the
             assert overrides[CONFIDENCE_CUT] == ("1" if arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM) else "0"), arm
             assert (overrides[STS_COLLECT] != "") == (arm == STS_COLLECT_ARM), arm
         assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm == CONFIDENCE_CUT_ARM), arm
-    prod = ab.ARMS[PROD_ARM][0]
+    prod = {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k != CONFIDENCE_CUT}
     for arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM):
         cut = ab.ARMS[arm][0]
+        assert cut[CONFIDENCE_CUT] == "1", arm
         assert {k: v for k, v in cut.items() if k != CONFIDENCE_CUT} == prod, arm
         assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == PROD_ARM
     flags = ab.server_flags(CONFIDENCE_CUT_ARM)
