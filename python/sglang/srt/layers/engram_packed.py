@@ -147,7 +147,7 @@ def pack_rows(weight: np.ndarray, scale: np.ndarray, out: np.ndarray | None = No
     # page are written separately, each through the view.
     full = n // rpp
     slots[:full, :, :dim] = weight[: full * rpp].reshape(full, rpp, dim)
-    slots[:full, :, dim:] = scale[: full * rpp].reshape(full, rpp, -1)
+    slots[:full, :, dim:] = scale[: full * rpp].reshape(full, rpp, scale.shape[1])
     if full < geometry.pages:
         tail = n - full * rpp
         slots[full, :tail, :dim] = weight[full * rpp :]

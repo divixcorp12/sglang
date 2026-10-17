@@ -108,6 +108,23 @@ def test_no_row_crosses_a_page_and_the_geometry_is_15_rows_per_page():
         assert g.row_offset(row) % 4096 + g.row_bytes <= 4096
 
 
+@pytest.mark.parametrize("n", [1, 14, 15, 16, 31, 45])
+def test_pack_rows_round_trips_full_and_partial_pages(n):
+    rng = np.random.default_rng(n)
+    weight = rng.integers(0, 256, (n, DIM), dtype=np.uint8)
+    scale = rng.integers(0, 256, (n, DIM // BLOCK), dtype=np.uint8)
+    out = np.full((8, 4096), 0xA5, dtype=np.uint8)  # a reused buffer: stale bytes must not survive
+    pages = engram_packed.pack_rows(weight, scale, out)
+    g = engram_packed.PackedGeometry(n, DIM, DIM // BLOCK)
+    flat = pages.reshape(-1)
+    for row in range(n):
+        assert np.array_equal(flat[g.row_offset(row) : g.row_offset(row) + ROW_BYTES], np.concatenate([weight[row], scale[row]]))
+    used = np.zeros(flat.size, bool)
+    for row in range(n):
+        used[g.row_offset(row) : g.row_offset(row) + ROW_BYTES] = True
+    assert pages.shape == (g.pages, 4096) and not flat[~used].any()
+
+
 def test_the_converted_file_is_page_aligned_padded_and_verified(tables):
     old, new, expected, packed = tables
     g = engram_packed.PackedGeometry(ROWS, DIM, DIM // BLOCK)
