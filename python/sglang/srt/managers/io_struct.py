@@ -2180,6 +2180,16 @@ class FreezeGCReq(BaseReq, kw_only=True):
     pass
 
 
+class EndStartupWarmupReqInput(BaseReq, kw_only=True):
+    # time.time() in the HTTP process when its startup warm-ups ended; None when the server ran none.
+    warmup_ended_at: Optional[float] = None
+
+
+class EndStartupWarmupReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.

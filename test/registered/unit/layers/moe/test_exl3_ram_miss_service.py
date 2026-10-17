@@ -1270,6 +1270,89 @@ def test_the_split_is_calibrated_once_paused_and_before_the_copy_engine_arms(mon
     assert events == ["device-sync", "pause", ("calibrate", 3), "resume", "arm"]
 
 
+def test_the_per_batch_fail_stop_check_no_longer_arms_the_copy_engine(monkeypatch):
+    """Arming calibrates the CPU split and split model; from the per-batch hook it ran inside the startup warm-up
+    (22:20:22, mid dsv41_prefill_shapes), with other traffic skewing the measured costs."""
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    service._copy_decodes = 10 * module.COPY_ENGINE_ARM_DECODES
+    monkeypatch.setattr(service, "_trace_step", lambda: None)
+    monkeypatch.setattr(service, "_trace_stages", lambda: None)
+    service.fail_stop_check()
+    assert not armed and not syncs and service.copy_engine_arm_pending
+
+
+def _quiet_host(busy_polls: dict):
+    """A host whose probes each report busy for the given number of polls, then idle."""
+    left = dict(busy_polls)
+
+    def busy(name):
+        left[name] = left.get(name, 0) - 1
+        return left[name] >= 0
+
+    return SimpleNamespace(
+        arm_copy_engine=lambda: None,
+        busy_episode=lambda: 7 if busy("ram_miss_thread") else 0,
+        copy_engine_idle=lambda timeout_s: not busy("copy_engine_jobs"),
+        drive_load=lambda: {
+            "roots": [{"demand_inflight_bytes": 0, "spec_inflight_bytes": 4096 if busy("tier_drive_reads") else 0}]
+        },
+    )
+
+
+def test_the_quiet_probes_read_the_ram_thread_copy_engine_tier_reads_and_the_drives(monkeypatch, tmp_path):
+    service, _, _ = _copy_engine_service(monkeypatch)
+    service.host = _quiet_host({"ram_miss_thread": 1, "copy_engine_jobs": 1, "tier_drive_reads": 1})
+    monkeypatch.setattr(module, "block_device_inflight_paths", lambda dirs: {"nvme9n1": "/x"} if list(dirs) else {})
+    monkeypatch.setattr(module, "inflight_busy", lambda path: path == "/x")
+    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)), envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.override(""):
+        probes = service.quiet_probes()
+    assert list(probes) == ["ram_miss_thread", "copy_engine_jobs", "tier_drive_reads", "nvme9n1_inflight"]
+    assert [probe() for probe in probes.values()] == [True, True, True, True]
+    assert [probe() for probe in probes.values()] == [False, False, False, True]
+
+
+def test_arming_when_quiet_drains_waits_for_quiet_logs_then_calibrates_and_arms(monkeypatch, caplog):
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    events = []
+    host = _quiet_host({"ram_miss_thread": 3})
+    host.arm_copy_engine = lambda: events.append("arm")
+    service.host = host
+    service._copy_decodes = module.COPY_ENGINE_ARM_DECODES + 2
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("device-sync"))
+    monkeypatch.setattr(service, "quiet_probes", lambda: {
+        "ram_miss_thread": lambda: events.append("probe") or host.busy_episode() != 0
+    })
+    with caplog.at_level("INFO", logger=module.__name__):
+        report = service.arm_copy_engine_when_quiet(
+            deadline=time.monotonic() + 30.0, busy_s={"scheduler_requests": 0.5}, warmup_ended_s_ago=1.25
+        )
+    assert events == ["device-sync", "probe", "probe", "probe", "probe", "arm"]
+    assert report.quiet and report.busy_s["scheduler_requests"] == 0.5 and "ram_miss_thread" in report.busy_s
+    assert service._copy_armed and not service.copy_engine_arm_pending
+    line = next(r.getMessage() for r in caplog.records if "calibration starts" in r.getMessage())
+    assert line.startswith(
+        f"exl3 RAM miss copy engine calibration starts 1.25 s after warm-up ended, "
+        f"{module.COPY_ENGINE_ARM_DECODES + 2} decode forwards since capture, device drained; quiet after "
+    )
+    assert "scheduler_requests 0.50 s" in line and "checks: ram_miss_thread" in line
+
+
+def test_arming_when_quiet_times_out_and_calibrates_anyway(monkeypatch, caplog):
+    service, armed, _ = _copy_engine_service(monkeypatch)
+    service._copy_decodes = module.COPY_ENGINE_ARM_DECODES
+    monkeypatch.setattr(service, "quiet_probes", lambda: {"nvme0n1_inflight": lambda: True})
+    with caplog.at_level("INFO", logger=module.__name__):
+        report = service.arm_copy_engine_when_quiet(deadline=time.monotonic(), busy_s={}, warmup_ended_s_ago=None)
+    assert not report.quiet and report.still_busy == ("nvme0n1_inflight",)
+    assert armed == [True]
+    record = next(r for r in caplog.records if "calibration starts" in r.getMessage())
+    assert record.levelname == "WARNING"
+    assert "starts with no startup warm-up," in record.getMessage()
+    assert "NOT quiet after" in record.getMessage() and "calibrating anyway: still busy nvme0n1_inflight" in (
+        record.getMessage()
+    )
+
+
 @pytest.mark.parametrize("value", [None, "", "LAZY", "eager", "DEFAULT"])
 def test_the_copy_engine_refuses_any_module_loading_but_eager(value):
     """A kernel loaded lazily after arming fail-stopped the copy-engine soak on the same decode step every time, and
