@@ -20,8 +20,22 @@ TOP_K, TOKENS, LANES, EXPERTS = 6, 6, 8, 48
 SINGLE_RANK = SimpleNamespace(world_size=1)
 
 
-def test_the_sharded_greedy_step_reduces_the_softmax_top_probability_with_its_argmax():
-    from sglang.kernels.ops.speculative.dspark.sharded_greedy import sharded_greedy_step
+def test_the_markov_step_logits_give_the_softmax_top_probability_with_the_argmax():
+    from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+    from sglang.srt.speculative.dspark_components.dspark_top_prob_gate import step_top_prob
+
+    def markov_step(base, bias, logits_out):
+        return MarkovSampleStep.execute(
+            base_logits=base,
+            bias=bias,
+            temperatures=torch.zeros(base.shape[0], device="cuda"),
+            key=0,
+            offset=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            step=0,
+            step_dtype=torch.float32,
+            logits_out=logits_out,
+            has_sampled_rows=False,
+        )
 
     generator = torch.Generator(device="cuda").manual_seed(3)
     rows, vocab = 4, 129_280  # the V4.1 vocabulary: 32 blocks, the last one partial
@@ -33,17 +47,20 @@ def test_the_sharded_greedy_step_reduces_the_softmax_top_probability_with_its_ar
     want_tokens = torch.argmax(base + bias.float(), dim=-1)
     want_probs = torch.softmax(base + bias.float(), dim=-1).amax(dim=-1)
 
-    plain = sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0)
-    # A column of a [rows, gamma] buffer, as the draft sampler passes it.
+    plain = markov_step(base, bias, None)
+    # A column of a [rows, gamma] buffer, as the draft block passes it.
     probs = torch.full((rows, 5), -1.0, device="cuda")
-    tokens = sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0, top_prob_out=probs[:, 2])
+    kept = torch.empty((rows, vocab), device="cuda")
+    tokens = markov_step(base, bias, kept)
+    probs[:, 2].copy_(step_top_prob(kept))
     assert torch.equal(tokens, plain) and torch.equal(tokens, want_tokens)
     assert torch.allclose(probs[:, 2], want_probs, rtol=1e-4, atol=1e-7)
     assert bool((probs[:, [0, 1, 3, 4]] == -1.0).all())
     assert float(probs[1, 2]) > 0.999
 
     base[3, 17] = float("nan")
-    sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0, top_prob_out=probs[:, 2])
+    markov_step(base, bias, kept)
+    probs[:, 2].copy_(step_top_prob(kept))
     assert torch.isnan(probs[3, 2]) and not bool(torch.isnan(probs[:3, 2]).any())
 
 

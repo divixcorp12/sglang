@@ -2,7 +2,6 @@
 
 import unittest
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass
 from itertools import chain
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -231,12 +230,6 @@ class _StopAfterDraftBuild(Exception):
     pass
 
 
-@dataclass
-class _ParallelState:
-    pp_rank: int = 0
-    pp_size: int = 1
-
-
 class EagleDraftWorkerScopeTests(unittest.TestCase):
     def offered_during_draft_build(self, algorithm):
         from sglang.srt.speculative import eagle_worker_v2
@@ -270,7 +263,9 @@ class EagleDraftWorkerScopeTests(unittest.TestCase):
             for name, value in (
                 ("get_device", lambda: SimpleNamespace(device="cpu")),
                 ("get_spec", lambda: spec),
-                ("get_parallel", lambda: SimpleNamespace(enable_dp_attention=False)),
+                ("get_parallel", lambda: SimpleNamespace(attn_dp_enabled=False)),
+                ("get_pp_stage_load_group", lambda: None),
+                ("draft_tp_context", lambda *_: nullcontext()),
                 ("draft_pp_context", nullcontext),
                 ("speculative_moe_backend_context", nullcontext),
                 ("speculative_moe_a2a_backend_context", nullcontext),
@@ -289,7 +284,6 @@ class EagleDraftWorkerScopeTests(unittest.TestCase):
                 eagle_worker_v2.EagleDraftWorker(
                     server_args=None,
                     gpu_id=0,
-                    ps=_ParallelState(),
                     nccl_port=0,
                     target_worker=target_worker,
                 )

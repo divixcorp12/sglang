@@ -542,7 +542,6 @@ class OffloaderIdentityTests(unittest.TestCase):
         ):
             offloader = offloader_module.create_offloader_from_server_args(
                 server_args=server_args,
-                dp_rank=0,
                 model_config=model_config,
             )
 
@@ -557,7 +556,7 @@ class OffloaderIdentityTests(unittest.TestCase):
             offloader_module, "get_exec", return_value=self._exec_config()
         ):
             offloader = offloader_module.create_offloader_from_server_args(
-                server_args=SimpleNamespace(), dp_rank=0
+                server_args=SimpleNamespace()
             )
 
         self.assertIsInstance(offloader, offloader_module.OffloaderV1)

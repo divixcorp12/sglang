@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.dspark import VanillaMarkov
-from sglang.srt.speculative.dspark_components.dspark_draft import sample_draft_block
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftNoise,
+    sample_draft_block,
+)
 from sglang.srt.speculative.dspark_components.dspark_top_prob_gate import (
     TopProbGate,
     gate_verify_lens,
@@ -66,15 +69,22 @@ def test_the_eager_greedy_proposal_records_each_steps_top_probability():
     base = torch.randn(1, GAMMA, VOCAB) * 3
     anchor = torch.tensor([4])
     sync = SimpleNamespace(sync=lambda site, tensor: tensor)
+    noise = DraftNoise(key=0, offset=torch.zeros(1, dtype=torch.int64))
     kwargs = dict(
-        base_logits=base, anchor_tokens=anchor, draft_hidden=None, markov_head=head, device="cpu", tp_sync=sync
+        base_logits=base, anchor_tokens=anchor, draft_hidden=None, markov_head=head, device="cpu", tp_sync=sync,
+        noise=noise,
     )
-    block = sample_draft_block(sampling_info=None, record_top_prob=True, **kwargs)
-    want = torch.softmax(block.corrected_logits.float(), dim=-1).amax(dim=-1)
+    # A sampling-capable draft keeps its step logits; at temperature 0 it drafts by argmax.
+    kept = sample_draft_block(sampling_info=None, greedy_draft=False, **kwargs)
+    want = torch.softmax(kept.corrected_logits.float(), dim=-1).amax(dim=-1)
+    # A greedy draft keeps none, but records the same probabilities for the gate.
+    block = sample_draft_block(sampling_info=None, greedy_draft=True, record_top_prob=True, **kwargs)
+    assert block.corrected_logits is None
     assert torch.allclose(block.top_probs, want)
-    unrecorded = sample_draft_block(sampling_info=None, **kwargs)
+    unrecorded = sample_draft_block(sampling_info=None, greedy_draft=True, **kwargs)
     assert unrecorded.top_probs is None
     assert torch.equal(unrecorded.draft_tokens, block.draft_tokens)
+    assert torch.equal(kept.draft_tokens, block.draft_tokens)
 
 
 def test_a_capped_greedy_accept_never_accepts_past_the_cut():

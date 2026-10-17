@@ -10,6 +10,7 @@ from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import draft_model_build_scope
+from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -28,13 +29,23 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def test_only_interleaving_backends_support_the_fusion(self):
+        for backend, expected in (
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTLASS, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUDNN, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_TRTLLM, False),
+            (Fp4GemmRunnerBackend.MARLIN, False),
+        ):
+            with self.subTest(backend=backend):
+                self.assertEqual(backend.supports_swiglu_fusion(), expected)
+
     def _make_layer(self):
         return MergedColumnParallelLinear(
             input_size=16,
             output_sizes=[16, 16],
             bias=False,
-            tp_rank=0,
-            tp_size=1,
+            parallel_group="replicated",
         )
 
     def _make_qkv_layer(self):
@@ -44,8 +55,7 @@ class TestModelOptNvfp4(CustomTestCase):
             total_num_heads=2,
             total_num_kv_heads=2,
             bias=False,
-            tp_rank=0,
-            tp_size=1,
+            parallel_group="replicated",
         )
 
     def test_fused_scalar_scale_load_fills_all_logical_slots(self):
@@ -141,6 +151,28 @@ class TestModelOptNvfp4(CustomTestCase):
                 group_size=16,
                 use_per_token_activation=True,
             )
+
+    def test_shared_expert_fusion_requires_matching_fp4_precision(self):
+        quantized_shared = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+        )
+        bf16_shared = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.*.mlp.shared_experts*"],
+        )
+
+        gate_only_bf16 = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.*.mlp.shared_expert_gate"],
+        )
+
+        self.assertTrue(quantized_shared.can_fuse_shared_expert())
+        self.assertFalse(bf16_shared.can_fuse_shared_expert())
+        # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
+        self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
 
 
 _DRAFT_EXPERTS = "mtp.layers.0.mlp.experts"
