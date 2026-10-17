@@ -1,5 +1,6 @@
 """A long-prompt, time-boxed served request, for spec_margin_capture.py's --long-prompt mode: one streaming
-/v1/chat/completions request with thinking on, greedy, cancelled DECODE_SECONDS after its first streamed token, so a
+/v1/chat/completions request with thinking on, greedy (or sampled with --temperature, and --top-p), cancelled
+DECODE_SECONDS after its first streamed token, so a
 capture measures decode past the ~900-token break-even of a TTFT cost (DSV_OPTIMIZATION.md, share 28 vs 64) on the
 same collectors as the 8 x 128-token probe.
 
@@ -14,6 +15,7 @@ entry per request, its "tokens" one per completion token, a chunk's text on its 
 lane_tier_replay.py read the run as K+1 serving prompts.
 
 Usage: long_prompt.py --port PORT --prompt PATH --out-dir DIR [--decode-seconds 300] [--ttft-repeats 0]
+                      [--temperature 0.6 [--top-p 0.95]]
 """
 
 from __future__ import annotations
@@ -35,11 +37,13 @@ GAP_SECONDS = 3.0
 REQUEST_TIMEOUT_S = 900
 
 
-def request_body(prompt: str, rid: str, max_tokens: int = MAX_TOKENS) -> dict:
+def request_body(prompt: str, rid: str, max_tokens: int = MAX_TOKENS, temperature: float = 0.0,
+                 top_p: float | None = None) -> dict:
     return {
         "model": "default",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        "temperature": temperature,
+        **({} if top_p is None else {"top_p": top_p}),
         "max_tokens": max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True, "continuous_usage_stats": True},
@@ -103,11 +107,13 @@ def abort(port: int, rid: str) -> int:
 
 def run_request(port: int, prompt: str, rid: str, decode_seconds: float, max_tokens: int = MAX_TOKENS,
                 connect: Callable[..., http.client.HTTPConnection] = http.client.HTTPConnection,
-                abort_fn: Callable[[int, str], int] = abort) -> dict:
+                abort_fn: Callable[[int, str], int] = abort, temperature: float = 0.0,
+                top_p: float | None = None) -> dict:
     conn = connect("127.0.0.1", port, timeout=REQUEST_TIMEOUT_S)
     sent_ns, sent_epoch_ns = time.monotonic_ns(), time.time_ns()
+    body = request_body(prompt, rid, max_tokens, temperature=temperature, top_p=top_p)
     try:
-        conn.request("POST", "/v1/chat/completions", body=json.dumps(request_body(prompt, rid, max_tokens)),
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(body),
                      headers={"Content-Type": "application/json"})
         response = conn.getresponse()
         if response.status != 200:
@@ -147,16 +153,20 @@ def ttft_prompt(prompt: str, i: int) -> str:
 
 
 def run(port: int, prompt_path: str, out_dir: str, decode_seconds: float = DECODE_SECONDS, ttft_repeats: int = 0,
-        request: Callable[..., dict] = run_request, sleep: Callable[[float], None] = time.sleep) -> int:
+        request: Callable[..., dict] = run_request, sleep: Callable[[float], None] = time.sleep,
+        temperature: float = 0.0, top_p: float | None = None) -> int:
     with open(prompt_path, "rb") as f:
         raw = f.read()
     prompt = raw.decode()
     tag = f"long-prompt-{os.getpid()}"
+    # Greedy requests pass no sampling arguments, so a request() written for greedy runs keeps working.
+    sampling = {} if temperature == 0.0 and top_p is None else {"temperature": temperature, "top_p": top_p}
     requests = []
     for i in range(ttft_repeats):
-        requests.append({"kind": "ttft", **request(port, ttft_prompt(prompt, i), f"{tag}-ttft{i}", TTFT_DECODE_SECONDS)})
+        requests.append({"kind": "ttft", **request(port, ttft_prompt(prompt, i), f"{tag}-ttft{i}", TTFT_DECODE_SECONDS,
+                                                   **sampling)})
         sleep(GAP_SECONDS)
-    requests.append({"kind": "long", **request(port, prompt, f"{tag}-long", decode_seconds)})
+    requests.append({"kind": "long", **request(port, prompt, f"{tag}-long", decode_seconds, **sampling)})
     sleep(GAP_SECONDS)
     record = {
         "prompt": os.path.abspath(prompt_path),
@@ -165,6 +175,8 @@ def run(port: int, prompt_path: str, out_dir: str, decode_seconds: float = DECOD
         "ttft_repeats": ttft_repeats,
         "ttft_decode_seconds": TTFT_DECODE_SECONDS,
         "max_tokens": MAX_TOKENS,
+        "temperature": temperature,
+        "top_p": top_p,
         "clock": "CLOCK_MONOTONIC",
         "requests": requests,
     }
@@ -185,10 +197,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--decode-seconds", type=float, default=DECODE_SECONDS)
     p.add_argument("--ttft-repeats", type=int, default=0)
+    p.add_argument("--temperature", type=float, default=0.0, help="0 is greedy")
+    p.add_argument("--top-p", type=float, default=None)
     a = p.parse_args(argv)
     if a.decode_seconds <= 0 or a.ttft_repeats < 0:
         p.error("--decode-seconds must be positive and --ttft-repeats non-negative")
-    return run(a.port, a.prompt, a.out_dir, a.decode_seconds, a.ttft_repeats)
+    if a.temperature < 0 or (a.top_p is not None and not 0 < a.top_p <= 1):
+        p.error("--temperature must be non-negative and --top-p in (0, 1]")
+    return run(a.port, a.prompt, a.out_dir, a.decode_seconds, a.ttft_repeats, temperature=a.temperature, top_p=a.top_p)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,44 @@ With c_k the draft's STS-calibrated confidence that draft k is accepted given dr
 is the probability draft k is accepted, and a verify of w rows (the anchor and drafts 1..w-1) yields E(w) =
 1 + S_1 + ... + S_{w-1} expected tokens. The cut verifies w* = argmax_w E(w) / T(w) rows, with T(w) the verify
 milliseconds at w live rows. It feeds the same dead-row mask and accept cap as the top-prob gate
-(dspark_top_prob_gate.py), so it shares that gate's limit to greedy batches of one request.
+(dspark_top_prob_gate.py), so it shares that gate's limit to batches of one request, greedy ones unless
+SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED is on.
+
+Why the cut keeps sampled decoding exact (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED). Rows 0..w-1 are live: the anchor and
+drafts d_1..d_{w-1}. Row j's target distribution p_{j+1} is the one for position j+1, so a w-row verify runs the
+rejection-sampling step for every position k <= w: accept d_k with probability min(1, p_k(d_k) / q_k(d_k)), else draw
+from the residual (p_k - q_k)+ and stop. The accept cap (CapCorrectLen) keeps the first w of those positions: when
+d_1..d_w are all accepted, the bonus is predicts[accept_index[w - 1]], which is d_w, accepted by position w's step, and
+when position w rejects, it is that step's residual draw. Either way the token at position w is position w's ordinary
+rejection-sampling output, whose law given the prefix is p_w, so a cut verify is speculative sampling stopped after
+position w. Stopped sampling is exact if the decision to run position k's step (w >= k) is independent of d_k given
+the prefix d_1..d_{k-1}: d_k is then still distributed as q_k on that event, so the accept/residual step yields p_k,
+and when the step is not run the next verify drafts position k afresh. (A rule that read d_k could run the step only
+for drafts it likes, which is not q_k; that is the bias the distribution tests' mutant shows.)
+
+The cut's rule meets that condition with a draft to spare. Write E(w) = 1 + S_1 + ... + S_{w-1} and
+T(w) = a + b * (w - 1), with a > 0 and b >= 0 (AffineCostFit), and r(w) = E(w) / T(w). Then
+r(w + 1) = (T(w) r(w) + b * (S_w / b)) / (T(w) + b) is a weighted mean of r(w) and S_w / b, so r(w + 1) > r(w) exactly
+when S_w > b r(w) (with b = 0 directly: when S_w > 0). Once that fails at some w, r(w + 1) >= S_w / b >= S_{w+1} / b
+(S_k = c_1 ... c_k is non-increasing because each c_k is in [0, 1]; with b = 0, S_w = 0 makes every later S zero), so
+it fails at every later width too: r rises and then stays or falls, and the argmax (ties to the narrower width) is the
+first w where r stops rising. So w >= k holds exactly when r rose at steps 1..k-1, and those read S_1..S_{k-1}, that
+is c_1..c_{k-1}. c_j is the head's output on the draft's hidden state at position j
+(computed from the anchor and mask tokens only: the draft forward never sees a drafted token) and the Markov
+embedding of the token before draft j (compute_confidence's prev_seq: the anchor, then d_1..d_{j-1}). So w >= k is a
+function of the context, the anchor and d_1..d_{k-2}, never of d_{k-1} or d_k. Sampled verifies take the rule in
+that stopping form (stop_rule_verify_lens), so float rounding in a whole-curve argmax cannot make w read a later
+confidence; greedy verifies keep cut_verify_lens, and the two agree whenever the scores are exact.
+
+Nothing else on the cut verify reads a drawn token past the cut. The dead-row mask and the Engram -1 posts are set from
+w alone; attention is causal, so a dead row cannot change a live row's logits, and the dead rows' logits feed only
+positions past w, which the cap drops; the static graph's folded (greedy-only) epilogue never runs a sampled batch.
+The T(w) calibration's forced widths are a round robin, independent of every token.
+
+A cost model must keep the condition: row r's price may depend on d_1..d_r (row r carries d_r, and keeping it runs
+position r + 1's step), but the decision must be taken row by row. A per-row cost conditioned on a row's own token
+(the "miss-conditioned cost" TODO) makes r(w) non-unimodal, and its whole-curve argmax then reads later rows' tokens
+to decide earlier ones, which breaks the condition.
 
 T(w) is measured on the running server once it is truly serving (CalibrationGate): the first CALIBRATION_VERIFIES
 eligible verifies after that run forced widths 1..gamma+1 round-robin, each timed with CUDA events read lazily at later
@@ -80,17 +117,34 @@ class ConfidenceCut:
         gamma: int,
         device,
         new_event: Optional[Callable[[], object]] = None,
+        cut_sampled: bool = False,
+        sampled_rescale: Optional[torch.Tensor] = None,
+        draft_cost: bool = False,
+        refit=None,
     ):
         self.gamma = gamma
         self.device = device
         self.num_widths = gamma + 1
+        # SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED: sampled bs-1 batches are cut (and calibrate T(w)) too.
+        self.cut_sampled = cut_sampled
+        # [gamma] T_head / T_sampled per position (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH), or None.
+        self._sampled_rescale = sampled_rescale
+        # SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST: the rule divides by draft ms + T(w), not T(w) alone.
+        self.draft_cost = draft_cost
+        # SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL: a dspark_confidence_refit.OnlineRefit, or None.
+        self.refit = refit
         # Any object with CUDA Event's record() / query() / elapsed_time(end); tests inject a CPU fake.
         self._new_event = new_event or (lambda: torch.cuda.Event(enable_timing=True))
         self._num_forced = 0
         self._timed_width: Optional[int] = None
+        self._draft_start_event = None
         self._start_event = None
-        self._pending: list[tuple[int, object, object]] = []
+        # (width, draft start event or None, verify start event, verify end event)
+        self._pending: list[tuple[int, object, object, object]] = []
         self._samples: list[list[float]] = [[] for _ in range(self.num_widths)]
+        self._draft_samples: list[float] = []
+        self._verify_cost_ms: Optional[list[float]] = None
+        self._draft_ms: Optional[float] = None
         self._cost_ms: Optional[list[float]] = None
         self._cost_ms_tensor: Optional[torch.Tensor] = None
         self._disabled = False
@@ -113,7 +167,55 @@ class ConfidenceCut:
             from sglang.kernels.ops.speculative.dspark.dspark_accept import preload_cut_accept_kernels
 
             preload_cut_accept_kernels(device=device, verify_num_draft_tokens=gamma + 1)
-        return cls(gamma=gamma, device=device)
+        cut_sampled = envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED.get()
+        sampled_sts_path = envs.SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH.get()
+        if sampled_sts_path and not cut_sampled:
+            raise ValueError(
+                "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH needs SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED=1; set it or "
+                "unset the path."
+            )
+        sampled_rescale = None
+        if sampled_sts_path:
+            from sglang.srt.runtime_context import get_spec
+
+            sampled_rescale = sampled_sts_rescale(
+                gamma=gamma,
+                head_sts_path=get_spec().speculative_dspark_confidence_sts_path,
+                sampled_sts_path=sampled_sts_path,
+                device=device,
+            )
+        if cut_sampled:
+            logger.info(
+                "dspark confidence cut: sampled bs-1 verifies are cut too (SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED), "
+                + (
+                    f"re-tempered by T_head / T_sampled = {[round(float(f), 4) for f in sampled_rescale]} "
+                    f"({sampled_sts_path})"
+                    if sampled_rescale is not None
+                    else "with the head's STS temperatures"
+                )
+            )
+        draft_cost = envs.SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST.get()
+        refit_interval = envs.SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL.get()
+        refit = None
+        if refit_interval > 0:
+            from sglang.srt.speculative.dspark_components.dspark_confidence_refit import (
+                REFIT_BUFFER_VERIFIES,
+                OnlineRefit,
+            )
+
+            refit = OnlineRefit(gamma=gamma, device=device, interval=refit_interval)
+            logger.info(
+                f"dspark confidence cut: online refit every {refit_interval} verifies over the last "
+                f"{REFIT_BUFFER_VERIFIES}, greedy and sampled apart (SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL)"
+            )
+        return cls(
+            gamma=gamma,
+            device=device,
+            cut_sampled=cut_sampled,
+            sampled_rescale=sampled_rescale,
+            draft_cost=draft_cost,
+            refit=refit,
+        )
 
     @property
     def calibrated(self) -> bool:
@@ -124,10 +226,54 @@ class ConfidenceCut:
         return self._disabled
 
     def cost_ms(self) -> Optional[list[float]]:
+        """The per-width cost the rule divides by: T(w), plus the draft ms with SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST."""
         return self._cost_ms
 
+    def verify_cost_ms(self) -> Optional[list[float]]:
+        """The fitted T(w) alone."""
+        return self._verify_cost_ms
+
+    def draft_ms(self) -> Optional[float]:
+        """The median draft ms over the calibration verifies (None before T(w) freezes, or with no draft timed)."""
+        return self._draft_ms
+
     def applies(self, *, bs: int, sampling_info) -> bool:
-        return bs == 1 and (sampling_info is None or sampling_info.is_all_greedy)
+        return bs == 1 and (self.cut_sampled or sampling_info is None or sampling_info.is_all_greedy)
+
+    def offline_confidence(self, confidence: torch.Tensor, *, sampled: bool) -> torch.Tensor:
+        """The head's [bs, gamma] confidences, re-tempered to the sampled STS file's temperatures for a sampled verify
+        when one is loaded: what the offline calibration says."""
+        if sampled and self._sampled_rescale is not None:
+            return rescale_confidence(confidence, self._sampled_rescale)
+        return confidence
+
+    def cut_confidence(self, confidence: torch.Tensor, *, sampled: bool) -> torch.Tensor:
+        """The [bs, gamma] confidences the cut reads: the offline ones, raised by the online refit where it says more
+        (never lowered). Per-position maps of this step's confidences only, so the stopping form's argument holds."""
+        offline = self.offline_confidence(confidence, sampled=sampled)
+        if self.refit is None:
+            return offline
+        return self.refit.apply(offline, sampled=sampled)
+
+    def observe_outcome(
+        self,
+        *,
+        confidence: torch.Tensor,
+        verify_lens: torch.Tensor,
+        correct_len: torch.Tensor,
+        cap_trim_lens: torch.Tensor,
+        sampled: bool,
+    ) -> None:
+        """A bs-1 cut verify's accept, for the online refit (no-op without one). ``confidence`` is the head's."""
+        if self.refit is None:
+            return
+        self.refit.observe(
+            confidence=self.offline_confidence(confidence, sampled=sampled),
+            verify_lens=verify_lens,
+            correct_len=correct_len,
+            cap_trim_lens=cap_trim_lens,
+            sampled=sampled,
+        )
 
     def admit_calibration(self, gate: CalibrationGate) -> bool:
         """Whether an eligible verify before T(w) froze may run the cut (a forced, timed width). A held verify covers
@@ -144,10 +290,13 @@ class ConfidenceCut:
             )
         return True
 
-    def verify_lens(self, confidence: torch.Tensor) -> torch.Tensor:
-        """[bs] int64 rows to verify in [1, gamma + 1], from the [bs, gamma] per-position confidences."""
+    def verify_lens(self, confidence: torch.Tensor, *, sampled: bool = False) -> torch.Tensor:
+        """[bs] int64 rows to verify in [1, gamma + 1], from the [bs, gamma] per-position confidences. ``sampled``
+        verifies take the rule in its stopping form (module docstring)."""
         bs = confidence.shape[0]
         if self._cost_ms_tensor is not None:
+            if sampled:
+                return stop_rule_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
             return cut_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
         if self._disabled:
             return self._full_width(bs=bs, device=confidence.device)
@@ -160,6 +309,15 @@ class ConfidenceCut:
         self._timed_width = None
         return self._full_width(bs=bs, device=confidence.device)
 
+    def begin_draft(self) -> None:
+        """Before a step's draft, until T(w) freezes: an event a timed verify's begin_verify closes, so the draft ms
+        (the proposal, the confidence and every launch up to the verify's) is timed on the same verifies as T(w),
+        read as lazily. An untimed step's event is replaced by the next step's."""
+        if self._cost_ms is not None or self._disabled:
+            return
+        self._draft_start_event = self._new_event()
+        self._draft_start_event.record()
+
     def begin_verify(self) -> None:
         if self._timed_width is None:
             return
@@ -171,20 +329,25 @@ class ConfidenceCut:
             return
         end_event = self._new_event()
         end_event.record()
-        self._pending.append((self._timed_width, self._start_event, end_event))
+        self._pending.append((self._timed_width, self._draft_start_event, self._start_event, end_event))
         self._num_forced += 1
         self._timed_width = None
+        self._draft_start_event = None
         self._start_event = None
 
     def _full_width(self, *, bs: int, device) -> torch.Tensor:
         return torch.full((bs,), self.num_widths, dtype=torch.int64, device=device)
 
     def _drain_ready_samples(self) -> None:
-        while self._pending and self._pending[0][2].query():
-            width, start_event, end_event = self._pending.pop(0)
+        while self._pending and self._pending[0][3].query():
+            width, draft_start_event, start_event, end_event = self._pending.pop(0)
             ms = float(start_event.elapsed_time(end_event))
             if math.isfinite(ms):
                 self._samples[width - 1].append(ms)
+            if draft_start_event is not None:
+                draft_ms = float(draft_start_event.elapsed_time(start_event))
+                if math.isfinite(draft_ms):
+                    self._draft_samples.append(draft_ms)
         if self._num_forced == CALIBRATION_VERIFIES and not self._pending:
             self._freeze()
 
@@ -196,14 +359,37 @@ class ConfidenceCut:
         if fit.base_ms <= 0.0:
             self._disable(reason=f"non-positive fitted T(1) {fit.base_ms} ms")
             return
-        cost_ms = fit.cost_ms(num_widths=self.num_widths)
+        verify_cost_ms = fit.cost_ms(num_widths=self.num_widths)
+        self._verify_cost_ms = verify_cost_ms
+        self._draft_ms = statistics.median(self._draft_samples) if self._draft_samples else None
+        if self.draft_cost and self._draft_ms is None:
+            logger.warning("dspark confidence cut: no draft was timed, so the cost leaves the draft out")
+        # The draft costs the same at every width (gamma drafts, one draft forward), so it adds to a alone: the cost
+        # stays affine with b unchanged, and the stopping form's argument holds (a + draft > 0).
+        cost_ms = (
+            [ms + self._draft_ms for ms in verify_cost_ms]
+            if self.draft_cost and self._draft_ms is not None
+            else verify_cost_ms
+        )
         self._cost_ms = cost_ms
         self._cost_ms_tensor = torch.tensor(cost_ms, dtype=torch.float32, device=self.device)
         medians = [round(statistics.median(samples), 4) for samples in self._samples]
+        if self._draft_ms is None:
+            draft = "draft ms not timed"
+        else:
+            draft = (
+                f"draft ms {self._draft_ms:.4f} (median; mean {statistics.fmean(self._draft_samples):.4f}, "
+                f"n {len(self._draft_samples)}), "
+                + (
+                    f"in the cost: {[round(ms, 4) for ms in cost_ms]}"
+                    if cost_ms is not verify_cost_ms
+                    else "not in the cost (SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST off)"
+                )
+            )
         logger.info(
-            f"dspark confidence cut: T(w) ms = {[round(ms, 4) for ms in cost_ms]} "
+            f"dspark confidence cut: T(w) ms = {[round(ms, 4) for ms in verify_cost_ms]} "
             f"(a={fit.base_ms:.4f}, b={fit.per_row_ms:.4f}/row, r2={fit.r2:.4f}; "
-            f"per-width median ms {medians}, counts {[len(samples) for samples in self._samples]})"
+            f"per-width median ms {medians}, counts {[len(samples) for samples in self._samples]}); {draft}"
         )
 
     def _disable(self, *, reason: str) -> None:
@@ -240,11 +426,46 @@ class AffineCostFit(msgspec.Struct, frozen=True):
         return [self.base_ms + self.per_row_ms * width_idx for width_idx in range(num_widths)]
 
 
-def cut_verify_lens(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
-    """[bs] int64 w* in [1, gamma + 1] maximising expected tokens per verify ms, from [bs, gamma] confidences and the
-    [gamma + 1] cost table. Ties go to the narrower verify."""
+def rescale_confidence(confidence: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
+    """sigmoid(logit(c) * factor) per position: a head output c = sigmoid(raw / T_head) re-tempered to
+    sigmoid(raw / T) when factor = T_head / T. 0 and 1 stay put, and a NaN stays NaN (the cut reads it as 0)."""
+    return torch.sigmoid(torch.logit(confidence.float()) * factor)
+
+
+def sampled_sts_rescale(*, gamma: int, head_sts_path: Optional[str], sampled_sts_path: str, device) -> torch.Tensor:
+    """[gamma] T_head / T_sampled: the head applies ``head_sts_path``'s temperatures (none: 1), and a sampled verify
+    wants ``sampled_sts_path``'s."""
+    from sglang.srt.speculative.dspark_components.dspark_sts import load_sts_calibration_from_path
+
+    head = load_sts_calibration_from_path(head_sts_path).temperatures if head_sts_path else [1.0] * gamma
+    sampled = load_sts_calibration_from_path(sampled_sts_path).temperatures
+    if len(head) != gamma or len(sampled) != gamma:
+        raise ValueError(
+            f"dspark confidence cut: STS files fit for gamma {len(head)} ({head_sts_path}) and {len(sampled)} "
+            f"({sampled_sts_path}), the runtime gamma is {gamma}"
+        )
+    return torch.tensor([h / s for h, s in zip(head, sampled)], dtype=torch.float32, device=device)
+
+
+def _tokens_per_ms(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
+    """[bs, gamma + 1] E(w) / T(w) for w = 1..gamma + 1; column w - 1 reads confidences 1..w-1 only."""
     c = confidence.float()
     # A NaN confidence ends the accepted prefix there instead of poisoning every later width's score.
     accept_prob = torch.cumprod(torch.where(torch.isnan(c), torch.zeros_like(c), c), dim=1)
     expected_tokens = 1.0 + torch.nn.functional.pad(torch.cumsum(accept_prob, dim=1), (1, 0))
-    return torch.argmax(expected_tokens / cost_ms, dim=1) + 1
+    return expected_tokens / cost_ms
+
+
+def cut_verify_lens(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
+    """[bs] int64 w* in [1, gamma + 1] maximising expected tokens per verify ms, from [bs, gamma] confidences and the
+    [gamma + 1] cost table. Ties go to the narrower verify."""
+    return torch.argmax(_tokens_per_ms(confidence=confidence, cost_ms=cost_ms), dim=1) + 1
+
+
+def stop_rule_verify_lens(*, confidence: torch.Tensor, cost_ms: torch.Tensor) -> torch.Tensor:
+    """cut_verify_lens's w* as a stopping rule: widen while E(w + 1) / T(w + 1) beats E(w) / T(w), and stop at the first
+    width where it does not. Equal to the argmax for an affine T(w) (module docstring), and by construction width
+    w + 1 is chosen from confidences 1..w only, which is what keeps a sampled verify exact."""
+    rate = _tokens_per_ms(confidence=confidence, cost_ms=cost_ms)
+    rises = (rate[:, 1:] > rate[:, :-1]).to(torch.int64)
+    return 1 + torch.cumprod(rises, dim=1).sum(dim=1)

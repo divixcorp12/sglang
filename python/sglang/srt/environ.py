@@ -825,6 +825,19 @@ class Envs:
     # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
     # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
     SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
+    # With the cut on, cut sampled (temperature > 0) bs-1 verifies too, not only greedy ones; their T(w) calibration
+    # admits them as well. Lossless by the stopping-rule argument in dspark_confidence_cut.py's docstring.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED = EnvBool(False)
+    # The sampled cut's own STS file (dspark_sts_fit --label soft at the serving temperature): sampled verifies re-temper
+    # the head's output from --speculative-dspark-confidence-sts-path's temperatures to these. Empty: they use the
+    # greedy file's, fitted on argmax labels.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH = EnvStr("")
+    # The cut's rule maximises E(w) / (draft ms + T(w)), the draft ms timed on the T(w) calibration's verifies, not
+    # E(w) / T(w). The draft ms is timed and logged either way.
+    SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST = EnvBool(False)
+    # Refit the cut's per-position calibration from the server's own accepts every this many cut verifies (greedy and
+    # sampled apart; dspark_confidence_refit.py). The cut reads max(offline, refit), so it never cuts harder. 0 is off.
+    SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

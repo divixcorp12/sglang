@@ -32,23 +32,25 @@ SAMPLING = SimpleNamespace(is_all_greedy=False)
 
 
 class _FakeCut:
-    def __init__(self, *, lens, disabled=False, calibrated=True, admit=True):
+    def __init__(self, *, lens, disabled=False, calibrated=True, admit=True, cut_sampled=False):
         self._lens = lens
         self.disabled = disabled
         self.calibrated = calibrated
         self._admit = admit
+        self.cut_sampled = cut_sampled
         self.seen = []
+        self.sampled = []
         self.gates = []
 
-    def applies(self, *, bs, sampling_info):
-        return bs == 1 and (sampling_info is None or sampling_info.is_all_greedy)
+    applies = dw_cut.ConfidenceCut.applies
 
     def admit_calibration(self, gate):
         self.gates.append(gate)
         return self._admit
 
-    def verify_lens(self, confidence):
+    def verify_lens(self, confidence, *, sampled=False):
         self.seen.append(confidence)
+        self.sampled.append(sampled)
         return self._lens
 
 
@@ -69,7 +71,34 @@ def test_the_cut_sets_a_greedy_single_request_verify_from_this_steps_confidence(
     cut = _FakeCut(lens=lens)
     confidence = torch.full((1, GAMMA), 0.7)
     assert _cut_lens(cut, confidence=confidence) is lens
-    assert cut.seen == [confidence]
+    assert cut.seen == [confidence] and cut.sampled == [False]
+
+
+def test_with_sampled_cutting_on_a_sampled_single_request_verify_is_cut_by_the_stopping_rule_and_calibrates():
+    """SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED: a sampled bs-1 verify reaches the gate and the cut, asking for the rule's
+    stopping form; a greedy one still takes the argmax. Mutant: the worker passes sampled=False, or the gate is skipped
+    for sampled batches -- red."""
+    lens = torch.tensor([2])
+    cut = _FakeCut(lens=lens, calibrated=False, admit=True, cut_sampled=True)
+    assert _cut_lens(cut, sampling_info=SAMPLING) is lens
+    assert len(cut.gates) == 1 and cut.sampled == [True]
+    assert _cut_lens(cut, sampling_info=GREEDY) is lens and cut.sampled == [True, False]
+    assert _cut_lens(cut, sampling_info=SAMPLING, bs=2) is None
+
+
+def test_the_worker_hands_the_cut_re_tempered_confidences_only_where_the_cut_applies():
+    cut = dw_cut.ConfidenceCut(
+        gamma=GAMMA, device="cpu", cut_sampled=True, sampled_rescale=torch.full((GAMMA,), 2.0)
+    )
+    worker = SimpleNamespace(_confidence_cut=cut)
+    confidence = torch.full((1, GAMMA), 0.7)
+    retempered = dw.DSparkWorkerV2._cut_confidence(worker, confidence, bs=1, sampling_info=SAMPLING)
+    assert torch.allclose(retempered, dw_cut.rescale_confidence(confidence, torch.full((GAMMA,), 2.0)))
+    assert dw.DSparkWorkerV2._cut_confidence(worker, confidence, bs=1, sampling_info=GREEDY) is confidence
+    wide = torch.full((2, GAMMA), 0.7)
+    assert dw.DSparkWorkerV2._cut_confidence(worker, wide, bs=2, sampling_info=SAMPLING) is wide
+    assert dw.DSparkWorkerV2._cut_confidence(SimpleNamespace(_confidence_cut=None), confidence, bs=1,
+                                             sampling_info=SAMPLING) is confidence
 
 
 def test_every_draft_is_verified_where_the_cut_does_not_apply():
@@ -264,12 +293,14 @@ def test_the_cut_stats_report_each_log_intervals_verifies_and_reset():
     assert stats.log_suffix() is None
     confidence = torch.tensor([[0.5, 0.5, 1.0, 1.0, 1.0]])
     stats.observe(confidence=confidence, verify_lens=torch.tensor([2]), commit_lens=torch.tensor([2]))
-    stats.observe(confidence=confidence, verify_lens=torch.tensor([6]), commit_lens=torch.tensor([3]))
+    stats.observe(confidence=confidence, verify_lens=torch.tensor([6]), commit_lens=torch.tensor([3]), sampled=True)
     assert stats.log_suffix() == (
-        "conf cut: verifies 2, w* 4.00, E(w*) 2.00, accept len 2.50, cut rows 4 (total 4)"
+        "conf cut: verifies 2, w* 4.00, E(w*) 2.00, accept len 2.50, cut rows 4 (total 4), "
+        "widths [0, 1, 0, 0, 0, 1], sampled 1"
     )
     assert stats.log_suffix() is None
     stats.observe(confidence=confidence, verify_lens=torch.tensor([1]), commit_lens=torch.tensor([1]))
     assert stats.log_suffix() == (
-        "conf cut: verifies 1, w* 1.00, E(w*) 1.00, accept len 1.00, cut rows 5 (total 9)"
+        "conf cut: verifies 1, w* 1.00, E(w*) 1.00, accept len 1.00, cut rows 5 (total 9), "
+        "widths [1, 0, 0, 0, 0, 0], sampled 0"
     )

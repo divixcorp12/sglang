@@ -603,6 +603,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             return None
         return self._top_prob_gate.verify_lens(draft_block.top_probs)
 
+    def _cut_confidence(
+        self, confidence: Optional[torch.Tensor], *, bs: int, sampling_info
+    ) -> Optional[torch.Tensor]:
+        """The confidences the cut and its stats read: a sampled verify's re-tempered to the sampled STS file, and
+        either raised by the online refit; the head's where the cut does not apply."""
+        if (
+            self._confidence_cut is None
+            or confidence is None
+            or not self._confidence_cut.applies(bs=bs, sampling_info=sampling_info)
+        ):
+            return confidence
+        return self._confidence_cut.cut_confidence(
+            confidence,
+            sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+        )
+
     def _cut_verify_lens(
         self, *, bs: int, sampling_info, confidence: Optional[torch.Tensor], reqs
     ) -> Optional[torch.Tensor]:
@@ -620,7 +636,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._confidence_cut_gate(reqs)
         ):
             return None
-        return cut.verify_lens(confidence)
+        return cut.verify_lens(
+            confidence,
+            sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+        )
 
     @staticmethod
     def _confidence_cut_gate(reqs) -> CalibrationGate:
@@ -1009,6 +1028,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        if self._confidence_cut is not None:
+            # Opens the draft ms bracket the T(w) calibration's timed verify closes (one event until T(w) freezes).
+            self._confidence_cut.begin_draft()
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -1047,8 +1069,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         # The confidence cut reads this step's own confidence, on the device: the folded proposal's confidence_out,
         # or the eager compute above. Its lengths take the top-probability gate's place (the two never run together).
+        # STS collection's head-retraining data: the confidence head's hidden input (the V4 draft's collapsed hidden
+        # tap, else the draft hidden), copied now because the draft graph's outputs are only live until the verify.
+        head_hidden = None
+        if self._observers.records_head_hidden:
+            tap = proposal.confidence_tap if proposal.confidence_tap is not None else proposal.draft_hidden
+            head_hidden = None if tap is None else tap.to(torch.float16, copy=True)
+        cut_confidence = self._cut_confidence(confidence, bs=bs, sampling_info=sampling_info)
         cut_verify_lens = self._cut_verify_lens(
-            bs=bs, sampling_info=sampling_info, confidence=confidence, reqs=batch.reqs
+            bs=bs, sampling_info=sampling_info, confidence=cut_confidence, reqs=batch.reqs
         )
         cut_calibrated = False
         if cut_verify_lens is not None:
@@ -1179,6 +1208,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             gate_verify_lens=gate_verify_lens,
         )
+        if cut_verify_lens is not None:
+            # The online refit's sample: a non-blocking copy of this verify's confidences and accept, read later.
+            self._confidence_cut.observe_outcome(
+                confidence=confidence,
+                verify_lens=cut_verify_lens,
+                correct_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
+                sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
@@ -1242,7 +1280,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
             cut_verify_lens=cut_verify_lens,
             cut_calibrated=cut_calibrated,
+            cut_confidence=cut_confidence,
             folded_confidence_raw=self._folded_confidence_raw(proposal, bs),
+            confidence_hidden=head_hidden,
         )
         if draft_probs is not None:
             self._draft_top_prob_log.record(
