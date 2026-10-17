@@ -160,7 +160,7 @@ def test_a_dry_run_start_reports_the_memory_floor_and_would_start_above_it(tmp_p
     # arm_env.PROD_NODE1_*: HiCache 12.67 + arm A's rest 51.24 + 1 GiB margin.
     assert "node-1 floor 64.91 GiB" in r.stdout
     assert "evicted 0 files" in r.stdout  # a dry run evicts nothing
-    assert "would start: node 1 is above its floor" in r.stdout
+    assert "would start: every checked node is above its floor" in r.stdout
     assert not (tmp_path / "servers").exists()
 
 
@@ -168,7 +168,8 @@ def test_a_dry_run_start_below_the_floor_names_the_nodes_the_floor_and_the_page_
     r = _run(tmp_path, "start", DRY_RUN=1, **_floor_env(tmp_path, 70.0, 20.0))
     assert r.returncode == 0, r.stderr  # a dry run decides, it does not fail
     assert "would refuse: node 1 has 20.0 GiB free" in r.stderr
-    assert "below its floor of 64.91 GiB; node 0 has 70.0 GiB free" in r.stderr
+    assert "below its floor of 64.91 GiB" in r.stderr
+    assert "node 0 has 70.0 GiB free" in r.stderr  # each node's free memory, the short one first (prelaunch-cache)
     assert "WARNING node 0 has 70.0 GiB free" in r.stderr  # under PROD_NODE0_WARN_GIB: a warning, not a refusal
     assert str(tmp_path / "holders" / "big-model") in r.stderr
     assert "drop_caches" in r.stderr
