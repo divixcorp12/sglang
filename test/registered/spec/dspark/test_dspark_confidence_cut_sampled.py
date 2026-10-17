@@ -58,10 +58,14 @@ def test_the_stopping_rule_admits_slot_k_from_confidences_before_it_only():
         again = stop_rule_verify_lens(confidence=perturbed, cost_ms=cost)
         assert torch.equal(again >= k, lens >= k), k
     # The look-ahead the stopping form rules out: with a cost that is not affine, the argmax's w >= 3 can depend on c_3.
-    bumpy = torch.tensor([1.0, 1.0, 3.0, 3.0, 3.0, 3.0])
+    # Rates: low [1, 1.9, 1.36, 1.36, 1.36, 1.36]; high [1, 1.9, 1.36, 1.76, 2.17, 2.57].
+    bumpy = torch.tensor([1.0, 1.0, 2.0, 2.0, 2.0, 2.0])
     low = torch.tensor([[0.9, 0.9, 0.0, 0.0, 0.0]])
     high = torch.tensor([[0.9, 0.9, 1.0, 1.0, 1.0]])
-    assert int(cut_verify_lens(confidence=low, cost_ms=bumpy)) != int(cut_verify_lens(confidence=high, cost_ms=bumpy))
+    assert int(cut_verify_lens(confidence=low, cost_ms=bumpy)) == 2
+    assert int(cut_verify_lens(confidence=high, cost_ms=bumpy)) == GAMMA + 1
+    assert int(stop_rule_verify_lens(confidence=low, cost_ms=bumpy)) == 2
+    assert int(stop_rule_verify_lens(confidence=high, cost_ms=bumpy)) == 2
 
 
 def test_sampled_verifies_take_the_stopping_form_and_greedy_ones_the_argmax(monkeypatch):
