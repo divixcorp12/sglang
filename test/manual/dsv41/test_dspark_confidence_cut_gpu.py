@@ -266,7 +266,7 @@ def test_the_real_sampling_accept_keeps_the_targets_law_with_every_row_and_under
     p_cut = dist.sequence_pvalue(toy, sequences)
     counts = torch.bincount(widths, minlength=TOKENS + 1)
     print(f"p every row {p_full:.4g}, p cut {p_cut:.4g}, widths {counts[1:].tolist()}")
-    assert (counts[1:] > 0).sum() >= 3 and widths.float().mean() < GAMMA
+    assert (counts[1:] > 0).all() and widths.float().mean() < GAMMA
     assert p_full > 1e-3 and p_cut > 1e-3
 
 

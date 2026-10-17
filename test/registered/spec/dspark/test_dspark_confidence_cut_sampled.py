@@ -131,7 +131,7 @@ def test_the_cut_keeps_the_output_law_the_targets_under_sampling(sampled_cut):
     toy, sequences, widths = _decode(lambda c, d: sampled_cut.verify_lens(c, sampled=True), seed=11)
     # Not vacuous: the cut picked several widths, most of them short of every row.
     counts = torch.bincount(widths, minlength=GAMMA + 2)
-    assert (counts[1:] > 0).sum() >= 3 and widths.float().mean() < GAMMA, counts.tolist()
+    assert (counts[1:] > 0).all() and widths.float().mean() < GAMMA, counts.tolist()
     assert dist.sequence_pvalue(toy, sequences) > PASS_P
 
 

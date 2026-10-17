@@ -38,8 +38,9 @@ class MarkovToy:
         # Close to the target, so most drafts are accepted and verifies reach several widths, but not equal to it.
         self.draft_logits = self.target_logits + 0.8 * torch.randn((vocab, vocab), generator=generator)
         # confidence[k - 1, t]: draft k's confidence when the token before it is t; spread so the served cost's cut
-        # picks every width.
-        self.confidence = 0.3 + 0.7 * torch.rand((gamma, vocab), generator=generator) ** 0.3
+        # (T(w) = 96.5 + 18.3 (w - 1)) picks every width, the anchor alone after token 2.
+        self.confidence = 0.05 + 0.95 * torch.rand((gamma, vocab), generator=generator) ** 0.5
+        self.confidence[0, 2 % vocab] = 0.1
 
     def target_probs(self) -> torch.Tensor:
         return torch.softmax(self.target_logits / self.temperature, dim=-1)
