@@ -157,10 +157,11 @@ def _floor_env(tmp_path, free0_gib, free1_gib):
 def test_a_dry_run_start_reports_the_memory_floor_and_would_start_above_it(tmp_path):
     r = _run(tmp_path, "start", DRY_RUN=1, **_floor_env(tmp_path, 86.0, 84.0))
     assert r.returncode == 0, r.stderr
-    # arm_env.PROD_NODE1_*: HiCache 12.67 + arm A's rest 51.24 + 1 GiB margin.
-    assert "node-1 floor 64.91 GiB" in r.stdout
+    # arm_env.PROD_NODE1_*: HiCache 12.67 + arm A's rest 51.24 + production's layer-major StateStore 5.0 + 1 GiB margin.
+    assert "node-1 floor 69.91 GiB" in r.stdout
+    assert "+ layer-major StateStore 5.0 + margin 1.0" in r.stdout
     assert "evicted 0 files" in r.stdout  # a dry run evicts nothing
-    assert "would start: node 1 is above its floor" in r.stdout
+    assert "would start: every checked node is above its floor" in r.stdout
     assert not (tmp_path / "servers").exists()
 
 
@@ -168,7 +169,8 @@ def test_a_dry_run_start_below_the_floor_names_the_nodes_the_floor_and_the_page_
     r = _run(tmp_path, "start", DRY_RUN=1, **_floor_env(tmp_path, 70.0, 20.0))
     assert r.returncode == 0, r.stderr  # a dry run decides, it does not fail
     assert "would refuse: node 1 has 20.0 GiB free" in r.stderr
-    assert "below its floor of 64.91 GiB; node 0 has 70.0 GiB free" in r.stderr
+    assert "below its floor of 69.91 GiB" in r.stderr
+    assert "node 0 has 70.0 GiB free" in r.stderr  # each node's free memory, the short one first (prelaunch-cache)
     assert "WARNING node 0 has 70.0 GiB free" in r.stderr  # under PROD_NODE0_WARN_GIB: a warning, not a refusal
     assert str(tmp_path / "holders" / "big-model") in r.stderr
     assert "drop_caches" in r.stderr
@@ -203,6 +205,17 @@ def test_the_real_start_checks_the_assets_before_the_lock():
     text = open(SCRIPT).read()
     lock = text.index('exec 9>"$gpu_lock"')
     assert text.rindex("check_assets || exit 1", 0, lock) > text.index('if [ "$dry" = 1 ]; then\n    echo "checkout')
+
+
+def test_the_floors_state_store_term_follows_the_envs_layer_major_threshold():
+    sys.path.insert(0, os.path.dirname(SCRIPT))
+    import arm_env
+
+    # 131072 tokens x (4 x 5120 bf16 + 4 fp32) = 5.00 GiB, for production (layer-major on) and nothing for the arms.
+    assert arm_env.LAYER_MAJOR_STATE_BYTES_PER_TOKEN == 40976
+    assert arm_env.layer_major_state_gib(arm_env.prod_env()) == 5.0
+    assert arm_env.layer_major_state_gib(arm_env.arm_env(arm_env.dspark_env())) == 0.0
+    assert arm_env.layer_major_state_gib({}) == 0.0
 
 
 def test_the_floor_check_runs_under_the_lock_and_before_the_server_starts():

@@ -50,9 +50,12 @@ def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: s
                verify_split: bool = True) -> dict:
     """The arm's env with the job trace on; ``top_k_only`` and ``scorer`` override the arm's only when given. With
     ``verify_split`` it also writes the stage trace's route log, the router capture and the per-verify accept log,
-    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs."""
+    which verify_split.py joins; they add host work, so a timing comparison must use the same setting on both runs. An
+    STS collection arm writes its shards under OUT_DIR (both_cpu_ab.sts_collect_stem)."""
     overrides, _ = both_cpu_ab.ARMS[arm]
     asked = {}
+    if arm in both_cpu_ab.STS_COLLECT_ARMS:
+        asked[both_cpu_ab.STS_COLLECT] = both_cpu_ab.sts_collect_stem(out_dir)
     if top_k_only:
         asked["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] = "1"
     if scorer is not None:
@@ -99,10 +102,46 @@ def counter_summary(log_path: str) -> dict:
     return out
 
 
+class Interrupted(SystemExit):
+    """SIGTERM or SIGHUP, raised in the main thread so the finally blocks run: the default action ends the process at
+    once, and a server started under it would outlive it (reparented to PID 1, holding the GPU)."""
+
+
+def raise_on_signal() -> None:
+    def handler(signum, frame):
+        raise Interrupted(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
+def launch_server(argv, env, out_dir: str, log, cwd: str = REPO) -> subprocess.Popen:
+    """Start the server as the leader of its own session and record its process group in OUT/server.pgid, so a wrapper
+    can clear the group if this process dies before it can."""
+    server = subprocess.Popen(argv, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=cwd, start_new_session=True)
+    with open(os.path.join(out_dir, "server.pgid"), "w") as f:
+        f.write(f"{server.pid}\n")
+    return server
+
+
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def stop_server(server: subprocess.Popen, timeout: float = 300) -> None:
     """SIGTERM the launcher alone so the scheduler shuts down and the engines write their event files; a group
-    SIGTERM kills the scheduler first and loses them."""
-    os.kill(server.pid, signal.SIGTERM)
+    SIGTERM kills the scheduler first and loses them. Then SIGKILL the whole group (children outlive the launcher) and
+    wait until no member is left."""
+    try:
+        os.kill(server.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     try:
         server.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -112,6 +151,9 @@ def stop_server(server: subprocess.Popen, timeout: float = 300) -> None:
         os.killpg(server.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    deadline = time.monotonic() + 30
+    while group_alive(server.pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
 
 
 def _healthy(port: int, deadline: float) -> bool:
@@ -129,9 +171,11 @@ def _healthy(port: int, deadline: float) -> bool:
 def client_argv(a: argparse.Namespace) -> list[str]:
     """The serving client: logprob_probe.py over the A/B's sessions, or long_prompt.py with --long-prompt."""
     if a.long_prompt:
+        sampling = ([] if not a.temperature else ["--temperature", str(a.temperature)]) + (
+            [] if a.top_p is None else ["--top-p", str(a.top_p)])
         return [arm_env.PYTHON, LONG_PROMPT, "--port", str(PORT), "--prompt", os.path.abspath(a.long_prompt),
                 "--decode-seconds", str(a.decode_seconds), "--ttft-repeats", str(a.ttft_repeats),
-                "--out-dir", a.out_dir]
+                "--out-dir", a.out_dir, *sampling]
     return [arm_env.PYTHON, PROBE, "--port", str(PORT), "--sessions", both_cpu_ab.SESSIONS, "--prompts", str(a.prompts),
             "--max-tokens", str(a.max_tokens), "--top-logprobs", "1", "--out", os.path.join(a.out_dir, "probe.json")]
 
@@ -155,12 +199,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with --long-prompt: cancel the request this long after its first streamed token")
     p.add_argument("--ttft-repeats", type=int, default=0,
                    help="with --long-prompt: first send it this many times with 20 s of decode, for TTFT samples")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="with --long-prompt: sample at this temperature (0, the default, is greedy)")
+    p.add_argument("--top-p", type=float, default=None, help="with --long-prompt and --temperature: nucleus top-p")
+    p.add_argument("--then-generate", metavar="JSON",
+                   help="after the client succeeds and before the shutdown, POST this /generate body once and save the "
+                        "reply as OUT_DIR/then_generate.json (e.g. a sampled request outside the timed windows)")
     p.add_argument("--resolve-env", metavar="KEYS",
                    help="launch nothing: print the server's env (the comma-separated KEYS from the caller's env under "
                         "the capture's own), its argv, and which of KEYS the capture overrides, as JSON")
     a = p.parse_args(argv)
-    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats):
-        p.error("--decode-seconds and --ttft-repeats need --long-prompt")
+    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats or a.temperature or a.top_p is not None):
+        p.error("--decode-seconds, --ttft-repeats, --temperature and --top-p need --long-prompt")
+    if a.temperature < 0 or (a.top_p is not None and (not 0 < a.top_p <= 1 or not a.temperature)):
+        p.error("--temperature must be non-negative, and --top-p in (0, 1] with a positive --temperature")
     if a.long_prompt and not os.path.isfile(a.long_prompt):
         p.error(f"--long-prompt {a.long_prompt}: no such file")
     if a.decode_seconds <= 0 or a.ttft_repeats < 0:
@@ -179,7 +231,10 @@ def capture_env(a: argparse.Namespace) -> dict:
 
 
 def server_argv(arm: str) -> list[str]:
-    return [*arm_env.ServerArgs(port=PORT, dspark=True).argv(), *both_cpu_ab.server_flags(arm)]
+    # The production arms warm up as production does (ServerArgs.prod(): dsv41_decode_paths too).
+    decode_warmup = arm in both_cpu_ab.PROD_ARMS
+    return [*arm_env.ServerArgs(port=PORT, dspark=True, decode_warmup=decode_warmup).argv(),
+            *both_cpu_ab.server_flags(arm)]
 
 
 def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
@@ -191,6 +246,24 @@ def resolve_env(a: argparse.Namespace, keys: list[str]) -> dict:
             "overridden": sorted(k for k, v in asked.items() if k in own and own[k] != v)}
 
 
+def then_generate(body_path: str, out_path: str, timeout_s: float = 600.0) -> int:
+    """POST ``body_path`` to the server's /generate once; the reply goes to ``out_path``. 0 on HTTP 200."""
+    with open(body_path, "rb") as f:
+        body = f.read()
+    request = urllib.request.Request(f"http://127.0.0.1:{PORT}/generate", data=body,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as r:
+            reply = r.read()
+    except OSError as error:
+        print(f"then-generate failed: {error!r}")
+        return 1
+    with open(out_path, "wb") as f:
+        f.write(reply)
+    print(f"then-generate: {len(reply)} bytes -> {out_path}")
+    return 0
+
+
 def main() -> int:
     a = parse_args()
     if a.resolve_env is not None:
@@ -199,17 +272,26 @@ def main() -> int:
     os.makedirs(a.out_dir, exist_ok=True)
     env = os.environ | capture_env(a) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = server_argv(a.arm)
+    raise_on_signal()
     with run_locks.take(DISK_LOCK), run_locks.take(arm_env.GPU_LOCK):
-        with open(os.path.join(a.out_dir, "server.log"), "w") as log:
-            server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
-                                      stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
+        server = None
+        interrupted = False
         rc = 1
         try:
+            with open(os.path.join(a.out_dir, "server.log"), "w") as log:
+                server = launch_server(["taskset", "-c", arm_env.SERVER_CORES, *argv], env, a.out_dir, log)
             if not _healthy(PORT, time.monotonic() + arm_env.DSPARK_HEALTH_TIMEOUT_S):
                 return 1
             rc = subprocess.run(["taskset", "-c", arm_env.DRIVER_CORES, *client_argv(a)], cwd=REPO).returncode
+            if rc == 0 and a.then_generate:
+                rc = then_generate(a.then_generate, os.path.join(a.out_dir, "then_generate.json"))
+        except BaseException:
+            interrupted = True
+            raise
         finally:
-            stop_server(server)
+            if server is not None:
+                # Aborted (the wrapper's load watchdog): give the launcher 30 s to shut down, then kill the group.
+                stop_server(server, 30 if interrupted else 300)
     if rc != 0:
         return rc
     events = os.path.join(a.out_dir, "events.*.jsonl")

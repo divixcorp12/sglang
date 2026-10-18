@@ -121,6 +121,50 @@ def test_the_one_kernel_dead_row_masking_matches_its_torch_definition(id_dtype):
         assert torch.equal(got_routes.cpu(), want_routes), live
 
 
+@pytest.mark.parametrize("live", [1, 2, TOKENS])
+def test_the_dedup_plan_leaves_dead_rows_out_of_the_route_counts_and_nothing_else(live):
+    """A verify's masked routes (dead rows repeat row 0's experts) through the dedup plan with the dead mask: the
+    residency route counts are the live rows' alone, and the remap, the scratch rows and every graph and outcome
+    counter equal the plan without the mask. With no row dead the mask is the identity. Mutant: count a dead route
+    -- red for live < 6."""
+    from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes_fused
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows, mask_dead_routes
+
+    generator = torch.Generator(device="cpu").manual_seed(9)
+    raw = torch.stack([torch.randperm(EXPERTS, generator=generator)[:TOP_K] for _ in range(TOKENS)])
+    dead_rows = VerifyDeadRows(max_rows=TOKENS, device="cuda")
+    dead_rows.set_live_rows(torch.tensor([live], device="cuda"))
+    ids, _ = mask_dead_routes(
+        topk_ids=raw.cuda(), topk_weights=torch.ones(raw.shape, device="cuda"), dead=dead_rows.dead
+    )
+    expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.int64, device="cuda")
+    expert_to_slot[::3] = torch.arange(EXPERTS // 3, device="cuda")  # a third of the experts hot
+    routes = TOKENS * TOP_K
+
+    def plan(dead):
+        out = dict(
+            source_rows_out=torch.full((routes,), -1, dtype=torch.int64, device="cuda"),
+            slots_out=torch.full((routes,), -1, dtype=torch.int32, device="cuda"),
+            count_out=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            graph_counters=torch.zeros(2, dtype=torch.int64, device="cuda"),
+            graph_unique_counters=torch.zeros(2, dtype=torch.int64, device="cuda"),
+            route_counts=torch.zeros(EXPERTS, dtype=torch.float32, device="cuda"),
+        )
+        out["remap"] = plan_graph_routes_fused(
+            ids.reshape(-1), expert_to_slot, 100, torch.int64, dedup=True, dead_rows=dead, row_top_k=TOP_K, **out
+        )
+        return out
+
+    masked, plain = plan(dead_rows.dead), plan(None)
+    for name, tensor in plain.items():
+        if name != "route_counts":
+            assert torch.equal(masked[name], tensor), name
+    want = torch.bincount(raw[:live].reshape(-1), minlength=EXPERTS).float()
+    assert torch.equal(masked["route_counts"].cpu(), want)
+    if live == TOKENS:
+        assert torch.equal(masked["route_counts"], plain["route_counts"])
+
+
 @pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
 def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
     from sglang.srt.environ import envs
@@ -192,10 +236,16 @@ def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
             ids.copy_(torch.tensor(routes, device="cuda", dtype=torch.int32))
 
             updater.overflow_flag.zero_()
+            updater.route_counts.zero_()
             dead_rows.set_live_rows(torch.tensor([2], device="cuda"))
             graph.replay()
             torch.cuda.synchronize()
             service.fail_stop_check()
+            if fused:
+                # The fused plan's residency route counts: the two live rows' routes only, none of the cut rows'
+                # (which repeat row 0's experts).
+                counts = updater.route_counts[0, :EXPERTS].cpu().tolist()
+                assert counts == [2.0 if e in live else 0.0 for e in range(EXPERTS)]
             assert streamer.row_backend.keep.item() == 1.0
             assert int(updater.overflow_flag.item()) == 0, "a cut row took a miss lane"
             now = mapping()

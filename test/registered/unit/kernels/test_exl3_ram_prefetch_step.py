@@ -79,14 +79,15 @@ def test_the_layer_reads_per_layer_rows_in_margin_order(tmp_path, per_layer, pic
         rig.host.stop()
 
 
-@pytest.mark.parametrize("live, picks", [(2, [0, 2]), (1, [2])])
-def test_each_live_token_adds_its_own_pick(tmp_path, live, picks):
+@pytest.mark.parametrize("tokens, live, picks", [(2, None, [0, 2]), (1, None, [2]), (2, 1, [2])])
+def test_each_live_token_adds_its_own_pick(tmp_path, tokens, live, picks):
     """A two-token row; token 0 prefers 2, token 1 prefers 0. With the table counting one live token,
-    token 1's stale input is not scored."""
+    token 1's stale input is not scored. The last case is a verify whose token 1 is dead: the record's 2 tokens
+    with 1 live (cpu_token_table.h), so the scorer reads the live count. Mutant: offer_spec reads +0 -- red."""
     rig = prefetch_rig(tmp_path, tokens=2)
     try:
         enable(rig, [LOGITS[0], [41, 21, 22, 23, 24, 25]], per_layer=2)
-        trigger(rig, tokens=live)
+        trigger(rig, tokens=tokens, live=live)
         assert rig.host.spec_pump(0)
         assert _landed(rig.host, 1) == picks
     finally:

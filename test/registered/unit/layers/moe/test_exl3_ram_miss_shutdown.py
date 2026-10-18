@@ -481,3 +481,20 @@ def test_shutdown_reads_the_shared_draft_hosts_counters_before_closing_the_host(
     assert [r.getMessage() for r in caplog.records if "DSpark CPU experts" in r.getMessage()] == [
         f"DSpark CPU experts: {counters}"
     ]
+
+
+def test_shutdown_logs_the_module_loads_that_drained_the_device_once(world, monkeypatch, caplog):
+    """The served check for the startup warm-up reads this line: a Triton or tvm-ffi module loaded after the copy
+    engine armed drained the device first (_copy_engine_module_load_guard). Logged once, with the armed state, and
+    without any device work of its own (the order is unchanged)."""
+    service, caches, order = world
+    service.copy_engine_module_loads = 3
+    service._copy_armed = True
+    _barrier(service, monkeypatch, order, lambda: None)
+    with caplog.at_level("INFO", logger=module.logger.name):
+        service.shutdown()
+        service.shutdown()
+    assert order == ["synchronize", "close_admission", "stop", "free0", "free1"]
+    assert [r.getMessage() for r in caplog.records if "copy_engine_module_loads" in r.getMessage()] == [
+        "exl3 RAM miss: copy_engine_module_loads=3 (module loads after the copy engine armed; armed: True)"
+    ]

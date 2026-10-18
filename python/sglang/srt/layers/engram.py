@@ -155,15 +155,36 @@ def _graphable_lookup_shape(indices: torch.Tensor, mode) -> bool:
     )
 
 
-def _device_wait_lookup(embed: EngramEmbedding, indices: torch.Tensor) -> torch.Tensor:
+def _device_wait_lookup(
+    embed: EngramEmbedding, indices: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
     lookup = embed._posted_lookup
     embed._posted_lookup = None
     if lookup is None:
         # No early post (a caller outside DeepseekV4Model's layer loop): post here.
         lookup = _EngramDeviceWaitLookup(embed.file_table, indices)
-        lookup.post(indices)
+        lookup.post(mask_dead_lookup_rows(indices, embed.verify_dead_rows, forward_batch))
     retain_for_current_graph(lookup)
     return lookup.wait(embed.file_table, indices)
+
+
+# A dead verify row's hash id (layers/moe/verify_dead_rows.py). The native Store serves it a zero row and counts
+# no access; it must match kDeadRowId in engram_host_node.cpp.
+DEAD_ROW_ID = -1
+
+
+def mask_dead_lookup_rows(
+    indices: torch.Tensor, dead: Optional[torch.Tensor], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """[T, n_hash_cols] ``indices`` with every dead row's ids set to DEAD_ROW_ID; the identity outside a target
+    verify of at most ``dead.shape[0]`` tokens, so decode, prefill and bs > 1 verifies are untouched."""
+    if (
+        dead is None
+        or not forward_batch.forward_mode.is_target_verify()
+        or indices.shape[0] > dead.shape[0]
+    ):
+        return indices
+    return torch.where(dead[: indices.shape[0]], DEAD_ROW_ID, indices)
 
 
 def post_engram_device_lookups(
@@ -180,7 +201,9 @@ def post_engram_device_lookups(
             embed, indices, forward_batch
         ):
             embed._posted_lookup = _EngramDeviceWaitLookup(embed.file_table, indices)
-            embed._posted_lookup.post(indices)
+            embed._posted_lookup.post(
+                mask_dead_lookup_rows(indices, embed.verify_dead_rows, forward_batch)
+            )
 
 
 # Arbitrary: far above the host node's 33.8 ms worst case, short enough that a lost
@@ -1002,6 +1025,8 @@ class EngramEmbedding(nn.Module):
         self.host_table: Optional[_HostTable] = None
         self.file_table: Optional[EngramFileTable] = None
         self._posted_lookup: Optional[_EngramDeviceWaitLookup] = None
+        # [max_rows, 1] bool: a speculative verify's dead rows (attach_verify_dead_rows), or None.
+        self.verify_dead_rows: Optional[torch.Tensor] = None
         table_dir = envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get()
         if table_dir:
             if self.tp_size != 1:
@@ -1078,7 +1103,7 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             if _captures_native_lookup(self, indices, forward_batch):
                 if envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get():
-                    return _device_wait_lookup(self, indices)
+                    return _device_wait_lookup(self, indices, forward_batch)
                 return _capture_engram_file_lookup(self.file_table, indices)
             return _engram_file_table_lookup(self.file_table, indices)
         if self._shared:

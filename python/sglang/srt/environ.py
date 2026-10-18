@@ -823,6 +823,22 @@ class Envs:
     # first draft where the running product of the draft's top-1 softmax probabilities falls below this, and the
     # target routes no experts for the positions past it. 0 is off. 0.4 was the offline replay's best.
     SGLANG_DSPARK_TOP_PROB_GATE = EnvFloat(0.0)
+    # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
+    # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
+    SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
+    # With the cut on, cut sampled (temperature > 0) bs-1 verifies too, not only greedy ones; their T(w) calibration
+    # admits them as well. Lossless by the stopping-rule argument in dspark_confidence_cut.py's docstring.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED = EnvBool(False)
+    # The sampled cut's own STS file (dspark_sts_fit --label soft at the serving temperature): sampled verifies re-temper
+    # the head's output from --speculative-dspark-confidence-sts-path's temperatures to these. Empty: they use the
+    # greedy file's, fitted on argmax labels.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH = EnvStr("")
+    # The cut's rule maximises E(w) / (draft ms + T(w)), the draft ms timed on the T(w) calibration's verifies, not
+    # E(w) / T(w). The draft ms is timed and logged either way.
+    SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST = EnvBool(False)
+    # Refit the cut's per-position calibration from the server's own accepts every this many cut verifies (greedy and
+    # sampled apart; dspark_confidence_refit.py). The cut reads max(offline, refit), so it never cuts harder. 0 is off.
+    SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -2325,6 +2341,18 @@ class Envs:
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
     # stream once per prompt. 0 turns it off. Model- and quant-agnostic; the model must provide an adapter.
     SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS = EnvInt(0)
+    # Lets layer-major prefill run under DSpark: the late-layer tail captures the draft's aux hiddens and the pass
+    # reports them at whole-extend row indices for the KV injection. Off: launch_refusal refuses DSpark as before.
+    SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK = EnvBool(False)
+    # Layer-major expert residency (layers/moe/prefill_residency.py): a buffer of this many expert rows keeps the experts
+    # one chunk of a layer read for the layer's later chunks, so each is read once per prompt. 0 turns it off. Stage 0:
+    # a plain allocation at the first layer-major pass, so the launch must leave it free (a smaller hot cache).
+    SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS = EnvInt(0)
+    # Stage 1 of the above: the rows are the late layers' (never run in the pass loop) VRAM hot-cache slots, lent in
+    # place for the pass and reloaded from the pinned RAM tier before the late-layer tail, so no buffer is allocated
+    # and the hot cache keeps its size. On by default (owner, 2026-10-18); only acts with ROWS > 0, and then the launch
+    # refuses prefetch pull mode and GPU drip slots. 0 gives stage 0's allocated buffer back.
+    SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND = EnvBool(True)
     # NUMA node for the layer-major host state store; node 0 is kept near full by the expert tier (DSV41_REFERENCE
     # §25.4, 27.17).
     SGLANG_LAYER_MAJOR_STATE_NUMA_NODE = EnvInt(1)

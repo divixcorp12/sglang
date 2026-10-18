@@ -10,6 +10,8 @@ GPU_MEMORY_ALL_TYPES = [
 ]
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
+# The server's own startup warm-up requests (--warmups and the server warmup request).
+WARMUP_RID_PREFIX = "WARMUP"
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item

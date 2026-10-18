@@ -890,6 +890,11 @@ Where the expert rows live, how they are read, and how they reach the GPU.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NUMA node of the layer-major host state store.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Lets layer-major prefill run under <code>--speculative-algorithm DSPARK</code>; the late-layer tail captures the draft's aux hidden states. Other speculative algorithms stay refused.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 

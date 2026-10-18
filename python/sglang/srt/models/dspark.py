@@ -353,7 +353,11 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    # Static verifies every row unless the confidence cut, the head's only static consumer, is on.
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and not envs.SGLANG_DSPARK_CONFIDENCE_CUT.get()
+    ):
         return None
     if not hasattr(config, "enable_confidence_head"):
         logger.warning(

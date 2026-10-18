@@ -23,6 +23,25 @@
 die() { echo "run_capture_pair: $*" >&2; exit 2; }
 
 OUT=""; BASE=""; WT=""; PY=/data/models/slang/.venv/bin/python; HICACHE_GIB=12.67; DRY=0
+# The roots prelaunch_evict.py searches for page-cache holders when evicting its listed files leaves node 1 short (the
+# same as arm_env.PROD_PAGE_CACHE_ROOTS).
+HOLDERS="--holders /mnt/nvme0 --holders /mnt/nvme1 --holders /mnt/nvme2 --holders /mnt/nvme4 --holders /data/models"
+# Node 0's floor for the prelaunch (MemFree + reclaimable slab at the start). A served arm takes every free page of node 0
+# during load: in the 13 completed arms of 2026-10-16/17 (memsample.jsonl) node-0 anonymous memory rose 81.6-83.7 GiB and
+# MemFree bottomed at 0.5-0.9 GiB, because the kernel gives the page cache back. What differs between a start that loads
+# and one that trips the watchdog is the start: the lowest start of a completed arm was 81.6 GiB (engram-spin, prod arm),
+# so 80.6 = that less 1 GiB. A hard floor at the anonymous peak (83.7) would refuse three of those completed starts (81.6, 81.9, 83.2).
+# Override with NODE0_FLOOR_GIB; 0 turns the node-0 check off.
+HOLDERS="$HOLDERS --node0-floor-gib ${NODE0_FLOOR_GIB:-80.6}"
+# PRELAUNCH_EVICT_HOLDERS=1 also drops the page cache of those holders at the first retry (prelaunch_evict.py
+# --evict-holders; clean pages of files not open for writing). Off by default.
+[ "${PRELAUNCH_EVICT_HOLDERS:-0}" = 1 ] && HOLDERS="$HOLDERS --evict-holders"
+# PAGE_CACHE_OPT_OUT=1 (owner, 2026-10-18): page cache the kernel can reclaim never stops an arm. The prelaunch check
+# still evicts and logs but a refusal prints PRELAUNCH FLOOR BYPASSED and the arm starts; the node-0 load watchdog logs
+# WATCHDOG OPT-OUT below the min watermark instead of aborting, and aborts only when more than SWAPIN_ABORT_MIB (default
+# 4096) is swapped in during the load. A real OOM still ends the server. Off by default.
+PAGE_CACHE_OPT_OUT=${PAGE_CACHE_OPT_OUT:-0}
+SWAPIN_ABORT_MIB=${SWAPIN_ABORT_MIB:-4096}
 COMMON=(); NAMES=(); SPECS=(); CAP=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -103,7 +122,7 @@ if [ "$DRY" = 1 ]; then
     name=${NAMES[$i]}
     echo "ARM $name"
     echo "  env: $(arm_assignments "$i")"
-    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB"
+    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB $HOLDERS"
     echo "  capture: env $(arm_assignments "$i") taskset -c 0-63 $PY $CAPTURE $OUT/$name --arm $BASE ${CAP[*]}"
     echo "  outputs: $OUT/$name $OUT/$name.memsample.jsonl $OUT/$name.nvme3n1.samples $OUT/$name.gpu-mem.csv $OUT/$name.memstate.txt $OUT/$name.diskstats.before $OUT/$name.diskstats.after $OUT/$name.ready.txt"
   done
@@ -112,6 +131,21 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
+. "$(dirname "${BASH_SOURCE[0]}")/reap_group.sh"
+SERVER_PORT=30032  # spec_margin_capture.PORT
+CUR_CAP=""; CUR_NAME=""
+# Killed or interrupted (also on a plain exit): stop the capture by PID, give it 40 s to stop its server, then clear the
+# server's group and the sampler loops it left.
+stop_all() {
+  if [ -n "$CUR_CAP" ] && kill -0 "$CUR_CAP" 2>/dev/null; then
+    echo "stopping capture $CUR_CAP ($CUR_NAME)"; kill -TERM "$CUR_CAP"
+    for ((i = 0; i < 400; i++)); do kill -0 "$CUR_CAP" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$CUR_CAP" 2>/dev/null && kill -KILL "$CUR_CAP"
+  fi
+  [ -n "$CUR_NAME" ] && { reap_server_group "$OUT/$CUR_NAME/server.pgid" "$CUR_NAME"; touch "$OUT/$CUR_NAME.disk.stop" "$OUT/$CUR_NAME.memsample.stop"; }
+}
+trap 'stop_all; echo ALLDONE; exit 130' INT TERM
+trap 'stop_all' EXIT
 mkdir -p "$OUT" "$TMPDIR"
 echo "$MERGED" > "$OUT/resolved-env.json"
 for i in "${!NAMES[@]}"; do
@@ -120,7 +154,16 @@ for i in "${!NAMES[@]}"; do
   echo "$name ${all[*]}"
   while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
     echo "waiting for a quiet box $(date)"; sleep 60; done
-  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB; then
+  # Layer-major prefill's node-1 StateStore, from the arm's resolved server env (0 when it does not prefill layer-major).
+  state_gib=$(echo "$MERGED" | "$PY" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import arm_env
+print(arm_env.layer_major_state_gib(json.load(sys.stdin)[sys.argv[1]]))' "$name" "$WT/benchmarks/dsv41_baseline") \
+    || { echo "REFUSED $name: no layer-major StateStore size"; echo ALLDONE; exit 2; }
+  if [ "$PAGE_CACHE_OPT_OUT" = 1 ]; then
+    # The check still evicts our files and logs every node; a refusal only reports, and the wait is one minute.
+    if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS --wait-min 1; then
+      echo "PRELAUNCH FLOOR BYPASSED $name: below a floor, starting anyway (PAGE_CACHE_OPT_OUT=1) $(date)"
+    fi
+  elif ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS; then
     echo "REFUSED $name: node 1 free below the floor $(date)"; echo ALLDONE; exit 3
   fi
   mkdir -p $OUT/$name
@@ -135,19 +178,41 @@ for i in "${!NAMES[@]}"; do
   echo "START $name $BASE $(date)"
   env "${all[@]}" taskset -c 0-63 "$PY" "$CAPTURE" "$OUT/$name" --arm "$BASE" "${CAP[@]}" &
   cap=$!
+  CUR_CAP=$cap; CUR_NAME=$name
   minfree=999999999
+  swapin0=$(awk '/^pswpin /{print $2}' /proc/vmstat)
+  below=0
   while kill -0 $cap 2>/dev/null && ! grep -q "fired up and ready" $OUT/$name/server.log 2>/dev/null; do
     read free min < <(awk "/^Node 0, zone +Normal/{z=1} z&&/pages free/{f=\$3} z&&/^ +min /{print f, \$2; exit}" /proc/zoneinfo)
     [ -n "$free" ] && [ "$free" -lt "$minfree" ] && minfree=$free
-    if [ -n "$free" ] && [ "$free" -lt "$min" ]; then
+    swapin_mib=$(( ($(awk '/^pswpin /{print $2}' /proc/vmstat) - swapin0) * 4 / 1024 ))
+    if [ "$PAGE_CACHE_OPT_OUT" = 1 ]; then
+      # Below the min watermark is the kernel reclaiming page cache; swapping in is the load really short of memory.
+      if [ -n "$free" ] && [ "$free" -lt "$min" ] && [ "$below" = 0 ]; then
+        below=1; echo "WATCHDOG OPT-OUT $name: node 0 Normal free $free pages below min $min during load, continuing (PAGE_CACHE_OPT_OUT=1) $(date)"
+      fi
+      if [ "$swapin_mib" -gt "$SWAPIN_ABORT_MIB" ]; then
+        echo "ABORT $name: $swapin_mib MiB swapped in during load, above $SWAPIN_ABORT_MIB $(date)"; kill $cap; break
+      fi
+    elif [ -n "$free" ] && [ "$free" -lt "$min" ]; then
       echo "ABORT $name: node 0 Normal free $free pages below min $min during load $(date)"; kill $cap; break
     fi
     sleep 1
   done
-  echo "load watchdog $name: node 0 Normal min free seen $minfree pages (min watermark ${min:-?})"
+  echo "load watchdog $name: node 0 Normal min free seen $minfree pages (min watermark ${min:-?}), swap-in during load $(( ($(awk '/^pswpin /{print $2}' /proc/vmstat) - swapin0) * 4 / 1024 )) MiB"
   grep -m1 -n "fired up and ready" $OUT/$name/server.log | cut -c1-40 > $OUT/$name.ready.txt
   wait $cap; rc=$?
   echo "RC $name $rc $(date)"
+  CUR_CAP=""
+  # The capture stops its own server on every exit it can handle (spec_margin_capture); this clears what a crash or a
+  # SIGKILL left, and does not go on while the port or the GPU is still held.
+  cleared=1
+  reap_server_group "$OUT/$name/server.pgid" "$name" || cleared=0
+  server_clear "$SERVER_PORT" "$name" || cleared=0
+  if [ "$cleared" = 0 ]; then
+    touch $OUT/$name.disk.stop $OUT/$name.memsample.stop; kill $smi 2>/dev/null
+    echo "ARM FAILED $name: its server is still up"; echo ALLDONE; exit 1
+  fi
   cat /proc/diskstats > $OUT/$name.diskstats.after; touch $OUT/$name.disk.stop
   sleep 10; touch $OUT/$name.memsample.stop; kill $smi; sleep 15
   journalctl -k --since "$start" 2>/dev/null | grep -E "Killed process|oom-kill:" | tail -3

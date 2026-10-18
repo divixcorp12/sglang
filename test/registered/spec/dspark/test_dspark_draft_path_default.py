@@ -5,6 +5,7 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
+    handle_speculative_decoding,
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -117,6 +118,65 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
+
+
+class TestDsparkConfidenceCutRefusals(CustomTestCase):
+    """SGLANG_DSPARK_CONFIDENCE_CUT's launch contract: one cut source, calibrated, static, DSpark only."""
+
+    def _cut_server_args(self) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_dspark_confidence_sts_path = "/fitted/sts.json"
+        return server_args
+
+    def test_flag_off_checks_nothing(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_algorithm = None
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(False):
+            handle_speculative_decoding(server_args)
+
+    def test_a_served_launch_is_admitted(self):
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+            True
+        ), envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            handle_speculative_decoding(self._cut_server_args())
+
+    def test_collect_mode_needs_no_sts_file(self):
+        """Collecting STS data builds the head with no table; the cut stays off, so the launch is admitted."""
+        server_args = self._cut_server_args()
+        server_args.speculative_dspark_confidence_sts_path = None
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+            True
+        ), envs.SGLANG_RAGGED_VERIFY_MODE.override(
+            "static"
+        ), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/captures/sts.jsonl"):
+            handle_speculative_decoding(server_args)
+
+    def test_each_refusal_names_its_fix(self):
+        refusals = {
+            "speculative-algorithm DSPARK": dict(speculative_algorithm=None),
+            "SGLANG_DSPARK_TOP_PROB_GATE=0": dict(top_prob_gate=0.4),
+            "confidence-sts-path": dict(sts_path=None),
+            "SGLANG_RAGGED_VERIFY_MODE=static": dict(mode="compact"),
+        }
+        for fix, change in refusals.items():
+            server_args = self._cut_server_args()
+            if "speculative_algorithm" in change:
+                server_args.speculative_algorithm = change["speculative_algorithm"]
+            if "sts_path" in change:
+                server_args.speculative_dspark_confidence_sts_path = change["sts_path"]
+            with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+                True
+            ), envs.SGLANG_DSPARK_TOP_PROB_GATE.override(
+                change.get("top_prob_gate", 0.0)
+            ), envs.SGLANG_RAGGED_VERIFY_MODE.override(
+                change.get("mode", "static")
+            ):
+                with self.subTest(fix=fix), self.assertRaisesRegex(ValueError, fix):
+                    handle_speculative_decoding(server_args)
 
 
 if __name__ == "__main__":

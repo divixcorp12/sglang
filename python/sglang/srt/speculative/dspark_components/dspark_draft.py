@@ -85,6 +85,8 @@ class DraftProposal(msgspec.Struct, frozen=True):
     # The draft forward's hidden states, for the draft top-probability log.
     raw_hidden: Optional[torch.Tensor] = None
     draft_hidden: Optional[torch.Tensor] = None
+    # The confidence head's input on the eager path, for STS head-retraining capture; None when folded.
+    confidence_features: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -421,7 +423,7 @@ class DraftBlockProposer:
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = None
+        confidence = confidence_raw = confidence_features = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -483,6 +485,7 @@ class DraftBlockProposer:
             folded=folded,
             raw_hidden=fwd.raw_hidden,
             draft_hidden=fwd.draft_hidden_3d,
+            confidence_features=confidence_features,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:

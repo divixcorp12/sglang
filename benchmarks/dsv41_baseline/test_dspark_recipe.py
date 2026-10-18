@@ -55,6 +55,32 @@ def test_prod_env_carries_the_best_arms_settings_and_both_startup_calibrations()
     assert {k: env.get(k) for k in PROD_DSPARK_SETTINGS} == PROD_DSPARK_SETTINGS
 
 
+def test_prod_prefills_layer_major_under_dspark_and_the_arms_do_not():
+    # Owner decision 2026-10-17: production turns layer-major prefill on under DSpark (threshold and the DSpark switch,
+    # which layer_major/gate.py needs under speculative decoding), plus the lent residency rows. dspark_env() keeps it off for
+    # every arm built on it.
+    env = arm_env.prod_env()
+    assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "8192"
+    assert env["SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"] == "1"
+    # Residency over lent hot-cache slots (owner, 2026-10-18): the rows are production's; the lend is the env default.
+    assert env["SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"] == "360"
+    assert "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND" not in env
+    from sglang.srt.environ import envs
+
+    assert envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get() is True
+    # The lend's launch refusals: production sets neither prefetch pull mode nor GPU drip slots.
+    assert env.get("SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE", "off") == "off"
+    assert env.get("SGLANG_MOE_EXPERT_PREFETCH_PULL", "0") == "0"
+    assert int(env.get("SGLANG_DSV41_GPU_DRIP_SLOTS", "0")) == 0
+    assert arm_env.dspark_env()["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
+    assert "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK" not in arm_env.dspark_env()
+    # The gate's launch checks production meets: one running request and the DSpark algorithm.
+    argv = arm_env.ServerArgs.prod().argv()
+    assert argv[argv.index("--max-running-requests") + 1] == "1"
+    assert argv[argv.index("--speculative-algorithm") + 1] == "DSPARK"
+    assert int(env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"]) > arm_env.CHUNKED_PREFILL_SIZE  # above the ring
+
+
 def test_prod_leaves_the_pending_and_held_flags_off():
     env = arm_env.prod_env()
     # The side stream waits on its own A/B; the lane head is held; the rest measured neutral or not served.
@@ -65,6 +91,17 @@ def test_prod_leaves_the_pending_and_held_flags_off():
         assert held not in env, held
     # Measurement only: the instrumented build's traces and the hot cache's metrics file.
     assert not any("TRACE" in k for k in env) and "SGLANG_MOE_HOT_METRICS_FILE" not in env
+
+
+def test_prod_leaves_the_confidence_cut_and_its_sts_collection_off():
+    # docs/hx/compact-verify-exl3.draft.md: off by default; the cut and its STS file belong to both_cpu_ab's cut arm.
+    env = arm_env.prod_env()
+    assert "SGLANG_DSPARK_CONFIDENCE_CUT" not in env and "SGLANG_DSPARK_STS_COLLECT_PATH" not in env
+    assert "--speculative-dspark-confidence-sts-path" not in arm_env.ServerArgs.prod().argv()
+    assert not any("DSPARK_STS" in k or "CONFIDENCE_CUT" in k for k in arm_env.dspark_env())
+    # The arm's fitted STS file: a production asset path with its digest pinned.
+    assert arm_env.PROD_DSPARK_STS_PATH.startswith("/data/models/slang/prod-assets/dspark-sts/")
+    assert len(arm_env.PROD_DSPARK_STS_SHA256) == 64
 
 
 # The best arm's prefetch keys, from divix01:/mnt/nvme1/share64-ab-20261016/resolved-env.json "on" (its head was
@@ -154,6 +191,18 @@ def test_prod_and_every_arm_pass_the_v41_reasoning_and_tool_call_parsers():
         assert ns.reasoning_parser == "deepseek-v41"
         assert ns.tool_call_parser == "deepseekv41"
         assert ns.language_model_only is True
+
+
+def test_prod_warms_decode_after_the_prefill_shapes_and_the_arms_keep_prefill_only():
+    from sglang.srt.entrypoints.warmup import _warmup_registry
+
+    argv = arm_env.ServerArgs.prod().argv()
+    # Order matters: the decode warm-up's long prompt evicts the SWA KV that the prefill warm-up left cached.
+    assert argv[argv.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths"
+    assert {"dsv41_prefill_shapes", "dsv41_decode_paths"} <= set(_warmup_registry)
+    for args in (arm_env.ServerArgs(port=1), arm_env.ServerArgs(port=1, dspark=True)):
+        argv = args.argv()
+        assert argv[argv.index("--warmups") + 1] == "dsv41_prefill_shapes"
 
 
 def test_prod_and_every_arm_bound_the_prefill_share_with_the_recorder_it_needs():

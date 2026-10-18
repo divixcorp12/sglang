@@ -163,6 +163,21 @@ divix01:
   or `exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock; flock 9` in a script
   (see the lock order below).
 
+### A CPU-only job must hide the GPU
+
+Launch offline analysis, replays and training that need no GPU with
+`CUDA_VISIBLE_DEVICES=` (empty). Never use `env -u CUDA_VISIBLE_DEVICES` for
+them: that form is for pytest's GPU tests, and it leaves the card visible.
+Anything that imports torch can then open a CUDA context, about 500 MiB,
+without holding `cc-gpu.lock`.
+
+That is enough to break a serving launch. Its KV pool is sized from free VRAM
+at startup, so a stray context shrinks it below the pinned 381,184 tokens, and
+the server dies with `KvPinMissed`. On 2026-10-17 a CPU-only head-retrain job
+launched with `env -u` did this to another agent's capture twice (KV pool
+210,944). Check with `nvidia-smi --query-compute-apps=pid,used_memory
+--format=csv` that none of your PIDs are listed.
+
 ## Lock order: `rowimg-disk.lock`, then `cc-gpu.lock`
 
 A job that needs both locks takes the disk lock first. `run_arm.sh` takes

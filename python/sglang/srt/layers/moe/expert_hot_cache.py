@@ -1626,6 +1626,7 @@ class ExpertHotCacheManager:
                 head_file.meta,
                 insert_decay=updater.insert_on_miss_decay,
                 top_prob_gate=envs.SGLANG_DSPARK_TOP_PROB_GATE.get(),
+                confidence_cut=envs.SGLANG_DSPARK_CONFIDENCE_CUT.get(),
             )
             manager.lane_head = LaneHead(head_file, updater.device)
             updater.lane_head = manager.lane_head
@@ -2081,6 +2082,36 @@ class ExpertHotCacheManager:
         """
         self._publish_completed_promotions(wait=True)
 
+    prefill_lend_active = False
+
+    def quiesce_for_prefill_lend(self) -> None:
+        """Settle every promotion and the pending decode boundary, then block the host on the device.
+
+        A layer-major pass that lends hot slots (prefill_residency.LentPrefillResidency) calls this before it reads the
+        slot maps. ``flush`` is the decode boundary that would otherwise promote into a lent slot at the first eager
+        gather, so it runs here; nothing the pass can reach changes a map after this returns."""
+        self.finish_promotions()
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            updater.flush()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def set_prefill_lend(self, active: bool) -> None:
+        """Mark whether a pass has hot slots lent; while it does, anything that would write or read a map fails."""
+        self.prefill_lend_active = active
+        if active and not getattr(self, "_lend_check_registered", False):
+            self._lend_check_registered = True
+            self.register_fail_stop_check(self._fail_if_prefill_lend_active)
+
+    def require_no_prefill_lend(self, what: str) -> None:
+        if self.prefill_lend_active:
+            raise RuntimeError(f"{what} ran while a layer-major pass has hot-cache slots lent")
+
+    def _fail_if_prefill_lend_active(self) -> None:
+        if self.prefill_lend_active:
+            raise RuntimeError("a forward ended with hot-cache slots still lent to a layer-major pass")
+
     def _publish_completed_promotions(self, wait: bool) -> None:
         """Publish promotions whose copies landed, or all of them with ``wait``."""
         pending = []
@@ -2104,6 +2135,7 @@ class ExpertHotCacheManager:
         applies its decision after a later event query. Promotion copies are
         ordered behind one transfer ticket in either path.
         """
+        self.require_no_prefill_lend("a residency boundary")
         clock = self._boundary_clock
         layers = [
             (layer_id, self.caches[layer_id], self.residency_policies[layer_id])

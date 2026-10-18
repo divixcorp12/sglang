@@ -680,6 +680,18 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
+def preload_cut_accept_kernels(*, device, verify_num_draft_tokens: int) -> None:
+    """Load the capped greedy accept's kernels, which only a cut verify reaches (accept_greedy_triton with
+    cutoff_verify_lens), before the server serves. The cut applies at bs 1 only, and accept_greedy_triton passes
+    correct_len int32 (compute_dflash_correct_drafts_and_bonus), verify_lens int64 (ConfidenceCut.verify_lens) and an
+    int64 [bs, verify_num_draft_tokens] argmax table, so that is the one variant of each kernel it can hit."""
+    correct_len = torch.zeros(1, dtype=torch.int32, device=device)
+    verify_lens = torch.ones(1, dtype=torch.int64, device=device)
+    capped, _ = cap_correct_len_triton(correct_len=correct_len, verify_lens=verify_lens)
+    table = torch.zeros((1, verify_num_draft_tokens), dtype=torch.int64, device=device)
+    gather_row_bonus_triton(table=table, idx=capped)
+
+
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
     # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
     # off the memory the reduction touches. The fused kernel does not reproduce

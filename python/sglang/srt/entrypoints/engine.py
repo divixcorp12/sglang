@@ -389,7 +389,7 @@ class Engine(EngineScoreMixin, EngineBase):
             trace_set_thread_info(thread_label)
 
         self.loop = self._ensure_event_loop()
-
+        self._end_startup_warmup()
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
         return self._scheduler_init_result.all_child_pids
@@ -1388,6 +1388,18 @@ class Engine(EngineScoreMixin, EngineBase):
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager
+
+    def _end_startup_warmup(self) -> None:
+        # The offline Engine runs no startup warm-up, so it ends it at once: the scheduler arms the Triton load
+        # watcher, and the EXL3 copy engine at its first idle moment after enough decodes.
+        if self.tokenizer_manager is None:
+            return
+        end = self.tokenizer_manager.end_startup_warmup(None)
+        if self.loop.is_running():
+            # Sent when the caller next yields to its loop.
+            self._end_startup_warmup_task = self.loop.create_task(end)
+        else:
+            self.loop.run_until_complete(end)
 
     @staticmethod
     def _ensure_event_loop() -> asyncio.AbstractEventLoop:

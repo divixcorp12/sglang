@@ -147,6 +147,8 @@ class ExpertGatherStats:
     host_read_ns: int = 0
     host_split_ns: int = 0
     host_fill_rows: int = 0
+    # Hot-cache misses staged from a layer-major pass's residency buffer instead of being read.
+    residency_hit_rows: int = 0
 
 
 def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
@@ -158,14 +160,17 @@ def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
     return ExpertGatherStats(**values)
 
 
-def host_row_of_source(slots: list[int], hits: list[bool]) -> list[int]:
+def host_row_of_source(
+    slots: list[int], hits: list[bool], in_place: bool | None = None
+) -> list[int]:
     """The staging row ``_gather_cached`` gives each source.
 
     ``slots`` and ``hits`` are its hot-cache lookup, read to the host. Returns the hot
     slot itself when every source hits, else misses first and then hits, each in
-    source order.
+    source order. ``in_place`` (default: every source hits) is False when some hits
+    are prefill-residency rows, which are staged like the hot hits are on a miss.
     """
-    if all(hits):
+    if all(hits) if in_place is None else in_place:
         return list(slots)
     order = [i for i, hit in enumerate(hits) if not hit] + [
         i for i, hit in enumerate(hits) if hit
@@ -497,6 +502,10 @@ class ExpertPinnedHostCache:
         self.stats.populated_bytes += len(slots) * self.bytes_per_expert
 
     @_host_use
+    def holds(self, expert_id: int) -> bool:
+        """Whether the tier holds ``expert_id``'s row now (host bookkeeping only)."""
+        return int(expert_id) in self._lru
+
     def prefetch_rows(self, expert_ids: Sequence[int], protected: Iterable[int]) -> int:
         """Start reading the non-resident experts of ``expert_ids``, in that order.
 
@@ -1256,6 +1265,10 @@ class ExpertStreamer:
         self._graph_pinned_tier = False
         self.row_tag = 0
         self.before_eager_gather = None
+        # A layer-major pass's PrefillResidency while this layer is its active one (prefill_residency.py).
+        self.prefill_residency = None
+        # prefill_fills' split of its call's experts by source, for the stage trace; taken by its record.
+        self.last_prefill_sources = None
         # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and
         # this layer is a scored prefetch target; see PrefetchPuller.join_target in
         # expert_prediction/serving/runtime.py.
@@ -1540,6 +1553,9 @@ class ExpertStreamer:
         # lane_head.LaneHeadGather when SGLANG_OPT_LANE_HEAD_PATH is set: writes _plan_miss_keys at each gather,
         # right before the fused plan reads them. None: the keys are the residency ranking's.
         self.lane_head_hook = None
+        # A verify's dead rows ([max_rows, 1] bool, layers/moe/verify_dead_rows.py) during Exl3MoEMethod._apply_graph's
+        # gather: the fused plan leaves their routes out of the residency route counts. None: every row is live.
+        self.verify_dead = None
         self._graph_fused_slots_scratch = (
             torch.empty(max_rows, dtype=torch.int32, device=device)
             if self._fused_plan_enabled
@@ -1654,6 +1670,12 @@ class ExpertStreamer:
                 remap_out=self._graph_fused_remaps[flat.dtype][:count],
                 miss_keys=self._plan_miss_keys,
                 dedup=topk_ids.shape[0] != 1,
+                dead_rows=(
+                    self.verify_dead
+                    if self.verify_dead is not None and topk_ids.ndim == 2 and topk_ids.shape[0] != 1
+                    else None
+                ),
+                row_top_k=topk_ids.shape[-1],
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]
@@ -1928,6 +1950,14 @@ class ExpertStreamer:
         slots, hit_mask = cache.lookup(source_ids)
         row_count = source_ids.numel()
         routed_rows = compact_ids.numel()
+        # A layer-major pass's resident experts count as hits, staged from the residency buffer (prefill_residency.py).
+        residency = self.prefill_residency
+        hot_mask = hit_mask
+        resident_rows = 0
+        if residency is not None:
+            residency_rows = residency.lookup(source_ids)
+            resident_mask = ~hot_mask & (residency_rows >= 0)
+            hit_mask = hot_mask | resident_mask
         if hot_out is not None:
             if routed_rows != row_count:
                 raise ValueError(
@@ -1935,19 +1965,47 @@ class ExpertStreamer:
                 )
             # The chunk's one sync also hands the host every row's place, so no
             # readback is needed after the gather.
-            slots_host, hits_host = torch.stack(
-                (slots.long(), hit_mask.long())
-            ).tolist()
-            hot_out.extend((slots_host, [bool(hit) for hit in hits_host]))
+            if residency is None:
+                slots_host, hits_host = torch.stack(
+                    (slots.long(), hit_mask.long())
+                ).tolist()
+            else:
+                slots_host, hits_host, resident_host = torch.stack(
+                    (slots.long(), hit_mask.long(), resident_mask.long())
+                ).tolist()
+                resident_rows = sum(resident_host)
+            # in_place: None reads every-source-hits off the hits; resident hits are staged, never read in place.
+            hot_out.extend(
+                (
+                    slots_host,
+                    [bool(hit) for hit in hits_host],
+                    None if resident_rows == 0 else False,
+                )
+            )
             hit_rows = routed_hit_rows = sum(hot_out[1])
         elif routed_rows == row_count:
-            hit_rows = routed_hit_rows = int(hit_mask.sum().item())
+            if residency is None:
+                hit_rows = routed_hit_rows = int(hit_mask.sum().item())
+            else:
+                hit_rows, resident_rows = torch.stack(
+                    (hit_mask.sum(), resident_mask.sum())
+                ).tolist()
+                routed_hit_rows = hit_rows
         else:
-            hit_rows, routed_hit_rows = torch.stack(
-                (hit_mask.sum(), hit_mask[compact_ids.long()].sum())
-            ).tolist()
+            if residency is None:
+                hit_rows, routed_hit_rows = torch.stack(
+                    (hit_mask.sum(), hit_mask[compact_ids.long()].sum())
+                ).tolist()
+            else:
+                hit_rows, routed_hit_rows, resident_rows = torch.stack(
+                    (
+                        hit_mask.sum(),
+                        hit_mask[compact_ids.long()].sum(),
+                        resident_mask.sum(),
+                    )
+                ).tolist()
         miss_rows = row_count - hit_rows
-        if miss_rows == 0:
+        if miss_rows == 0 and resident_rows == 0:
             self.last_gather_stats = ExpertGatherStats(
                 row_count, hit_rows, routed_rows=routed_rows
             )
@@ -1979,7 +2037,7 @@ class ExpertStreamer:
         misses = {name: output[:miss_rows] for name, output in gathered.items()}
         assembly_bytes = hit_rows * self.bytes_per_expert
         if hit_rows:
-            hot_slots = slots[hit_mask]
+            hot_slots = slots[hot_mask] if resident_rows else slots[hit_mask]
             order = torch.cat(
                 ((~hit_mask).nonzero().flatten(), hit_mask.nonzero().flatten())
             )
@@ -1988,6 +2046,13 @@ class ExpertStreamer:
             row_of_source[order] = rows
             compact_ids = row_of_source[compact_ids.long()]
             hit_positions = rows[miss_rows:]
+            if resident_rows:
+                # The hits' staging rows follow source order; split them by where each is copied from.
+                hot_of_hit = hot_mask[hit_mask]
+                resident_positions = hit_positions[~hot_of_hit]
+                resident_sources = residency_rows[resident_mask]
+                hit_positions = hit_positions[hot_of_hit]
+        hot_rows = hit_rows - resident_rows
         pinned_hit_rows = 0
         pinned_miss_rows = 0
         pinned_populated_bytes = 0
@@ -1995,7 +2060,9 @@ class ExpertStreamer:
         copy_engine_bytes = 0
         pinned_cache = self.pinned_host_cache
         source_bytes = miss_rows * self.bytes_per_expert
-        if (
+        if not miss_rows:
+            pass  # every row is a hot or resident hit: nothing to read
+        elif (
             pinned_cache is not None
             and pinned_cache.capacity
             and self.file_source_bytes_per_expert is not None
@@ -2025,10 +2092,10 @@ class ExpertStreamer:
                 )
         else:
             copy_engine_bytes = self._copy_source_rows(miss_source_ids, misses)
-        if hit_rows:
+        if hot_rows:
             for name, output in gathered.items():
                 row_bytes = output.numel() * output.element_size() // row_count
-                _scatter_hot_rows_kernel[(hit_rows, triton.cdiv(row_bytes, 1024))](
+                _scatter_hot_rows_kernel[(hot_rows, triton.cdiv(row_bytes, 1024))](
                     cache.tensors[name].view(torch.uint8),
                     hot_slots,
                     hit_positions,
@@ -2036,9 +2103,16 @@ class ExpertStreamer:
                     row_bytes,
                     BLOCK=1024,
                 )
+        if resident_rows:
+            residency.scatter(
+                resident_sources, resident_positions, resident_rows, gathered
+            )
+        if residency is not None and miss_rows:
+            # Kept for the layer's later chunks, which route to the same experts again.
+            residency.adopt(miss_source_ids, gathered, miss_rows)
         self.last_gather_stats = ExpertGatherStats(
             row_count,
-            hit_rows,
+            hot_rows,
             miss_rows,
             assembly_bytes
             + miss_rows * (self.bytes_per_expert - self.host_bytes_per_expert),
@@ -2053,6 +2127,7 @@ class ExpertStreamer:
             routed_rows=routed_rows,
             routed_miss_rows=routed_rows - routed_hit_rows,
             unique_miss_rows=miss_rows,
+            residency_hit_rows=resident_rows,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
 
@@ -2142,18 +2217,39 @@ class ExpertStreamer:
         ids = source_ids.long()
         with cache.host_use():
             hot = self.hot_cache
-            if hot is not None and hot.capacity:
+            residency = self.prefill_residency
+            resident_rows = None
+            if hot is not None and hot.capacity and residency is not None:
+                experts, hot_slots, resident_rows = torch.stack(
+                    (ids, hot.expert_to_slot[ids].long(), residency.lookup(ids))
+                ).tolist()
+            elif hot is not None and hot.capacity:
                 experts, hot_slots = torch.stack(
                     (ids, hot.expert_to_slot[ids].long())
                 ).tolist()
             else:
                 experts = ids.tolist()
                 hot_slots = [-1] * len(experts)
-            # The layer's first gather reports the claimed rows as its host_fill_rows.
-            self._pending_fill_rows = cache.prefetch_rows(
-                sorted(expert for expert, slot in zip(experts, hot_slots) if slot < 0),
-                protected=experts,
+            # A resident expert is staged from the residency buffer, like a hot one: no fill.
+            resident = (
+                [e for e, s, r in zip(experts, hot_slots, resident_rows) if s < 0 <= r]
+                if resident_rows is not None
+                else []
             )
+            unhot = sorted(
+                expert for expert, slot in zip(experts, hot_slots) if slot < 0
+            )
+            taken = set(resident)
+            unread = [expert for expert in unhot if expert not in taken]
+            # Where each of this call's experts comes from, for the stage trace (host lists only, no sync): hot,
+            # resident, read from NVMe (not in the pinned tier now), or else the pinned tier.
+            self.last_prefill_sources = {
+                "hot": sorted(e for e, s in zip(experts, hot_slots) if s >= 0),
+                "resident": sorted(resident),
+                "nvme": [e for e in unread if not cache.holds(e)],
+            }
+            # The layer's first gather reports the claimed rows as its host_fill_rows.
+            self._pending_fill_rows = cache.prefetch_rows(unread, protected=experts)
             try:
                 yield
             finally:

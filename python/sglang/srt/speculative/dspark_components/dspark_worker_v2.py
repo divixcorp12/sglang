@@ -50,6 +50,12 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_confidence_cut import (
+    CalibrationGate,
+    ConfidenceCut,
+    is_serving_rid,
+    ram_miss_copy_engine_state,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
@@ -111,6 +117,7 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
+from sglang.srt.utils import triton_load_watch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -396,9 +403,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
         )
         self._top_prob_gate = TopProbGate.from_envs()
+        self._confidence_cut = self._build_confidence_cut()
         self._verify_dead_rows = None
         if self._top_prob_gate is not None:
-            self._verify_dead_rows = self._init_top_prob_gate()
+            self._verify_dead_rows = self._init_verify_dead_rows(
+                flag="SGLANG_DSPARK_TOP_PROB_GATE",
+                description=(
+                    "top-probability verify gate on "
+                    f"(threshold={self._top_prob_gate.threshold})"
+                ),
+            )
+        if self._confidence_cut is not None:
+            self._verify_dead_rows = self._init_confidence_cut()
         if (
             get_parallel().attn_dp_enabled
             and not self._draft_is_moe
@@ -473,7 +489,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
-                static_cutoff=self._top_prob_gate is not None,
+                # The cut and the top-probability gate both drive dead rows; they never run together.
+                static_cutoff=self._verify_dead_rows is not None,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -534,6 +551,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=get_parallel().tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
+            confidence_cut=self._confidence_cut is not None,
         )
         self._draft_top_prob_log = get_draft_top_prob_log()
 
@@ -545,8 +563,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         # SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL, likewise; outside the log, so its "before" follows the release.
         maybe_install_larger_prefill_release(self)
 
-    def _init_top_prob_gate(self) -> VerifyDeadRows:
-        """Refuse a launch the top-probability gate cannot serve, and point the target's EXL3 MoE at its dead rows."""
+    def _init_verify_dead_rows(self, *, flag: str, description: str) -> VerifyDeadRows:
+        """Refuse a launch a bs-1 verify cut (``flag``) cannot serve, and point the target's EXL3 MoE at its dead
+        rows."""
         refusals = []
         if self._verify_planner.mode_value != "static":
             refusals.append(f"SGLANG_RAGGED_VERIFY_MODE={self._verify_planner.mode_value} (needs static)")
@@ -559,22 +578,51 @@ class DSparkWorkerV2(BaseSpecWorker):
             refusals.append("SGLANG_SIMULATE_ACC_LEN")
         if refusals:
             raise ValueError(
-                "SGLANG_DSPARK_TOP_PROB_GATE is unsupported with " + ", ".join(refusals)
+                f"{flag} is unsupported with " + ", ".join(refusals)
                 + "; unset it (0) to verify every draft."
             )
-        # One request's verify rows: the gate applies at bs 1 only (dspark_top_prob_gate.py).
+        # One request's verify rows: a cut applies at bs 1 only (dspark_top_prob_gate.py).
         dead_rows = VerifyDeadRows(
             max_rows=self.verify_num_draft_tokens, device=self.device
         )
         attached = attach_verify_dead_rows(self.model_runner.model, dead_rows)
         if get_parallel().tp_rank == 0:
             logger.info(
-                "DSpark top-probability verify gate on (threshold=%s): %d EXL3 MoE layers "
-                "route no experts for cut drafts.",
-                self._top_prob_gate.threshold,
+                "DSpark %s: %d EXL3 MoE layers route no experts for cut drafts.",
+                description,
                 attached,
             )
         return dead_rows
+
+    def _build_confidence_cut(self) -> Optional[ConfidenceCut]:
+        """The configured confidence cut, or None. STS collection (SGLANG_DSPARK_STS_COLLECT_PATH) builds the head
+        under the cut's flag but verifies every row: its labels are the target's argmax over all of them, and a cut
+        row's logits are not valid."""
+        if envs.SGLANG_DSPARK_STS_COLLECT_PATH.get():
+            if envs.SGLANG_DSPARK_CONFIDENCE_CUT.get() and get_parallel().tp_rank == 0:
+                logger.info(
+                    "DSpark confidence cut off for STS collection (SGLANG_DSPARK_STS_COLLECT_PATH): "
+                    "every verify covers all %d rows.",
+                    self.verify_num_draft_tokens,
+                )
+            return None
+        return ConfidenceCut.from_envs(gamma=self.gamma, device=self.device)
+
+    def _init_confidence_cut(self) -> VerifyDeadRows:
+        """Refuse a launch the confidence-head verify cut cannot serve, and attach its dead rows."""
+        if self._top_prob_gate is not None:
+            raise ValueError(
+                "SGLANG_DSPARK_CONFIDENCE_CUT and SGLANG_DSPARK_TOP_PROB_GATE both cut the verify; set only one."
+            )
+        if getattr(self.draft_model, "confidence_head", None) is None:
+            raise ValueError(
+                "SGLANG_DSPARK_CONFIDENCE_CUT needs the draft's confidence head, but the draft model built none "
+                "(a checkpoint without confidence_head weights, or a draft model that does not build the head "
+                "under SGLANG_RAGGED_VERIFY_MODE=static)."
+            )
+        return self._init_verify_dead_rows(
+            flag="SGLANG_DSPARK_CONFIDENCE_CUT", description="confidence-head verify cut on"
+        )
 
     def _gate_verify_lens(
         self, *, bs: int, sampling_info, draft_block
@@ -587,6 +635,53 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             return None
         return self._top_prob_gate.verify_lens(draft_block.top_probs)
+
+    def _cut_confidence(
+        self, confidence: Optional[torch.Tensor], *, bs: int, sampling_info
+    ) -> Optional[torch.Tensor]:
+        """The confidences the cut and its stats read: a sampled verify's re-tempered to the sampled STS file, and
+        either raised by the online refit; the head's where the cut does not apply."""
+        if (
+            self._confidence_cut is None
+            or confidence is None
+            or not self._confidence_cut.applies(bs=bs, sampling_info=sampling_info)
+        ):
+            return confidence
+        return self._confidence_cut.cut_confidence(
+            confidence,
+            sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+        )
+
+    def _cut_verify_lens(
+        self, *, bs: int, sampling_info, confidence: Optional[torch.Tensor], reqs
+    ) -> Optional[torch.Tensor]:
+        """This step's [bs] verify lengths under the confidence cut (forced widths while it calibrates T(w)), or
+        None when every draft is verified, as before the calibration gate opens."""
+        cut = self._confidence_cut
+        if (
+            cut is None
+            or cut.disabled
+            or confidence is None
+            or not cut.applies(bs=bs, sampling_info=sampling_info)
+        ):
+            return None
+        if not cut.calibrated and not cut.admit_calibration(
+            self._confidence_cut_gate(reqs)
+        ):
+            return None
+        return cut.verify_lens(
+            confidence,
+            sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+        )
+
+    @staticmethod
+    def _confidence_cut_gate(reqs) -> CalibrationGate:
+        """The T(w) calibration gate from host-side state only: no device read on the verify path."""
+        return CalibrationGate(
+            engine_ready=triton_load_watch.serving_started(),
+            copy_engine=ram_miss_copy_engine_state(),
+            serving_request=all(is_serving_rid(req.rid) for req in reqs),
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -1080,6 +1175,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             simulate_bonus_sampling_info = sampling_info
             sampling_info = None
+        if self._confidence_cut is not None:
+            # Opens the draft ms bracket the T(w) calibration's timed verify closes (one event until T(w) freezes).
+            self._confidence_cut.begin_draft()
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -1111,6 +1209,27 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
 
         confidence = proposal.confidence
+        # The confidence cut reads this step's own confidence, on the device: the folded proposal's confidence_out,
+        # or the eager proposal's. Its lengths take the top-probability gate's place (the two never run together).
+        # STS collection's head-retraining data: the confidence head's hidden input (the eager proposal's
+        # confidence_features, else the draft hidden), copied now because the draft graph's outputs are only live
+        # until the verify.
+        head_hidden = None
+        if self._observers.records_head_hidden:
+            tap = (
+                proposal.confidence_features
+                if proposal.confidence_features is not None
+                else proposal.draft_hidden
+            )
+            head_hidden = None if tap is None else tap.to(torch.float16, copy=True)
+        cut_confidence = self._cut_confidence(confidence, bs=bs, sampling_info=sampling_info)
+        cut_verify_lens = self._cut_verify_lens(
+            bs=bs, sampling_info=sampling_info, confidence=cut_confidence, reqs=batch.reqs
+        )
+        cut_calibrated = False
+        if cut_verify_lens is not None:
+            gate_verify_lens = cut_verify_lens
+            cut_calibrated = self._confidence_cut.calibrated
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -1193,6 +1312,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                             gate_verify_lens, fold_eligible
                         )
                 if gate_verify_lens is not None:
+                    if cut_verify_lens is not None:
+                        # Times this verify for T(w) while the cut calibrates, the lease-gate wait included.
+                        self._confidence_cut.begin_verify()
                     self._verify_dead_rows.set_live_rows(gate_verify_lens)
                 try:
                     target_verify = self._verify_executor.run_non_compact(
@@ -1202,6 +1324,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         verify_window=verify_window,
                         sampling_info=sampling_info,
                     )
+                    if cut_verify_lens is not None:
+                        self._confidence_cut.end_verify()
                 finally:
                     if gate_verify_lens is not None:
                         self._verify_dead_rows.clear()
@@ -1241,6 +1365,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             gate_verify_lens=gate_verify_lens,
         )
+        if cut_verify_lens is not None:
+            # The online refit's sample: a non-blocking copy of this verify's confidences and accept, read later.
+            self._confidence_cut.observe_outcome(
+                confidence=confidence,
+                verify_lens=cut_verify_lens,
+                correct_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
+                sampled=sampling_info is not None and not sampling_info.is_all_greedy,
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
@@ -1318,6 +1451,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            cut_verify_lens=cut_verify_lens,
+            cut_calibrated=cut_calibrated,
+            cut_confidence=cut_confidence,
+            confidence_hidden=head_hidden,
         )
         if draft_probs is not None:
             self._draft_top_prob_log.record(

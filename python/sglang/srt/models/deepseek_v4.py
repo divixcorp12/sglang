@@ -4655,18 +4655,27 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         model = self.model
         input_ids = forward_batch.input_ids
+        # DSpark's target layers are all late layers, so their aux hiddens are the tail's rows, as in a chunked extend.
+        capture_dspark = self.capture_aux_hidden_states
+        dspark_aux_hidden_states: List[torch.Tensor] = []
         hidden_states, last_pre, tail = model._forward_layers_hc_pre_from_prev(
             forward_batch.positions,
             hidden_states,
             forward_batch,
             input_ids,
             input_ids,
-            False,
-            [],
+            capture_dspark,
+            dspark_aux_hidden_states,
             layer_ids=range(model.late_layer_start, model.end_layer),
             prev_pre_in=prev_pre,
             hash_ids_in=hash_ids,
         )
+        if capture_dspark and len(dspark_aux_hidden_states) != len(model.dspark_layers_to_capture):
+            raise ValueError(
+                f"layer-major late tail captured {len(dspark_aux_hidden_states)} DSpark aux hiddens, expected "
+                f"{len(model.dspark_layers_to_capture)}: a DSpark target layer lies before late_layer_start "
+                f"{model.late_layer_start}"
+            )
         pre_hc_head = hidden_states.flatten(1)
         hidden_states = model.norm(hc_combine(pre_hc_head.float(), last_pre, model.hc_mult, hidden_states.dtype))
         # Tail rows only: scattering back to the full extend would allocate [T, 5120] and [T, 20480] tensors.
@@ -4675,8 +4684,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
         output = self.logits_processor(
-            tail.rows(input_ids), hidden_states, self.lm_head, logits_metadata, None,
-            hidden_states_before_norm=pre_hc_head,
+            tail.rows(input_ids), hidden_states, self.lm_head, logits_metadata,
+            dspark_aux_hidden_states if capture_dspark else None,
+            hidden_states_before_norm=None if capture_dspark else pre_hc_head,
         )
         output.hidden_states_token_indices = tail.token_indices
         return output

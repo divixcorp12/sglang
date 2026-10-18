@@ -294,12 +294,26 @@ PROD_DSPARK_PINNED_HOST_MB = "111530"
 PROD_DSPARK_PINNED_HOST_NUMA_MB = "0:59656,1:51874"
 # launch_prod.sh's pre-launch floor (analysis/dsv41-drive/dspark/prelaunch_evict.py, the arms' logic): node 1 must hold
 # the HiCache host pools of the pinned 381,184-token pool (12.67 GiB, as the share-64 A/B ran it), the rest of the
-# server's node-1 need (arm A's 51.24 GiB) and 1 GiB of margin: 64.91 GiB. Every served -mem arm started with node 0 at
+# server's node-1 need (arm A's 51.24 GiB) and 1 GiB of margin: 64.91 GiB, plus layer-major's StateStore when the env
+# prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production). Every served -mem arm started with node 0 at
 # 75.4 GiB free or more; below that the start only warns. The wait is bounded so a refusal comes in minutes.
 PROD_NODE1_HICACHE_GIB = 12.67
 PROD_NODE1_MARGIN_GIB = 1.0
 PROD_NODE0_WARN_GIB = 75.0
 PROD_FLOOR_WAIT_MIN = 10
+# Layer-major prefill's pinned node-1 StateStore (layer_major/worker_entry.py, SGLANG_LAYER_MAJOR_STATE_NUMA_NODE=1),
+# which arm A's rest predates: CONTEXT_LENGTH tokens of DeepseekV4LayerMajorAdapter.field_specs, `hidden`
+# [hc_mult 4, 5120] bf16 plus `prev_pre` [4] fp32 = 40,976 bytes a token, 5.00 GiB at 131072. Measured: node-1 anon at
+# the same load point is 5.1-5.4 GiB higher with layer-major on (lmon 61.9 / hotfull 63.3 against confcut-prod 56.5 and
+# lmoff 56.8 GiB, /mnt/nvme1/{layer-major-dspark,hot-smaller-ab-20261017,confcut-ab-20261017}, 2026-10-17).
+LAYER_MAJOR_STATE_BYTES_PER_TOKEN = 4 * 5120 * 2 + 4 * 4
+
+
+def layer_major_state_gib(env: dict[str, str]) -> float:
+    """The node-1 floor's StateStore term for a server env: 0 unless it prefills layer-major."""
+    if int(env.get("SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS") or 0) <= 0:
+        return 0.0
+    return round(CONTEXT_LENGTH * LAYER_MAJOR_STATE_BYTES_PER_TOKEN / 2**30, 2)
 # Other servers that read the files the pre-launch step evicts: while one listens, production checks without evicting.
 PROD_PRELAUNCH_SKIP_EVICT_PORTS = (30032,)
 # Where a refusal looks for the page cache that fills node 1.
@@ -309,6 +323,12 @@ PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4",
 # file is there with this SHA256 (check_prod_assets).
 PROD_RAM_PREFETCH_LEARNED_HEAD = "/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors"
 PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309"
+# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the cut arm
+# only (both_cpu_ab's -prod-confcut); production stays off and loads neither. Fitted 2026-10-16 from the -prod-stscollect
+# arm's long-prompt capture (/mnt/nvme1/sts-collect-20261016, 2,048 verifies): temperatures 0.89/0.79/1.26/0.89/0.63,
+# ECE 2.9-3.8% -> 2.1-3.0%. Read-only copy, 0444.
+PROD_DSPARK_STS_PATH = "/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json"
+PROD_DSPARK_STS_SHA256 = "a0f2fc7c6acd4ca06dca213d68954b3f46e0fef2a5e6ed4ab460feda7538bcd5"
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:
@@ -326,7 +346,8 @@ def dspark_env() -> dict[str, str]:
         # the first 8 VRAM victims; the rest are CPU lanes, a miss among them read into a RAM victim (Owner decision 3).
         "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "8",
         "SGLANG_RAGGED_VERIFY_MODE": "static",
-        # Layer-major prefill refuses speculative decoding (layer_major/gate.py).
+        # Layer-major prefill off for the arms: under speculative decoding it needs SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK
+        # as well (layer_major/gate.py refuses the launch otherwise). Production turns both on in prod_dspark_env().
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
         # The draft's CPU experts as a second job source of node 0's CPU expert team (one team per node), on the
         # optimized build (its gate names both defines).
@@ -412,6 +433,16 @@ def prod_dspark_env() -> dict[str, str]:
         "SGLANG_DSV41_RAM_PREFETCH_PROMOTE": "1",
         "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE": "1",
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",  # the older GPU-side expert prefetch stays off (base_env's, stated)
+        # Layer-major prefill under DSpark: every uncached suffix of 8192+ tokens is prefilled layer by layer, as
+        # base_env() does for the non-DSpark recipe (token 0 identical to chunked at 8k-33k, DSV41_REFERENCE.md 27.19,
+        # 27.20). Owner decision 2026-10-17, with no served A/B first (both_cpu_ab's -prod-layermajor is that arm).
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
+        "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": "1",
+        # Expert residency over lent late-layer hot-cache slots (SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND, on by default):
+        # 360 rows, no VRAM allocated and the hot cache keeps its size. Owner decision 2026-10-18 after the served
+        # validation (-prod-layermajor-lend): 32k TTFT 92.0 / 74.4 / 76.2 s against -prod's 176.9 / 169.7 / 156.8 s, decode
+        # 78.7 against 77.7 ms/token, token 0 identical to chunked, 0 slots evicted.
+        "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": "360",
     }
 
 
@@ -457,11 +488,13 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     mem_fraction_static: str | None = None
     max_total_tokens: int | None = None
     drop_cache_after_load: bool = False
+    # Production's warm-up also runs dsv41_decode_paths (~35 s); the arms keep the prefill-only one they measured with.
+    decode_warmup: bool = False
 
     @classmethod
     def prod(cls) -> "ServerArgs":
         if not PROD_DSPARK:
-            return cls(port=PROD_PORT, host=PROD_HOST)
+            return cls(port=PROD_PORT, host=PROD_HOST, decode_warmup=True)
         return cls(
             port=PROD_PORT,
             host=PROD_HOST,
@@ -469,6 +502,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             mem_fraction_static=PROD_DSPARK_MEM_FRACTION_STATIC,
             max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
             drop_cache_after_load=True,
+            decode_warmup=True,
         )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
@@ -530,8 +564,10 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--tool-call-parser",
             "deepseekv41",
             # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).
+            # Production also decodes, greedy and sampled, after a two-chunk prompt: its first long request otherwise
+            # loaded the SWA eviction and DSpark sampling kernels mid-serving (prod-20261016-180932/server.log).
             "--warmups",
-            "dsv41_prefill_shapes",
+            "dsv41_prefill_shapes,dsv41_decode_paths" if self.decode_warmup else "dsv41_prefill_shapes",
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]
