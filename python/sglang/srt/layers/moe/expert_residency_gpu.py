@@ -528,6 +528,8 @@ class GpuResidencyUpdater:
         Called at the first streamed layer's graph gather. Without decode boundaries
         the forward is only counted.
         """
+        if getattr(self.manager, "prefill_lend_active", False):
+            raise RuntimeError("a graph gather ran while a layer-major pass has hot-cache slots lent")
         if self.update_decode_forwards > 0:
             self._apply(
                 self.boundary_pending & self.enabled, self.max_promotions, _DECODE_PHASE
@@ -658,6 +660,8 @@ class GpuResidencyUpdater:
 
     def _apply(self, gate: torch.Tensor, width: int, phase: int) -> None:
         """Run one masked boundary: every tensor keeps its value where ``gate`` is false."""
+        if getattr(self.manager, "prefill_lend_active", False):
+            raise RuntimeError("a residency boundary ran while a layer-major pass has hot-cache slots lent")
         inserting = self.insert_on_miss and phase == _DECODE_PHASE
         if self.insert_on_miss:
             insert_decay = self.insert_decay_table.index_select(

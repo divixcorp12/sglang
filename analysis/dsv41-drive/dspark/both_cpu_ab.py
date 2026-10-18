@@ -614,23 +614,45 @@ RESIDENCY_ROWS = 360
 LAYER_MAJOR_SMALL_HOT_MB = int(arm_env.PROD_DSPARK_HOT_GPU_MB) - -(-RESIDENCY_ROWS * HOT_SLOT_BYTES // 2**20)
 LAYER_MAJOR_SMALL_HOT_ARM = LAYER_MAJOR_ARM + "-smallhot"
 ARMS[LAYER_MAJOR_SMALL_HOT_ARM] = (
-    {**ARMS[LAYER_MAJOR_ARM][0], "SGLANG_MOE_HOT_GPU_MB": str(LAYER_MAJOR_SMALL_HOT_MB), CALIBRATE: "0"},
+    {**ARMS[LAYER_MAJOR_ARM][0], "SGLANG_MOE_HOT_GPU_MB": str(LAYER_MAJOR_SMALL_HOT_MB), CALIBRATE: "0", RESIDENCY: "0"},
     True,
 )
 LAYER_MAJOR_RESIDENCY_ARM = LAYER_MAJOR_ARM + "-res"
+# Production has the rows and the lend on since 2026-10-18 (arm_env.prod_dspark_env), so the stage-0 arms state both:
+# -smallhot has the rows off, -res the rows on with the lend off (the allocated buffer).
 ARMS[LAYER_MAJOR_RESIDENCY_ARM] = (
-    {**ARMS[LAYER_MAJOR_SMALL_HOT_ARM][0], RESIDENCY: str(RESIDENCY_ROWS)},
+    {**ARMS[LAYER_MAJOR_SMALL_HOT_ARM][0], RESIDENCY: str(RESIDENCY_ROWS), "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND": "0"},
+    True,
+)
+# Stage 1 (branch layer-major-lend): the residency rows are the late layers' hot-cache slots, lent for the pass and
+# reloaded from the pinned tier before the tail, so the hot cache keeps its full size. -lend is production with the rows
+# and the lend stated. Production has both on since 2026-10-18, so this arm now equals -prod; it is the arm the served
+# validation ran (decode A/B against the earlier -prod, TTFT pair against -res).
+LEND = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
+LAYER_MAJOR_LEND_ARM = LAYER_MAJOR_ARM + "-lend"
+ARMS[LAYER_MAJOR_LEND_ARM] = ({**ARMS[LAYER_MAJOR_ARM][0], RESIDENCY: str(RESIDENCY_ROWS), LEND: "1"}, True)
+# The chunked-prefill reference for token-0 parity: production with layer-major prefill off (the DSpark switch is only
+# stated by arms that turn it on).
+CHUNKED_ARM = PROD_ARM + "-chunked"
+ARMS[CHUNKED_ARM] = (
+    {
+        **{k: v for k, v in ARMS[PROD_ARM][0].items() if k != "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"},
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
+        RESIDENCY: "0",
+    },
     True,
 )
 PROD_ARMS = (
-    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM
+    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM,
+    LAYER_MAJOR_LEND_ARM, CHUNKED_ARM,
 )
 ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
 # An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
 ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
 REFERENCE.update(
     {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM, LAYER_MAJOR_ARM: PROD_ARM,
-     LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM}
+     LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM,
+     LAYER_MAJOR_LEND_ARM: PROD_ARM, CHUNKED_ARM: PROD_ARM}
 )
 
 

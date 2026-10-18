@@ -435,10 +435,14 @@ def prod_dspark_env() -> dict[str, str]:
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",  # the older GPU-side expert prefetch stays off (base_env's, stated)
         # Layer-major prefill under DSpark: every uncached suffix of 8192+ tokens is prefilled layer by layer, as
         # base_env() does for the non-DSpark recipe (token 0 identical to chunked at 8k-33k, DSV41_REFERENCE.md 27.19,
-        # 27.20). Owner decision 2026-10-17, with no served A/B first (both_cpu_ab's -prod-layermajor is that arm). The
-        # expert residency (SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS) stays off.
+        # 27.20). Owner decision 2026-10-17, with no served A/B first (both_cpu_ab's -prod-layermajor is that arm).
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
         "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": "1",
+        # Expert residency over lent late-layer hot-cache slots (SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND, on by default):
+        # 360 rows, no VRAM allocated and the hot cache keeps its size. Owner decision 2026-10-18 after the served
+        # validation (-prod-layermajor-lend): 32k TTFT 92.0 / 74.4 / 76.2 s against -prod's 176.9 / 169.7 / 156.8 s, decode
+        # 78.7 against 77.7 ms/token, token 0 identical to chunked, 0 slots evicted.
+        "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": "360",
     }
 
 

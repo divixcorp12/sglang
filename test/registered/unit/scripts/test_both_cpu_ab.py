@@ -405,7 +405,9 @@ STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-con
 LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
 LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM = f"{LAYER_MAJOR_ARM}-smallhot", f"{LAYER_MAJOR_ARM}-res"
 LAYER_MAJOR_ARMS = (LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS)
+LAYER_MAJOR_LEND_ARM = f"{LAYER_MAJOR_ARM}-lend"
+CHUNKED_ARM = f"{PROD_ARM}-chunked"
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS, LAYER_MAJOR_LEND_ARM, CHUNKED_ARM)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1157,7 +1159,9 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                     "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
     # Layer-major prefill under DSpark: production since 2026-10-17 (owner), never served on the best arm.
     layer_major = {"SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": ("0", "8192"),
-                   "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1")}
+                   "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1"),
+                   # Lent residency rows: production since 2026-10-18 (owner), after the served lend validation.
+                   "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": (None, "360")}
     rest = {k: v for k, v in differs.items() if k not in prefetch}
     assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
@@ -1230,7 +1234,15 @@ def test_the_production_arms_prefill_layer_major_and_every_other_arm_keeps_it_of
     ab = _ab()
     threshold, switch = "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS", "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"
     for arm, (overrides, _) in ab.ARMS.items():
-        if arm in PROD_ARMS:
+        if arm == CHUNKED_ARM:
+            # The parity reference: production with layer-major prefill off, and the switch unstated.
+            assert overrides[threshold] == "0" and switch not in overrides
+            rows = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"  # residency rows need layer-major prefill: off too
+            assert overrides[rows] == "0"
+            assert {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k not in (threshold, switch, rows)} == {
+                k: v for k, v in overrides.items() if k not in (threshold, rows)
+            }
+        elif arm in PROD_ARMS:
             assert (overrides[threshold], overrides[switch]) == ("8192", "1"), arm
         else:
             assert overrides.get(threshold, "0") == "0" and switch not in overrides, arm
@@ -1242,23 +1254,46 @@ def test_the_production_arms_prefill_layer_major_and_every_other_arm_keeps_it_of
 
 def test_the_residency_pair_differs_only_in_the_residency_rows_and_both_give_up_that_much_hot_cache():
     """-smallhot is -layermajor with the hot cache RESIDENCY_ROWS slots smaller and the startup calibration off (it
-    would grow back into the buffer's memory); -res adds the rows alone. No other arm sets the rows. Mutant: the pair
-    differs in another knob, or the hot cache keeps the memory the buffer needs -- red."""
+    would grow back into the buffer's memory) and the rows off; -res adds the rows with the lend off (stage 0's allocated
+    buffer). Production has the rows (and the lend, by default) since 2026-10-18, so only the arms built on non-production
+    recipes leave the rows unset. Mutant: the pair differs in another knob, or the hot cache keeps the memory the buffer
+    needs -- red."""
     ab = _ab()
     residency, hot = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS", "SGLANG_MOE_HOT_GPU_MB"
+    lend = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
     for arm, (overrides, _) in ab.ARMS.items():
-        assert (residency in overrides) == (arm == LAYER_MAJOR_RESIDENCY_ARM), arm
+        assert (residency in overrides) == (arm in PROD_ARMS), arm
+        want = "0" if arm in (LAYER_MAJOR_SMALL_HOT_ARM, CHUNKED_ARM) else str(ab.RESIDENCY_ROWS)
+        assert overrides.get(residency, want) == want, arm
     lm, small, res = (ab.ARMS[a][0] for a in LAYER_MAJOR_ARMS)
-    assert {k: v for k, v in res.items() if k != residency} == small
-    assert res[residency] == str(ab.RESIDENCY_ROWS)
-    assert {k: v for k, v in small.items() if k not in (hot, ab.CALIBRATE)} == {
-        k: v for k, v in lm.items() if k not in (hot, ab.CALIBRATE)
+    assert {k: v for k, v in res.items() if k not in (residency, lend)} == {
+        k: v for k, v in small.items() if k != residency
+    }
+    assert res[residency] == str(ab.RESIDENCY_ROWS) and res[lend] == "0" and small[residency] == "0"
+    assert {k: v for k, v in small.items() if k not in (hot, ab.CALIBRATE, residency)} == {
+        k: v for k, v in lm.items() if k not in (hot, ab.CALIBRATE, residency)
     }
     assert small[ab.CALIBRATE] == "0"
     given_up = (int(lm[hot]) - int(small[hot])) * 2**20
     assert ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES <= given_up < ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES + 2**20
     assert ab.REFERENCE[LAYER_MAJOR_RESIDENCY_ARM] == LAYER_MAJOR_SMALL_HOT_ARM
     assert all(ab.server_flags(a) == ab.server_flags(PROD_ARM) for a in LAYER_MAJOR_ARMS)
+
+
+def test_the_lend_arm_is_production_with_the_lend_stated():
+    """-lend keeps production's full hot cache and calibration (the decode bar is the full hot cache) and equals -prod,
+    which has the rows (and the lend by default) since 2026-10-18, with the lend stated 1; only it and -res (lend 0) state
+    the lend. Mutant: the arm shrinks the hot cache, drops the lend, or another arm sets it -- red."""
+    ab = _ab()
+    lend = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
+    for arm, (overrides, _) in ab.ARMS.items():
+        assert (lend in overrides) == (arm in (LAYER_MAJOR_LEND_ARM, LAYER_MAJOR_RESIDENCY_ARM)), arm
+    prod, arm = ab.ARMS[PROD_ARM][0], ab.ARMS[LAYER_MAJOR_LEND_ARM][0]
+    assert arm[lend] == "1" and arm["SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"] == str(ab.RESIDENCY_ROWS)
+    assert {k: v for k, v in arm.items() if k != lend} == prod
+    assert ab.ARMS[LAYER_MAJOR_LEND_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_LEND_ARM] == PROD_ARM
+    assert ab.server_flags(LAYER_MAJOR_LEND_ARM) == ab.server_flags(PROD_ARM)
+    assert LAYER_MAJOR_LEND_ARM in ab.PROD_ARMS
 
 
 def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_own(monkeypatch):
@@ -1310,4 +1345,4 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
     assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
     assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
-    assert len(layer_major) == len(LAYER_MAJOR_ARMS) and all(STS_PATH_FLAG not in a for a in layer_major)
+    assert len(layer_major) == len(LAYER_MAJOR_ARMS) + 2 and all(STS_PATH_FLAG not in a for a in layer_major)
