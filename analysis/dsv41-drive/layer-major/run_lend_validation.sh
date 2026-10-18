@@ -33,7 +33,7 @@ cd "$WT" || exit 2
 PROD=$(PYTHONPATH=$WT/analysis/dsv41-drive/dspark:$WT/python $PY -c "import both_cpu_ab as a; print(a.PROD_ARM)")
 RES=$PROD-layermajor-smallhot-res
 LEND=$PROD-layermajor-lend
-CHUNKED_ENV="SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0 SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK=0"
+CHUNKED=$PROD-chunked
 mkdir -p "$ROOT"
 
 # One capture: pair OUTDIR BASE_ARM NAME[=K=V...] -- capture args. Returns the wrapper's status.
@@ -73,12 +73,12 @@ stage_long() { # stage_long STAGE PROMPT DECODE_S ARMS...
   local dirs=() rc
   for arm in "$@"; do
     case $arm in
-      prod)    base=$PROD;  name=prod ;;
-      chunked) base=$PROD;  name="chunked=$CHUNKED_ENV" ;;
-      res)     base=$RES;   name=res= ;;
-      lend)    base=$LEND;  name=lend= ;;
+      prod)    base=$PROD ;;
+      chunked) base=$CHUNKED ;;
+      res)     base=$RES ;;
+      lend)    base=$LEND ;;
     esac
-    [[ $name == *=* ]] || name=$name=
+    name=$arm=
     pair "$ROOT/$stage-$arm" "$base" "$name" -- --no-verify-split --long-prompt "$ROOT/prompts/$prompt.md" \
       --decode-seconds "$secs" --ttft-repeats 2
     rc=$?
