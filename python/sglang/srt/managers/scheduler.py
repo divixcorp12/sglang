@@ -4639,10 +4639,10 @@ class Scheduler(
         exception surfaces, the adapter's release_pass(failed=True) (Task 10/11's
         seam) has already finalized the window ring. The request is then released
         through the same no-further-forward path retraction uses: release_kv_cache
-        -> cache_finished_req frees [req.kv.cache_protected_len, owned_kv_len).
+        frees [req.kv.cache_protected_len, owned_kv_len).
         alloc_for_extend sets kv_committed_len (owned_kv_len reads it) to the whole
         new sequence length at allocation time, before this pass ever runs, so that
-        range already covers the entire failed extend; is_insert=False is what keeps
+        range already covers the entire failed extend; checkpoint=False is what keeps
         a possibly-partial pass's KV out of the shared tree, not the freed range."""
         if batch.layer_major_ring_tokens is not None:
             try:
@@ -4666,7 +4666,7 @@ class Scheduler(
                 "InternalServerError",
             )
             req.finished_reason = reason
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
             self.ipc_channels.send_to_tokenizer.send_output(
                 _make_abort_req(req, finished_reason=reason.to_json()), req
             )

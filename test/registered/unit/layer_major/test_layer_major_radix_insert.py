@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -78,7 +79,7 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.rid += 1
         self.rtp.alloc([req])
         req.init_next_round_input(self.cache)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        req.lock = self.cache.lock(req.last_node)  # as _commit_prefill_admission takes it
         prefix_indices = self.cache.prefix_device_indices(req)
         prefix = len(prefix_indices)
         slot = req.kv.req_pool_idx
@@ -90,6 +91,8 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         ).to(torch.int64)
         self.rtp.write((slot, slice(prefix, n)), full)
         req.extend_end = n  # the round extends [prefix_len, extend_end); the match set prefix_len
+        # alloc_for_extend commits and allocates the whole new length before the pass runs.
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = n
         ring = self.alloc.ring_slots(full[-(CHUNK + PAGE) :])
         self.alloc.map_ring_positions(full, torch.arange(prefix, n), ring)
         handle = SimpleNamespace(schedule_batch=SimpleNamespace(reqs=[req], prefix_lens=[prefix]),
@@ -100,18 +103,16 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
     def _layer_major_prefill(self, n: int) -> Req:
         """A pass that finishes normally: finalize, then the post-prefill insert."""
         req = self._run_pass(n)
-        req.kv.kv_committed_len = n
-        self.cache.cache_unfinished_req(req)
+        self.cache.checkpoint(req, up_to=n)
         return req
 
     def _finish(self, req: Req) -> None:
-        self.cache.cache_finished_req(req, owned_kv_len=len(req.origin_input_ids))
-        self.rtp.free(req)
+        release_kv_cache(req, self.cache, checkpoint=True)  # frees the row too
 
-    def _abort(self, req: Req, *, owned_kv_len: int) -> None:
+    def _abort(self, req: Req) -> None:
         # release_pass(failed=True): only _finalize_ring ran, so cache_protected_len is still the pre-pass prefix.
-        self.cache.cache_finished_req(req, is_insert=False, owned_kv_len=owned_kv_len)
-        self.rtp.free(req)
+        # The scheduler's containment (Scheduler._finish_layer_major_batch_after_exception) releases it so.
+        release_kv_cache(req, self.cache, checkpoint=False)
 
     def _pool_sizes(self) -> tuple[int, int]:
         return self.alloc.full_available_size(), self.alloc.swa_available_size()
@@ -215,11 +216,11 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self._assert_pool_restored_after_evict()
 
     def test_abort_after_finalize_restores_the_pool(self):
-        # release_pass(failed=True) runs _finalize_ring only; cache_finished_req(is_insert=False) then frees the
+        # release_pass(failed=True) runs _finalize_ring only; release_kv_cache(checkpoint=False) then frees the
         # request's KV without inserting it: both the SWA and full pools must return to their starting sizes.
         self._seed(2048, swa_live_from=1792)
         req = self._run_pass(2148)
-        self._abort(req, owned_kv_len=2148)
+        self._abort(req)
         self.cache.sanity_check()
         self._assert_pool_restored_after_evict()
 

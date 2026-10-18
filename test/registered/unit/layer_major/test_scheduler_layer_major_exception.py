@@ -67,14 +67,15 @@ class TestRunBatchLayerMajorExceptionHandling(unittest.TestCase):
         batch = _FakeBatch(layer_major_ring_tokens=4352, reqs=[req])
         sched._run_batch_impl = mock.Mock(side_effect=RuntimeError("boom"))
 
-        with mock.patch.object(scheduler_mod, "release_kv_cache") as mock_release:
+        # autospec: a keyword release_kv_cache does not take fails here (the merge left is_insert=False behind).
+        with mock.patch.object(scheduler_mod, "release_kv_cache", autospec=True) as mock_release:
             result = sched.run_batch(batch)
 
         self.assertIsInstance(result, GenerationBatchResult)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertEqual(req.finished_reason.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
         self.assertEqual(batch.reqs, [])
-        mock_release.assert_called_once_with(req, sched.tree_cache, is_insert=False)
+        mock_release.assert_called_once_with(req, sched.tree_cache, checkpoint=False)
         self.assertEqual(len(sched.ipc_channels.send_to_tokenizer.sent), 1)
 
     def test_does_not_catch_exception_for_a_normal_batch(self):
