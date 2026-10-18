@@ -36,6 +36,12 @@ HOLDERS="$HOLDERS --node0-floor-gib ${NODE0_FLOOR_GIB:-80.6}"
 # PRELAUNCH_EVICT_HOLDERS=1 also drops the page cache of those holders at the first retry (prelaunch_evict.py
 # --evict-holders; clean pages of files not open for writing). Off by default.
 [ "${PRELAUNCH_EVICT_HOLDERS:-0}" = 1 ] && HOLDERS="$HOLDERS --evict-holders"
+# PAGE_CACHE_OPT_OUT=1 (owner, 2026-10-18): page cache the kernel can reclaim never stops an arm. The prelaunch check
+# still evicts and logs but a refusal prints PRELAUNCH FLOOR BYPASSED and the arm starts; the node-0 load watchdog logs
+# WATCHDOG OPT-OUT below the min watermark instead of aborting, and aborts only when more than SWAPIN_ABORT_MIB (default
+# 4096) is swapped in during the load. A real OOM still ends the server. Off by default.
+PAGE_CACHE_OPT_OUT=${PAGE_CACHE_OPT_OUT:-0}
+SWAPIN_ABORT_MIB=${SWAPIN_ABORT_MIB:-4096}
 COMMON=(); NAMES=(); SPECS=(); CAP=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -148,7 +154,16 @@ for i in "${!NAMES[@]}"; do
   echo "$name ${all[*]}"
   while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
     echo "waiting for a quiet box $(date)"; sleep 60; done
-  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB $HOLDERS; then
+  # Layer-major prefill's node-1 StateStore, from the arm's resolved server env (0 when it does not prefill layer-major).
+  state_gib=$(echo "$MERGED" | "$PY" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import arm_env
+print(arm_env.layer_major_state_gib(json.load(sys.stdin)[sys.argv[1]]))' "$name" "$WT/benchmarks/dsv41_baseline") \
+    || { echo "REFUSED $name: no layer-major StateStore size"; echo ALLDONE; exit 2; }
+  if [ "$PAGE_CACHE_OPT_OUT" = 1 ]; then
+    # The check still evicts our files and logs every node; a refusal only reports, and the wait is one minute.
+    if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS --wait-min 1; then
+      echo "PRELAUNCH FLOOR BYPASSED $name: below a floor, starting anyway (PAGE_CACHE_OPT_OUT=1) $(date)"
+    fi
+  elif ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS; then
     echo "REFUSED $name: node 1 free below the floor $(date)"; echo ALLDONE; exit 3
   fi
   mkdir -p $OUT/$name
@@ -165,15 +180,26 @@ for i in "${!NAMES[@]}"; do
   cap=$!
   CUR_CAP=$cap; CUR_NAME=$name
   minfree=999999999
+  swapin0=$(awk '/^pswpin /{print $2}' /proc/vmstat)
+  below=0
   while kill -0 $cap 2>/dev/null && ! grep -q "fired up and ready" $OUT/$name/server.log 2>/dev/null; do
     read free min < <(awk "/^Node 0, zone +Normal/{z=1} z&&/pages free/{f=\$3} z&&/^ +min /{print f, \$2; exit}" /proc/zoneinfo)
     [ -n "$free" ] && [ "$free" -lt "$minfree" ] && minfree=$free
-    if [ -n "$free" ] && [ "$free" -lt "$min" ]; then
+    swapin_mib=$(( ($(awk '/^pswpin /{print $2}' /proc/vmstat) - swapin0) * 4 / 1024 ))
+    if [ "$PAGE_CACHE_OPT_OUT" = 1 ]; then
+      # Below the min watermark is the kernel reclaiming page cache; swapping in is the load really short of memory.
+      if [ -n "$free" ] && [ "$free" -lt "$min" ] && [ "$below" = 0 ]; then
+        below=1; echo "WATCHDOG OPT-OUT $name: node 0 Normal free $free pages below min $min during load, continuing (PAGE_CACHE_OPT_OUT=1) $(date)"
+      fi
+      if [ "$swapin_mib" -gt "$SWAPIN_ABORT_MIB" ]; then
+        echo "ABORT $name: $swapin_mib MiB swapped in during load, above $SWAPIN_ABORT_MIB $(date)"; kill $cap; break
+      fi
+    elif [ -n "$free" ] && [ "$free" -lt "$min" ]; then
       echo "ABORT $name: node 0 Normal free $free pages below min $min during load $(date)"; kill $cap; break
     fi
     sleep 1
   done
-  echo "load watchdog $name: node 0 Normal min free seen $minfree pages (min watermark ${min:-?})"
+  echo "load watchdog $name: node 0 Normal min free seen $minfree pages (min watermark ${min:-?}), swap-in during load $(( ($(awk '/^pswpin /{print $2}' /proc/vmstat) - swapin0) * 4 / 1024 )) MiB"
   grep -m1 -n "fired up and ready" $OUT/$name/server.log | cut -c1-40 > $OUT/$name.ready.txt
   wait $cap; rc=$?
   echo "RC $name $rc $(date)"
