@@ -567,9 +567,18 @@ REFERENCE = {
 # arm but the two below, pinned so a shell that exports them cannot carry them into one.
 CONFIDENCE_CUT = "SGLANG_DSPARK_CONFIDENCE_CUT"
 STS_COLLECT = "SGLANG_DSPARK_STS_COLLECT_PATH"
+# The sampled-path knobs of the cut (spec F142, dspark-sampled-finish): off in every arm but the two sampled cut arms
+# below. SGLANG_DSPARK_USE_GREEDY_DRAFT (an argmax-only draft) is off in every arm, including those two: the draft stays
+# sampled, as block verification gains nothing on a one-hot draft.
+CONFIDENCE_CUT_SAMPLED = "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED"
+CONFIDENCE_CUT_DRAFT_COST = "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST"
+CONFIDENCE_CUT_REFIT_INTERVAL = "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL"
+USE_GREEDY_DRAFT = "SGLANG_DSPARK_USE_GREEDY_DRAFT"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[CONFIDENCE_CUT] = "0"
     _overrides_of_arm[STS_COLLECT] = ""
+    for _key in (CONFIDENCE_CUT_SAMPLED, CONFIDENCE_CUT_DRAFT_COST, CONFIDENCE_CUT_REFIT_INTERVAL, USE_GREEDY_DRAFT):
+        _overrides_of_arm[_key] = "0"
 # Production's arm: -expseg with what production adds to it (arm_env.prod_dspark_env: both startup calibrations on and
 # the prefetch head's checksummed copy) and production's server flags. It takes no fixed split, as production
 # calibrates its table at startup (_takes_fixed_split). The two cut arms build on it and are compared with it.
@@ -593,6 +602,22 @@ STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
 # fails.
 CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
 ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
+# The sampled A/B (run_sampled_finish_ab.sh): the cut for sampled requests with draft time priced into T(w) and no
+# online refit (owner, 2026-10-18: one sample cannot judge the refit), on the greedy STS file; and that plus upstream's
+# block verification on the sampled draft. Block verification alone is not an arm.
+SAMPLED_CUT_ARM = CONFIDENCE_CUT_ARM + "-sampled"
+ARMS[SAMPLED_CUT_ARM] = (
+    {
+        **ARMS[PROD_ARM][0],
+        CONFIDENCE_CUT: "1",
+        CONFIDENCE_CUT_SAMPLED: "1",
+        CONFIDENCE_CUT_DRAFT_COST: "1",
+        CONFIDENCE_CUT_REFIT_INTERVAL: "0",
+    },
+    True,
+)
+SAMPLED_CUT_BLOCK_ARM = SAMPLED_CUT_ARM + "-block"
+ARMS[SAMPLED_CUT_BLOCK_ARM] = (dict(ARMS[SAMPLED_CUT_ARM][0]), True)
 # Layer-major prefill under DSpark (branch layer-major-dspark): production with every uncached suffix of 8192+ tokens
 # prefilled layer by layer. Production itself has it on since 2026-10-17 (arm_env.prod_dspark_env), so -prod and the
 # arms built on it carry it and this arm now equals -prod; dspark_env() keeps the threshold at 0 for every other arm.
@@ -643,14 +668,22 @@ ARMS[CHUNKED_ARM] = (
     True,
 )
 PROD_ARMS = (
-    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM,
-    LAYER_MAJOR_LEND_ARM, CHUNKED_ARM,
+    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM, LAYER_MAJOR_ARM,
+    LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM, LAYER_MAJOR_LEND_ARM, CHUNKED_ARM,
 )
 ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
-# An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
-ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
+# An arm's speculative-decoding flags (a flat tuple of argv words, any number of flags), appended to its argv
+# (server_flags) and to its probe server's.
+STS_PATH_FLAGS = ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)
+BLOCK_VERIFICATION_FLAGS = ("--speculative-use-block-verification",)
+ARM_SPEC_FLAGS = {
+    CONFIDENCE_CUT_ARM: STS_PATH_FLAGS,
+    SAMPLED_CUT_ARM: STS_PATH_FLAGS,
+    SAMPLED_CUT_BLOCK_ARM: STS_PATH_FLAGS + BLOCK_VERIFICATION_FLAGS,
+}
 REFERENCE.update(
-    {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM, LAYER_MAJOR_ARM: PROD_ARM,
+    {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM,
+     SAMPLED_CUT_ARM: PROD_ARM, SAMPLED_CUT_BLOCK_ARM: SAMPLED_CUT_ARM, LAYER_MAJOR_ARM: PROD_ARM,
      LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM,
      LAYER_MAJOR_LEND_ARM: PROD_ARM, CHUNKED_ARM: PROD_ARM}
 )
