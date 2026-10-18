@@ -37,7 +37,11 @@ CHUNKED=$PROD-chunked
 mkdir -p "$ROOT"
 
 # One capture: pair OUTDIR BASE_ARM NAME[=K=V...] -- capture args. Returns the wrapper's status.
+# GATE, when set, is a command that returns only when a server may load; it runs before every server load.
+gate() { [ -z "${GATE:-}" ] || [ "${DRY:-0}" = 1 ] || "$GATE"; }
+
 pair() { local out=$1 base=$2 name=$3; shift 3
+  gate || return 1
   "$CAPPAIR" "${DRYFLAG[@]}" "$out" --worktree "$WT" --arm "$base" "$name" "$@"; }
 
 prompts() {
@@ -57,6 +61,7 @@ EOF
 
 parity_base() {
   local base=/mnt/nvme1/layer-major/equiv-t12fix
+  gate || return 1
   EXTRA_ENV_JSON='{"SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": "360", "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND": "1"}' \
     bash analysis/dsv41-drive/layer-major/drive_equiv.sh lend "$WT" 8192 "$ROOT/parity-base" || return $?
   $PY analysis/dsv41-drive/layer-major/equiv.py compare "$base/chunked.jsonl" "$ROOT/parity-base/lend.jsonl" \
