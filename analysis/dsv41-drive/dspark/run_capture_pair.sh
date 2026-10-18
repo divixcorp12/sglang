@@ -12,6 +12,8 @@
 #                    --decode-seconds 300 --ttft-repeats 3; none serves the default 8-prompt probe.
 #   --worktree       the checkout to run (default: the one holding this script). A dirty one is refused.
 #   --hicache-gib    prelaunch_evict.py's HiCache pools on node 1 (the template's -mergechunk-expseg value).
+#   PRELAUNCH_FLOOR_BYPASS=1 (env) runs the floor check (evicting, logging) but starts the arm when it refuses,
+#                    printing "PRELAUNCH FLOOR BYPASSED"; for page cache the kernel can reclaim (owner, 2026-10-17).
 #   --dry-run        resolve and print each arm's env, command and outputs; launch and write nothing.
 #
 # Every SGLANG_* variable inherited from the shell is unset, except both_cpu_ab.PASSTHROUGH's build caches, and so is
@@ -120,7 +122,13 @@ for i in "${!NAMES[@]}"; do
   echo "$name ${all[*]}"
   while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
     echo "waiting for a quiet box $(date)"; sleep 60; done
-  if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB; then
+  if [ "${PRELAUNCH_FLOOR_BYPASS:-0}" = 1 ]; then
+    # Owner's opt-out (2026-10-17): the check still evicts our files and logs its numbers, waits a minute instead of
+    # 30, and a refusal for page cache is reported instead of stopping the run (the kernel reclaims the cache).
+    if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --wait-min 1; then
+      echo "PRELAUNCH FLOOR BYPASSED $name: node 1 free below the floor, starting anyway (PRELAUNCH_FLOOR_BYPASS=1) $(date)"
+    fi
+  elif ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB; then
     echo "REFUSED $name: node 1 free below the floor $(date)"; echo ALLDONE; exit 3
   fi
   mkdir -p $OUT/$name
