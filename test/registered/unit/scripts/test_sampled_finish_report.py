@@ -109,7 +109,7 @@ def test_the_ship_rule_needs_5_percent_on_both_metrics_no_errors_and_no_lower_ac
     close = r.verdict({"prod": prod, "cut": _arm(1.04), "block": _arm(1.04)})
     assert not close["arms"]["cut"]["clears_rule_vs_prod"] and close["suggestion"].startswith("owner")
     assert r.verdict({"prod": prod, "cut": _arm(0.9), "block": _arm(0.9)})["suggestion"] == "none"
-    errs = r.verdict({"prod": prod, "cut": _arm(1.2, errors=["Traceback"]), "block": _arm(1.2)})
+    errs = r.verdict({"prod": prod, "cut": _arm(1.06, errors=["Traceback"]), "block": _arm(1.2)})
     assert not errs["arms"]["cut"]["clears_rule_vs_prod"] and errs["suggestion"] == "block"
     low_accept = r.verdict({"prod": prod, "cut": _arm(1.2, tpv=3.5), "block": _arm(1.2, tpv=3.5)})
     assert "tokens per verify lower than -prod" in low_accept["arms"]["cut"]["reasons"]

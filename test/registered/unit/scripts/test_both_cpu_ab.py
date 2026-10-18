@@ -1388,8 +1388,10 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
     for arm in PROD_ARMS:
         assert ab.run_probe(arm, str(tmp_path)) == 1
-    prod, collect, cut, *layer_major = argvs
-    assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    prod, collect, cut, sampled, block, *layer_major = argvs
+    for argv in (cut, sampled, block):
+        assert argv[argv.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    assert BLOCK_FLAG in block and BLOCK_FLAG not in sampled and BLOCK_FLAG not in cut and BLOCK_FLAG not in prod
     assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
     assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
     assert len(layer_major) == len(LAYER_MAJOR_ARMS) + 2 and all(STS_PATH_FLAG not in a for a in layer_major)

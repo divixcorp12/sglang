@@ -80,7 +80,8 @@ def parse_server_log(text: str) -> dict:
             total_rows = max(total_rows, int(m["total"]))
             sampled += int(m["sampled"] or 0)
             counts = _ints(m["widths"])
-            widths = [a + b for a, b in zip(widths + [0] * len(counts), counts + [0] * len(widths))] if counts else widths
+            size = max(len(widths), len(counts))
+            widths = [(widths + [0] * size)[k] + (counts + [0] * size)[k] for k in range(size)]
         if m := TW_RE.search(line):
             counts = _ints(m["counts"])
             calibration = {"a": float(m["a"]), "b": float(m["b"]), "r2": float(m["r2"]),
