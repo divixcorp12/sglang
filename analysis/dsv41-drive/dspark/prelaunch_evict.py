@@ -8,7 +8,8 @@ Node-1 floor = HiCache host pools on node 1 (--hicache-gib; 0 when they stay on 
 need + --margin-gib. The rest comes from the arm's previous memsample (--previous, memsample.py's JSONL) where one
 exists: node-1 MemFree at its first sample less its minimum, less the pools it bound there (its peak node-1 Shmem
 rise). Otherwise it is DEFAULT_REST_GIB, from arm A (splitmodel-stream-mem-hicache1, 2026-10-15: 64.69 GiB free at
-start, 1.70 GiB at its lowest, 11.75 GiB of it HiCache). The record says which was used.
+start, 1.70 GiB at its lowest, 11.75 GiB of it HiCache). The record says which was used. Arm A predates layer-major
+prefill, whose pinned node-1 StateStore (5.00 GiB at context 131072) --layer-major-state-gib adds to the default rest.
 
 Production (launch_prod.sh) runs it too, with three more options:
 - --skip-evict-port PORT: while anything listens on PORT (another of our servers reading the same files), check the
@@ -173,18 +174,23 @@ def rest_from_samples(lines) -> tuple[float, float]:
     return need - pools, pools
 
 
-def node1_floor(previous: str, hicache_gib: float, margin_gib: float) -> dict:
-    """The floor and where its non-HiCache part came from."""
+def node1_floor(previous: str, hicache_gib: float, margin_gib: float, layer_major_state_gib: float = 0.0) -> dict:
+    """The floor and where its non-HiCache part came from. ``layer_major_state_gib`` is layer-major prefill's pinned
+    node-1 StateStore (arm_env.layer_major_state_gib): arm A's default rest predates it, so it is added to the default;
+    a previous memsample of the same arm already holds it."""
     rest, source = DEFAULT_REST_GIB, "default (arm A, 2026-10-15)"
+    state = layer_major_state_gib
     if previous and os.path.exists(previous):
         try:
             with open(previous) as f:
                 rest, _ = rest_from_samples(f)
             source = previous
+            state = 0.0
         except (ValueError, KeyError, json.JSONDecodeError) as error:
             source = f"default (arm A); {previous} unusable: {error}"
-    return {"floor_gib": round(hicache_gib + rest + margin_gib, 2), "rest_gib": round(rest, 2),
-            "hicache_gib": hicache_gib, "margin_gib": margin_gib, "rest_source": source}
+    return {"floor_gib": round(hicache_gib + rest + state + margin_gib, 2), "rest_gib": round(rest, 2),
+            "hicache_gib": hicache_gib, "layer_major_state_gib": state, "margin_gib": margin_gib,
+            "rest_source": source}
 
 
 def evict(paths=PATHS) -> dict:
@@ -321,6 +327,8 @@ def main() -> int:
     p.add_argument("--previous", default="", help="the arm's previous memsample.py JSONL, if any")
     p.add_argument("--hicache-gib", type=float, default=DEFAULT_HICACHE_GIB)
     p.add_argument("--margin-gib", type=float, default=1.0)
+    p.add_argument("--layer-major-state-gib", type=float, default=0.0,
+                   help="layer-major prefill's node-1 StateStore (arm_env.layer_major_state_gib); 0 when it is off")
     p.add_argument("--wait-min", type=float, default=30.0)
     p.add_argument("--skip-evict-port", type=int, action="append", default=[])
     p.add_argument("--node0-warn-gib", type=float, default=0.0)
@@ -334,11 +342,12 @@ def main() -> int:
     p.add_argument("--evict-holders-min-mib", type=float, default=256.0)
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
-    floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib)
+    floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib, a.layer_major_state_gib)
     floors = {"0": a.node0_floor_gib, "1": floor["floor_gib"]}
     record = {"node0_floor_gib": a.node0_floor_gib,"t": time.time(), **floor, "before": node_meminfo(), "rounds": [], "dry_run": a.dry_run}
+    state = f" + layer-major StateStore {floor['layer_major_state_gib']}" if floor["layer_major_state_gib"] else ""
     print(f"prelaunch: node-1 floor {floor['floor_gib']} GiB = HiCache {a.hicache_gib} + rest {floor['rest_gib']} "
-          f"({floor['rest_source']}) + margin {a.margin_gib}", flush=True)
+          f"({floor['rest_source']}){state} + margin {a.margin_gib}", flush=True)
     if a.node0_floor_gib:
         print(f"prelaunch: node-0 floor {a.node0_floor_gib} GiB (free + reclaimable slab)", flush=True)
     busy = [port for port in a.skip_evict_port if listening(port)]

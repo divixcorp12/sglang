@@ -294,12 +294,26 @@ PROD_DSPARK_PINNED_HOST_MB = "111530"
 PROD_DSPARK_PINNED_HOST_NUMA_MB = "0:59656,1:51874"
 # launch_prod.sh's pre-launch floor (analysis/dsv41-drive/dspark/prelaunch_evict.py, the arms' logic): node 1 must hold
 # the HiCache host pools of the pinned 381,184-token pool (12.67 GiB, as the share-64 A/B ran it), the rest of the
-# server's node-1 need (arm A's 51.24 GiB) and 1 GiB of margin: 64.91 GiB. Every served -mem arm started with node 0 at
+# server's node-1 need (arm A's 51.24 GiB) and 1 GiB of margin: 64.91 GiB, plus layer-major's StateStore when the env
+# prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production). Every served -mem arm started with node 0 at
 # 75.4 GiB free or more; below that the start only warns. The wait is bounded so a refusal comes in minutes.
 PROD_NODE1_HICACHE_GIB = 12.67
 PROD_NODE1_MARGIN_GIB = 1.0
 PROD_NODE0_WARN_GIB = 75.0
 PROD_FLOOR_WAIT_MIN = 10
+# Layer-major prefill's pinned node-1 StateStore (layer_major/worker_entry.py, SGLANG_LAYER_MAJOR_STATE_NUMA_NODE=1),
+# which arm A's rest predates: CONTEXT_LENGTH tokens of DeepseekV4LayerMajorAdapter.field_specs, `hidden`
+# [hc_mult 4, 5120] bf16 plus `prev_pre` [4] fp32 = 40,976 bytes a token, 5.00 GiB at 131072. Measured: node-1 anon at
+# the same load point is 5.1-5.4 GiB higher with layer-major on (lmon 61.9 / hotfull 63.3 against confcut-prod 56.5 and
+# lmoff 56.8 GiB, /mnt/nvme1/{layer-major-dspark,hot-smaller-ab-20261017,confcut-ab-20261017}, 2026-10-17).
+LAYER_MAJOR_STATE_BYTES_PER_TOKEN = 4 * 5120 * 2 + 4 * 4
+
+
+def layer_major_state_gib(env: dict[str, str]) -> float:
+    """The node-1 floor's StateStore term for a server env: 0 unless it prefills layer-major."""
+    if int(env.get("SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS") or 0) <= 0:
+        return 0.0
+    return round(CONTEXT_LENGTH * LAYER_MAJOR_STATE_BYTES_PER_TOKEN / 2**30, 2)
 # Other servers that read the files the pre-launch step evicts: while one listens, production checks without evicting.
 PROD_PRELAUNCH_SKIP_EVICT_PORTS = (30032,)
 # Where a refusal looks for the page cache that fills node 1.
