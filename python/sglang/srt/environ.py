@@ -2202,6 +2202,10 @@ class Envs:
     # one chunk of a layer read for the layer's later chunks, so each is read once per prompt. 0 turns it off. Stage 0:
     # a plain allocation at the first layer-major pass, so the launch must leave it free (a smaller hot cache).
     SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS = EnvInt(0)
+    # Stage 1 of the above: the rows are the late layers' (never run in the pass loop) VRAM hot-cache slots, lent in
+    # place for the pass and reloaded from the pinned RAM tier before the late-layer tail, so no buffer is allocated
+    # and the hot cache keeps its size. Needs ROWS > 0; the launch refuses prefetch pull mode and GPU drip slots.
+    SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND = EnvBool(False)
     # NUMA node for the layer-major host state store; node 0 is kept near full by the expert tier (DSV41_REFERENCE
     # §25.4, 27.17).
     SGLANG_LAYER_MAJOR_STATE_NUMA_NODE = EnvInt(1)
