@@ -77,7 +77,9 @@ dependencies = [
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
-  "sgl-deep-gemm==0.2.2",
+  # deepseek-ai/DeepGEMM nv_dev, pinned: carries the sm_120 sparse and PAGE_KV=32 MQA logits kernels (PR #447) that
+  # sgl-deep-gemm lacks. Both install deep_gemm/, so it replaces sgl-deep-gemm.
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@b64107f2b9599ca76445b7f62eedf66bae1d095b",
   "sglang-kernel==0.4.10",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
@@ -205,6 +207,11 @@ all = [
 [tool.uv.extra-build-dependencies]
 st-attn = ["setuptools", "torch"]
 vsa = ["setuptools", "torch"]
+deep-gemm = ["setuptools", "wheel", "packaging", "torch==2.14.1"]
+
+# Build DeepGEMM from source: its setup.py otherwise downloads a release wheel built from main, not nv_dev.
+[tool.uv.extra-build-variables]
+deep-gemm = { DG_FORCE_BUILD = "1" }
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
