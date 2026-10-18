@@ -84,10 +84,10 @@ class TestValidateDeepseekV41FeaturesLayerMajorGate(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "--enable-decoder-swa-bounded-replay"):
                 _run(_cfg(enable_decoder_swa_bounded_replay=False))
 
-    def test_lending_needs_residency_rows(self):
-        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.override(True):
-            with self.assertRaisesRegex(ValueError, "RESIDENCY_ROWS > 0"):
-                _run(_cfg())
+    def test_lending_is_on_by_default_and_inert_without_residency_rows(self):
+        self.assertTrue(envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get())
+        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), envs.SGLANG_DSV41_GPU_DRIP_SLOTS.override(4):
+            _run(_cfg())  # ROWS is 0: the default lend does not refuse the launch
 
     def test_lending_refuses_prefetch_pull_mode_and_gpu_drip(self):
         lend = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.override(True)
@@ -103,8 +103,12 @@ class TestValidateDeepseekV41FeaturesLayerMajorGate(unittest.TestCase):
 
     def test_drip_and_pull_mode_are_fine_without_lending(self):
         rows = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.override(360)
-        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), rows, envs.SGLANG_DSV41_GPU_DRIP_SLOTS.override(4):
-            _run(_cfg())
+        no_lend = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.override(False)
+        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), rows, no_lend:
+            with envs.SGLANG_DSV41_GPU_DRIP_SLOTS.override(4):
+                _run(_cfg())
+            with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+                _run(_cfg())
 
     # The encoder-replay refusal (dsv41_layer_major_refusal's other branch) is not exercised
     # through the full hook here: setting cfg.enable_encoder_swa_bounded_replay=True also

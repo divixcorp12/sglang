@@ -400,9 +400,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS keeps experts across a layer-major pass's chunks; "
             "it needs SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS > 0"
         )
-    if envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get():
-        if envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.get() <= 0:
-            raise ValueError("SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND needs SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS > 0")
+    # The lend is on by default and does nothing without residency rows, so it is checked only with them.
+    if envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.get() > 0 and envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get():
         # Both could write or read a late layer's slots while the pass has them lent.
         if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
             raise ValueError(

@@ -57,13 +57,21 @@ def test_prod_env_carries_the_best_arms_settings_and_both_startup_calibrations()
 
 def test_prod_prefills_layer_major_under_dspark_and_the_arms_do_not():
     # Owner decision 2026-10-17: production turns layer-major prefill on under DSpark (threshold and the DSpark switch,
-    # which layer_major/gate.py needs under speculative decoding); residency stays off. dspark_env() keeps it off for
+    # which layer_major/gate.py needs under speculative decoding), plus the lent residency rows. dspark_env() keeps it off for
     # every arm built on it.
     env = arm_env.prod_env()
     assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "8192"
     assert env["SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"] == "1"
-    assert "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS" not in env
+    # Residency over lent hot-cache slots (owner, 2026-10-18): the rows are production's; the lend is the env default.
+    assert env["SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"] == "360"
     assert "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND" not in env
+    from sglang.srt.environ import envs
+
+    assert envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get() is True
+    # The lend's launch refusals: production sets neither prefetch pull mode nor GPU drip slots.
+    assert env.get("SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE", "off") == "off"
+    assert env.get("SGLANG_MOE_EXPERT_PREFETCH_PULL", "0") == "0"
+    assert int(env.get("SGLANG_DSV41_GPU_DRIP_SLOTS", "0")) == 0
     assert arm_env.dspark_env()["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
     assert "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK" not in arm_env.dspark_env()
     # The gate's launch checks production meets: one running request and the DSpark algorithm.
