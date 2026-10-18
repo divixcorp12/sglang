@@ -34,7 +34,7 @@ if [[ -z "${L2_AB_LOCKED:-}" ]]; then
     exec flock "$DISK_LOCK" bash "$0" "$@"
 fi
 
-PY=/data/models/slang/.venv/bin/python
+PY=/data/models/slang/.venv-upstream/bin/python
 DSPARK=analysis/dsv41-drive/dspark
 MISSCUT=dspark-both-misscut
 FLOORS=dspark-both-prefetch-gpu-misscut-idle2-floors

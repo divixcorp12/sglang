@@ -40,7 +40,7 @@ if [[ -z "${L2_T3_QUICK_LOCKED:-}" ]]; then
     exec flock "$DISK_LOCK" bash "$0" "$@"
 fi
 
-PY=/data/models/slang/.venv/bin/python
+PY=/data/models/slang/.venv-upstream/bin/python
 DSPARK=analysis/dsv41-drive/dspark
 L2=dspark-both-prefetch-gpu-misscut-idle2-l2
 T3=dspark-both-prefetch-gpu-misscut-idle2-l2-t3

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import arm_config as ac  # noqa: E402
 import compare  # noqa: E402
 
-VENV_PYTHON = "/data/models/slang/.venv/bin/python"
+VENV_PYTHON = "/data/models/slang/.venv-upstream/bin/python"
 BENCH_ARM = str(Path(__file__).resolve().parent / "bench_arm.py")
 
 

@@ -84,14 +84,14 @@ On divix01, in `wt-dsv41` after `git pull --ff-only origin <branch>` (GitHub; se
 cd /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41
 # rehearsal: prints every command and both resolved launches, asserts the EXL3 gate; no lock, no GPU
 taskset -c 0-63 env OMP_NUM_THREADS=16 PYTHONPATH=$PWD/python \
-  /data/models/slang/.venv/bin/python benchmarks/dsv41_flash/run_ab.py --dry-run
+  /data/models/slang/.venv-upstream/bin/python benchmarks/dsv41_flash/run_ab.py --dry-run
 # the real thing (needs approval); each arm runs under gpu-run.sh, which takes cc-gpu.lock
-PYTHONPATH=$PWD/python /data/models/slang/.venv/bin/python benchmarks/dsv41_flash/run_ab.py \
+PYTHONPATH=$PWD/python /data/models/slang/.venv-upstream/bin/python benchmarks/dsv41_flash/run_ab.py \
   --out-dir /data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-flash-bench/$(date -u +%Y%m%d)
 ```
 
 `run_ab.py` passes unknown flags to `bench_arm.py` (`--requests`, `--output-tokens`, ...). `PYTHONPATH` must name the
-tree under test: `/data/models/slang/.venv/bin/python` otherwise imports sglang from `main-port-probe-7bc4eb`, so
+tree under test: `/data/models/slang/.venv-upstream/bin/python` otherwise imports sglang from `wt-upstream-merge`, so
 `bench_arm.py` asserts `sglang.__file__` resolves under this repo and exits 2 (`REFUSED: ImportPathError`) if not.
 The per-arm command is `gpu-run.sh <python> bench_arm.py --arm {lease_off,lease_on} --rep N --position P --out ...`;
 the recipe environment is set inside `bench_arm.py`, so it cannot drift between arms.
