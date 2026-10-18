@@ -31,7 +31,7 @@ CAPPAIR=$WT/analysis/dsv41-drive/dspark/run_capture_pair.sh
 DRYFLAG=(); [ "${DRY:-0}" = 1 ] && DRYFLAG=(--dry-run)
 cd "$WT" || exit 2
 PROD=$(PYTHONPATH=$WT/analysis/dsv41-drive/dspark:$WT/python $PY -c "import both_cpu_ab as a; print(a.PROD_ARM)")
-RES=$PROD-layermajor-smallhot-res
+RES=$PROD-layermajor-res
 LEND=$PROD-layermajor-lend
 CHUNKED=$PROD-chunked
 mkdir -p "$ROOT"
