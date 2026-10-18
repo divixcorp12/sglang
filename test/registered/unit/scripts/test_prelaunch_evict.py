@@ -98,7 +98,8 @@ def test_layer_major_state_store_raises_the_default_floor_and_the_log_names_it(t
     assert r.returncode == 3 and record["floor_gib"] == 69.91
     assert "node-1 floor 69.91 GiB = HiCache 12.67 + rest 51.24 (default (arm A, 2026-10-15)) " \
            "+ layer-major StateStore 5.0 + margin 1.0" in r.stdout
-    r, record = _main(tmp_path, 66.0, "--hicache-gib", "12.67")
+    (tmp_path / "off").mkdir()
+    r, record = _main(tmp_path / "off", 66.0, "--hicache-gib", "12.67")
     assert r.returncode == 0 and record["layer_major_state_gib"] == 0.0 and "StateStore" not in r.stdout
 
 
