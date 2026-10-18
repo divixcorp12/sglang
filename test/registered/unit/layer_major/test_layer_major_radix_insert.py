@@ -54,8 +54,10 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
                                                device="cpu", kvcache=kv, need_sort=False)
         self.cache = UnifiedRadixCache(params=CacheInitParams(
             req_to_token_pool=self.rtp, token_to_kv_pool_allocator=self.alloc, page_size=PAGE, disable=False,
-            sliding_window_size=DSV4_WINDOW, tree_components=(ComponentType.FULL, ComponentType.SWA)))
-        # The recipe's --enable-decoder-swa-bounded-replay: admission caps the match a window short of the input.
+            sliding_window_size=DSV4_WINDOW, tree_components=(ComponentType.FULL, ComponentType.SWA),
+            # The recipe's --enable-decoder-swa-bounded-replay: admission caps the match a window short of the
+            # input. Upstream's cache takes it at construction, as the scheduler passes it.
+            decoder_swa_bounded_replay=True))
         override = get_context().override_server_args(enable_decoder_swa_bounded_replay=True)
         override.install()
         self.addCleanup(override.restore)
@@ -87,7 +89,7 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
             last_loc.to(torch.int64), n - prefix, swa_tail_len=CHUNK + PAGE,
         ).to(torch.int64)
         self.rtp.write((slot, slice(prefix, n)), full)
-        req.set_extend_range(prefix, n)
+        req.extend_end = n  # the round extends [prefix_len, extend_end); the match set prefix_len
         ring = self.alloc.ring_slots(full[-(CHUNK + PAGE) :])
         self.alloc.map_ring_positions(full, torch.arange(prefix, n), ring)
         handle = SimpleNamespace(schedule_batch=SimpleNamespace(reqs=[req], prefix_lens=[prefix]),
@@ -133,21 +135,25 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         """ids[:prefix] fully live; ids[prefix:branch) full-KV live but SWA-tombstoned, chained onto the same
         prefix addresses via prev_prefix_len (as cache_finished_req does for a real request)."""
         self._seed(prefix, swa_live_from=0)
-        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:prefix]))))
-        last_loc = m.device_indices[-1:].to(torch.int64)
+        matched = self._matched_indices(self.ids[:prefix])
+        last_loc = matched[-1:].to(torch.int64)
         ext = self.alloc.alloc_extend(
             torch.tensor([prefix]), torch.tensor([prefix]), torch.tensor([branch]), torch.tensor([branch]),
             last_loc, branch - prefix,
         ).to(torch.int64)
         self.alloc.free_swa_segment(ext, start_pos=prefix)
-        value = torch.cat([m.device_indices.to(torch.int64), ext])
+        value = torch.cat([matched.to(torch.int64), ext])
         self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:branch])), value=value,
                                        component_evicted_seqlens={ComponentType.SWA: branch},
                                        prev_prefix_len=prefix))
 
+    def _matched_indices(self, ids) -> torch.Tensor:
+        """The device KV indices a match of ``ids`` returns (upstream's MatchResult carries the length and node)."""
+        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", ids))))
+        return self.cache.path_device_indices(m.last_device_node)[: m.device_prefix_len]
+
     def _assert_matches(self, n: int) -> None:
-        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:n]))))
-        self.assertEqual(len(m.device_indices), n)
+        self.assertEqual(len(self._matched_indices(self.ids[:n])), n)
 
     def test_prefix_hit_capped_at_a_tombstone_branch_point(self):
         # The crash's shape at 1/16 scale: a 2148-token prompt's match, capped at 2148 - 128, reaches full KV

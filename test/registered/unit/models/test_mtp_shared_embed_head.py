@@ -16,6 +16,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.models import qwen3_5, qwen3_5_mtp, qwen4_exp_mtp
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -125,6 +126,12 @@ class BuildWithTargetWeightTests(unittest.TestCase):
 
 
 class RealMtpConstructionTests(unittest.TestCase):
+    def setUp(self):
+        # Upstream's linear layers resolve their TP group through get_parallel(), outside the patched modules.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     def construction_patches(self, stack):
         for owner, name, value in (
             (qwen3_5_mtp, "_mtp_quant_config", lambda q: None),
