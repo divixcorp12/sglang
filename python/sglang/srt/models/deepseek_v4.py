@@ -3771,9 +3771,11 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                 )
         tail = None
+        # A layer-major early-layer call (layer_ids short of late_layer_start) has no tail metadata installed.
         if (
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and (layer_ids is None or self.late_layer_start in layer_ids)
         ):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
