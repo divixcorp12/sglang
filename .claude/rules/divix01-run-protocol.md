@@ -35,9 +35,13 @@ construction, so the failure mode does not exist.
 
 ## The interpreter trap
 
-`/data/models/slang/.venv/bin/python` imports sglang from
-`main-port-probe-7bc4eb` unless `PYTHONPATH` points at the tree under test.
-Without it a run exercises unrelated code and reports green. Print
+The serving venv is `/data/models/slang/.venv-upstream` (torch 2.14.1,
+flashinfer 0.7.2; `arm_env.PYTHON`) since the upstream merge of 2026-10-18. Its
+sglang is an editable install of `wt-upstream-merge`, so it imports that tree
+unless `PYTHONPATH` points at the tree under test. The old venv
+`/data/models/slang/.venv` (torch 2.13) imports `main-port-probe-7bc4eb` the
+same way; keep it for rollback and for re-running dated records made on it.
+Without `PYTHONPATH` a run exercises unrelated code and reports green. Print
 `sglang.__file__` and read it before trusting any result.
 
 ## A pipeline reports the last command's status, not pytest's
@@ -72,7 +76,7 @@ noise. A change to the expert-stream / RAM-miss host or device code, for example
 
 ```bash
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
-  /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
+  /data/models/slang/.venv-upstream/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
 ```
 
 `test/registered` and `test/registered/unit` sweep in directories (`xpu/`,

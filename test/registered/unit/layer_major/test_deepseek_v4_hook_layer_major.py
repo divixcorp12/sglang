@@ -51,6 +51,13 @@ def _cfg(**overrides):
         enable_dp_attention=False,
         attn_cp_size=1,
         max_running_requests=1,
+        # Upstream's prefill-CP and DP-attention reads (attn_dp_enabled_of), at their defaults: no CP, tp 1.
+        enable_prefill_cp=False,
+        cp_strategy=None,
+        tp_size=1,
+        attn_dp_size=1,
+        dcp_size=1,
+        ep_join_mode=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)

@@ -2,7 +2,6 @@
 
 import unittest
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass
 from itertools import chain
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +16,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.models import qwen3_5, qwen3_5_mtp, qwen4_exp_mtp
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -126,13 +126,19 @@ class BuildWithTargetWeightTests(unittest.TestCase):
 
 
 class RealMtpConstructionTests(unittest.TestCase):
+    def setUp(self):
+        # Upstream's linear layers resolve their TP group through get_parallel(), outside the patched modules.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     def construction_patches(self, stack):
         for owner, name, value in (
             (qwen3_5_mtp, "_mtp_quant_config", lambda q: None),
             (qwen3_5_mtp, "get_parallel", _parallel),
             (qwen3_5_mtp, "LogitsProcessor", lambda c: nn.Identity()),
             (qwen3_5, "get_parallel", _parallel),
-            (qwen3_5, "make_layers", lambda *a, **k: (nn.ModuleList(), 0, 0)),
+            (qwen3_5, "make_pp_layers", lambda *a, **k: (nn.ModuleList(), 0, 0)),
             (qwen3_5, "get_stream", lambda name: None),
             (qwen3_5, "is_dp_attention_enabled", lambda: False),
             (qwen4_exp_mtp, "Qwen4ExpModel", lambda *a, **k: nn.Module()),
@@ -231,12 +237,6 @@ class _StopAfterDraftBuild(Exception):
     pass
 
 
-@dataclass
-class _ParallelState:
-    pp_rank: int = 0
-    pp_size: int = 1
-
-
 class EagleDraftWorkerScopeTests(unittest.TestCase):
     def offered_during_draft_build(self, algorithm):
         from sglang.srt.speculative import eagle_worker_v2
@@ -270,7 +270,9 @@ class EagleDraftWorkerScopeTests(unittest.TestCase):
             for name, value in (
                 ("get_device", lambda: SimpleNamespace(device="cpu")),
                 ("get_spec", lambda: spec),
-                ("get_parallel", lambda: SimpleNamespace(enable_dp_attention=False)),
+                ("get_parallel", lambda: SimpleNamespace(attn_dp_enabled=False)),
+                ("get_pp_stage_load_group", lambda: None),
+                ("draft_tp_context", lambda *_: nullcontext()),
                 ("draft_pp_context", nullcontext),
                 ("speculative_moe_backend_context", nullcontext),
                 ("speculative_moe_a2a_backend_context", nullcontext),
@@ -289,7 +291,6 @@ class EagleDraftWorkerScopeTests(unittest.TestCase):
                 eagle_worker_v2.EagleDraftWorker(
                     server_args=None,
                     gpu_id=0,
-                    ps=_ParallelState(),
                     nccl_port=0,
                     target_worker=target_worker,
                 )
@@ -333,7 +334,11 @@ class InitLmHeadMetaCheckTests(unittest.TestCase):
             model_runner=SimpleNamespace(
                 model=SimpleNamespace(
                     get_embed_and_head=lambda: (embed, None), lm_head=None
-                )
+                ),
+                # Read for the draft's checkpoint fallback (resolve_draft_embed_and_head), unused when the
+                # target offers its embedding.
+                model_config=SimpleNamespace(model_path="unused", revision=None),
+                load_config=None,
             )
         )
         worker.draft_runner = SimpleNamespace(

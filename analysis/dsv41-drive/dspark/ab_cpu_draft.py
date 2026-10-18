@@ -16,7 +16,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
 import arm_env  # noqa: E402
 
-PYTHON = "/data/models/slang/.venv/bin/python"
+PYTHON = arm_env.PYTHON
 DRAFT = "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-dspark-draft"
 SESSIONS = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
 RESIDENT = "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"

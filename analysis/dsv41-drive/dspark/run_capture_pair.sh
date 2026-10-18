@@ -22,7 +22,7 @@
 
 die() { echo "run_capture_pair: $*" >&2; exit 2; }
 
-OUT=""; BASE=""; WT=""; PY=/data/models/slang/.venv/bin/python; HICACHE_GIB=12.67; DRY=0
+OUT=""; BASE=""; WT=""; PY=/data/models/slang/.venv-upstream/bin/python; HICACHE_GIB=12.67; DRY=0
 # The roots prelaunch_evict.py searches for page-cache holders when evicting its listed files leaves node 1 short (the
 # same as arm_env.PROD_PAGE_CACHE_ROOTS).
 HOLDERS="--holders /mnt/nvme0 --holders /mnt/nvme1 --holders /mnt/nvme2 --holders /mnt/nvme4 --holders /data/models"

@@ -35,16 +35,42 @@ def draft_top_probs(
 ) -> dict[str, torch.Tensor]:
     """[bs, gamma] top-1/top-2 probabilities of the draft's step logits, with the drafted tokens fed back as the
     Markov head's previous tokens (what the in-graph proposal fed itself)."""
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        DraftNoise,
+        _draft_step,
+        step_logits_width,
+    )
+
     bs, gamma = draft_tokens.shape
     base_logits, _ = draft_model.compute_base_logits(raw_hidden)
+    base_logits = base_logits.view(bs, gamma, -1)
     forced = draft_tokens.long()
-    _, corrected = draft_model.markov_head.sample_block(
-        base_logits.view(bs, gamma, -1),
-        first_prev_tokens=anchor_tokens,
-        hidden_states=draft_hidden,
-        sampler=lambda step_logits, step_idx: forced[:, step_idx],
-        collect_corrected=True,
+    markov_head = draft_model.markov_head
+    corrected = torch.empty(
+        (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
+        dtype=markov_head.step_logits_dtype(base_logits.dtype),
+        device=base_logits.device,
     )
+    # Argmax steps (zero temperatures): only the Markov-corrected step logits are read here.
+    temperatures = torch.zeros(bs, dtype=torch.float32, device=base_logits.device)
+    noise = DraftNoise(
+        key=0, offset=torch.zeros(1, dtype=torch.int64, device=base_logits.device)
+    )
+    state = markov_head.init_state(draft_hidden)
+    prev_tokens = anchor_tokens.long()
+    for step in range(gamma):
+        _, state = _draft_step(
+            markov_head,
+            prev_tokens,
+            base_logits[:, step],
+            hidden_states=None if draft_hidden is None else draft_hidden[:, step],
+            state=state,
+            temperatures=temperatures,
+            noise=noise,
+            step=step,
+            logits_out=corrected[:, step],
+        )
+        prev_tokens = forced[:, step]
     top = torch.softmax(corrected.float(), dim=-1).topk(2, dim=-1)
     return {
         "top_prob": top.values[..., 0],

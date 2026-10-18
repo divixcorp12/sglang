@@ -2,10 +2,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
@@ -56,12 +54,14 @@ class _RecordingBackend:
         self.tail_forward_metadata = tail_metadata
 
 
-class _FakeLayer:
-    engram = None
+class _FakeModel:
+    hc_mult = 1
+    hidden_size = 4
+    start_layer = 0
 
-    def forward_hc_pre_from_prev(self, *, hidden_states, prev_pre, **_unused):
+    def _forward_layers_hc_pre_from_prev(self, positions, hidden_states, *_args, **_kwargs):
         rows, hc_mult = hidden_states.shape[0], hidden_states.shape[1]
-        return hidden_states, torch.zeros(rows, hc_mult)
+        return hidden_states, torch.zeros(rows, hc_mult), None
 
 
 class _FakeStore:
@@ -96,26 +96,17 @@ class TestRunLayerTailMetadata(unittest.TestCase):
             ],
             schedule_batch=SimpleNamespace(prefix_lens=[0]),
             tail_by_span={1: "TAIL"},
+            hash_ids=[None] * len(spans),
         )
         store = _FakeStore({0: "META0", 1: "META1"})
         backend = _RecordingBackend()
-        model = SimpleNamespace(
-            hc_mult=1, hidden_size=4, start_layer=0, layers=[_FakeLayer()]
-        )
         adapter_self = SimpleNamespace(
-            runner=SimpleNamespace(device="cpu"), model=model, backend=backend
+            runner=SimpleNamespace(device="cpu"), model=_FakeModel(), backend=backend
         )
-        recorder = SimpleNamespace(
-            with_current_layer=lambda layer_id: contextlib.nullcontext()
-        )
-        with mock.patch(
-            "sglang.srt.eplb.expert_distribution.get_global_expert_distribution_recorder",
-            return_value=recorder,
-        ):
-            for chunk in range(len(spans)):
-                DeepseekV4LayerMajorAdapter.run_layer(
-                    adapter_self, handle, layer_id=0, chunk=chunk, store=store
-                )
+        for chunk in range(len(spans)):
+            DeepseekV4LayerMajorAdapter.run_layer(
+                adapter_self, handle, layer_id=0, chunk=chunk, store=store
+            )
         return backend
 
     def test_only_the_final_chunk_installs_the_tail(self):
@@ -143,18 +134,13 @@ class TestRunLayerPenultimateTailMetadata(unittest.TestCase):
             forward_batches=[SimpleNamespace(positions=None, input_ids=None) for _ in spans],
             schedule_batch=SimpleNamespace(prefix_lens=[0]),
             tail_by_span={1: "TAIL_PENULTIMATE", 2: "TAIL_FINAL"},
+            hash_ids=[None] * len(spans),
         )
         store = _FakeStore({0: "META0", 1: "META1", 2: "META2"})
         backend = _RecordingBackend()
-        model = SimpleNamespace(hc_mult=1, hidden_size=4, start_layer=0, layers=[_FakeLayer()])
-        adapter_self = SimpleNamespace(runner=SimpleNamespace(device="cpu"), model=model, backend=backend)
-        recorder = SimpleNamespace(with_current_layer=lambda layer_id: contextlib.nullcontext())
-        with mock.patch(
-            "sglang.srt.eplb.expert_distribution.get_global_expert_distribution_recorder",
-            return_value=recorder,
-        ):
-            for chunk in range(len(spans)):
-                DeepseekV4LayerMajorAdapter.run_layer(adapter_self, handle, layer_id=0, chunk=chunk, store=store)
+        adapter_self = SimpleNamespace(runner=SimpleNamespace(device="cpu"), model=_FakeModel(), backend=backend)
+        for chunk in range(len(spans)):
+            DeepseekV4LayerMajorAdapter.run_layer(adapter_self, handle, layer_id=0, chunk=chunk, store=store)
         self.assertEqual(
             backend.calls,
             [("META0", None), ("META1", "TAIL_PENULTIMATE"), ("META2", "TAIL_FINAL")],

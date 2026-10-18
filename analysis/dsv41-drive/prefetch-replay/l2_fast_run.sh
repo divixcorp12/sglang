@@ -16,7 +16,7 @@ MODEL_PATH="${5:-${MODEL_PATH:?MODEL_PATH is required}}"
 F109="${6:-${F109:-/mnt/nvme1/nvfp4-work/f109-l2-cap1-20261013}}"
 OUT="${7:-${OUT:-/mnt/nvme1/nvfp4-work/f123-l2-fast-$(date +%Y%m%d)}}"
 GATE_DTYPE="${GATE_DTYPE:-bfloat16}"
-PYTHON="${PYTHON:-/data/models/slang/.venv/bin/python}"
+PYTHON="${PYTHON:-/data/models/slang/.venv-upstream/bin/python}"
 LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 
 PWD_REAL="$(pwd -P)"

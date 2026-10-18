@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -54,8 +55,10 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
                                                device="cpu", kvcache=kv, need_sort=False)
         self.cache = UnifiedRadixCache(params=CacheInitParams(
             req_to_token_pool=self.rtp, token_to_kv_pool_allocator=self.alloc, page_size=PAGE, disable=False,
-            sliding_window_size=DSV4_WINDOW, tree_components=(ComponentType.FULL, ComponentType.SWA)))
-        # The recipe's --enable-decoder-swa-bounded-replay: admission caps the match a window short of the input.
+            sliding_window_size=DSV4_WINDOW, tree_components=(ComponentType.FULL, ComponentType.SWA),
+            # The recipe's --enable-decoder-swa-bounded-replay: admission caps the match a window short of the
+            # input. Upstream's cache takes it at construction, as the scheduler passes it.
+            decoder_swa_bounded_replay=True))
         override = get_context().override_server_args(enable_decoder_swa_bounded_replay=True)
         override.install()
         self.addCleanup(override.restore)
@@ -76,17 +79,20 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.rid += 1
         self.rtp.alloc([req])
         req.init_next_round_input(self.cache)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        prefix = len(req.prefix_indices)
+        req.lock = self.cache.lock(req.last_node)  # as _commit_prefill_admission takes it
+        prefix_indices = self.cache.prefix_device_indices(req)
+        prefix = len(prefix_indices)
         slot = req.kv.req_pool_idx
-        self.rtp.write((slot, slice(0, prefix)), req.prefix_indices)
+        self.rtp.write((slot, slice(0, prefix)), prefix_indices)
         last_loc = self.rtp.req_to_token[slot, prefix - 1 : prefix] if prefix else torch.tensor([-1])
         full = self.alloc.alloc_extend_swa_tail(
             torch.tensor([prefix]), torch.tensor([prefix]), torch.tensor([n]), torch.tensor([n]),
             last_loc.to(torch.int64), n - prefix, swa_tail_len=CHUNK + PAGE,
         ).to(torch.int64)
         self.rtp.write((slot, slice(prefix, n)), full)
-        req.set_extend_range(prefix, n)
+        req.extend_end = n  # the round extends [prefix_len, extend_end); the match set prefix_len
+        # alloc_for_extend commits and allocates the whole new length before the pass runs.
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = n
         ring = self.alloc.ring_slots(full[-(CHUNK + PAGE) :])
         self.alloc.map_ring_positions(full, torch.arange(prefix, n), ring)
         handle = SimpleNamespace(schedule_batch=SimpleNamespace(reqs=[req], prefix_lens=[prefix]),
@@ -97,18 +103,16 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
     def _layer_major_prefill(self, n: int) -> Req:
         """A pass that finishes normally: finalize, then the post-prefill insert."""
         req = self._run_pass(n)
-        req.kv.kv_committed_len = n
-        self.cache.cache_unfinished_req(req)
+        self.cache.checkpoint(req, up_to=n)
         return req
 
     def _finish(self, req: Req) -> None:
-        self.cache.cache_finished_req(req, owned_kv_len=len(req.origin_input_ids))
-        self.rtp.free(req)
+        release_kv_cache(req, self.cache, checkpoint=True)  # frees the row too
 
-    def _abort(self, req: Req, *, owned_kv_len: int) -> None:
+    def _abort(self, req: Req) -> None:
         # release_pass(failed=True): only _finalize_ring ran, so cache_protected_len is still the pre-pass prefix.
-        self.cache.cache_finished_req(req, is_insert=False, owned_kv_len=owned_kv_len)
-        self.rtp.free(req)
+        # The scheduler's containment (Scheduler._finish_layer_major_batch_after_exception) releases it so.
+        release_kv_cache(req, self.cache, checkpoint=False)
 
     def _pool_sizes(self) -> tuple[int, int]:
         return self.alloc.full_available_size(), self.alloc.swa_available_size()
@@ -126,26 +130,31 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         ).to(torch.int64)
         self.alloc.free_swa_segment(full[:swa_live_from], start_pos=0)
         self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:n])), value=full,
-                                       swa_evicted_seqlen=swa_live_from))
+                                       component_evicted_seqlens={ComponentType.SWA: swa_live_from}))
 
     def _seed_live_prefix_then_tombstone(self, prefix: int, branch: int) -> None:
         """ids[:prefix] fully live; ids[prefix:branch) full-KV live but SWA-tombstoned, chained onto the same
         prefix addresses via prev_prefix_len (as cache_finished_req does for a real request)."""
         self._seed(prefix, swa_live_from=0)
-        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:prefix]))))
-        last_loc = m.device_indices[-1:].to(torch.int64)
+        matched = self._matched_indices(self.ids[:prefix])
+        last_loc = matched[-1:].to(torch.int64)
         ext = self.alloc.alloc_extend(
             torch.tensor([prefix]), torch.tensor([prefix]), torch.tensor([branch]), torch.tensor([branch]),
             last_loc, branch - prefix,
         ).to(torch.int64)
         self.alloc.free_swa_segment(ext, start_pos=prefix)
-        value = torch.cat([m.device_indices.to(torch.int64), ext])
+        value = torch.cat([matched.to(torch.int64), ext])
         self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:branch])), value=value,
-                                       swa_evicted_seqlen=branch, prev_prefix_len=prefix))
+                                       component_evicted_seqlens={ComponentType.SWA: branch},
+                                       prev_prefix_len=prefix))
+
+    def _matched_indices(self, ids) -> torch.Tensor:
+        """The device KV indices a match of ``ids`` returns (upstream's MatchResult carries the length and node)."""
+        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", ids))))
+        return self.cache.path_device_indices(m.last_device_node)[: m.device_prefix_len]
 
     def _assert_matches(self, n: int) -> None:
-        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:n]))))
-        self.assertEqual(len(m.device_indices), n)
+        self.assertEqual(len(self._matched_indices(self.ids[:n])), n)
 
     def test_prefix_hit_capped_at_a_tombstone_branch_point(self):
         # The crash's shape at 1/16 scale: a 2148-token prompt's match, capped at 2148 - 128, reaches full KV
@@ -207,11 +216,11 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self._assert_pool_restored_after_evict()
 
     def test_abort_after_finalize_restores_the_pool(self):
-        # release_pass(failed=True) runs _finalize_ring only; cache_finished_req(is_insert=False) then frees the
+        # release_pass(failed=True) runs _finalize_ring only; release_kv_cache(checkpoint=False) then frees the
         # request's KV without inserting it: both the SWA and full pools must return to their starting sizes.
         self._seed(2048, swa_live_from=1792)
         req = self._run_pass(2148)
-        self._abort(req, owned_kv_len=2148)
+        self._abort(req)
         self.cache.sanity_check()
         self._assert_pool_restored_after_evict()
 

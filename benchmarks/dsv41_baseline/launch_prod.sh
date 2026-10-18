@@ -21,7 +21,8 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 here=$repo/benchmarks/dsv41_baseline
-py=/data/models/slang/.venv/bin/python
+# arm_env.PYTHON, which it cannot import before it has an interpreter (test_launch_prod.py checks they agree).
+py=/data/models/slang/.venv-upstream/bin/python
 
 cmd=${1:-start}
 case "$cmd" in

@@ -191,6 +191,8 @@ class FileExpertOffloadTests(unittest.TestCase):
         )
         layer.moe_runner_config = SimpleNamespace(layer_id=layer_id, is_gated=True)
         layer.quant_method.moe_runner_config = layer.moe_runner_config
+        # weight_loader reads the method's layout flag for an NVFP4 method (set in its __init__), not the layer's.
+        layer.quant_method.use_flashinfer_trtllm_weight_layout = False
         layer.scheme = None
         layer.quant_config = SimpleNamespace(get_name=lambda: "modelopt_fp4")
         layer.moe_tp_rank = 0
@@ -542,7 +544,6 @@ class OffloaderIdentityTests(unittest.TestCase):
         ):
             offloader = offloader_module.create_offloader_from_server_args(
                 server_args=server_args,
-                dp_rank=0,
                 model_config=model_config,
             )
 
@@ -557,7 +558,7 @@ class OffloaderIdentityTests(unittest.TestCase):
             offloader_module, "get_exec", return_value=self._exec_config()
         ):
             offloader = offloader_module.create_offloader_from_server_args(
-                server_args=SimpleNamespace(), dp_rank=0
+                server_args=SimpleNamespace()
             )
 
         self.assertIsInstance(offloader, offloader_module.OffloaderV1)
@@ -784,7 +785,6 @@ class RouteTraceConfigurationTests(unittest.TestCase):
             max_running_requests=1,
             expert_distribution_recorder_mode="per_pass",
             elastic_ep_backend=None,
-            elastic_ep_rejoin=False,
             ep_join_mode=None,
             enable_elastic_expert_backup=False,
             enable_eplb=False,
@@ -825,7 +825,6 @@ class HotCacheConfigurationTests(unittest.TestCase):
             max_running_requests=1,
             expert_distribution_recorder_mode="stat",
             elastic_ep_backend=None,
-            elastic_ep_rejoin=False,
             ep_join_mode=None,
             enable_elastic_expert_backup=False,
             enable_eplb=False,
@@ -897,7 +896,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
             (dict(max_running_requests=2), "max-running-requests 1"),
             (dict(max_running_requests=None), "max-running-requests 1"),
             (dict(elastic_ep_backend="mooncake"), "elastic"),
-            (dict(elastic_ep_rejoin=True), "elastic"),
+            (dict(ep_join_mode="recover"), "elastic"),
             (dict(ep_join_mode="scale"), "elastic"),
             (dict(enable_elastic_expert_backup=True), "elastic"),
             (dict(elastic_ep_initial_size=1), "elastic"),

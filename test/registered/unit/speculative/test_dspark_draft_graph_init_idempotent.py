@@ -25,12 +25,12 @@ def _worker(built):
         device="cuda",
         gpu_id=0,
         _draft_graph_group=None,
-        ps=SimpleNamespace(tp_rank=0),
+        _hosts_draft=True,
         _draft_context=nullcontext,
         draft_model_runner=SimpleNamespace(capture_tail_hooks=[]),
         _draft_sampler=None,
         _draft_sampler_built=False,
-        _maybe_build_draft_sampler=lambda *, available_memory_gb: built.append(available_memory_gb) or f"sampler{len(built)}",
+        _maybe_build_draft_sampler=lambda: built.append(None) or f"sampler{len(built)}",
         _proposer=SimpleNamespace(attach_draft_sampler=lambda s: captures.append(("attach", s))),
         _draft_worker=SimpleNamespace(init_cuda_graphs=lambda **k: captures.append(("capture", k))),
     ), captures
@@ -47,6 +47,6 @@ def test_two_calls_build_one_sampler_and_append_one_hook(monkeypatch):
     with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(True):
         dw.DSparkWorkerV2.init_cuda_graphs(worker)
         dw.DSparkWorkerV2.init_cuda_graphs(worker)
-    assert built == [4.0]  # one sampler
+    assert len(built) == 1  # one sampler
     assert worker.draft_model_runner.capture_tail_hooks == [("hook", "sampler1")]  # one hook
     assert captures == [("attach", "sampler1"), ("capture", {"capture_decode_cuda_graph": True})] * 2

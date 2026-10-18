@@ -268,8 +268,7 @@ def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
         getattr(cfg, name, None)
         for name in (
             "elastic_ep_backend",
-            "elastic_ep_rejoin",
-            "ep_join_mode",
+            "ep_join_mode",  # upstream's recover/scale join; it replaced elastic_ep_rejoin
             "enable_elastic_expert_backup",
             "elastic_ep_initial_size",
             "max_ep_size",

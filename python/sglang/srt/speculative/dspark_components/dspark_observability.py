@@ -198,9 +198,10 @@ class DsparkInfoDumper:
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
 
-        self._d2h_stream: Optional[torch.cuda.Stream] = None
+        self._device_module = torch.get_device_module(device)
+        self._d2h_stream = None
         if self.enabled and InfoComponent.REQS in self._components:
-            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._d2h_stream = self._device_module.Stream(device=device)
 
         self._current_segments: dict[
             InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]
@@ -308,7 +309,7 @@ class DsparkInfoDumper:
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
-        start = torch.cuda.Event(enable_timing=True)
+        start = self._device_module.Event(enable_timing=True)
         start.record()
         self._open_segments[segment] = start
 
@@ -316,7 +317,7 @@ class DsparkInfoDumper:
         start = self._open_segments.pop(segment, None)
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = self._device_module.Event(enable_timing=True)
         end.record()
         self._current_segments[segment] = (start, end)
 
@@ -822,7 +823,7 @@ def verify_target_probs(*, target_logits: torch.Tensor, sampling_info, verify_nu
     """[bs, rows, vocab] the target's sampling distribution per verify row, built as AcceptSampling builds it
     (temperature, then top-k/top-p). The top-k path reads its max k on the host: STS collection only."""
     from sglang.kernels.ops.speculative.dspark.dspark_accept import SoftmaxTemp
-    from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
+    from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 
     rows = verify_num_draft_tokens
     bs = target_logits.shape[0] // rows
@@ -831,7 +832,7 @@ def verify_target_probs(*, target_logits: torch.Tensor, sampling_info, verify_nu
             logits=target_logits, temperatures=sampling_info.temperatures, rows_per_request=rows
         )
     else:
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits, sampling_info=sampling_info, draft_token_num=rows, bs=bs
         )
     return target_probs.view(bs, rows, -1)
@@ -1074,6 +1075,7 @@ class DsparkStepObservers:
         target_logits: Optional[torch.Tensor],
         layout,
         confidence: Optional[torch.Tensor],
+        confidence_raw: Optional[torch.Tensor],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         draft_block,
@@ -1089,38 +1091,34 @@ class DsparkStepObservers:
         cut_verify_lens: Optional[torch.Tensor] = None,
         cut_calibrated: bool = False,
         cut_confidence: Optional[torch.Tensor] = None,
-        folded_confidence_raw: Optional[torch.Tensor] = None,
         confidence_hidden: Optional[torch.Tensor] = None,
     ) -> None:
         """``cut_verify_lens`` is the confidence cut's [bs] verify widths when it set this verify's (forced widths
         while it calibrates, then ``cut_calibrated``), else None; ``cut_confidence`` the confidences it read (a sampled
-        verify's re-tempered ones), ``confidence`` when not given. ``folded_confidence_raw`` is the folded proposal's
-        pre-STS confidence logits when its draft graph records them (static STS collection), else None."""
+        verify's re-tempered ones), ``confidence`` when not given."""
         if cut_confidence is None:
             cut_confidence = confidence
         if self._verify_markers is not None:
             self._verify_markers.end(forward_ct=forward_ct, bs=bs)
         planner = self._planner
-        if not proposal_folded or folded_confidence_raw is not None:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-                confidence_raw=folded_confidence_raw,
-                draft_block=draft_block,
-                sampling_info=sampling_info,
-                correct_len=correct_len,
-                confidence_hidden=confidence_hidden,
-            )
-        if not proposal_folded:
-            self._confidence_probe.maybe_observe(
-                carries_confidence=planner.carries_confidence,
-                is_compact_mode=planner.is_compact_mode,
-                confidence_raw=planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-            )
+        self._maybe_record_sts_collect(
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=target_logits,
+            bs=bs,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            correct_len=correct_len,
+            confidence_hidden=confidence_hidden,
+        )
+        self._confidence_probe.maybe_observe(
+            carries_confidence=planner.carries_confidence,
+            is_compact_mode=planner.is_compact_mode,
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=target_logits,
+            bs=bs,
+        )
         if self._block_accept_recorder is not None and not proposal_folded:
             self._block_accept_recorder.observe_verify_step(
                 forward_ct=forward_ct,
@@ -1218,10 +1216,10 @@ class DsparkStepObservers:
     def _maybe_record_sts_collect(
         self,
         *,
+        confidence_raw: Optional[torch.Tensor],
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
         bs: int,
-        confidence_raw: Optional[torch.Tensor] = None,
         draft_block=None,
         sampling_info=None,
         correct_len: Optional[torch.Tensor] = None,
@@ -1231,10 +1229,6 @@ class DsparkStepObservers:
         rejection-sampling outcome the sampled STS fit labels with (dspark_sts_fit --label)."""
         if not self._sts_collect_path:
             return
-        if not self._planner.carries_confidence:
-            return
-        if confidence_raw is None:
-            confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
             return
         if self._sts_recorder is None:

@@ -26,7 +26,7 @@
 set -u
 WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 ROOT=${ROOT:-/mnt/nvme1/lm-lend}
-PY=/data/models/slang/.venv/bin/python
+PY=/data/models/slang/.venv-upstream/bin/python
 CAPPAIR=$WT/analysis/dsv41-drive/dspark/run_capture_pair.sh
 DRYFLAG=(); [ "${DRY:-0}" = 1 ] && DRYFLAG=(--dry-run)
 cd "$WT" || exit 2
