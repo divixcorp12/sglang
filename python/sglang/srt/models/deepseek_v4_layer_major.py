@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.layer_major.state_store import FieldSpec, StateStore
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -299,7 +300,7 @@ class DeepseekV4LayerMajorAdapter:
             req.swa_branching_seqlen = None
         self.allocator.finalize_ring(handle.extend_full_locs, extend_start=prefix_len, keep_from=keep_from,
                                      ring=handle.ring)
-        req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, keep_from)
+        req.kv.set_evicted_seqlen(ComponentType.SWA, max(req.kv.get_evicted_seqlen(ComponentType.SWA), keep_from))
         handle.finalized = True
 
     def _insert_keep_from(self, req: Req, handle: _Pass, *, prefix_len: int, seq_len: int) -> tuple[int, bool]:
