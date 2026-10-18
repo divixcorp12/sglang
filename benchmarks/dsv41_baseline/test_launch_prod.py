@@ -61,6 +61,15 @@ def _kill(*procs):
             p.wait()
 
 
+def test_the_script_runs_arm_envs_interpreter():
+    sys.path.insert(0, os.path.dirname(SCRIPT))
+    import arm_env
+
+    with open(SCRIPT) as f:
+        assignments = [line.strip() for line in f if line.startswith("py=")]
+    assert assignments == [f"py={arm_env.PYTHON}"]
+
+
 def test_stop_ends_the_server_on_its_port_and_no_other(tmp_path):
     prod, other = _stand_in(PORT), _stand_in(PORT + 1)
     try:

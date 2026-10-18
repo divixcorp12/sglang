@@ -52,12 +52,19 @@ EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
 # byte-identical, reads split ~33% per drive (analysis/dsv41-drive/mirror3/).
 EXPERT_MIRROR_DIRS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
 EXL3_SRC = f"{NVFP4_WORK}/exllamav3"
-EXL3_BUILD_DIR = f"{CC}/exl3-build"
+# The torch 2.14.1 venv (upstream merge, flashinfer 0.7.2) and its own build dirs. The old venv's builds link torch
+# 2.13: torch.utils.cpp_extension keys a build on its sources and flags, not on torch, so a shared directory would load
+# them under 2.14. TORCH_EXTENSIONS_DIR is the Engram host node's and the HiCache hash's; both venvs would otherwise
+# resolve the same ~/.cache/torch_extensions/py313_cu130. The other caches (sglang JIT, Triton, DeepGEMM, FlashInfer)
+# key on package or compiler versions and stay shared.
+UPSTREAM_CACHE = f"{NVFP4_WORK}/upstream-cache"
+EXL3_BUILD_DIR = f"{UPSTREAM_CACHE}/exl3-build"
+TORCH_EXTENSIONS_DIR = f"{UPSTREAM_CACHE}/torch-extensions"
 # GCC 15 builds the optimized EXL3 CPU kernel (validated on it) and, as CXX, every sglang JIT build: host C++ and
 # nvcc's host half through -ccbin.
 EXL3_CPU_CXX = "/opt/rh/gcc-toolset-15/root/usr/bin/g++"
 CUDA_HOME = "/usr/local/cuda-13.2"
-PYTHON = "/data/models/slang/.venv/bin/python"
+PYTHON = "/data/models/slang/.venv-upstream/bin/python"
 GPU_LOCK = f"{NVFP4_WORK}/cc-gpu.lock"
 
 # 262144 since 2026-09-26, for 250k-token prompts; the KV pool then (driver 610.57.04) held ~387k tokens. No prompt
@@ -180,6 +187,7 @@ def base_env() -> dict[str, str]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "SGLANG_EXL3_SRC": EXL3_SRC,
         "SGLANG_EXL3_BUILD_DIR": EXL3_BUILD_DIR,
+        "TORCH_EXTENSIONS_DIR": TORCH_EXTENSIONS_DIR,
         "SGLANG_EXL3_CPU_CXX": EXL3_CPU_CXX,
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
         "SGLANG_DSV41_ENGRAM_TABLE_DIR": ENGRAM_TABLE_DIR,
