@@ -78,6 +78,26 @@ _CONFIDENCE = Invariant(
 )
 _is_npu = is_npu()
 
+# The smallest magnitude an fp16 cast rounds to inf, and where fit_fp16_rows puts a row's largest entry instead.
+_FP16_INF_FROM = 65520.0
+_FP16_FIT_TARGET = 256.0
+
+
+def fit_fp16_rows(x: torch.Tensor) -> torch.Tensor:
+    """``x`` with each row an fp16 cast would overflow scaled by a power of two to put its largest entry near 256.
+
+    The target's hidden for a BOS token (id 0) carries attention-sink activations of ~3e5. An EXL3 main_proj casts its
+    input to fp16, where they turn inf, so the projection, main_norm and that position's draft KV become NaN, and every
+    draft whose 128-token window holds that position is NaN too (0 drafts accepted). main_proj has no bias and
+    main_norm is an RMSNorm, so scaling a row leaves the normalized projection unchanged up to rounding and eps. Every
+    other row is multiplied by exactly 1, so it is unchanged, and the call stays branchless for the folded commit's
+    CUDA graph.
+    """
+    amax = x.abs().amax(dim=-1, keepdim=True).float()
+    shift = torch.ceil(torch.log2(amax / _FP16_FIT_TARGET))
+    scale = torch.where(amax >= _FP16_INF_FROM, torch.exp2(-shift), torch.ones_like(amax))
+    return x * scale.to(x.dtype)
+
 
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
@@ -939,7 +959,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
-        projected, _ = stage0.main_proj(main_hidden)
+        projected, _ = stage0.main_proj(fit_fp16_rows(main_hidden))
         return stage0.main_norm(projected)
 
     def write_target_hidden_kv(
