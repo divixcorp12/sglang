@@ -1159,7 +1159,9 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                     "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
     # Layer-major prefill under DSpark: production since 2026-10-17 (owner), never served on the best arm.
     layer_major = {"SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": ("0", "8192"),
-                   "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1")}
+                   "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1"),
+                   # Lent residency rows: production since 2026-10-18 (owner), after the served lend validation.
+                   "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": (None, "360")}
     rest = {k: v for k, v in differs.items() if k not in prefetch}
     assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
