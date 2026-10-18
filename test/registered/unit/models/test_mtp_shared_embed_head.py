@@ -131,7 +131,7 @@ class RealMtpConstructionTests(unittest.TestCase):
             (qwen3_5_mtp, "get_parallel", _parallel),
             (qwen3_5_mtp, "LogitsProcessor", lambda c: nn.Identity()),
             (qwen3_5, "get_parallel", _parallel),
-            (qwen3_5, "make_layers", lambda *a, **k: (nn.ModuleList(), 0, 0)),
+            (qwen3_5, "make_pp_layers", lambda *a, **k: (nn.ModuleList(), 0, 0)),
             (qwen3_5, "get_stream", lambda name: None),
             (qwen3_5, "is_dp_attention_enabled", lambda: False),
             (qwen4_exp_mtp, "Qwen4ExpModel", lambda *a, **k: nn.Module()),
@@ -327,7 +327,11 @@ class InitLmHeadMetaCheckTests(unittest.TestCase):
             model_runner=SimpleNamespace(
                 model=SimpleNamespace(
                     get_embed_and_head=lambda: (embed, None), lm_head=None
-                )
+                ),
+                # Read for the draft's checkpoint fallback (resolve_draft_embed_and_head), unused when the
+                # target offers its embedding.
+                model_config=SimpleNamespace(model_path="unused", revision=None),
+                load_config=None,
             )
         )
         worker.draft_runner = SimpleNamespace(

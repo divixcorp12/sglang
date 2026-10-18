@@ -1,7 +1,8 @@
 """Regression coverage for Task 10: an EXL3-quantized DSpark draft linear (or
 shared lm_head) has no dense `.weight` (`Exl3LinearMethod.create_weights`
 registers `trellis`/`suh`/`svh`/`mul1` instead). The fused commit-kv-proj
-capability checks and `_base_logits_dtype` used to read `linear.weight`
+capability checks and `_base_logits_dtype` (now upstream's
+`project_through_lm_head`, see TestProjectThroughLmHead) used to read `linear.weight`
 unguarded and raised `AttributeError` for such a linear; they must instead
 recognize "no dense weight" as "the fused/dense path does not apply" so
 `CommitKvProj.execute` takes the per-linear torch path
@@ -9,7 +10,7 @@ recognize "no dense weight" as "the fused/dense path does not apply" so
 through its quant method's module `__call__`.
 
 Fail-first: reverting the guards in dspark_draft_model.py /
-dspark_draft_sampler.py makes `test_weightless_*` below raise
+models/dspark.py makes `test_weightless_*` below raise
 `AttributeError: ... object has no attribute 'weight'` instead of passing.
 """
 
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.speculative.dspark import dspark_draft_model
-from sglang.srt.speculative.dspark_components import dspark_draft_sampler
+from sglang.srt.models.dspark import project_through_lm_head
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -182,34 +183,31 @@ class TestCommitKvProjExecuteRoutesToTorchPath(CustomTestCase):
             self.assertTrue(torch.equal(kv, torch.full((3, 8), 7.0)))
 
 
-class TestBaseLogitsDtype(CustomTestCase):
-    def _model(self, lm_head, markov_dtype=torch.float32):
-        markov_head = torch.nn.Linear(4, 4, dtype=markov_dtype)
-        return SimpleNamespace(lm_head=lm_head, markov_head=markov_head)
+class TestProjectThroughLmHead(CustomTestCase):
+    """The draft's base logits through the shared head. Upstream's sampler takes the step dtype from those logits
+    (``markov_head.step_logits_dtype(base_logits.dtype)``), so ``_base_logits_dtype`` and its ``lm_head.weight``
+    read are gone; what is left of the EXL3 hazard is this projection, which must not read ``.weight`` either."""
 
-    def test_dense_floating_weight_uses_its_own_dtype(self):
-        lm_head = SimpleNamespace(weight=torch.randn(4, 4, dtype=torch.bfloat16))
-        model = self._model(lm_head, markov_dtype=torch.float32)
-        self.assertEqual(
-            dspark_draft_sampler._base_logits_dtype(model), torch.bfloat16
+    def test_dense_head_projects_in_its_weight_dtype(self):
+        weight = torch.randn(6, 4, dtype=torch.bfloat16)
+        lm_head = SimpleNamespace(weight=weight, quant_method=None)
+        hidden = torch.randn(3, 4)
+        out = project_through_lm_head(hidden, lm_head)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(out, torch.matmul(hidden.to(torch.bfloat16), weight.T)))
+
+    def test_weightless_head_applies_its_quant_method(self):
+        """EXL3's shared lm_head has no `.weight` (applies_without_weight=True): reading it would raise."""
+        calls = []
+        quant_method = SimpleNamespace(
+            applies_without_weight=True,
+            apply=lambda layer, x, bias: calls.append(x) or torch.zeros(x.shape[0], 6, dtype=torch.bfloat16),
         )
-
-    def test_packed_non_floating_weight_falls_back_to_markov_head(self):
-        """Pre-existing behaviour: a packed (e.g. int8) `weight` carries no
-        logits dtype, so the kernel's activation dtype (markov_head) wins."""
-        lm_head = SimpleNamespace(weight=torch.zeros(4, 4, dtype=torch.int8))
-        model = self._model(lm_head, markov_dtype=torch.float16)
-        self.assertEqual(dspark_draft_sampler._base_logits_dtype(model), torch.float16)
-
-    def test_weightless_head_falls_back_to_markov_head(self):
-        """The bug: EXL3's shared lm_head has no `.weight` at all
-        (applies_without_weight=True), so `model.lm_head.weight` used to
-        raise AttributeError instead of falling through to markov_head."""
-        lm_head = SimpleNamespace(quant_method=SimpleNamespace(applies_without_weight=True))
-        model = self._model(lm_head, markov_dtype=torch.bfloat16)
-        self.assertEqual(
-            dspark_draft_sampler._base_logits_dtype(model), torch.bfloat16
-        )
+        lm_head = SimpleNamespace(quant_method=quant_method)
+        hidden = torch.randn(3, 4)
+        out = project_through_lm_head(hidden, lm_head)
+        self.assertEqual(out.shape, (3, 6))
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

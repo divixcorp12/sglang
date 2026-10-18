@@ -77,9 +77,10 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.rtp.alloc([req])
         req.init_next_round_input(self.cache)
         req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        prefix = len(req.prefix_indices)
+        prefix_indices = self.cache.prefix_device_indices(req)
+        prefix = len(prefix_indices)
         slot = req.kv.req_pool_idx
-        self.rtp.write((slot, slice(0, prefix)), req.prefix_indices)
+        self.rtp.write((slot, slice(0, prefix)), prefix_indices)
         last_loc = self.rtp.req_to_token[slot, prefix - 1 : prefix] if prefix else torch.tensor([-1])
         full = self.alloc.alloc_extend_swa_tail(
             torch.tensor([prefix]), torch.tensor([prefix]), torch.tensor([n]), torch.tensor([n]),
@@ -126,7 +127,7 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         ).to(torch.int64)
         self.alloc.free_swa_segment(full[:swa_live_from], start_pos=0)
         self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:n])), value=full,
-                                       swa_evicted_seqlen=swa_live_from))
+                                       component_evicted_seqlens={ComponentType.SWA: swa_live_from}))
 
     def _seed_live_prefix_then_tombstone(self, prefix: int, branch: int) -> None:
         """ids[:prefix] fully live; ids[prefix:branch) full-KV live but SWA-tombstoned, chained onto the same
@@ -141,7 +142,8 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.alloc.free_swa_segment(ext, start_pos=prefix)
         value = torch.cat([m.device_indices.to(torch.int64), ext])
         self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:branch])), value=value,
-                                       swa_evicted_seqlen=branch, prev_prefix_len=prefix))
+                                       component_evicted_seqlens={ComponentType.SWA: branch},
+                                       prev_prefix_len=prefix))
 
     def _assert_matches(self, n: int) -> None:
         m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:n]))))

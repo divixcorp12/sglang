@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.nvfp4_online import (
     ModelOptNvFp4OnlineFusedMoEMethod,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.srt.utils.offloader import _iter_streamed_nvfp4_parameters
 from sglang.test.test_utils import CustomTestCase
@@ -195,6 +196,10 @@ class TestDraftMoeNvfp4Requant(CustomTestCase):
             }
         )
         self.moe = FusedMoE.__new__(FusedMoE)
+        # draft_model_build_scope reads the exec and spec bags.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
 
     def test_flag_on_in_draft_scope_requantizes_with_per_tensor_activation(self, _):
         with envs.SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT.override(True):

@@ -7,6 +7,7 @@ import pytest
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components import dspark_worker_v2
 from sglang.srt.speculative.dspark_components.dspark_graphed_verify import (
     draft_graph_allowed,
@@ -150,16 +151,25 @@ def test_an_exl3_draft_captures_unless_disabled():
     assert draft_graph_allowed(_draft("fp8"))
 
 
+@pytest.fixture(autouse=True)
+def _rank0():
+    # The worker logs from rank 0 (get_parallel().tp_rank); this process stands in for it.
+    with get_parallel().override(tp_rank=0):
+        yield
+
+
 def _worker(monkeypatch, draft, log):
     monkeypatch.setattr(dspark_worker_v2, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(dspark_worker_v2, "draft_pp_context", nullcontext)
     worker = object.__new__(DSparkWorkerV2)
+    # Read first: an unset attribute falls through __getattr__ to target_worker, which this stand-in lacks.
+    worker._hosts_draft = True
+    worker._draft_sampler_built = False
     worker._decode_graph_allowed = True
     worker.draft_model = draft
     worker._tp_sync = SimpleNamespace(available_memory_gb=lambda *a, **k: 10.0)
     worker.device = "cuda"
     worker.gpu_id = 0
-    worker.ps = SimpleNamespace(tp_rank=0)
     worker._draft_graph_group = None
     worker._draft_context = nullcontext
     worker._draft_sampler = None

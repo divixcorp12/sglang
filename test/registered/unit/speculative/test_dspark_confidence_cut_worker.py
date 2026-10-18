@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components import dspark_confidence_cut as dw_cut
 from sglang.srt.speculative.dspark_components import dspark_worker_v2 as dw
 from sglang.srt.speculative.dspark_components.dspark_observability import (
@@ -163,8 +164,8 @@ def test_sts_collection_builds_no_cut_so_every_row_is_verified(monkeypatch):
     monkeypatch.setattr(
         dw.ConfidenceCut, "from_envs", classmethod(lambda cls, *, gamma, device: built.append(gamma) or "cut")
     )
-    worker = SimpleNamespace(gamma=GAMMA, device="cpu", ps=SimpleNamespace(tp_rank=0), verify_num_draft_tokens=GAMMA + 1)
-    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True):
+    worker = SimpleNamespace(gamma=GAMMA, device="cpu", verify_num_draft_tokens=GAMMA + 1)
+    with get_parallel().override(tp_rank=0), envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True):
         with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/tmp/sts-collect/shard"):
             assert dw.DSparkWorkerV2._build_confidence_cut(worker) is None
         assert built == []
@@ -174,19 +175,23 @@ def test_sts_collection_builds_no_cut_so_every_row_is_verified(monkeypatch):
 
 
 def test_the_dead_row_refusals_name_the_cut_that_asked(monkeypatch):
-    monkeypatch.setattr(dw, "get_parallel", lambda: SimpleNamespace(enable_dp_attention=False))
     monkeypatch.setattr(dw, "attach_verify_dead_rows", lambda model, dead_rows: 3)
     worker = SimpleNamespace(
         _verify_planner=SimpleNamespace(mode_value="compact"),
-        ps=SimpleNamespace(tp_size=1, tp_rank=0),
         verify_num_draft_tokens=GAMMA + 1,
         device="cpu",
         model_runner=SimpleNamespace(model=None),
     )
-    with pytest.raises(ValueError, match=r"^SGLANG_DSPARK_CONFIDENCE_CUT is unsupported with SGLANG_RAGGED_VERIFY_MODE"):
-        dw.DSparkWorkerV2._init_verify_dead_rows(worker, flag="SGLANG_DSPARK_CONFIDENCE_CUT", description="cut")
-    worker._verify_planner = SimpleNamespace(mode_value="static")
-    dead_rows = dw.DSparkWorkerV2._init_verify_dead_rows(worker, flag="SGLANG_DSPARK_CONFIDENCE_CUT", description="cut")
+    # A published default launch (tp 1, no DP attention) and this process as its rank 0.
+    with get_context().override_server_args(), get_parallel().override(tp_rank=0):
+        with pytest.raises(
+            ValueError, match=r"^SGLANG_DSPARK_CONFIDENCE_CUT is unsupported with SGLANG_RAGGED_VERIFY_MODE"
+        ):
+            dw.DSparkWorkerV2._init_verify_dead_rows(worker, flag="SGLANG_DSPARK_CONFIDENCE_CUT", description="cut")
+        worker._verify_planner = SimpleNamespace(mode_value="static")
+        dead_rows = dw.DSparkWorkerV2._init_verify_dead_rows(
+            worker, flag="SGLANG_DSPARK_CONFIDENCE_CUT", description="cut"
+        )
     assert isinstance(dead_rows, dw.VerifyDeadRows)
 
 
