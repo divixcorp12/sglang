@@ -237,6 +237,17 @@ class TestPassThroughLentSlots(_Base):
         self.assertEqual(residency.buffer.reloaded_rows, 4)  # chunk 1 and 2 adopted 4 distinct experts (1,3,5,7)
         residency.end()
 
+    def test_rows_written_by_an_earlier_layer_are_reloaded_after_a_later_layer_used_fewer(self):
+        manager, _, _, _, tiers = _world({21: [0, 1, 2, 3], 22: [4, 5, 6, 7]})
+        before = _bytes(manager)
+        residency = self.residency(manager, rows=6)
+        self._pass(manager, residency)  # layer 0 adopts 4 rows
+        residency.make_resident(1)
+        manager.caches[1].streamer._gather_experts(torch.tensor([2]))  # layer 1 restarts at row 0 and adopts 1
+        residency.restore()
+        self.assertTrue(torch.equal(manager.caches[22].tensors["rows"], before[22]))
+        self.assertEqual(residency.buffer.written, 4)
+
     def test_only_written_slots_are_reloaded(self):
         manager, _, _, _, tiers = _world({21: [0, 1, 2, 3], 22: [4, 5, 6, 7]})
         residency = self.residency(manager, rows=6)

@@ -213,6 +213,8 @@ class LentPrefillResidency(PrefillResidency):
         self.tensors = {}
         self.row_of_expert = torch.full((num_experts,), -1, dtype=torch.long, device=device)
         self.used = 0
+        # Every layer of the pass restarts at row 0, so the rows to reload are those below the most any layer used.
+        self.written = 0
         self.streamer: Any = None
         self.adopted_rows = 0
         self.hit_rows = 0
@@ -297,6 +299,7 @@ class LentPrefillResidency(PrefillResidency):
         self._copy(entries, staged, torch.arange(take, dtype=torch.long, device=self.device), take, to_lent=True)
         self.row_of_expert[experts[:take].long()] = entries
         self.used += take
+        self.written = max(self.written, self.used)
         self.adopted_rows += take
         return take
 
@@ -316,7 +319,7 @@ class LentPrefillResidency(PrefillResidency):
         changed = set(self.verify())
         failed: set[int] = set()
         by_layer: dict[int, list[int]] = {}
-        for entry in range(self.used):
+        for entry in range(self.written):
             if entry not in changed and self.original[entry] >= 0:
                 by_layer.setdefault(self.plan[entry].layer_id, []).append(entry)
         for entries in by_layer.values():
@@ -409,7 +412,7 @@ class LentPrefillResidency(PrefillResidency):
 
     def summary(self) -> str:
         return (
-            f"{self.rows} slots lent, {self.used} written, {self.reloaded_rows} reloaded in {self.reload_ms:.0f} ms "
+            f"{self.rows} slots lent, {self.written} written, {self.reloaded_rows} reloaded in {self.reload_ms:.0f} ms "
             f"(pinned tier {self.pinned_hit_rows} hits, {self.pinned_miss_rows} misses, "
             f"{self.fallback_gathers} fallback gathers), {self.evicted_rows} evicted"
         )
