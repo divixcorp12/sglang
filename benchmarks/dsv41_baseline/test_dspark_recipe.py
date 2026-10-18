@@ -63,6 +63,7 @@ def test_prod_prefills_layer_major_under_dspark_and_the_arms_do_not():
     assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "8192"
     assert env["SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"] == "1"
     assert "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS" not in env
+    assert "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND" not in env
     assert arm_env.dspark_env()["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
     assert "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK" not in arm_env.dspark_env()
     # The gate's launch checks production meets: one running request and the DSpark algorithm.

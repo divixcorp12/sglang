@@ -13,6 +13,9 @@
 #                   run's, so pair the compare with --allow-head-mismatch; the prompt-hash check still
 #                   refuses a mismatched corpus.
 #
+# EXTRA_ENV_JSON='{"K": "V", ...}' (environment) adds env assignments on top of the arm_env recipe, e.g. the expert
+# residency lend; each must appear in env.txt or the run refuses.
+#
 # Writes env.txt, argv.txt, driver.log, server.log, vram.csv, numa.log, phases.txt and retries.txt to
 # <out_root>/<arm>/, and the case results to <out_root>/<arm>.jsonl.
 # Takes rowimg-disk.lock, then cc-gpu.lock (waits, never breaks them), exactly as chunk_smoke.sh.
@@ -65,8 +68,9 @@ while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do 
 ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exit 1; }
 
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
+import json, os
 import arm_env
-e = arm_env.arm_env({'SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS': '$MIN_TOKENS'})
+e = arm_env.arm_env({'SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS': '$MIN_TOKENS', **json.loads(os.environ.get('EXTRA_ENV_JSON') or '{}')})
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')
@@ -74,6 +78,12 @@ for k, v in e.items(): print(f'{k}={v}')
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
 grep -q "^SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=$MIN_TOKENS\$" $OUT/env.txt || { say "min_tokens missing from env; refusing"; exit 1; }
+while IFS= read -r kv; do
+  grep -qxF "$kv" $OUT/env.txt || { say "extra env $kv missing from env.txt; refusing"; exit 1; }
+done < <(PYTHONPATH=$H $PY -c "
+import json, os
+for k, v in json.loads(os.environ.get('EXTRA_ENV_JSON') or '{}').items(): print(f'{k}={v}')
+")
 mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 argv = arm_env.ServerArgs(port=$PORT).argv()

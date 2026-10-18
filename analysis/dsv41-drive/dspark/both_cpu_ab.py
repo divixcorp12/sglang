@@ -622,15 +622,24 @@ ARMS[LAYER_MAJOR_RESIDENCY_ARM] = (
     {**ARMS[LAYER_MAJOR_SMALL_HOT_ARM][0], RESIDENCY: str(RESIDENCY_ROWS)},
     True,
 )
+# Stage 1 (branch layer-major-lend): the residency rows are the late layers' hot-cache slots, lent for the pass and
+# reloaded from the pinned tier before the tail, so the hot cache keeps its full size. -lend is production with the rows
+# and the lend alone: a decode A/B against -prod (the hot cache and calibration are production's), and a TTFT pair
+# against -res.
+LEND = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
+LAYER_MAJOR_LEND_ARM = LAYER_MAJOR_ARM + "-lend"
+ARMS[LAYER_MAJOR_LEND_ARM] = ({**ARMS[LAYER_MAJOR_ARM][0], RESIDENCY: str(RESIDENCY_ROWS), LEND: "1"}, True)
 PROD_ARMS = (
-    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM
+    PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM,
+    LAYER_MAJOR_LEND_ARM,
 )
 ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm in PROD_ARMS})
 # An arm's speculative-decoding flags, appended to its argv (server_flags) and to its probe server's.
 ARM_SPEC_FLAGS = {CONFIDENCE_CUT_ARM: ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)}
 REFERENCE.update(
     {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM, LAYER_MAJOR_ARM: PROD_ARM,
-     LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM}
+     LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM,
+     LAYER_MAJOR_LEND_ARM: PROD_ARM}
 )
 
 

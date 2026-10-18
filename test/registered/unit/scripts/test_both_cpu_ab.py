@@ -405,7 +405,8 @@ STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-con
 LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
 LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM = f"{LAYER_MAJOR_ARM}-smallhot", f"{LAYER_MAJOR_ARM}-res"
 LAYER_MAJOR_ARMS = (LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS)
+LAYER_MAJOR_LEND_ARM = f"{LAYER_MAJOR_ARM}-lend"
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS, LAYER_MAJOR_LEND_ARM)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1247,7 +1248,7 @@ def test_the_residency_pair_differs_only_in_the_residency_rows_and_both_give_up_
     ab = _ab()
     residency, hot = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS", "SGLANG_MOE_HOT_GPU_MB"
     for arm, (overrides, _) in ab.ARMS.items():
-        assert (residency in overrides) == (arm == LAYER_MAJOR_RESIDENCY_ARM), arm
+        assert (residency in overrides) == (arm in (LAYER_MAJOR_RESIDENCY_ARM, LAYER_MAJOR_LEND_ARM)), arm
     lm, small, res = (ab.ARMS[a][0] for a in LAYER_MAJOR_ARMS)
     assert {k: v for k, v in res.items() if k != residency} == small
     assert res[residency] == str(ab.RESIDENCY_ROWS)
@@ -1259,6 +1260,22 @@ def test_the_residency_pair_differs_only_in_the_residency_rows_and_both_give_up_
     assert ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES <= given_up < ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES + 2**20
     assert ab.REFERENCE[LAYER_MAJOR_RESIDENCY_ARM] == LAYER_MAJOR_SMALL_HOT_ARM
     assert all(ab.server_flags(a) == ab.server_flags(PROD_ARM) for a in LAYER_MAJOR_ARMS)
+
+
+def test_the_lend_arm_is_production_with_the_residency_rows_and_the_lend_alone():
+    """-lend keeps production's full hot cache and calibration (the decode bar is the full hot cache) and differs from
+    -prod in the rows and the lend; it is the only arm that sets the lend, and it is measured against -prod. Mutant:
+    the arm shrinks the hot cache, drops the lend, or another arm sets it -- red."""
+    ab = _ab()
+    lend = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
+    for arm, (overrides, _) in ab.ARMS.items():
+        assert (lend in overrides) == (arm == LAYER_MAJOR_LEND_ARM), arm
+    prod, arm = ab.ARMS[PROD_ARM][0], ab.ARMS[LAYER_MAJOR_LEND_ARM][0]
+    assert arm[lend] == "1" and arm["SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"] == str(ab.RESIDENCY_ROWS)
+    assert {k: v for k, v in arm.items() if k not in (lend, "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS")} == prod
+    assert ab.ARMS[LAYER_MAJOR_LEND_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_LEND_ARM] == PROD_ARM
+    assert ab.server_flags(LAYER_MAJOR_LEND_ARM) == ab.server_flags(PROD_ARM)
+    assert ab.PROD_ARMS[-1] == LAYER_MAJOR_LEND_ARM
 
 
 def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_own(monkeypatch):
@@ -1310,4 +1327,4 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
     assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
     assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
-    assert len(layer_major) == len(LAYER_MAJOR_ARMS) and all(STS_PATH_FLAG not in a for a in layer_major)
+    assert len(layer_major) == len(LAYER_MAJOR_ARMS) + 1 and all(STS_PATH_FLAG not in a for a in layer_major)
