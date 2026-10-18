@@ -2,6 +2,7 @@
 replaced, and that _accept_sampling_core applies it under block verification only (CPU; the kernel's output law is
 checked by the GPU distribution test)."""
 
+import unittest
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,7 +13,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     replace_dead_target_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -26,7 +26,7 @@ def _rows(seed=0):
     return target, draft
 
 
-class TestReplaceDeadTargetRows(CustomTestCase):
+class TestReplaceDeadTargetRows(unittest.TestCase):
     def _check(self, verify_lens):
         target, draft = _rows()
         # Poison what the guard must replace: dead rows may hold NaN or Inf.
@@ -85,7 +85,7 @@ class TestReplaceDeadTargetRows(CustomTestCase):
         self.assertTrue(torch.equal(target, before))
 
 
-class TestGuardWiring(CustomTestCase):
+class TestGuardWiring(unittest.TestCase):
     """_accept_sampling_core hands the kernel guarded rows under block verification and the raw rows otherwise."""
 
     def _run(self, *, block_verification, cutoff_verify_lens):
@@ -144,6 +144,4 @@ class TestGuardWiring(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
