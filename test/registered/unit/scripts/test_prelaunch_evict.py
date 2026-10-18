@@ -89,6 +89,28 @@ def test_a_start_below_the_floor_evicts_once_then_refuses_with_the_holders(tmp_p
     assert record["page_cache_holders"]["holders"][0]["path"] == str(holders / "co-tenant")
 
 
+def test_layer_major_state_store_raises_the_default_floor_and_the_log_names_it(tmp_path):
+    # Arm A's default rest predates layer-major's 5 GiB node-1 StateStore: added to it, and named on the floor's line.
+    floor = pe.node1_floor("", 12.67, 1.0, 5.0)
+    assert floor["floor_gib"] == round(12.67 + 51.24 + 5.0 + 1.0, 2) and floor["layer_major_state_gib"] == 5.0
+    # 66.0 GiB free passes 64.91 without the StateStore and is short of 69.91 with it.
+    r, record = _main(tmp_path, 66.0, "--hicache-gib", "12.67", "--layer-major-state-gib", "5.0")
+    assert r.returncode == 3 and record["floor_gib"] == 69.91
+    assert "node-1 floor 69.91 GiB = HiCache 12.67 + rest 51.24 (default (arm A, 2026-10-15)) " \
+           "+ layer-major StateStore 5.0 + margin 1.0" in r.stdout
+    (tmp_path / "off").mkdir()
+    r, record = _main(tmp_path / "off", 66.0, "--hicache-gib", "12.67")
+    assert r.returncode == 0 and record["layer_major_state_gib"] == 0.0 and "StateStore" not in r.stdout
+
+
+def test_a_previous_memsample_already_holds_the_state_store(tmp_path):
+    lines = [_sample(60, 0.4), _sample(4, 12.4)]
+    path = tmp_path / "prev.memsample.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    floor = pe.node1_floor(str(path), 11.75, 1.0, 5.0)
+    assert floor["layer_major_state_gib"] == 0.0 and floor["floor_gib"] == 56.75
+
+
 def test_above_the_floor_it_is_ready_and_names_no_holders(tmp_path):
     r, record = _main(tmp_path, 80.0)
     assert r.returncode == 0 and record["ready"] is True and "page_cache_holders" not in record

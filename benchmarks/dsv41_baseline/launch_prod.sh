@@ -92,6 +92,7 @@ import os
 import arm_env as a
 roots = os.environ.get("LAUNCH_PROD_PAGE_CACHE_ROOTS")
 out = ["--hicache-gib", a.PROD_NODE1_HICACHE_GIB, "--margin-gib", a.PROD_NODE1_MARGIN_GIB,
+       "--layer-major-state-gib", a.layer_major_state_gib(a.prod_env()),
        "--wait-min", a.PROD_FLOOR_WAIT_MIN, "--node0-warn-gib", a.PROD_NODE0_WARN_GIB,
        "--holders-budget-s", os.environ.get("LAUNCH_PROD_HOLDERS_BUDGET_S", "60")]
 for port in a.PROD_PRELAUNCH_SKIP_EVICT_PORTS:
