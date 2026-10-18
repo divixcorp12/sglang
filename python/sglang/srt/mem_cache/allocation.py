@@ -296,7 +296,7 @@ def _evict_for_ring(
     holds one ring, so charging it the full extend length would evict nearly
     every cached window to free a few thousand ring slots.
     """
-    if tree_cache is None or tree_cache.is_chunk_cache():
+    if tree_cache is None:
         return
     full_shortfall = max(0, full_target - allocator.full_available_size())
     swa_shortfall = max(0, swa_target - allocator.swa_available_size())
