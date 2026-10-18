@@ -15,6 +15,13 @@ METRICS = "SGLANG_MOE_HOT_METRICS_FILE"
 STS_COLLECT = "SGLANG_DSPARK_STS_COLLECT_PATH"
 CONFIDENCE_CUT = "SGLANG_DSPARK_CONFIDENCE_CUT"
 STS_PATH_FLAG = "--speculative-dspark-confidence-sts-path"
+BLOCK_FLAG = "--speculative-use-block-verification"
+SAMPLED_KNOBS = (
+    "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL",
+    "SGLANG_DSPARK_USE_GREEDY_DRAFT",
+)
 
 
 def _ab():
@@ -402,12 +409,15 @@ PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 # Production's arm (-expseg with production's additions) and the confidence cut's two arms built on it.
 PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
 STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
+SAMPLED_CUT_ARM = f"{CONFIDENCE_CUT_ARM}-sampled"
+SAMPLED_CUT_BLOCK_ARM = f"{SAMPLED_CUT_ARM}-block"
 LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
 LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM = f"{LAYER_MAJOR_ARM}-smallhot", f"{LAYER_MAJOR_ARM}-res"
 LAYER_MAJOR_ARMS = (LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
 LAYER_MAJOR_LEND_ARM = f"{LAYER_MAJOR_ARM}-lend"
 CHUNKED_ARM = f"{PROD_ARM}-chunked"
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS, LAYER_MAJOR_LEND_ARM, CHUNKED_ARM)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM, *LAYER_MAJOR_ARMS,
+             LAYER_MAJOR_LEND_ARM, CHUNKED_ARM)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1147,6 +1157,7 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
         "SGLANG_DSPARK_TOP_PROB_GATE": "0",
         CONFIDENCE_CUT: "0",
         STS_COLLECT: "",
+        **{k: "0" for k in SAMPLED_KNOBS},
         "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS": "",
         "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK": "0",
         "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB": "5",
@@ -1212,9 +1223,11 @@ def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the
     monkeypatch.setenv(STS_COLLECT, "/shell/sts")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[CONFIDENCE_CUT] == ("1" if arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM) else "0"), arm
+            cut_arms = (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM)
+            assert overrides[CONFIDENCE_CUT] == ("1" if arm in cut_arms else "0"), arm
             assert (overrides[STS_COLLECT] != "") == (arm == STS_COLLECT_ARM), arm
-        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm == CONFIDENCE_CUT_ARM), arm
+        sts_arms = (CONFIDENCE_CUT_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM)
+        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm in sts_arms), arm
     prod = {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k != CONFIDENCE_CUT}
     for arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM):
         cut = ab.ARMS[arm][0]
@@ -1224,6 +1237,40 @@ def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the
     flags = ab.server_flags(CONFIDENCE_CUT_ARM)
     assert flags[:-2] == ab.server_flags(PROD_ARM)
     assert flags[-2:] == (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+
+
+def test_the_sampled_cut_arms_are_prod_with_the_sampled_knobs_and_block_verification_adds_its_flag_alone(monkeypatch):
+    """-confcut-sampled is -prod plus the cut, its sampled path, the draft's time in T(w) and no online refit, on the
+    greedy STS file; -confcut-sampled-block is that plus --speculative-use-block-verification alone. The draft stays
+    sampled: SGLANG_DSPARK_USE_GREEDY_DRAFT is 0 in every arm, whatever the shell exports. Every other arm pins the
+    sampled knobs off. Mutant: an arm drops a knob, turns the greedy draft on, the block arm changes env, or block
+    verification reaches another arm -- red."""
+    ab = _ab()
+    for key in SAMPLED_KNOBS:
+        monkeypatch.setenv(key, "1")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0", arm
+            if arm not in (SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM):
+                assert all(overrides[k] == "0" for k in SAMPLED_KNOBS), arm
+        assert (BLOCK_FLAG in ab.server_flags(arm)) == (arm == SAMPLED_CUT_BLOCK_ARM), arm
+    prod = ab.ARMS[PROD_ARM][0]
+    for arm in (SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM):
+        env = ab.ARMS[arm][0]
+        assert {k: v for k, v in env.items() if prod.get(k) != v} == {
+            CONFIDENCE_CUT: "1",
+            "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED": "1",
+            "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST": "1",
+        }, arm
+        assert env["SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL"] == "0" and env["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0"
+        assert ab.ARMS[arm][1] is True and arm in ab.PROD_ARMS
+    assert ab.ARMS[SAMPLED_CUT_ARM][0] == ab.ARMS[SAMPLED_CUT_BLOCK_ARM][0]
+    assert ab.REFERENCE[SAMPLED_CUT_ARM] == PROD_ARM and ab.REFERENCE[SAMPLED_CUT_BLOCK_ARM] == SAMPLED_CUT_ARM
+    sts = (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+    assert ab.ARM_SPEC_FLAGS[SAMPLED_CUT_ARM] == sts
+    assert ab.ARM_SPEC_FLAGS[SAMPLED_CUT_BLOCK_ARM] == (*sts, BLOCK_FLAG)
+    assert ab.server_flags(SAMPLED_CUT_BLOCK_ARM) == ab.server_flags(SAMPLED_CUT_ARM) + (BLOCK_FLAG,)
+    assert ab.server_flags(SAMPLED_CUT_ARM)[:-2] == ab.server_flags(PROD_ARM)
 
 
 def test_the_production_arms_prefill_layer_major_and_every_other_arm_keeps_it_off():
