@@ -190,6 +190,9 @@ def base_env() -> dict[str, str]:
         "TORCH_EXTENSIONS_DIR": TORCH_EXTENSIONS_DIR,
         "SGLANG_EXL3_CPU_CXX": EXL3_CPU_CXX,
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
+        # Upstream 6bbd689ab4 raised the default "high" tier from budget 50 to 75, which changes every answer from
+        # token 0 and lengthens reasoning (32k prompt: 617 -> 1601 tokens). Pinned to the pre-merge budget (owner).
+        "SGLANG_DSV41_REASONING_EFFORT": "50",
         "SGLANG_DSV41_ENGRAM_TABLE_DIR": ENGRAM_TABLE_DIR,
         "SGLANG_DSV41_TORCH_PREFILL_INDEXER": "1",
         # Chunks the prefill indexer's score tensor: a 30k/32k prompt peaks 3.0 GiB lower with no OOM retries, and
