@@ -64,8 +64,10 @@ def _residency(model_runner):
         raise ValueError(f"SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS={rows} must be 0 (off) or a row count")
     if rows == 0:
         return NullResidency()
-    from sglang.srt.layers.moe.prefill_residency import Exl3LayerMajorResidency
+    from sglang.srt.layers.moe.prefill_residency import Exl3LayerMajorResidency, Exl3LendingLayerMajorResidency
 
+    if envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get():
+        return Exl3LendingLayerMajorResidency(model_runner, rows)
     return Exl3LayerMajorResidency(model_runner, rows)
 
 
