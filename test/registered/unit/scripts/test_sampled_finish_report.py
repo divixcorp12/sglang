@@ -153,12 +153,12 @@ def test_the_driver_dry_run_prints_the_three_arms_envs_and_the_sampled_argv_and_
     for res, name in zip(resolved, ("prod", "cut", "block")):
         env, argv = res[name], res["argv"]
         assert env["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0"
-        on = name != "prod"
-        assert env["SGLANG_DSPARK_CONFIDENCE_CUT"] == ("1" if on else "0")
-        assert env["SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED"] == ("1" if on else "0")
-        assert env["SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST"] == ("1" if on else "0")
+        # The sampled cut shipped on 2026-10-18, so -prod and the cut arm are the same configuration.
+        assert env["SGLANG_DSPARK_CONFIDENCE_CUT"] == "1"
+        assert env["SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED"] == "1"
+        assert env["SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST"] == "1"
         assert env["SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL"] == "0"
-        assert ("--speculative-dspark-confidence-sts-path" in argv) == on
+        assert "--speculative-dspark-confidence-sts-path" in argv
         assert ("--speculative-use-block-verification" in argv) == (name == "block")
     caps = [x for x in lines if x.strip().startswith("capture: ")]
     assert len(caps) == 3

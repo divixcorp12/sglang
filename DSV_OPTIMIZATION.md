@@ -1477,7 +1477,49 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - divix01 has ccache 4.11.3 system-wide (`/etc/profile.d/ccache.sh`), `~/.config/ccache/ccache.conf` max_size 50G.
   Build-time measurements must set `CCACHE_DISABLE=1`.
 
-### 3.12 DSpark confidence-head verify cut — branch `confidence-cut` (`60852853fd`), NOT merged, off by default
+### 3.12 DSpark confidence-head verify cut — MERGED; the sampled cut is on in production (owner, 2026-10-18)
+
+- **Shipped 2026-10-18 (owner): the cut for sampled requests, without block verification.** Production's env
+  (`arm_env.PROD_DSPARK_CUT_ENV`) sets `SGLANG_DSPARK_CONFIDENCE_CUT=1`, `..._CUT_SAMPLED=1`, `..._CUT_DRAFT_COST=1`
+  (draft time priced into T(w)) and `..._CUT_REFIT_INTERVAL=0` (one sample cannot judge an online refit);
+  `ServerArgs.prod()` passes `--speculative-dspark-confidence-sts-path` with the greedy STS file below. The draft stays
+  sampled (`SGLANG_DSPARK_USE_GREEDY_DRAFT` off). `check_prod_assets` now also checks that file's sha256, so production
+  refuses to start without the fitted file. The A/B's `-prod-confcut-sampled` arm is now identical to `-prod`.
+  - **Served sampled A/B** (2026-10-18, sampled at temperature 0.6 / top-p 0.95, long prompt, 420 s decode, KV 381,184,
+    `/mnt/nvme1/sampled-finish-20261018`, `report.txt`, `report-cutretry.txt`; `wt-sf-ab` @ `08d7acdbe1` plus the driver
+    fixes). Block verification and the accept kernels logged no late device loads:
+
+    | 60-360 s | -prod | cut | cut, second run | cut + block |
+    |---|---:|---:|---:|---:|
+    | ms/token | 73.14 | 61.60 | 66.27 | 62.02 (60-358 s) |
+    | decode tok/s | 13.7 | 16.2 | 15.1 | 16.1 |
+    | ms per verify | 186.2 | 130.4 | 138.2 | 139.4 |
+    | tokens per verify | 2.55 | 2.12 | 2.09 | 2.25 |
+    | accept length (decode log) | 2.66 | 2.22 | 2.15 | 2.27 |
+    | TTFT | 14.39 s | 14.47 s | 14.22 s | 14.17 s |
+
+    - The cut is 9.4-15.8% faster on ms/token and 25.8-30.0% on ms per verify, depending on which cut run is read.
+    - **Run-to-run noise is about 7%**: the two cut runs differ by 61.6 vs 66.3 ms/token (6,752 vs 6,299 tokens in 420 s).
+      Each arm has one or two samples, so a 5% bar is inside the noise for ms/token; the ms per verify gain is the more
+      robust number.
+    - **Tokens per verify and accept length fall by design**: the cut verifies fewer rows (verify-weighted w* about 2.6 of
+      6). Read literally, the ship rule's "accept not lower" cannot pass for any cut; the owner shipped on the speed result.
+    - **Block verification is not shipped.** Block over cut-only was -0.7% ms/token and -6.9% ms per verify against the
+      first cut run, and +6.4% and -0.9% against the second: inconclusive, below the 5% bar. The block run also ended
+      itself at 358 s (finish "stop"), so its 60-360 s window is 60-358 s. The block arm stays in `both_cpu_ab`
+      (`-prod-confcut-sampled-block`).
+    - **T(w) calibration** (post-warm-up, 96 verifies, 16 per width): a=131.9 ms, b=51.8 ms/row, r2=0.55 (first cut run);
+      a=154.6, b=54.8, r2=0.43 (second); a=149.3, b=60.1, r2=0.50 (block). The fit is still noisy (r2 about 0.5).
+    - **Trace overflow and warn-only.** The cut runs overflowed the copy-engine job-trace buffer (1,048,576 events a
+      file; 181,212 and 135,317 dropped) because they verify more per second, and `spec_margin.py` refused the run
+      (rc=1) although the decode was complete. That drop affects only the diagnostic trace, not decode or the verify
+      count. `spec_margin_capture.py --analysis-warn-only` (set by `run_sampled_finish_ab.sh`) now logs it as a WARNING
+      with the dropped count and does not fail the arm; the server env is unchanged. The report flags truncation only
+      when the verify or device-stamp files drop events.
+  - Tools: `analysis/dsv41-drive/dspark/run_sampled_finish_ab.sh` (three arms; `--only` adds arms to a finished
+    directory) and `sampled_finish_report.py`.
+
+- (history) The cut began as branch `confidence-cut` (`60852853fd`), off by default.
 
 - **What it does.** At batch size 1 with greedy sampling, each verify keeps the w* rows that maximise
   (1 + sum_{k<w} S_k) / T(w). S_k is the STS-calibrated cumulative product of the draft's trained Markov confidence
