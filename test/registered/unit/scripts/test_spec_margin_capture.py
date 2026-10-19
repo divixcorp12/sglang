@@ -108,3 +108,25 @@ def test_the_capture_logs_routes_router_inputs_and_verify_accepts_unless_told_no
     off = cap.server_env("/out", False, arm="dspark-both", verify_split=False)
     assert not any(k in off for k in ("SGLANG_DSV41_EXPERT_TRACE_PATH", "SGLANG_DSV41_ROUTER_CAPTURE_PATH",
                                       "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH"))
+
+
+def test_the_default_client_is_the_greedy_session_probe_and_prompts_files_make_it_sample(tmp_path):
+    cap = _capture()
+    default = cap.client_argv(cap.parse_args([str(tmp_path)]))
+    assert "--prompts-file" not in default and "--temperature" not in default and "--top-p" not in default
+    assert default[default.index("--top-logprobs") + 1] == "1"
+    prompts = tmp_path / "p.json"
+    prompts.write_text("[]")
+    a = cap.parse_args([str(tmp_path), "--prompts-file", str(prompts), "--temperature", "0.6", "--top-p", "0.95",
+                        "--max-tokens", "768"])
+    argv = cap.client_argv(a)
+    assert argv[argv.index("--temperature") + 1] == "0.6" and argv[argv.index("--top-p") + 1] == "0.95"
+    assert argv[argv.index("--max-tokens") + 1] == "768" and argv[argv.index("--top-logprobs") + 1] == "0"
+    assert argv[argv.index("--prompts-file") + 1] == str(prompts)
+    assert cap.capture_env(a)["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] == cap.LONG_TRACE_CAPACITY
+
+
+def test_sampling_flags_need_a_long_prompt_or_a_prompts_file(tmp_path):
+    cap = _capture()
+    with pytest.raises(SystemExit):
+        cap.parse_args([str(tmp_path), "--temperature", "0.6"])

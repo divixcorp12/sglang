@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +58,8 @@ class StsDataRecorder:
       greedy verify or when the caller passed none.
     - ``markov_prev_tokens`` [n, gamma] int64: the tokens the head's Markov embedding reads (the anchor, then drafts
       1..gamma-1); -1 when the caller passed none.
+    - ``record_ns`` [n] int64: CLOCK_MONOTONIC when the verify was recorded, to map rows back to the request that was
+      being served (a client logging its requests' CLOCK_MONOTONIC spans).
     - ``head_hidden`` [n, gamma, hidden] float16: the confidence head's hidden input, for retraining the head offline.
       Written for at most HEAD_HIDDEN_MAX_VERIFIES verifies per launch, and only in a shard where every verify has it.
     """
@@ -81,6 +84,7 @@ class StsDataRecorder:
                 *self.DRAFT_FEATURES,
                 *self.TARGET_FEATURES,
                 "markov_prev_tokens",
+                "record_ns",
             )
         }
         self._head_hidden: list[Optional[torch.Tensor]] = []
@@ -146,6 +150,7 @@ class StsDataRecorder:
             if markov_prev_tokens is None
             else markov_prev_tokens.detach().to(device="cpu", dtype=torch.int64)
         )
+        self._buffers["record_ns"].append(torch.full((bs,), time.monotonic_ns(), dtype=torch.int64))
         if head_hidden is not None and self.records_head_hidden():
             self._head_hidden.append(head_hidden.detach().to(device="cpu", dtype=torch.float16))
             self.head_hidden_ct += bs

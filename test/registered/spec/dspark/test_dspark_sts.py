@@ -167,6 +167,10 @@ class TestStsDataRecorder(CustomTestCase):
         self.assertTrue(torch.equal(shard["sampled_prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.isnan(shard["accept_rates"]).all())
         self.assertTrue(torch.isnan(shard["temperatures"]).all())
+        # Each row carries the CLOCK_MONOTONIC time it was recorded at.
+        self.assertEqual(shard["record_ns"].shape, (4,))
+        self.assertEqual(shard["record_ns"].dtype, torch.int64)
+        self.assertGreater(int(shard["record_ns"][0]), 0)
 
     def test_records_the_sampled_accepts_outcome_rates_and_temperatures(self):
         gamma = 3
