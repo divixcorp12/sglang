@@ -24,7 +24,9 @@ def forward_verify_with_reverify(model_runner, forward):
     overflowed = manager.take_verify_overflow(graphed=graphed)
     if not overflowed and not (graphed and envs.SGLANG_TEST_DSPARK_FORCE_REVERIFY.get()):
         return out
-    with manager.suspend_graph_gather(), model_runner.decode_cuda_graph_runner.eager_only():
+    # The residency clock saw the discarded forward as a verify; the worker commits once per step, for the re-run.
+    manager.discard_overflowed_verify()
+    with manager.suspend_graph_gather(),model_runner.decode_cuda_graph_runner.eager_only():
         return forward()
 
 
