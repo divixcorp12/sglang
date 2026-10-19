@@ -1602,9 +1602,30 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
     - the debug confidence metrics and `block_accept_recorder` read every row's logits;
     - dead routes count toward row 0's experts in the planner route counts.
     Outputs are unaffected. Fix them if any of those metrics gets used for a decision.
+- **Sampled STS recalibration (owner, 2026-10-18): not shipped; production keeps the greedy STS file.**
+  - Data: 6,758 verifies over 32 prompts (24 from `hot-cache-policy/prompts_varied.json`, 8 short answers in
+    `dspark/prompts_short_answer.json`) at T=0.6, top-p 0.95, thinking on, 768 new tokens each, collected at
+    `4a2e4e9602` (`-prod-stscollect`, KV 381,184). Rows map to prompts through the shards' `record_ns` and
+    `probe.json`'s CLOCK_MONOTONIC spans. 116 rows with NaN draft features were dropped. The recorder lost its partial
+    last shard, so short answers 6 and 7 have no rows and the short-answer category has only 214.
+  - Result (4-fold CV holding out whole prompts, stratified by category; `sts_cut_replay` ms/token at the served cost
+    a=131.9, b=51.8, draft 5.8 ms): (a) greedy STS 99.25; (b) per-position temperature fitted to the sampled label
+    +0.2%; (c) per-position temperature plus additive logit bias, fitted to the replayed ms/token, -0.9%; (d) logistic
+    regression over head logit, q(d_k), top-1 probability and entropy, -2.0% (offline only). Constant w=2 112.8,
+    every row 147.9, realized oracle 83.8. SAMPLE_PROMPT_DIVIX01 as an extra test set: (a) 117.85, (d) 116.25. No
+    candidate reaches the bar of 3% overall with no category losing more than 3%.
+  - Why: the T=10 pin of 2026-10-17 was a single-prompt artifact. On 32 prompts the sampled temperatures are 1.0, 0.89,
+    1.12, 1.0, 1.26, close to the greedy file's. The head's signal for sampled acceptance is weak: AUC at position 1 is
+    about 0.62 (draft q, top-1 and entropy are no better there), which caps what recalibrating it can do.
+  - Next lever, if one is wanted: a retrained confidence head (`head_hidden` and the draft/target features are in
+    the shards). (c) would need an optional `biases` list in the STS JSON and its loader; (d) needs the draft features
+    at cut time.
+  - Caveat: the ms/token figures rest on a fixed affine T(w) and an assumed 5.8 ms draft cost. The startup T(w) fit
+    is noisy (see above), and a live A/B could differ.
+  - Results: `divix01:/mnt/nvme1/sts-collect-varied-20261018/cv-draft5.8.json` and `cv-draft0.json` (shards in
+    `collect/sts/`); script `analysis/dsv41-drive/dspark/sts_sampled_cv.py` at `fd3a312795`.
 - **TODO (owner, 2026-10-16):**
-  - Broaden the STS calibration data: collect a few more prompt types (code, chat, short answers) and refit.
-    Positions 4-5 have the fewest samples.
+  - ~~Broaden the STS calibration data~~ Done 2026-10-18: see "Sampled STS recalibration" above.
   - Drive-pressure-aware cost: scale T(w)'s slope by a live NVMe pressure signal (e.g. recent NVMe wait per row), so
     the cut is harder while the SPCC stalls. Check it against the owner's startup-calibration rule first.
   - A per-row cost conditioned on predicted misses: price each extra row by the likelihood that its experts miss

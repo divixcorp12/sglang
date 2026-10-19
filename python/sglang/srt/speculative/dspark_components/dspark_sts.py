@@ -172,3 +172,8 @@ class StsDataRecorder:
             values.clear()
         self._head_hidden.clear()
         self._shard_ct += 1
+
+    def close(self) -> None:
+        """Writes the verifies still buffered as a last, shorter shard (same name and format). Writes nothing when none
+        are pending, so a second call, or one after an exact multiple of ``flush_every``, adds no file."""
+        self.flush()
