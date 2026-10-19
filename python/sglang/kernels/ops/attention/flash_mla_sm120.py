@@ -205,7 +205,8 @@ def _sm120_sparse_decode_fwd(
 
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
-# Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
+# Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback, or flashinfer_prefill for FlashInfer's
+# prefill (more than SM120_DECODE_MAX_TOKENS tokens) with the Triton kernel for decode and the DSpark verify.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
@@ -299,7 +300,8 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
-    Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback.
+    Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback. The ``flashinfer_prefill`` backend
+    sends calls of more than ``SM120_DECODE_MAX_TOKENS`` tokens to FlashInfer's prefill and the rest to Triton.
     """
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
@@ -341,7 +343,24 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
 
-    if _sm120_default_backend == "triton":
+    if (
+        _sm120_default_backend == "flashinfer_prefill"
+        and q.shape[0] > SM120_DECODE_MAX_TOKENS
+    ):
+        return _flash_mla_sm120_prefill(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+
+    if _sm120_default_backend in ("triton", "flashinfer_prefill"):
         from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )

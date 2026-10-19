@@ -586,6 +586,58 @@ class TestEntryPointDispatch(CustomTestCase):
 
 
 @unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+class TestFlashinferPrefillRouting(CustomTestCase):
+    """``flashinfer_prefill`` is FlashInfer above SM120_DECODE_MAX_TOKENS tokens and Triton at or below it."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required")
+        if importlib.util.find_spec("flashinfer.mla._sparse_mla_sm120") is None:
+            raise unittest.SkipTest("FlashInfer SM120 sparse MLA (flashinfer.mla._sparse_mla_sm120) not available")
+        cls.device = torch.device("cuda")
+
+    def _call(self, backend, num_tokens, dual_cache):
+        num_heads, num_pages, page_size, topk = 64, 4, 64, 128
+        k_cache, _ = _build_kvcache(num_pages, page_size, device=self.device, seed=31)
+        extra_cache, _ = _build_kvcache(num_pages, page_size, device=self.device, seed=37)
+        q, indices = _build_q_indices(
+            num_tokens, num_heads, topk, num_pages, page_size, device=self.device, seed=41
+        )
+        topk_length = torch.full((num_tokens,), topk, dtype=torch.int32, device=self.device)
+        sink = torch.linspace(-1.0, 1.0, num_heads, dtype=torch.float32, device=self.device)
+        with mock.patch.object(fmod, "_sm120_default_backend", backend):
+            out, _ = flash_mla_with_kvcache_sm120(
+                q=q,
+                k_cache=k_cache,
+                indices=indices,
+                topk_length=topk_length,
+                attn_sink=sink,
+                head_dim_v=_D,
+                softmax_scale=_D**-0.5,
+                extra_k_cache=extra_cache if dual_cache else None,
+                extra_indices_in_kvcache=indices if dual_cache else None,
+                extra_topk_length=topk_length if dual_cache else None,
+            )
+        return out
+
+    def test_prefill_is_flashinfer_and_decode_is_triton(self):
+        for num_tokens in (1, 6, fmod.SM120_DECODE_MAX_TOKENS, fmod.SM120_DECODE_MAX_TOKENS + 1, 130):
+            for dual_cache in (False, True):
+                with self.subTest(tokens=num_tokens, dual_cache=dual_cache):
+                    routed = self._call("flashinfer_prefill", num_tokens, dual_cache)
+                    expected = "flashinfer" if num_tokens > fmod.SM120_DECODE_MAX_TOKENS else "triton"
+                    reference = self._call(expected, num_tokens, dual_cache)
+                    self.assertEqual(routed.shape, reference.shape)
+                    self.assertTrue(torch.equal(routed, reference))
+                    # the other backend's output differs, so the equality above names the route
+                    other = "triton" if expected == "flashinfer" else "flashinfer"
+                    self.assertFalse(torch.equal(routed, self._call(other, num_tokens, dual_cache)))
+
+
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestTouchedPageSplit(CustomTestCase):
     """The pbs=256 -> pbs=64 split must rewrite only referenced source pages.
 
