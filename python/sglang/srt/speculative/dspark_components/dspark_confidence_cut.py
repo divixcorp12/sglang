@@ -439,7 +439,12 @@ class ConfidenceCut:
             if self.draft_cost and self._draft_ms is not None
             else verify_cost_ms
         )
-        self._cost_ms_tensor = torch.tensor(self._cost_ms, dtype=torch.float32, device=self.device)
+        table = torch.tensor(self._cost_ms, dtype=torch.float32)
+        if self._cost_ms_tensor is None:
+            self._cost_ms_tensor = table.to(self.device)
+        else:
+            # A refit on the serving path: written in place from pinned memory, so it syncs nothing.
+            self._cost_ms_tensor.copy_(table.pin_memory() if self._cost_ms_tensor.is_cuda else table, non_blocking=True)
 
     def _full_width(self, *, bs: int, device) -> torch.Tensor:
         return torch.full((bs,), self.num_widths, dtype=torch.int64, device=device)
