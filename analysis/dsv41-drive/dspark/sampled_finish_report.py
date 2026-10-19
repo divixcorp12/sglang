@@ -99,6 +99,7 @@ def parse_server_log(text: str) -> dict:
 def aggregate(res: dict) -> dict:
     """One arm's headline numbers from long_compare.analyse's result: whole decode and the 60-360 s windows."""
     lo, hi = STEADY_WINDOW_S
+    counted_files_dropped = any("verify" in f or "device-stamps" in f for f in res.get("trace_dropped_files", []))
 
     def over(windows: list[dict]) -> dict:
         tokens = sum(w["tokens"] for w in windows)
@@ -109,7 +110,9 @@ def aggregate(res: dict) -> dict:
             "ms_per_token": seconds * 1e3 / tokens if tokens else None,
             "ms_per_verify": seconds * 1e3 / verifies if verifies else None,
             "tokens_per_verify": tokens / verifies if verifies else None,
-            "truncated": any(w.get("truncated") for w in windows),
+            # Verifies and their times come from the verify and device-stamp files; a drop in another file (the copy
+            # engine's, say) undercounts only the diagnostic columns, so it does not make ms per verify untrustworthy.
+            "truncated": counted_files_dropped and any(w.get("truncated") for w in windows),
         }
 
     steady = [w for w in res["windows"] if w["t0_s"] >= lo and w["t1_s"] <= hi + 1e-6]

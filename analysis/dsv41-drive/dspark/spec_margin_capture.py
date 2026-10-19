@@ -188,6 +188,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--top-k-only", action="store_true")
     p.add_argument("--scorer", choices=("cpu", "gpu"))
     p.add_argument("--arm", choices=tuple(both_cpu_ab.ARMS), default="dspark-both-prefetch")
+    p.add_argument("--analysis-warn-only", action="store_true",
+                   help="a refusal by layer_misses.py or spec_margin.py after a complete run (a job-trace buffer overflow) "
+                        "is printed as a warning and does not fail the capture; the server is unaffected")
     p.add_argument("--no-verify-split", dest="verify_split", action="store_false",
                    help="skip the route log, router capture and accept log (verify_split.py's inputs)")
     p.add_argument("--draft-top-prob", action="store_true",
@@ -304,6 +307,9 @@ def main() -> int:
             [sys.executable, os.path.join(HERE, "spec_margin.py"), events, "--json",
              os.path.join(a.out_dir, "spec_margin.json")]
         ).returncode
+    if rc and a.analysis_warn_only:
+        print(f"WARNING: the post-run analysis exited {rc} (see above); the run itself completed, --analysis-warn-only", flush=True)
+        rc = 0
     if a.verify_split:
         rc = rc or subprocess.run(
             [sys.executable, os.path.join(HERE, "verify_split.py"), a.out_dir, "--json",
