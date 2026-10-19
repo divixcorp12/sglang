@@ -70,6 +70,7 @@ def assign_prompts(rows: dict, probe: list[dict]) -> tuple[dict, list[str]]:
     out = {k: v[inside] for k, v in rows.items() if torch.is_tensor(v)}
     out["prompt"] = idx[inside]
     out["outside"] = int((~inside).sum())
+    out["dropped_nan"] = rows["dropped_nan"]
     return out, [r["session_id"] for r in probe]
 
 
