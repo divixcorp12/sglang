@@ -79,6 +79,8 @@ CALIBRATION_VERIFIES = 96
 # The live refit's window (about 35 s of decode at 140 ms a verify) and the least it fits: two widths and this many samples.
 LIVE_FIT_WINDOW = 192
 LIVE_FIT_MIN_SAMPLES = 48
+# Timed verifies in flight at once (the pinned width ring's slots).
+LIVE_RING_SLOTS = 64
 
 COPY_ENGINE_OFF = "off"
 COPY_ENGINE_PENDING = "pending"
@@ -165,9 +167,12 @@ class ConfidenceCut:
         # SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL: refit T(w) every this many timed cut verifies; 0 is off.
         self._live_fit_interval = live_fit_interval
         self._timing_live = False
-        self._live_width_host: Optional[torch.Tensor] = None
-        # (host copy of the verify's width, start event, end event), oldest first, and the recent (width, ms) window.
-        self._live_pending: list[tuple[torch.Tensor, object, object]] = []
+        # The widths come back through a pinned ring (allocated at first use): the armed verify's slot, then
+        # (slot, start event, end event) of each timed verify, oldest first, and the recent (width, ms) window.
+        self._live_ring: Optional[torch.Tensor] = None
+        self._live_next_slot = 0
+        self._live_armed_slot: Optional[int] = None
+        self._live_pending: list[tuple[int, object, object]] = []
         self._live_window: deque[tuple[int, float]] = deque(maxlen=LIVE_FIT_WINDOW)
         self._live_since_fit = 0
         self._live_fit_ct = 0
@@ -360,12 +365,12 @@ class ConfidenceCut:
 
     def end_verify(self) -> None:
         if self._timing_live:
-            if self._start_event is not None and self._live_width_host is not None:
+            if self._start_event is not None and self._live_armed_slot is not None:
                 end_event = self._new_event()
                 end_event.record()
-                self._live_pending.append((self._live_width_host, self._start_event, end_event))
+                self._live_pending.append((self._live_armed_slot, self._start_event, end_event))
             self._timing_live = False
-            self._live_width_host = None
+            self._live_armed_slot = None
             self._start_event = None
             return
         if self._timed_width is None or self._start_event is None:
@@ -379,19 +384,25 @@ class ConfidenceCut:
         self._start_event = None
 
     def _arm_live_timing(self, lens: torch.Tensor) -> None:
-        """Times the coming verify for the live refit: its width is copied to pinned host memory without a sync (the
-        copy is ahead of the verify on the stream, so the end event's completion covers it)."""
-        host = torch.empty(lens.shape, dtype=torch.int64, pin_memory=lens.is_cuda)
-        host.copy_(lens, non_blocking=True)
-        self._live_width_host = host
+        """Times the coming verify for the live refit: its width is copied to a pinned host slot without a sync (the
+        copy is ahead of the verify on the stream, so the end event's completion covers it). A full ring skips the
+        verify, so a slot is never rewritten before its sample is read."""
+        if len(self._live_pending) >= LIVE_RING_SLOTS:
+            return
+        if self._live_ring is None:
+            self._live_ring = torch.zeros(LIVE_RING_SLOTS, dtype=torch.int64, pin_memory=lens.is_cuda)
+        slot = self._live_next_slot
+        self._live_next_slot = (slot + 1) % LIVE_RING_SLOTS
+        self._live_ring[slot : slot + 1].copy_(lens.reshape(-1)[:1], non_blocking=True)
+        self._live_armed_slot = slot
         self._timing_live = True
 
     def _drain_live_samples(self) -> None:
         """Moves the completed timed verifies into the window, in order, and refits T(w) every interval of them."""
         while self._live_pending and self._live_pending[0][2].query():
-            host, start_event, end_event = self._live_pending.pop(0)
+            slot, start_event, end_event = self._live_pending.pop(0)
             ms = float(start_event.elapsed_time(end_event))
-            width = int(host.reshape(-1)[0])
+            width = int(self._live_ring[slot])
             if math.isfinite(ms) and 1 <= width <= self.num_widths:
                 self._live_window.append((width, ms))
                 self._live_since_fit += 1

@@ -447,6 +447,19 @@ def test_the_live_refit_reads_only_completed_timings_and_forgets_a_phase_after_t
     assert cut.cost_ms() == pytest.approx([40.0 + 10.0 * i for i in range(6)], rel=0.03)
 
 
+def test_a_full_ring_of_unread_timings_skips_timing_instead_of_overwriting_a_slot():
+    from sglang.srt.speculative.dspark_components.dspark_confidence_cut import LIVE_RING_SLOTS
+
+    cut, timings = _calibrated_cut(8, [lambda width: 40.0 + 10.0 * (width - 1)])
+    generator = torch.Generator().manual_seed(4)
+    for _ in range(3 * LIVE_RING_SLOTS):
+        run_verify(cut, timings, torch.rand((1, GAMMA), generator=generator))
+    assert len(cut._live_pending) == LIVE_RING_SLOTS
+    timings.complete_all()
+    cut.verify_lens(torch.full((1, GAMMA), 0.5))
+    assert len(cut._live_pending) == 0 and len(cut._live_window) == LIVE_RING_SLOTS
+
+
 def test_the_live_refit_keeps_the_table_when_the_window_holds_one_width():
     cut, timings = _calibrated_cut(8, [lambda width: 100.0 + 20.0 * (width - 1)])
     before = list(cut.cost_ms())
