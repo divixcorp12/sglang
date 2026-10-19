@@ -584,11 +584,6 @@ for _overrides_of_arm, _ in ARMS.values():
 # calibrates its table at startup (_takes_fixed_split). The two cut arms build on it and are compared with it.
 PROD_ARM = MERGE_CHUNK_EXPSEG_ARM + "-prod"
 ARMS[PROD_ARM] = ({**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], **arm_env.prod_dspark_env(), FIXED_SPLIT_VAR: ""}, True)
-# fi-prefill-check (branch-local): production's arm with FlashInfer's SM120 FlashMLA (the code default) in place of the
-# triton override arm_env.dspark_env() sets. An --env or NAME=KEY=VAL assignment cannot do this: the capture's arm
-# env wins over a shell assignment of a key the arm sets (run_capture_pair.sh refuses it).
-FLASHINFER_FLASHMLA_ARM = PROD_ARM + "-fiflashmla"
-ARMS[FLASHINFER_FLASHMLA_ARM] = ({**ARMS[PROD_ARM][0], "SGLANG_SM120_FLASHMLA_BACKEND": "flashinfer"}, True)
 # Step 1 of the cut's calibration, STS collection: the flag on with SGLANG_DSPARK_STS_COLLECT_PATH set and no STS file
 # is collect mode. The head is built under static, the cut does not apply, and every verify covers all gamma + 1 rows
 # with identity temperatures, so each verify's raw head logits and accepted prefix are valid; StsDataRecorder saves
@@ -687,6 +682,16 @@ REFERENCE.update(
      LAYER_MAJOR_SMALL_HOT_ARM: LAYER_MAJOR_ARM, LAYER_MAJOR_RESIDENCY_ARM: LAYER_MAJOR_SMALL_HOT_ARM,
      LAYER_MAJOR_LEND_ARM: PROD_ARM, CHUNKED_ARM: PROD_ARM}
 )
+# fi-prefill-check (branch-local): production's arm with FlashInfer's SM120 FlashMLA (the code default) in place of the
+# triton override arm_env.dspark_env() sets. An --env or NAME=KEY=VAL assignment cannot do this: the capture's arm
+# env wins over a shell assignment of a key the arm sets (run_capture_pair.sh refuses it). It is a production arm in
+# every table above, so its argv (STS path, memory flags, production warm-up) is production's.
+FLASHINFER_FLASHMLA_ARM = PROD_ARM + "-fiflashmla"
+ARMS[FLASHINFER_FLASHMLA_ARM] = ({**ARMS[PROD_ARM][0], "SGLANG_SM120_FLASHMLA_BACKEND": "flashinfer"}, True)
+PROD_ARMS = (*PROD_ARMS, FLASHINFER_FLASHMLA_ARM)
+ARM_MEMORY_FLAGS[FLASHINFER_FLASHMLA_ARM] = ARM_MEMORY_FLAGS[PROD_ARM]
+ARM_SPEC_FLAGS[FLASHINFER_FLASHMLA_ARM] = ARM_SPEC_FLAGS[PROD_ARM]
+REFERENCE[FLASHINFER_FLASHMLA_ARM] = PROD_ARM
 
 
 def sts_collect_stem(directory: str) -> str:
