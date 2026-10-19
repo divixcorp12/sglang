@@ -33,6 +33,7 @@ WT=""; PY=/data/models/slang/.venv-upstream/bin/python; OUT=""; DRY=0; ONLY=""
 PORT=7867
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
+ARGS=("$@")  # the re-run under flock needs them; the loop below consumes $@
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT=$2; shift 2 ;;
@@ -97,7 +98,7 @@ why=$(busy) && { echo "REFUSED: $why; the owner must free the GPU"; exit 75; }
 # again once the lock is ours.
 if [ -z "$SF_DISK_LOCK_HELD" ]; then
   echo "taking $DISK_LOCK (waits for its holder) $(date)"
-  SF_DISK_LOCK_HELD=1 exec flock "$DISK_LOCK" bash "${BASH_SOURCE[0]}" "$@"
+  SF_DISK_LOCK_HELD=1 exec flock "$DISK_LOCK" bash "${BASH_SOURCE[0]}" "${ARGS[@]}"
 fi
 [ -z "$ONLY" ] && [ -e "$OUT" ] && die "$OUT exists; give --out a new directory (or --only NAMES to add arms to it)"
 echo "== sampled-finish A/B $(date) tree=$WT @ $(git -C "$WT" log -1 --format=%h) py=$PY out=$OUT"
