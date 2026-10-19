@@ -186,13 +186,58 @@ def tokens_for(widths: torch.Tensor, taken: torch.Tensor) -> torch.Tensor:
     return torch.minimum(taken, widths - 1) + 1
 
 
-def replay(conf: torch.Tensor, taken: torch.Tensor, decide: torch.Tensor, truth: torch.Tensor) -> dict:
+def expected_tokens(conf: torch.Tensor) -> torch.Tensor:
+    """[n, 6] E(w) = 1 + S_1 + ... + S_{w-1}."""
+    s = torch.cumprod(conf.double(), dim=1)
+    return 1.0 + torch.nn.functional.pad(torch.cumsum(s, dim=1), (1, 0))
+
+
+def dinkelbach_widths(conf: torch.Tensor, decide: torch.Tensor) -> torch.Tensor:
+    """The widths minimising total ms per token over the verifies: each verify takes argmax_w mu E(w) - C(w), with mu the
+    resulting ms per expected token (iterated to its fixed point). The rule's per-verify ratio E/C is the same only when
+    every verify shares one cost table and ignores that a cheap verify's tokens are worth the same as a dear one's."""
+    e = expected_tokens(conf)
+    mu = float(decide[:, 2].mean() / e[:, 2].mean())
+    for _ in range(50):
+        w = torch.argmax(mu * e - decide, dim=1)
+        new = float(decide.gather(1, w[:, None]).sum() / e.gather(1, w[:, None]).sum())
+        if abs(new - mu) < 1e-9:
+            break
+        mu = new
+    return w + 1
+
+
+def replay(conf: torch.Tensor, taken: torch.Tensor, decide: torch.Tensor, truth: torch.Tensor, dink: bool = False) -> dict:
     """decide, truth: [n, 6] cost tables (per verify) the rule divides by / the realized cost at each width."""
-    widths = stop_rule_verify_lens(confidence=conf, cost_ms=decide)
+    widths = dinkelbach_widths(conf, decide) if dink else stop_rule_verify_lens(confidence=conf, cost_ms=decide)
     ms = truth.gather(1, (widths - 1)[:, None]).squeeze(1)
     tok = tokens_for(widths, taken)
     return {"ms_per_token": float(ms.sum() / tok.sum()), "tokens_per_verify": float(tok.double().mean()),
-            "mean_width": float(widths.double().mean())}
+            "mean_width": float(widths.double().mean()), "_ms": ms, "_tok": tok.double()}
+
+
+def paired_bootstrap(a: dict, b: dict, draws: int = 400) -> list[float]:
+    """5th, 50th and 95th percentile (%) of policy a's ms/token against policy b's over resampled verifies."""
+    g = torch.Generator().manual_seed(0)
+    n = a["_ms"].numel()
+    out = []
+    for _ in range(draws):
+        i = torch.randint(0, n, (n,), generator=g)
+        out.append(100 * float((a["_ms"][i].sum() / a["_tok"][i].sum()) / (b["_ms"][i].sum() / b["_tok"][i].sum()) - 1))
+    return [float(x) for x in np.percentile(out, [5, 50, 95])]
+
+
+def pav_increasing(y: np.ndarray) -> np.ndarray:
+    """Isotonic (non-decreasing) fit: a cost cannot fall as rows are added."""
+    blocks = [[v, 1] for v in y]
+    out: list[list[float]] = []
+    for b in blocks:
+        out.append(b)
+        while len(out) > 1 and out[-2][0] > out[-1][0]:
+            v2, n2 = out.pop()
+            v1, n1 = out.pop()
+            out.append([(v1 * n1 + v2 * n2) / (n1 + n2), n1 + n2])
+    return np.concatenate([[v] * int(n) for v, n in out])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     pool = [(widths[n][serving_mask(arms[n], ks[n])], arms[n]["cost_ms"][serving_mask(arms[n], ks[n])]) for n in ks]
     wcat, ccat = np.concatenate([x[0] for x in pool]), np.concatenate([x[1] for x in pool])
     prod_cost = arms["prod"]["cost_ms"][serving_mask(arms["prod"], None)]
-    tbar = np.array([ccat[wcat == k].mean() for k in range(1, 6)] + [prod_cost.mean()])
+    tbar = pav_increasing(np.array([ccat[wcat == k].mean() for k in range(1, 6)] + [prod_cost.mean()]))
     report["tbar"] = tbar.tolist()
     shards = [torch.load(p_, map_location="cpu") for p_ in sorted(glob.glob(a.sets_glob))]
     cat = lambda k: torch.cat([s[k] for s in shards])  # noqa: E731
@@ -270,15 +315,28 @@ def main(argv: list[str] | None = None) -> int:
                 "ii oracle per-verify cost": replay(conf, taken, truth, truth),
                 "iii live ridge over lagged signals": replay(conf, taken, hat(eps_hat, rho_hat), truth),
                 "iii live previous-verify residual": replay(conf, taken, hat(eps_hat1, rho_hat1), truth),
+                "iv-D corrected static, Dinkelbach rule": replay(conf, taken, tb, truth, dink=True),
+                "ii-D oracle per-verify cost, Dinkelbach rule": replay(conf, taken, truth, truth, dink=True),
+                "iii-D live ridge, Dinkelbach rule": replay(conf, taken, hat(eps_hat, rho_hat), truth, dink=True),
             }
+            boot = {k: paired_bootstrap(v, r_["i static T(w) (startup fit)"]) for k, v in r_.items()}
+            boot_vs_iv = {k: paired_bootstrap(r_[k], r_["iv corrected static (mean cost per width)"])
+                          for k in ("ii oracle per-verify cost", "iii live ridge over lagged signals",
+                                    "ii-D oracle per-verify cost, Dinkelbach rule", "iii-D live ridge, Dinkelbach rule")}
             for wd in range(1, 7):
                 r_[f"constant w={wd}"] = {
                     "ms_per_token": float(truth[:, wd - 1].sum() / tokens_for(torch.full((n,), wd), taken).sum())}
             r_["realized oracle width (w = accepts + 1)"] = {
                 "ms_per_token": float(truth.gather(1, taken[:, None].clamp(max=5)).sum() / (taken + 1).sum())}
             base = r_["i static T(w) (startup fit)"]["ms_per_token"]
-            for v in r_.values():
+            for k, v in r_.items():
                 v["vs_i_pct"] = 100 * (v["ms_per_token"] / base - 1)
+                if k in boot:
+                    v["vs_i_pct_p5_p50_p95"] = boot[k]
+                if k in boot_vs_iv:
+                    v["vs_iv_pct_p5_p50_p95"] = boot_vs_iv[k]
+                v.pop("_ms", None)
+                v.pop("_tok", None)
             res[mode] = r_
         out[arm] = res
     report["ceiling"] = out
