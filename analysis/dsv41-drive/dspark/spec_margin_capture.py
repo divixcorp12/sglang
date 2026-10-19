@@ -20,6 +20,7 @@ Usage: spec_margin_capture.py OUT_DIR [--arm ARM] [--no-verify-split] [--prompts
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import signal
@@ -267,6 +268,48 @@ def then_generate(body_path: str, out_path: str, timeout_s: float = 600.0) -> in
     return 0
 
 
+def dropped_events(out_dir: str) -> dict[str, int]:
+    """Per job-trace file that overflowed its buffer, the events dropped (the file's last line is {"dropped": N})."""
+    out = {}
+    for path in sorted(glob.glob(os.path.join(out_dir, "events.*.jsonl"))):
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            lines = [x for x in f.read().decode(errors="replace").splitlines() if x.strip()]
+        try:
+            n = json.loads(lines[-1]).get("dropped", 0) if lines else 0
+        except (ValueError, AttributeError):
+            n = 0
+        if n:
+            out[os.path.basename(path)] = n
+    return out
+
+
+def post_run(a: argparse.Namespace) -> int:
+    """The analyses over a completed run's trace. With --analysis-warn-only a refusal by layer_misses.py or spec_margin.py
+    (a job-trace buffer overflow) is a warning with the dropped-event count, and the run still counts as completed."""
+    events = os.path.join(a.out_dir, "events.*.jsonl")
+    rc = subprocess.run(
+        [sys.executable, os.path.join(HERE, "layer_misses.py"), events, "--json",
+         os.path.join(a.out_dir, "layer_misses.json")]
+    ).returncode
+    if server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)["SGLANG_DSV41_RAM_PREFETCH"] == "1":
+        rc = rc or subprocess.run(
+            [sys.executable, os.path.join(HERE, "spec_margin.py"), events, "--json",
+             os.path.join(a.out_dir, "spec_margin.json")]
+        ).returncode
+    if rc and a.analysis_warn_only:
+        print(f"WARNING: the post-run analysis exited {rc}; the run itself completed (--analysis-warn-only). "
+              f"Job-trace events dropped: {dropped_events(a.out_dir) or 'none'}", flush=True)
+        rc = 0
+    if a.verify_split:
+        rc = rc or subprocess.run(
+            [sys.executable, os.path.join(HERE, "verify_split.py"), a.out_dir, "--json",
+             os.path.join(a.out_dir, "verify_split.json")]
+        ).returncode
+    return rc
+
+
 def main() -> int:
     a = parse_args()
     if a.resolve_env is not None:
@@ -297,24 +340,7 @@ def main() -> int:
                 stop_server(server, 30 if interrupted else 300)
     if rc != 0:
         return rc
-    events = os.path.join(a.out_dir, "events.*.jsonl")
-    rc = subprocess.run(
-        [sys.executable, os.path.join(HERE, "layer_misses.py"), events, "--json",
-         os.path.join(a.out_dir, "layer_misses.json")]
-    ).returncode
-    if server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)["SGLANG_DSV41_RAM_PREFETCH"] == "1":
-        rc = rc or subprocess.run(
-            [sys.executable, os.path.join(HERE, "spec_margin.py"), events, "--json",
-             os.path.join(a.out_dir, "spec_margin.json")]
-        ).returncode
-    if rc and a.analysis_warn_only:
-        print(f"WARNING: the post-run analysis exited {rc} (see above); the run itself completed, --analysis-warn-only", flush=True)
-        rc = 0
-    if a.verify_split:
-        rc = rc or subprocess.run(
-            [sys.executable, os.path.join(HERE, "verify_split.py"), a.out_dir, "--json",
-             os.path.join(a.out_dir, "verify_split.json")]
-        ).returncode
+    rc = post_run(a)
     summary = counter_summary(os.path.join(a.out_dir, "server.log"))
     with open(os.path.join(a.out_dir, "counters.json"), "w") as f:
         json.dump(summary, f, indent=1)
