@@ -381,3 +381,100 @@ def test_from_envs_preloads_the_cut_accept_kernels_on_cuda_only_when_the_cut_is_
         assert calls == []
         assert ConfidenceCut.from_envs(gamma=GAMMA, device="cuda") is not None
     assert calls == [{"device": "cuda", "verify_num_draft_tokens": GAMMA + 1}]
+
+
+def _calibrated_cut(live_fit_interval, truth, timings=None):
+    """A cut whose forced calibration measured ``truth(width)`` ms, with the live refit set as asked."""
+    timings = timings or FakeTimings(lambda width: truth[0](width))
+    cut = ConfidenceCut(
+        gamma=GAMMA, device="cpu", new_event=timings.new_event, live_fit_interval=live_fit_interval
+    )
+    confident = torch.full((1, GAMMA), 0.99)
+    for _ in range(CALIBRATION_VERIFIES):
+        run_verify(cut, timings, confident)
+    timings.complete_all()
+    cut.verify_lens(confident)
+    assert cut.calibrated
+    return cut, timings
+
+
+def _serve(cut, timings, count, seed=0):
+    """``count`` calibrated verifies at assorted confidences, their timings completed before the next one."""
+    generator = torch.Generator().manual_seed(seed)
+    widths = []
+    for _ in range(count):
+        timings.complete_all()
+        confidence = torch.rand((1, GAMMA), generator=generator)
+        widths.append(run_verify(cut, timings, confidence))
+    timings.complete_all()
+    cut.verify_lens(torch.full((1, GAMMA), 0.5))
+    return widths
+
+
+def test_the_live_refit_follows_the_server_out_of_a_slow_calibration():
+    """The calibration saw a slow phase (100 + 40 (w - 1) ms); the server then ran at 40 + 10 (w - 1). The frozen table
+    keeps the slow numbers, the live one reaches the new ones. Mutant: the refit never installs, or reads the wrong
+    width -- red."""
+    slow = lambda width: 100.0 + 40.0 * (width - 1)  # noqa: E731
+    fast = lambda width: 40.0 + 10.0 * (width - 1)  # noqa: E731
+    live, live_timings = _calibrated_cut(16, [slow])
+    frozen, frozen_timings = _calibrated_cut(0, [slow])
+    assert live.cost_ms() == pytest.approx(frozen.cost_ms())
+    live_timings.ms_for_width = fast
+    frozen_timings.ms_for_width = fast
+    widths = _serve(live, live_timings, 240)
+    _serve(frozen, frozen_timings, 240)
+    assert len(set(widths)) >= 3
+    assert live.cost_ms() == pytest.approx([40.0 + 10.0 * i for i in range(6)], rel=0.02)
+    assert frozen.cost_ms() == pytest.approx([100.0 + 40.0 * i for i in range(6)])
+
+
+def test_the_live_refit_reads_only_completed_timings_and_forgets_a_phase_after_the_window():
+    cut, timings = _calibrated_cut(8, [lambda width: 40.0 + 10.0 * (width - 1)])
+    before = list(cut.cost_ms())
+    # Verifies whose end events have not completed are not read: no refit however many are issued.
+    generator = torch.Generator().manual_seed(1)
+    for _ in range(40):
+        run_verify(cut, timings, torch.rand((1, GAMMA), generator=generator))
+    assert cut.cost_ms() == before
+    timings.complete_all()
+    # A slow phase, then a fast one: after a window of fast verifies the slow ones are gone.
+    timings.ms_for_width = lambda width: 90.0 + 30.0 * (width - 1)
+    _serve(cut, timings, 200, seed=2)
+    assert cut.cost_ms()[0] == pytest.approx(90.0, rel=0.05)
+    timings.ms_for_width = lambda width: 40.0 + 10.0 * (width - 1)
+    _serve(cut, timings, 400, seed=3)
+    assert cut.cost_ms() == pytest.approx([40.0 + 10.0 * i for i in range(6)], rel=0.03)
+
+
+def test_the_live_refit_keeps_the_table_when_the_window_holds_one_width():
+    cut, timings = _calibrated_cut(8, [lambda width: 100.0 + 20.0 * (width - 1)])
+    before = list(cut.cost_ms())
+    for _ in range(100):
+        timings.complete_all()
+        run_verify(cut, timings, torch.full((1, GAMMA), 0.99))
+    timings.complete_all()
+    cut.verify_lens(torch.full((1, GAMMA), 0.99))
+    assert cut.cost_ms() == before
+
+
+def test_with_the_live_refit_off_a_calibrated_cut_times_nothing_more():
+    cut, timings = _calibrated_cut(0, [lambda width: 100.0 + 20.0 * (width - 1)])
+    count = len(timings.events)
+    _serve(cut, timings, 20)
+    assert len(timings.events) == count
+
+
+def test_the_live_refit_keeps_the_draft_ms_in_the_cost_with_draft_cost_on():
+    cut = ConfidenceCut(gamma=GAMMA, device="cpu", draft_cost=True, live_fit_interval=8)
+    cut._draft_ms = 7.0
+    cut._install_cost(cc.AffineCostFit(base_ms=50.0, per_row_ms=10.0, r2=1.0))
+    assert cut.cost_ms() == pytest.approx([57.0 + 10.0 * i for i in range(6)])
+    assert cut.verify_cost_ms() == pytest.approx([50.0 + 10.0 * i for i in range(6)])
+
+
+def test_from_envs_reads_the_live_fit_interval():
+    with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(True), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(""):
+        assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu")._live_fit_interval == 0
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL.override(32):
+            assert ConfidenceCut.from_envs(gamma=GAMMA, device="cpu")._live_fit_interval == 32
