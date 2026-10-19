@@ -106,9 +106,10 @@ print(" ".join(map(str, out)))
     "$py" "$repo/analysis/dsv41-drive/dspark/prelaunch_evict.py" --log "$log" $args "$@"
 }
 
-# The files prod_env() names that are not in this checkout: the RAM prefetch's learned head must exist and hash to
-# arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 (arm_env.check_prod_assets); otherwise nothing starts.
-# LAUNCH_PROD_HEAD and LAUNCH_PROD_HEAD_SHA256 exist for test_launch_prod.py.
+# The files prod_env() and ServerArgs.prod() name that are not in this checkout: the RAM prefetch's learned head and the
+# confidence cut's STS file must each exist and hash to their pinned SHA256 (arm_env.check_prod_assets); otherwise
+# nothing starts. LAUNCH_PROD_HEAD, LAUNCH_PROD_HEAD_SHA256, LAUNCH_PROD_STS and LAUNCH_PROD_STS_SHA256 exist for
+# test_launch_prod.py.
 check_assets() {
     PYTHONPATH="$here" "$py" -c '
 import os
@@ -119,6 +120,10 @@ if os.environ.get("LAUNCH_PROD_HEAD"):
     kw["head"] = os.environ["LAUNCH_PROD_HEAD"]
 if os.environ.get("LAUNCH_PROD_HEAD_SHA256"):
     kw["sha256"] = os.environ["LAUNCH_PROD_HEAD_SHA256"]
+if os.environ.get("LAUNCH_PROD_STS"):
+    kw["sts"] = os.environ["LAUNCH_PROD_STS"]
+if os.environ.get("LAUNCH_PROD_STS_SHA256"):
+    kw["sts_sha256"] = os.environ["LAUNCH_PROD_STS_SHA256"]
 print(arm_env.check_prod_assets(**kw))
 '
 }

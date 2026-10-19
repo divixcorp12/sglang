@@ -596,28 +596,24 @@ ARMS[PROD_ARM] = ({**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], **arm_env.prod_dspark_env(
 # (this driver's timed run writes OUT/<arm>/sts/confidence.*.pt). Step 3: install the JSON read-only at
 # arm_env.PROD_DSPARK_STS_PATH and pin its digest in arm_env.PROD_DSPARK_STS_SHA256.
 STS_COLLECT_ARM = PROD_ARM + "-stscollect"
-ARMS[STS_COLLECT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
+# Production has run the sampled cut since 2026-10-18 (arm_env.PROD_DSPARK_CUT_ENV), so the two arms built on -prod that
+# predate it state the greedy-only cut they were run as: the sampled path and the draft's cost off.
+GREEDY_CUT = {CONFIDENCE_CUT: "1", CONFIDENCE_CUT_SAMPLED: "0", CONFIDENCE_CUT_DRAFT_COST: "0"}
+ARMS[STS_COLLECT_ARM] = ({**ARMS[PROD_ARM][0], **GREEDY_CUT}, True)
 STS_COLLECT_ARMS = (STS_COLLECT_ARM,)
-# The cut: production with the flag and the fitted STS file (ARM_SPEC_FLAGS). Until the file is fitted, its launch
-# fails.
+# The greedy-only cut: production with the flag and the fitted STS file (ARM_SPEC_FLAGS), the 2026-10-17 pair's arm.
 CONFIDENCE_CUT_ARM = PROD_ARM + "-confcut"
-ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], CONFIDENCE_CUT: "1"}, True)
-# The sampled A/B (run_sampled_finish_ab.sh): the cut for sampled requests with draft time priced into T(w) and no
-# online refit (owner, 2026-10-18: one sample cannot judge the refit), on the greedy STS file; and that plus upstream's
-# block verification on the sampled draft. Block verification alone is not an arm.
+ARMS[CONFIDENCE_CUT_ARM] = ({**ARMS[PROD_ARM][0], **GREEDY_CUT}, True)
+# The sampled A/B (run_sampled_finish_ab.sh, 2026-10-18): -prod against the cut for sampled requests with draft time
+# priced into T(w) and no online refit (owner: one sample cannot judge the refit), on the greedy STS file, and against that
+# plus upstream's block verification on the sampled draft. Block verification alone is not an arm. The cut won and
+# shipped (DSV_OPTIMIZATION.md 3.12), so -prod-confcut-sampled now IS -prod, kept as a name so the A/B's commands and
+# reports still resolve; its settings are arm_env.PROD_DSPARK_CUT_ENV, which production's env carries. The block arm is
+# production plus --speculative-use-block-verification.
 SAMPLED_CUT_ARM = CONFIDENCE_CUT_ARM + "-sampled"
-ARMS[SAMPLED_CUT_ARM] = (
-    {
-        **ARMS[PROD_ARM][0],
-        CONFIDENCE_CUT: "1",
-        CONFIDENCE_CUT_SAMPLED: "1",
-        CONFIDENCE_CUT_DRAFT_COST: "1",
-        CONFIDENCE_CUT_REFIT_INTERVAL: "0",
-    },
-    True,
-)
+ARMS[SAMPLED_CUT_ARM] = (dict(ARMS[PROD_ARM][0]), True)
 SAMPLED_CUT_BLOCK_ARM = SAMPLED_CUT_ARM + "-block"
-ARMS[SAMPLED_CUT_BLOCK_ARM] = (dict(ARMS[SAMPLED_CUT_ARM][0]), True)
+ARMS[SAMPLED_CUT_BLOCK_ARM] = (dict(ARMS[PROD_ARM][0]), True)
 # Layer-major prefill under DSpark (branch layer-major-dspark): production with every uncached suffix of 8192+ tokens
 # prefilled layer by layer. Production itself has it on since 2026-10-17 (arm_env.prod_dspark_env), so -prod and the
 # arms built on it carry it and this arm now equals -prod; dspark_env() keeps the threshold at 0 for every other arm.
@@ -676,11 +672,10 @@ ARM_MEMORY_FLAGS.update({arm: ARM_MEMORY_FLAGS[MERGE_CHUNK_EXPSEG_ARM] for arm i
 # (server_flags) and to its probe server's.
 STS_PATH_FLAGS = ("--speculative-dspark-confidence-sts-path", arm_env.PROD_DSPARK_STS_PATH)
 BLOCK_VERIFICATION_FLAGS = ("--speculative-use-block-verification",)
-ARM_SPEC_FLAGS = {
-    CONFIDENCE_CUT_ARM: STS_PATH_FLAGS,
-    SAMPLED_CUT_ARM: STS_PATH_FLAGS,
-    SAMPLED_CUT_BLOCK_ARM: STS_PATH_FLAGS + BLOCK_VERIFICATION_FLAGS,
-}
+# Every production arm runs the cut on the fitted STS file, as production does (ServerArgs.prod), except the collect arm,
+# which has no STS file by definition; the block arm adds block verification.
+ARM_SPEC_FLAGS = {arm: STS_PATH_FLAGS for arm in PROD_ARMS if arm != STS_COLLECT_ARM}
+ARM_SPEC_FLAGS[SAMPLED_CUT_BLOCK_ARM] = STS_PATH_FLAGS + BLOCK_VERIFICATION_FLAGS
 REFERENCE.update(
     {PROD_ARM: MERGE_CHUNK_EXPSEG_ARM, STS_COLLECT_ARM: PROD_ARM, CONFIDENCE_CUT_ARM: PROD_ARM,
      SAMPLED_CUT_ARM: PROD_ARM, SAMPLED_CUT_BLOCK_ARM: SAMPLED_CUT_ARM, LAYER_MAJOR_ARM: PROD_ARM,

@@ -340,6 +340,17 @@ PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756e
 # ECE 2.9-3.8% -> 2.1-3.0%. Read-only copy, 0444.
 PROD_DSPARK_STS_PATH = "/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json"
 PROD_DSPARK_STS_SHA256 = "a0f2fc7c6acd4ca06dca213d68954b3f46e0fef2a5e6ed4ab460feda7538bcd5"
+# The confidence cut as production runs it since 2026-10-18 (owner), which is both_cpu_ab's -prod-confcut-sampled arm: the
+# cut for sampled requests (production is sampled traffic), the draft's time priced into T(w), no online refit (one
+# sample cannot judge it), on the greedy STS file above (ServerArgs.prod passes it). The draft stays sampled
+# (SGLANG_DSPARK_USE_GREEDY_DRAFT off) and block verification stays off. DSV_OPTIMIZATION.md 3.12: 60-360 s ms/token
+# 73.14 -> 61.60 / 66.3 (two cut runs), ms per verify 186.2 -> 130.4 / 138.2.
+PROD_DSPARK_CUT_ENV = {
+    "SGLANG_DSPARK_CONFIDENCE_CUT": "1",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED": "1",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST": "1",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL": "0",
+}
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:
@@ -385,6 +396,7 @@ def prod_dspark_env() -> dict[str, str]:
     Pending, not set here: SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM (needs an A/B on the copy engine and the graphed
     verify) and SGLANG_OPT_LANE_HEAD_PATH (held)."""
     return {
+        **PROD_DSPARK_CUT_ENV,
         # Whole layers 0 and 1 in the pinned tier, in a tier grown to hold them: 70.5 vs 76.2 ms/token, layers 0+1
         # 20.5 -> 13.0 ms a verify (DO 3.1; the OFF run was stall-flagged).
         "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": "0,1",
@@ -458,22 +470,30 @@ def prod_dspark_env() -> dict[str, str]:
 
 
 def check_prod_assets(head: str = PROD_RAM_PREFETCH_LEARNED_HEAD,
-                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) -> str:
-    """launch_prod.sh's asset check: the prefetch head production loads exists and hashes to the pinned SHA256.
-    Returns a line saying so; raises SystemExit with the reason otherwise."""
+                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256,
+                      sts: str = PROD_DSPARK_STS_PATH,
+                      sts_sha256: str = PROD_DSPARK_STS_SHA256) -> str:
+    """launch_prod.sh's asset check: the prefetch head production loads and the confidence cut's STS file each exist and
+    hash to their pinned SHA256. Returns a line for each saying so; raises SystemExit with the reason otherwise."""
     import hashlib
 
-    if not os.path.isfile(head):
-        raise SystemExit(f"not starting production: the RAM prefetch head {head} is missing "
-                         f"(arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD; expected sha256 {sha256})")
-    digest = hashlib.sha256()
-    with open(head, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    if digest.hexdigest() != sha256:
-        raise SystemExit(f"not starting production: the RAM prefetch head {head} has sha256 {digest.hexdigest()}, "
-                         f"not the pinned {sha256} (arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256)")
-    return f"prefetch head verified: {head} sha256 {sha256}"
+    lines = []
+    for what, path, pinned, constant, verified in (
+        ("RAM prefetch head", head, sha256, "PROD_RAM_PREFETCH_LEARNED_HEAD", "prefetch head verified"),
+        ("DSpark confidence STS file", sts, sts_sha256, "PROD_DSPARK_STS_PATH", "confidence STS file verified"),
+    ):
+        if not os.path.isfile(path):
+            raise SystemExit(f"not starting production: the {what} {path} is missing "
+                             f"(arm_env.{constant}; expected sha256 {pinned})")
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+        if digest.hexdigest() != pinned:
+            raise SystemExit(f"not starting production: the {what} {path} has sha256 {digest.hexdigest()}, "
+                             f"not the pinned {pinned} (arm_env.{constant}_SHA256)")
+        lines.append(f"{verified}: {path} sha256 {pinned}")
+    return "\n".join(lines)
 
 
 def prod_env() -> dict[str, str]:
@@ -501,6 +521,9 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     drop_cache_after_load: bool = False
     # Production's warm-up also runs dsv41_decode_paths (~35 s); the arms keep the prefill-only one they measured with.
     decode_warmup: bool = False
+    # The confidence cut's STS file (PROD_DSPARK_STS_PATH for production); the arms append theirs through
+    # both_cpu_ab.ARM_SPEC_FLAGS.
+    dspark_sts_path: str | None = None
 
     @classmethod
     def prod(cls) -> "ServerArgs":
@@ -514,6 +537,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
             drop_cache_after_load=True,
             decode_warmup=True,
+            dspark_sts_path=PROD_DSPARK_STS_PATH,
         )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
@@ -588,4 +612,6 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             argv += ["--max-total-tokens", str(self.max_total_tokens)]
         if self.drop_cache_after_load:
             argv += ["--weight-loader-drop-cache-after-load"]
+        if self.dspark_sts_path is not None:
+            argv += ["--speculative-dspark-confidence-sts-path", self.dspark_sts_path]
         return argv
