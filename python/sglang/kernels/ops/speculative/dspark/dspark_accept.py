@@ -89,6 +89,30 @@ class AcceptSampling:
         )
 
 
+def replace_dead_target_rows(
+    *,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    verify_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Give the target rows of a cut verify's dead positions a finite, valid distribution.
+
+    target_probs is [bs, S, V] and draft_probs [bs, S - 1, V]; row r of both is the distribution at slot r + 1
+    (target row S - 1 is the bonus row and has no draft row). A request keeps verify_lens[b] slots (the root and
+    verify_lens[b] - 1 drafts), so its target rows 0 .. verify_lens[b] - 1 are live and rows >= verify_lens[b] are
+    dead: those become the matching draft row (p = q) and, for row S - 1, a uniform row. Block verification reads
+    every row, and one NaN or Inf in a dead row would poison the chain's h values; the cap drops those positions."""
+    bs, num_rows, vocab = target_probs.shape
+    dead = torch.arange(num_rows, device=target_probs.device)[None, :] >= verify_lens.to(
+        target_probs.device
+    )[:, None].to(torch.long)
+    uniform_row = torch.full(
+        (bs, 1, vocab), 1.0 / vocab, dtype=target_probs.dtype, device=target_probs.device
+    )
+    replacement = torch.cat([draft_probs.to(target_probs.dtype), uniform_row], dim=1)
+    return torch.where(dead[:, :, None], replacement, target_probs)
+
+
 def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
@@ -117,6 +141,12 @@ def _accept_sampling_core(
             bs=bs,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
+        )
+    if block_verification and cutoff_verify_lens is not None:
+        target_probs = replace_dead_target_rows(
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            verify_lens=cutoff_verify_lens,
         )
     (
         retrieve_index,
@@ -690,6 +720,61 @@ def preload_cut_accept_kernels(*, device, verify_num_draft_tokens: int) -> None:
     capped, _ = cap_correct_len_triton(correct_len=correct_len, verify_lens=verify_lens)
     table = torch.zeros((1, verify_num_draft_tokens), dtype=torch.int64, device=device)
     gather_row_bonus_triton(table=table, idx=capped)
+
+
+def preload_sampled_accept_kernels(
+    *,
+    device,
+    vocab_size: int,
+    verify_num_draft_tokens: int,
+    block_verification: bool,
+) -> None:
+    """Load the sampled accept's kernel before the server serves, as _accept_sampling_core calls it at bs 1: int64
+    candidates, float32 [bs, S, V] target and [bs, S - 1, V] draft probabilities, the int32 chain buffers, and float32
+    uniforms. Mixed traffic reaches the token-by-token variant first, so it always loads; the block variant loads
+    too when block_verification is configured."""
+    bs = 1
+    num_slots = verify_num_draft_tokens
+    candidates = torch.zeros((bs, num_slots), dtype=torch.int64, device=device)
+    target_probs = torch.full(
+        (bs, num_slots, vocab_size), 1.0 / vocab_size, dtype=torch.float32, device=device
+    )
+    draft_probs = torch.full(
+        (bs, num_slots - 1, vocab_size), 1.0 / vocab_size, dtype=torch.float32, device=device
+    )
+    (
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(
+        bs=bs, draft_token_num=num_slots, device=torch.device(device)
+    )
+    uniform_samples = torch.rand((bs, num_slots - 1), dtype=torch.float32, device=device)
+    uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    for block in (True, False) if block_verification else (False,):
+        sampling_fn = chain_speculative_sampling_triton
+        if block:
+            sampling_fn = partial(sampling_fn, block_verification=True)
+        sampling_fn(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
+    torch.cuda.synchronize(device)
 
 
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:

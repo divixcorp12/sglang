@@ -152,7 +152,9 @@ for i in "${!NAMES[@]}"; do
   name=${NAMES[$i]}
   read -ra all <<< "$(arm_assignments "$i")"
   echo "$name ${all[*]}"
-  while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
+  # DISK_LOCK_HELD_BY_CALLER=1: an ancestor (run_sampled_finish_ab.sh) holds rowimg-disk.lock across the arms, as the lock
+  # order asks, so the probe for that lock is skipped; the capture treats the ancestor's hold as its own (run_locks.take).
+  while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || pgrep -f "spec_margin_capture|pytest|ninja|cc1plus|nvcc|sglang.launch_server|validate_split_calib|prefill_peak_probe" > /dev/null || { [ "${DISK_LOCK_HELD_BY_CALLER:-0}" != 1 ] && ! flock -n /data/models/slang/nvfp4-work/rowimg-disk.lock true; } || ! flock -n /data/models/slang/nvfp4-work/cc-gpu.lock true; do
     echo "waiting for a quiet box $(date)"; sleep 60; done
   # Layer-major prefill's node-1 StateStore, from the arm's resolved server env (0 when it does not prefill layer-major).
   state_gib=$(echo "$MERGED" | "$PY" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import arm_env

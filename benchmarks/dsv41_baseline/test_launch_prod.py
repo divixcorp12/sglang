@@ -40,8 +40,10 @@ def _head(tmp_path, content=b"a stand-in prefetch head", name="head.safetensors"
 
 def _run(tmp_path, *args, **env):
     head, sha = _head(tmp_path, name="default-head.safetensors")  # every run checks a head; tests may name another
+    sts, sts_sha = _head(tmp_path, b"a stand-in sts file", "default-sts.json")  # and the cut's STS file
     full = dict(os.environ, LAUNCH_PROD_PORT=str(PORT), LAUNCH_PROD_GPU_LOCK=str(tmp_path / "gpu.lock"),
-                LAUNCH_PROD_HEAD=str(head), LAUNCH_PROD_HEAD_SHA256=sha)
+                LAUNCH_PROD_HEAD=str(head), LAUNCH_PROD_HEAD_SHA256=sha,
+                LAUNCH_PROD_STS=str(sts), LAUNCH_PROD_STS_SHA256=sts_sha)
     full.update({k: str(v) for k, v in env.items()})
     return subprocess.run(["bash", SCRIPT, *args], env=full, capture_output=True, text=True, timeout=120)
 
@@ -208,6 +210,23 @@ def test_a_start_refuses_a_prefetch_head_that_does_not_match_or_is_missing(tmp_p
              LAUNCH_PROD_HEAD_SHA256=sha)
     assert r.returncode == 1 and "is missing" in r.stderr
     # The real start runs the same check_assets before anything else (test_the_real_start_checks_the_assets_...).
+
+
+def test_a_dry_run_start_verifies_the_confidence_sts_files_checksum_and_refuses_a_wrong_or_missing_one(tmp_path):
+    sts, sha = _head(tmp_path, b"the sts file production loads", "sts.json")
+    r = _run(tmp_path, "start", DRY_RUN=1, LAUNCH_PROD_STS=sts, LAUNCH_PROD_STS_SHA256=sha,
+             **_floor_env(tmp_path, 86.0, 84.0))
+    assert r.returncode == 0, r.stderr
+    assert f"confidence STS file verified: {sts} sha256 {sha}" in r.stdout
+    wrong = hashlib.sha256(b"another file").hexdigest()
+    for cmd in ("start", "restart"):
+        (tmp_path / cmd).mkdir()
+        r = _run(tmp_path, cmd, DRY_RUN=1, LAUNCH_PROD_STS=sts, LAUNCH_PROD_STS_SHA256=wrong,
+                 **_floor_env(tmp_path / cmd, 86.0, 84.0))
+        assert r.returncode == 1, (cmd, r.stdout, r.stderr)
+        assert f"has sha256 {sha}, not the pinned {wrong}" in r.stderr and "prelaunch:" not in r.stdout
+    r = _run(tmp_path, "start", DRY_RUN=1, LAUNCH_PROD_STS=tmp_path / "missing.json", LAUNCH_PROD_STS_SHA256=sha)
+    assert r.returncode == 1 and "STS file" in r.stderr and "is missing" in r.stderr
 
 
 def test_the_real_start_checks_the_assets_before_the_lock():

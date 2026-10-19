@@ -32,6 +32,31 @@ def test_the_capture_scores_where_asked_and_otherwise_runs_the_prefetch_arm():
     assert gpu["SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"] == "/out/events"
 
 
+@pytest.mark.parametrize("warn_only", [False, True])
+def test_a_trace_overflow_refusal_fails_the_capture_unless_analysis_warn_only_and_then_names_the_dropped_count(
+    monkeypatch, tmp_path, capsys, warn_only
+):
+    """Default: a nonzero layer_misses/spec_margin exit is the capture's exit. --analysis-warn-only: exit 0 with a
+    WARNING that carries the per-file dropped-event count. Mutant: the flag is ignored, or applies to the default -- red."""
+    import argparse
+
+    cap = _capture()
+    (tmp_path / "events.1.exl3-copy-eng.2.jsonl").write_text('{"e":1}\n{"dropped":181212}\n')
+    (tmp_path / "events.1.exl3-tier0.0.jsonl").write_text('{"e":1}\n{"dropped":0}\n')
+    ran = []
+    monkeypatch.setattr(cap, "server_env", lambda *a, **k: {"SGLANG_DSV41_RAM_PREFETCH": "1"})
+    monkeypatch.setattr(cap.subprocess, "run",
+                        lambda argv, **_: ran.append(os.path.basename(argv[1])) or argparse.Namespace(
+                            returncode=1 if "spec_margin" in argv[1] else 0))
+    a = argparse.Namespace(out_dir=str(tmp_path), top_k_only=False, scorer=None, arm="x", verify_split=False,
+                           analysis_warn_only=warn_only)
+    assert cap.post_run(a) == (0 if warn_only else 1)
+    assert ran == ["layer_misses.py", "spec_margin.py"]
+    out = capsys.readouterr().out
+    assert ("WARNING" in out and "181212" in out and "exl3-copy-eng" in out) == warn_only
+    assert cap.dropped_events(str(tmp_path)) == {"events.1.exl3-copy-eng.2.jsonl": 181212}
+
+
 def test_the_counter_summary_reads_the_last_counters_line(tmp_path):
     cap = _capture()
     log = tmp_path / "server.log"

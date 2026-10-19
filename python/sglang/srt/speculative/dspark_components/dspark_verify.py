@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
+    preload_sampled_accept_kernels,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -141,6 +142,16 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
         self._simulated_correct_len = simulated_correct_len
+        device = getattr(target_worker, "device", None)
+        if not _is_npu and device is not None and torch.device(device).type == "cuda":
+            # A sampled verify's accept kernel (the token-by-token variant, and the block one when configured) would
+            # otherwise device-load on the first sampled request, inside the serving window.
+            preload_sampled_accept_kernels(
+                device=device,
+                vocab_size=int(target_worker.model_runner.model_config.vocab_size),
+                verify_num_draft_tokens=int(verify_num_draft_tokens),
+                block_verification=block_verification,
+            )
 
     def accept_and_finalize(
         self,

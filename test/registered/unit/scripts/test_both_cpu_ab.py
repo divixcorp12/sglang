@@ -15,6 +15,13 @@ METRICS = "SGLANG_MOE_HOT_METRICS_FILE"
 STS_COLLECT = "SGLANG_DSPARK_STS_COLLECT_PATH"
 CONFIDENCE_CUT = "SGLANG_DSPARK_CONFIDENCE_CUT"
 STS_PATH_FLAG = "--speculative-dspark-confidence-sts-path"
+BLOCK_FLAG = "--speculative-use-block-verification"
+SAMPLED_KNOBS = (
+    "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL",
+    "SGLANG_DSPARK_USE_GREEDY_DRAFT",
+)
 
 
 def _ab():
@@ -402,12 +409,15 @@ PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
 # Production's arm (-expseg with production's additions) and the confidence cut's two arms built on it.
 PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
 STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
+SAMPLED_CUT_ARM = f"{CONFIDENCE_CUT_ARM}-sampled"
+SAMPLED_CUT_BLOCK_ARM = f"{SAMPLED_CUT_ARM}-block"
 LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
 LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM = f"{LAYER_MAJOR_ARM}-smallhot", f"{LAYER_MAJOR_ARM}-res"
 LAYER_MAJOR_ARMS = (LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
 LAYER_MAJOR_LEND_ARM = f"{LAYER_MAJOR_ARM}-lend"
 CHUNKED_ARM = f"{PROD_ARM}-chunked"
-PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, *LAYER_MAJOR_ARMS, LAYER_MAJOR_LEND_ARM, CHUNKED_ARM)
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM, *LAYER_MAJOR_ARMS,
+             LAYER_MAJOR_LEND_ARM, CHUNKED_ARM)
 PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
                       f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
@@ -1145,8 +1155,8 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
     prefetch = set()
     stated_defaults = {
         "SGLANG_DSPARK_TOP_PROB_GATE": "0",
-        CONFIDENCE_CUT: "0",
         STS_COLLECT: "",
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT": "0",
         "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS": "",
         "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK": "0",
         "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB": "5",
@@ -1162,8 +1172,12 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                    "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1"),
                    # Lent residency rows: production since 2026-10-18 (owner), after the served lend validation.
                    "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": (None, "360")}
+    # The sampled confidence cut: production since 2026-10-18 (owner), after the served sampled A/B (DO 3.12). The refit
+    # interval 0 is the library default, stated by the arms.
+    cut = {k: ("0", "1") for k in ("SGLANG_DSPARK_CONFIDENCE_CUT", "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED",
+                                   "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST")}
     rest = {k: v for k, v in differs.items() if k not in prefetch}
-    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
     argv = arm_env.ServerArgs.prod().argv()
     flags = ab.server_flags(arm)
@@ -1185,9 +1199,12 @@ def test_the_prod_arm_is_production_with_the_arms_stated_defaults_and_takes_no_f
     assert {k: v for k, v in env.items() if k in prod} == prod
     extra = {k: v for k, v in env.items() if k not in prod}
     assert all(v in ("", "0", "5", "0.98") for v in extra.values()), extra  # stated off or at the library default
-    assert extra[SPLIT] == "" and extra[CONFIDENCE_CUT] == "0" and extra[STS_COLLECT] == ""
+    assert extra[SPLIT] == "" and extra[STS_COLLECT] == ""
+    # The sampled cut is production's (arm_env.PROD_DSPARK_CUT_ENV) and runs on the fitted STS file.
+    assert {k: env[k] for k in ab.arm_env.PROD_DSPARK_CUT_ENV} == ab.arm_env.PROD_DSPARK_CUT_ENV
+    assert env[CONFIDENCE_CUT] == "1" and env["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0"
     assert ab.ARMS[PROD_ARM][1] is True and ab.REFERENCE[PROD_ARM] == PIN01_HICACHE_ARMS[5]
-    assert ab.server_flags(PROD_ARM) == ab.server_flags(PIN01_HICACHE_ARMS[5])
+    assert ab.server_flags(PROD_ARM) == ab.server_flags(PIN01_HICACHE_ARMS[5]) + (STS_PATH_FLAG, arm_env.PROD_DSPARK_STS_PATH)
     assert all(flag in arm_env.ServerArgs.prod().argv() for flag in ab.server_flags(PROD_ARM))
     monkeypatch.setenv(SPLIT, "0:3,1:5")
     for arm in PROD_ARMS:
@@ -1202,28 +1219,60 @@ def test_the_prod_arm_is_production_with_the_arms_stated_defaults_and_takes_no_f
     assert ran == list(PROD_ARMS)
 
 
-def test_the_cut_arms_are_prod_with_the_flag_and_every_other_arm_pins_it_and_the_collection_off(monkeypatch):
-    """Both cut arms are -prod with SGLANG_DSPARK_CONFIDENCE_CUT=1 alone; the collect arm has no STS file (collect mode:
-    the head built, the cut off) and the cut arm has production's STS path. Every other arm states the flag 0 and the
-    collect path empty against a shell's. Mutant: an arm inherits the shell's flag or path, the collect arm passes the
-    STS file, or the cut arm drops it -- red."""
+def test_the_cut_arms_are_prod_or_its_greedy_cut_and_every_other_arm_pins_the_cut_and_the_collection_off(monkeypatch):
+    """Production runs the sampled cut (arm_env.PROD_DSPARK_CUT_ENV) on the fitted STS file, so every production arm
+    carries the cut and the STS flag, except the collect arm, which has no STS file (collect mode: the head built, the cut
+    off). -confcut and -stscollect state the greedy-only cut they ran as (the sampled path and the draft's cost off). Every
+    other arm states the flag 0 and the collect path empty against a shell's. Mutant: an arm inherits the shell's flag or
+    path, the collect arm passes the STS file, a production arm drops it, or a greedy cut arm takes the sampled path -- red."""
     ab = _ab()
     monkeypatch.setenv(CONFIDENCE_CUT, "1")
     monkeypatch.setenv(STS_COLLECT, "/shell/sts")
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[CONFIDENCE_CUT] == ("1" if arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM) else "0"), arm
+            assert overrides[CONFIDENCE_CUT] == ("1" if arm in PROD_ARMS else "0"), arm
             assert (overrides[STS_COLLECT] != "") == (arm == STS_COLLECT_ARM), arm
-        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm == CONFIDENCE_CUT_ARM), arm
-    prod = {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k != CONFIDENCE_CUT}
+        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm in PROD_ARMS and arm != STS_COLLECT_ARM), arm
+    prod = ab.ARMS[PROD_ARM][0]
+    greedy = {CONFIDENCE_CUT: "1", "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED": "0", "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST": "0"}
     for arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM):
         cut = ab.ARMS[arm][0]
-        assert cut[CONFIDENCE_CUT] == "1", arm
-        assert {k: v for k, v in cut.items() if k != CONFIDENCE_CUT} == prod, arm
+        assert {k: v for k, v in cut.items() if k in greedy} == greedy, arm
+        assert {k: v for k, v in cut.items() if k not in greedy} == {k: v for k, v in prod.items() if k not in greedy}, arm
         assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == PROD_ARM
     flags = ab.server_flags(CONFIDENCE_CUT_ARM)
-    assert flags[:-2] == ab.server_flags(PROD_ARM)
+    assert flags == ab.server_flags(PROD_ARM)
     assert flags[-2:] == (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+    assert ab.server_flags(STS_COLLECT_ARM) == ab.server_flags(PIN01_HICACHE_ARMS[5])
+
+
+def test_the_sampled_cut_arm_is_prod_and_the_block_arm_adds_block_verification_alone(monkeypatch):
+    """-confcut-sampled ran the sampled A/B (2026-10-18) as -prod plus the cut; the cut shipped, so the arm now equals
+    -prod and states arm_env.PROD_DSPARK_CUT_ENV. -confcut-sampled-block is -prod plus --speculative-use-block-verification
+    alone. The draft stays sampled: SGLANG_DSPARK_USE_GREEDY_DRAFT is 0 in every arm, whatever the shell exports. Every
+    non-production arm pins the sampled knobs off. Mutant: an arm drops a knob, turns the greedy draft on, the block arm
+    changes env, or block verification reaches another arm -- red."""
+    ab = _ab()
+    for key in SAMPLED_KNOBS:
+        monkeypatch.setenv(key, "1")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0", arm
+            if arm not in PROD_ARMS:
+                assert all(overrides[k] == "0" for k in SAMPLED_KNOBS), arm
+        assert (BLOCK_FLAG in ab.server_flags(arm)) == (arm == SAMPLED_CUT_BLOCK_ARM), arm
+    prod = ab.ARMS[PROD_ARM][0]
+    assert {k: prod[k] for k in ab.arm_env.PROD_DSPARK_CUT_ENV} == ab.arm_env.PROD_DSPARK_CUT_ENV
+    assert prod["SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL"] == "0" and prod["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0"
+    for arm in (SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM):
+        assert ab.ARMS[arm] == ab.ARMS[PROD_ARM], arm
+        assert arm in ab.PROD_ARMS
+    assert ab.REFERENCE[SAMPLED_CUT_ARM] == PROD_ARM and ab.REFERENCE[SAMPLED_CUT_BLOCK_ARM] == SAMPLED_CUT_ARM
+    sts = (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+    assert ab.ARM_SPEC_FLAGS[SAMPLED_CUT_ARM] == ab.ARM_SPEC_FLAGS[PROD_ARM] == sts
+    assert ab.ARM_SPEC_FLAGS[SAMPLED_CUT_BLOCK_ARM] == (*sts, BLOCK_FLAG)
+    assert ab.server_flags(SAMPLED_CUT_ARM) == ab.server_flags(PROD_ARM)
+    assert ab.server_flags(SAMPLED_CUT_BLOCK_ARM) == ab.server_flags(PROD_ARM) + (BLOCK_FLAG,)
 
 
 def test_the_production_arms_prefill_layer_major_and_every_other_arm_keeps_it_off():
@@ -1341,8 +1390,10 @@ def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monk
     monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
     for arm in PROD_ARMS:
         assert ab.run_probe(arm, str(tmp_path)) == 1
-    prod, collect, cut, *layer_major = argvs
-    assert cut[cut.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    prod, collect, cut, sampled, block, *layer_major = argvs
+    for argv in (prod, cut, sampled, block):
+        assert argv[argv.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    assert BLOCK_FLAG in block and BLOCK_FLAG not in sampled and BLOCK_FLAG not in cut and BLOCK_FLAG not in prod
     assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
-    assert STS_PATH_FLAG not in prod and STS_PATH_FLAG not in collect
-    assert len(layer_major) == len(LAYER_MAJOR_ARMS) + 2 and all(STS_PATH_FLAG not in a for a in layer_major)
+    assert STS_PATH_FLAG not in collect
+    assert len(layer_major) == len(LAYER_MAJOR_ARMS) + 2 and all(STS_PATH_FLAG in a for a in layer_major)
