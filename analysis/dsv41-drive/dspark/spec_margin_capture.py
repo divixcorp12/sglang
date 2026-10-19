@@ -177,6 +177,12 @@ def client_argv(a: argparse.Namespace) -> list[str]:
         return [arm_env.PYTHON, LONG_PROMPT, "--port", str(PORT), "--prompt", os.path.abspath(a.long_prompt),
                 "--decode-seconds", str(a.decode_seconds), "--ttft-repeats", str(a.ttft_repeats),
                 "--out-dir", a.out_dir, *sampling]
+    if a.prompts_file:
+        # Every prompt of every file, sampled as asked and with thinking on; no logprobs (nothing here reads them).
+        sampling = ["--temperature", str(a.temperature)] + ([] if a.top_p is None else ["--top-p", str(a.top_p)])
+        files = [x for path in a.prompts_file for x in ("--prompts-file", os.path.abspath(path))]
+        return [arm_env.PYTHON, PROBE, "--port", str(PORT), "--prompts", str(10**6), "--max-tokens", str(a.max_tokens),
+                "--top-logprobs", "0", *sampling, *files, "--out", os.path.join(a.out_dir, "probe.json")]
     return [arm_env.PYTHON, PROBE, "--port", str(PORT), "--sessions", both_cpu_ab.SESSIONS, "--prompts", str(a.prompts),
             "--max-tokens", str(a.max_tokens), "--top-logprobs", "1", "--out", os.path.join(a.out_dir, "probe.json")]
 
@@ -199,6 +205,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "one extra draft LM-head pass per verify, so compare timings only against runs with it on")
     p.add_argument("--long-prompt", metavar="PATH",
                    help="serve this prompt once, streaming with thinking on, instead of the probe's sessions")
+    p.add_argument("--prompts-file", metavar="JSON", action="append", default=[],
+                   help="serve every prompt of this JSON list of strings (repeatable) through logprob_probe.py, one "
+                        "request each, thinking on, at --temperature/--top-p and capped at --max-tokens new tokens; "
+                        "probe.json records each request's CLOCK_MONOTONIC span")
     p.add_argument("--decode-seconds", type=float, default=300.0,
                    help="with --long-prompt: cancel the request this long after its first streamed token")
     p.add_argument("--ttft-repeats", type=int, default=0,
@@ -213,8 +223,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="launch nothing: print the server's env (the comma-separated KEYS from the caller's env under "
                         "the capture's own), its argv, and which of KEYS the capture overrides, as JSON")
     a = p.parse_args(argv)
-    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats or a.temperature or a.top_p is not None):
-        p.error("--decode-seconds, --ttft-repeats, --temperature and --top-p need --long-prompt")
+    if a.long_prompt and a.prompts_file:
+        p.error("--long-prompt and --prompts-file are exclusive")
+    if not a.long_prompt and (a.decode_seconds != 300.0 or a.ttft_repeats):
+        p.error("--decode-seconds and --ttft-repeats need --long-prompt")
+    if not (a.long_prompt or a.prompts_file) and (a.temperature or a.top_p is not None):
+        p.error("--temperature and --top-p need --long-prompt or --prompts-file")
+    for path in a.prompts_file:
+        if not os.path.isfile(path):
+            p.error(f"--prompts-file {path}: no such file")
     if a.temperature < 0 or (a.top_p is not None and (not 0 < a.top_p <= 1 or not a.temperature)):
         p.error("--temperature must be non-negative, and --top-p in (0, 1] with a positive --temperature")
     if a.long_prompt and not os.path.isfile(a.long_prompt):
@@ -227,7 +244,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def capture_env(a: argparse.Namespace) -> dict:
     """What the capture sets over the caller's env for its server; a caller's value for one of these keys is lost."""
     env = server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)
-    if a.long_prompt:
+    if a.long_prompt or a.prompts_file:
         env["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] = LONG_TRACE_CAPACITY
     if a.draft_top_prob:
         env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")

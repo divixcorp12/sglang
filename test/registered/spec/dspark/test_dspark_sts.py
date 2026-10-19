@@ -167,6 +167,10 @@ class TestStsDataRecorder(CustomTestCase):
         self.assertTrue(torch.equal(shard["sampled_prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.isnan(shard["accept_rates"]).all())
         self.assertTrue(torch.isnan(shard["temperatures"]).all())
+        # Each row carries the CLOCK_MONOTONIC time it was recorded at.
+        self.assertEqual(shard["record_ns"].shape, (4,))
+        self.assertEqual(shard["record_ns"].dtype, torch.int64)
+        self.assertGreater(int(shard["record_ns"][0]), 0)
 
     def test_records_the_sampled_accepts_outcome_rates_and_temperatures(self):
         gamma = 3
@@ -199,6 +203,74 @@ class TestStsDataRecorder(CustomTestCase):
                 load_collected_labels(data_glob=glob, label="soft", temperature=1.0)
             logits, _ = load_collected_labels(data_glob=glob, label="soft", temperature=0.6)
             self.assertEqual(logits.shape[0], 2)
+
+    @staticmethod
+    def _record(recorder, bs, gamma=3):
+        recorder.record(
+            confidence_raw=torch.randn(bs, gamma),
+            num_correct_drafts=torch.ones(bs, dtype=torch.int64),
+            temperatures=torch.full((bs,), 0.6),
+            draft_features={k: torch.rand(bs, gamma) for k in StsDataRecorder.DRAFT_FEATURES},
+        )
+
+    def test_close_writes_the_partial_tail_as_a_last_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=2)
+            for _ in range(3):
+                self._record(recorder, bs=1)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt"])
+            recorder.close()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt", "shard.1.pt"])
+            tail = torch.load(f"{stem}.1.pt")
+            self.assertEqual(tail["logits"].shape, (1, 3))
+            self.assertEqual(set(tail), set(torch.load(f"{stem}.0.pt")))
+
+    def test_close_with_nothing_pending_writes_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            StsDataRecorder(path_stem=stem, gamma=3, flush_every=2).close()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=2)
+            for _ in range(2):
+                self._record(recorder, bs=1)
+            recorder.close()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt"])
+
+    def test_close_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=10)
+            self._record(recorder, bs=2)
+            recorder.close()
+            recorder.close()
+            recorder.flush()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt"])
+            self.assertEqual(torch.load(f"{stem}.0.pt")["logits"].shape[0], 2)
+
+    def test_a_short_tail_shard_loads_in_the_fit_and_the_cv_script(self):
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[4]
+        spec = importlib.util.spec_from_file_location(
+            "sts_sampled_cv", root / "analysis" / "dsv41-drive" / "dspark" / "sts_sampled_cv.py"
+        )
+        cv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cv)
+        from sglang.benchmark.dspark_sts_fit import load_collected_labels
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=2)
+            for _ in range(3):
+                self._record(recorder, bs=1)
+            recorder.close()
+            logits, target = load_collected_labels(data_glob=f"{stem}.*.pt", label="argmax")
+            self.assertEqual(logits.shape[0], 3)
+            self.assertEqual(target.shape, (3, 3))
+            rows = cv.load_rows(f"{stem}.*.pt")
+            self.assertEqual((rows["raw"].shape[0], rows["dropped_nan"]), (3, 0))
+            self.assertEqual(rows["ns"].shape, (3,))
 
     def test_a_shard_without_sampled_labels_refuses_a_sampled_fit(self):
         with tempfile.TemporaryDirectory() as tmp:

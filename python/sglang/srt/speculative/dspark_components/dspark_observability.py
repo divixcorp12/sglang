@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import math
@@ -1237,6 +1238,8 @@ class DsparkStepObservers:
                 gamma=self._gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
             )
+            # A normal exit writes the partial final shard, as the draft top-prob log's close does.
+            atexit.register(self._sts_recorder.close)
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self._verify_num_draft_tokens
         )
