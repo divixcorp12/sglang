@@ -13,6 +13,15 @@ logger = logging.getLogger(__name__)
 _MAX_OUTSTANDING_VERIFIES = 16
 
 
+def _diag(op, depth, tokens):  # F141 DIAGNOSTIC, not for merge
+    import time
+    import traceback
+
+    frames = [f.name for f in traceback.extract_stack()[:-2]][-9:]
+    with open("/mnt/nvme1/f141-diag.log", "a") as f:
+        f.write(f"{time.time():.3f} {op} depth={depth} tokens={tokens} {frames}\n")
+
+
 class ForwardKind(Enum):
     """How a forward observed by the hot cache advances the residency clock."""
 
@@ -116,6 +125,7 @@ class ResidencyBoundaryClock:
 
     def commit(self, accepted_tokens: int) -> None:
         """Correct the current window by the oldest outstanding verify's accepted minus drafted tokens."""
+        _diag("commit", len(self._provisional), accepted_tokens)
         if self._provisional:
             self.tokens_since_boundary = max(
                 0,
@@ -125,6 +135,7 @@ class ResidencyBoundaryClock:
             )
 
     def _track_provisional(self, tokens: int) -> None:
+        _diag("push", len(self._provisional), tokens)
         if (
             len(self._provisional) == self._provisional.maxlen
             and not self._warned_dropped_provisional
