@@ -85,13 +85,19 @@ if [ "$DRY" = 1 ]; then
 fi
 
 why=$(busy) && { echo "REFUSED: $why; the owner must free the GPU"; exit 75; }
+# The lock must be held by an ancestor of the capture (run_locks.take looks the holder's pid up in /proc/locks and trusts
+# only an ancestor), so this script re-runs itself under `flock`, whose process stays the parent. A bare `flock -n 9` here
+# is held by the dead flock child's pid: the capture then waits forever on its own driver. The checks above and below run
+# again once the lock is ours.
+if [ -z "$SF_DISK_LOCK_HELD" ]; then
+  echo "taking $DISK_LOCK (waits for its holder) $(date)"
+  SF_DISK_LOCK_HELD=1 exec flock "$DISK_LOCK" bash "${BASH_SOURCE[0]}" "$@"
+fi
 [ -e "$OUT" ] && die "$OUT exists; give --out a new directory"
 echo "== sampled-finish A/B $(date) tree=$WT @ $(git -C "$WT" log -1 --format=%h) py=$PY out=$OUT"
 mkdir -p "$OUT" || die "cannot create $OUT"
-# Disk lock first, held to the end; then poll for a quiet GPU. A holder of the disk lock is named by the wait.
-exec 9>"$DISK_LOCK"
-until flock -n 9; do echo "waiting for $DISK_LOCK $(date)"; sleep 60; done
 echo "holding $DISK_LOCK"
+# Disk lock first (taken above), held to the end; then poll for a quiet GPU.
 while why=$(busy) || ! flock -n "$GPU_LOCK" true; do echo "waiting for the GPU (${why:-cc-gpu.lock held}) $(date)"; sleep 60; done
 
 rc_all=0; FINAL=()
