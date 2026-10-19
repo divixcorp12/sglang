@@ -6,7 +6,11 @@
 #   block     -prod-confcut-sampled-block      + --speculative-use-block-verification
 # Arm names come from both_cpu_ab (PROD_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM), so a rename cannot desync them.
 #
-# Usage: run_sampled_finish_ab.sh [--worktree DIR] [--python PY] [--out DIR] [--dry-run]
+# Usage: run_sampled_finish_ab.sh [--worktree DIR] [--python PY] [--out DIR] [--only NAMES] [--dry-run]
+#   --only      comma list of arm names (prod, cut, block) to run into an existing --out; the others must already hold a
+#               finished run (OUT/X/X/long_prompt.json and server.log) and are reported as is.
+#   The capture runs with --analysis-warn-only: a job-trace overflow in layer_misses.py / spec_margin.py after a complete
+#               decode is a warning, not an ARM FAILED (the server env is unchanged).
 #   --worktree  the checkout to run (default: the one holding this script); a dirty one is refused by the wrapper.
 #   --python    default /data/models/slang/.venv-upstream/bin/python
 #   --out       default /mnt/nvme1/sampled-finish-$(date +%Y%m%d); arm X lands in OUT/X/X (server.log, long_prompt.json, ...)
@@ -25,16 +29,18 @@
 die() { echo "run_sampled_finish_ab: $*" >&2; exit 2; }
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-WT=""; PY=/data/models/slang/.venv-upstream/bin/python; OUT=""; DRY=0
+WT=""; PY=/data/models/slang/.venv-upstream/bin/python; OUT=""; DRY=0; ONLY=""
 PORT=7867
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
+ARGS=("$@")  # the re-run under flock needs them; the loop below consumes $@
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT=$2; shift 2 ;;
     --python) PY=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --only) ONLY=$2; shift 2 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -56,7 +62,8 @@ read -r PROD_ARM CUT_ARM BLOCK_ARM <<< "$(arm_names)"
 NAMES=(prod cut block)
 ARMS=("$PROD_ARM" "$CUT_ARM" "$BLOCK_ARM")
 # The 2026-10-17 confcut pair's prompt and length, now sampled. --no-verify-split as that pair and run_blong.sh.
-CAPTURE=(--no-verify-split --long-prompt "$PROMPT" --decode-seconds 420 --ttft-repeats 0 --temperature 0.6 --top-p 0.95)
+CAPTURE=(--no-verify-split --long-prompt "$PROMPT" --decode-seconds 420 --ttft-repeats 0 --temperature 0.6 --top-p 0.95
+         --analysis-warn-only)
 
 busy() {
   if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then echo "port $PORT is serving"; return 0; fi
@@ -85,18 +92,30 @@ if [ "$DRY" = 1 ]; then
 fi
 
 why=$(busy) && { echo "REFUSED: $why; the owner must free the GPU"; exit 75; }
-[ -e "$OUT" ] && die "$OUT exists; give --out a new directory"
+# The lock must be held by an ancestor of the capture (run_locks.take looks the holder's pid up in /proc/locks and trusts
+# only an ancestor), so this script re-runs itself under `flock`, whose process stays the parent. A bare `flock -n 9` here
+# is held by the dead flock child's pid: the capture then waits forever on its own driver. The checks above and below run
+# again once the lock is ours.
+if [ -z "$SF_DISK_LOCK_HELD" ]; then
+  echo "taking $DISK_LOCK (waits for its holder) $(date)"
+  SF_DISK_LOCK_HELD=1 exec flock "$DISK_LOCK" bash "${BASH_SOURCE[0]}" "${ARGS[@]}"
+fi
+[ -z "$ONLY" ] && [ -e "$OUT" ] && die "$OUT exists; give --out a new directory (or --only NAMES to add arms to it)"
 echo "== sampled-finish A/B $(date) tree=$WT @ $(git -C "$WT" log -1 --format=%h) py=$PY out=$OUT"
 mkdir -p "$OUT" || die "cannot create $OUT"
-# Disk lock first, held to the end; then poll for a quiet GPU. A holder of the disk lock is named by the wait.
-exec 9>"$DISK_LOCK"
-until flock -n 9; do echo "waiting for $DISK_LOCK $(date)"; sleep 60; done
 echo "holding $DISK_LOCK"
+# Disk lock first (taken above), held to the end; then poll for a quiet GPU.
 while why=$(busy) || ! flock -n "$GPU_LOCK" true; do echo "waiting for the GPU (${why:-cc-gpu.lock held}) $(date)"; sleep 60; done
 
 rc_all=0; FINAL=()
 for i in 0 1 2; do
   name=${NAMES[$i]}; arm=${ARMS[$i]}
+  if [ -n "$ONLY" ] && [[ ",$ONLY," != *",$name,"* ]]; then
+    dir=$OUT/$name/$name
+    [ -f "$dir/long_prompt.json" ] && [ -f "$dir/server.log" ] || die "--only $ONLY: $name has no finished run in $dir"
+    echo "##### $name: using the finished run in $dir"
+    FINAL+=("$dir"); continue
+  fi
   echo "##### $name $arm $(date +%T)"
   wrapper "$name" "$arm" > "$OUT/$name.log" 2>&1; rc=$?
   echo "##### $name rc=$rc $(date +%T) $(grep -E 'ALLDONE|REFUSED|ARM FAILED|ABORT|Traceback' "$OUT/$name.log" | tail -2 | tr '\n' ' ')"

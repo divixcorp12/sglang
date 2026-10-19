@@ -88,6 +88,16 @@ def test_the_aggregate_takes_the_steady_window_from_60_to_360_s_and_the_whole_de
     assert not short["steady_complete"]
 
 
+def test_a_dropped_copy_engine_trace_does_not_truncate_ms_per_verify_but_a_dropped_verify_file_does():
+    res = _res(1.0)
+    for w in res["windows"]:
+        w["truncated"] = True
+    r = _report()
+    assert not r.aggregate({**res, "trace_dropped_files": ["events.1.exl3-copy-eng.2.jsonl"]})["steady"]["truncated"]
+    assert r.aggregate({**res, "trace_dropped_files": ["events.1.verify.jsonl"]})["steady"]["truncated"]
+    assert r.aggregate({**res, "trace_dropped_files": ["events.1.device-stamps.jsonl"]})["steady"]["truncated"]
+
+
 def _arm(tokens_per_s_scale, tpv=4.0, errors=(), kv=381184):
     # A faster arm streams more tokens in the same windows, with tokens per verify held at ``tpv``.
     windows = [_window(60 * k, 60 * (k + 1), int(600 * tokens_per_s_scale), int(600 * tokens_per_s_scale / tpv))
