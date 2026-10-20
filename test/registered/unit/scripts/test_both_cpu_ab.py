@@ -1176,7 +1176,9 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
     # interval 0 is the library default, stated by the arms.
     cut = {k: ("0", "1") for k in ("SGLANG_DSPARK_CONFIDENCE_CUT", "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED",
                                    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST")}
-    rest = {k: v for k, v in differs.items() if k not in prefetch}
+    # The live T(w) refit every 32 timed cut verifies: production since 2026-10-20 (owner); the non-prod arms leave it unset.
+    cut["SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL"] = (None, "32")
+    rest ={k: v for k, v in differs.items() if k not in prefetch}
     assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
     argv = arm_env.ServerArgs.prod().argv()
