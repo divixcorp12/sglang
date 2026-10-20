@@ -1493,7 +1493,9 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
-    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    # SM120 FlashMLA backend: "flashinfer" (default), "triton", or "torch". "flashinfer_prefill" runs FlashInfer's
+    # prefill for calls of more than 64 tokens and the triton kernel for decode and the DSpark verify (64 tokens or
+    # fewer); the triton merge-budget and chunk knobs below then apply to that triton path.
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Byte cap (MiB) on the fp32 temporaries of the triton backend's LSE merge and
     # attention-sink scaling, which peak at 3 fp32 copies of the [tokens, heads,
