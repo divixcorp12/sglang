@@ -48,6 +48,13 @@ eligible verifies after that run forced widths 1..gamma+1 round-robin, each time
 verifies, so the hot path never waits on the host, and T(w) is the affine least-squares fit over all of them. Until
 then the cut does not apply and every row is verified. A forced width is safe for the same reason any cut is: the
 accept is capped at it.
+
+That table describes the server as it was in the calibration's seconds. The first ~35 s of a decode run slow (a drive
+whose read latency is 7-9 ms instead of 1 ms: 2026-10-18's sampled-finish captures read 270-380 ms per step against 123-134
+ms after, at the same routed experts and lanes), so a frozen fit overstates every width's cost for the rest of the run
+(a=131.9, b=51.8 against the realized 92 + 25 (w - 1)). With SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL > 0 the cut
+keeps timing its own verifies (the width read back asynchronously, no host sync) and refits T(w) by least squares over
+the last LIVE_FIT_WINDOW of them every that many verifies, so the table follows the server out of a slow phase.
 """
 
 from __future__ import annotations
@@ -56,6 +63,7 @@ import logging
 import math
 import statistics
 import sys
+from collections import deque
 from typing import Callable, Optional
 
 import msgspec
@@ -68,6 +76,11 @@ logger = logging.getLogger(__name__)
 
 # Lead's choice, 16 samples per width at gamma 5; not tuned.
 CALIBRATION_VERIFIES = 96
+# The live refit's window (about 35 s of decode at 140 ms a verify) and the least it fits: two widths and this many samples.
+LIVE_FIT_WINDOW = 192
+LIVE_FIT_MIN_SAMPLES = 48
+# Timed verifies in flight at once (the pinned width ring's slots).
+LIVE_RING_SLOTS = 64
 
 COPY_ENGINE_OFF = "off"
 COPY_ENGINE_PENDING = "pending"
@@ -121,6 +134,7 @@ class ConfidenceCut:
         sampled_rescale: Optional[torch.Tensor] = None,
         draft_cost: bool = False,
         refit=None,
+        live_fit_interval: int = 0,
     ):
         self.gamma = gamma
         self.device = device
@@ -150,6 +164,18 @@ class ConfidenceCut:
         self._disabled = False
         self._calibration_started = False
         self._num_held_verifies = 0
+        # SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL: refit T(w) every this many timed cut verifies; 0 is off.
+        self._live_fit_interval = live_fit_interval
+        self._timing_live = False
+        # The widths come back through a pinned ring (allocated at first use): the armed verify's slot, then
+        # (slot, start event, end event) of each timed verify, oldest first, and the recent (width, ms) window.
+        self._live_ring: Optional[torch.Tensor] = None
+        self._live_next_slot = 0
+        self._live_armed_slot: Optional[int] = None
+        self._live_pending: list[tuple[int, object, object]] = []
+        self._live_window: deque[tuple[int, float]] = deque(maxlen=LIVE_FIT_WINDOW)
+        self._live_since_fit = 0
+        self._live_fit_ct = 0
 
     @classmethod
     def from_envs(cls, *, gamma: int, device) -> Optional[ConfidenceCut]:
@@ -208,6 +234,12 @@ class ConfidenceCut:
                 f"dspark confidence cut: online refit every {refit_interval} verifies over the last "
                 f"{REFIT_BUFFER_VERIFIES}, greedy and sampled apart (SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL)"
             )
+        live_fit_interval = envs.SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL.get()
+        if live_fit_interval > 0:
+            logger.info(
+                f"dspark confidence cut: T(w) is refit live every {live_fit_interval} cut verifies over the last "
+                f"{LIVE_FIT_WINDOW} (SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL)"
+            )
         return cls(
             gamma=gamma,
             device=device,
@@ -215,6 +247,7 @@ class ConfidenceCut:
             sampled_rescale=sampled_rescale,
             draft_cost=draft_cost,
             refit=refit,
+            live_fit_interval=live_fit_interval,
         )
 
     @property
@@ -295,9 +328,15 @@ class ConfidenceCut:
         verifies take the rule in its stopping form (module docstring)."""
         bs = confidence.shape[0]
         if self._cost_ms_tensor is not None:
+            if self._live_fit_interval > 0:
+                self._drain_live_samples()
             if sampled:
-                return stop_rule_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
-            return cut_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
+                lens = stop_rule_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
+            else:
+                lens = cut_verify_lens(confidence=confidence, cost_ms=self._cost_ms_tensor)
+            if self._live_fit_interval > 0:
+                self._arm_live_timing(lens)
+            return lens
         if self._disabled:
             return self._full_width(bs=bs, device=confidence.device)
         self._drain_ready_samples()
@@ -319,12 +358,21 @@ class ConfidenceCut:
         self._draft_start_event.record()
 
     def begin_verify(self) -> None:
-        if self._timed_width is None:
+        if self._timed_width is None and not self._timing_live:
             return
         self._start_event = self._new_event()
         self._start_event.record()
 
     def end_verify(self) -> None:
+        if self._timing_live:
+            if self._start_event is not None and self._live_armed_slot is not None:
+                end_event = self._new_event()
+                end_event.record()
+                self._live_pending.append((self._live_armed_slot, self._start_event, end_event))
+            self._timing_live = False
+            self._live_armed_slot = None
+            self._start_event = None
+            return
         if self._timed_width is None or self._start_event is None:
             return
         end_event = self._new_event()
@@ -334,6 +382,69 @@ class ConfidenceCut:
         self._timed_width = None
         self._draft_start_event = None
         self._start_event = None
+
+    def _arm_live_timing(self, lens: torch.Tensor) -> None:
+        """Times the coming verify for the live refit: its width is copied to a pinned host slot without a sync (the
+        copy is ahead of the verify on the stream, so the end event's completion covers it). A full ring skips the
+        verify, so a slot is never rewritten before its sample is read."""
+        if len(self._live_pending) >= LIVE_RING_SLOTS:
+            return
+        if self._live_ring is None:
+            self._live_ring = torch.zeros(LIVE_RING_SLOTS, dtype=torch.int64, pin_memory=lens.is_cuda)
+        slot = self._live_next_slot
+        self._live_next_slot = (slot + 1) % LIVE_RING_SLOTS
+        self._live_ring[slot : slot + 1].copy_(lens.reshape(-1)[:1], non_blocking=True)
+        self._live_armed_slot = slot
+        self._timing_live = True
+
+    def _drain_live_samples(self) -> None:
+        """Moves the completed timed verifies into the window, in order, and refits T(w) every interval of them."""
+        while self._live_pending and self._live_pending[0][2].query():
+            slot, start_event, end_event = self._live_pending.pop(0)
+            ms = float(start_event.elapsed_time(end_event))
+            width = int(self._live_ring[slot])
+            if math.isfinite(ms) and 1 <= width <= self.num_widths:
+                self._live_window.append((width, ms))
+                self._live_since_fit += 1
+        if self._live_since_fit >= self._live_fit_interval:
+            self._live_since_fit = 0
+            self._refit_live()
+
+    def _refit_live(self) -> None:
+        by_width: list[list[float]] = [[] for _ in range(self.num_widths)]
+        for width, ms in self._live_window:
+            by_width[width - 1].append(ms)
+        if len(self._live_window) < LIVE_FIT_MIN_SAMPLES or sum(1 for s in by_width if s) < 2:
+            return
+        fit = AffineCostFit.from_samples(by_width)
+        if fit.base_ms <= 0.0:
+            return
+        self._install_cost(fit)
+        self._live_fit_ct += 1
+        if self._live_fit_ct == 1 or self._live_fit_ct % 8 == 0:
+            logger.info(
+                f"dspark confidence cut: live T(w) refit #{self._live_fit_ct} over {len(self._live_window)} verifies "
+                f"(a={fit.base_ms:.4f}, b={fit.per_row_ms:.4f}/row, r2={fit.r2:.4f}; widths seen "
+                f"{[len(s) for s in by_width]})"
+            )
+
+    def _install_cost(self, fit: AffineCostFit) -> None:
+        """Makes ``fit`` the table the rule divides by: T(w), plus the calibration's draft ms with the draft cost on."""
+        verify_cost_ms = fit.cost_ms(num_widths=self.num_widths)
+        self._verify_cost_ms = verify_cost_ms
+        # The draft costs the same at every width (gamma drafts, one draft forward), so it adds to a alone: the cost
+        # stays affine with b unchanged, and the stopping form's argument holds (a + draft > 0).
+        self._cost_ms = (
+            [ms + self._draft_ms for ms in verify_cost_ms]
+            if self.draft_cost and self._draft_ms is not None
+            else verify_cost_ms
+        )
+        table = torch.tensor(self._cost_ms, dtype=torch.float32)
+        if self._cost_ms_tensor is None:
+            self._cost_ms_tensor = table.to(self.device)
+        else:
+            # A refit on the serving path: written in place from pinned memory, so it syncs nothing.
+            self._cost_ms_tensor.copy_(table.pin_memory() if self._cost_ms_tensor.is_cuda else table, non_blocking=True)
 
     def _full_width(self, *, bs: int, device) -> torch.Tensor:
         return torch.full((bs,), self.num_widths, dtype=torch.int64, device=device)
@@ -359,20 +470,11 @@ class ConfidenceCut:
         if fit.base_ms <= 0.0:
             self._disable(reason=f"non-positive fitted T(1) {fit.base_ms} ms")
             return
-        verify_cost_ms = fit.cost_ms(num_widths=self.num_widths)
-        self._verify_cost_ms = verify_cost_ms
         self._draft_ms = statistics.median(self._draft_samples) if self._draft_samples else None
         if self.draft_cost and self._draft_ms is None:
             logger.warning("dspark confidence cut: no draft was timed, so the cost leaves the draft out")
-        # The draft costs the same at every width (gamma drafts, one draft forward), so it adds to a alone: the cost
-        # stays affine with b unchanged, and the stopping form's argument holds (a + draft > 0).
-        cost_ms = (
-            [ms + self._draft_ms for ms in verify_cost_ms]
-            if self.draft_cost and self._draft_ms is not None
-            else verify_cost_ms
-        )
-        self._cost_ms = cost_ms
-        self._cost_ms_tensor = torch.tensor(cost_ms, dtype=torch.float32, device=self.device)
+        self._install_cost(fit)
+        verify_cost_ms, cost_ms = self._verify_cost_ms, self._cost_ms
         medians = [round(statistics.median(samples), 4) for samples in self._samples]
         if self._draft_ms is None:
             draft = "draft ms not timed"

@@ -839,6 +839,10 @@ class Envs:
     # Refit the cut's per-position calibration from the server's own accepts every this many cut verifies (greedy and
     # sampled apart; dspark_confidence_refit.py). The cut reads max(offline, refit), so it never cuts harder. 0 is off.
     SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL = EnvInt(0)
+    # Keep timing the cut's own verifies after the T(w) calibration and refit T(w) (least squares over the last 192)
+    # every this many of them, so the table follows the server out of the slow first ~35 s of a run instead of freezing
+    # the calibration's. 0 is off: T(w) stays as the calibration fitted it.
+    SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
