@@ -1624,6 +1624,19 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
     is noisy (see above), and a live A/B could differ.
   - Results: `divix01:/mnt/nvme1/sts-collect-varied-20261018/cv-draft5.8.json` and `cv-draft0.json` (shards in
     `collect/sts/`); script `analysis/dsv41-drive/dspark/sts_sampled_cv.py` at `fd3a312795`.
+- **Live T(w) refit on in production (owner, 2026-10-20), benefit unproven.** `PROD_DSPARK_CUT_ENV` sets
+  `SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL=32` (branch `tw-calib-fix`, merged): T(w) is refit by least squares
+  over the last 192 timed cut verifies every 32, so the table follows the server out of the slow first ~35 s of a run.
+  This overrides the owner rule "values calculated at startup" for this one table, at the owner's request. The served
+  pair (`/mnt/nvme1/tw-calib-fix-20261018/`) showed 32 refits with no error and no regression. It did not show a
+  benefit: the live arm never hit the nvme3n1 slow phase the refit exists to follow. `..._REFIT_INTERVAL` stays 0; it
+  refits the per-position acceptance calibration (`OnlineRefit`), a separate object that does not touch T(w).
+- **F141 merged (owner, 2026-10-20).** Branch `f141-residency-clock`: `forward_verify_with_reverify` re-runs a verify
+  whose narrowed gather overflowed (common on the cold warm-up cache). Both forwards were observed as verifies but the
+  worker commits once per step, so each re-run left an uncommitted provisional, and the `dsv41_decode_paths` warm-up
+  overflowed the 16-deep queue and logged a false "commits are not reaching the hot cache manager". The overflowed
+  forward now takes its provisional back (`discard_overflowed_verify`); the warning counts the drops. Its temporary diagnostic commit (`04e1d36f6f`) is not in the
+  merged tree.
 - **TODO (owner, 2026-10-16):**
   - ~~Broaden the STS calibration data~~ Done 2026-10-18: see "Sampled STS recalibration" above.
   - Drive-pressure-aware cost: scale T(w)'s slope by a live NVMe pressure signal (e.g. recent NVMe wait per row), so
@@ -1632,6 +1645,26 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
     VRAM/RAM. Needs a per-row miss predictor; the parked lane head (4a) is the foundation.
   - Use the calibrated S_k beyond the cut: weight RAM prefetch candidates toward likely-accepted positions, and feed the
     split model's CPU/GPU decisions.
+
+### 3.13 SM120 FlashMLA backend: FlashInfer everywhere (owner, 2026-10-20)
+
+- **Decision (owner, 2026-10-20): full FlashInfer, in every arm and in production.** `arm_env.dspark_env()` sets
+  `SGLANG_SM120_FLASHMLA_BACKEND=flashinfer` (it was `triton`: every DSpark text result before this date ran triton
+  attention). The new `flashinfer_prefill` value (FlashInfer for calls of more than 64 tokens, triton for decode and the
+  DSpark verify) is kept as an option, not used.
+- **Served pair, 32k prompt** (`/mnt/nvme1/fi-prefill/serve-20261019-0300` and `-control`): TTFT 63.8 s vs triton
+  81.4 / 80.5 s; accept len 2.36 vs 2.34; median step 150 vs 151 ms; KV 381,184, no OOM.
+- **Exactness:** FlashInfer's decode is less exact than triton's at 64 tokens or fewer (relL2 3e-3..1.2e-2 vs <= 2.6e-3
+  on realistic keys, `parity.json`). The greedy split (token 19) is within triton's own run-to-run split (token 27).
+- `SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB=128` and `..._CHUNK_KERNELS=0` stay in `prod_dspark_env()`; they only act
+  when the backend is triton or on `flashinfer_prefill`'s triton path.
+- **Open, owner to decide:** the parity test `test_flash_mla_backends.py:473` silently skips on flashinfer 0.7.2. Its
+  guard looks for `flashinfer.sparse_mla_sm120`; the module is `flashinfer.mla._sparse_mla_sm120`. Left unchanged.
+- **Known failure, not called by production:** the 8 `test_dsa_indexer.py::test_dsv4_flashinfer_compact_topk_cuda_graph`
+  subtests fail because FlashInfer 0.7.2 refuses graph-safe top-k on SM120 (128 KiB shared memory). The indexer uses the
+  sgl-kernel top-k.
+- Stale comment, left as is: `DSPARK_MEM_FRACTION_STATIC`'s block in `arm_env.py` describes the triton fp32 prefill merge's
+  peak and says flashinfer "refuses the 5-token draft capture"; the served pair above ran DSpark on flashinfer.
 
 ## 4. Ideas on record, not started
 

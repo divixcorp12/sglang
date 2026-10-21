@@ -83,7 +83,8 @@ class ResidencyBoundaryClock:
         self.tokens_since_boundary = 0
         self.decode_forwards_since_boundary = 0
         self._provisional: deque[int] = deque(maxlen=_MAX_OUTSTANDING_VERIFIES)
-        self._warned_dropped_provisional = False
+        self.num_dropped_provisionals = 0
+        self._next_drop_warning = 1
 
     def observe(self, kind: ForwardKind, tokens: int) -> int | None:
         """Count one forward; return the tokens a boundary advances by, or None."""
@@ -124,14 +125,27 @@ class ResidencyBoundaryClock:
                 - self._provisional.popleft(),
             )
 
-    def _track_provisional(self, tokens: int) -> None:
-        if (
-            len(self._provisional) == self._provisional.maxlen
-            and not self._warned_dropped_provisional
-        ):
-            logger.warning(
-                "Expert residency clock dropped an uncommitted verify token count; "
-                "speculative commits are not reaching the hot cache manager"
+    def discard_last_verify(self) -> None:
+        """Forget the newest verify's provisional tokens: its output was discarded and the verify re-run.
+
+        The re-run is observed as a verify of its own, and the speculative worker commits once per step, so the
+        discarded forward would otherwise leave a provisional that no commit ever matches.
+        """
+        if self._provisional:
+            self.tokens_since_boundary = max(
+                0, self.tokens_since_boundary - self._provisional.pop()
             )
-            self._warned_dropped_provisional = True
+
+    def _track_provisional(self, tokens: int) -> None:
+        if len(self._provisional) == self._provisional.maxlen:
+            self.num_dropped_provisionals += 1
+            # Warn at the 1st, 10th, 100th ... drop: the count says how far commits are behind.
+            if self.num_dropped_provisionals == self._next_drop_warning:
+                logger.warning(
+                    "Expert residency clock dropped an uncommitted verify token count: "
+                    "%d dropped so far, each with %d newer verifies still waiting for a commit",
+                    self.num_dropped_provisionals,
+                    _MAX_OUTSTANDING_VERIFIES,
+                )
+                self._next_drop_warning *= 10
         self._provisional.append(tokens)

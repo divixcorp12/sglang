@@ -3010,6 +3010,10 @@ class ExpertHotCacheManager:
         updater = getattr(self, "gpu_residency", None)
         return updater is not None and bool(getattr(updater, "narrow_gather", False))
 
+    def discard_overflowed_verify(self) -> None:
+        """Tell the residency clock the verify just observed is being re-run, so only the re-run awaits a commit."""
+        self._boundary_clock.discard_last_verify()
+
     def take_verify_overflow(self, graphed: bool = True) -> bool:
         """After a verify on the narrowed gather: whether a layer's gather could not serve its misses. Clears the flag.
 

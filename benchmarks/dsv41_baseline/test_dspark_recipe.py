@@ -100,12 +100,14 @@ def test_prod_leaves_the_pending_and_held_flags_off():
 def test_prod_runs_the_sampled_confidence_cut_without_block_verification_or_the_greedy_draft():
     # DSV_OPTIMIZATION.md 3.12, owner 2026-10-18: the cut for sampled requests with the draft's time in T(w) and no
     # online refit, on the fitted STS file. Block verification and the greedy draft stay off; STS collection is off.
+    # Owner, 2026-10-20: T(w) is refit live every 32 timed cut verifies (DSV_OPTIMIZATION.md 3.12).
     env = arm_env.prod_env()
     assert {k: env[k] for k in arm_env.PROD_DSPARK_CUT_ENV} == {
         "SGLANG_DSPARK_CONFIDENCE_CUT": "1",
         "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED": "1",
         "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST": "1",
         "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL": "0",
+        "SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL": "32",
     }
     assert "SGLANG_DSPARK_STS_COLLECT_PATH" not in env and env.get("SGLANG_DSPARK_USE_GREEDY_DRAFT", "0") == "0"
     argv = arm_env.ServerArgs.prod().argv()

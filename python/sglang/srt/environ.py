@@ -839,6 +839,10 @@ class Envs:
     # Refit the cut's per-position calibration from the server's own accepts every this many cut verifies (greedy and
     # sampled apart; dspark_confidence_refit.py). The cut reads max(offline, refit), so it never cuts harder. 0 is off.
     SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL = EnvInt(0)
+    # Keep timing the cut's own verifies after the T(w) calibration and refit T(w) (least squares over the last 192)
+    # every this many of them, so the table follows the server out of the slow first ~35 s of a run instead of freezing
+    # the calibration's. 0 is off: T(w) stays as the calibration fitted it.
+    SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1489,7 +1493,9 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
-    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    # SM120 FlashMLA backend: "flashinfer" (default), "triton", or "torch". "flashinfer_prefill" runs FlashInfer's
+    # prefill for calls of more than 64 tokens and the triton kernel for decode and the DSpark verify (64 tokens or
+    # fewer); the triton merge-budget and chunk knobs below then apply to that triton path.
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Byte cap (MiB) on the fp32 temporaries of the triton backend's LSE merge and
     # attention-sink scaling, which peak at 3 fp32 copies of the [tokens, heads,

@@ -172,7 +172,8 @@ class TestResidencyBoundaryClock(unittest.TestCase):
         self.assertEqual(boundaries[:2], [0, 32])
         self.assertTrue(all(tokens >= 0 for tokens in boundaries), boundaries)
 
-    def test_dropped_uncommitted_verify_warns_once(self):
+    def test_genuinely_missing_commits_warn_with_the_dropped_count(self):
+        """Steady serving with no commit at all: the 17th verify drops one, the 26th is the 10th drop."""
         clock = ResidencyBoundaryClock(16, 0)
         with self.assertLogs(
             "sglang.srt.layers.moe.expert_residency_clock", level="WARNING"
@@ -180,7 +181,48 @@ class TestResidencyBoundaryClock(unittest.TestCase):
             for _ in range(40):
                 _observe(clock, _verify())
 
-        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(clock.num_dropped_provisionals, 24)
+        self.assertEqual(
+            [record.getMessage().split(": ")[1].split(" ")[0] for record in logs.records],
+            ["1", "10"],
+        )
+        self.assertNotIn("not reaching", logs.records[0].getMessage())
+
+    def _warm_up_decode(self, clock, steps, *, discard_overflowed):
+        """A cold-cache warm-up decode: every step's first verify overflows and is re-run, then one commit."""
+        for _ in range(steps):
+            _observe(clock, _verify())
+            if discard_overflowed:
+                clock.discard_last_verify()
+            _observe(clock, _verify())
+            clock.commit(1)
+
+    def test_rerun_verifies_without_a_discard_overflow_the_queue(self):
+        """The warm-up pattern before the fix: two provisionals per commit drop entries by the 16th step."""
+        clock = ResidencyBoundaryClock(16, 0)
+        with self.assertLogs(
+            "sglang.srt.layers.moe.expert_residency_clock", level="WARNING"
+        ):
+            self._warm_up_decode(clock, 20, discard_overflowed=False)
+        self.assertGreater(clock.num_dropped_provisionals, 0)
+
+    def test_discarded_rerun_verifies_leave_no_uncommitted_count(self):
+        clock = ResidencyBoundaryClock(16, 0)
+        with self.assertNoLogs(
+            "sglang.srt.layers.moe.expert_residency_clock", level="WARNING"
+        ):
+            self._warm_up_decode(clock, 200, discard_overflowed=True)
+        self.assertEqual(clock.num_dropped_provisionals, 0)
+        self.assertEqual(len(clock._provisional), 0)
+
+    def test_discard_takes_the_verify_tokens_out_of_the_window(self):
+        clock = ResidencyBoundaryClock(16, 0)
+        _observe(clock, _verify(4))
+        clock.discard_last_verify()
+        self.assertEqual(clock.tokens_since_boundary, 0)
+        self.assertEqual(clock.forwards, 1)
+        clock.discard_last_verify()  # nothing outstanding: a no-op
+        self.assertEqual(clock.tokens_since_boundary, 0)
 
     def test_manager_ignores_draft_forwards_before_touching_state(self):
         bare = ExpertHotCacheManager.__new__(ExpertHotCacheManager)

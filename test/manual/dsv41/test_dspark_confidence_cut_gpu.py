@@ -187,6 +187,39 @@ def test_the_sampled_cut_draft_timing_and_online_refit_add_no_device_sync():
     assert len(refit._modes["sampled"].buffer) > RING_SLOTS
 
 
+def test_the_live_t_w_refit_times_real_verifies_and_reads_widths_back_with_no_device_sync():
+    """A calibrated cut with the live refit on, real CUDA events, around real GPU work: the width copy to the pinned
+    ring, the events' queries and the refits run under torch's sync debug mode set to error. The table moves off the
+    calibration's once enough timed verifies of at least two widths are in. Mutant: a .item() or a pageable copy of the
+    width, or an event synchronize, in that path -- red."""
+    from sglang.srt.speculative.dspark_components.dspark_confidence_cut import AffineCostFit, ConfidenceCut
+
+    cut = ConfidenceCut(gamma=GAMMA, device=torch.device("cuda"), live_fit_interval=4)
+    cut._install_cost(AffineCostFit(base_ms=1000.0, per_row_ms=200.0, r2=1.0))
+    work, scratch = torch.randn((2048, 2048), device="cuda"), torch.empty((2048, 2048), device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    # Warm the host ring's pinned allocation and the matmul outside the debug mode.
+    cut.verify_lens(torch.rand((1, GAMMA), device="cuda", generator=generator))
+    cut.begin_verify()
+    torch.matmul(work, work, out=scratch)
+    cut.end_verify()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(200):
+            confidence = torch.rand((1, GAMMA), device="cuda", generator=generator)
+            cut.verify_lens(confidence)
+            cut.begin_verify()
+            torch.matmul(work, work, out=scratch)
+            cut.end_verify()
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    torch.cuda.synchronize()
+    cut.verify_lens(torch.rand((1, GAMMA), device="cuda", generator=generator))
+    assert cut._live_fit_ct >= 1
+    assert cut.cost_ms()[0] < 1000.0
+
+
 # The sampled cut's distribution test on the real accept: AcceptSampling (temperature softmax, the chain rejection
 # sampling kernel, CapCorrectLen and the bonus gather) with widths from the real rule (ConfidenceCut.verify_lens,
 # sampled). sglang.test.dspark_cut_distribution has the toy; its CPU twin is test_dspark_confidence_cut_sampled.py.

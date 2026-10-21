@@ -28,6 +28,10 @@ class _Manager:
         self.suspended = False
         self.reads = 0
         self.graphed = []
+        self.discards = 0
+
+    def discard_overflowed_verify(self):
+        self.discards += 1
 
     def take_verify_overflow(self, graphed=True):
         self.reads += 1
@@ -64,6 +68,7 @@ def test_a_flagged_graphed_verify_is_re_run_eagerly_with_the_gather_suspended(mo
     log = []
     out = forward_verify_with_reverify(runner, _forward(runner, log))
     assert log == [(True, False), (False, True)]
+    assert manager.discards == 1
     assert out.tag == 2 and not out.can_run_cuda_graph
     assert not manager.suspended and not runner.decode_cuda_graph_runner._eager_only
 
@@ -75,6 +80,7 @@ def test_an_unflagged_graphed_verify_is_kept(monkeypatch):
     log = []
     out = forward_verify_with_reverify(runner, _forward(runner, log))
     assert log == [(True, False)] and out.tag == 1 and manager.reads == 1
+    assert manager.discards == 0
 
 
 @pytest.mark.parametrize("graphed", [True, False])

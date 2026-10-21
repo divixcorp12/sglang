@@ -350,6 +350,11 @@ PROD_DSPARK_CUT_ENV = {
     "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED": "1",
     "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST": "1",
     "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL": "0",
+    # T(w) refit live every 32 timed cut verifies (owner turned it on, 2026-10-20). This overrides the owner rule
+    # "values calculated at startup" for this one table, at the owner's request. The served pair
+    # (/mnt/nvme1/tw-calib-fix-20261018/) showed 32 refits with no error and no regression; the benefit is untested,
+    # because the live arm never hit the nvme3n1 slow phase it is meant to follow.
+    "SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL": "32",
 }
 
 
@@ -382,8 +387,13 @@ def dspark_env() -> dict[str, str]:
         "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "",
         # Budget A, with DSPARK_MEM_FRACTION_STATIC (reasons and the owner's option-C TODO at DSPARK_MEM_FRACTION_STATIC).
         "SGLANG_MOE_HOT_GPU_MB": DSPARK_HOT_GPU_MB,
-        # Every DSpark text result so far ran triton attention (§33.2, §33.8, §33.9).
-        "SGLANG_SM120_FLASHMLA_BACKEND": "triton",
+        # FlashInfer for every arm and production (owner, 2026-10-20: full FlashInfer everywhere). Every DSpark text
+        # result before it ran triton attention (§33.2, §33.8, §33.9). Served pair on the 32k prompt
+        # (/mnt/nvme1/fi-prefill/serve-20261019-0300 and -control): TTFT 63.8 s vs triton 81.4 / 80.5 s, accept len 2.36
+        # vs 2.34, median step 150 vs 151 ms, KV 381,184, no OOM. FlashInfer's decode is less exact than triton's at 64
+        # tokens or fewer (relL2 3e-3..1.2e-2 vs <= 2.6e-3 on realistic keys, parity.json); the greedy split (token 19)
+        # sits within triton's own run-to-run split (token 27). DSV_OPTIMIZATION.md 3.13.
+        "SGLANG_SM120_FLASHMLA_BACKEND": "flashinfer",
     }
 
 
@@ -419,7 +429,8 @@ def prod_dspark_env() -> dict[str, str]:
         # HiCache host pools on node 1: node 0's load-time swap 11.6 GiB -> 5 MB, throughput unchanged (DO 3.4).
         "SGLANG_HICACHE_HOST_NUMA_NODE": "1",
         # The triton FlashMLA prefill merge in 128 MiB token chunks, bit-identical, 1,217 MiB of prefill peak freed for
-        # the hot cache: -2.02 ms/token, 95% CI -3.7..-0.6 (DO 3.4 re-score, 3.7).
+        # the hot cache: -2.02 ms/token, 95% CI -3.7..-0.6 (DO 3.4 re-score, 3.7). Only acts when the backend is triton
+        # or on flashinfer_prefill's triton path (64 tokens or fewer); production's flashinfer backend does not read it.
         "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB": "128",
         # The caching allocator on expandable segments: ~1.5 GB of stranded reserve recovered at no cost (-0.26
         # ms/token, CI -0.39..-0.02), spent on 1,035 hot slots: -1.79 ms/token, CI -4.51..-0.64 (DO 3.7, expseg2).
@@ -430,6 +441,7 @@ def prod_dspark_env() -> dict[str, str]:
         # under serving (DO 3.7). A failed calibration keeps the configured size. Without the A1/A2 cuts it was served
         # with: per-chunk kernels off and the indexer budget at base_env's 128, as the best arm ran.
         "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": "1",
+        # The per-chunk kernels knob only acts when the backend is triton or on flashinfer_prefill's triton path.
         "SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS": "0",
         # The NVMe-to-RAM prefetch exactly as the best arm served it (share64-ab-20261016 resolved-env "on"): GPU
         # scorer on layer L's hidden state for layer L+2 through the learned T3 head, 2 reads a layer, 1 a token,
