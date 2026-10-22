@@ -1693,6 +1693,44 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   3105-13964 us) and 15-38% faster than master's generic vnni path (411 / 975 / 1606 us at experts 1/3/5). Arm labels are
   read from the data, not recorded in the directory.
 
+### 3.15 EXL3 CPU experts on the 8280: chunks of 8, VNNI byte accumulate, claimed groups, 16 threads, SMT opt-in (2026-10-22)
+
+Branch `exl3-8280-kernels` (not merged). All bit-exact: master-build references (24 frozen layer outputs, 13 routed
+workloads incl. shared5-8 and counts8-7-6-5-4-3-2-1) at 10 and 16 workers, with and without SMT, vnni and bw; A/B dumps
+72/72 at vnni, bw, avx2, scalar; bare and full-stack validates at the host tier and bw, also with `--smt`.
+
+- **What changed.**
+  - #6: on a VNNI host one-token chunks drop `register_bytesum` and accumulate the product bytes with 4 `vpdpbusd` per
+    decoded state against byte-duplicated activations (12.5 vs 13.5 vector ops per state); bw and M >= 2 unchanged
+    (disassembly identical to master's).
+  - #5: `SGLANG_EXL3_CPU_MAX_M` 8 -> 16, chunks of up to 8 tokens; M = 5..8 through `register_band_halves` (one output
+    half per pass, 2M accumulators). The generic plan keeps chunks of at most 4 (`GENERIC_CHUNK_M`), so its build does not
+    grow (555 s for a full 16-row table vs 478 s).
+  - #1: a call whose chunks differ in token count claims 8-tile groups from an atomic counter (gate/up, down); uniform
+    calls keep the static split. It covers every call row weighting would change, so
+    `SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT` (#1b) now only reaches the generic plan and stays off.
+  - #2: `arm_env.CPU_EXPERTS_THREADS` 10 -> 16 (experts 6-21 and 28-43); driver 18-21 -> 22-25, capture helpers
+    22-25 -> 78-81 (`HELPER_CORES`).
+  - #11: `SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT` (off) adds each expert core's SMT sibling to its pool; benches take `--smt`.
+- **Bare bench, node 1, membind 1, vnni, 5 rotated rounds, p50 us medians** (`/mnt/nvme1/exl3-8280/tprod`; per-feature
+  conditions in `t10`, `t16`; range across rounds <= 6% except single outlier rounds):
+
+  | workload | master @10 (prod today) | branch @10 | branch @16 (shipped) | branch @16 + SMT | master @16 |
+  |---|---|---|---|---|---|
+  | experts 1 / 3 / 5 | 315 / 954 / 1585 | 298 / 906 / 1478 | 252 / 759 / 1255 | 232 / 820 / 1312 | 268 / 797 / 1290 |
+  | rows 2 / 3 / 4 / 8 random | 3801 / 5733 / 8673 / 13742 | 3569 / 4914 / 6744 / 11607 | 3008 / 4078 / 5701 / 9320 | 3283 / 3992 / 5706 / 9013 | 3155 / 4990 / 7416 / 12830 |
+  | shared 5 / 6 / 7 / 8 | 6373 / 6569 / 6677 / 6895 | 4285 / 4648 / 5198 / 5546 | 3073 / 3357 / 3774 / 4064 | 2568 / 2828 / 3183 / 3520 | 5033 / 4983 / 4976 / 4983 |
+
+  Shipped vs production today: one-token calls -20%, mixed rows -21..-34%, shared5-8 -41..-52%.
+- **Per feature** (vs master at the same worker count, 10 / 16 workers): #6 experts 1-5 -5..-6% / -2..-4%; #5 shared5-8
+  -32..-19% / -38..-18%; #1 rows 3/4/8 -11/-17/-13% / -17/-22/-26%; #1b -3.5/-12/-5% / -13/-18/-12%; #11 at 10 workers
+  -3..-15%, at 16 workers +2..+9% on memory-bound one-token calls (experts 3, 5, rows 2), -7..-15% on several tokens.
+- **SMT under the engine's idle policy** (full stack, keep-warm 2000 us, 1 ms gaps, `/mnt/nvme1/exl3-8280/kw`): 10 cores
+  300 / 908 / 1503 us -> with siblings 291 / 892 / 1438; 16 cores 269 / 757 / 1256 -> 236 / 819 / 1332. The same pattern as
+  the bare bench: SMT stays off, an owner A/B question once the GPU is back.
+- **Open:** a served A/B of the shipped settings (16 threads; the kernel changes ship with the extension) before
+  production restarts.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.
