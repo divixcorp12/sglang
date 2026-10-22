@@ -467,13 +467,13 @@ def _add(cfg: Config) -> None:
 
 for _d in (0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 1.0):
     _add(Config(f"d{_d}", decay=_d))
-for _d in (0.98, 0.995, 0.999):
+for _d in (0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 1.0):
     _add(Config(f"d{_d}-noprefill", decay=_d, prefill_counts=False))
-for _d in (0.98, 0.995, 0.999):
+for _base, _d, _pf in (("d0.98", 0.98, True), ("d0.995", 0.995, True), ("d0.999-noprefill", 0.999, False)):
     for _adm in ("s", "s+cur", "L0.999", "L0.999+cur", "L0.9995+cur"):
         for _m in ("0", "1", "x1.25"):
             ld = float(_adm[1:].split("+")[0]) if _adm.startswith("L") else 0.999
-            _add(Config(f"d{_d}-adm{_adm}-m{_m}", decay=_d, adm=_adm, margin=_m, long_decay=ld))
+            _add(Config(f"{_base}-adm{_adm}-m{_m}", decay=_d, adm=_adm, margin=_m, long_decay=ld, prefill_counts=_pf))
 
 
 def main() -> int:
