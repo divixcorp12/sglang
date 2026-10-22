@@ -370,7 +370,7 @@ def _check_slot_map() -> None:
         if getattr(envs, name).get().strip() and not envs.SGLANG_DSV41_CPU_TWO_STAGE.get():
             raise ValueError(f"{name} needs SGLANG_DSV41_CPU_TWO_STAGE=1")
     if envs.SGLANG_DSV41_CPU_TWO_STAGE.get():
-        from sglang.srt.layers.moe.exl3_expert_format import two_stage_span_weights
+        from sglang.srt.layers.moe.expert_engine.formats.exl3 import two_stage_span_weights
 
         two_stage_span_weights()
 

@@ -357,7 +357,13 @@ class ModelOptQuantConfig(QuantizationConfig):
             if self.is_layer_excluded(prefix):
                 # Falls back to default unquantized MoE
                 return None
-            return Moe(self)
+            method = Moe(self)
+            # An NVFP4 MoE method learns here whether the expert engine streams this layer (the prefix is not
+            # known to its constructor); every other method has nothing to bind.
+            bind_expert_engine = getattr(method, "bind_expert_engine", None)
+            if bind_expert_engine is not None:
+                bind_expert_engine(prefix)
+            return method
         return None
 
     @classmethod
@@ -2404,6 +2410,28 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         self._cache_permute_indices = {}
 
+    def bind_expert_engine(self, prefix: str) -> None:
+        """Route this layer through the native expert engine when its model has an engine profile.
+
+        Called once per layer by ``ModelOptQuantConfig._get_quant_method``. The layers of DSV4.1 and MiMo (the
+        ``expert_engine`` profiles) stream through ``expert_engine.quant_hook`` with the NVFP4 format; every other
+        model (Qwen included) leaves ``expert_profile_name`` None and keeps ``_attach_expert_streamer`` and the
+        ExpertStreamer ``apply`` path unchanged.
+        """
+        from sglang.srt.layers.moe.expert_engine.formats.nvfp4 import (
+            engine_profile_name_for,
+        )
+
+        profile_name = engine_profile_name_for(prefix)
+        if profile_name is not None:
+            self.expert_format_name = "nvfp4"
+            self.expert_profile_name = profile_name
+
+    @property
+    def engine_streamed(self) -> bool:
+        """Whether the native expert engine, not ExpertStreamer, streams this layer's experts."""
+        return self.expert_profile_name is not None
+
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
         from sglang.srt.layers.moe import get_moe_runner_backend
@@ -2470,6 +2498,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
+
+        if self.engine_streamed:
+            # Routed experts stay on disk and the expert engine streams them (formats/nvfp4.py): no expert tensor is
+            # allocated, on the host or the device. With no parameters, the profile's skip hook drops the checkpoint's
+            # expert tensors at load, and process_weights_after_loading attaches the engine's streamer. The dims are
+            # what the row format is built from; the per-layer activation scales are bound by the row source.
+            layer.nvfp4_num_experts = num_experts
+            layer.nvfp4_hidden = hidden_size
+            layer.nvfp4_inter = intermediate_size_per_partition
+            layer.nvfp4_gated = layer.moe_runner_config.is_gated
+            layer.nvfp4_streamed = True
+            layer.w13_input_scale_quant = None
+            layer.w2_input_scale_quant = None
+            return
 
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
@@ -2693,6 +2735,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        if self.engine_streamed:
+            # Nothing was materialized here: the engine's row source supplies swizzled scales and alphas row by row
+            # (Nvfp4ExpertFormat.prepare_host_rows). Bind the engine and attach the streamer.
+            from sglang.srt.layers.moe.expert_engine import quant_hook
+
+            quant_hook.attach(layer, self)
+            return
         stream_experts = (
             expert_streaming_enabled() and layer.w13_weight.device.type == "cpu"
         )
@@ -3235,6 +3284,42 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             global_num_experts=global_num_experts,
         )
 
+    def _apply_engine(
+        self, layer: FusedMoE, dispatch_output: StandardDispatchOutput
+    ) -> CombineInput:
+        """The native engine's streamed branch: ``quant_hook.apply`` gathers, then the NVFP4 format's FlashInfer CUTLASS
+        call runs over the slot buffers (formats/nvfp4.py)."""
+        from sglang.srt.layers.moe.expert_engine import quant_hook
+        from sglang.srt.layers.moe.expert_format import expert_streamer_of
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+        )
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        streamer = expert_streamer_of(layer)
+        if streamer is None:
+            raise RuntimeError(
+                f"nvfp4 layer {getattr(layer, 'layer_id', '?')} streams but has no expert streamer"
+            )
+        topk = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_bypassed(topk):
+            raise RuntimeError(
+                "NVFP4 expert-engine streaming needs STANDARD top-k output"
+            )
+        x = dispatch_output.hidden_states
+        if x.shape[0] == 0:
+            return StandardCombineInput(hidden_states=x)
+        limit = self.moe_runner_config.gemm1_clamp_limit or self.moe_runner_config.swiglu_limit
+        out = quant_hook.apply(
+            layer,
+            streamer,
+            x,
+            topk.topk_weights,
+            topk.topk_ids,
+            None if limit is None else float(limit),
+        )
+        return StandardCombineInput(hidden_states=out)
+
     def apply(
         self,
         layer: FusedMoE,
@@ -3246,6 +3331,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "the model block must route every forward through "
                 "run_mega_routed_experts (check the MegaMoE token budget)."
             )
+        if self.engine_streamed:
+            return self._apply_engine(layer, dispatch_output)
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
         # tuple). Defer per-attribute access to the branches that actually

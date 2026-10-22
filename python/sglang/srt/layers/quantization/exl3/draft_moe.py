@@ -10,7 +10,7 @@ from typing import Sequence
 
 import torch
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.quantization.exl3.fused_moe import ROW_TILE, Exl3FusedMoE
 
 # The fused route tables take at most this many routes a call (exl3_route_tables.cuh, kMaxRoutes).

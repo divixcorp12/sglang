@@ -11,7 +11,7 @@ import torch
 from safetensors import safe_open
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import (
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
     EXL3_STREAMED_NAMES,
     exl3_expert_layout_for,
 )
@@ -178,14 +178,14 @@ def test_process_rejects_a_mismatched_layer(ckpt, kwargs, env_dir, match):
 
 
 def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
-    from sglang.srt.layers.moe import exl3_expert_format
+    from sglang.srt.layers.moe.expert_engine.formats import exl3 as exl3_expert_format
 
     monkeypatch.setattr(exl3_expert_format, "_WARNED_WITHOUT_PINNED_TIER", False)
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
         str(ckpt)
     ), envs.SGLANG_MOE_PINNED_HOST_MB.override(0):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
-        with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.exl3_expert_format"):
+        with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.expert_engine.formats.exl3"):
             for _ in range(2):
                 layer = _layer(method, hidden=2 * HIDDEN)  # fails after the warning
                 with pytest.raises(ValueError, match="do not match the layer"):

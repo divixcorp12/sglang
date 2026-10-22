@@ -166,7 +166,7 @@ class ChainSim:
         self.replica.apply_bulk([tuple(int(v) for v in entry) for entry in bulk])
 
     def sync_bulk(self) -> None:
-        """Exl3RamMissService.after_host_use: take the host's bulk delta (the caller owns the tier: no thread, or
+        """ExpertEngineService.after_host_use: take the host's bulk delta (the caller owns the tier: no thread, or
         paused) and apply it as map_bulk_apply does."""
         self.apply_bulk_like_device(self.host.take_bulk_delta().tolist())
 

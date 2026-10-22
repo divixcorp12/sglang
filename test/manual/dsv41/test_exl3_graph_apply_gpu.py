@@ -37,7 +37,7 @@ LOOSE_BOUND = 2.5e-2
 def _layer(tmp_path):
     """(layer, streamer, source rows {name: [EXPERTS, ...]} read afresh from the checkpoint)."""
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache

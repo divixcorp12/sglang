@@ -732,7 +732,7 @@ def test_the_trait_weights_only_the_source_the_option_names(caplog):
 
     ext = type("Ext", (), {"__file__": "/build/sglang_exl3_ext.so"})()
     with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override("draft"):
-        with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        with caplog.at_level("INFO", logger="sglang.srt.layers.moe.expert_engine.formats.exl3"):
             draft, target = cpu_trait_for("exl3", ext, source="draft"), cpu_trait_for("exl3", ext, source="target")
     assert (draft.row_weighted, target.row_weighted) == (True, False)
     assert "draft" in caplog.text and "row-weighted" in caplog.text and "/build/sglang_exl3_ext.so" in caplog.text

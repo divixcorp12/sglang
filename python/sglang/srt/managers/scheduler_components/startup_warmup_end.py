@@ -25,13 +25,13 @@ from sglang.srt.utils import triton_load_watch
 
 logger = logging.getLogger(__name__)
 
-_RAM_MISS_MODULE = "sglang.srt.layers.moe.exl3_ram_miss"
+_RAM_MISS_MODULE = "sglang.srt.layers.moe.expert_engine.service"
 
 
 def ram_miss_service():
-    """The EXL3 RAM-miss service when one exists, without importing its module."""
+    """The expert engine service when one exists, without importing its module."""
     module = sys.modules.get(_RAM_MISS_MODULE)
-    return None if module is None else module.Exl3RamMissService._instance
+    return None if module is None else module.ExpertEngineService._instance
 
 
 def arm_decodes() -> int:

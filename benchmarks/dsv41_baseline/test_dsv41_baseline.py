@@ -1088,7 +1088,7 @@ def test_default_mirror_roots_are_three_absolute_paths_on_distinct_drives():
 
 def test_an_arm_turns_mirroring_off_with_an_empty_override():
     # Not by dropping the key: base_env always supplies one, so the empty string is the
-    # only way off, and exl3_expert_format.exl3_mirror_config reads it as off.
+    # only way off, and expert_engine.formats.exl3.exl3_mirror_config reads it as off.
     env = arm_env.arm_env({"SGLANG_MOE_EXPERT_MIRROR_DIRS": ""})
     assert env["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == ""
 

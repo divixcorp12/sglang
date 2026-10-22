@@ -16,7 +16,6 @@ arithmetic is in ``cpu_experts/policy.py``.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import Mapping, Optional, Sequence
 
@@ -24,47 +23,25 @@ import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import cpu_row_bytes
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
 from sglang.srt.layers.moe.cpu_experts.policy import (
     capped_split,
     format_calibration,
     split_table,
 )
+from sglang.srt.layers.moe.expert_engine.formats import get_format
 
 logger = logging.getLogger(__name__)
 
 
-def _short_sha256(path: Optional[str]) -> str:
-    """First 12 hex digits of the file's sha256, so a log line names the exact shared object that served an arm."""
-    if not path:
-        return "?"
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:12]
-    except OSError:
-        return "?"
-
-
 def cpu_trait_for(format_key: str, ext=None, *, source: str):
-    """The quant trait of a streamed expert format for ``source``'s layers ("draft" or "target"); only EXL3 has a
-    CPU kernel today. Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice."""
-    if format_key == "exl3":
-        from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
-        from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    """The quant trait of a registered expert format for ``source``'s layers ("draft" or "target").
 
-        if ext is None:
-            ext = exl3_ext()
-        row_weighted = source in row_weighted_sources()
-        path = getattr(ext, "__file__", None)
-        logger.info(
-            "CPU experts: the %s's EXL3 layers use %s tile assignment (extension %s, sha256 %s)",
-            source,
-            "row-weighted" if row_weighted else "even",
-            path,
-            _short_sha256(path),
-        )
-        return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
-    raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
+    ValueError when the format has no CPU kernel (``cpu_trait`` returns None).
+    """
+    trait = get_format(format_key).cpu_trait(source=source, ext=ext)
+    if trait is None:
+        raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
+    return trait
 
 
 def _parsed_split(spec: str, lanes: int, name: str) -> list[int]:
@@ -200,7 +177,7 @@ class CpuExpertService:
         self.store_out = envs.SGLANG_DSV41_CPU_EXPERTS_STORE_OUT.get()
         self.span_weights = (None, None)
         if self.two_stage:
-            from sglang.srt.layers.moe.exl3_expert_format import two_stage_span_weights
+            from sglang.srt.layers.moe.expert_engine.formats.exl3 import two_stage_span_weights
 
             self.span_weights = two_stage_span_weights()
         host.enable_cpu_experts(

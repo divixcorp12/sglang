@@ -19,7 +19,7 @@ sys.path.insert(
 
 import verify_expert_mirror as vem  # noqa: E402
 
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat  # noqa: E402
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat  # noqa: E402
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout  # noqa: E402
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402

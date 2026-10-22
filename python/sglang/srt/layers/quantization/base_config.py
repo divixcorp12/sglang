@@ -96,6 +96,12 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
     runner: MoeRunner | None = None
+    # The expert engine's registry names for the format this method streams and the model profile it streams
+    # for (expert_engine.formats / expert_engine.profiles); None for a method the engine does not serve.
+    expert_format_name: Optional[str] = None
+    expert_profile_name: Optional[str] = None
+    # A speculative draft's MoE, which keeps its experts resident instead of streaming them.
+    draft: bool = False
 
     def create_weights(
         self,

@@ -116,8 +116,8 @@ def is_serving_rid(rid) -> bool:
 
 def ram_miss_copy_engine_state() -> str:
     """The EXL3 RAM-miss copy engine's state, read off the service singleton without importing its module."""
-    module = sys.modules.get("sglang.srt.layers.moe.exl3_ram_miss")
-    service = None if module is None else module.Exl3RamMissService._instance
+    module = sys.modules.get("sglang.srt.layers.moe.expert_engine.service")
+    service = None if module is None else module.ExpertEngineService._instance
     if service is None or not service.copy_engine:
         return COPY_ENGINE_OFF
     return COPY_ENGINE_ARMED if service.copy_engine_armed else COPY_ENGINE_PENDING

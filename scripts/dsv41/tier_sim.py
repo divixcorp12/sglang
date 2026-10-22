@@ -41,7 +41,7 @@ from typing import Callable, Iterable, Optional
 import numpy as np
 import torch
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_MAX_GATHER_ROWS
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_MAX_GATHER_ROWS
 from sglang.srt.layers.moe.expert_host_tier import PinnedSlotLRU
 from sglang.srt.layers.moe.expert_residency import (
     ExpertResidencyPolicy,

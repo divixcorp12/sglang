@@ -11,7 +11,7 @@ import torch
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_once, read_rows_traced
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
@@ -287,7 +287,7 @@ def _eof_checkpoint(tmp_path, weights, *, rows, need_bytes=None):
     Every row starts on a page, so it starts its buffer. The single segment copies the first
     ``need_bytes`` of the row (default: the whole aligned superset of row 0) into the slab.
     """
-    from sglang.srt.layers.moe.exl3_expert_format import RowSegment
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import RowSegment
     from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout, Exl3ExpertRecord
 
     source = tmp_path / "ckpt"

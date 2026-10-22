@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 
-from sglang.srt.layers.moe.exl3_expert_format import (
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
     EXL3_MAX_GATHER_ROWS,
     EXL3_STREAMED_NAMES,
     Exl3ExpertFormat,
@@ -131,7 +131,7 @@ def test_rejects_an_unexpected_row(tmp_path):
 
 
 def test_the_exl3_format_serves_graph_gathers_from_its_pinned_tier():
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.expert_format import graph_source_kind_of
 
     assert graph_source_kind_of(Exl3ExpertFormat) == "pinned_tier"
@@ -359,7 +359,7 @@ def test_the_streamer_builder_hands_the_format_the_real_source_root(
     import types
 
     from sglang.srt.layers.moe import expert_stream
-    from sglang.srt.layers.moe.exl3_expert_format import build_exl3_expert_streamer
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import build_exl3_expert_streamer
 
     fmt, roots = _mirrored(tmp_path)
     link = tmp_path / "ckpt_link"

@@ -7,7 +7,7 @@ import torch
 from safetensors import safe_open
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 

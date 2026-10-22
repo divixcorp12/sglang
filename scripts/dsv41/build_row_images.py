@@ -44,7 +44,7 @@ from verify_expert_mirror import parse_layers
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_row_image as ri
-from sglang.srt.layers.moe.exl3_expert_format import _row_schema, parse_mirror_roots
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import _row_schema, parse_mirror_roots
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
     build_exl3_expert_layout,

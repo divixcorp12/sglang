@@ -8,7 +8,7 @@ import torch
 from safetensors import safe_open
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
 from sglang.srt.layers.moe.exl3_shard_row_source import (

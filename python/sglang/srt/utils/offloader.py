@@ -62,6 +62,10 @@ def _iter_streamed_nvfp4_parameters(
         quant_method = getattr(submodule, "quant_method", None)
         if type(quant_method).__name__ != "ModelOptNvFp4FusedMoEMethod":
             continue
+        if getattr(quant_method, "engine_streamed", False):
+            # The native expert engine streams this layer's experts (formats/nvfp4.py): create_weights allocated no
+            # expert tensor, so there is nothing to place on the host or bind to expert files.
+            continue
 
         missing = [
             name

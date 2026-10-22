@@ -21,6 +21,7 @@ See DSV41_REFERENCE.md section 9.1 for the pinned-tier budget these formats use.
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import math
 import os
@@ -144,8 +145,15 @@ class Exl3ExpertFormat:
     """
 
     key = "exl3"
+    transport_build = "exl3"
+    engine_served = True
     supports_graph_gather = False
     supports_host_arena = False
+    # The six streamed names are exactly the transfer executor's bundle of row copies.
+    supports_transfer_executor = True
+    supports_cpu_experts = True
+    supports_draft = True
+    supports_dead_rows = True
     graph_source_kind = "pinned_tier"
     max_gather_rows: Optional[int] = EXL3_MAX_GATHER_ROWS
     names = EXL3_STREAMED_NAMES
@@ -202,9 +210,11 @@ class Exl3ExpertFormat:
             streamer = expert_streamer_of(layer)
             hot = None if streamer is None else streamer.hot_cache
             if hot is not None:
-                from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+                from sglang.srt.layers.moe.expert_engine.service import (
+                    ExpertEngineService,
+                )
 
-                service = Exl3RamMissService.get()
+                service = ExpertEngineService.get()
                 if service.gpu_hot_enabled:
                     return expert_id in service.hot_experts(self.layer_id)
             return hot is not None and expert_id in hot.slot_to_expert
@@ -213,13 +223,15 @@ class Exl3ExpertFormat:
         if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
             # The C++ RAM-miss thread owns this tier's slots;
             # ExpertPinnedHostCache binds the tier's capacity into the table.
-            from sglang.srt.layers.moe.exl3_ram_miss import (
-                Exl3RamMissService,
+            from sglang.srt.layers.moe.expert_engine.row_backend import (
                 NativePinnedSlotTable,
+            )
+            from sglang.srt.layers.moe.expert_engine.service import (
+                ExpertEngineService,
             )
 
             options["slot_table"] = NativePinnedSlotTable(
-                Exl3RamMissService.get(),
+                ExpertEngineService.get(),
                 self.layer_id,
                 lambda: expert_streamer_of(layer),
             )
@@ -238,32 +250,32 @@ class Exl3ExpertFormat:
         Called before the first tier fill, while the service reserves its staging
         slots. A no-op unless the tier runs on the native slot table.
         """
-        from sglang.srt.layers.moe.exl3_ram_miss import (
-            Exl3RamMissService,
+        from sglang.srt.layers.moe.expert_engine.row_backend import (
             NativePinnedSlotTable,
         )
+        from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
         tier = getattr(streamer, "pinned_host_cache", None)
         if isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
-            Exl3RamMissService.get().plan_gather_width(rows, routes)
+            ExpertEngineService.get().plan_gather_width(rows, routes)
             victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
             if victims and victims < rows:
-                Exl3RamMissService.get().plan_staging_width(victims)
+                ExpertEngineService.get().plan_staging_width(victims)
 
     def attach_hot_cache_manager(self, manager, streamer) -> None:
         """Attach the RAM-miss service (fail-stop check, residency pushes, row backend).
 
         A no-op unless the layer's pinned tier runs on the native slot table.
         """
-        from sglang.srt.layers.moe.exl3_ram_miss import (
-            Exl3RamMissService,
+        from sglang.srt.layers.moe.expert_engine.row_backend import (
             NativePinnedSlotTable,
         )
+        from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
         tier = getattr(streamer, "pinned_host_cache", None)
         if not isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
             return
-        Exl3RamMissService.get().attach(manager, streamer)
+        ExpertEngineService.get().attach(manager, streamer)
 
     def default_row_source(
         self,
@@ -358,6 +370,88 @@ class Exl3ExpertFormat:
         A non-None value turns on the eager pinned host tier and the file counters.
         """
         return None if row_source is None else row_source.file_bytes_per_expert
+
+    def engine_tables(self, streamers: dict):
+        """The flat tables the native reader runs from, over every streamed layer's pinned slabs and row images.
+
+        ``streamers`` maps a layer id to its streamer. The mirror roots and direct-read setting are the ones the
+        eager row source uses, validated by the same code.
+        """
+        from sglang.srt.layers.moe.expert_engine.formats.exl3_tables import (
+            exl3_ram_miss_tables,
+            open_service_row_images,
+        )
+
+        mirrors = self.mirror_table_args()
+        direct = self._resolve_direct()
+        return exl3_ram_miss_tables(
+            self.layout,
+            self.segment_map(),
+            {
+                layer_id: s.pinned_host_cache.tensors
+                for layer_id, s in streamers.items()
+            },
+            **mirrors,
+            row_images=open_service_row_images(
+                self.layout, self.segment_map(), mirrors, direct, streamers
+            ),
+        )
+
+    @staticmethod
+    def layer_dims(layer: torch.nn.Module) -> tuple[int, int]:
+        return layer.exl3_num_experts, layer.exl3_hidden
+
+    @staticmethod
+    def build_streamer(layer: torch.nn.Module):
+        return build_exl3_expert_streamer(layer)
+
+    @staticmethod
+    def cpu_trait(*, source: str, ext=None):
+        """The EXL3 CPU kernel's quant trait for ``source``'s layers ("draft" or "target").
+
+        Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice.
+        """
+        from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
+        from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+        from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+        if ext is None:
+            ext = exl3_ext()
+        row_weighted = source in row_weighted_sources()
+        path = getattr(ext, "__file__", None)
+        logger.info(
+            "CPU experts: the %s's EXL3 layers use %s tile assignment (extension %s, sha256 %s)",
+            source,
+            "row-weighted" if row_weighted else "even",
+            path,
+            _short_sha256(path),
+        )
+        return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
+
+    def prepare_host_rows(
+        self, layer: torch.nn.Module, name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """EXL3 rows are staged as the checkpoint stores them."""
+        return tensor
+
+    def moe_apply(self, layer, x, slot_ids, weights, slot_tensors) -> torch.Tensor:
+        """The fused EXL3 MoE over the hot-cache slots the gather filled (fp32 output).
+
+        ``slot_ids`` is the router's int32 remap of this batch's expert ids to slot ids. Layer fusion takes it as it
+        is and writes the int64 copy inside its one kernel; the unfused kernel reads int64.
+        """
+        from sglang.srt.layers.quantization.exl3.fused_moe import exl3_fused_moe_for
+
+        fused = exl3_fused_moe_for(layer, slot_tensors.streamer)
+        flat_ids = slot_ids.reshape(-1)
+        return fused.run(
+            x,
+            weights.reshape(-1),
+            flat_ids if fused.layer_fusion else flat_ids.long(),
+            slot_tensors.keep,
+            slot_tensors.swiglu_limit,
+            cpu=slot_tensors.cpu,
+        )
 
     def _resolve_direct(self) -> bool:
         """Whether shard reads use O_DIRECT, from ``direct`` or the file-reader mode."""
@@ -488,6 +582,17 @@ def exl3_mirror_config() -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:
 
 logger = logging.getLogger(__name__)
 _WARNED_WITHOUT_PINNED_TIER = False
+
+
+def _short_sha256(path: Optional[str]) -> str:
+    """First 12 hex digits of the file's sha256, so a log line names the exact shared object that served an arm."""
+    if not path:
+        return "?"
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "?"
 
 
 @functools.lru_cache(maxsize=4)

@@ -493,7 +493,7 @@ task's to make).
 Mirroring is a property of the box's storage and production reads mirrored, so an arm
 that omitted it was measuring a drive layout nobody runs. To measure the unmirrored
 drive, override the var to the **empty string** — dropping the key is no longer possible,
-since `base_env()` always supplies one, and `exl3_expert_format.exl3_mirror_config()`
+since `base_env()` always supplies one, and `expert_engine.formats.exl3.exl3_mirror_config()`
 reads an empty value as off.
 
 That last point is why the verdict's `mirror` flag tests the *value* and not the key

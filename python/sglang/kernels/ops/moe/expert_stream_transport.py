@@ -75,6 +75,9 @@ BuildKey = tuple[str, str]
 EXL3_BUILD: BuildKey = ("exl3", "sqrt_softplus")
 NVFP4_BUILD: BuildKey = ("nvfp4", "sqrt_softplus")
 MXFP4_BUILD: BuildKey = ("mxfp4", "sigmoid")
+# MiMo V2.6 Pro once converted to NVFP4: the NVFP4 rows with MiMo's sigmoid router. The same host and device sources,
+# so only the -D macros (and so the JIT keys) differ from NVFP4_BUILD.
+NVFP4_MIMO_BUILD: BuildKey = ("nvfp4", "sigmoid")
 
 _ENGINE_HOST = "moe/expert_stream/engine_host.cpp"
 _ENGINE_DEVICE = "moe/expert_stream/engine_device.cuh"
@@ -97,7 +100,7 @@ def _engine_build(key: BuildKey) -> TransportBuild:
 # build is absent: ``_build_for`` raises with the JIT key it looked for. Adding a format
 # adds a ``csrc/moe/formats/<format>/format.h`` and an entry here.
 LAYOUTS: dict[BuildKey, TransportBuild] = {
-    key: _engine_build(key) for key in (EXL3_BUILD, NVFP4_BUILD, MXFP4_BUILD)
+    key: _engine_build(key) for key in (EXL3_BUILD, NVFP4_BUILD, NVFP4_MIMO_BUILD, MXFP4_BUILD)
 }
 
 # The two host builds: production (ProdBuild) and instrumented (InstrBuild), selected

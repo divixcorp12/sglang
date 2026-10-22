@@ -399,7 +399,7 @@ class GpuResidencyUpdater:
             # per-expert scalars (8 B/row in production) are on that kernel otherwise.
             if (
                 not streamer._graph_host_pair_count
-                and getattr(streamer.format, "key", None) != "exl3"
+                and not streamer.format.engine_served
             ):
                 raise ValueError(
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
@@ -469,8 +469,8 @@ class GpuResidencyUpdater:
           residency, and reads cache rows from a side stream.
         """
         if self.insert_direct:
-            exl3 = [getattr(s.format, "key", None) == "exl3" for s in self.streamers]
-            if any(exl3) and not all(exl3):
+            engine_served = [s.format.engine_served for s in self.streamers]
+            if any(engine_served) and not all(engine_served):
                 raise ValueError(
                     "EXL3 DIRECT requires every GPU-updated layer to use EXL3"
                 )
@@ -485,10 +485,8 @@ class GpuResidencyUpdater:
                 "cache rows this mode commits residency for"
             )
         for streamer in self.streamers:
-            if self.insert_direct and getattr(streamer.format, "key", None) == "exl3":
-                from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
-
-                if not isinstance(streamer.row_backend, Exl3RamMissRowBackend):
+            if self.insert_direct and streamer.format.engine_served:
+                if not streamer.row_backend.leased:
                     raise ValueError(
                         "EXL3 DIRECT requires the native EXL3 RAM-miss backend"
                     )
@@ -504,7 +502,7 @@ class GpuResidencyUpdater:
             if (
                 self.insert_direct
                 and streamer.pinned_host_cache is not None
-                and getattr(streamer.format, "key", None) != "exl3"
+                and not streamer.format.engine_served
             ):
                 raise ValueError(
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
@@ -699,8 +697,7 @@ class GpuResidencyUpdater:
                 self.insert_direct
                 and phase == _PREFILL_PHASE
                 and any(
-                    getattr(streamer.format, "key", None) == "exl3"
-                    for streamer in self.streamers
+                    streamer.format.engine_served for streamer in self.streamers
                 )
             ):
                 self._promote(eligible, width, phase)
@@ -1086,11 +1083,11 @@ class GpuResidencyUpdater:
         if self.layer_fusion:
             self._fused_commit_gather(row, streamer, destinations, live)
             return
-        if getattr(backend, "name", None) == "exl3_ram_miss" and backend.cpu_experts:
+        if backend.leased and backend.cpu_experts:
             raise RuntimeError(
                 "CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its commit leaves CPU lanes out"
             )
-        if getattr(backend, "name", None) == "exl3_ram_miss":
+        if backend.leased:
             delivered = backend.delivered_count.long()
             live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
         self._commit_gather(row, streamer, destinations, live)
@@ -1127,7 +1124,7 @@ class GpuResidencyUpdater:
         self.gather_insertions[row].add_(live.sum())
         self.gather_evictions[row].add_(evicted.sum())
         backend = streamer.row_backend
-        if getattr(backend, "name", None) == "exl3_ram_miss":
+        if backend.leased:
             delivered = backend.delivered_count.long()
             good = backend.keep[0] > 0
             self.insertion_truncated[row].add_(
@@ -1147,7 +1144,7 @@ class GpuResidencyUpdater:
         )
 
         backend = streamer.row_backend
-        leased = getattr(backend, "name", None) == "exl3_ram_miss"
+        leased = backend.leased
         direct_commit_gather(
             destinations,
             live,

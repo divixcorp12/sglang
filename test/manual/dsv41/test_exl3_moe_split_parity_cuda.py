@@ -45,7 +45,7 @@ TRIALS = 4
 
 def load_slot_rows(device, layer: int = LAYER, experts=EXPERTS) -> dict:
     """Real EXL3 expert rows of one layer, in hot-cache slot layout (as the P2 probe reads them)."""
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 

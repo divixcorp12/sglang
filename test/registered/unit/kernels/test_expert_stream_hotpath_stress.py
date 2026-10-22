@@ -8,7 +8,7 @@ import random
 import threading
 import time
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test import hotpath_script as hp
 from sglang.test.ci.ci_register import register_cpu_ci

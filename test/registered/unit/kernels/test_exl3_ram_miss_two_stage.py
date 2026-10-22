@@ -32,7 +32,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     read_rows_two_span,
 )
 from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim

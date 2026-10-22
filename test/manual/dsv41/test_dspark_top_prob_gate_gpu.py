@@ -168,20 +168,20 @@ def test_the_dedup_plan_leaves_dead_rows_out_of_the_route_counts_and_nothing_els
 @pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
 def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import exl3_ram_miss as service_module
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine import service as service_module
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import dsv41_exl3_pairing, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
-    service_module.Exl3RamMissService._instance = None
-    service = service_module.Exl3RamMissService.get()
+    service_module.ExpertEngineService._instance = None
+    service = service_module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     service.plan_gather_width(LANES)
     try:
         with (

@@ -42,22 +42,22 @@ def _distinct(experts):
 
 def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_once_armed(tmp_path):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import exl3_ram_miss as service_module
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine import service as service_module
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.moe.ram_slot_map import LaneKind
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import dsv41_exl3_pairing, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     source = _source_rows(tmp_path, num_experts=EXPERTS)
     source_cuda = {name: rows.cuda() for name, rows in source.items()}
     layout = build_exl3_expert_layout(str(tmp_path))
-    service_module.Exl3RamMissService._instance = None
-    service = service_module.Exl3RamMissService.get()
+    service_module.ExpertEngineService._instance = None
+    service = service_module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     try:
         with (
             service_row_images(tmp_path),

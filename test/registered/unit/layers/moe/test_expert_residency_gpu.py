@@ -1562,7 +1562,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         delivered = torch.tensor([1], dtype=torch.int32, device="cuda")
         keep = torch.tensor([0.0], dtype=torch.float32, device="cuda")
         streamer.row_backend = SimpleNamespace(
-            name="exl3_ram_miss", delivered_count=delivered, keep=keep, cpu_experts=False,
+            leased=True, delivered_count=delivered, keep=keep, cpu_experts=False,
         )
         destinations = torch.zeros(updater.miss_rows, dtype=torch.long, device="cuda")
         live = torch.zeros(updater.miss_rows, dtype=torch.bool, device="cuda")
@@ -1586,7 +1586,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         manager = _manager(_model(), gpu=True, **DIRECT)
         updater = manager.gpu_residency
         for streamer in updater.streamers:
-            streamer.format = SimpleNamespace(key="exl3")
+            streamer.format = SimpleNamespace(key="exl3", engine_served=True)
         updater.enabled.fill_(True)
         updater.route_counts[:, 3].fill_(4.0)
         before = updater.scores[:, 3].clone()

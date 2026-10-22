@@ -32,7 +32,7 @@ LAYER = 1
 )
 @pytest.mark.parametrize("route_plan", [False, True])
 def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_experts, route_plan):
-    from sglang.srt.layers.moe.exl3_expert_format import exl3_expert_layout_for
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import exl3_expert_layout_for
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
     from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
@@ -123,7 +123,7 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
     """80 experts, 40 tokens x 6 routes with dropped routes: two 64-expert chunks, through
     an 8-expert hot cache and a pinned tier that holds them all. No token routes an expert twice: CUDA index_add_
     adds repeated rows atomically, in no fixed order; the CPU tests pin that case bitwise."""
-    from sglang.srt.layers.moe.exl3_expert_format import exl3_expert_layout_for
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import exl3_expert_layout_for
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
     from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod

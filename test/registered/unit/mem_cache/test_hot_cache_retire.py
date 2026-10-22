@@ -2,7 +2,7 @@
 
 Two kinds of test:
 * the capacity-holder census reads the real classes' source (ExpertHotCache, ExpertResidencyPolicy,
-  GpuResidencyUpdater, Exl3RamMissRowBackend, ExpertRowPlanner, SpecScoreRow) and fails if any of them assigns a
+  GpuResidencyUpdater, ExpertEngineRowBackend, ExpertRowPlanner, SpecScoreRow) and fails if any of them assigns a
   capacity-named attribute that CAPACITY_HOLDERS neither lists nor exempts, so a new holder cannot slip past retire;
 * retire itself on CPU fakes with the real attribute names: evictions from the device bank, mapping and host lists,
   every capacity value lowered, the RAM-miss hot sets re-pushed, victims re-ranked, the VMM tail released, and the
@@ -42,7 +42,7 @@ def _assigned_capacity_attrs(cls) -> set:
 
 
 def test_every_capacity_holder_in_the_real_classes_is_listed_or_exempt():
-    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
+    from sglang.srt.layers.moe.expert_engine.row_backend import ExpertEngineRowBackend
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
     from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
@@ -51,7 +51,7 @@ def test_every_capacity_holder_in_the_real_classes_is_listed_or_exempt():
 
     listed = {attr.split("[")[0].split(".")[-1] for _, attr in hr.CAPACITY_HOLDERS} | hr.EXEMPT_CAPACITY_ATTRS
     found = {}
-    for cls in (ExpertHotCache, ExpertResidencyPolicy, GpuResidencyUpdater, Exl3RamMissRowBackend, ExpertRowPlanner,
+    for cls in (ExpertHotCache, ExpertResidencyPolicy, GpuResidencyUpdater, ExpertEngineRowBackend, ExpertRowPlanner,
                 SpecScoreRow):
         for attr in _assigned_capacity_attrs(cls):
             found.setdefault(attr, []).append(cls.__name__)
@@ -246,12 +246,12 @@ def _real_spec_scores(updater, service):
     the prefetch for row 1 (layer 7), as the L+2 scorer does; row 1 has no target."""
     import types
 
-    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
     gate = SimpleNamespace(weight=torch.zeros(E, 4), bias=torch.zeros(E))
     service._spec_gpu = SimpleNamespace(picked=SimpleNamespace(targets=torch.tensor([[1, 0], [-1, 0]]), gates=[gate]))
     service._spec_hot = {0: (updater.slot_to_expert[0], C), 1: (updater.slot_to_expert[1], C)}
-    service._bind_spec_scores = types.MethodType(Exl3RamMissService._bind_spec_scores, service)
+    service._bind_spec_scores = types.MethodType(ExpertEngineService._bind_spec_scores, service)
     service._bind_spec_scores()
     assert service._row_backends[0].spec_score.target == 1 and service._row_backends[1].spec_score is None
 

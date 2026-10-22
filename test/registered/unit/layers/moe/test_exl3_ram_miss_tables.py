@@ -10,8 +10,8 @@ import os
 import pytest
 
 from sglang.srt.layers.moe import exl3_row_image as ri
-from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+from sglang.srt.layers.moe.expert_engine.formats.exl3_tables import exl3_ram_miss_tables
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 

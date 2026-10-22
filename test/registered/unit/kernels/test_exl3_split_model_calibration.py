@@ -245,8 +245,8 @@ def test_a_failed_native_calibration_keeps_its_scratch():
 
 
 def _service_stub(nodes=2, fail=None):
-    """An Exl3RamMissService stand-in for _calibrate_split_model and _refine_split_model."""
-    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+    """An ExpertEngineService stand-in for _calibrate_split_model and _refine_split_model."""
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
     published = []
     stats = {"jobs": 0, "lanes": 0, "forward_ns": 0, "staged_jobs": 0, "stage_two_waits": 0, "stage_two_wait_ns": 0}
@@ -262,9 +262,9 @@ def _service_stub(nodes=2, fail=None):
         staging_width=lambda: 4,
         _split_model_refiner=None,
     )
-    stub._split_model_moments = lambda: Exl3RamMissService._split_model_moments(stub)
-    stub._publish_split_model = lambda costs: Exl3RamMissService._publish_split_model(stub, costs)
-    return stub, published, Exl3RamMissService
+    stub._split_model_moments = lambda: ExpertEngineService._split_model_moments(stub)
+    stub._publish_split_model = lambda costs: ExpertEngineService._publish_split_model(stub, costs)
+    return stub, published, ExpertEngineService
 
 
 def test_the_service_publishes_calibrated_words_and_starts_a_refiner(monkeypatch):

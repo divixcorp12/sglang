@@ -7,13 +7,20 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
-from sglang.srt.models.deepseek_v4_exl3_weights import (
-    is_dspark_draft_expert_module,
-    is_streamed_expert_module,
-)
+from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+PROFILE = get_profile_by_name("dsv41")
+
+
+def is_streamed_expert_module(prefix):
+    return PROFILE.is_streamed_module(prefix)
+
+
+def is_dspark_draft_expert_module(prefix):
+    return PROFILE.draft_adapter().is_draft_module(prefix)
 
 
 @pytest.mark.parametrize(

@@ -471,14 +471,14 @@ def test_the_service_builds_its_device_side_with_the_split_model_words():
     """exl3_ram_miss passes _split_model_words(): with SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL on and CPU experts running,
     words that hold the model off until the calibration publishes its costs (whatever the env's costs say), else
     None."""
-    import sglang.srt.layers.moe.exl3_ram_miss as service
+    import sglang.srt.layers.moe.expert_engine.service as service
 
     tree = ast.parse(Path(service.__file__).read_text())
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]
     for call in calls:
         assert {k.arg: ast.unparse(k.value) for k in call.keywords}["split_model"] == "self._split_model_words()"
     stub = SimpleNamespace(cpu_experts=object(), wire=SimpleNamespace(nodes=2))
-    words = service.Exl3RamMissService._split_model_words
+    words = service.ExpertEngineService._split_model_words
     from sglang.srt.environ import envs
 
     with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(False):
@@ -498,7 +498,7 @@ def test_a_negative_split_miss_cut_is_refused(name):
 
 def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
     """exl3_ram_miss passes the two env vars, the cut zeroed without CPU experts (split_miss_cut)."""
-    import sglang.srt.layers.moe.exl3_ram_miss as service
+    import sglang.srt.layers.moe.expert_engine.service as service
 
     tree = ast.parse(Path(service.__file__).read_text())
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab_arena
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes

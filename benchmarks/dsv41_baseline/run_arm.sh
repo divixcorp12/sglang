@@ -722,7 +722,7 @@ import verdict
 report = json.load(open('$report_path'))
 task1_module = task1_verdict.load_task1_verdict()
 # Truthy, not merely present: mirroring is on by default in arm_env, and an arm turns it
-# off by overriding the var to the empty string (exl3_expert_format.exl3_mirror_config
+# off by overriding the var to the empty string (expert_engine.formats.exl3.exl3_mirror_config
 # reads an empty value as off). Testing for the key would then judge an unmirrored arm
 # against the mirrored baseline.
 mirror = bool(json.load(open('$expected_env_path')).get('SGLANG_MOE_EXPERT_MIRROR_DIRS'))

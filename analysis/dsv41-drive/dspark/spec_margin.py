@@ -102,7 +102,7 @@ FLOORS = (0.3, 0.4, 0.5, 0.6)
 
 def _load_stratum():
     # By file path: the moe package __init__ imports torch, which this script must not need.
-    path = Path(__file__).resolve().parents[3] / "python/sglang/srt/layers/moe/dsv41_strata.py"
+    path = Path(__file__).resolve().parents[3] / "python/sglang/srt/layers/moe/expert_engine/profiles/dsv41_strata.py"
     spec = importlib.util.spec_from_file_location("sglang_dsv41_strata", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

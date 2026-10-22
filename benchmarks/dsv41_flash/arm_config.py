@@ -1,7 +1,7 @@
 """The launch of one benchmark arm: environment, Engine arguments, and the checks that refuse a wrong one.
 
 Two arms share every environment variable and Engine argument except SGLANG_DSV41_ENABLE_RAM_MISS_LEASES,
-which Exl3RamMissService reads once at start, so each arm is its own process.
+which ExpertEngineService reads once at start, so each arm is its own process.
 
 The phase3a env.sh sets SGLANG_MOE_EXPERT_GRAPH_GATHER=0 and decodes eagerly. Lease mode lives in the in-graph
 RAM-miss path, so that recipe as it stands makes both arms identical by construction. recipe_env applies the

@@ -71,9 +71,9 @@ def cpu_slots(on_cpu: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
 
 
 def _ram_miss_service():
-    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
-    return Exl3RamMissService.get()
+    return ExpertEngineService.get()
 
 
 def _new_host(areas, **kw):
@@ -101,7 +101,7 @@ class DraftCpuExperts:
         device=None,
     ):
         from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
-        from sglang.srt.layers.moe.exl3_ram_miss import watchdog_wait_s
+        from sglang.srt.layers.moe.expert_engine.service import watchdog_wait_s
 
         self.kernel = kernel
         self.cores = list(cores)
@@ -164,6 +164,7 @@ class DraftCpuExpertsRegistry:
     def __init__(self):
         self._layers: dict[int, DraftLayer] = {}
         self._stages: set[int] = set()
+        self._format_key: Optional[str] = None
         self._runtime: Optional[DraftCpuExperts] = None
         self._lock = threading.Lock()
 
@@ -174,8 +175,12 @@ class DraftCpuExpertsRegistry:
         act_limit: Optional[float],
         *,
         layer_id: int,
+        format_key: str,
     ) -> int:
-        """Add one stage; returns its key. Every stage must share one activation limit (one kernel trait)."""
+        """Add one stage of expert format ``format_key``; returns its key.
+
+        Every stage must share one activation limit and one format (one kernel trait).
+        """
         with self._lock:
             if self._runtime is not None:
                 raise RuntimeError("a DSpark draft stage registered after the CPU experts started")
@@ -184,6 +189,11 @@ class DraftCpuExpertsRegistry:
                 raise ValueError(
                     f"DSpark draft stages disagree on the activation limit: {sorted(limits)} and {act_limit}"
                 )
+            if self._format_key is not None and format_key != self._format_key:
+                raise ValueError(
+                    f"DSpark draft stages disagree on the expert format: {self._format_key!r} and {format_key!r}"
+                )
+            self._format_key = format_key
             key = len(self._layers)
             self._stages.add(layer_id)
             self._layers[key] = DraftLayer(slabs, on_cpu, act_limit)
@@ -228,7 +238,7 @@ class DraftCpuExpertsRegistry:
                         )
                         threads = len(cores)
                     check_engine_cores(cores, threads)
-                kernel = draft_kernel_for("exl3", next(iter(self._layers.values())).act_limit)
+                kernel = draft_kernel_for(self._format_key, next(iter(self._layers.values())).act_limit)
                 self._runtime = DraftCpuExperts(kernel, self._layers, cores=cores, threads=threads)
                 atexit.register(self.close)
                 logger.info(

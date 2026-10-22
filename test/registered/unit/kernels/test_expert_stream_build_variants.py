@@ -238,7 +238,7 @@ def test_the_draft_kernel_exports_run_on_prod(tmp_path):
 
 
 def test_a_traced_read_on_prod_reads_exact_bytes_with_an_empty_record_and_refuses_a_fault(tmp_path):
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
     from sglang.test.dsv41_ram_miss_fixtures import same_bytes
 
     s = ram_miss_setup(tmp_path)

@@ -194,7 +194,7 @@ class GraphRouteLog:
 
     For the stage trace only. A replayed decode graph runs no Python, so its routes
     never reach ``Exl3StreamTrace.record``. ``record`` is instead called from each
-    layer's in-graph gather (``Exl3RamMissRowBackend.post``) and is captured with it:
+    layer's in-graph gather (``ExpertEngineRowBackend.post``) and is captured with it:
     the first streamed layer (row 0) takes the next ring slot and bumps ``seq``, then
     every layer copies its routes and its plan's miss count into that slot. Each
     forward thus writes its own entry, numbered by ``seq`` (the graph forwards that
@@ -208,7 +208,7 @@ class GraphRouteLog:
     from a token count.
 
     ``poll`` runs at the per-batch check. It reads the ring back through pinned
-    buffers without waiting, one batch behind (like ``Exl3RamMissService._graph_rows``),
+    buffers without waiting, one batch behind (like ``ExpertEngineService._graph_rows``),
     and writes the entries finished since the last read. The copy is on the host's
     current stream, which need not be the stream the graph replays on, so an entry is
     trusted only when the ``seq`` read before the ring shows a later forward has

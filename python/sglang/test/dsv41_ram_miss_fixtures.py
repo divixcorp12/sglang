@@ -16,7 +16,9 @@ from typing import Iterable, Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.formats import get_format
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
 from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
@@ -126,14 +128,22 @@ def service_row_images(source) -> contextlib.ExitStack:
     return stack
 
 
+def dsv41_exl3_pairing() -> dict:
+    """The ``ExpertEngineService`` keyword arguments of the DSV4.1 EXL3 pairing: ``ExpertEngineService(**...)`` builds
+    a service, ``ExpertEngineService.bind(**...)`` binds the singleton."""
+    return dict(expert_format=get_format("exl3"), profile=get_profile_by_name("dsv41"))
+
+
 def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=None):
     """``exl3_ram_miss_tables`` over row images of the fake checkpoint at ``source_root``, built by
     ``write_row_images`` for the layers in ``slabs_by_layer``: one image root beside the checkpoint per mirror weight
     (``<source_root>_images<i>``; one root, weight 1, when ``mirror_weights`` is None), split as the weights say. The
     image files must take O_DIRECT (``require_o_direct``). Returns the tables and the roots. For harnesses that
     allocate their own slabs (the manual GPU suites); ``ram_miss_setup`` builds its tables with it too."""
-    from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+    from sglang.srt.layers.moe.expert_engine.formats.exl3_tables import (
+        exl3_ram_miss_tables,
+    )
     from sglang.srt.layers.moe.exl3_row_image import open_row_images
 
     weights = (1.0,) if mirror_weights is None else tuple(mirror_weights)

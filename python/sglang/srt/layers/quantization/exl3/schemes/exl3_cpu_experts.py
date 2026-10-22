@@ -12,7 +12,7 @@ from typing import Any, Mapping, Optional
 import torch
 
 from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
 
 class Exl3CpuQuantTrait:

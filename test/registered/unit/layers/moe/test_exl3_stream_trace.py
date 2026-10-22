@@ -670,13 +670,15 @@ def _assert_residency_record(loaded, record, step, row):
 
 def _residency_log(tmp_path, *, layer_ids, depth=8, margin=2, router=False):
     from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
     from sglang.srt.layers.moe.residency_capture import residency_rows
 
     log = module.GraphRouteLog(layers=len(layer_ids), width=8, device="cpu", depth=depth, margin=margin)
     if router:
         log.enable_router(str(tmp_path / "router"))
     gates = {layer_ids[0]: SimpleNamespace(bias=torch.zeros(4)), layer_ids[1]: SimpleNamespace(bias=None)}
-    log.enable_residency(str(tmp_path / "router.res"), rows=residency_rows(layer_ids, gates=gates))
+    log.enable_residency(str(tmp_path / "router.res"), rows=residency_rows(layer_ids, gates=gates, strata=get_profile_by_name("dsv41").strata)
+    )
     for row, layer in enumerate(layer_ids):
         log.bind(row, layer, 28)
     return log

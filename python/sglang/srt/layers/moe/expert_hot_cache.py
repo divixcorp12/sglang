@@ -61,7 +61,6 @@ from sglang.srt.layers.moe.expert_residency_clock import (
 )
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
 from sglang.srt.layers.moe.expert_transfer import (
-    NVFP4_TRANSFER_TENSOR_COUNT,
     AsyncExpertTransferExecutor,
     ExpertCopySubmission,
     ExpertRowCopyRequest,
@@ -500,7 +499,7 @@ class ExpertHotCache:
             return
         assert self._transfer_executor is not None
         spec_only = self.streamer.has_spec_only_tensors
-        six_tensors = len(self.streamer.tensor_names) == NVFP4_TRANSFER_TENSOR_COUNT
+        six_tensors = self.streamer.format.supports_transfer_executor
         pinned_cache = self.streamer.pinned_host_cache
         if (
             spec_only
@@ -792,7 +791,7 @@ class ExpertHotCache:
                     tuple(zip(promoted, free_slots)), consumer_complete=True
                 )
                 if (
-                    len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT
+                    not self.streamer.format.supports_transfer_executor
                     or self.streamer.has_spec_only_tensors
                 ):
                     self._load_reserved(tickets)
@@ -1255,7 +1254,7 @@ class ExpertHotCacheManager:
             require_graph_gather_support(
                 streamers.values(),
                 pinned_tier_ok=not gpu_residency_update,
-                exl3_direct_ok=(
+                engine_direct_ok=(
                     gpu_residency_update and insert_on_miss == InsertOnMissStage.DIRECT
                 ),
             )

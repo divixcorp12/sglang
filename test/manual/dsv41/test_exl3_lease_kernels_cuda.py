@@ -1,6 +1,6 @@
 """The slot-map chain's kernels on a real GPU against the real C++ service (LEASE_PROTOCOL.md).
 
-Every gather is the production ``Exl3RamMissRowBackend.post`` (lease_chain_rig.Chain): post -> C1 -> S -> CW -> stream
+Every gather is the production ``ExpertEngineRowBackend.post`` (lease_chain_rig.Chain): post -> C1 -> S -> CW -> stream
 wait -> CC. Every byte check reads a snapshot taken on the gather's stream before anything synchronizes, so a chain
 that ended before its copies landed would show as stale bytes.
 

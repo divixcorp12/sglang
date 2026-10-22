@@ -10,13 +10,14 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import exl3_ram_miss as module
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+from sglang.srt.layers.moe.expert_engine import row_backend
+from sglang.srt.layers.moe.expert_engine import service as module
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, write_row_images
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, dsv41_exl3_pairing, write_row_images
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -47,7 +48,8 @@ def _build(tmp_path, *, fills=True, device="cpu"):
         (envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS, fills),
     ):
         stack.enter_context(env.override(value))
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
+    module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     streamers, caches = {}, {}
     for layer_id in range(LAYERS):
         layer = torch.nn.Module()
@@ -67,11 +69,11 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def tiers(tmp_path, request):
     device = "cpu" if request.param == "cpu" else f"cuda:{torch.cuda.current_device()}"
     stack, layout, source, streamers, caches = _build(tmp_path, device=device)
-    service = module.Exl3RamMissService.get()
+    service = module.ExpertEngineService.get()
     service.plan_gather_width(1)
     yield service, layout, source, streamers, caches
     service.shutdown()
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
     stack.close()
 
 
@@ -95,7 +97,7 @@ def _same(outputs, reference):
 def test_the_native_slot_table_is_the_tiers_row_fills(tiers):
     service, layout, source, streamers, caches = tiers
     assert caches[1].row_fills is caches[1]._lru
-    assert isinstance(caches[1]._lru, module.NativePinnedSlotTable)
+    assert isinstance(caches[1]._lru, row_backend.NativePinnedSlotTable)
 
 
 def test_ensure_rows_lands_the_row_images_through_the_service_reader(tiers, monkeypatch):
@@ -145,7 +147,7 @@ def test_without_the_flag_the_tier_has_no_row_fills(tmp_path):
     try:
         assert all(cache.row_fills is None for cache in caches.values())
     finally:
-        module.Exl3RamMissService._instance = None
+        module.ExpertEngineService._instance = None
         stack.close()
 
 

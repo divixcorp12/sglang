@@ -11,15 +11,20 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan, ThreadingConfig
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+from sglang.srt.layers.moe.expert_engine import service as module
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, paused, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import (
+    ROW_IMAGE_DIM,
+    dsv41_exl3_pairing,
+    paused,
+    service_row_images,
+)
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -42,7 +47,8 @@ def two_groups(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "slot_nodes", lambda slabs, capacity: [0] * (capacity // 2) + [1] * (capacity // 2))
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
+    module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     caches = {}
     with contextlib.ExitStack() as stack:
         stack.enter_context(service_row_images(tmp_path))
@@ -56,11 +62,11 @@ def two_groups(tmp_path, monkeypatch):
                 caches[layer_id] = ExpertPinnedHostCache(
                     streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer)
                 )
-        service = module.Exl3RamMissService.get()
+        service = module.ExpertEngineService.get()
         service.plan_gather_width(1)
         yield service, caches, cores
         service.shutdown()
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
     faulthandler.cancel_dump_traceback_later()
 
 

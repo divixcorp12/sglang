@@ -40,7 +40,6 @@ from sglang.srt.layers.moe import moe_side_stream
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
 from sglang.srt.layers.moe.expert_format import (
     DenseLayerFormat,
-    ExpertFormat,
     ExpertTensorSpec,
     graph_source_kind_of,
     iter_expert_streamers,
@@ -79,6 +78,7 @@ from sglang.srt.layers.moe.expert_row_source import (
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_engine.formats import ExpertFormat
     from sglang.srt.layers.moe.host_numa import Placement
 
 logger = logging.getLogger(__name__)

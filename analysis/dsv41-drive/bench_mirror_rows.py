@@ -59,7 +59,7 @@ if (_PYTHON_DIR / "sglang").is_dir() and str(_PYTHON_DIR) not in sys.path:
 
 import torch  # noqa: E402
 
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat  # noqa: E402
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat  # noqa: E402
 from sglang.srt.layers.moe.exl3_expert_layout import (  # noqa: E402
     Exl3ExpertLayout,
     build_exl3_expert_layout,

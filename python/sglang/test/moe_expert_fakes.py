@@ -96,8 +96,13 @@ class SpecOnlyFormat:
     """
 
     key = "spec_only_test"
+    transport_build = None
+    engine_served = False
     supports_graph_gather = False
     supports_host_arena = False
+    supports_cpu_experts = False
+    supports_draft = False
+    supports_dead_rows = False
     max_gather_rows: Optional[int] = None
 
     def __init__(
@@ -109,6 +114,8 @@ class SpecOnlyFormat:
         inclusive_pinned_tier: bool = False,
     ):
         self.reference = dict(reference)
+        # The transfer executor's bundle is six row copies, as the streamer's tensor count used to decide.
+        self.supports_transfer_executor = len(self.reference) == 6
         self._tier_options = dict(tier_options or {})
         self.max_gather_rows = max_gather_rows
         self.inclusive_pinned_tier = inclusive_pinned_tier

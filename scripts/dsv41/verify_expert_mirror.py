@@ -54,7 +54,7 @@ from typing import Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import (
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
     Exl3ExpertFormat,
     parse_mirror_roots,
 )

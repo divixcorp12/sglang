@@ -1,7 +1,8 @@
 """The engine's transport builds are keyed by (format, router): the registry, the JIT keys, the format traits' C++
 headers (CPU only; nothing here builds a JIT module or needs CUDA).
 
-  * LAYOUTS holds the three pairs (exl3, sqrt_softplus), (nvfp4, sqrt_softplus) and (mxfp4, sigmoid), each with its own
+  * LAYOUTS holds the four pairs (exl3, sqrt_softplus), (nvfp4, sqrt_softplus), (nvfp4, sigmoid: MiMo once converted to
+    NVFP4) and (mxfp4, sigmoid), each with its own
     host and device JIT key and the -D macros engine_select.h switches on;
   * an unregistered pair, or a bare format name, raises, and the message names the JIT key looked for;
   * the row layouts of formats/<name>/row_layout.h agree with their Python tensor tables;
@@ -24,16 +25,30 @@ from sglang.test.expert_stream_sources import MOE
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-KEYS = [ops.EXL3_BUILD, ops.NVFP4_BUILD, ops.MXFP4_BUILD]
+KEYS = [ops.EXL3_BUILD, ops.NVFP4_BUILD, ops.NVFP4_MIMO_BUILD, ops.MXFP4_BUILD]
 UNREGISTERED = ("mxfp4", "sqrt_softplus")  # a real format with a router it is not built for
 
 
-def test_the_three_builds_are_registered_as_format_router_pairs():
+def test_the_builds_are_registered_as_format_router_pairs():
     assert set(ops.LAYOUTS) == {
         ("exl3", "sqrt_softplus"),
         ("nvfp4", "sqrt_softplus"),
+        ("nvfp4", "sigmoid"),
         ("mxfp4", "sigmoid"),
     }
+    assert ops.NVFP4_MIMO_BUILD == ("nvfp4", "sigmoid")
+
+
+def test_the_two_nvfp4_builds_share_their_sources_and_differ_only_in_the_router_macro():
+    dsv41, mimo = ops.LAYOUTS[ops.NVFP4_BUILD], ops.LAYOUTS[ops.NVFP4_MIMO_BUILD]
+    assert dsv41.host_sources == mimo.host_sources and dsv41.device_source == mimo.device_source
+    assert dsv41.defines != mimo.defines
+    assert set(dsv41.defines) ^ set(mimo.defines) == {
+        "-DSGLANG_EXPERT_ROUTER=sqrt_softplus",
+        "-DSGLANG_EXPERT_ROUTER=sigmoid",
+    }
+    assert ops.device_jit_key(ops.NVFP4_MIMO_BUILD) == "expert_stream_nvfp4_sigmoid_l8"
+    assert ops.host_jit_key(ops.NVFP4_MIMO_BUILD, "prod") == "expert_stream_host_nvfp4_sigmoid_prod_l8"
 
 
 def test_each_build_has_distinct_host_and_device_jit_keys_naming_both_halves():
@@ -71,8 +86,8 @@ def test_an_unregistered_host_build_raises_with_the_jit_key_it_looked_for():
     with pytest.raises(ValueError, match="expert_stream_host_mxfp4_sqrt_softplus_prod_l8") as error:
         ops._host_module(UNREGISTERED, "prod")
     assert "(format, router)" in str(error.value) and "mxfp4', 'sigmoid" in str(error.value)  # what is registered
-    with pytest.raises(ValueError, match="expert_stream_host_nvfp4_sigmoid_instr_l8_n2"):
-        ops._host_module(("nvfp4", "sigmoid"), "instr", 8, 2)
+    with pytest.raises(ValueError, match="expert_stream_host_exl3_sigmoid_instr_l8_n2"):
+        ops._host_module(("exl3", "sigmoid"), "instr", 8, 2)
 
 
 def test_an_unregistered_device_build_raises_with_the_jit_key_it_looked_for():
@@ -111,7 +126,7 @@ def test_the_nvfp4_row_is_the_streamed_tensor_tuple_in_order():
 
 
 def test_the_exl3_row_is_unchanged_by_its_move():
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
     assert tuple(_names("exl3")) == EXL3_STREAMED_NAMES
     assert _mask("exl3", "kSmallMask") == 0b110110 and _mask("exl3", "kSecondStageMask") == 0b111000
