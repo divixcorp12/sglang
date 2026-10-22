@@ -220,6 +220,9 @@ struct ForwardCtx
     // Down tiles finished per (chunk, 128-output block), when a plan splits the down GEMVs finer than a block: the
     // worker that finishes a block's eighth tile applies its output transform.
     int* down_tiles_done;
+    // PlanTraits::kClaimMixedChunks on a call of differing chunk sizes: the next unclaimed group of gate/up ([0]) and
+    // of down ([16], its own cache line); null: the static split.
+    int* claims = nullptr;
 };
 
 template <Isa I>
@@ -392,6 +395,7 @@ struct ForwardArena
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
     std::vector<int> down_tiles_done;
+    std::vector<int> claims;  // ForwardCtx::claims
     std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
     std::vector<uint8_t> written;                      // store_first: per token, whether a chunk row writes it
     std::vector<int> unrouted;                         // store_first: the tokens no chunk row writes
@@ -413,6 +417,7 @@ struct PlanTraits
     static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed (one-token chunks: kRegisterBudget[0])
     static constexpr bool kWideSingleExpert = false;  // 512-wide quantization for one token through one expert
     static constexpr int kSplitTiles = 8;             // GEMV split unit in tiles (assign_gemvs)
+    static constexpr bool kClaimMixedChunks = false;  // chunks of differing token counts claim groups (claim_groups)
 };
 
 // DeepSeek V4.1 on AVX-512BW: the validated fast path.
@@ -423,6 +428,10 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
     static constexpr bool kGroupedTraversal = true;
     static constexpr bool kWideSingleExpert = true;
     static constexpr int kSplitTiles = 2;  // compact unswizzled kernels take any tile pair (register_tiles)
+    // A call whose chunks differ in token count claims 8-tile groups instead of a static split, which neither evenly
+    // nor by rows matches a chunk's cost (memory-bound at one token, compute-bound at several): rows 3/4/8 random
+    // -14/-21/-26% at 16 workers. Uniform calls keep the static split, its grouped traversal included.
+    static constexpr bool kClaimMixedChunks = true;
 };
 
 // Profile: time each phase (its barrier included) on worker 0 and print "moe_cpu phases(us)" after the forward. Off,
@@ -505,6 +514,18 @@ private:
             grow(ar.down_tiles_done, blocks, "ar.down_tiles_done");
             std::fill_n(ar.down_tiles_done.data(), blocks, 0);
             ctx.down_tiles_done = ar.down_tiles_done.data();
+        }
+        ctx.claims = nullptr;
+        if constexpr (Traits::kClaimMixedChunks)
+        {
+            const bool mixed = std::any_of(ctx.chunks.begin(), ctx.chunks.end(),
+                                           [&](const Chunk& ch) { return ch.m != ctx.chunks.front().m; });
+            if (mixed)
+            {
+                grow(ar.claims, 32, "ar.claims");
+                std::fill_n(ar.claims.data(), 32, 0);
+                ctx.claims = ar.claims.data();
+            }
         }
         if (EXL3_MOE_CPU_ACT_BLOCK)
         {
@@ -595,10 +616,9 @@ private:
         }
         else if constexpr (P == Phase::GateUp)
         {
-            // Gate + up GEMVs (see assign_gemvs)
+            // Gate + up GEMVs (see assign_gemvs; claim_groups for a call of differing chunk sizes)
             const int gu = 2;
-            assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16,
-                [&](int j) { return c.chunks[j / gu].m; }, [&](int j, int t0, int t1)
+            const auto gemv = [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = j % gu;
@@ -607,7 +627,10 @@ private:
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
                 run_tiles<I, Vnni>(mat, p, tout, ch.m, t0, t1, grouped);
-            }, E.params.row_weighted != 0);
+            };
+            if (c.claims) claim_groups(c.claims[0], nc * gu, I_ / 16, gemv);
+            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16,
+                [&](int j) { return c.chunks[j / gu].m; }, gemv, E.params.row_weighted != 0);
         }
         else if constexpr (P == Phase::Middle)
         {
@@ -629,9 +652,8 @@ private:
         }
         else if constexpr (P == Phase::Down)
         {
-            // Down GEMVs
-            assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
-                [&](int j) { return c.chunks[j].m; }, [&](int j, int t0, int t1)
+            // Down GEMVs (claimed as gate/up's are)
+            const auto gemv = [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
@@ -649,7 +671,10 @@ private:
                             transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,b*8,b*8+8);
                     }
                 }
-            }, E.params.row_weighted != 0);
+            };
+            if (c.claims) claim_groups(c.claims[16], nc, H / 16, gemv);
+            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
+                [&](int j) { return c.chunks[j].m; }, gemv, E.params.row_weighted != 0);
         }
         else
         {

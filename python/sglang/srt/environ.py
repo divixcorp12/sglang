@@ -1427,7 +1427,9 @@ class Envs:
     # split their gate/up and down output tiles by chunk row count instead of evenly
     # (csrc/exl3/optimized/tile_assignment.hpp): "draft", "target" or "both"; empty keeps the original assignment
     # everywhere. Per layer at run time, not a build flavor: the same arithmetic in another worker's hands. The launch
-    # gate requires the named source's CPU experts.
+    # gate requires the named source's CPU experts. The DSV4.1 plan claims 8-tile groups dynamically whenever a call's
+    # chunks differ in token count (PlanTraits::kClaimMixedChunks), the only calls row weighting changes, so there the
+    # setting has no effect: it still weights the generic plan's layers.
     SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT = EnvStr("")
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
     # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
