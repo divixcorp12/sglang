@@ -727,11 +727,14 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     monkeypatch.setenv(FULL_LAYERS, "5")
     monkeypatch.setenv(SPLIT_LAYERS, "5:0")
     monkeypatch.setenv(SPLIT, "0:3,1:5")
+    # Production pins every layer whole since 2026-10-22 (owner): the arms built on it carry its list.
+    prod_full = ab.arm_env.prod_env()[FULL_LAYERS]
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
-                                                               PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
-                                                               *PIN01_HICACHE_ARMS)
+            assert overrides[FULL_LAYERS] == (prod_full if arm in PROD_ARMS
+                                              else "0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
+                                                                    PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                                    *PIN01_HICACHE_ARMS)
                                               else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
@@ -1179,15 +1182,22 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                                    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST")}
     # The live T(w) refit every 32 timed cut verifies: production since 2026-10-20 (owner); the non-prod arms leave it unset.
     cut["SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL"] = (None, "32")
+    # Owner, 2026-10-22, no served A/B: the pinned tier holds every routed expert row (all 40 layers whole), and the hot
+    # cache starts 41 slots smaller, because driver 615.71.10 and the 8280 build missed the KV pin at -expseg's size.
+    pinned = {k: (best.get(k), prod.get(k)) for k in ("SGLANG_MOE_PINNED_HOST_FULL_LAYERS", "SGLANG_MOE_PINNED_HOST_MB",
+                                                       "SGLANG_MOE_PINNED_HOST_NUMA_MB", "SGLANG_MOE_HOT_GPU_MB")}
+    assert pinned["SGLANG_MOE_HOT_GPU_MB"] == (str(ab.EXPSEG_HOT_GPU_MB), arm_env.PROD_DSPARK_HOT_GPU_MB)
     rest ={k: v for k, v in differs.items() if k not in prefetch}
-    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut, **pinned}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
     argv = arm_env.ServerArgs.prod().argv()
     flags = ab.server_flags(arm)
     assert flags == ("--weight-loader-drop-cache-after-load", "--mem-fraction-static",
                      arm_env.PROD_DSPARK_MEM_FRACTION_STATIC, "--max-total-tokens",
                      str(arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS))
-    assert ab.EXPSEG_HOT_GPU_MB == int(arm_env.PROD_DSPARK_HOT_GPU_MB)
+    # Production starts its hot cache below -expseg's (2026-10-22) and keeps -expseg's fraction, so the freed memory
+    # goes to the KV pool and the startup calibration grows the cache back into what remains.
+    assert int(arm_env.PROD_DSPARK_HOT_GPU_MB) < ab.EXPSEG_HOT_GPU_MB
     assert all(flag in argv for flag in flags)
 
 

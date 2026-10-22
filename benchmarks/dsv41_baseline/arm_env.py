@@ -314,10 +314,15 @@ DSPARK_MEM_FRACTION_STATIC = "0.78"
 DSPARK_HOT_GPU_MB = "10840"
 # Production's own DSpark memory sizes since 2026-10-16 (MERGE_PLAN_1016.md). The two above stay the OFF -mem arm's
 # measured init: both_cpu_ab's fraction_keeping_kv and hot_mb_for_margin derive every arm's sizes from them. These are
-# the -mergechunk-expseg arm's (both_cpu_ab.EXPSEG_HOT_GPU_MB, its ARM_MEMORY_FLAGS), the best served DSpark arm: 1,035
-# hot slots, the fraction that keeps the KV pool at the pin, and the pin. With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
-# (prod_dspark_env) the hot cache is the starting point the startup calibration grows or trims from.
-PROD_DSPARK_HOT_GPU_MB = "13144"
+# the -mergechunk-expseg arm's (its ARM_MEMORY_FLAGS), the best served DSpark arm: the fraction that keeps the KV pool at
+# the pin, and the pin. With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP (prod_dspark_env) the hot cache is the starting
+# point the startup calibration grows or trims from. Its start: -expseg's 1,035 slots (both_cpu_ab.EXPSEG_HOT_GPU_MB)
+# until 2026-10-22, 994 since (owner): NVIDIA driver 615.71.10 left 0.37 GiB less free before load (28.91 vs 29.28 GiB)
+# and the 8280 build ~0.18 GB more in use before the draft load, and at 1,035 the pool sized to 156,928 tokens
+# (KvPinMissed, prod-20261022-033013). The fraction stays -expseg's, so the 41 slots go to the pool and the calibration
+# regrows the cache into what is left. The arms' sizing (both_cpu_ab hot_mb_for_margin, fraction_keeping_kv) predates the
+# driver and is not yet re-measured.
+PROD_DSPARK_HOT_GPU_MB = "12623"
 PROD_DSPARK_MEM_FRACTION_STATIC = "0.8623"
 PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
 # Since 2026-10-22 production's pinned tier holds every routed expert row (owner, after the 128 GB RAM upgrade; the request
