@@ -10,7 +10,7 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
 - **A graph-mode report's `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` table can describe the warm-up, not the capture.** In `engram-on-trace-20260922-221602`, all 1,298 rows carry negative timestamps and correlation IDs strictly below the captured window's minimum: they are flushed pre-capture events on a different time base. Read naively they give a confident per-graph-execution average that describes nothing in the traced region. Check before using the table: `MIN(start)` against the other tables' `MIN(start)`, and whether its correlation IDs overlap `CUPTI_ACTIVITY_KIND_RUNTIME`'s. Summed graph time exceeding wall time is the tell.
 - **`cudaMemcpyAsync` host time is not transfer time, and in this workload it is mostly not even a transfer.** Join each call to its GPU-side record by `correlationId` and read `bytes` before concluding anything about bandwidth: the same trace's biggest memcpy costs are 31-byte and 2 KB device-to-host readbacks (`.item()`) that block the host 841 us and 145 ms respectively while moving nothing. Evidence: `DSV41_REFERENCE.md` section 21.
 - Bound every trace analysis's memory. On the laptop, `/tmp` is a RAM-backed tmpfs, and the Nsight skill writes its Parquet/DuckDB cache to `/tmp/nvidia/nsight_systems/nsys-skill-cache`. Loading a 250 MB node-mode decode report there out-of-memoried the laptop and crashed VS Code.
-  - Analyse traces on divix01 where they live, under `taskset -c 0-63`. Copy a report to the laptop only when asked, and then only to a disk path, never `/tmp` or the scratchpad.
+  - Analyse traces on divix01 where they live, under `taskset -c 0-51,56-107` (every core but the NVMe-interrupt ones; layout in `.claude/rules/divix01-run-protocol.md`). Copy a report to the laptop only when asked, and then only to a disk path, never `/tmp` or the scratchpad.
   - Cap memory for any local run: `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 <cmd>`. For DuckDB, also set `SET memory_limit='4GB'; SET threads=4`.
   - Narrow the data before loading it. Use `--filter-time`/`--filter-nvtx` or a short capture (`--duration`), and bound queries (`LIMIT`, pre-filtered CTEs).
   - Delete the skill cache and any copied report when done.
@@ -110,7 +110,7 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
   not usable timelines. Seeing `keep_warm_either` frames establishes control
   flow, not the cause of a memory or scheduling stall.
 - Follow `.claude/rules/divix01-run-protocol.md`: commit/push/pull code into a
-  private worktree, cap CPU jobs to cores 0–63 with `OMP_NUM_THREADS`, and use
+  private worktree, cap CPU jobs to cores 0-51,56-107 (GPU jobs: node 0, 0-27,56-83) with `OMP_NUM_THREADS`, and use
   the disk/GPU locks for serving. Write artifacts to disk, preserve failed
   attempts separately, and checksum completed laptop copies. Shut down normally
   when bounded application buffers need flushing.

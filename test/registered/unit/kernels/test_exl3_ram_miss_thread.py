@@ -208,7 +208,7 @@ def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
         host.stop()
 
 
-@pytest.mark.parametrize("core, error, match", [(71, ValueError, "64-71"), (1000, RuntimeError, "pin")])
+@pytest.mark.parametrize("core, error, match", [(111, ValueError, "52-55,108-111"), (1000, RuntimeError, "pin")])
 def test_a_reserved_or_unusable_core_is_refused(tmp_path, core, error, match):
     s = ram_miss_setup(tmp_path)
     host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32))

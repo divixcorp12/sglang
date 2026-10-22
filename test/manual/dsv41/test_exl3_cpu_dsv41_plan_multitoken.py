@@ -10,7 +10,7 @@ The three must agree bit for bit. The plan counter (sglang_exl3_cpu::plan_calls)
 chunk-size cases are generated from the build's CHUNK_M, so a larger MAX_M widens them with no edit here.
 
 Needs SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1 and the bw tier (EXL3_MOE_CPU_MAX_ISA=bw on a host above it). Run on
-divix01 under taskset -c 0-63.
+divix01 under taskset -c 0-51,56-107.
 """
 
 import os

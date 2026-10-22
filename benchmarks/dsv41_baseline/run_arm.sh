@@ -56,7 +56,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 worktree=${DSV41_WORKTREE:-$(cd "$here/../.." && pwd)}
 py=/data/models/slang/.venv-upstream/bin/python  # arm_env.PYTHON, as in launch_prod.sh
 # Read the server's core list from arm_env rather than repeating it: this line and
-# arm_env.SERVER_CORES were two copies of "32-63" that could drift, and a taskset
+# arm_env.SERVER_CORES were two copies of a core list ("32-63" at the time) that could drift, and a taskset
 # spanning both NUMA nodes is exactly the startup hang of 2026-09-22. The command
 # substitution finishes long before the launch below, so it does not break the
 # "nothing may fork between the shell and python" rule that keeps $! the server.

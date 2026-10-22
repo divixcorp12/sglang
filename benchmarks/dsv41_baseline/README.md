@@ -310,8 +310,11 @@ sessions as context.
 
 ## CPU pinning (hard requirement)
 
-Cores 64-71 stay free for every CPU job on divix01 — NVMe completion interrupts are
-pinned there, and the RAM-miss path reads rows from NVMe. `run_arm.sh` pins the
+Cores 52-55,108-111 (`arm_env.FREE_CORES`, node 1's top four physical cores and their
+siblings) stay free for every job on divix01 — they are reserved for NVMe completion
+interrupts, and the RAM-miss path reads rows from NVMe. CPU-only jobs run under
+`taskset -c 0-51,56-107` (`arm_env.CPU_JOB_CORES`), GPU jobs under `0-27,56-83`
+(`arm_env.GPU_JOB_CORES`, node 0). `run_arm.sh` pins the
 server to `arm_env.SERVER_CORES` and the driver (`run_capture_sessions.py`, invoked
 once per session) to `arm_env.DRIVER_CORES`, and caps `OMP_NUM_THREADS` /
 `MKL_NUM_THREADS`. `DSV41_SERVER_CORES` and `DSV41_DRIVER_CORES` override them for

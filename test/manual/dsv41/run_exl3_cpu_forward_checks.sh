@@ -54,7 +54,7 @@ step() {
 
 ab=$wt/test/manual/dsv41/exl3_cpu_forward_ab.py
 for isa in bw avx2 scalar; do
-  step "dump-$isa" taskset -c 0-63 "$PY" "$ab" dump --isa "$isa" --registration slabs --out "$out/ab-$isa-slabs.pt"
+  step "dump-$isa" taskset -c 0-51,56-107 "$PY" "$ab" dump --isa "$isa" --registration slabs --out "$out/ab-$isa-slabs.pt"
   if [[ $mode == check ]]; then
     step "compare-$isa" "$PY" "$ab" compare "$base/ab-$isa-slabs.pt" "$out/ab-$isa-slabs.pt"
   fi
@@ -67,15 +67,15 @@ if [[ $mode == check ]]; then
     -DEXL3_CXX11_ABI=1 "-DEXL3_TVM_FFI_ROOT=$SITE/tvm_ffi")
   gbench=/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src
   [[ -d $gbench ]] && configure+=("-DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=$gbench")
-  step bench-configure taskset -c 0-63 cmake -S "$bench" -B "$build" "${configure[@]}"
-  step bench-build taskset -c 0-63 cmake --build "$build" -j16 --target exl3_cpu_optimized exl3_full_stack_prod
+  step bench-configure taskset -c 0-51,56-107 cmake -S "$bench" -B "$build" "${configure[@]}"
+  step bench-build taskset -c 0-51,56-107 cmake --build "$build" -j16 --target exl3_cpu_optimized exl3_full_stack_prod
   export EXL3_MOE_CPU_MAX_ISA=bw OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
   export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
   step bare-validate "$build/exl3_cpu_optimized" --validate-only
   mkdir -p "$out/images"
   step full-stack-validate "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
   unset EXL3_MOE_CPU_MAX_ISA
-  step pytest taskset -c 0-63 "$PY" -m pytest -q -p no:randomly \
+  step pytest taskset -c 0-51,56-107 "$PY" -m pytest -q -p no:randomly \
     test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py \
     test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
 fi

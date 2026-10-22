@@ -190,8 +190,8 @@ def test_the_native_start_thread_refuses_a_reserved_core_of_any_group(tmp_path):
     gone, so a thread pins itself to a core that takes NVMe completion interrupts."""
     s, page, host, sim = _host(tmp_path)
     try:
-        for cores in ([64, 0], [0, 71]):
-            with pytest.raises(RuntimeError, match=r"cores 64-71 are reserved \(NVMe completion interrupts"):
+        for cores in ([52, 0], [0, 111], [108, 55]):
+            with pytest.raises(RuntimeError, match=r"cores 52-55,108-111 are reserved \(NVMe completion interrupts"):
                 host._module.expert_stream_start_thread(
                     host.handle, torch.tensor(cores, dtype=torch.int64), int(1e9), -1, 0
                 )
@@ -201,14 +201,14 @@ def test_the_native_start_thread_refuses_a_reserved_core_of_any_group(tmp_path):
 
 
 def test_the_native_start_thread_warns_when_an_inherited_affinity_covers_the_reserved_cores(tmp_path):
-    """Mutation: the warning is gone. The subprocess widens its own affinity to core 64 and starts the threads with
+    """Mutation: the warning is gone. The subprocess widens its own affinity to core 52 and starts the threads with
     -1 (inherit); the C++ fprintf goes to the real stderr, so it is read from the child's."""
-    if (os.cpu_count() or 0) < 72:
-        pytest.skip("needs cores 64-71")
-    body = "import os; os.sched_setaffinity(0, {0, 64})\nhost.start_thread(fatal_wait_s=60.0)\nhost.stop()\nprint('reached')\n"
+    if (os.cpu_count() or 0) < 56:
+        pytest.skip("needs cores 52-55")
+    body = "import os; os.sched_setaffinity(0, {0, 52})\nhost.start_thread(fatal_wait_s=60.0)\nhost.stop()\nprint('reached')\n"
     result = _run_child(textwrap.dedent(_SCRIPT) + body, tmp_path, 120)
     assert "reached" in result.stdout, result.stderr
-    assert "run under taskset -c 0-63" in result.stderr
+    assert "run under taskset -c 0-51,56-107" in result.stderr
 
 
 CHILD_VARIANT, CHILD_NODES = "instr", 2  # what _SCRIPT constructs; test_the_child_script_builds_what_the_parent_warms pins it

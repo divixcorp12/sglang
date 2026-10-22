@@ -16,7 +16,7 @@ the ring first and never reach registration.
 The harness drives InstrUringReader: the fan-out counters it asserts (fixed_cuts, fanout_sqes) are InstrBuild
 metrics (spec M10) and do not exist on the production UringReader, whose I/O code is the same template.
 
-Run on divix01 (see the brief's Step 2 command): under rowimg-disk.lock, numactl --membind=1, taskset -c 0-63.
+Run on divix01 (see the brief's Step 2 command): under rowimg-disk.lock, numactl --membind=1, taskset -c 0-51,56-107.
 """
 
 import os

@@ -22,7 +22,7 @@ if (( ${#base_names[@]} != ${#variants[@]} )); then
 fi
 mkdir -p "$out"
 exe=$out/ab
-if ! taskset -c 0-63 "$py" "$build" --cxx "$cxx" --output "$exe" --main "$harness" > "$out/build.log" 2>&1; then
+if ! taskset -c 0-51,56-107 "$py" "$build" --cxx "$cxx" --output "$exe" --main "$harness" > "$out/build.log" 2>&1; then
   echo "FAIL build (see $out/build.log)"; exit 1
 fi
 fail=0

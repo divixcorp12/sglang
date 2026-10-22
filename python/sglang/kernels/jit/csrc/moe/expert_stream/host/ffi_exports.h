@@ -799,7 +799,7 @@ struct HostExports {
   // each) and `bias` float32 [n, experts], host memory the caller keeps alive, and `candidates` empty. GPU scorer:
   // `candidates` uint8 [SpecCandidates::kCandPageBytes], pinned memory the caller keeps alive, `gates` and `bias`
   // [0, 0], `hidden` unused. `cores` int64 [groups, width]: each group's speculative thread's cores, -1 padding (none:
-  // the caller's affinity). Cores 64-71 are refused. `min_margin` float32 [rows] (GPU scorer only), per target row the
+  // the caller's affinity). Cores 52-55,108-111 are refused. `min_margin` float32 [rows] (GPU scorer only), per target row the
   // least margin a candidate needs, or [0]: no floors. `idle_deadline_ns` > 0: idle-drive speculative reads
   // (RamPrefetchConfig::idle_deadline_ns), 0: the shared reader; `idle_spread` and `idle_pieces` shape them.
   // `promote` != 0: RamPrefetchConfig::promote; `pool_serve` != 0: RamPrefetchConfig::pool_serve.
@@ -884,10 +884,10 @@ struct HostExports {
       for (int64_t j = 0; j < cores.size(1); ++j) {
         const int64_t core = c[g * cores.size(1) + j];
         if (core < 0) continue;
-        if (core >= CPU_SETSIZE || (core >= 64 && core <= 71))
+        if (core >= CPU_SETSIZE || is_reserved_core(core))
           throw std::runtime_error(
               error_prefix<Layout>() + "RAM prefetch: core " + std::to_string(core) +
-              " is out of range or reserved (64-71 take NVMe completion interrupts)");
+              " is out of range or reserved (" + kReservedCoresText + " take NVMe completion interrupts)");
         own.push_back(static_cast<int>(core));
       }
       config.cores.push_back(std::move(own));
@@ -1145,9 +1145,10 @@ struct HostExports {
     bool inherits = false;
     for (int g = 0; g < Wire::kNodes; ++g) {
       if (core_data[g] >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
-      if (core_data[g] >= 64 && core_data[g] <= 71) {
+      if (is_reserved_core(core_data[g])) {
         throw std::runtime_error(
-            error_prefix<Layout>() + "cores 64-71 are reserved (NVMe completion interrupts are pinned there)");
+            error_prefix<Layout>() + "cores " + kReservedCoresText +
+            " are reserved (NVMe completion interrupts are to be pinned there)");
       }
       inherits = inherits || core_data[g] < 0;
       cores.push_back(static_cast<int>(core_data[g]));
@@ -1156,13 +1157,14 @@ struct HostExports {
       cpu_set_t inherited;
       CPU_ZERO(&inherited);
       if (pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited) == 0) {
-        for (int core = 64; core <= 71; ++core) {
-          if (CPU_ISSET(core, &inherited)) {
+        for (int core = 0; core < CPU_SETSIZE; ++core) {
+          if (is_reserved_core(core) && CPU_ISSET(core, &inherited)) {
             std::fprintf(
                 stderr,
-                "WARNING %sthe service thread inherits an affinity that includes reserved cores 64-71; "
-                "run under taskset -c 0-63 or pass cpu_core\n",
-                error_prefix<Layout>().c_str());
+                "WARNING %sthe service thread inherits an affinity that includes reserved cores %s; "
+                "run under taskset -c 0-51,56-107 or pass cpu_core\n",
+                error_prefix<Layout>().c_str(),
+                kReservedCoresText);
             break;
           }
         }

@@ -318,13 +318,13 @@ Configure two Release build directories at the same commit, changing only
 The default remains OFF. This switch affects the bare optimized benchmark only.
 
 Run from the repository root on divix01, with no serving/profiling CPU workload:
-  taskset -c 0-63 env OMP_NUM_THREADS=10 python \
+  taskset -c 0-51,56-107 env OMP_NUM_THREADS=10 python \
     benchmarks/dsv41_baseline/run_row_weighted_experiment.py \
     --a=BUILD_A/exl3_cpu_optimized --b=BUILD_B/exl3_cpu_optimized \
     --output=NEW_RESULTS_DIRECTORY
 
 The runner serially alternates AB/BA on each NUMA node, ten workers pinned to
-6-15 / 18-27 and memory bound to the matching node. Eight layers and twelve
+6-15 / 28-37 and memory bound to the matching node. Eight layers and twelve
 expert slots per layer exceed the shared L3 capacity. The original 24 frozen
 outputs are checked, and A writes routed output references that every later
 process must match bit-exactly before and after timing. Results include means,

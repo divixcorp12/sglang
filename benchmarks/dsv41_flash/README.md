@@ -83,7 +83,7 @@ On divix01, in `wt-dsv41` after `git pull --ff-only origin <branch>` (GitHub; se
 ```bash
 cd /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41
 # rehearsal: prints every command and both resolved launches, asserts the EXL3 gate; no lock, no GPU
-taskset -c 0-63 env OMP_NUM_THREADS=16 PYTHONPATH=$PWD/python \
+taskset -c 0-51,56-107 env OMP_NUM_THREADS=16 PYTHONPATH=$PWD/python \
   /data/models/slang/.venv-upstream/bin/python benchmarks/dsv41_flash/run_ab.py --dry-run
 # the real thing (needs approval); each arm runs under gpu-run.sh, which takes cc-gpu.lock
 PYTHONPATH=$PWD/python /data/models/slang/.venv-upstream/bin/python benchmarks/dsv41_flash/run_ab.py \

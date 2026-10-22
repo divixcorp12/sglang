@@ -249,14 +249,15 @@ FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
 for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
-# Both fixed-split with node 1's CPU expert team on 13 physical cores instead of 10: 32-34 are the node's cores no
-# server, RAM, spec or driver thread uses (arm_env.DRIVER_CORES 28-31). Node 0's CPU cores are stated as derived (6-15),
+# Both fixed-split with node 1's CPU expert team on 13 physical cores instead of 10: 38-40 are the node's cores no
+# server, RAM (51), spec (50) or driver thread uses (the driver is on node 0, arm_env.DRIVER_CORES 18-21). Node 0's CPU
+# cores are stated as derived (6-15),
 # so the THREADS cap of 13 changes node 1 alone; its RAM core stays SPIN_CORE's (naming it here too is refused).
 ARMS[PROMOTE_POOL_SERVE_ARM + "-cores13" + FIXED_SPLIT_SUFFIX] = (
     {
         **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
         "SGLANG_DSV41_CPU_EXPERTS_THREADS": "13",
-        "SGLANG_EXPERT_NUMA_CORES": "0:cpu=6-15;1:ram=35,cpu=18-27,32-34",
+        "SGLANG_EXPERT_NUMA_CORES": "0:cpu=6-15;1:ram=51,cpu=28-40",
     },
     True,
 )
