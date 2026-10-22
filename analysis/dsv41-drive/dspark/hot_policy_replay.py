@@ -49,8 +49,11 @@ import json
 import os
 import shlex
 import sys
+from bisect import bisect_right
 
 import numpy as np
+
+INF = 1 << 60
 
 EXPERTS = 384
 VICTIM_LANES = 8
@@ -461,6 +464,243 @@ def validate(val: collections.Counter, hot: frozenset, nxt: frozenset, o: dict, 
         val["act_gpu_lanes"] += len(act_gpu)
 
 
+# ---- a model-wide pool -------------------------------------------------------------------------------------------
+#
+# A hypothetical: one pool of N slots shared by every layer. Scores stay per (layer, expert) under the same rule, and
+# they are comparable across layers as they stand: every layer routes every token top_k times, so each layer's counts
+# sum to the same total, and the decay counts the same tokens for every layer (one device clock, _count :653).
+# The shortlist becomes one global ranking at each boundary (free slots, then every resident by (routed, score,
+# -expert)); each layer's gather, in layer order, takes up to VICTIM_LANES entries from its head, skipping the slots
+# this forward already reassigned and its own hazards (residents of the layer this forward routes). A CPU lane leaves
+# its victim for the next layer. The lanes, split and commit are the per-layer rules unchanged.
+
+
+class GlobalSim:
+    def __init__(self, hot0: list, slots: int, cfg: Config, mode: str):
+        self.cfg, self.mode, self.layers = cfg, mode, len(hot0)
+        init = [(L, e) for L, h in enumerate(hot0) for e in sorted(h)]
+        self.slot = init[:slots] + [None] * max(0, slots - len(init))
+        self.where = [dict() for _ in range(self.layers)]
+        for s, le in enumerate(self.slot):
+            if le is not None:
+                self.where[le[0]][le[1]] = s
+        self.score = np.zeros((self.layers, EXPERTS), dtype=np.float32)
+        self.pend = np.zeros_like(self.score)
+        self.tokens = 0
+        self.pending = False
+        self.key_routed = np.zeros((self.layers, EXPERTS), dtype=bool)
+        self.key_score = self.score.copy()
+        self.rank()
+
+    def boundary(self) -> None:
+        self.score = self.score * f32_decay(self.cfg.decay, self.tokens) + self.pend
+        self.key_routed, self.key_score = self.pend > 0, self.score.copy()
+        self.pend = np.zeros_like(self.score)
+        self.tokens = 0
+        self.pending = False
+        self.rank()
+
+    def rank(self) -> None:
+        free = [s for s, le in enumerate(self.slot) if le is None]
+        occ = sorted((s for s, le in enumerate(self.slot) if le is not None),
+                     key=lambda s: (self.key_routed[self.slot[s]], self.key_score[self.slot[s]], -self.slot[s][1],
+                                    -self.slot[s][0]))
+        self.ranking = free + occ
+
+    def eager(self, counts: list, tokens: int, phase: str) -> None:
+        if self.pending:
+            self.boundary()
+        if self.cfg.prefill_tokens or phase == "target_verify":
+            self.tokens += tokens
+        if self.cfg.prefill_counts or phase == "target_verify":
+            for L, c in enumerate(counts):
+                for e, n in c.items():
+                    self.pend[L, e] += n
+        if phase == "target_verify":
+            self.pending = True
+        elif tokens >= PREFILL_BOUNDARY_TOKENS:
+            self.boundary()
+
+    def graph(self, f: dict, kinds_of) -> list:
+        if self.pending:
+            self.boundary()
+        self.tokens += f["tokens"]
+        moved = set()  # slots reassigned by this forward
+        outs = []
+        for L in range(self.layers):
+            counts = f["counts"][L]
+            u = set(counts)
+            where = self.where[L]
+            hits = [e for e in u if e in where]
+            misses = sorted((e for e in u if e not in where),
+                            key=lambda e: (-int(self.key_routed[L, e]), -float(self.key_score[L, e]), e))
+            usable = []
+            for s in self.ranking:
+                if len(usable) >= min(VICTIM_LANES, len(misses)):
+                    break
+                le = self.slot[s]
+                if s in moved or (le is not None and le[0] == L and le[1] in u):
+                    continue
+                usable.append(s)
+            if self.cfg.adm is None:
+                assigned = list(zip(misses, usable))
+                forced = misses[len(usable):]
+            else:
+                assigned, forced, i = [], [], 0
+                for e in misses:
+                    if i < len(usable):
+                        v = self.slot[usable[i]]
+                        if v is None or self.cfg.beats(self.key_score[L, e] + (counts[e] if self.cfg.adm.endswith("+cur") else 0),
+                                                       float(self.key_score[v])):
+                            assigned.append((e, usable[i]))
+                            i += 1
+                            continue
+                    forced.append(e)
+            kinds = kinds_of(L)
+            cpu = (LayerSim.split_model(LayerSim, assigned, forced, counts) if self.mode == "today"
+                   else LayerSim.split_fixed(assigned, forced, kinds))
+            inserted = cross = 0
+            for e, s in assigned:
+                if e in cpu:
+                    continue
+                old = self.slot[s]
+                if old is not None:
+                    del self.where[old[0]][old[1]]
+                    cross += old[0] != L
+                self.slot[s] = (L, e)
+                where[e] = s
+                moved.add(s)
+                inserted += 1
+            for e, n in counts.items():
+                self.pend[L, e] += n
+            o = {"unique": len(u), "hits": len(hits), "pairs": sum(counts.values()),
+                 "pairs_hit": sum(counts[e] for e in hits), "misses": len(misses), "inserted": inserted,
+                 "live": len(assigned), "forced": len(forced), "cross": cross}
+            if self.mode == "today":
+                o["span_ms"] = LayerSim.span(LayerSim, assigned, forced, cpu, counts)
+            outs.append(o)
+        if f["phase"] == "target_verify":
+            self.pending = True
+        return outs
+
+
+def replay_global(cap: dict, cfg: Config, mode: str, slots: int | None, skip: int) -> dict:
+    fwds = cap["forwards"]
+    total = slots or sum(cap["header"]["hot_capacity"])
+    first = next(f for f in fwds if f["graph"])
+    sim = GlobalSim(first["hot"], total, cfg, mode)
+    tot = collections.Counter()
+    occ = [[] for _ in range(cap["layers"])]
+    verify_i = 0
+    for f in fwds:
+        if not f["graph"]:
+            sim.eager(f["counts"], f["tokens"], f["phase"])
+            continue
+        is_verify = f["phase"] == "target_verify"
+        counted = is_verify and verify_i >= skip
+        verify_i += is_verify
+        lanes = f.get("lanes") or [None] * cap["layers"]
+        outs = sim.graph(f, lambda L: ({e: k for e, (_, k) in lanes[L].items()} if lanes[L] and mode == "capture"
+                                       else {}))
+        if counted:
+            tot["verifies"] += 1
+            for o in outs:
+                for k in ("unique", "hits", "pairs", "pairs_hit", "misses", "inserted", "live", "forced", "cross"):
+                    tot[k] += o[k]
+                tot["span_ms"] += o.get("span_ms", 0.0)
+            for L in range(cap["layers"]):
+                occ[L].append(len(sim.where[L]))
+    n = max(1, tot["verifies"])
+    mean_occ = [float(np.mean(o)) for o in occ]
+    order = sorted(range(len(mean_occ)), key=lambda L: -mean_occ[L])
+    res = {"config": vars(cfg), "mode": mode, "pool": "global", "slots": total, "verifies": tot["verifies"],
+           "unique_per_verify": tot["unique"] / n, "hits_per_verify": tot["hits"] / n,
+           "hit_rate": tot["hits"] / max(1, tot["unique"]), "pair_hit_rate": tot["pairs_hit"] / max(1, tot["pairs"]),
+           "inserts_per_verify": tot["inserted"] / n, "cpu_lanes_per_verify": (tot["misses"] - tot["inserted"]) / n,
+           "forced_per_verify": tot["forced"] / n, "live_per_verify": tot["live"] / n,
+           "cross_layer_evictions_per_verify": tot["cross"] / n,
+           "slots_by_layer_mean": [round(x, 1) for x in mean_occ],
+           "slots_by_layer_summary": {"min": min(mean_occ), "median": float(np.median(mean_occ)), "max": max(mean_occ),
+                                      "top5": [(L, round(mean_occ[L], 1)) for L in order[:5]],
+                                      "bottom5": [(L, round(mean_occ[L], 1)) for L in order[-5:]],
+                                      "mean_abs_step_change": float(np.mean([np.mean(np.abs(np.diff(o))) for o in occ]))}}
+    if mode == "today":
+        res["model_span_ms_per_verify"] = tot["span_ms"] / n
+    return res
+
+
+def belady_bounds(cap: dict, slots: int | None, skip: int) -> dict:
+    """Belady with bypass over the graph forwards' distinct (layer, expert) accesses, no lane or insert limits: each
+    layer at its own capacity, and one pool of the same total. Hits are counted on the verifies after ``skip``."""
+    import heapq
+
+    graph = [f for f in cap["forwards"] if f["graph"]]
+    layers = cap["layers"]
+    caps = capacities(cap["header"], slots)
+    seq = []  # (time, layer, experts, counted)
+    vi = 0
+    for t, f in enumerate(graph):
+        is_verify = f["phase"] == "target_verify"
+        counted = is_verify and vi >= skip
+        vi += is_verify
+        for L in range(layers):
+            seq.append((t * layers + L, L, sorted(f["counts"][L]), counted))
+    occ = collections.defaultdict(list)
+    for g, L, es, _ in seq:
+        for e in es:
+            occ[(L, e)].append(g)
+
+    def next_use(key, g):
+        o = occ[key]
+        i = bisect_right(o, g)
+        return o[i] if i < len(o) else INF
+
+    def run(pool_of, cap_of):
+        resident = {}  # key -> next use
+        heaps = collections.defaultdict(list)
+        size = collections.Counter()
+        hits = unique = 0
+        for g, L, es, counted in seq:
+            p = pool_of(L)
+            for e in es:
+                key = (L, e)
+                if key in resident:
+                    hits += counted
+                    resident[key] = next_use(key, g)
+                    heapq.heappush(heaps[p], (-resident[key], key))
+            for e in es:
+                key = (L, e)
+                unique += counted
+                if key in resident and resident[key] > g:
+                    continue
+                nu = next_use(key, g)
+                if nu == INF:
+                    continue
+                if size[p] < cap_of(p):
+                    resident[key] = nu
+                    size[p] += 1
+                    heapq.heappush(heaps[p], (-nu, key))
+                    continue
+                h = heaps[p]
+                while h and resident.get(h[0][1]) != -h[0][0]:
+                    heapq.heappop(h)
+                if not h or -h[0][0] <= nu:
+                    continue
+                _, victim = heapq.heappop(h)
+                del resident[victim]
+                resident[key] = nu
+                heapq.heappush(h, (-nu, key))
+        return hits, unique
+
+    n = sum(1 for _, L, _, c in seq if c and L == 0)
+    out = {}
+    for name, pool_of, cap_of in (("per_layer", lambda L: L, lambda p: caps[p]),
+                                  ("global", lambda L: 0, lambda p: sum(caps))):
+        h, u = run(pool_of, cap_of)
+        out[name] = {"hits_per_verify": h / n, "hit_rate": h / u}
+    return out
+
+
 CONFIGS = {}
 
 
@@ -490,6 +730,9 @@ def main() -> int:
     ap.add_argument("--configs", default="d0.98", help="comma-separated names, 'decays', 'all'")
     ap.add_argument("--skip", type=int, default=8)
     ap.add_argument("--validate", action="store_true", help="also run d0.98 one step at a time from the capture's sets")
+    ap.add_argument("--pool", choices=("layer", "global"), default="layer",
+                    help="global: one pool of --slots shared by every layer (replay_global)")
+    ap.add_argument("--belady", action="store_true", help="also the per-layer and global Belady bounds")
     args = ap.parse_args()
     if args.configs == "all":
         names = list(CONFIGS)
@@ -505,12 +748,23 @@ def main() -> int:
         print(f"{label or path}: {sum(f['graph'] for f in cap['forwards'])} graph forwards, "
               f"{sum(not f['graph'] for f in cap['forwards'])} eager, lanes from {cap['lanes']}", flush=True)
     cmd = " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
-    tag = f"{args.mode}-{args.slots or 'cap'}"
+    tag = ("global-" if args.pool == "global" else "") + f"{args.mode}-{args.slots or 'cap'}"
+    run = replay_global if args.pool == "global" else replay
+    if args.belady:
+        rows = {label: belady_bounds(cap, args.slots or None, args.skip) for label, cap in caps}
+        d = os.path.join(args.out, tag, "belady")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "result.json"), "w") as f:
+            json.dump(rows, f, indent=1)
+        with open(os.path.join(d, "command.txt"), "w") as f:
+            f.write(cmd + "\n")
+        for label, r in rows.items():
+            print(f"BELADY {label}: " + json.dumps(r), flush=True)
     for name in names:
         cfg = CONFIGS[name]
         rows = {}
         for label, cap in caps:
-            rows[label] = replay(cap, cfg, args.mode, args.slots or None, args.skip)
+            rows[label] = run(cap, cfg, args.mode, args.slots or None, args.skip)
         pooled = pool(rows)
         rows["pooled"] = pooled
         d = os.path.join(args.out, tag, name)
