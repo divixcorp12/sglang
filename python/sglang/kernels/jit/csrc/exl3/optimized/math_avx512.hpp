@@ -101,7 +101,7 @@ M1_TARGET_VNNI
 inline void vnni_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (dword_pair_wins<bits>())
@@ -165,7 +165,7 @@ void vnni_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -300,7 +300,7 @@ M1_TARGET_BW
 M1_ALWAYS_INLINE void bw_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat_dup, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (dword_pair_wins<bits>())
@@ -394,7 +394,7 @@ constexpr std::array<uint16_t, 32> bw3_word_shifts()
 template <int rows, int band, int P>
 M1_TARGET_BW
 M1_ALWAYS_INLINE void bw3_band_rows(__m512i p0, __m512i p1, int b,
-    const int32_t* splat_dup, int k, __m512i (&acc)[band][MAX_M], const char* future_weight)
+    const int32_t* splat_dup, int k, __m512i (&acc)[band][GENERIC_MAX_M], const char* future_weight)
 {
     if constexpr (P < 8)
     {
@@ -457,7 +457,7 @@ void bw_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -659,7 +659,7 @@ M1_TARGET_VBMI
 inline void vbmi_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (P < 8)
@@ -709,7 +709,7 @@ void vbmi_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -815,7 +815,7 @@ void bw3_blocked_band(const Exl3Projection& mat, const PreparedIn& in, float* to
     __m512 sums[band][rows];
     for (int kb = 0; kb < mat.k / B; ++kb)
     {
-        __m512i acc[band][MAX_M];
+        __m512i acc[band][GENERIC_MAX_M];
         for (int b = 0; b < band; ++b)
             for (int i = 0; i < rows; ++i)
                 acc[b][i] = _mm512_setzero_si512();
@@ -915,42 +915,57 @@ M1_TARGET_BW M1_ALWAYS_INLINE __m512i register_word(__m512i p0,__m512i p1,__m512
 
 // The compact register kernels' register budget, one entry per tokens-per-chunk M = 1..CHUNK_M (register_tiles<M>):
 // pairs, the tile pairs one register_band call holds; traversal, whether whole 128-output groups take the grouped
-// traversal (its IntegerAccum holds one token's rows). Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
+// traversal (its IntegerAccum holds one token's rows); halves, whether each 128-input block runs once per output half
+// (register_band_halves), holding half the accumulators. Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
 // compile below until an entry is added.
 struct RegisterBudget
 {
     int pairs;
     bool traversal;
+    bool halves = false;
 };
 constexpr RegisterBudget kRegisterBudget[] = {
     {4, true},   // M = 1: today's kernels (register_band<1..4>, traversal_kblock's four bands)
     {2, false},  // M = 2
     {1, false},  // M = 3
     {1, false},  // M = 4
+    {1, false, true},  // M = 5..8: 4 * M accumulators per tile pair exceed the registers; 2 * M per half fit
+    {1, false, true},
+    {1, false, true},
+    {1, false, true},
 };
 // zmm registers register_rows keeps live besides the integer accumulators: prev, a, b, c, the state, its byte sum, two
 // products, the multiplier halves, the ones vector and the broadcast activation pair.
 constexpr int kRegisterDecodeZmm = 12;
 
+// Integer accumulators one register_band call holds for M tokens: two output halves of 2 * M rows per tile pair, or
+// one half at a time.
+constexpr int register_accumulators(int m, const RegisterBudget& b) { return (b.halves ? 2 : 4) * m * b.pairs; }
+
 constexpr bool register_budget_fits()
 {
     for (int m = 1; m <= int(std::size(kRegisterBudget)); ++m)
-        if (kRegisterBudget[m - 1].pairs < 1 || 4 * m * kRegisterBudget[m - 1].pairs + kRegisterDecodeZmm > 32)
+        if (kRegisterBudget[m - 1].pairs < 1
+            || register_accumulators(m, kRegisterBudget[m - 1]) + kRegisterDecodeZmm > 32)
             return false;
     return true;
 }
 static_assert(register_budget_fits(), "kRegisterBudget (math_avx512.hpp): an entry's integer accumulators "
-                                      "(4 * M * pairs) plus kRegisterDecodeZmm exceed the 32 zmm registers");
+                                      "(register_accumulators) plus kRegisterDecodeZmm exceed the 32 zmm registers");
 static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(std::size(kRegisterBudget)),
               "kRegisterBudget (math_avx512.hpp) has no entry for this CHUNK_M: add one before raising "
               "EXL3_MOE_CPU_MAX_M");
 
 // The register kernels, once per integer accumulate (register_kernels.hpp). reg_bw is today's code, for every
-// AVX-512BW host. reg_vnni accumulates with vpdpwssd and runs on VNNI hosts (the plan's tier is >= Isa::Vnni).
+// AVX-512BW host. reg_vnni accumulates with vpdpwssd and runs on VNNI hosts (the plan's tier is >= Isa::Vnni); its
+// one-token compact chunks drop the byte sum for vpdpbusd on the product bytes (M1_REG_BYTES), one fewer vector
+// operation per decoded state, the same int32 sums.
 namespace reg_bw {
 #define M1_REG_TARGET M1_TARGET_BW
 #define M1_REG_ACC(acc, sum, pair) _mm512_add_epi32((acc), _mm512_madd_epi16((sum), (pair)))
+#define M1_REG_BYTES 0
 #include "register_kernels.hpp"
+#undef M1_REG_BYTES
 #undef M1_REG_ACC
 #undef M1_REG_TARGET
 }  // namespace reg_bw
@@ -958,7 +973,9 @@ namespace reg_bw {
 namespace reg_vnni {
 #define M1_REG_TARGET M1_TARGET_VNNI
 #define M1_REG_ACC(acc, sum, pair) _mm512_dpwssd_epi32((acc), (sum), (pair))
+#define M1_REG_BYTES 1
 #include "register_kernels.hpp"
+#undef M1_REG_BYTES
 #undef M1_REG_ACC
 #undef M1_REG_TARGET
 }  // namespace reg_vnni

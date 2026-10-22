@@ -39,9 +39,9 @@ export SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_EXL3_CPU_CXX=$GXX CUDA_HOME=/usr/local/
 export CXX=$GXX  # the host module's JIT build (kernel_layer/kernel_forward from Task 6): the kernels' GCC 15
 export PYTHONPATH=$wt/python OMP_NUM_THREADS=8 EXL3_MOE_CPU_PIN=0
 export CUDA_VISIBLE_DEVICES=9  # CPU-only: no device 9, so no CUDA context (an empty value crashes sglang.test.test_utils)
-# The default build is resid_b128_m8_cpu_v1 (SGLANG_EXL3_CPU_MAX_M=8); resid_b128_cpu_v1 is MAX_M=0's. Seed whichever
-# the user cache holds, so a run does not rebuild them.
-for flavor in resid_b128_m8_cpu_v1 resid_b128_cpu_v1; do
+# The default build is resid_b128_m16_cpu_v1 (SGLANG_EXL3_CPU_MAX_M=16; m8 before it); resid_b128_cpu_v1 is MAX_M=0's.
+# Seed whichever the user cache holds, so a run does not rebuild them.
+for flavor in resid_b128_m16_cpu_v1 resid_b128_m8_cpu_v1 resid_b128_cpu_v1; do
   if [[ ! -d $SGLANG_EXL3_BUILD_DIR/$flavor && -d ~/.cache/sglang/exl3_ext/$flavor ]]; then
     mkdir -p "$SGLANG_EXL3_BUILD_DIR"
     cp -a ~/.cache/sglang/exl3_ext/$flavor "$SGLANG_EXL3_BUILD_DIR/"

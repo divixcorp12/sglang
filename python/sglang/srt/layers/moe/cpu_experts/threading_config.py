@@ -167,6 +167,7 @@ class CoreSettings:
     cpu_experts: bool = False  # SGLANG_DSV41_CPU_EXPERTS
     cores: str = ""  # SGLANG_DSV41_CPU_EXPERTS_CORES
     threads: int = 0  # SGLANG_DSV41_CPU_EXPERTS_THREADS, 0: no cap
+    smt: bool = False  # SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: each CPU expert core's SMT siblings join its pool
     spin_core: Optional[int] = None  # SGLANG_DSV41_RAM_MISS_SPIN_CORE
     sqpoll: bool = False  # SGLANG_EXPERT_STREAM_URING_MODE names a sqpoll mode
     sq_thread_cpu: Optional[int] = None  # SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU
@@ -232,6 +233,7 @@ class ThreadingConfig:
             cpu_experts=cpu_experts,
             cores=envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get(),
             threads=envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.get(),
+            smt=envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT.get(),
             spin_core=envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.get(),
             sqpoll="sqpoll" in envs.SGLANG_EXPERT_STREAM_URING_MODE.get(),
             sq_thread_cpu=envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.get(),
@@ -448,7 +450,28 @@ def _derive(group, node, override, topology, affinity, settings, taken) -> NodeP
     if settings.cpu_experts:
         listed = override["cpu"] if "cpu" in override else sorted(free)
         cpu = tuple(listed[: settings.threads] if settings.threads else listed)
+        if settings.smt:
+            held = taken | {s for c in (ram, sq) if c is not None for s in topology.siblings[c]}
+            cpu += _smt_siblings(node, cpu, topology, affinity, held)
     return NodePlan(group=group, node=node, ram=ram, cpu=cpu, sq=sq, busy_poll=True)
+
+
+def _smt_siblings(node, cores, topology, affinity, taken) -> tuple[int, ...]:
+    """SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: the SMT siblings of the pool's cores, in the cores' order, for the pool to
+    run after them. Raises ValueError for a sibling the server's affinity, the reserved cores or another role holds."""
+    pool = set(cores)
+    siblings = []
+    for core in cores:
+        for sibling in sorted(topology.siblings[core] - {core}):
+            if sibling in pool or sibling in siblings:
+                continue
+            if sibling in affinity or sibling in RESERVED_CORES or sibling in taken:
+                raise ValueError(
+                    f"node {node}: SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT adds core {core}'s SMT sibling {sibling} to the "
+                    "CPU expert pool, but the server's affinity, the reserved cores or another role holds it"
+                )
+            siblings.append(sibling)
+    return tuple(siblings)
 
 
 def _check_plan(plan: NodePlan, topology: Topology, affinity: frozenset[int], settings: CoreSettings) -> None:
@@ -465,6 +488,9 @@ def _check_plan(plan: NodePlan, topology: Topology, affinity: frozenset[int], se
         if core in affinity:
             raise ValueError(f"node {plan.node}: core {core} is in the server's affinity")
     for a, b in combinations(cores, 2):
+        # SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: the pool's own cores may share physical cores with each other.
+        if settings.smt and a in plan.cpu and b in plan.cpu:
+            continue
         if b in topology.siblings[a]:
             raise ValueError(f"node {plan.node}: cores {min(a, b)} and {max(a, b)} share a physical core")
     if plan.ram is not None and topology.siblings[plan.ram] & affinity:

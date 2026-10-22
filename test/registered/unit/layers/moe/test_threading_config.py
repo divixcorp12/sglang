@@ -245,6 +245,7 @@ def test_from_env_reads_every_core_setting(monkeypatch):
     monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
     with envs.SGLANG_DSV41_CPU_EXPERTS_CORES.override("18-29"), \
             envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.override(4), \
+            envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT.override(True), \
             envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.override(17), \
             envs.SGLANG_EXPERT_STREAM_URING_MODE.override("sqpoll_iopoll"), \
             envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.override(15), \
@@ -261,7 +262,7 @@ def test_from_env_reads_every_core_setting(monkeypatch):
         "affinity": frozenset({0, 1}),
         "topology": "topology",
         "settings": CoreSettings(
-            cpu_experts=True, cores="18-29", threads=4, spin_core=17, sqpoll=True, sq_thread_cpu=15,
+            cpu_experts=True, cores="18-29", threads=4, smt=True, spin_core=17, sqpoll=True, sq_thread_cpu=15,
             numa_cores="1:ram=35,cpu=18-33", draft=True, draft_cores="6-11", draft_threads=3, ram_prefetch=True,
         ),
     }
@@ -455,3 +456,46 @@ def test_the_8280_ram_threads_have_their_physical_cores_alone(xeon8280):
 def test_without_the_spin_core_the_8280_derives_the_same_ram_cores(xeon8280):
     config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10)
     assert [p.ram for p in config.plans] == [26, 51] and config.copy_cpus == (27,)
+
+
+# --- SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: each pool core's SMT sibling joins the pool, after the cores ---
+
+
+def test_smt_adds_each_pool_cores_sibling_after_the_cores(xeon8280):
+    """The recipe with SMT on: each node's 10 cores, then their siblings; the RAM, copy and spec threads keep their
+    physical cores alone and nothing lands on a reserved core. Mutant: _derive ignoring settings.smt -- red."""
+    config = resolve(
+        xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, smt=True, spin_core=26, ram_prefetch=True
+    )
+    assert config.log_lines() == [
+        "numa node0: ram=26 cpu=6-15,62-71 (20) sq=- spec=0-5,56-61",
+        "numa node1: ram=51 cpu=28-37,84-93 (20) sq=- spec=50",
+        "numa copy thread: node0 cpus=27",
+    ]
+    used = {c for p in config.plans for c in p.cores() + list(p.spec)} | set(config.copy_cpus)
+    assert not used & REAL_RESERVED
+    others = [c for p in config.plans for c in [p.ram, *p.spec] if c not in SERVER_8280] + list(config.copy_cpus)
+    pool = {c % 56 for p in config.plans for c in p.cpu}
+    assert not {c % 56 for c in others} & pool, "a pool sibling shares a physical core with another role"
+
+
+def test_smt_off_leaves_the_plan_unchanged(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, spin_core=26)
+    assert [p.cpu for p in config.plans] == [tuple(range(6, 16)), tuple(range(28, 38))]
+
+
+def test_smt_applies_to_named_cpu_cores(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, cores="28-31", smt=True, spin_core=26)
+    assert config.plans[1].cpu == (28, 29, 30, 31, 84, 85, 86, 87)
+
+
+def test_smt_refuses_a_sibling_in_the_servers_affinity(xeon8280):
+    """The server's affinity reaching 62 and 63, the siblings of cores 6 and 7. The copy thread takes 7 (it prefers a
+    core whose sibling is the server's), so pool core 6 brings 62, which the pool cannot take."""
+    with pytest.raises(ValueError, match=r"node 0: SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT adds core 6's SMT sibling 62"):
+        resolve(xeon8280, affinity=SERVER_8280 | {62, 63}, cpu_experts=True, threads=10, smt=True, spin_core=26)
+
+
+def test_without_smt_pool_cores_on_one_physical_core_are_still_refused(xeon8280):
+    with pytest.raises(ValueError, match=r"cores 28 and 84 share a physical core"):
+        resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, cores="28,84", spin_core=26)

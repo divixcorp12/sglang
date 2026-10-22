@@ -24,7 +24,7 @@ void scalar_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, 
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
-        float acc[MAX_M][16] = {};
+        float acc[GENERIC_MAX_M][16] = {};
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k)
         {
             const uint16_t* packed = mat.trellis + (static_cast<size_t>(tile_k) * tiles_n + tile_n) * packed_size;

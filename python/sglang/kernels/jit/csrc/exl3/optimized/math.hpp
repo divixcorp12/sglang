@@ -49,7 +49,7 @@ constexpr float HAD_SCALE = 0.088388347648f;
 // Quantized activation rows per chunk: CHUNK_M tokens times ACT_ROWS (below). Every per-chunk array, stride and tile
 // table derives from it. A build raises it with -DEXL3_MOE_CPU_MAX_M (SGLANG_EXL3_CPU_MAX_M; the bench's EXL3_MAX_M).
 constexpr int MAX_M = EXL3_MOE_CPU_MAX_M;
-static_assert(MAX_M >= 2 && MAX_M <= 8 && MAX_M % 2 == 0, "EXL3_MOE_CPU_MAX_M must be even, in [2, 8]");
+static_assert(MAX_M >= 2 && MAX_M <= 16 && MAX_M % 2 == 0, "EXL3_MOE_CPU_MAX_M must be even, in [2, 16]");
 
 #ifndef EXL3_MOE_CPU_ACT_RESIDUAL
 #define EXL3_MOE_CPU_ACT_RESIDUAL 0
@@ -62,6 +62,11 @@ static_assert(EXL3_MOE_CPU_ACT_BLOCK >= 0 && EXL3_MOE_CPU_ACT_BLOCK % 16 == 0,
 // Quantized activation rows per token row, and so the most tokens a chunk can hold
 constexpr int ACT_ROWS = EXL3_MOE_CPU_ACT_RESIDUAL ? 2 : 1;
 constexpr int CHUNK_M = MAX_M / ACT_ROWS;
+// The generic plan's quantized rows per chunk: MAX_M up to 8, whatever the build's MAX_M. Its tile tables (kTiles) and
+// row-templated kernels are instantiated per row count, so a larger table only lengthens the build; the DSV4.1 plan
+// alone takes chunks past 4 tokens (register_tiles<M>). Exl3Quant::dispatch splits a generic call at GENERIC_CHUNK_M.
+constexpr int GENERIC_MAX_M = MAX_M < 8 ? MAX_M : 8;
+constexpr int GENERIC_CHUNK_M = GENERIC_MAX_M / ACT_ROWS;
 
 inline bool act_blocked(int k)
 {

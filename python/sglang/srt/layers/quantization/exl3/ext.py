@@ -68,8 +68,8 @@ def _max_m_defines() -> list[str]:
     max_m = envs.SGLANG_EXL3_CPU_MAX_M.get()
     if not max_m:
         return []
-    if max_m < 2 or max_m > 8 or max_m % 2:
-        raise ValueError(f"SGLANG_EXL3_CPU_MAX_M must be 0 or even in [2, 8], got {max_m}")
+    if max_m < 2 or max_m > 16 or max_m % 2:
+        raise ValueError(f"SGLANG_EXL3_CPU_MAX_M must be 0 or even in [2, 16], got {max_m}")
     return [f"-DEXL3_MOE_CPU_MAX_M={max_m}"]
 
 
@@ -104,7 +104,7 @@ def cpu_act_defines() -> list[str]:
 
 
 def build_flavor(defines: list[str]) -> str:
-    """The empty string for upstream's kernel, else a suffix naming the options, e.g. "_resid_b128" or "_resid_b128_m8_cpu_v1"."""
+    """The empty string for upstream's kernel, else a suffix naming the options, e.g. "_resid_b128" or "_resid_b128_m16_cpu_v1"."""
     flavor = ""
     if "-DEXL3_MOE_CPU_ACT_RESIDUAL=1" in defines:
         flavor += "_resid"

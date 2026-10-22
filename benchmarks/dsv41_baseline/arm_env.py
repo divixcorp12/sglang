@@ -103,9 +103,9 @@ MAX_TOKENS = 128
 # Core layout of 2026-10-21, for divix01's 2x Xeon Platinum 8280 (28 physical cores per socket, SMT 2, 112 CPUs, ~160 GB
 # per node): node 0 (the GPU's) is cpus 0-27 and their siblings 56-83, node 1 (all four NVMe drives) is 28-55 and 84-111;
 # cpu N's sibling is N + 56. The roles are the ones the 18-core CPUs had (node 0 = 0-17,36-53, node 1 = 18-35,54-71,
-# sibling N + 36); only the numbers moved. Node 0: server 0-5, CPU experts 6-15, driver 18-21, RAM thread 26, copy thread 27
-# (derived: the highest physical cores outside the server). Node 1: CPU experts 28-37, RAM thread 51 (derived), FREE_CORES
-# 52-55,108-111 kept clear. 16-17 and 22-25 on node 0, 38-50 on node 1 are spare.
+# sibling N + 36); only the numbers moved. Node 0: server 0-5, CPU experts 6-21 (16 since 2026-10-22), driver 22-25 and
+# helpers 78-81 (its siblings), RAM thread 26, copy thread 27 (derived: the highest physical cores outside the server).
+# Node 1: CPU experts 28-43, RAM thread 51 (derived), FREE_CORES 52-55,108-111 kept clear; 44-49 on node 1 are spare.
 # Node-0 cores only, since 2026-09-22. The old "32-63" spanned both nodes,
 # so first-touch put part of the 70 GiB pinned host buffer on node 1 -- which the
 # box's reth/nimbus stack keeps at ~9 GB free. Huge-page allocations there fail, and
@@ -114,20 +114,24 @@ MAX_TOKENS = 128
 # and no server log line after "Load weight end" until the 900s abort. Keeping every
 # server thread on node 0 keeps its memory on node 0's free ~70 GiB.
 # Since 2026-10-05 the server keeps 6 physical cores (0-5 and their siblings 56-61): CPU experts run on both nodes,
-# and node 0's other physical cores go to the expert stream (CPU experts 6-15, copy thread 27, RAM thread 26).
+# and node 0's other physical cores go to the expert stream (CPU experts 6-21, copy thread 27, RAM thread 26).
 # Arms from here on are not comparable to earlier cells.
 SERVER_CORES = "0-5,56-61"
 # The RAM-miss service busy-polls cpu 26; its SMT sibling 82 and 26 itself are left out of SERVER_CORES so the physical
 # core is the service's alone (plan 2026-10-01-expert-stream-read-record D4). Arms from here on have one physical core
 # fewer: not comparable to earlier cells. 26 is what ThreadingConfig derives anyway (the highest physical core below the
-# copy thread's 27); naming it keeps node 0's CPU experts contiguous with room to grow (16-25).
+# copy thread's 27); naming it keeps node 0's CPU experts contiguous (6-21), with the driver above them (22-25).
 SPIN_CORE = 26
-# CPU expert workers per NUMA node (SGLANG_DSV41_CPU_EXPERTS_THREADS): node 0 gets 6-15, node 1 28-37. Each node now has
-# 28 physical cores, so more threads is open (a performance experiment, not part of the remap).
-CPU_EXPERTS_THREADS = 10
-# Node 0 (the GPU's), clear of the CPU experts (6-15), RAM thread (26) and copy thread (27): the client stays off node 1,
-# whose cores are the NVMe-side experts'. 22-25 are the helpers' (memsample, nvidia-smi, prelaunch_evict).
-DRIVER_CORES = "18-21"
+# CPU expert workers per NUMA node (SGLANG_DSV41_CPU_EXPERTS_THREADS): node 0 gets 6-21, node 1 28-43. 16 since
+# 2026-10-22 (10 before): one-token CPU forwards run 17-21% faster at 16 than at 10 (DSV_OPTIMIZATION.md 3.14); past 16
+# they are bound by node memory bandwidth. Arms from here on are not comparable to earlier cells.
+CPU_EXPERTS_THREADS = 16
+# Node 0 (the GPU's), clear of the CPU experts (6-21), RAM thread (26) and copy thread (27): the client stays off node 1,
+# whose cores are the NVMe-side experts'. It moved from 18-21 when the experts grew to 16 threads.
+DRIVER_CORES = "22-25"
+# The capture helpers (memsample, nvidia-smi, prelaunch_evict): the driver cores' SMT siblings, the last node-0 CPUs no
+# server, expert (or, with SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT, expert sibling 62-77), RAM or copy thread holds.
+HELPER_CORES = "78-81"
 # Never touched: the top four physical cores of node 1 (the NVMe node) and their siblings, for NVMe completion
 # interrupts. Nothing pins the interrupts there yet (irqbalance spreads them over node 1 and node 0's siblings 57-83); a
 # root step does: write 52-55,108-111 to each nvme queue IRQ's /proc/irq/N/smp_affinity_list, and set

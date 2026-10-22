@@ -6,12 +6,24 @@
 //   M1_REG_TARGET             the target attribute of every function here
 //   M1_REG_ACC(acc, sum, pair) acc + sum . pair, the pairwise 16-bit dot of the byte-sum vector with a broadcast
 //                             activation pair: wraps mod 2^32 in both forms, so the two tiers are bit-identical.
+//   M1_REG_BYTES              1: one-token compact chunks skip the byte sum and accumulate the product bytes
+//                             themselves with vpdpbusd (register_rows' byte path, byte_dup_rows); 0: today's kernels.
 // Everything the two copies share (register_bytesum, register_word, kRegisterBudget) is defined before the includes.
 
-template<int J,int Pairs,bool Compact=false,int M=1>
-M1_REG_TARGET M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i b,__m512i c,
-    const std::conditional_t<Compact,int16_t,int32_t>* splat,__m512i (&acc)[Pairs][2][2*M],int band) {
-    if constexpr(J<16) {
+// The byte path's activations: each compact int16 x (|x| <= 127) as the byte pair (x, x), so a broadcast activation
+// pair reads as the bytes (xE, xE, xO, xO). rows quantized rows of one 128-input block, 128 apart, as in compact.
+M1_REG_TARGET M1_ALWAYS_INLINE void byte_dup_rows(const int16_t* src,int16_t* dst,int rows) {
+    const __m512i low=_mm512_set1_epi16(0x00ff);
+    for(int i=0;i<rows*128;i+=32) {
+        const __m512i x=_mm512_and_si512(_mm512_loadu_si512(src+i),low);
+        _mm512_store_si512(dst+i,_mm512_or_si512(x,_mm512_slli_epi16(x,8)));
+    }
+}
+
+// Decoded state J (0..15) of a tile pair: 32 16-bit trellis states, from the transposed words a, b, c and the
+// preceding lane's last word (prev).
+template<int J>
+M1_REG_TARGET M1_ALWAYS_INLINE __m512i register_state(__m512i prev,__m512i a,__m512i b,__m512i c) {
         constexpr int offset=19+6*J,q=offset/32,s=offset%32;
         __m512i lo,hi;
         if constexpr(q==0){lo=prev;hi=a;}
@@ -37,8 +49,31 @@ M1_REG_TARGET M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i
         const __m512i v=_mm512_or_si512(_mm512_slli_epi32(lo,s),_mm512_srli_epi32(hi,32-s));
         state=_mm512_mask_blend_epi16(0xaaaaaaaaU,_mm512_srli_epi32(v,16),_mm512_slli_epi32(v,3));
     }
-        const __m512i sum=register_bytesum(state);
+        return state;
+}
+
+template<int J,int Pairs,bool Compact=false,int M=1>
+M1_REG_TARGET M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i b,__m512i c,
+    const std::conditional_t<Compact,int16_t,int32_t>* splat,__m512i (&acc)[Pairs][2][2*M],int band) {
+    if constexpr(J<16) {
+        const __m512i state=register_state<J>(prev,a,b,c);
         constexpr int row=(J/4)*2+(J%2)*8,half=(J/2)%2;
+        if constexpr(M1_REG_BYTES && Compact && M==1) {
+            // The byte sum's 32-bit product, its low and high halves (register_bytesum), each dotted bytewise with
+            // (xE, xE, xO, xO): the sum of all four product bytes times x per state, the integer the byte sum gives.
+            const __m512i ml=_mm512_set1_epi16(int16_t(MUL1_MULT&0xffff));
+            const __m512i mh=_mm512_set1_epi16(int16_t(MUL1_MULT>>16));
+            const __m512i lo=_mm512_mullo_epi16(state,ml);
+            const __m512i hi=_mm512_add_epi16(_mm512_mulhi_epu16(state,ml),_mm512_mullo_epi16(state,mh));
+            for(int i=0;i<2;++i) {
+                uint32_t pair;std::memcpy(&pair,splat+i*128+row,4);
+                const __m512i x=_mm512_set1_epi32(int32_t(pair));
+                acc[band][half][i]=_mm512_dpbusd_epi32(_mm512_dpbusd_epi32(acc[band][half][i],lo,x),hi,x);
+            }
+            register_rows<J+1,Pairs,Compact,M>(prev,a,b,c,splat,acc,band);
+            return;
+        }
+        const __m512i sum=register_bytesum(state);
         // 2 * M quantized rows, 128 apart: M token rows, then their M residual rows (compact_quantize_block).
         for(int i=0;i<2*M;++i) {
             uint32_t pair;std::memcpy(&pair,reinterpret_cast<const char*>(splat+i*128+row)+(Compact?0:2),4);
@@ -60,12 +95,16 @@ M1_REG_TARGET void register_band(const Exl3Projection& mat,const PreparedIn& in,
     const size_t step=size_t(swz?8:tiles_n)*96;
     __m512 sums[Pairs][2][R];
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
+    constexpr bool bytes=M1_REG_BYTES && Compact && M==1;  // register_rows' byte path
+    [[maybe_unused]] alignas(64) int16_t dup[bytes?R*128:1];
     for(int kb=0;kb<k/128;++kb) {
         __m512i acc[Pairs][2][R];
         for(int b=0;b<Pairs;++b)for(int h=0;h<2;++h)for(int i=0;i<R;++i)acc[b][h][i]=_mm512_setzero_si512();
+        if constexpr(bytes) byte_dup_rows(in.compact+size_t(kb)*R*128,dup,R);
         for(int kt=0;kt<8;++kt) {
             const auto* splat=[&]() {
-                    if constexpr(Compact) return in.compact+size_t(kb)*R*128+kt*16;
+                    if constexpr(bytes) return static_cast<const int16_t*>(dup)+kt*16;
+                    else if constexpr(Compact) return in.compact+size_t(kb)*R*128+kt*16;
                     else return in.splat_dup+size_t(kb)*R*128+kt*16;
                 }();
             for(int band=0;band<Pairs;++band) {
@@ -113,6 +152,82 @@ M1_REG_TARGET M1_ALWAYS_INLINE void register_band_for(std::integer_sequence<int,
     (void)((pairs==P+1 && (register_band<P+1,0,0,true,M>(mat,in,tout,n0),true)) || ...);
 }
 
+// register_rows for one output half: the states J with (J / 2) % 2 == Half, each decoded once, into that half's 2 * M
+// rows (register_band_halves).
+template<int J,int Pairs,int M,int Half>
+M1_REG_TARGET M1_ALWAYS_INLINE void register_rows_half(__m512i prev,__m512i a,__m512i b,__m512i c,
+    const int16_t* splat,__m512i (&acc)[Pairs][2*M],int band) {
+    if constexpr(J<16) {
+        if constexpr((J/2)%2==Half) {
+            const __m512i sum=register_bytesum(register_state<J>(prev,a,b,c));
+            constexpr int row=(J/4)*2+(J%2)*8;
+            for(int i=0;i<2*M;++i) {
+                uint32_t pair;std::memcpy(&pair,splat+i*128+row,4);
+                acc[band][i]=M1_REG_ACC(acc[band][i],sum,_mm512_set1_epi32(int32_t(pair)));
+            }
+        }
+        register_rows_half<J+1,Pairs,M,Half>(prev,a,b,c,splat,acc,band);
+    }
+}
+
+// register_band<Pairs, 0, 0, true, M> for chunks whose 4 * M accumulators per tile pair do not fit the registers
+// (kRegisterBudget's split entries). Each 128-input block runs its eight k-tiles once per output half, holding only
+// that half's 2 * M accumulators; the second pass reloads the tiles from L1 and decodes the other half's states, so
+// every state is still decoded once. Each output's integer sums are the same exact int32 values, and its per-block
+// scale, FP32 sums in increasing k-block order and token + residual are register_band's operations in its order.
+template<int Pairs,int M>
+M1_REG_TARGET void register_band_halves(const Exl3Projection& mat,const PreparedIn& in,float* tout,int n0) {
+    constexpr int R=2*M;
+    const int k=mat.k,n=mat.n,tiles_n=n/16;
+    const size_t step=size_t(tiles_n)*96;
+    __m512 sums[Pairs][2][R];
+    alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
+    for(int kb=0;kb<k/128;++kb) {
+        __m512 scales[R],corrections[R];
+        for(int i=0;i<R;++i) {
+            const float scale=0x1.bb8p-8f*in.bq[kb*MAX_M+i];
+            scales[i]=_mm512_set1_ps(scale);
+            corrections[i]=_mm512_set1_ps(-510.0f*float(in.bsum[kb*MAX_M+i])*scale);
+        }
+        auto half=[&]<int Half>() {
+            __m512i acc[Pairs][R];
+            for(int b=0;b<Pairs;++b)for(int i=0;i<R;++i)acc[b][i]=_mm512_setzero_si512();
+            for(int kt=0;kt<8;++kt) {
+                const int16_t* splat=in.compact+size_t(kb)*R*128+kt*16;
+                for(int band=0;band<Pairs;++band) {
+                    const int nt=n0+2*band,tile_k=kb*8+kt;
+                    const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+(size_t(tile_k)*tiles_n+nt)*48);
+                    if constexpr(Half==0) {
+                        const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+step*2;
+                        #pragma GCC unroll 3
+                        for(int line=0;line<3;++line)_mm_prefetch(reinterpret_cast<const char*>(future+line*64),_MM_HINT_T0);
+                    }
+                    const __m512i p0=_mm512_loadu_si512(packed),p1=_mm512_loadu_si512(packed+16),p2=_mm512_loadu_si512(packed+32);
+                    const __m512i a=register_word<0>(p0,p1,p2),b=register_word<1>(p0,p1,p2),c=register_word<2>(p0,p1,p2);
+                    const __m512i prev=_mm512_permutexvar_epi32(_mm512_load_si512(previous),c);
+                    register_rows_half<0,Pairs,M,Half>(prev,a,b,c,splat,acc,band);
+                }
+            }
+            for(int b=0;b<Pairs;++b)for(int i=0;i<R;++i) {
+                const __m512 v=_mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]),scales[i],corrections[i]);
+                if(kb==0)sums[b][Half][i]=v;else sums[b][Half][i]=_mm512_add_ps(sums[b][Half][i],v);
+            }
+        };
+        half.template operator()<0>();
+        half.template operator()<1>();
+    }
+    for(int b=0;b<Pairs;++b)for(int t=0;t<M;++t) {
+        float* row=tout+size_t(t)*n;
+        float* res=tout+size_t(M+t)*n;
+        const __m512 lo=_mm512_add_ps(sums[b][0][t],sums[b][0][M+t]);
+        const __m512 hi=_mm512_add_ps(sums[b][1][t],sums[b][1][M+t]);
+        _mm512_storeu_ps(row+(n0+2*b)*16,_mm512_shuffle_f32x4(lo,hi,0x44));
+        _mm512_storeu_ps(row+(n0+2*b+1)*16,_mm512_shuffle_f32x4(lo,hi,0xee));
+        _mm512_storeu_ps(res+(n0+2*b)*16,_mm512_shuffle_f32x4(sums[b][0][M+t],sums[b][1][M+t],0x44));
+        _mm512_storeu_ps(res+(n0+2*b+1)*16,_mm512_shuffle_f32x4(sums[b][0][M+t],sums[b][1][M+t],0xee));
+    }
+}
+
 // Visit neighboring 128-output bands before advancing to the next 128-input block.
 // Original packed weights and each output's increasing-kb FP32 addition order stay
 // unchanged. One integer band is live at a time; FP32 partials reside in private
@@ -131,9 +246,11 @@ void traversal_kblock(const Exl3Projection& mat, const PreparedIn& in,
     const size_t step=size_t(swz?8:tiles_n)*96;
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
     IntegerAccum first;integer_acc_zero(first);
+    [[maybe_unused]] alignas(64) int16_t dup[M1_REG_BYTES?256:1];  // register_rows' byte path
+    if constexpr(M1_REG_BYTES) byte_dup_rows(in.compact+size_t(kb)*256,dup,2);
     for(int kt=0;kt<8;++kt) {
         auto& acc=first.lanes;
-        const int16_t* splat=in.compact+size_t(kb)*256+kt*16;
+        const int16_t* splat=(M1_REG_BYTES?static_cast<const int16_t*>(dup):in.compact+size_t(kb)*256)+kt*16;
         #pragma omp unroll full
         for(int band=0;band<4;++band) {
             const int nt=n0+2*band, tile_k=kb*8+kt;
@@ -220,7 +337,7 @@ M1_REG_TARGET void compact_pairs(const Exl3Projection& mat,const PreparedIn& in,
 
 // The tokens of one chunk, M = 1..CHUNK_M. M = 1 is the one-token kernel either plan calls (compact or not, swizzled
 // or not; the grouped traversal: kRegisterBudget[0]). M > 1 is the DSV4.1 plan's compact, unswizzled input, in runs of
-// up to kRegisterBudget[M - 1].pairs tile pairs.
+// up to kRegisterBudget[M - 1].pairs tile pairs; M = 5..8 (halves entries) through register_band_halves.
 template<int M>
 M1_REG_TARGET void register_tiles(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1,
                                  [[maybe_unused]] bool grouped) {
@@ -256,6 +373,11 @@ M1_REG_TARGET void register_tiles(const Exl3Projection& mat,const PreparedIn& in
         static_assert(!budget.traversal,"the grouped traversal holds one token's rows (IntegerAccum)");
         TORCH_CHECK(in.compact && !mat.swz && t0%2==0 && t1%2==0,
                     "a chunk of several tokens needs compact, unswizzled tile pairs");
+        if constexpr (budget.halves) {
+            static_assert(budget.pairs==1,"register_band_halves runs one tile pair per call here");
+            for(int n0=t0;n0<t1;n0+=2)register_band_halves<1,M>(mat,in,tout,n0);
+            return;
+        }
         for(int n0=t0;n0<t1;) {
             const int pairs=std::min(budget.pairs,(t1-n0)/2);
             register_band_for<M>(std::make_integer_sequence<int,budget.pairs>{},mat,in,tout,n0,pairs);

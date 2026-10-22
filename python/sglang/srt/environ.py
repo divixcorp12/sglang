@@ -1418,15 +1418,18 @@ class Envs:
     SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
     SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
     # Build-time: the optimized EXL3 CPU kernel's quantized activation rows per chunk (EXL3_MOE_CPU_MAX_M, even in
-    # [2, 8]; a chunk holds half as many tokens). 8 by default: an expert shared by 3-4 verify tokens decodes its
-    # weights once (DSV41_REFERENCE.md 33.20). 0 keeps the kernel source's default (4). A nonzero value builds into its
-    # own extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
-    SGLANG_EXL3_CPU_MAX_M = EnvInt(8)
+    # [2, 16]; a chunk holds half as many tokens). 16 by default: an expert shared by up to 8 verify tokens decodes its
+    # weights once (DSV41_REFERENCE.md 33.20; chunks of 5-8 tokens through register_band_halves). The generic plan
+    # keeps chunks of at most 4 tokens. 0 keeps the kernel source's default (4). A nonzero value builds into its own
+    # extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
+    SGLANG_EXL3_CPU_MAX_M = EnvInt(16)
     # Experiment-only; retire with plan 2026-10-07-dsv41-row-weighted-serving-experiment. Whose EXL3 CPU expert layers
     # split their gate/up and down output tiles by chunk row count instead of evenly
     # (csrc/exl3/optimized/tile_assignment.hpp): "draft", "target" or "both"; empty keeps the original assignment
     # everywhere. Per layer at run time, not a build flavor: the same arithmetic in another worker's hands. The launch
-    # gate requires the named source's CPU experts.
+    # gate requires the named source's CPU experts. The DSV4.1 plan claims 8-tile groups dynamically whenever a call's
+    # chunks differ in token count (PlanTraits::kClaimMixedChunks), the only calls row weighting changes, so there the
+    # setting has no effect: it still weights the generic plan's layers.
     SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT = EnvStr("")
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
     # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
@@ -2194,6 +2197,10 @@ class Envs:
     SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
+    # Each node's CPU expert pool also takes the SMT sibling of every one of its cores (after THREADS caps them), so
+    # a pool of n cores runs 2n workers, siblings after the cores. A sibling that the server's affinity, a reserved
+    # core or another role holds refuses the plan. Off by default; measured to help chunks of several tokens only.
+    SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT = EnvBool(False)
     # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
     # "1:ram=51,cpu=28-43,sq=50;0:ram=26": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
     # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
