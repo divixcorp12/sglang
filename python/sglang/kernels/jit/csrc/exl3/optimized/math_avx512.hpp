@@ -956,6 +956,31 @@ static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(s
               "kRegisterBudget (math_avx512.hpp) has no entry for this CHUNK_M: add one before raising "
               "EXL3_MOE_CPU_MAX_M");
 
+// Layout study (bench builds only; the server never defines it): EXL3_BENCH_LAYOUT selects how the register kernels
+// address an unswizzled 3-bit trellis. 0 (default): native [k/16][n/16] tiles. 1: pair-major, tile (kt, nt) at
+// ((nt / 2) * tiles_k + kt) * 2 + nt % 2, so a tile pair's whole k-column is contiguous and a worker's pair range is
+// one byte range. 2: group-major, the swizzled order (nt / 8, kt, nt % 8). The bench repacks its slabs to match.
+// Prefetch: native keeps two rows ahead; the others EXL3_BENCH_PF_ROWS of their own (shorter) row steps.
+#ifndef EXL3_BENCH_LAYOUT
+#define EXL3_BENCH_LAYOUT 0
+#endif
+#ifndef EXL3_BENCH_PF_ROWS
+#define EXL3_BENCH_PF_ROWS 8
+#endif
+M1_ALWAYS_INLINE inline size_t reg_tile(int tile_k, int nt, int tiles_k, int tiles_n)
+{
+    if constexpr (EXL3_BENCH_LAYOUT == 1) return (size_t(nt >> 1) * tiles_k + tile_k) * 2 + (nt & 1);
+    else if constexpr (EXL3_BENCH_LAYOUT == 2) return (size_t(nt >> 3) * tiles_k + tile_k) * 8 + (nt & 7);
+    else return size_t(tile_k) * tiles_n + nt;
+}
+// Bytes from a tile pair to the one the kernel prefetches: the same pair EXL3_BENCH_PF_ROWS k-rows on (two natively).
+inline size_t reg_prefetch_ahead(int tiles_n)
+{
+    if constexpr (EXL3_BENCH_LAYOUT == 1) return size_t(EXL3_BENCH_PF_ROWS) * 2 * 96;
+    else if constexpr (EXL3_BENCH_LAYOUT == 2) return size_t(EXL3_BENCH_PF_ROWS) * 8 * 96;
+    else return size_t(tiles_n) * 96 * 2;
+}
+
 // The register kernels, once per integer accumulate (register_kernels.hpp). reg_bw is today's code, for every
 // AVX-512BW host. reg_vnni accumulates with vpdpwssd and runs on VNNI hosts (the plan's tier is >= Isa::Vnni); its
 // one-token compact chunks drop the byte sum for vpdpbusd on the product bytes (M1_REG_BYTES), one fewer vector

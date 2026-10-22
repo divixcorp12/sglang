@@ -41,6 +41,10 @@
 #include <unistd.h>
 #include <vector>
 
+#ifndef EXL3_BENCH_LAYOUT
+#define EXL3_BENCH_LAYOUT 0  // the trellis layout the kernel was built to read (math_avx512.hpp, reg_tile)
+#endif
+
 #ifdef EXL3_BENCH_BASELINE
 #include <c10/util/Half.h>
 #include <span>
@@ -228,7 +232,19 @@ struct SlabLayer {
         uint8_t* dst = slabs[n].get() + s * row;
         for (const auto* part : parts) {
           const at::Tensor t = (*part)[s % experts].contiguous();
-          std::memcpy(dst, t.data_ptr(), t.nbytes());
+          if (n % 3 == 0 && EXL3_BENCH_LAYOUT != 0) {
+            // A trellis, [k/16][n/16] 96-byte tiles, stored in the layout the kernels were built to read
+            // (math_avx512.hpp, reg_tile).
+            const int tiles_k = int(t.size(0)), tiles_n = int(t.size(1));
+            const auto* src = static_cast<const uint8_t*>(t.data_ptr());
+            for (int kt = 0; kt < tiles_k; ++kt)
+              for (int nt = 0; nt < tiles_n; ++nt) {
+                const size_t to = EXL3_BENCH_LAYOUT == 1 ? (size_t(nt >> 1) * tiles_k + kt) * 2 + (nt & 1)
+                                                         : (size_t(nt >> 3) * tiles_k + kt) * 8 + (nt & 7);
+                std::memcpy(dst + to * 96, src + (size_t(kt) * tiles_n + nt) * 96, 96);
+              }
+          } else
+            std::memcpy(dst, t.data_ptr(), t.nbytes());
           dst += t.nbytes();
         }
       }
@@ -422,7 +438,7 @@ struct RoutedWorkload {
       }
     }
     for (size_t layer = 0; layer < layers.size(); ++layer) {
-      const auto* x = static_cast<const at::Half*>(fixture.layers[layer].input.data_ptr());
+      const auto* x = static_cast<const at::Half*>(fixture.layers[layer % fixture.layers.size()].input.data_ptr());
       std::vector<at::Half> rows_x(static_cast<size_t>(rows) * f.hidden);
       for (int t = 0; t < rows; ++t)
         for (int i = 0; i < f.hidden; ++i)
@@ -589,10 +605,13 @@ int main(int argc, char** argv) {
     RoutedLayers routed_layers;
     std::vector<std::unique_ptr<RoutedWorkload>> routed;
     if (!options.routed.empty()) {
-      if (options.routed_layers < 1 || options.routed_layers > int(fixture.layers.size()) || options.routed_slots < 1)
+      // Layout study: more routed layers than the fixture holds repeat its layers as separate copies, so a routed
+      // workload's rotation can read past L3 (cold weights) as the fixture's experts:N workloads do.
+      if (options.routed_layers < 1 || options.routed_layers > 64 || options.routed_slots < 1)
         throw std::runtime_error("Invalid --routed-layers or --routed-slots");
       for (int layer = 0; layer < options.routed_layers; ++layer)
-        routed_layers.push_back(std::make_unique<SlabLayer>(fixture.layers[layer], fixture.hidden, options.routed_slots));
+        routed_layers.push_back(std::make_unique<SlabLayer>(fixture.layers[layer % fixture.layers.size()],
+                                                            fixture.hidden, options.routed_slots));
       for (const auto& spec : options.routed) {
         routed.push_back(std::make_unique<RoutedWorkload>(fixture, options, routed_layers, spec));
         routed.back()->validate();

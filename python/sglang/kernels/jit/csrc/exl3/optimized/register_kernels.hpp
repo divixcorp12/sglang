@@ -92,7 +92,7 @@ M1_REG_TARGET void register_band(const Exl3Projection& mat,const PreparedIn& in,
     const int k=FixedK?FixedK:mat.k,n=FixedN?FixedN:mat.n;
     const bool swz=FixedK?false:mat.swz;
     const int tiles_k=k/16,tiles_n=n/16;
-    const size_t step=size_t(swz?8:tiles_n)*96;
+    const size_t ahead=swz?size_t(8)*96*2:reg_prefetch_ahead(tiles_n);
     __m512 sums[Pairs][2][R];
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
     constexpr bool bytes=M1_REG_BYTES && Compact && M==1;  // register_rows' byte path
@@ -109,9 +109,9 @@ M1_REG_TARGET void register_band(const Exl3Projection& mat,const PreparedIn& in,
                 }();
             for(int band=0;band<Pairs;++band) {
                 const int nt=n0+2*band,tile_k=kb*8+kt;
-                const size_t tile=swz?size_t(nt/8)*tiles_k*8+size_t(tile_k)*8+nt%8:size_t(tile_k)*tiles_n+nt;
+                const size_t tile=swz?size_t(nt/8)*tiles_k*8+size_t(tile_k)*8+nt%8:reg_tile(tile_k,nt,tiles_k,tiles_n);
                 const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+tile*48);
-                const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+step*2;
+                const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+ahead;
                 #pragma GCC unroll 3
                 for(int line=0;line<3;++line)_mm_prefetch(reinterpret_cast<const char*>(future+line*64),_MM_HINT_T0);
                 const __m512i p0=_mm512_loadu_si512(packed),p1=_mm512_loadu_si512(packed+16),p2=_mm512_loadu_si512(packed+32);
@@ -178,8 +178,8 @@ M1_REG_TARGET M1_ALWAYS_INLINE void register_rows_half(__m512i prev,__m512i a,__
 template<int Pairs,int M>
 M1_REG_TARGET void register_band_halves(const Exl3Projection& mat,const PreparedIn& in,float* tout,int n0) {
     constexpr int R=2*M;
-    const int k=mat.k,n=mat.n,tiles_n=n/16;
-    const size_t step=size_t(tiles_n)*96;
+    const int k=mat.k,n=mat.n,tiles_k=k/16,tiles_n=n/16;
+    const size_t ahead=reg_prefetch_ahead(tiles_n);
     __m512 sums[Pairs][2][R];
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
     for(int kb=0;kb<k/128;++kb) {
@@ -196,9 +196,9 @@ M1_REG_TARGET void register_band_halves(const Exl3Projection& mat,const Prepared
                 const int16_t* splat=in.compact+size_t(kb)*R*128+kt*16;
                 for(int band=0;band<Pairs;++band) {
                     const int nt=n0+2*band,tile_k=kb*8+kt;
-                    const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+(size_t(tile_k)*tiles_n+nt)*48);
+                    const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+reg_tile(tile_k,nt,tiles_k,tiles_n)*48);
                     if constexpr(Half==0) {
-                        const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+step*2;
+                        const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+ahead;
                         #pragma GCC unroll 3
                         for(int line=0;line<3;++line)_mm_prefetch(reinterpret_cast<const char*>(future+line*64),_MM_HINT_T0);
                     }
@@ -243,7 +243,7 @@ void traversal_kblock(const Exl3Projection& mat, const PreparedIn& in,
                       __m512 (&sums)[4][2][2], int n0, int kb) {
     const int tiles_k=mat.k/16, tiles_n=mat.n/16;
     const bool swz=mat.swz;
-    const size_t step=size_t(swz?8:tiles_n)*96;
+    const size_t ahead=swz?size_t(8)*96*2:reg_prefetch_ahead(tiles_n);
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
     IntegerAccum first;integer_acc_zero(first);
     [[maybe_unused]] alignas(64) int16_t dup[M1_REG_BYTES?256:1];  // register_rows' byte path
@@ -255,9 +255,9 @@ void traversal_kblock(const Exl3Projection& mat, const PreparedIn& in,
         for(int band=0;band<4;++band) {
             const int nt=n0+2*band, tile_k=kb*8+kt;
             const size_t tile=swz?size_t(nt/8)*tiles_k*8+size_t(tile_k)*8+nt%8
-                                 :size_t(tile_k)*tiles_n+nt;
+                                 :reg_tile(tile_k,nt,tiles_k,tiles_n);
             const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+tile*48);
-            const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+step*2;
+            const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+ahead;
             #pragma GCC unroll 3
             for(int line=0;line<3;++line)
                 _mm_prefetch(reinterpret_cast<const char*>(future+line*64),_MM_HINT_T0);

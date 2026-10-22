@@ -41,6 +41,8 @@ add_compile_definitions(SGLANG_EXPERT_STREAM_NODES=${EXPERT_STREAM_NODES})
 set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (even, 2..16; the server builds 16); empty: the source default")
 
 option(EXL3_ROW_WEIGHTED_ASSIGNMENT "Experimental row-weighted matrix assignment" OFF)
+set(EXL3_LAYOUT 0 CACHE STRING "Layout study: trellis layout of the optimized kernel and its slabs (0 native, 1 pair-major, 2 group-major)")
+set(EXL3_PF_ROWS 8 CACHE STRING "Layout study: prefetch distance in k-rows for layouts 1 and 2")
 
 option(EXL3_FETCH_BENCHMARK "Download pinned Google Benchmark when not installed" ON)
 find_package(benchmark 1.9 QUIET CONFIG)
@@ -91,6 +93,10 @@ foreach(BACKEND baseline optimized)
   endif()
   if(EXL3_ROW_WEIGHTED_ASSIGNMENT AND NOT BACKEND STREQUAL "baseline")
     target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT=1)
+  endif()
+  if(NOT BACKEND STREQUAL "baseline")
+    target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
+      EXL3_BENCH_LAYOUT=${EXL3_LAYOUT} EXL3_BENCH_PF_ROWS=${EXL3_PF_ROWS})
   endif()
   # Kernel flags match the selected study. Keep the harness's NaN/error checks
   # outside fast-math; kernel and harness are distinct translation units.
