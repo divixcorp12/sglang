@@ -314,10 +314,11 @@ DSPARK_MEM_FRACTION_STATIC = "0.78"
 DSPARK_HOT_GPU_MB = "10840"
 # Production's own DSpark memory sizes since 2026-10-16 (MERGE_PLAN_1016.md). The two above stay the OFF -mem arm's
 # measured init: both_cpu_ab's fraction_keeping_kv and hot_mb_for_margin derive every arm's sizes from them. These are
-# the -mergechunk-expseg arm's (both_cpu_ab.EXPSEG_HOT_GPU_MB, its ARM_MEMORY_FLAGS), the best served DSpark arm: 1,035
-# hot slots, the fraction that keeps the KV pool at the pin, and the pin. With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
+# the -mergechunk-expseg arm's (both_cpu_ab.EXPSEG_HOT_GPU_MB, its ARM_MEMORY_FLAGS), the best served DSpark arm: 994
+# hot slots (1,035 until 2026-10-22: driver 615.71.10 and the 8280 build left the pool at 156,928 tokens, KvPinMissed),
+# the fraction that keeps the KV pool at the pin, and the pin. With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP
 # (prod_dspark_env) the hot cache is the starting point the startup calibration grows or trims from.
-PROD_DSPARK_HOT_GPU_MB = "13144"
+PROD_DSPARK_HOT_GPU_MB = "12623"
 PROD_DSPARK_MEM_FRACTION_STATIC = "0.8623"
 PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
 # Since 2026-10-22 production's pinned tier holds every routed expert row (owner, after the 128 GB RAM upgrade; the request

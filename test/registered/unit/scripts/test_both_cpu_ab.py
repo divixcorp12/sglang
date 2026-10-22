@@ -905,7 +905,7 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
 
 def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_alone(monkeypatch):
     """-expseg is -mergechunk with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and a hot cache sized from its smoke
-    (923 slots, 2,040 MiB free, 29.39 GiB) less 3 held-back slots: 1035 slots, KV still pinned; every other arm states the
+    (923 slots, 2,040 MiB free, 29.39 GiB) less 10 held-back slots: 994 slots, KV still pinned; every other arm states the
     allocator config empty against a shell's. Mutant: another arm inherits the shell's config, or the size moves -- red."""
     ab = _ab()
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
@@ -917,7 +917,7 @@ def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_
     e, m = ab.ARMS[expseg][0], ab.ARMS[merge][0]
     knobs = ("PYTORCH_CUDA_ALLOC_CONF", "SGLANG_MOE_HOT_GPU_MB")
     assert {k: v for k, v in e.items() if k not in knobs} == {k: v for k, v in m.items() if k not in knobs}
-    assert int(e["SGLANG_MOE_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 1035
+    assert int(e["SGLANG_MOE_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 994
     flags = ab.server_flags(expseg)
     assert flags[flags.index("--max-total-tokens") + 1] == "381184"
     assert flags[flags.index("--mem-fraction-static") + 1] == ab.fraction_keeping_kv(ab.EXPSEG_HOT_GPU_MB, 381184)

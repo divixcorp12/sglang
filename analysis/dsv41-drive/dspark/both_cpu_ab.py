@@ -425,8 +425,10 @@ def fraction_keeping_kv(hot_mb: int, kv_tokens: int) -> str:
 PROBE_HOT_SLOTS = 956
 PROBE_FREE_AT_PEAK_MIB = 134
 PROBE_PRE_LOAD_GIB = 29.37
-# The lowest free-before-load seen (mem-budget/L2): a launch that low leaves that much less at the peak.
-MIN_PRE_LOAD_GIB = 29.33
+# The lowest free-before-load seen: a launch that low leaves that much less at the peak. 28.91 since 2026-10-22: NVIDIA
+# driver 615.71.10 (from 615.71.09) leaves 0.37 GiB less free before load (prod-20261022-033013 29.28 -> 28.91 GiB),
+# and that start missed the KV pin (156,928 tokens). Was 29.33 (mem-budget/L2).
+MIN_PRE_LOAD_GIB = 28.91
 # The margin the DSpark arms keep today over their 4096-token warm-up (arm_env, at DSPARK_MEM_FRACTION_STATIC).
 PEAK_MARGIN_MIB = 508
 
@@ -469,9 +471,11 @@ ARMS[MERGE_CHUNK_ARM] = (
 ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[ALLOC_CONF] = ""
-# -expseg spends that on the hot cache by hot_mb_for_margin from the smoke, holding back 3 slots against a node-0
-# squeeze during load (the smoke's node 0 fell below its low watermark loading): 1035 slots.
-EXPSEG_HELD_BACK_SLOTS = 3
+# -expseg spends that on the hot cache by hot_mb_for_margin from the smoke, holding back slots against a node-0
+# squeeze during load (the smoke's node 0 fell below its low watermark loading): 3 until 2026-10-22 (1035 slots), 10
+# since, for the ~0.18 GB more that the 8280 build takes between target load and draft load (16 CPU expert threads, all
+# 40 layers pinned whole): 994 slots. The startup calibration grows the cache back once the KV pool is sized.
+EXPSEG_HELD_BACK_SLOTS = 10
 EXPSEG_HOT_GPU_MB = hot_mb_for_margin(
     probe_slots=923, probe_free_mib=2040, probe_pre_load_gib=29.39, held_back_slots=EXPSEG_HELD_BACK_SLOTS
 )
