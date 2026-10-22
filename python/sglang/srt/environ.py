@@ -318,7 +318,8 @@ class InsertOnMissStage(IntEnum):
 
     The values are ordered so that the retired boolean
     ``SGLANG_MOE_HOT_INSERT_ON_MISS`` keeps its meaning: ``0`` is OFF and ``1``
-    is SCRATCH, the behaviour that boolean selected.
+    is SCRATCH, the behaviour that boolean selected. The boolean is a removed
+    name now (``SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE`` replaces it).
     """
 
     OFF = 0
@@ -579,6 +580,222 @@ class Envs:
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+
+    # ===================================================================
+    # Expert streaming engine: master switch and tiers
+    # ===================================================================
+    # Every name in the "Expert streaming engine" sections is read once, by sglang.srt.layers.moe.expert_engine.config
+    # (ExpertStreamConfig.from_envs); engine code takes the resolved config and never reads these. A name that is a
+    # JSON object (URING, MIRROR, TRACE, CPU_SPLIT, CPU_TWO_STAGE, SHADOW_PREFETCH) is decoded into its config
+    # sub-struct, unknown keys rejected; unset or empty keeps every default. The old names these replace are still
+    # registered below until the wiring step switches the engine over; expert_engine/removed_env.py then refuses
+    # them at startup.
+    # Stream the routed experts from host memory and disk through the expert engine.
+    SGLANG_EXPERT_STREAM_ENABLE = EnvBool(False)
+    # The format's read-only source shard directory (for EXL3 the checkpoint's shards, which may sit on another drive
+    # than the model). Required when streaming such a format.
+    SGLANG_EXPERT_STREAM_EXPERT_DIR = EnvStr("")
+    # The engine's writable file-cache directory (repacked runtime tensors, identity-keyed and reused across
+    # restarts); empty copies the experts into plain CPU tensors.
+    SGLANG_EXPERT_STREAM_FILE_CACHE_DIR = EnvStr("")
+    SGLANG_EXPERT_STREAM_PINNED_HOST_MB = EnvInt(0)
+    # Where the pinned host tier lives: "node:MiB,node:MiB" (e.g. "0:65536,1:30720"), summing to PINNED_HOST_MB.
+    # Every layer's rows are bound to the nodes in that proportion, and startup refuses a node without the memory.
+    # Empty keeps first-touch placement.
+    SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB = EnvStr("")
+    # Layer ids whose every expert stays in the pinned host tier ("0,1"): each is bought first, per node, with the
+    # slots its tier's reader holds back on top, and filled at start; the rest of the budget is split as without.
+    # Empty: no layer is held whole.
+    SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS = EnvTuple(tuple())
+    # Copy all host expert rows into registered memory (legacy streamer; replaces the pinned LRU).
+    SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA = EnvBool(False)
+    # mmap | uring | uring_direct. The EXL3 path refuses mmap, so the default cannot start it (recorded, not changed).
+    SGLANG_EXPERT_STREAM_FILE_READER = EnvStr("mmap")
+    # Where host expert rows are read from: auto | files | tensor | shards, or a kind the expert format defines.
+    SGLANG_EXPERT_STREAM_ROW_SOURCE = EnvStr("auto")
+    # Per-node thread plans replacing the derived ones, e.g. "1:ram=51,cpu=28-43,sq=50;0:ram=26": nodes separated by
+    # ";", keys ram, cpu, sq, each a taskset list. Validated like a derived plan; a refused plan stops the start.
+    # Empty derives every node's plan. Replaces the single-core spellings of the same three roles.
+    SGLANG_EXPERT_STREAM_NUMA_CORES = EnvStr("")
+    # JSON object -> TiersConfig.uring: mode, queue_depth, fixed_files, read_mode, wait_mode, sq_thread_idle_ms,
+    # diagnostics, read_cuts, slab_arena.
+    SGLANG_EXPERT_STREAM_URING = EnvStr("")
+    # JSON object -> TiersConfig.mirror: dirs (os.pathsep-separated roots, each a byte-identical checkpoint copy on
+    # its own drive), weights (colon-separated read shares), dynamic, caps (comma-separated in-flight caps).
+    SGLANG_EXPERT_STREAM_MIRROR = EnvStr("")
+
+    # ===================================================================
+    # Expert streaming engine: copy path
+    # ===================================================================
+    # What moves a RAM-resident row into its VRAM slot: sm_copy (the in-graph SM copy kernel), dma (the legacy
+    # streamer's CUDA copy engine) or copy_engine (the native engine's copy thread, armed after 16 decode forwards;
+    # needs CUDA_MODULE_LOADING=EAGER). The default reproduces COPY_BACKEND=gpu with the copy engine off.
+    SGLANG_EXPERT_STREAM_COPY_MODE = EnvStr("sm_copy")
+    # What moves a captured decode post's RAM hits once the copy engine is armed: "ce" (its DMA) or "sm" (the in-graph
+    # SM copy). CPU lanes complete through the copy thread either way.
+    SGLANG_EXPERT_STREAM_RAM_HIT_COPY = EnvStr("ce")
+    # The copy engine copies only each RAM-hit row's big tensors; the copy wait reads the layout's small ones from the
+    # pinned slot with SM loads. Needs the copy engine.
+    SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES = EnvBool(False)
+    # Lease-chain kernels launch with programmatic dependent launch (at most ~1 us per layer).
+    SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL = EnvBool(False)
+    # How long the in-graph wait for the RAM-miss thread may take per MoE layer, in ms, before the process fails
+    # stop. The thread's watchdog aborts after max(30 s, 3x this) (CopyConfig.watchdog_wait_s), so it outlasts this
+    # wait and the eager pause bound (2x this + 1 s).
+    SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # How long an idle RAM-miss service thread (one per NUMA group) polls before it sleeps. -1: never sleep.
+    SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US = EnvInt(5000)
+    # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
+    SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US = EnvInt(5000)
+    # Serve decode-sized expert gathers without host syncs so CUDA graphs capture them; requires HOT_GPU_MB.
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER = EnvBool(False)
+    # Plan a graph-gather's BS1, unique-ID, top_k<=32 routes with one fused CUDA kernel launch; requires GRAPH_GATHER.
+    SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN = EnvBool(False)
+    # Speculative decoding only: cap each layer's graph-gather scratch rows below one per verify route; 0 keeps that
+    # bound. Startup rejects a cap below one request's routes.
+    SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
+    # Speculative decoding with DIRECT residency only: each layer's graph gather serves at most this many distinct
+    # misses, below one per verify route; 0 keeps one lane per route.
+    SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES = EnvInt(0)
+    # Spill: only the first V of a gather's miss lanes in plan order take a VRAM victim and a staging slot; every later
+    # lane is a CPU lane. 0: every miss lane may take a victim. 1 <= V < the routes.
+    SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
+    # Prefill misses are read by the native reader straight into the pinned slabs; needs GRAPH_GATHER.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS = EnvBool(False)
+    # A prefill's pinned-tier admissions own at most one gather chunk of rows per layer, then evict their own LRU row.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE = EnvBool(False)
+    # With the prefill share on: a fixed share in rows per layer instead of the computed one, for A/B arms. Unset uses
+    # the computed size.
+    SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS = EnvInt(None)
+    # The eager streamed MoE reads a layer's topk_ids to the host once and takes each chunk's expert ids as host lists.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
+    # A prefill gather chunk copies its already-pinned rows before waiting for the layer's fill.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
+    # GPU drip: this many VRAM scratch slots, one expert row each, which the copy engine fills from pinned RAM with
+    # the experts the GPU scorer predicts. 0 is off. Needs the RAM prefetch with the GPU scorer, and the copy engine.
+    SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS = EnvInt(0)
+    # Drips per scored record: the best-scored experts mapped in RAM and not VRAM-hot (1 to 8).
+    SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS = EnvInt(4)
+    # The most one drip copy submission carries, in KiB: a demand copy issued meanwhile waits behind at most this.
+    SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB = EnvInt(1024)
+
+    # ===================================================================
+    # Expert streaming engine: hot cache and residency
+    # ===================================================================
+    SGLANG_EXPERT_STREAM_HOT_GPU_MB = EnvInt(0)
+    # Startup residency, a {"count": [[...]]} JSON file.
+    SGLANG_EXPERT_STREAM_HOT_SEED = EnvStr("")
+    SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL = EnvInt(100)
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC = EnvBool(False)
+    SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS = EnvInt(1024)
+    # Also update dynamic residency every this many decode forwards; 0 leaves updates to qualifying prefills only.
+    SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS = EnvInt(0)
+    SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS = EnvInt(8)
+    SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO = EnvFloat(1.0)
+    # Decay residency scores by 0.95 once per this many routed tokens instead of once per boundary; 0 keeps
+    # per-boundary decay.
+    SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS = EnvInt(0)
+    # Standard deviations of routing-count noise a candidate expert must lead the expert it replaces by, on top of
+    # HOT_BENEFIT_RATIO.
+    SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS = EnvFloat(0.0)
+    # Return from a residency boundary once promotion copies are submitted and publish the promoted slots on a later
+    # forward after the copies complete.
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS = EnvBool(False)
+    # Copy CPU-policy scores to a pinned host buffer at residency boundaries and apply decisions only after a
+    # nonblocking CUDA event query succeeds.
+    SGLANG_EXPERT_STREAM_ENABLE_ASYNC_RESIDENCY_SCORES = EnvBool(False)
+    # Run the decode residency update as device ops inside the captured decode graph; requires HOT_DYNAMIC and
+    # GRAPH_GATHER.
+    SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE = EnvBool(False)
+    # Most experts one layer promotes at a decode boundary on the GPU path.
+    SGLANG_EXPERT_STREAM_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
+    # Decode boundaries serve misses out of residency instead of promoting host rows; see InsertOnMissStage. Requires
+    # GPU_RESIDENCY_UPDATE and HOT_UPDATE_DECODE_FORWARDS=1.
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE = EnvInt(InsertOnMissStage.OFF)
+    # Per-token decay of the scores that pick insert-on-miss victims.
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
+    # Run stage 1's boundary insert copies through the fused masked Triton kernel (byte-identical, one pass).
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT = EnvBool(False)
+
+    # ===================================================================
+    # Expert streaming engine: prefetch
+    # ===================================================================
+    # NVMe-to-RAM prefetch: per NUMA group a thread scores a later layer's gate and reads its pick into a pool of RAM
+    # slots the device never maps; a forced CPU miss on a pooled expert swaps it in. Needs CPU experts. Inert when the
+    # pinned full-layer list covers every streamed layer.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH = EnvBool(False)
+    # Candidates per live token, in its score order past the hot, mapped and pooled experts.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN = EnvInt(1)
+    # Speculative rows per layer over all NUMA groups.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER = EnvInt(1)
+    # Pool slots per row and NUMA group, taken out of the tier at start.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE = EnvInt(2)
+    # Pick only among each token's predicted top_k.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
+    # Where the target layer's gate is scored: "cpu" (each group's speculative thread) or "gpu" (two kernels after the
+    # layer's post inside the decode graph; needs the copy engine).
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER = EnvStr("gpu")
+    # Speculative reads only to an idle drive: a reader of its own per group, one piece at a time.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
+    # How long such a read waits for an idle drive before it is abandoned.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
+    # With idle-drive reads: spread each row's pieces over the idle drives instead of keeping a row on one drive.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD = EnvBool(False)
+    # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4).
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
+    # Defer each row's map delta to the previous row's next record and fold landed pool rows into it. Needs RAM_PREFETCH.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE = EnvBool(False)
+    # Serve a GPU miss whose row landed in the prefetch pool straight from the pool slot. Needs RAM_PREFETCH.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE = EnvBool(False)
+    # How many layers ahead the speculative scorer targets (1 to 4). Above 1 needs the profile's margin floors set,
+    # since the packaged floors were fit for 1.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON = EnvInt(1)
+    # The older GPU-side next-layer prefetch (rejected by the preset); mutually exclusive with the shadow predictor.
+    SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES = EnvInt(0)
+    # JSON object -> PrefetchConfig.shadow: predictor, model_dir, candidates, budget, apex_tau, pull_mode (off |
+    # count_zero | always; needs a predictor), shadow_recall, fused_top1, calibration, calibration_file,
+    # calibration_provenance, predictors, predictor_candidates, score_interval, max_rows.
+    SGLANG_EXPERT_STREAM_SHADOW_PREFETCH = EnvStr("")
+
+    # ===================================================================
+    # Expert streaming engine: CPU experts, draft and trace
+    # ===================================================================
+    # Decode computes a layer's RAM-tier experts on the CPU, in place over the pinned tier, instead of copying them
+    # over the link. Batch-1 decode only; startup fails where the format's CPU kernel is a stub.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS = EnvBool(False)
+    # Worker threads of the CPU expert pool per NUMA node, at most one per core. 0 takes one per core.
+    SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS = EnvInt(0)
+    # Each node's CPU expert pool also takes the SMT sibling of every one of its cores.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT = EnvBool(False)
+    # CPU-computed NVMe misses: the CPU's split tail counts every missing lane, not only RAM hits. Needs CPU experts.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES = EnvBool(False)
+    # For this many us after its last job, the idle CPU expert team runs the kernel's register-only AVX-512 loop
+    # instead of PAUSE. 0: PAUSE only. The team never sleeps either way.
+    SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
+    # A verify's CPU job leaves the overwrite of its token rows to the kernel. Needs CPU experts.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT = EnvBool(False)
+    # Caps the CPU kernel's ISA tier: scalar | avx2 | bw | vnni | vbmi, never raising it; empty keeps the host's.
+    SGLANG_EXPERT_STREAM_CPU_MAX_ISA = EnvStr("")
+    # Print the CPU kernel's chosen ISA tier to stderr.
+    SGLANG_EXPERT_STREAM_CPU_REPORT_ISA = EnvBool(False)
+    # JSON object -> CpuExpertsConfig.split: table, layer_tables, cpu_ms, link_ms, handoff_ms, retune_batches,
+    # calibration, calibration_reps, miss_cut, miss_cut_max, model, model_costs, model_refine_batches,
+    # model_residency_tiebreak.
+    SGLANG_EXPERT_STREAM_CPU_SPLIT = EnvStr("")
+    # JSON object -> CpuExpertsConfig.two_stage: enabled, w13_weights, w2_weights.
+    SGLANG_EXPERT_STREAM_CPU_TWO_STAGE = EnvStr("")
+    # The draft's experts as a second job source of the GPU node's CPU expert team (needs a speculative draft adapter;
+    # startup fails where the profile's adapter is a stub).
+    SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS = EnvBool(False)
+    # Cores of the draft's own CPU expert kernel, as a taskset list ("6-15"); refused with CPU experts on.
+    SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the draft's own CPU expert kernel. 0 takes one per core.
+    SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS = EnvInt(0)
+    # The draft experts kept on the GPU, per stage; empty keeps none: every routed draft expert runs on the CPU.
+    SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH = EnvStr("")
+    # JSON object -> TraceConfig (diagnostics and captures, all off by default). Nested objects: predictor_capture,
+    # job, draft_trigger, cpu_worker, preforward_readiness, route.
+    SGLANG_EXPERT_STREAM_TRACE = EnvStr("")
 
     # ===================================================================
     # HTTP server and health
@@ -1434,6 +1651,11 @@ class Envs:
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
     # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
+    # The vendored EXL3 CPU kernel pins its workers to the first cores unless this is "0", and the engine (which pins
+    # its own workers) refuses anything else. Unset leaves the kernel's default (the previous EXL3_MOE_CPU_PIN).
+    SGLANG_EXL3_MOE_CPU_PIN = EnvStr(None)
+    # Caps the vendored EXL3 CPU kernel's small-expert workers; 0 is no cap (the previous EXL3_MOE_CPU_SMALL_WORKERS).
+    SGLANG_EXL3_MOE_CPU_SMALL_WORKERS = EnvInt(0)
 
     # ===================================================================
     # Humming quantization
@@ -2101,7 +2323,7 @@ class Envs:
     SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH = EnvStr("")
     # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
     # thread may take per MoE layer, in ms, before the process fails stop. The
-    # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
+    # thread's watchdog aborts after max(30 s, 3x this) (expert_engine.service.watchdog_wait_s),
     # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
     # With the copy engine, the copy wait gets this again, timed by that watchdog from
     # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
@@ -2172,7 +2394,7 @@ class Envs:
     # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
     # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own
     # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
-    # Off by default. The share's size is set at start from the tier's layout (exl3_ram_miss.prefill_share_rows).
+    # Off by default. The share's size is set at start from the tier's layout (expert_engine.row_backend.prefill_share_rows).
     SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
     # With the prefill share on: a fixed share in rows per layer instead of the size computed at start, for A/B arms.
     # Unset (the default) uses the computed size.

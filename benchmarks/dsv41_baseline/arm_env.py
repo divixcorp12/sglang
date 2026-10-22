@@ -558,6 +558,34 @@ def prod_env() -> dict[str, str]:
     return arm_env({**dspark_env(), **prod_dspark_env()}) if PROD_DSPARK else base_env()
 
 
+def node_of_cpu(cpu: int) -> int:
+    """The NUMA node of a divix01 cpu (the core layout above: node 0 is 0-27 and 56-83, node 1 the rest)."""
+    return 0 if cpu % 56 < 28 else 1
+
+
+def new_names_env(env: dict[str, str]) -> dict[str, str]:
+    """A recipe env (written with the old names above) as the same settings under the F145 names.
+
+    NOT used by launch_prod.sh or the arms: the engine still reads the old names until the config wiring lands, and the
+    wiring step switches production to this at once (it then replaces the dicts above). The translation is
+    expert_engine/removed_env.translate_env: group members become one JSON object per group, the stream switches and
+    copy mechanisms merge, SPIN_CORE becomes a NUMA_CORES entry, and the retired HIT_WAIT_US is dropped.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "python/sglang/srt/layers/moe/expert_engine/removed_env.py"
+    spec = importlib.util.spec_from_file_location("expert_engine_removed_env", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.translate_env(env, node_of_cpu)
+
+
+def prod_env_new_names() -> dict[str, str]:
+    """prod_env() under the F145 names; see new_names_env."""
+    return new_names_env(prod_env())
+
+
 class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     port: int
     host: str = "127.0.0.1"
