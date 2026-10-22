@@ -926,14 +926,18 @@ class TestInsertOnMiss(unittest.TestCase):
 
         def prefill(tokens, record_first):
             routes = [[generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)] for _ in range(LAYERS)]
-            for layer, streamer in sorted(manager.streamers.items()):
-                ids = torch.tensor(routes[layer], dtype=torch.int32, device="cuda")
-                if record_first:
-                    streamer.record_routes(ids)
-                    updater.flush()
-                    streamer.gather_experts(torch.unique(ids.reshape(-1)))
-                else:
-                    streamer.gather(ids)
+            streamers = sorted(manager.streamers.items())
+            ids = {layer: torch.tensor(routes[layer], dtype=torch.int32, device="cuda") for layer, _ in streamers}
+            if record_first:
+                # Every layer's routes in the window the flush closes (EXL3 puts its first layer's there).
+                for layer, streamer in streamers:
+                    streamer.record_routes(ids[layer])
+                updater.flush()
+                for layer, streamer in streamers:
+                    streamer.gather_experts(torch.unique(ids[layer].reshape(-1)))
+            else:
+                for layer, streamer in streamers:
+                    streamer.gather(ids[layer])
             manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
             torch.cuda.synchronize()
             return routes
