@@ -162,7 +162,7 @@ def _raw(x, w, bias, skip, *, top_k=6, per_token=2, per_layer=4):
     """The FFI as a direct caller sees it: x, w as raw bytes, no wrapper to even the strides."""
     out = torch.full((per_layer,), -1, dtype=torch.int64)
     meta = torch.zeros((per_layer, 2), dtype=torch.float32)
-    return es._host_module("exl3", None).expert_stream_score_gate(
+    return es._host_module(es.EXL3_BUILD, None).expert_stream_score_gate(
         x, w, bias, torch.tensor(skip, dtype=torch.uint8), top_k, per_token, per_layer, 0, out, meta
     )
 

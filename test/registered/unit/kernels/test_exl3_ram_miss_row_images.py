@@ -238,9 +238,9 @@ def test_the_reader_refuses_buffered_reads_of_row_images(tmp_path):
     """Row images are read with O_DIRECT only: a buffered read would copy through the page cache (spec section 3)."""
     s = ram_miss_setup(tmp_path)
     fault = ops._fault_tensor()
-    record = torch.zeros(ops._stage_words("exl3"), dtype=torch.int64)
+    record = torch.zeros(ops._stage_words(ops.EXL3_BUILD), dtype=torch.int64)
     with pytest.raises(Exception, match="O_DIRECT"):
-        ops._host_module("exl3").expert_stream_read_rows_traced(
+        ops._host_module(ops.EXL3_BUILD).expert_stream_read_rows_traced(
             *ops._table_args(s.tables, False), 0, torch.tensor([1]), torch.tensor([0]), 8, fault, record, -1)
 
 
