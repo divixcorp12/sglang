@@ -17,7 +17,7 @@ engine (``calibrate``), publishes the fitted words to the device, and can refine
   the node's reader (O_DIRECT: no page cache serves them) into its staging slots, timed until the last row lands;
   ``landing(m) = first_byte + per_expert*m`` by least squares, over every node's points. It starts at the read, not at
   the post, so the RAM thread's pickup of a record is not in it. A fully pinned model has no staging slots and no
-  misses: nothing is read, and both words take their range's lower bound (``assemble(landing=False)``).
+  misses: nothing is read, and both words are 0 (``assemble(landing=False)``; ``clamp_costs`` leaves them there).
 - **Stream coupling** (``stream_lane``, ``stream_base``). The stream kernel's host pulls (``calibration_pull``: S's grid
   and copy on one expert of pinned host rows) after a delay of first_byte, alone and with STREAM_LANES copy-engine
   lanes started at time 0 as a record's FIFO is; ``stream_lane`` is the slope of the pull time's growth through the
@@ -68,6 +68,8 @@ RANGES_MS = {
     "stream_lane": (0.0, 3.0),
     "stream_base": (0.0, 3.0),
 }
+# The NVMe landing's costs, which a fully pinned model never measures or charges.
+LANDING_KEYS = ("first_byte", "per_expert")
 # Live refinement: a window needs this many jobs per part, its fit pulls the running estimate toward itself by
 # REFINE_WEIGHT, and REFINE_PRIOR_JOBS jobs' worth of ridge toward the running estimate keep the directions a window
 # cannot tell apart (served k and pairs move together) where they were.
@@ -193,12 +195,15 @@ def fit_slope(points: Sequence[tuple]) -> float:
     return sum(x * y for x, y in points) / xx
 
 
-def clamp_costs(costs: SplitModelCosts) -> tuple[SplitModelCosts, list]:
+def clamp_costs(costs: SplitModelCosts, *, landing: bool = True) -> tuple[SplitModelCosts, list]:
     """``costs`` with each value clamped to RANGES_MS, and the names clamped. Raises SplitModelCalibrationError for a
-    value that is not finite or lies outside its range by more than the range's width."""
+    value that is not finite or lies outside its range by more than the range's width. ``landing=False`` (nothing was
+    read from NVMe: assemble(landing=False)) keeps first_byte and per_expert at their 0, not per_expert's floor."""
     clamped = []
 
     def one(name: str, value: float) -> float:
+        if not landing and name in LANDING_KEYS:
+            return value
         lo, hi = RANGES_MS[name.split(".")[0]]
         if not math.isfinite(value) or value < lo - (hi - lo) or value > hi + (hi - lo):
             raise SplitModelCalibrationError(f"{name} = {value} ms is outside any sane range ({lo}..{hi} ms)")
@@ -259,14 +264,14 @@ def assemble(nodes: Sequence[dict], stream: tuple[float, float], *, landing: boo
     """The model's costs from each node's fit_node and the stream fit; landing pools every node's points.
 
     ``landing=False`` (no row stages: the model is fully pinned, so no expert can miss) measures no landing, and
-    first_byte and per_expert take their RANGES_MS lower bounds: the model reads them only for misses."""
+    first_byte and per_expert are 0: no NVMe read is ever charged, and the model reads them only for misses."""
     if landing:
         points = [p for n in nodes for p in n["landing"]]
         if len({m for m, _ in points}) < 2:
             raise SplitModelCalibrationError(f"the landing fit needs reads of two sizes, got {points}")
         first_byte, per_expert = fit_line(points)
     else:
-        first_byte, per_expert = RANGES_MS["first_byte"][0], RANGES_MS["per_expert"][0]
+        first_byte, per_expert = 0.0, 0.0
     copies = [n["copy_lane"] for n in nodes if "copy_lane" in n]
     if not copies:
         raise SplitModelCalibrationError("no node timed a copy lane")
@@ -485,5 +490,6 @@ def calibrate(host, groups, device_side, *, device: int, reps: int, staging_widt
     else:
         stream = (0.0, 0.0)  # the test backend has no GPU to pull with: no stream side
     # staging_width 0: the model is fully pinned, no row stages, so no landing cell ran and no miss will land.
-    costs, clamped = clamp_costs(assemble(fits, stream, landing=staging_width > 0))
+    landing = staging_width > 0
+    costs, clamped = clamp_costs(assemble(fits, stream, landing=landing), landing=landing)
     return costs, clamped, time.monotonic() - began
