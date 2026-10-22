@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include "moe_mul1.h"
 #include "../../moe/expert_stream/host/cpu_experts/team.hpp"
+#include "../../moe/expert_stream/host/core_topology.h"
 #include "tile_assignment.hpp"
 #include <algorithm>
 #include <chrono>
@@ -68,6 +69,7 @@ struct Options {
   fs::path references = "/data/models/exl3_exp/threading";
   std::string cpus = "28-43";  // node 1's first 16 physical cores; their SMT siblings 84-99 stay idle
   int workers = EXL3_BENCH_DEFAULT_WORKERS;
+  bool smt = false;  // --smt: the workers' SMT siblings join the team after them (SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT)
   int node = 1;
   int warmup = 128;
   int gap_us = 0;
@@ -121,6 +123,8 @@ Options parse_options(int& argc, char** argv) {
       opt.cpus = value("--cpus=");
     else if (arg.starts_with("--workers="))
       opt.workers = number(value("--workers="));
+    else if (arg == "--smt")
+      opt.smt = true;
     else if (arg.starts_with("--numa-node="))
       opt.node = number(value("--numa-node="));
     else if (arg.starts_with("--warmup-forwards="))
@@ -145,6 +149,7 @@ Options parse_options(int& argc, char** argv) {
       std::cout << "Native DSV4.1 full-forward benchmark (" EXL3_BENCH_BACKEND
                    ")\n"
                    "--fixture=FILE --reference-dir=DIR --cpus=28-43 --workers=N\n"
+                   "--smt adds each of the N workers' SMT siblings to the team, after them (2N workers)\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
                    "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
@@ -530,12 +535,19 @@ void full_forward(benchmark::State& state, W& workload) {
 
 int main(int argc, char** argv) {
   try {
-    const auto options = parse_options(argc, argv);
+    auto options = parse_options(argc, argv);
     benchmark::Initialize(&argc, argv);
     if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
     auto cores = parse_cpus(options.cpus);
     if (options.workers > int(cores.size())) throw std::runtime_error("Not enough configured CPUs");
     cores.resize(options.workers);
+    if (options.smt) {
+      const size_t physical = cores.size();
+      for (size_t i = 0; i < physical; ++i)
+        for (int sibling : ::sglang::expert_stream::core_siblings(cores[i]))
+          if (std::find(cores.begin(), cores.end(), sibling) == cores.end()) cores.push_back(sibling);
+      options.workers = static_cast<int>(cores.size());  // every call and the team run the siblings too
+    }
     cpu_set_t allowed;
     if (sched_getaffinity(0, sizeof(allowed), &allowed)) throw std::runtime_error("Cannot read caller affinity");
     for (int cpu : cores) {

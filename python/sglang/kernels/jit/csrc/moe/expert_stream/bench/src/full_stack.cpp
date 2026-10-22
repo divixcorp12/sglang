@@ -53,6 +53,7 @@ struct Options {
   int warmup = 128;
   int gap_us = 0;
   int keep_warm_us = 0;
+  bool smt = false;  // --smt: each group's workers' SMT siblings join it, after them (SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT)
   int wait_timeout_ms = 2000;
   bool validate_only = false;
   bool self_test = false;
@@ -89,6 +90,8 @@ Options parse_options(int& argc, char** argv) {
       opt.gap_us = number(value("--gap-us="));
     else if (arg.starts_with("--keep-warm-us="))
       opt.keep_warm_us = number(value("--keep-warm-us="));
+    else if (arg == "--smt")
+      opt.smt = true;
     else if (arg.starts_with("--wait-timeout-ms="))
       opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
     else if (arg == "--validate-only")
@@ -107,6 +110,7 @@ Options parse_options(int& argc, char** argv) {
              "--warmup-forwards=128 --gap-us=0 --keep-warm-us=0 --wait-timeout-ms=2000 --validate-only\n"
              "--keep-warm-us: register work after each job, before the held CPU team falls back to PAUSE\n"
              "  (0: PAUSE only)\n"
+             "--smt: each group's --cpus also run on their SMT siblings, after them (twice the workers)\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
              "--cpus=3 (two groups: --copy-cpu=1 --service-cpu=2,3 --cpus=4/5)\n"
              "Google Benchmark flags are also accepted.\n";
@@ -170,8 +174,16 @@ Placement resolve_placement(const Options& o) {
   const auto service_list = per_group(o.service_cpus.value_or(services), ',', "--service-cpu");
   const auto cpu_lists = per_group(o.cpus.value_or(cpus), '/', "--cpus");
   const auto node_list = per_group(o.worker_nodes.value_or(nodes), ',', "--worker-node");
-  for (int g = 0; g < kGroups; ++g)
-    p.groups.push_back({number(service_list[g]), parse_cpus(cpu_lists[g]), number(node_list[g])});
+  for (int g = 0; g < kGroups; ++g) {
+    auto workers = parse_cpus(cpu_lists[g]);
+    if (o.smt) {
+      const size_t physical = workers.size();
+      for (size_t i = 0; i < physical; ++i)
+        for (int sibling : es::core_siblings(workers[i]))
+          if (std::find(workers.begin(), workers.end(), sibling) == workers.end()) workers.push_back(sibling);
+    }
+    p.groups.push_back({number(service_list[g]), std::move(workers), number(node_list[g])});
+  }
   return p;
 }
 

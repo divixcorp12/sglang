@@ -73,6 +73,9 @@ CPU placement:
   workers are individually pinned. Do not taskset the entire process to CPU 28:
   the helpers need access to all their CPUs. Leave SMT siblings 84..99 idle too
   for isolated timings. 52-55,108-111 are kept free for NVMe interrupts.
+  --smt (bare and full-stack benches) appends each selected worker CPU's SMT
+  sibling after them, so --workers=10 --smt runs 20 workers on 10 physical
+  cores: the bench form of SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT.
 
 Memory placement:
   No process-wide NUMA memory policy is imposed. The process inherits its launch

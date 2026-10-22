@@ -2195,6 +2195,10 @@ class Envs:
     SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
+    # Each node's CPU expert pool also takes the SMT sibling of every one of its cores (after THREADS caps them), so
+    # a pool of n cores runs 2n workers, siblings after the cores. A sibling that the server's affinity, a reserved
+    # core or another role holds refuses the plan. Off by default; measured to help chunks of several tokens only.
+    SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT = EnvBool(False)
     # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
     # "1:ram=51,cpu=28-43,sq=50;0:ram=26": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
     # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
