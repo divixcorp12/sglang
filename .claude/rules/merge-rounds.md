@@ -1,7 +1,8 @@
 # Merge rounds and agent hand-offs
 
 A merge itself takes minutes. What makes it take an hour is re-testing: a C++ change gives every JIT module a new build
-key (50-100 s per expert-stream host variant), and the GPU groups run one at a time behind `cc-gpu.lock`. On 2026-10-16
+key (50-100 s per expert-stream host variant), and the GPU groups ran one at a time behind `cc-gpu.lock` (since 2026-10-22, test groups share the card; see
+`divix01-run-protocol.md`). On 2026-10-16
 a consolidation merge to master took about an hour. The git merges were quick; the time went to three avoidable things:
 
 1. Six branches and a settings change were added one at a time **after** the test round had started. Each addition

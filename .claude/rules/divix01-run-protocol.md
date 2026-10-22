@@ -166,14 +166,17 @@ divix01 has two Xeon Platinum 8280s (28 physical cores per socket, SMT 2, 112 CP
 
 - **CPU-only jobs** run under `taskset -c 0-51,56-107` (everything but the free cores; `arm_env.CPU_JOB_CORES`) with
   threads capped (`OMP_NUM_THREADS`).
-- **GPU jobs** run under `cc-gpu.lock` on node 0, `taskset -c 0-27,56-83` (`arm_env.GPU_JOB_CORES`), never as a bare
-  command.
+- **GPU jobs** run on node 0, `taskset -c 0-27,56-83` (`arm_env.GPU_JOB_CORES`). Several can share the card: GPU unit
+  and correctness tests, mutants and offline GPU analysis run alongside each other without `cc-gpu.lock`.
+- **Only A/B tests and performance-sensitive benchmarks take `cc-gpu.lock`**, for exclusive use of the card: served
+  A/Bs and arms (`run_arm.sh` takes it itself), timed benchmarks and anything whose numbers another GPU job would
+  distort. Owner, 2026-10-22: a 30 s test file had waited tens of minutes behind another agent's test round.
 - **52-55,108-111 stay free**: NVMe completion interrupts belong there, and the RAM-miss path reads rows from NVMe.
   Nothing pins the interrupts yet: irqbalance spreads them over node 1 and node 0's siblings. A root step does (write the
   cores to each nvme queue IRQ's `/proc/irq/N/smp_affinity_list`, and set `IRQBALANCE_BANNED_CPULIST=0-51,56-107`). The
   code refuses these cores already (`RESERVED_CORES` in `threading_config.py`, `is_reserved_core` in `core_topology.h`).
 
-Two ways to take the GPU lock, both on divix01:
+Two ways to take the GPU lock (A/B tests and performance-sensitive benchmarks only), both on divix01:
 
 - `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh <cmd>`
   (not in any repo). It retries the lock every 60 s and **gives up after 30 min
@@ -200,7 +203,7 @@ launched with `env -u` did this to another agent's capture twice (KV pool
 
 ## Lock order: `rowimg-disk.lock`, then `cc-gpu.lock`
 
-A job that needs both locks takes the disk lock first. `run_arm.sh` takes
+A job that needs both locks (an A/B or a performance-sensitive benchmark) takes the disk lock first. `run_arm.sh` takes
 `cc-gpu.lock` itself (non-blocking), so an arm driver must already hold
 `rowimg-disk.lock` and poll for the GPU; a script that held the GPU while
 waiting for the disk would deadlock against it, both waiting forever.
