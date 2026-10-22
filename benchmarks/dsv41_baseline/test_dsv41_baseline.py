@@ -1103,11 +1103,13 @@ def test_the_verdicts_mirror_flag_follows_the_value_not_the_key():
 
 # --- arm_env: the server's cores stay on NUMA node 0 (the 2026-09-22 startup hang) ---
 
-# divix01's topology, from `numactl --hardware`. Node 1 is where the box's reth/nimbus
-# stack lives, so a server thread that lands there first-touches memory into a node with
-# ~9 GB free and the allocator spins in direct compaction instead of failing over.
-NODE0_CPUS = frozenset(range(0, 18)) | frozenset(range(36, 54))
-NODE1_CPUS = frozenset(range(18, 36)) | frozenset(range(54, 72))
+# divix01's topology (2x Xeon Platinum 8280, 112 CPUs, cpu N's sibling is N + 56), from `numactl --hardware`. Node 1 is
+# where the NVMe drives sit (and, on the old CPUs, the box's reth/nimbus stack with ~9 GB free), so a server thread that
+# lands there first-touches memory into a node the pinned tier needs and the allocator can spin in direct compaction
+# instead of failing over.
+NODE0_CPUS = frozenset(range(0, 28)) | frozenset(range(56, 84))
+NODE1_CPUS = frozenset(range(28, 56)) | frozenset(range(84, 112))
+SIBLING_OFFSET = 56
 
 
 def _cores(spec: str) -> set[int]:
@@ -1138,15 +1140,16 @@ def test_server_cores_touch_no_node_1_core():
 
 
 def _divix01_topology(tc, root):
-    """divix01's sysfs as ThreadingConfig reads it: nodes 0-17,36-53 and 18-35,54-71, siblings c and c + 36."""
-    for node, cpus in {0: "0-17,36-53", 1: "18-35,54-71"}.items():
+    """divix01's sysfs as ThreadingConfig reads it: nodes 0-27,56-83 and 28-55,84-111, siblings c and c + 56."""
+    for node, cpus in {0: "0-27,56-83", 1: "28-55,84-111"}.items():
         node_dir = root / "node" / f"node{node}"
         node_dir.mkdir(parents=True)
         (node_dir / "cpulist").write_text(cpus)
         for cpu in _cores(cpus):
             topology = root / "cpu" / f"cpu{cpu}" / "topology"
             topology.mkdir(parents=True)
-            (topology / "thread_siblings_list").write_text(f"{cpu % 36},{cpu % 36 + 36}")
+            low = cpu % SIBLING_OFFSET
+            (topology / "thread_siblings_list").write_text(f"{low},{low + SIBLING_OFFSET}")
     return tc.Topology.from_sysfs(str(root))
 
 
@@ -1166,9 +1169,10 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES)
     for plan in config.plans:
         assert not (topology.siblings[plan.ram] & taken), (plan.ram, sorted(topology.siblings[plan.ram] & taken))
-    # Node 1's derived RAM core 35 pairs with 71, one of the NVMe interrupt cores; only the spin core is held to FREE.
-    spin = topology.siblings[arm_env.SPIN_CORE]
-    assert not (spin & _cores(arm_env.FREE_CORES)), sorted(spin & _cores(arm_env.FREE_CORES))
+    # Neither node's RAM core, nor its sibling, is a FREE core.
+    for plan in config.plans:
+        ram = topology.siblings[plan.ram]
+        assert not (ram & _cores(arm_env.FREE_CORES)), (plan.ram, sorted(ram & _cores(arm_env.FREE_CORES)))
     assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
 
 
@@ -1186,9 +1190,16 @@ def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_serv
     )
     assert [plan.threads for plan in config.plans] == [threads] * len(_recipe_nodes())
     busy = {c for plan in config.plans for c in plan.cores()} | set(config.copy_cpus)
-    physical = lambda cores: {c % 36 for c in cores}  # noqa: E731
+    physical = lambda cores: {c % SIBLING_OFFSET for c in cores}  # noqa: E731
     others = physical(_cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES))
     assert not (physical(busy) & others), sorted(physical(busy) & others)
+    # Each plan's threads are on the plan's node, and nothing the stream runs (or its siblings) is a FREE core.
+    for plan in config.plans:
+        assert set(plan.cores()) <= (NODE0_CPUS, NODE1_CPUS)[plan.node], plan.log_line()
+    assert set(config.copy_cpus) <= NODE0_CPUS, "the copy thread belongs on the GPU's node"
+    assert not (physical(busy) & physical(_cores(arm_env.FREE_CORES))), sorted(
+        physical(busy) & physical(_cores(arm_env.FREE_CORES))
+    )
 
 
 def test_every_jit_build_and_the_exl3_cpu_kernel_use_gcc_15():
@@ -1202,8 +1213,20 @@ def test_every_jit_build_and_the_exl3_cpu_kernel_use_gcc_15():
 def test_server_cores_do_not_overlap_the_driver_or_the_reserved_cores():
     server = _cores(arm_env.SERVER_CORES)
     assert not (server & _cores(arm_env.DRIVER_CORES)), "server and driver share cores"
-    # NVMe completion interrupts are pinned to 64-71; they stay free for every CPU job.
+    # NVMe completion interrupts are to be pinned to FREE_CORES; they stay free for every job.
     assert not (server & _cores(arm_env.FREE_CORES)), "server touches the reserved cores"
+    # The client sits on the GPU's node, away from node 1's experts; FREE_CORES are node 1's top physical cores.
+    assert _cores(arm_env.DRIVER_CORES) <= NODE0_CPUS, "the driver belongs on node 0"
+    assert _cores(arm_env.FREE_CORES) <= NODE1_CPUS
+    assert not (_cores(arm_env.FREE_CORES) & _cores(arm_env.CPU_JOB_CORES)), "a CPU job may use a FREE core"
+    assert _cores(arm_env.CPU_JOB_CORES) | _cores(arm_env.FREE_CORES) == NODE0_CPUS | NODE1_CPUS
+    assert _cores(arm_env.GPU_JOB_CORES) == NODE0_CPUS
+
+
+def test_free_cores_are_the_threading_configs_reserved_cores():
+    # Two copies (arm_env, and the C++ check in core_topology.h is the third) that must agree.
+    tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
+    assert set(tc.RESERVED_CORES) == _cores(arm_env.FREE_CORES)
 
 
 def test_run_arm_pins_the_server_with_arm_envs_core_list_not_a_literal():

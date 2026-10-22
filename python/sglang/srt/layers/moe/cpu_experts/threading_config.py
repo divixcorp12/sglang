@@ -21,14 +21,17 @@ logger = logging.getLogger(__name__)
 # (node, core) pairs already warned about: resolve runs more than once per launch.
 _warned_shared_spec_cores: set[tuple[int, int]] = set()
 
-# NVMe completion interrupts are pinned to these cores on divix01.
-RESERVED_CORES = frozenset(range(64, 72))
+# Kept clear for NVMe completion interrupts on divix01 (2x Xeon Platinum 8280, 112 CPUs, SMT sibling of cpu N is N + 56):
+# the top four physical cores of node 1, the node the NVMe drives sit on, and their siblings. This is
+# benchmarks/dsv41_baseline/arm_env.FREE_CORES, and the C++ check in expert_stream/host/ffi_exports.h
+# (is_reserved_core in core_topology.h) has to match it. The cores were 64-71 on the 18-core-per-socket CPUs this box had before.
+RESERVED_CORES = frozenset(range(52, 56)) | frozenset(range(108, 112))
 SYSFS = "/sys/devices/system"
 PCI_DEVICES = "/sys/bus/pci/devices"
 
 
 def parse_cpu_list(spec: str) -> list[int]:
-    """Cores from a sysfs or taskset list such as "0-17,36-53", sorted and unique."""
+    """Cores from a sysfs or taskset list such as "0-27,56-83", sorted and unique."""
     cores: set[int] = set()
     for part in spec.strip().split(","):
         part = part.strip()
@@ -95,7 +98,9 @@ def parse_numa_cores(spec: str) -> dict[int, dict[str, list[int]]]:
 def check_not_reserved(core: int) -> None:
     """Raise ValueError for a core in RESERVED_CORES."""
     if core in RESERVED_CORES:
-        raise ValueError(f"core {core} is reserved: cores 64-71 take NVMe completion interrupts")
+        raise ValueError(
+            f"core {core} is reserved: cores {_format_cpus(sorted(RESERVED_CORES))} take NVMe completion interrupts"
+        )
 
 
 def check_engine_cores(cores: Sequence[int], threads: int) -> None:

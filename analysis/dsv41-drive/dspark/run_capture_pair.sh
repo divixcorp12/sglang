@@ -122,8 +122,8 @@ if [ "$DRY" = 1 ]; then
     name=${NAMES[$i]}
     echo "ARM $name"
     echo "  env: $(arm_assignments "$i")"
-    echo "  prelaunch: taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB $HOLDERS"
-    echo "  capture: env $(arm_assignments "$i") taskset -c 0-63 $PY $CAPTURE $OUT/$name --arm $BASE ${CAP[*]}"
+    echo "  prelaunch: taskset -c 22-25 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB $HOLDERS"
+    echo "  capture: env $(arm_assignments "$i") taskset -c 0-51,56-107 $PY $CAPTURE $OUT/$name --arm $BASE ${CAP[*]}"
     echo "  outputs: $OUT/$name $OUT/$name.memsample.jsonl $OUT/$name.nvme3n1.samples $OUT/$name.gpu-mem.csv $OUT/$name.memstate.txt $OUT/$name.diskstats.before $OUT/$name.diskstats.after $OUT/$name.ready.txt"
   done
   echo "resolved-env.json: $(echo "$MERGED" | tr -d '\n')"
@@ -162,23 +162,23 @@ print(arm_env.layer_major_state_gib(json.load(sys.stdin)[sys.argv[1]]))' "$name"
     || { echo "REFUSED $name: no layer-major StateStore size"; echo ALLDONE; exit 2; }
   if [ "$PAGE_CACHE_OPT_OUT" = 1 ]; then
     # The check still evicts our files and logs every node; a refusal only reports, and the wait is one minute.
-    if ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS --wait-min 1; then
+    if ! taskset -c 22-25 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS --wait-min 1; then
       echo "PRELAUNCH FLOOR BYPASSED $name: below a floor, starting anyway (PAGE_CACHE_OPT_OUT=1) $(date)"
     fi
-  elif ! taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS; then
+  elif ! taskset -c 22-25 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/prelaunch_evict.py --log $OUT/$name.prelaunch.json --hicache-gib $HICACHE_GIB --layer-major-state-gib "$state_gib" $HOLDERS; then
     echo "REFUSED $name: node 1 free below the floor $(date)"; echo ALLDONE; exit 3
   fi
   mkdir -p $OUT/$name
   { date; free -g; grep -E "^Swap" /proc/meminfo; for n in /sys/devices/system/node/node*/meminfo; do grep -E "MemFree|FilePages" $n; done; } > $OUT/$name.memstate.txt
   cat /proc/diskstats > $OUT/$name.diskstats.before
   rm -f $OUT/$name.memsample.stop $OUT/$name.disk.stop
-  (taskset -c 56-63 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/memsample.py $OUT/$name $OUT/$name.memsample.jsonl $OUT/$name.memsample.stop 5 &)
+  (taskset -c 22-25 /usr/bin/python3 $WT/analysis/dsv41-drive/dspark/memsample.py $OUT/$name $OUT/$name.memsample.jsonl $OUT/$name.memsample.stop 5 &)
   (while [ ! -e $OUT/$name.disk.stop ]; do echo "$(date +%s.%N) $(grep -w nvme3n1 /proc/diskstats)"; sleep 2; done > $OUT/$name.nvme3n1.samples &)
-  taskset -c 56-63 nvidia-smi --query-gpu=timestamp,memory.used,memory.free --format=csv,noheader,nounits -lms 1000 > $OUT/$name.gpu-mem.csv &
+  taskset -c 22-25 nvidia-smi --query-gpu=timestamp,memory.used,memory.free --format=csv,noheader,nounits -lms 1000 > $OUT/$name.gpu-mem.csv &
   smi=$!
   start=$(date "+%Y-%m-%d %H:%M:%S")
   echo "START $name $BASE $(date)"
-  env "${all[@]}" taskset -c 0-63 "$PY" "$CAPTURE" "$OUT/$name" --arm "$BASE" "${CAP[@]}" &
+  env "${all[@]}" taskset -c 0-51,56-107 "$PY" "$CAPTURE" "$OUT/$name" --arm "$BASE" "${CAP[@]}" &
   cap=$!
   CUR_CAP=$cap; CUR_NAME=$name
   minfree=999999999

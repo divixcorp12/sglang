@@ -2022,7 +2022,7 @@ class ExpertStreamHost:
         """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
         ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
-        affinity. Cores 64-71 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
+        affinity. Cores 52-55,108-111 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
         or with ``busy_poll`` with no PAUSE (which the C++ side refuses unless each physical core is its service's
         alone), for ``spin_us``, then sleeps 50 us between polls; parked, it sleeps 20 us between checks. -1 never
         sleeps (``SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`` in a server).

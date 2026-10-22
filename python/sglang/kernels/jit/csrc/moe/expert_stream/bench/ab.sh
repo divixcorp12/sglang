@@ -2,7 +2,8 @@
 # A/B of two builds of the bare-forward bench (exl3_cpu_optimized): BASE_BUILD and HEAD_BUILD run as separate processes,
 # alternating order each round, for EXL3_BENCH_ROUNDS rounds (default 8), each with the same flags. Writes every round's
 # Google JSON and log, and summary.tsv: per benchmark, the median over rounds of p50_us for each build, head / base, and
-# the plan each build ran (from the dsv41_calls / generic_calls counters). Refuses while a server runs: it pins 18-33.
+# the plan each build ran (from the dsv41_calls / generic_calls counters). Refuses while a server runs: it pins 28-43. The ISA tier is the host's unless
+# EXL3_MOE_CPU_MAX_ISA is set; isa.txt records the tier each run printed.
 set -euo pipefail
 if [[ $# -lt 3 ]]; then
   echo "Usage: bash ab.sh BASE_BUILD HEAD_BUILD NEW_RESULTS_DIR [benchmark options...]" >&2
@@ -13,7 +14,7 @@ head=$(realpath "$2")
 results=$3
 shift 3
 if pgrep -f sglang.launch_server > /dev/null; then
-  echo "a server is running: the bench pins CPUs 18-33" >&2
+  echo "a server is running: the bench pins CPUs 28-43" >&2
   exit 2
 fi
 mkdir "$results"  # Refuse to overwrite a prior record.
@@ -21,13 +22,18 @@ results=$(realpath "$results")
 rounds=${EXL3_BENCH_ROUNDS:-8}
 export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
 export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
-export EXL3_MOE_CPU_PIN=0 EXL3_MOE_CPU_MAX_ISA=bw EXL3_MOE_CPU_SMALL_WORKERS=0
+export EXL3_MOE_CPU_PIN=0 EXL3_MOE_CPU_SMALL_WORKERS=0
+# The ISA tier is the host's unless the caller sets EXL3_MOE_CPU_MAX_ISA (scalar|avx2|bw|vnni|vbmi), which passes through
+# unchanged. The kernels ignore an unrecognized value, an empty one included, and run the host's tier; an empty one is
+# unset here so the record says so. Each binary prints the tier it ran ("isa tier <tier>") into its log; isa.txt gathers them.
+[[ -n ${EXL3_MOE_CPU_MAX_ISA-} ]] || unset EXL3_MOE_CPU_MAX_ISA
 export MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 {
   date -Is
   printf 'Arguments:'
   printf ' %q' "$@"
   printf '\n'
+  echo "EXL3_MOE_CPU_MAX_ISA=${EXL3_MOE_CPU_MAX_ISA-<unset: the host tier>}"
   sha256sum "$base/exl3_cpu_optimized" "$head/exl3_cpu_optimized"
 } > "$results/environment.txt"
 for ((round = 0; round < rounds; ++round)); do
@@ -41,6 +47,10 @@ for ((round = 0; round < rounds; ++round)); do
       > "$results/round-$round-$side.log" 2>&1
   done
 done
+{
+  echo "EXL3_MOE_CPU_MAX_ISA=${EXL3_MOE_CPU_MAX_ISA-<unset: the host tier>}"
+  grep -H '^isa tier ' "$results"/round-*.log || true
+} > "$results/isa.txt"
 "${PYTHON:-python3}" - "$results" "$rounds" <<'PY'
 import json, statistics, sys
 

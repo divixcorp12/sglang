@@ -65,13 +65,14 @@ and the routing coefficients the references were computed with. The benchmark
 generates no fixture or reference: supply the paths explicitly on other hosts.
 
 CPU placement:
-  Default --cpus=18-33 and --numa-node=1. Worker zero (the caller) stays on
-  CPU 18; baseline helpers use 19..29, optimized helpers use 19..33. --workers
+  Default --cpus=28-43 and --numa-node=1 (divix01's 2x Xeon 8280: node 1 is
+  28-55,84-111; cpu N's SMT sibling is N+56). Worker zero (the caller) stays on
+  CPU 28; baseline helpers use 29..39, optimized helpers use 29..43. --workers
   selects the first N CPUs in the list. The runner verifies that the requested
   CPUs belong to the node, are allowed by its affinity/cgroup, and that the real
-  workers are individually pinned. Do not taskset the entire process to CPU 18:
-  the helpers need access to all their CPUs. Reserve SMT siblings 54..69 too for
-  isolated timings.
+  workers are individually pinned. Do not taskset the entire process to CPU 28:
+  the helpers need access to all their CPUs. Leave SMT siblings 84..99 idle too
+  for isolated timings. 52-55,108-111 are kept free for NVMe interrupts.
 
 Memory placement:
   No process-wide NUMA memory policy is imposed. The process inherits its launch
@@ -108,8 +109,18 @@ equal-team comparison append --workers=16. The existing isolation must include
 all active CPUs. The script writes binary hashes, affinity/cgroup context, logs
 and Google JSON results to a new directory and refuses to reuse an existing one.
 
-Single-process examples:
-  export EXL3_MOE_CPU_MAX_ISA=bw OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
+ISA tier: the scripts (run.sh, ab.sh, run_full_stack.sh) leave EXL3_MOE_CPU_MAX_ISA
+unset, so both kernels run the host's tier (vnni on divix01). A caller's
+EXL3_MOE_CPU_MAX_ISA (scalar|avx2|bw|vnni|vbmi, case-insensitive) passes through
+unchanged: EXL3_MOE_CPU_MAX_ISA=bw bash run.sh ... measures the old bw path. The
+kernels cap but never raise the tier and ignore an unrecognized value, an empty
+one included (the scripts unset an empty one). Every process prints "isa tier
+<tier>" at startup and puts isa_tier in its Google JSON context; each results
+directory's isa.txt gathers the lines and the requested cap, and environment.txt
+records the cap too. Read the tier from there, not from the variable.
+
+Single-process examples (the tier is the host's; add EXL3_MOE_CPU_MAX_ISA=bw to cap it):
+  export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
   export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
   "$build/exl3_cpu_optimized" --validate-only
   "$build/exl3_cpu_optimized" --benchmark_filter='experts:1/' \
@@ -171,28 +182,35 @@ EXL3_TVM_FFI_ROOT:
 
   cmake -S "$bench" -B "$build" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-15/root/usr/bin/g++ \
-    -DEXL3_TORCH_ROOT=/data/models/slang/.venv/lib/python3.13/site-packages/torch \
-    -DEXL3_TVM_FFI_ROOT=/data/models/slang/.venv/lib/python3.13/site-packages/tvm_ffi
+    -DEXL3_TORCH_ROOT=/data/models/slang/.venv-upstream/lib/python3.13/site-packages/torch \
+    -DEXL3_TVM_FFI_ROOT=/data/models/slang/.venv-upstream/lib/python3.13/site-packages/tvm_ffi
   cmake --build "$build" -j16 --target exl3_full_stack_prod exl3_full_stack_instr
 
 Placement
 ---------
 Defaults (all options):
-  --writer-cpu=16    the writer, node 0; the request page and lease block are
-                     first-touched there
-  --service-cpu=17   RamThread, busy-polling, with its physical core to itself
-  --copy-cpu=52      the copy thread and the watchdog (the writer's SMT sibling)
-  --cpus=18-33       CPU expert worker 0 (the CPU expert thread) and the kernel's
-                     15 helpers, node 1; slabs, x and outputs are first-touched
+  --writer-cpu=22    the writer, node 0 (a core of production's helper block
+                     22-25); the request page and lease block are first-touched
                      there
+  --service-cpu=26   RamThread, busy-polling, with its physical core to itself
+                     (production's RAM thread core; sibling 82 stays idle)
+  --copy-cpu=27      the copy thread and the watchdog (production's copy core)
+  --cpus=28-43       CPU expert worker 0 (the CPU expert thread) and the kernel's
+                     15 helpers, node 1 (production's CPU experts take 28-37;
+                     the bench takes 16 cores for the same team as the bare
+                     bench); slabs, x and outputs are first-touched there
   --host-node=0 --worker-node=1
                      the nodes the runner requires; anything else is refused
                      before setup
 
-Run inside exl3bench.service (partition 16-33,52-69, service/README.txt). Off
-the partition, use another placement, for example
---writer-cpu=0 --service-cpu=1 --copy-cpu=36 --cpus=2-15 --host-node=0
---worker-node=0 under taskset -c 0-15,36: it is correct, but not a measurement.
+Run inside exl3bench.service (partition 22-43,78-99, service/README.txt; the
+installed unit keeps the old partition until reinstalled). Off the partition,
+use another placement, for example
+--writer-cpu=0 --service-cpu=1 --copy-cpu=2 --cpus=3-15 --host-node=0
+--worker-node=0 under taskset -c 0-15: it is correct, but not a measurement.
+Bare phase: each group's bare forwards run on one persistent Team (the kernel's
+own, not a throwaway one per call), so BM_bare no longer times thread creation,
+and the bare thread census counts that Team's live helpers.
 
 Two or more NUMA groups
 -----------------------
@@ -202,7 +220,7 @@ service thread, CPU expert thread, kernel engine and slot range of every row
 (StackFixture::kGroupSlots = 8 slots each: 5 experts and 3 staging slots), and
 one copy thread completes every group's lanes. Per-group flags take one entry
 per group:
-  --service-cpu=17,35 --cpus=8-15/18-33 --worker-node=0,1
+  --service-cpu=26,51 --cpus=6-15/28-43 --worker-node=0,1
 (',' between groups' service CPUs and nodes, '/' between groups' CPU lists).
 Above one group a group's service and workers must sit on its own node; the
 writer and the copy thread stay on --host-node. A measured run needs all three
@@ -309,7 +327,7 @@ run_full_stack.sh BUILD_DIR [NEW_RESULTS_DIR] [options...] alternates prod/instr
 processes over EXL3_BENCH_ROUNDS rounds (default 8), 512 calls per benchmark,
 writes environment.txt, logs, Google JSON and status.txt, and exits 1 when any
 process failed. Without NEW_RESULTS_DIR it writes to EXL3BENCH_RESULTS (the
-service's directory). Do not run it while a production server uses CPUs 16-33.
+service's directory). Do not run it while a production server uses CPUs 22-43.
 
 Row-weighted assignment experiment (bare optimized forward)
 -----------------------------------------------------------
@@ -318,13 +336,13 @@ Configure two Release build directories at the same commit, changing only
 The default remains OFF. This switch affects the bare optimized benchmark only.
 
 Run from the repository root on divix01, with no serving/profiling CPU workload:
-  taskset -c 0-63 env OMP_NUM_THREADS=10 python \
+  taskset -c 0-51,56-107 env OMP_NUM_THREADS=10 python \
     benchmarks/dsv41_baseline/run_row_weighted_experiment.py \
     --a=BUILD_A/exl3_cpu_optimized --b=BUILD_B/exl3_cpu_optimized \
     --output=NEW_RESULTS_DIRECTORY
 
 The runner serially alternates AB/BA on each NUMA node, ten workers pinned to
-6-15 / 18-27 and memory bound to the matching node. Eight layers and twelve
+6-15 / 28-37 and memory bound to the matching node. Eight layers and twelve
 expert slots per layer exceed the shared L3 capacity. The original 24 frozen
 outputs are checked, and A writes routed output references that every later
 process must match bit-exactly before and after timing. Results include means,

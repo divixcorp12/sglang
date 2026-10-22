@@ -42,7 +42,7 @@ IDLE2=dspark-both-prefetch-gpu-misscut-idle2
 L2=dspark-both-prefetch-gpu-misscut-idle2-l2
 
 run() {
-    taskset -c 0-63 "$PY" "$@"
+    taskset -c 0-51,56-107 "$PY" "$@"
 }
 
 record_commit() {

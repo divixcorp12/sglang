@@ -19,7 +19,7 @@ pytest: 8, 16 and 32 GiB at the new alignment, and an 8 GiB control with the pre
 (``--old-alignment``), which must reproduce the quadratic growth. The 90 GiB tier-scale run is a command, gated and
 run under the locks by hand (task-10 report), not a pytest case:
 
-    flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-63 python test_numa_aligned_registration_growth.py \
+    flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-51,56-107 python test_numa_aligned_registration_growth.py \
         --tier-90g --gate [--collapse]
 
 ``--collapse`` is a measurement only: ``madvise(MADV_COLLAPSE)`` per slab after the touch, before registration.
@@ -33,8 +33,8 @@ each mapping's last huge page was split onto 4 KiB folios and its last registere
 runs the separate-slab layout at 32 GiB; the tier-scale separate-slab run and the 8 GiB old-tail control are
 commands:
 
-    taskset -c 0-63 python test_numa_aligned_registration_growth.py --gib 8 --separate-slabs --old-tail
-    flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-63 python test_numa_aligned_registration_growth.py \
+    taskset -c 0-51,56-107 python test_numa_aligned_registration_growth.py --gib 8 --separate-slabs --old-tail
+    flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-51,56-107 python test_numa_aligned_registration_growth.py \
         --tier-90g --separate-slabs --gate
 """
 

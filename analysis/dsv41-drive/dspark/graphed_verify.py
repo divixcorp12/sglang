@@ -57,7 +57,7 @@ DRAFT_CPU_LINE = re.compile(r"DSpark CPU experts: (\{.*\})")
 
 
 # Cores the recipe and ab_cpu_draft name for their own affinities. Unset, ThreadingConfig derives the RAM threads' and
-# the draft's cores from this run's affinity (the recipe's server cores, 0-5,36-41), keeping them apart.
+# the draft's cores from this run's affinity (the recipe's server cores, 0-5,56-61), keeping them apart.
 HAND_PINNED = ("SGLANG_DSV41_RAM_MISS_SPIN_CORE", "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES")
 
 
