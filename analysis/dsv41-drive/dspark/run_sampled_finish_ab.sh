@@ -131,7 +131,7 @@ for i in 0 1 2; do
 done
 
 echo "== report $(date +%T)"
-CUDA_VISIBLE_DEVICES= PYTHONPATH=$WT/python OMP_NUM_THREADS=8 taskset -c 0-63 "$PY" "$HERE/sampled_finish_report.py" \
+CUDA_VISIBLE_DEVICES= PYTHONPATH=$WT/python OMP_NUM_THREADS=8 taskset -c 0-51,56-107 "$PY" "$HERE/sampled_finish_report.py" \
   --prod "${FINAL[0]}" --cut "${FINAL[1]}" --block "${FINAL[2]}" --json "$OUT/report.json" | tee "$OUT/report.txt"
 rc=${PIPESTATUS[0]}
 echo "== done rc=$rc $(date +%T)"

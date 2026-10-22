@@ -308,7 +308,7 @@ def main():
             clock_env = {**env, "PYTHONPATH": str(ROOT/"python"),
                          "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(output/"events")}
             with (output/"clock-end.log").open("w") as clock_log:
-                subprocess.run(["flock", "/data/models/slang/nvfp4-work/cc-gpu.lock", "taskset", "-c", "32-63",
+                subprocess.run(["flock", "/data/models/slang/nvfp4-work/cc-gpu.lock", "taskset", "-c", "0-27,56-83",
                     sys.executable, str(ROOT/"benchmarks/dsv41_baseline/draft_clock_anchor.py"), str(clock_path)],
                     env=clock_env, stdout=clock_log, stderr=subprocess.STDOUT, check=True, timeout=180)
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,

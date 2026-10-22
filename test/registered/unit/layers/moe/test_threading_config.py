@@ -25,9 +25,16 @@ DIVIX01 = {0: "0-17,36-53", 1: "18-35,54-71"}
 SERVER = frozenset(parse_cpu_list("0-7,16,36-52"))
 
 
+LEGACY_RESERVED = frozenset(range(64, 72))
+REAL_RESERVED = frozenset(range(52, 56)) | frozenset(range(108, 112))
+
+
 @pytest.fixture(autouse=True)
-def fresh_shared_spec_core_warnings():
+def fresh_shared_spec_core_warnings(monkeypatch):
+    """The rule tests below run on a synthetic 72-CPU machine (the 18-core CPUs divix01 had until 2026-10-21), so they
+    reserve that machine's 64-71. The real box's layout is pinned by the 8280 tests at the end."""
     tc._warned_shared_spec_cores.clear()
+    monkeypatch.setattr(tc, "RESERVED_CORES", LEGACY_RESERVED)
 
 
 def fake_sysfs(root, nodes, pairs):
@@ -396,3 +403,55 @@ def test_ram_prefetch_spec_cores_leave_out_the_reserved_cores(divix01):
     config = resolve(divix01, affinity=SERVER | set(range(64, 72)), cpu_experts=True, threads=17, ram_prefetch=True)
     assert config.plans[1].spec == (config.plans[1].ram,)
     assert not set(config.plans[0].spec) & tc.RESERVED_CORES
+
+
+# --- divix01 on its 2x Xeon Platinum 8280 (2026-10-21): 112 CPUs, node 0 0-27,56-83, node 1 28-55,84-111, sibling N + 56 ---
+
+SYS_8280 = {0: "0-27,56-83", 1: "28-55,84-111"}
+SERVER_8280 = frozenset(parse_cpu_list("0-5,56-61"))  # benchmarks/dsv41_baseline/arm_env.SERVER_CORES
+
+
+@pytest.fixture
+def xeon8280(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc, "RESERVED_CORES", REAL_RESERVED)
+    return fake_sysfs(tmp_path, SYS_8280, 56)
+
+
+def test_the_8280_reserved_cores_are_node_1s_top_four_physical_cores_and_their_siblings(xeon8280):
+    assert REAL_RESERVED == frozenset(parse_cpu_list("52-55,108-111"))
+    assert {xeon8280.node_of(c) for c in REAL_RESERVED} == {1}
+    assert {s for c in range(52, 56) for s in xeon8280.siblings[c]} == REAL_RESERVED
+    for core in (51, 56, 64, 71, 107):
+        check_not_reserved(core)  # 64-71 are ordinary cores now
+    for core in REAL_RESERVED:
+        with pytest.raises(ValueError, match=r"52-55,108-111"):
+            check_not_reserved(core)
+
+
+def test_the_8280_recipe_plan_is_the_old_roles_on_the_new_numbers(xeon8280):
+    """The recipe (arm_env: SERVER 0-5,56-61, SPIN_CORE 26, 10 CPU expert threads). Node 0: copy 27, RAM 26, experts 6-15;
+    node 1: RAM 51, experts 28-37, nothing on 52-55,108-111. Mutant: RESERVED_CORES back at 64-71 -- red (node 1's RAM
+    thread lands on 55, a reserved core)."""
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, spin_core=26, ram_prefetch=True)
+    assert config.log_lines() == [
+        "numa node0: ram=26 cpu=6-15 (10) sq=- spec=0-5,56-61",
+        "numa node1: ram=51 cpu=28-37 (10) sq=- spec=50",
+        "numa copy thread: node0 cpus=27",
+    ]
+    used = {c for p in config.plans for c in p.cores() + list(p.spec)} | set(config.copy_cpus)
+    assert not used & REAL_RESERVED
+    assert all(xeon8280.node_of(c) == p.node for p in config.plans for c in p.cores())
+    assert xeon8280.node_of(config.copy_cpus[0]) == 0
+
+
+def test_the_8280_ram_threads_have_their_physical_cores_alone(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, spin_core=26)
+    busy = [c for p in config.plans for c in p.cores()] + list(config.copy_cpus)
+    physical = [c % 56 for c in busy]
+    assert len(set(physical)) == len(physical), "two expert-stream threads share a physical core"
+    assert not {c % 56 for c in SERVER_8280} & set(physical)
+
+
+def test_without_the_spin_core_the_8280_derives_the_same_ram_cores(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10)
+    assert [p.ram for p in config.plans] == [26, 51] and config.copy_cpus == (27,)

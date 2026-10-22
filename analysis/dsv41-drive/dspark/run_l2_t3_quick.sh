@@ -47,7 +47,7 @@ T3=dspark-both-prefetch-gpu-misscut-idle2-l2-t3
 T3_HEAD=$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import both_cpu_ab; print(both_cpu_ab.T3_HEAD)' "$HERE/$DSPARK")
 
 run() {
-    taskset -c 0-63 "$PY" "$@"
+    taskset -c 0-51,56-107 "$PY" "$@"
 }
 
 record_commit() {

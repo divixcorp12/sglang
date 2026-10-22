@@ -10,7 +10,7 @@ Plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 13. A lane per route (36 on a
 Run on divix01 from the pushed worktree, holding rowimg-disk.lock then cc-gpu.lock, on the recipe's server cores (the
 CPU expert team derives node 0's 6-15):
   CUDA_MODULE_LOADING=EAGER SGLANG_DSV41_CPU_EXPERTS=1 EXL3_MOE_CPU_PIN=0 SGLANG_EXL3_SRC=... SGLANG_EXL3_CPU_CXX=...
-  taskset -c 0-5,36-41 python -m pytest -q test/manual/dsv41/test_exl3_verify_cpu_spill_gpu.py
+  taskset -c 0-5,56-61 python -m pytest -q test/manual/dsv41/test_exl3_verify_cpu_spill_gpu.py
 """
 
 import os

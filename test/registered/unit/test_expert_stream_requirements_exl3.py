@@ -550,7 +550,7 @@ def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
 
 DSPARK_CPU_ENV = dict(
     SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=True,
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES="18-27",
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES="6-15",
     SGLANG_EXL3_CPU_ACT_RESIDUAL=True,
     SGLANG_EXL3_CPU_ACT_BLOCK=128,
 )
@@ -611,12 +611,12 @@ def test_dspark_cpu_experts_refuse_more_threads_than_cores(model_dir, cpu_pin_of
 
 
 def test_dspark_cpu_experts_refuse_the_nvme_interrupt_cores(model_dir, cpu_pin_off):
-    """Cores 64-71 take the NVMe completion interrupts the RAM-miss reads wait on; a spinning draft worker there would
-    stall them, so the launch refuses rather than the first draft call."""
-    with pytest.raises(ValueError, match="64"):
+    """Cores 52-55,108-111 take the NVMe completion interrupts the RAM-miss reads wait on; a spinning draft worker there
+    would stall them, so the launch refuses rather than the first draft call."""
+    with pytest.raises(ValueError, match="52"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
-            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "62-65"},
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "50-53"},
         )
 
 
@@ -628,8 +628,8 @@ def test_dspark_cpu_experts_are_checked_without_an_expert_cache(model_dir, cpu_p
     not at the first draft call."""
     args = _launch(model_dir, speculative_algorithm="DSPARK")
     _gate(args, **DSPARK_CPU_ENV, **NO_EXPERT_CACHE)
-    with pytest.raises(ValueError, match="64"):
-        _gate(args, **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "62-65"}, **NO_EXPERT_CACHE)
+    with pytest.raises(ValueError, match="52"):
+        _gate(args, **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "50-53"}, **NO_EXPERT_CACHE)
 
 
 @pytest.mark.parametrize(

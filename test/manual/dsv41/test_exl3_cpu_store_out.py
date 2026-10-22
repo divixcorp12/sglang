@@ -9,7 +9,7 @@ zeroed rows and the new one into rows full of NaN (whatever an earlier record le
 second, accumulating job on the same rows (a record's later CPU misses into part 1) must then agree too.
 
 Needs SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1 and the bw tier (EXL3_MOE_CPU_MAX_ISA=bw on a host above it). Run on
-divix01 under taskset -c 0-63.
+divix01 under taskset -c 0-51,56-107.
 """
 
 import os

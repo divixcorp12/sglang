@@ -100,27 +100,43 @@ MAX_RUNNING_REQUESTS = 1
 
 MAX_TOKENS = 128
 
-# Node-0 cores only, since 2026-09-22. divix01 is two NUMA nodes of ~96 GB:
-# node 0 is cpus 0-17,36-53 and node 1 is 18-35,54-71. The old "32-63" spanned both,
+# Core layout of 2026-10-21, for divix01's 2x Xeon Platinum 8280 (28 physical cores per socket, SMT 2, 112 CPUs, ~160 GB
+# per node): node 0 (the GPU's) is cpus 0-27 and their siblings 56-83, node 1 (all four NVMe drives) is 28-55 and 84-111;
+# cpu N's sibling is N + 56. The roles are the ones the 18-core CPUs had (node 0 = 0-17,36-53, node 1 = 18-35,54-71,
+# sibling N + 36); only the numbers moved. Node 0: server 0-5, CPU experts 6-15, driver 18-21, RAM thread 26, copy thread 27
+# (derived: the highest physical cores outside the server). Node 1: CPU experts 28-37, RAM thread 51 (derived), FREE_CORES
+# 52-55,108-111 kept clear. 16-17 and 22-25 on node 0, 38-50 on node 1 are spare.
+# Node-0 cores only, since 2026-09-22. The old "32-63" spanned both nodes,
 # so first-touch put part of the 70 GiB pinned host buffer on node 1 -- which the
 # box's reth/nimbus stack keeps at ~9 GB free. Huge-page allocations there fail, and
 # with THP enabled=always the allocator does not fail over, it spins in direct
 # compaction: three threads at 100% system time, zero completed syscalls, GPU idle,
 # and no server log line after "Load weight end" until the 900s abort. Keeping every
 # server thread on node 0 keeps its memory on node 0's free ~70 GiB.
-# Since 2026-10-05 the server keeps 6 physical cores (0-5 and their siblings 36-41): CPU experts run on both nodes,
-# and node 0's other 12 physical cores go to the expert stream (CPU experts 6-15, copy thread 16, RAM thread 17).
+# Since 2026-10-05 the server keeps 6 physical cores (0-5 and their siblings 56-61): CPU experts run on both nodes,
+# and node 0's other physical cores go to the expert stream (CPU experts 6-15, copy thread 27, RAM thread 26).
 # Arms from here on are not comparable to earlier cells.
-SERVER_CORES = "0-5,36-41"
-# The RAM-miss service busy-polls cpu 17; its SMT sibling 53 and 17 itself are left out of SERVER_CORES so the physical
+SERVER_CORES = "0-5,56-61"
+# The RAM-miss service busy-polls cpu 26; its SMT sibling 82 and 26 itself are left out of SERVER_CORES so the physical
 # core is the service's alone (plan 2026-10-01-expert-stream-read-record D4). Arms from here on have one physical core
-# fewer: not comparable to earlier cells.
-SPIN_CORE = 17
-# CPU expert workers per NUMA node (SGLANG_DSV41_CPU_EXPERTS_THREADS): node 0 gets 6-15, node 1 18-27.
+# fewer: not comparable to earlier cells. 26 is what ThreadingConfig derives anyway (the highest physical core below the
+# copy thread's 27); naming it keeps node 0's CPU experts contiguous with room to grow (16-25).
+SPIN_CORE = 26
+# CPU expert workers per NUMA node (SGLANG_DSV41_CPU_EXPERTS_THREADS): node 0 gets 6-15, node 1 28-37. Each node now has
+# 28 physical cores, so more threads is open (a performance experiment, not part of the remap).
 CPU_EXPERTS_THREADS = 10
-# Node 1, clear of its CPU experts (18-27) and RAM thread (35): node 0 has no physical core left for the driver.
-DRIVER_CORES = "28-31"
-FREE_CORES = "64-71"  # never touched; NVMe completion interrupts are pinned there.
+# Node 0 (the GPU's), clear of the CPU experts (6-15), RAM thread (26) and copy thread (27): the client stays off node 1,
+# whose cores are the NVMe-side experts'. 22-25 are the helpers' (memsample, nvidia-smi, prelaunch_evict).
+DRIVER_CORES = "18-21"
+# Never touched: the top four physical cores of node 1 (the NVMe node) and their siblings, for NVMe completion
+# interrupts. Nothing pins the interrupts there yet (irqbalance spreads them over node 1 and node 0's siblings 57-83); a
+# root step does: write 52-55,108-111 to each nvme queue IRQ's /proc/irq/N/smp_affinity_list, and set
+# IRQBALANCE_BANNED_CPULIST=0-51,56-107 (the server and expert cores) so irqbalance leaves them alone.
+FREE_CORES = "52-55,108-111"
+# Taskset lists for jobs that are not the server: a CPU-only job may use every core but FREE_CORES, and a GPU job stays
+# on the GPU's node (.claude/rules/divix01-run-protocol.md).
+CPU_JOB_CORES = "0-51,56-107"
+GPU_JOB_CORES = "0-27,56-83"
 
 # Host-memory budget, resized 2026-09-22. The server's threads all sit on NUMA node 0
 # (see SERVER_CORES), so the pinned buffer plus the weights must fit in node 0's free
