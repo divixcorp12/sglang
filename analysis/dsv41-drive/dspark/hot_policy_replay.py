@@ -159,10 +159,12 @@ def attach_lanes(d: str, graph: list, layers: int) -> str:
 
 class Config:
     def __init__(self, name: str, decay: float = 0.98, adm: str | None = None, margin: str = "0",
-                 long_decay: float = 0.999, prefill_counts: bool = True):
+                 long_decay: float = 0.999, prefill_counts: bool = True, prefill_tokens: bool = True):
         self.name, self.decay, self.adm, self.margin, self.long_decay = name, decay, adm, margin, long_decay
-        # Diagnostic only: False drops the eager prefills' route counts, which the code does fold in.
+        # Code-change candidates, not settings: False drops the eager prefills' route counts (which the code folds into
+        # the insert score, exl3.py:796 -> _apply), and their tokens from the decay as well.
         self.prefill_counts = prefill_counts
+        self.prefill_tokens = prefill_tokens
 
     def beats(self, f: float, v: float) -> bool:
         if self.margin.startswith("x"):
@@ -213,7 +215,8 @@ class LayerSim:
     def eager(self, counts: dict, tokens: int, phase: str) -> None:
         if self.pending:
             self.boundary()
-        self.tokens += tokens
+        if self.cfg.prefill_tokens or phase == "target_verify":
+            self.tokens += tokens
         if self.cfg.prefill_counts or phase == "target_verify":
             for e, c in counts.items():
                 self.pend[e] += c
@@ -465,10 +468,12 @@ def _add(cfg: Config) -> None:
     CONFIGS[cfg.name] = cfg
 
 
-for _d in (0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 1.0):
+for _d in (0.95, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 1.0):
     _add(Config(f"d{_d}", decay=_d))
 for _d in (0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 1.0):
     _add(Config(f"d{_d}-noprefill", decay=_d, prefill_counts=False))
+for _d in (0.98, 0.995, 0.999, 1.0):
+    _add(Config(f"d{_d}-prefillneutral", decay=_d, prefill_counts=False, prefill_tokens=False))
 for _base, _d, _pf in (("d0.98", 0.98, True), ("d0.995", 0.995, True), ("d0.999-noprefill", 0.999, False)):
     for _adm in ("s", "s+cur", "L0.999", "L0.999+cur", "L0.9995+cur"):
         for _m in ("0", "1", "x1.25"):
