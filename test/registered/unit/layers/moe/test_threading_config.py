@@ -490,9 +490,10 @@ def test_smt_applies_to_named_cpu_cores(xeon8280):
 
 
 def test_smt_refuses_a_sibling_in_the_servers_affinity(xeon8280):
-    """The server's affinity reaching 62, the sibling of pool core 6: the pool cannot take it."""
+    """The server's affinity reaching 62 and 63, the siblings of cores 6 and 7. The copy thread takes 7 (it prefers a
+    core whose sibling is the server's), so pool core 6 brings 62, which the pool cannot take."""
     with pytest.raises(ValueError, match=r"node 0: SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT adds core 6's SMT sibling 62"):
-        resolve(xeon8280, affinity=SERVER_8280 | {62}, cpu_experts=True, threads=10, smt=True, spin_core=26)
+        resolve(xeon8280, affinity=SERVER_8280 | {62, 63}, cpu_experts=True, threads=10, smt=True, spin_core=26)
 
 
 def test_without_smt_pool_cores_on_one_physical_core_are_still_refused(xeon8280):
