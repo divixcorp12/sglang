@@ -103,6 +103,27 @@ def test_layer_major_state_store_raises_the_default_floor_and_the_log_names_it(t
     assert r.returncode == 0 and record["layer_major_state_gib"] == 0.0 and "StateStore" not in r.stdout
 
 
+def test_the_pinned_tier_beyond_arm_a_raises_the_default_floor_and_the_log_names_it(tmp_path):
+    floor = pe.node1_floor("", 12.67, 1.0, 5.0, 53.19)
+    assert floor["floor_gib"] == round(12.67 + 51.24 + 5.0 + 53.19 + 1.0, 2) == 123.1
+    assert floor["pinned_extra_gib"] == 53.19
+    r, record = _main(tmp_path, 100.0, "--hicache-gib", "12.67", "--layer-major-state-gib", "5.0",
+                      "--pinned-extra-gib", "53.19")
+    assert r.returncode == 3 and record["floor_gib"] == 123.1
+    assert "+ layer-major StateStore 5.0 + pinned tier beyond arm A 53.19 + margin 1.0" in r.stdout
+    (tmp_path / "off").mkdir()
+    r, record = _main(tmp_path / "off", 100.0, "--hicache-gib", "12.67")
+    assert r.returncode == 0 and record["pinned_extra_gib"] == 0.0 and "pinned tier" not in r.stdout
+
+
+def test_a_previous_memsample_already_holds_the_pinned_tier(tmp_path):
+    lines = [_sample(60, 0.4), _sample(4, 12.4)]
+    path = tmp_path / "prev.memsample.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    floor = pe.node1_floor(str(path), 11.75, 1.0, 5.0, 53.19)
+    assert floor["pinned_extra_gib"] == 0.0 and floor["floor_gib"] == 56.75
+
+
 def test_a_previous_memsample_already_holds_the_state_store(tmp_path):
     lines = [_sample(60, 0.4), _sample(4, 12.4)]
     path = tmp_path / "prev.memsample.jsonl"

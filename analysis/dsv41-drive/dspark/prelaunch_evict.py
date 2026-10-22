@@ -174,22 +174,27 @@ def rest_from_samples(lines) -> tuple[float, float]:
     return need - pools, pools
 
 
-def node1_floor(previous: str, hicache_gib: float, margin_gib: float, layer_major_state_gib: float = 0.0) -> dict:
+def node1_floor(previous: str, hicache_gib: float, margin_gib: float, layer_major_state_gib: float = 0.0,
+                pinned_extra_gib: float = 0.0) -> dict:
     """The floor and where its non-HiCache part came from. ``layer_major_state_gib`` is layer-major prefill's pinned
     node-1 StateStore (arm_env.layer_major_state_gib): arm A's default rest predates it, so it is added to the default;
-    a previous memsample of the same arm already holds it."""
+    a previous memsample of the same arm already holds it. So does ``pinned_extra_gib``, the run's node-1 pinned tier
+    beyond arm A's 48 GiB (arm_env.PROD_NODE1_PINNED_EXTRA_GIB)."""
     rest, source = DEFAULT_REST_GIB, "default (arm A, 2026-10-15)"
     state = layer_major_state_gib
+    extra = pinned_extra_gib
     if previous and os.path.exists(previous):
         try:
             with open(previous) as f:
                 rest, _ = rest_from_samples(f)
             source = previous
             state = 0.0
+            extra = 0.0
         except (ValueError, KeyError, json.JSONDecodeError) as error:
             source = f"default (arm A); {previous} unusable: {error}"
-    return {"floor_gib": round(hicache_gib + rest + state + margin_gib, 2), "rest_gib": round(rest, 2),
-            "hicache_gib": hicache_gib, "layer_major_state_gib": state, "margin_gib": margin_gib,
+    return {"floor_gib": round(hicache_gib + rest + state + extra + margin_gib, 2), "rest_gib": round(rest, 2),
+            "hicache_gib": hicache_gib, "layer_major_state_gib": state, "pinned_extra_gib": extra,
+            "margin_gib": margin_gib,
             "rest_source": source}
 
 
@@ -329,6 +334,8 @@ def main() -> int:
     p.add_argument("--margin-gib", type=float, default=1.0)
     p.add_argument("--layer-major-state-gib", type=float, default=0.0,
                    help="layer-major prefill's node-1 StateStore (arm_env.layer_major_state_gib); 0 when it is off")
+    p.add_argument("--pinned-extra-gib", type=float, default=0.0,
+                   help="the run's node-1 pinned tier beyond arm A's 48 GiB (arm_env.PROD_NODE1_PINNED_EXTRA_GIB)")
     p.add_argument("--wait-min", type=float, default=30.0)
     p.add_argument("--skip-evict-port", type=int, action="append", default=[])
     p.add_argument("--node0-warn-gib", type=float, default=0.0)
@@ -342,12 +349,13 @@ def main() -> int:
     p.add_argument("--evict-holders-min-mib", type=float, default=256.0)
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
-    floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib, a.layer_major_state_gib)
+    floor = node1_floor(a.previous, a.hicache_gib, a.margin_gib, a.layer_major_state_gib, a.pinned_extra_gib)
     floors = {"0": a.node0_floor_gib, "1": floor["floor_gib"]}
     record = {"node0_floor_gib": a.node0_floor_gib,"t": time.time(), **floor, "before": node_meminfo(), "rounds": [], "dry_run": a.dry_run}
     state = f" + layer-major StateStore {floor['layer_major_state_gib']}" if floor["layer_major_state_gib"] else ""
+    extra = f" + pinned tier beyond arm A {floor['pinned_extra_gib']}" if floor["pinned_extra_gib"] else ""
     print(f"prelaunch: node-1 floor {floor['floor_gib']} GiB = HiCache {a.hicache_gib} + rest {floor['rest_gib']} "
-          f"({floor['rest_source']}){state} + margin {a.margin_gib}", flush=True)
+          f"({floor['rest_source']}){state}{extra} + margin {a.margin_gib}", flush=True)
     if a.node0_floor_gib:
         print(f"prelaunch: node-0 floor {a.node0_floor_gib} GiB (free + reclaimable slab)", flush=True)
     busy = [port for port in a.skip_evict_port if listening(port)]
