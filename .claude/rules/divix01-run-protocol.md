@@ -75,7 +75,7 @@ noise. A change to the expert-stream / RAM-miss host or device code, for example
 ## Point the registered suite at `unit/kernels`, not the whole tree
 
 ```bash
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-51,56-107 \
   /data/models/slang/.venv-upstream/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
 ```
 
@@ -153,17 +153,33 @@ result is only meaningful next to the restored baseline.
 
 ## CPU and cores
 
-Every CPU job runs under `taskset -c 0-63` with threads capped
-(`OMP_NUM_THREADS`). Cores 64-71 stay free: NVMe completion interrupts are
-pinned there, and the RAM-miss path reads rows from NVMe. GPU work runs under
-`cc-gpu.lock` on cores 32-63, never as a bare command. Two ways, both on
-divix01:
+divix01 has two Xeon Platinum 8280s (28 physical cores per socket, SMT 2, 112 CPUs; cpu N's SMT sibling is N + 56):
+
+| | node 0 (the GPU's) | node 1 (all four NVMe drives) |
+|---|---|---|
+| CPUs | 0-27, 56-83 | 28-55, 84-111 |
+| Production roles | server 0-5,56-61; CPU experts 6-15; RAM thread 26; copy thread 27; benchmark client 18-21; helpers 22-25 | CPU experts 28-37; RAM thread 51; RAM-prefetch thread 50 |
+| Kept free | | 52-55,108-111 (`arm_env.FREE_CORES`) |
+
+(The roles are `benchmarks/dsv41_baseline/arm_env.py`'s; the 18-core CPUs this box had before 2026-10-21 used 0-17,36-53 and
+18-35,54-71 with the same roles. Older notes and result files quote those numbers.)
+
+- **CPU-only jobs** run under `taskset -c 0-51,56-107` (everything but the free cores; `arm_env.CPU_JOB_CORES`) with
+  threads capped (`OMP_NUM_THREADS`).
+- **GPU jobs** run under `cc-gpu.lock` on node 0, `taskset -c 0-27,56-83` (`arm_env.GPU_JOB_CORES`), never as a bare
+  command.
+- **52-55,108-111 stay free**: NVMe completion interrupts belong there, and the RAM-miss path reads rows from NVMe.
+  Nothing pins the interrupts yet: irqbalance spreads them over node 1 and node 0's siblings. A root step does (write the
+  cores to each nvme queue IRQ's `/proc/irq/N/smp_affinity_list`, and set `IRQBALANCE_BANNED_CPULIST=0-51,56-107`). The
+  code refuses these cores already (`RESERVED_CORES` in `threading_config.py`, `is_reserved_core` in `core_topology.h`).
+
+Two ways to take the GPU lock, both on divix01:
 
 - `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh <cmd>`
   (not in any repo). It retries the lock every 60 s and **gives up after 30 min
   with exit 75**, so it fails behind a long arm or soak; check for 75.
 - To wait as long as it takes, lock directly:
-  `flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 <cmd>`,
+  `flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 0-27,56-83 <cmd>`,
   or `exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock; flock 9` in a script
   (see the lock order below).
 

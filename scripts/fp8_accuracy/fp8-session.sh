@@ -29,7 +29,7 @@ exec > >(tee -a "$log") 2>&1
 echo "STARTED $phase $(date --iso-8601=seconds) args=$*"
 
 harness() {
-    PYTHONPATH="$root/worktree/python" taskset -c 64-71 env OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=9 \
+    PYTHONPATH="$root/worktree/python" taskset -c 22-25 env OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=9 \
         "$python" "$harness_dir/fp8_accuracy.py" "$@"
 }
 

@@ -100,10 +100,10 @@ Options parse_options(int& argc, char** argv) {
           << "Full-stack CPU-expert benchmark (" EXL3_BENCH_BACKEND
              ")\n"
              "--fixture=FILE --reference-dir=DIR --image-dir=DIR (O_DIRECT-capable; row images are written there)\n"
-             "--writer-cpu=16 --service-cpu=17 --copy-cpu=52 --cpus=18-33 --host-node=0 --worker-node=1\n"
+             "--writer-cpu=22 --service-cpu=26 --copy-cpu=27 --cpus=28-43 --host-node=0 --worker-node=1\n"
              "one NUMA group per -DEXPERT_STREAM_NODES: --service-cpu and --worker-node take one entry per group, "
-             "comma-separated, and --cpus one CPU list per group, '/'-separated: --service-cpu=17,35 "
-             "--cpus=8-15/18-33 --worker-node=0,1\n"
+             "comma-separated, and --cpus one CPU list per group, '/'-separated: --service-cpu=26,51 "
+             "--cpus=6-15/28-43 --worker-node=0,1\n"
              "--warmup-forwards=128 --gap-us=0 --keep-warm-us=0 --wait-timeout-ms=2000 --validate-only\n"
              "--keep-warm-us: register work after each job, before the held CPU team falls back to PAUSE\n"
              "  (0: PAUSE only)\n"
@@ -146,11 +146,11 @@ Placement resolve_placement(const Options& o) {
   p.host_node = o.host_node;
   std::string services, cpus, nodes;
   if (kGroups == 1) {
-    services = o.self_test ? "1" : "17";
-    cpus = o.self_test ? "3" : "18-33";
+    services = o.self_test ? "1" : "26";
+    cpus = o.self_test ? "3" : "28-43";
     nodes = "1";
-    p.writer = o.self_test ? 0 : 16;
-    p.copy = o.self_test ? 2 : 52;
+    p.writer = o.self_test ? 0 : 22;
+    p.copy = o.self_test ? 2 : 27;
   } else if (o.self_test) {
     services = "2,3";
     cpus = "4/5";
@@ -162,8 +162,8 @@ Placement resolve_placement(const Options& o) {
       throw std::runtime_error(
           "a " + std::to_string(kGroups) + "-group run needs --service-cpu, --cpus and --worker-node (one entry per "
           "NUMA group)");
-    p.writer = 16;
-    p.copy = 52;
+    p.writer = 22;
+    p.copy = 27;
   }
   p.writer = o.writer_cpu.value_or(p.writer);
   p.copy = o.copy_cpu.value_or(p.copy);
@@ -218,10 +218,12 @@ struct StackCall {
 // The benchmark state, in two phases that must run in this order.
 //
 // Bare phase: the slots hold expert e in slot_of(e) (StackFixture::preload_slots) and no stack exists, so no CPU expert
-// thread spins on worker 0's core, where the kernel puts every caller, and the kernel's per-caller OpenMP team is the
-// only one. Stack phase (enter_stack_phase): the bare caller's team is released, the Stack is built, every expert is
-// loaded through the tier's reader, and the layers are registered. A bare forward after that fails: it would share
-// worker 0's core with the CPU expert thread and run a second OpenMP team.
+// thread spins on worker 0's core, where the kernel puts every caller. Each group's bare forwards run on one Team made
+// at its first forward and kept for the phase (bare_team): a kernel forward without a Team builds and joins one per
+// call, which would time thread creation and leave no helper for the census. Stack phase (enter_stack_phase): the bare
+// Teams are joined, the Stack is built, every expert is loaded through the tier's reader, and the layers are
+// registered. A bare forward after that fails: it would share worker 0's core with the CPU expert thread and run a
+// second Team.
 //
 // Runs on the writer's thread. Every path is checked bit-exactly against the frozen references (validate), and the
 // thread census (check_threads) runs once per phase, before that phase is timed.
@@ -278,7 +280,7 @@ class Bench {
 
   // Checks thread affinity once per phase, before the phase is timed: a failed check must stop the run before any
   // timing. The bare phase has only the kernel's helpers (this thread is worker 0 and predates `before`); the stack
-  // phase has every thread setup created. Call after a forward of the phase, which builds its OpenMP team.
+  // phase has every thread setup created. Call after a forward of the phase, which builds its Team.
   void check_threads() {
     if (stack_) {
       if (stack_census_) return;
@@ -286,19 +288,24 @@ class Bench {
       stack_census_ = true;
     } else {
       if (bare_census_) return;
-      // Above one group the bare forwards of every group share this thread's one OpenMP team, which each forward
-      // re-pins to its own group's cores: only the last group's helpers are left to count.
-      const auto& workers = placement_.groups.back().workers;
-      verify_threads(before_, std::vector<int>(workers.begin() + 1, workers.end()));
+      // The helpers of every group's bare Team (workers[1..]); a group none of whose experts are in the checked routes
+      // ran no forward and has no Team.
+      std::vector<int> expected;
+      for (int g = 0; g < kGroups; ++g) {
+        if (!bare_teams_[g]) continue;
+        const auto& workers = placement_.groups[g].workers;
+        expected.insert(expected.end(), workers.begin() + 1, workers.end());
+      }
+      verify_threads(before_, expected);
       bare_census_ = true;
     }
   }
 
-  // Ends the bare phase: builds the stack and loads every expert into the slots the bare forwards used. Throws if the
-  // tier picks different slots. Idempotent.
+  // Ends the bare phase: joins the bare Teams, builds the stack and loads every expert into the slots the bare forwards
+  // used. Throws if the tier picks different slots. Idempotent.
   void enter_stack_phase() {
     if (stack_) return;
-    release_kernel_team();
+    for (auto& team : bare_teams_) team.reset();  // joins the helpers
     stack_ = std::make_unique<Stack<BenchBuild>>(stack_config(fixture_, placement_, options_));
     sim_ = std::make_unique<DeviceSim>(stack_->page(), stack_->lease(), rows(), fixture_.experts());
     const int64_t timeout_ns = int64_t{options_.wait_timeout_ms} * 1'000'000;
@@ -339,6 +346,19 @@ class Bench {
     return call;
   }
 
+  // The group's bare Team: its workers on the group's cores, worker 0 the calling thread. Idle workers PAUSE-spin
+  // (keep-warm 0, as the kernel's own throwaway Team and cpu_forward.cpp's bench team), so a bare forward never waits for
+  // a wake-up.
+  ::sglang::cpu_experts::Team& bare_team(int group) {
+    auto& team = bare_teams_.at(static_cast<size_t>(group));
+    if (!team) {
+      const std::vector<int32_t>& workers = placement_.groups[group].workers;
+      team = std::make_unique<::sglang::cpu_experts::Team>(
+          workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::exl3_cpu_kernel(), 0);
+    }
+    return *team;
+  }
+
   // The kernel's forward on the row's bare layer (the same slabs), slots and x as the stack, from the calling thread, over
   // the experts of experts_[k] homed on `group` (their slots are slot_of(expert)), on that group's cores, into
   // `out`. Does nothing when the group has none. Throws once the stack exists (see the class doc).
@@ -346,7 +366,7 @@ class Bench {
     if (stack_)
       throw std::runtime_error(
           "a bare forward once the stack exists would share worker 0's core with the CPU expert "
-          "thread and run a second OpenMP team: BM_bare runs first "
+          "thread and run a second Team: BM_bare runs first "
           "(no --benchmark_enable_random_interleaving)");
     std::vector<int32_t> slots;
     std::vector<float> weights;
@@ -367,7 +387,8 @@ class Bench {
     call.accumulate = false;
     call.cores = placement_.groups[group].workers;
     try {
-      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(bare_layers_.layers[static_cast<size_t>(row)], call);
+      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(
+          bare_layers_.layers[static_cast<size_t>(row)], call, bare_team(group));
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("the bare CPU forward failed: ") + e.what());
     }
@@ -467,6 +488,10 @@ class Bench {
   StackFixture& fixture_;
   const BareLayers& bare_layers_;  // main's, which outlives this
   std::set<int> before_;          // the process's threads before setup
+  // The bare phase's Team per group, made at its first bare forward (bare_team), on the group's workers; the helpers
+  // pin themselves, and the Team pins the calling thread to worker 0's core. Emptied by enter_stack_phase.
+  std::vector<std::unique_ptr<::sglang::cpu_experts::Team>> bare_teams_ =
+      std::vector<std::unique_ptr<::sglang::cpu_experts::Team>>(kGroups);
   bool bare_census_ = false;
   bool stack_census_ = false;
   int64_t deadline_ns_;
@@ -704,6 +729,7 @@ int main(int argc, char** argv) {
     }
     benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
     benchmark::AddCustomContext("host_build", std::string(BenchBuild::kName));
+    benchmark::AddCustomContext("isa_tier", kernel_isa_tier());
     benchmark::AddCustomContext("fixture", options.fixture.string());
     benchmark::AddCustomContext("image_dir", options.image_dir.string());
     benchmark::AddCustomContext("writer_cpu", std::to_string(placement.writer));
@@ -720,7 +746,7 @@ int main(int argc, char** argv) {
     benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
     benchmark::AddCustomContext("keep_warm_us", std::to_string(options.keep_warm_us));
     benchmark::AddCustomContext("compiler", __VERSION__);
-    // Every BM_bare before any BM_stack: one OpenMP team at a time (see Bench). Each benchmark checks its path's 8
+    // Every BM_bare before any BM_stack: one Team on worker 0's core at a time (see Bench). Each benchmark checks its path's 8
     // outputs bit-exactly before and after it is timed. Above one group there is no BM_bare: record_bare ran each
     // group's bare forwards above.
     if (kGroups == 1)

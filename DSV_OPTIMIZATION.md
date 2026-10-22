@@ -1666,6 +1666,33 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - Stale comment, left as is: `DSPARK_MEM_FRACTION_STATIC`'s block in `arm_env.py` describes the triton fp32 prefill merge's
   peak and says flashinfer "refuses the 5-token draft capture"; the served pair above ran DSpark on flashinfer.
 
+### 3.14 divix01's 8280 core layout, the bench at the host tier, the full-stack census fix (owner, 2026-10-22)
+
+- **Core layout** (`core-layout-8280`, merged): divix01 is 2x Xeon Platinum 8280 (28 cores per socket, SMT 2; node 0 =
+  0-27,56-83, node 1 = 28-55,84-111; AVX-512 VNNI, no VBMI). Every hard-coded core was remapped: server 0-5,56-61, RAM
+  thread 26, copy thread 27, CPU experts 6-15 and 28-37, node-1 RAM thread 51, benchmark client 18-21, free 52-55,108-111;
+  CPU jobs `0-51,56-107`, GPU jobs `0-27,56-83` (`.claude/rules/divix01-run-protocol.md`).
+- **Expert-stream bench** (`python/sglang/kernels/jit/csrc/moe/expert_stream/bench/`):
+  - `run.sh`, `ab.sh` and `run_full_stack.sh` no longer pin `EXL3_MOE_CPU_MAX_ISA=bw`, so they measure the host's tier
+    (vnni). A caller's `EXL3_MOE_CPU_MAX_ISA` passes through; an empty one is unset (the kernels ignore it anyway). Every
+    process prints `isa tier <tier>`, puts `isa_tier` in its JSON context, and each results directory has an `isa.txt`.
+    Before this the bench could only ever time the old bw path.
+  - Defaults: bare bench `--cpus=28-43 --numa-node=1`; full stack writer 22, service 26, copy 27, workers 28-43 (the
+    production roles' cores), and the `exl3bench` partition source files now say 22-43,78-99 (the installed unit keeps
+    16-33,52-69 until the root reinstall).
+  - **Census root cause.** The full-stack bench failed its bare-phase thread census (`threads are pinned to {}, expected
+    {29..43}`) at master. Its bare forwards called `CpuExpertKernel::forward(layer, call)`, which builds a `Team` for the
+    call and joins it on return (`team.hpp`), so no helper was alive when the census ran; the census and the class
+    comments still assumed the OpenMP team the kernel had before the persistent-Team change (`9085b3be4e`), and
+    `release_kernel_team` paused an OpenMP pool that no longer exists. The bench now holds one `Team` per group for the
+    bare phase (as `cpu_forward.cpp` already did), counts its live helpers, and joins it on entering the stack phase.
+    Side effect: `BM_bare` no longer includes a thread create and join per call, so its numbers drop against earlier
+    full-stack results (the stack-minus-bare overhead counter grows by the same amount).
+- **VNNI tier** (`exl3-vnni`, `/mnt/nvme1/exl3-vnni/stageC`, 10 rounds, medians of p50): the DSV4.1 plan at the vnni tier is
+  4-11% faster than bw (experts 1/3/5: 255 / 755 / 1256 us vs 275 / 800 / 1316 us; routed rows 2-8: 2977-12459 us vs
+  3105-13964 us) and 15-38% faster than master's generic vnni path (411 / 975 / 1606 us at experts 1/3/5). Arm labels are
+  read from the data, not recorded in the directory.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.

@@ -49,7 +49,7 @@ ARMS = {
     "hybrid": {
         "SGLANG_MOE_HOT_GPU_MB": "12040",
         "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": "1",
-        # NUMA node 0's physical cores 6-17 (node 0 is 0-17,36-53): the target's CPU experts are off, so the
+        # NUMA node 0's physical cores 6-17 (node 0 is 0-27,56-83): the target's CPU experts are off, so the
         # recipe's CPU-expert cores are free.
         "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "6-17",
         "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": RESIDENT,

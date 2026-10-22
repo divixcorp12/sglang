@@ -2111,7 +2111,7 @@ class Envs:
     # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
     SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US = EnvInt(5000)
     # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
-    # (ThreadingConfig.resolve). Refused unless it is outside cores 64-71 and the server's affinity, on a node of the
+    # (ThreadingConfig.resolve). Refused unless it is outside cores 52-55,108-111 and the server's affinity, on a node of the
     # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
     # core); also refused with SGLANG_EXPERT_NUMA_CORES naming that node's ram=. Unset: with several nodes or CPU
     # experts each node's thread takes the node's highest free physical core; with one node and no CPU experts it
@@ -2196,7 +2196,7 @@ class Envs:
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
     # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
-    # "1:ram=35,cpu=18-33,sq=34;0:ram=17": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
+    # "1:ram=51,cpu=28-43,sq=50;0:ram=26": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
     # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
     SGLANG_EXPERT_NUMA_CORES = EnvStr("")
     # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
@@ -2258,7 +2258,7 @@ class Envs:
     # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
     # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.
     SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS = EnvBool(False)
-    # Cores of the draft's CPU expert kernel, as a taskset list ("18-27"). At least two, none of the reserved 64-71.
+    # Cores of the draft's CPU expert kernel, as a taskset list ("6-15"). At least two, none of the reserved 52-55,108-111.
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)

@@ -8,7 +8,7 @@ any GPU. Quote it only with that label and with the "conditions" block this scri
 It refuses to produce numbers unless --box-clear is given: a measurement on a contended box is worse
 than none. Without the flag it only proves the harness runs (--smoke) and prints no timings.
 
-Run:  taskset -c 0-63 env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONPATH=<wt>/python \
+Run:  taskset -c 0-51,56-107 env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONPATH=<wt>/python \
       python scripts/dsv41/exl3_stage_trace_overhead.py --box-clear --out result.json
 """
 
