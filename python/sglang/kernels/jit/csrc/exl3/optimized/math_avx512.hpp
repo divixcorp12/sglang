@@ -946,11 +946,15 @@ static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(s
               "EXL3_MOE_CPU_MAX_M");
 
 // The register kernels, once per integer accumulate (register_kernels.hpp). reg_bw is today's code, for every
-// AVX-512BW host. reg_vnni accumulates with vpdpwssd and runs on VNNI hosts (the plan's tier is >= Isa::Vnni).
+// AVX-512BW host. reg_vnni accumulates with vpdpwssd and runs on VNNI hosts (the plan's tier is >= Isa::Vnni); its
+// one-token compact chunks drop the byte sum for vpdpbusd on the product bytes (M1_REG_BYTES), one fewer vector
+// operation per decoded state, the same int32 sums.
 namespace reg_bw {
 #define M1_REG_TARGET M1_TARGET_BW
 #define M1_REG_ACC(acc, sum, pair) _mm512_add_epi32((acc), _mm512_madd_epi16((sum), (pair)))
+#define M1_REG_BYTES 0
 #include "register_kernels.hpp"
+#undef M1_REG_BYTES
 #undef M1_REG_ACC
 #undef M1_REG_TARGET
 }  // namespace reg_bw
@@ -958,7 +962,9 @@ namespace reg_bw {
 namespace reg_vnni {
 #define M1_REG_TARGET M1_TARGET_VNNI
 #define M1_REG_ACC(acc, sum, pair) _mm512_dpwssd_epi32((acc), (sum), (pair))
+#define M1_REG_BYTES 1
 #include "register_kernels.hpp"
+#undef M1_REG_BYTES
 #undef M1_REG_ACC
 #undef M1_REG_TARGET
 }  // namespace reg_vnni

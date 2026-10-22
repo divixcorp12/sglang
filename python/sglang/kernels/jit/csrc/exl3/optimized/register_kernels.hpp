@@ -6,7 +6,19 @@
 //   M1_REG_TARGET             the target attribute of every function here
 //   M1_REG_ACC(acc, sum, pair) acc + sum . pair, the pairwise 16-bit dot of the byte-sum vector with a broadcast
 //                             activation pair: wraps mod 2^32 in both forms, so the two tiers are bit-identical.
+//   M1_REG_BYTES              1: one-token compact chunks skip the byte sum and accumulate the product bytes
+//                             themselves with vpdpbusd (register_rows' byte path, byte_dup_rows); 0: today's kernels.
 // Everything the two copies share (register_bytesum, register_word, kRegisterBudget) is defined before the includes.
+
+// The byte path's activations: each compact int16 x (|x| <= 127) as the byte pair (x, x), so a broadcast activation
+// pair reads as the bytes (xE, xE, xO, xO). rows quantized rows of one 128-input block, 128 apart, as in compact.
+M1_REG_TARGET M1_ALWAYS_INLINE void byte_dup_rows(const int16_t* src,int16_t* dst,int rows) {
+    const __m512i low=_mm512_set1_epi16(0x00ff);
+    for(int i=0;i<rows*128;i+=32) {
+        const __m512i x=_mm512_and_si512(_mm512_loadu_si512(src+i),low);
+        _mm512_store_si512(dst+i,_mm512_or_si512(x,_mm512_slli_epi16(x,8)));
+    }
+}
 
 template<int J,int Pairs,bool Compact=false,int M=1>
 M1_REG_TARGET M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i b,__m512i c,
@@ -37,8 +49,23 @@ M1_REG_TARGET M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i
         const __m512i v=_mm512_or_si512(_mm512_slli_epi32(lo,s),_mm512_srli_epi32(hi,32-s));
         state=_mm512_mask_blend_epi16(0xaaaaaaaaU,_mm512_srli_epi32(v,16),_mm512_slli_epi32(v,3));
     }
-        const __m512i sum=register_bytesum(state);
         constexpr int row=(J/4)*2+(J%2)*8,half=(J/2)%2;
+        if constexpr(M1_REG_BYTES && Compact && M==1) {
+            // The byte sum's 32-bit product, its low and high halves (register_bytesum), each dotted bytewise with
+            // (xE, xE, xO, xO): the sum of all four product bytes times x per state, the integer the byte sum gives.
+            const __m512i ml=_mm512_set1_epi16(int16_t(MUL1_MULT&0xffff));
+            const __m512i mh=_mm512_set1_epi16(int16_t(MUL1_MULT>>16));
+            const __m512i lo=_mm512_mullo_epi16(state,ml);
+            const __m512i hi=_mm512_add_epi16(_mm512_mulhi_epu16(state,ml),_mm512_mullo_epi16(state,mh));
+            for(int i=0;i<2;++i) {
+                uint32_t pair;std::memcpy(&pair,splat+i*128+row,4);
+                const __m512i x=_mm512_set1_epi32(int32_t(pair));
+                acc[band][half][i]=_mm512_dpbusd_epi32(_mm512_dpbusd_epi32(acc[band][half][i],lo,x),hi,x);
+            }
+            register_rows<J+1,Pairs,Compact,M>(prev,a,b,c,splat,acc,band);
+            return;
+        }
+        const __m512i sum=register_bytesum(state);
         // 2 * M quantized rows, 128 apart: M token rows, then their M residual rows (compact_quantize_block).
         for(int i=0;i<2*M;++i) {
             uint32_t pair;std::memcpy(&pair,reinterpret_cast<const char*>(splat+i*128+row)+(Compact?0:2),4);
@@ -60,12 +87,16 @@ M1_REG_TARGET void register_band(const Exl3Projection& mat,const PreparedIn& in,
     const size_t step=size_t(swz?8:tiles_n)*96;
     __m512 sums[Pairs][2][R];
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
+    constexpr bool bytes=M1_REG_BYTES && Compact && M==1;  // register_rows' byte path
+    [[maybe_unused]] alignas(64) int16_t dup[bytes?R*128:1];
     for(int kb=0;kb<k/128;++kb) {
         __m512i acc[Pairs][2][R];
         for(int b=0;b<Pairs;++b)for(int h=0;h<2;++h)for(int i=0;i<R;++i)acc[b][h][i]=_mm512_setzero_si512();
+        if constexpr(bytes) byte_dup_rows(in.compact+size_t(kb)*R*128,dup,R);
         for(int kt=0;kt<8;++kt) {
             const auto* splat=[&]() {
-                    if constexpr(Compact) return in.compact+size_t(kb)*R*128+kt*16;
+                    if constexpr(bytes) return static_cast<const int16_t*>(dup)+kt*16;
+                    else if constexpr(Compact) return in.compact+size_t(kb)*R*128+kt*16;
                     else return in.splat_dup+size_t(kb)*R*128+kt*16;
                 }();
             for(int band=0;band<Pairs;++band) {
@@ -131,9 +162,11 @@ void traversal_kblock(const Exl3Projection& mat, const PreparedIn& in,
     const size_t step=size_t(swz?8:tiles_n)*96;
     alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
     IntegerAccum first;integer_acc_zero(first);
+    [[maybe_unused]] alignas(64) int16_t dup[M1_REG_BYTES?256:1];  // register_rows' byte path
+    if constexpr(M1_REG_BYTES) byte_dup_rows(in.compact+size_t(kb)*256,dup,2);
     for(int kt=0;kt<8;++kt) {
         auto& acc=first.lanes;
-        const int16_t* splat=in.compact+size_t(kb)*256+kt*16;
+        const int16_t* splat=(M1_REG_BYTES?static_cast<const int16_t*>(dup):in.compact+size_t(kb)*256)+kt*16;
         #pragma omp unroll full
         for(int band=0;band<4;++band) {
             const int nt=n0+2*band, tile_k=kb*8+kt;
