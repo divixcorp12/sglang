@@ -43,7 +43,9 @@ ROUTES = {
 }
 WEIGHTS = (0.5, 0.3, 0.2, 0.15, 0.1)
 SCALES = (1.0, 8.0)
-TIERS = {"scalar": (False, False), "avx2": (True, False), "bw": (True, True)}
+# (avx2, avx512bw, avx512vnni) the kernel reports at each EXL3_MOE_CPU_MAX_ISA; vnni needs a VNNI host (no VBMI is used)
+TIERS = {"scalar": (False, False, False), "avx2": (True, False, False), "bw": (True, True, False),
+         "vnni": (True, True, True)}
 
 
 def random_slabs(torch, hidden, inter, seed):
@@ -156,9 +158,13 @@ def dump(args):
 
     print(f"sglang {sglang.__file__}")
     ext = exl3_ext()
-    tier = (bool(ext.exl3_moe_cpu_has_avx2()), bool(ext.exl3_moe_cpu_has_avx512_bw()))
+    tier = (
+        bool(ext.exl3_moe_cpu_has_avx2()),
+        bool(ext.exl3_moe_cpu_has_avx512_bw()),
+        bool(ext.exl3_moe_cpu_has_avx512_vnni()),
+    )
     if tier != TIERS[args.isa]:
-        sys.exit(f"asked for {args.isa}, the kernel reports avx2={tier[0]} bw={tier[1]}")
+        sys.exit(f"asked for {args.isa}, the kernel reports avx2={tier[0]} bw={tier[1]} vnni={tier[2]}")
     torch.set_num_threads(1)
     halves = None
     if args.registration == "cores":
