@@ -1202,6 +1202,29 @@ def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_serv
     )
 
 
+@pytest.mark.parametrize("smt", [False, True], ids=["cores", "smt"])
+def test_the_recipes_expert_pools_with_or_without_siblings_leave_the_driver_helpers_server_and_free_cores(tmp_path, smt):
+    # The recipe's 16 experts per node (6-21, 28-43), and with SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT their siblings
+    # (62-77, 84-99): no CPU of a pool, the RAM or copy thread, or a sibling of one, is the server's, the driver's, a
+    # helper's or a FREE core. Mutant: DRIVER_CORES back at 18-21 -- red (experts 18-21).
+    tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
+    topology = _divix01_topology(tc, tmp_path)
+    config = tc.ThreadingConfig.resolve(
+        nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES), topology=topology,
+        settings=tc.CoreSettings(
+            cpu_experts=True, threads=arm_env.CPU_EXPERTS_THREADS, smt=smt, spin_core=arm_env.SPIN_CORE
+        ),
+    )
+    assert [plan.threads for plan in config.plans] == [arm_env.CPU_EXPERTS_THREADS * (2 if smt else 1)] * 2
+    stream = {c for plan in config.plans for c in plan.cores()} | set(config.copy_cpus)
+    stream |= {s for c in stream for s in topology.siblings[c]}
+    for name in ("SERVER_CORES", "DRIVER_CORES", "HELPER_CORES", "FREE_CORES"):
+        cores = _cores(getattr(arm_env, name))
+        assert not (stream & cores), (name, sorted(stream & cores))
+    assert not (_cores(arm_env.DRIVER_CORES) & _cores(arm_env.HELPER_CORES))
+    assert _cores(arm_env.HELPER_CORES) <= NODE0_CPUS
+
+
 def test_every_jit_build_and_the_exl3_cpu_kernel_use_gcc_15():
     # The optimized EXL3 CPU kernel is validated on GCC 15 (ext.py check_cpu_compiler). CXX moves sglang's JIT builds
     # (host C++, and nvcc's host half through -ccbin) to the same compiler.
