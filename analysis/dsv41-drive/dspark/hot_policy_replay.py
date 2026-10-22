@@ -102,6 +102,7 @@ def load_capture(d: str) -> dict:
             c = collections.Counter(e for e in r["routes"][L] if e >= 0)
             counts.append(dict(c))
         fwds.append({"graph": True, "fp": r["forward_pass_id"], "phase": r.get("phase"), "tokens": tokens,
+                     "rid": (r.get("rids") or ["?"])[0],
                      "counts": counts, "hot": [frozenset(h) for h in r["hot"]]})
     graph_fps = {f["fp"] for f in fwds}
     for fp, e in eager.items():
@@ -158,8 +159,10 @@ def attach_lanes(d: str, graph: list, layers: int) -> str:
 
 class Config:
     def __init__(self, name: str, decay: float = 0.98, adm: str | None = None, margin: str = "0",
-                 long_decay: float = 0.999):
+                 long_decay: float = 0.999, prefill_counts: bool = True):
         self.name, self.decay, self.adm, self.margin, self.long_decay = name, decay, adm, margin, long_decay
+        # Diagnostic only: False drops the eager prefills' route counts, which the code does fold in.
+        self.prefill_counts = prefill_counts
 
     def beats(self, f: float, v: float) -> bool:
         if self.margin.startswith("x"):
@@ -211,8 +214,9 @@ class LayerSim:
         if self.pending:
             self.boundary()
         self.tokens += tokens
-        for e, c in counts.items():
-            self.pend[e] += c
+        if self.cfg.prefill_counts or phase == "target_verify":
+            for e, c in counts.items():
+                self.pend[e] += c
         if phase == "target_verify":
             self.pending = True
         elif tokens >= PREFILL_BOUNDARY_TOKENS:
@@ -231,7 +235,7 @@ class LayerSim:
     def victim_freq(self, v: int) -> float:
         return float(self.key_long[v]) if self.cfg.adm.startswith("L") else float(self.key_score[v])
 
-    def graph(self, counts: dict, tokens: int, phase: str, nvme: set, teacher=None) -> dict:
+    def graph(self, counts: dict, tokens: int, phase: str, kinds: dict, teacher=None) -> dict:
         """One graph forward. ``teacher`` (the capture's hot set before it) replaces the replay's residency first."""
         if self.pending:
             self.boundary()
@@ -265,7 +269,7 @@ class LayerSim:
                         i += 1
                         continue
                 forced.append(e)
-        cpu = self.split(assigned, forced, counts, nvme)
+        cpu = self.split(assigned, forced, counts, kinds)
         inserted = []
         for e, s in assigned:
             if e in cpu:
@@ -289,21 +293,24 @@ class LayerSim:
 
     # ---- the split -----------------------------------------------------------------------------------------------
 
-    def split(self, assigned: list, forced: list, counts: dict, nvme: set) -> set:
+    def split(self, assigned: list, forced: list, counts: dict, kinds: dict) -> set:
         """The live lanes the CPU computes (forced lanes are the CPU's whatever this returns)."""
         if self.mode == "today":
             return self.split_model(assigned, forced, counts)
-        return self.split_fixed(assigned, forced, nvme)
+        return self.split_fixed(assigned, forced, kinds)
 
     @staticmethod
-    def split_fixed(assigned: list, forced: list, nvme: set) -> set:
+    def split_fixed(assigned: list, forced: list, kinds: dict) -> set:
+        """``kinds``: the capture's lane kind of each expert it had as a lane. An unforced NVMe miss streams to the
+        GPU and an unforced drip scratch hit is copied from scratch; neither is eligible for the CPU."""
         n = [0, 0]
         forced_misses = [0, 0]
+        gpu_only = {e for e, k in kinds.items() if k in NVME_KINDS or k == 6}
         for e, _ in assigned:
-            if e not in nvme:
+            if e not in gpu_only:
                 n[e % 2] += 1
         for e in forced:
-            if e in nvme:
+            if kinds.get(e) in NVME_KINDS:
                 forced_misses[e % 2] += 1
         take = []
         for node in (0, 1):
@@ -313,7 +320,7 @@ class LayerSim:
             take.append(t)
         cpu = set()
         for e, _ in reversed(assigned):
-            if e in nvme:
+            if e in gpu_only:
                 continue
             if take[e % 2] > 0:
                 take[e % 2] -= 1
@@ -370,6 +377,10 @@ def capacities(header: dict, slots: int | None) -> list:
     return caps
 
 
+POS_LIMITS = (4, 16, 1 << 30)
+POS_BUCKETS = ("verify1-4", "verify5-16", "verify17+")
+
+
 def replay(cap: dict, cfg: Config, mode: str, slots: int | None, skip: int, teacher: bool = False) -> dict:
     """Run every layer over the capture's forwards; totals over the verifies after ``skip``."""
     fwds = cap["forwards"]
@@ -381,6 +392,9 @@ def replay(cap: dict, cfg: Config, mode: str, slots: int | None, skip: int, teac
     verify_i = 0
     graph = [f for f in fwds if f["graph"]]
     next_hot = {id(g): (graph[i + 1]["hot"] if i + 1 < len(graph) else None) for i, g in enumerate(graph)}
+    # hits by the verify's position in its request: early verifies are where a long window's history is stalest
+    by_pos = collections.defaultdict(collections.Counter)
+    seen = collections.Counter()
     for f in fwds:
         if not f["graph"]:
             for L, sim in enumerate(sims):
@@ -390,19 +404,24 @@ def replay(cap: dict, cfg: Config, mode: str, slots: int | None, skip: int, teac
         counted = is_verify and verify_i >= skip
         if is_verify:
             verify_i += 1
+            seen[f["rid"]] += 1
+        pos = POS_BUCKETS[min(i for i, hi in enumerate(POS_LIMITS) if seen[f["rid"]] <= hi)]
         nh = next_hot[id(f)]
         for L, sim in enumerate(sims):
             lanes = (f.get("lanes") or [None] * cap["layers"])[L]
-            nvme = {e for e, (_, kind) in lanes.items() if kind in NVME_KINDS} if (lanes and mode == "capture") else set()
-            o = sim.graph(f["counts"][L], f["tokens"], f["phase"], nvme, f["hot"][L] if teacher else None)
+            kinds = {e: kind for e, (_, kind) in lanes.items()} if (lanes and mode == "capture") else {}
+            o = sim.graph(f["counts"][L], f["tokens"], f["phase"], kinds, f["hot"][L] if teacher else None)
             if counted:
                 for k in ("unique", "hits", "pairs", "pairs_hit", "misses", "inserted", "live", "forced"):
                     tot[k] += o[k]
                 tot["span_ms"] += o.get("span_ms", 0.0)
+                by_pos[pos]["hits"] += o["hits"]
+                by_pos[pos]["unique"] += o["unique"]
             if teacher and counted and nh is not None:
                 validate(val, f["hot"][L], nh[L], o, lanes)
         if counted:
             tot["verifies"] += 1
+            by_pos[pos]["verifies"] += 1
     n = max(1, tot["verifies"])
     res = {"config": vars(cfg), "mode": mode, "slots": sum(caps), "verifies": tot["verifies"],
            "unique_per_verify": tot["unique"] / n, "hits_per_verify": tot["hits"] / n,
@@ -411,6 +430,8 @@ def replay(cap: dict, cfg: Config, mode: str, slots: int | None, skip: int, teac
            "forced_per_verify": tot["forced"] / n, "live_per_verify": tot["live"] / n}
     if mode == "today":
         res["model_span_ms_per_verify"] = tot["span_ms"] / n
+    res["hits_by_position"] = {p: {"verifies": c["verifies"], "hits_per_verify": c["hits"] / max(1, c["verifies"]),
+                                   "hit_rate": c["hits"] / max(1, c["unique"])} for p, c in by_pos.items()}
     if teacher:
         res["validation"] = {k: v for k, v in val.items()}
     return res
@@ -446,6 +467,8 @@ def _add(cfg: Config) -> None:
 
 for _d in (0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 1.0):
     _add(Config(f"d{_d}", decay=_d))
+for _d in (0.98, 0.995, 0.999):
+    _add(Config(f"d{_d}-noprefill", decay=_d, prefill_counts=False))
 for _d in (0.98, 0.995, 0.999):
     for _adm in ("s", "s+cur", "L0.999", "L0.999+cur", "L0.9995+cur"):
         for _m in ("0", "1", "x1.25"):
