@@ -102,6 +102,9 @@ class ExpertResidencyPolicy:
             self.num_experts, dtype=torch.float32, device=self.device
         )
         self._scores = torch.zeros_like(self._pending_counts)
+        # Set by GpuResidencyUpdater under SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0: eager counts also land here, so its
+        # insert score can leave them out.
+        self._eager_counts: torch.Tensor | None = None
         if initial_scores is not None:
             scores = torch.as_tensor(
                 initial_scores, dtype=self._scores.dtype, device=self.device
@@ -124,7 +127,10 @@ class ExpertResidencyPolicy:
             raise ValueError("counts must have one entry per expert")
         if counts.device != self.device:
             raise ValueError("counts must be on the policy device")
-        self._pending_counts.add_(counts.reshape(-1).to(dtype=self._pending_counts.dtype))
+        counts = counts.reshape(-1).to(dtype=self._pending_counts.dtype)
+        self._pending_counts.add_(counts)
+        if self._eager_counts is not None:
+            self._eager_counts.add_(counts)
         self._metrics.recorded_count_batches += 1
 
     def record_routes(self, expert_ids: torch.Tensor) -> None:

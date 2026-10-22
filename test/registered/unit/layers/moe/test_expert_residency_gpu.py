@@ -559,8 +559,11 @@ class _InsertOnMissReference:
     Then the forward's routes gather against the resulting mapping.
     """
 
-    def __init__(self, manager, decay=IOM_DECAY):
+    def __init__(self, manager, decay=IOM_DECAY, eager_counts=True):
         self.decay = decay
+        # False (SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0): the eager routes stay in route counts but the insert
+        # score and the routed mask leave them out.
+        self.eager_counts = eager_counts
         self.caches = [cache for _, cache in sorted(manager.caches.items())]
         self.mapping = [cache.expert_to_slot.tolist() for cache in self.caches]
         self.slots = []
@@ -575,6 +578,7 @@ class _InsertOnMissReference:
             [manager.residency_policies[layer_id]._scores.detach().cpu() for layer_id in sorted(manager.caches)]
         ).to(torch.float32)
         self.pending = torch.zeros_like(self.scores)
+        self.eager = torch.zeros_like(self.scores)
         self.tokens = 0
         self.plans = None
         self.insertions = [0] * LAYERS
@@ -585,9 +589,11 @@ class _InsertOnMissReference:
 
     def boundary(self):
         factor = torch.tensor(self.decay**self.tokens, dtype=torch.float32)
-        self.scores = self.scores * factor + self.pending
-        routed = self.pending > 0
+        counts = self.pending if self.eager_counts else self.pending - self.eager
+        self.scores = self.scores * factor + counts
+        routed = counts > 0
         self.pending = torch.zeros_like(self.pending)
+        self.eager = torch.zeros_like(self.eager)
         self.tokens = 0
         plans, self.plans = self.plans, None
         if plans is None:
@@ -629,15 +635,23 @@ class _InsertOnMissReference:
             self.plans.append(plan)
         self.tokens += 1
 
-    def eager_prefill(self, routes, tokens):
-        """A prefill below the prefill boundary: flush a pending boundary, then only count."""
+    def eager_prefill(self, routes, tokens, record_first=False):
+        """A prefill below the prefill boundary: flush a pending boundary, then only count. ``record_first`` records
+        its routes before the flush, as the EXL3 path does (exl3.py records before its first chunk's gather)."""
+        if record_first:
+            self._count_eager(routes)
         if self.plans is not None:
             self.boundary()
+        if not record_first:
+            self._count_eager(routes)
+        self.tokens += tokens
+
+    def _count_eager(self, routes):
         for row, layer_routes in enumerate(routes):
             for token in layer_routes:
                 for expert in token:
                     self.pending[row, expert] += 1
-        self.tokens += tokens
+                    self.eager[row, expert] += 1
 
     def assert_matches(self, test, manager, context):
         updater = manager.gpu_residency
@@ -894,6 +908,52 @@ class TestInsertOnMiss(unittest.TestCase):
             manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
         self.assertGreater(sum(updater.snapshot()["insertions"]), inserted)
         self.assertEqual(sum(updater.snapshot()["promotions"][0]), 0)
+
+    def test_eager_counts_off_leaves_prefill_routes_out_of_the_insert_score(self):
+        """SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0: a prefill's routes stay in the route counts (and the promotion
+        scores) but not in the insert score or the routed mask, whether recorded after the pending boundary's flush
+        (the NVFP4 gather) or before it (EXL3), and decode insertions stay exact. Mutation: subtract nothing --
+        "short prefill"/"recorded first" scores red."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS.override(False):
+            manager = _manager(self.model, gpu=True, **IOM)
+        updater = manager.gpu_residency
+        self.assertIsNotNone(updater.eager_counts)
+        reference = _InsertOnMissReference(manager, eager_counts=False)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(7)
+
+        def prefill(tokens, record_first):
+            routes = [[generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)] for _ in range(LAYERS)]
+            for layer, streamer in sorted(manager.streamers.items()):
+                ids = torch.tensor(routes[layer], dtype=torch.int32, device="cuda")
+                if record_first:
+                    streamer.record_routes(ids)
+                    updater.flush()
+                    streamer.gather_experts(torch.unique(ids.reshape(-1)))
+                else:
+                    streamer.gather(ids)
+            manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
+            torch.cuda.synchronize()
+            return routes
+
+        for record_first in (False, True):
+            context = "recorded first" if record_first else "short prefill"
+            for step in range(4):
+                self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"{context} {step}")
+            self.assertTrue(updater.host_pending)
+            reference.eager_prefill(prefill(6, record_first), 6, record_first=record_first)
+            reference.assert_matches(self, manager, context)
+            for step in range(4, 8):
+                self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"{context} {step}")
+        self.assertGreater(sum(reference.insertions), 0)
+        self.assertEqual(updater.eager_counts.abs().sum().item(), 0.0)
+
+    def test_a_decay_near_one_tabulates(self):
+        """0.999 (production since 2026-10-22) reaches a float32 zero only after ~103k tokens."""
+        manager = _manager(self.model, gpu=True, **dict(IOM, insert_on_miss_decay=0.999))
+        self.assertGreater(manager.gpu_residency.insert_decay_table_tokens, 1 << 16)
 
     def test_decode_forward_hook_is_sync_free(self):
         manager = _manager(self.model, gpu=True, **IOM)

@@ -423,6 +423,11 @@ class Envs:
     )
     # Per-token decay of the scores that pick insert-on-miss victims.
     SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
+    # Count eager forwards' routes in that insert-on-miss score. False leaves them out, so the score follows the routes
+    # the graph gathers count (verifies/decodes; with the verify graphed, the eager forwards are the prefills). The
+    # decay still advances by their tokens. A prefill small enough for the graph gather is still counted. Needs
+    # SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.
+    SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS = EnvBool(True)
     # Run stage 1's boundary insert copies through the fused masked Triton
     # kernel instead of index_select + index_copy_. Byte-identical output; one
     # pass instead of two, and idle lanes move no bytes. Off by default until a
