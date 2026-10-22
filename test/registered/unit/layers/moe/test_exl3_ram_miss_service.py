@@ -1546,6 +1546,16 @@ def test_a_forced_share_below_one_is_refused(tiers, monkeypatch):
         _prefill_share_service(tiers, monkeypatch, on=True, share=0)
 
 
+def test_a_tier_of_only_full_layers_sizes_no_prefill_share():
+    """Every layer full (production's whole-model tier): no layer admits, so the share is 0 and the start goes on."""
+    tables = SimpleNamespace(layer_ids=[0, 1, 2])
+    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1,2"):
+        assert module.Exl3RamMissService._size_prefill_share(SimpleNamespace(), tables, 2) == 0
+    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1,2"), envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.override(0):
+        with pytest.raises(ValueError, match="SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"):
+            module.Exl3RamMissService._size_prefill_share(SimpleNamespace(), tables, 2)
+
+
 def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
     """The no-op recorder drops observers, so the flag would silently do nothing."""
     from sglang.srt.eplb import expert_distribution

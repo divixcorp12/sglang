@@ -1731,6 +1731,14 @@ workloads incl. shared5-8 and counts8-7-6-5-4-3-2-1) at 10 and 16 workers, with 
 - **Open:** a served A/B of the shipped settings (16 threads; the kernel changes ship with the extension) before
   production restarts.
 
+### 3.16 Production's pinned tier holds every routed expert row (owner, 2026-10-22)
+
+- After the 128 GB RAM upgrade the owner asked for +90 GiB of pinned host memory. The useful maximum is every expert row:
+  all 40 layers full layers (408 slots each: 192 homed experts a node, 10 held back, 2 seam), `207244` MiB, `0:103622,1:103622`
+  (93.5 GiB over the old 111,530 MiB; derivation in `arm_env.py`). Pre-launch floor: node 1 123.10 GiB (the pinned share
+  beyond arm A's 48 GiB is `--pinned-extra-gib`), node-0 warn 117.94 GiB. `_size_prefill_share` returns 0 when no layer
+  admits (it raised, which would have refused the start). No served A/B yet; startup now reads every row from NVMe.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.

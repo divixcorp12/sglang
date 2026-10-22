@@ -2035,10 +2035,13 @@ class Exl3RamMissService:
             capacity = int(tables.capacity[row])
             ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
             usable[int(layer_id)] = usable_rows(ranges, staging_width=self.staging_width(), share=spec_share)
-        computed = prefill_share_rows(list(usable.values()))
         forced = envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.get()
         if forced is not None and forced < 1:
             raise ValueError(f"exl3 RAM miss: SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS={forced} must be at least 1")
+        if not usable:
+            logger.info("exl3 RAM miss prefill share: every layer is a full layer and admits nothing, so no share")
+            return 0
+        computed = prefill_share_rows(list(usable.values()))
         rows = computed if forced is None else forced
         logger.info(
             "exl3 RAM miss prefill share: %d rows per layer (%s; computed %d = %.2f x the smallest layer's %d usable "

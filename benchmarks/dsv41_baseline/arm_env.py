@@ -320,17 +320,36 @@ DSPARK_HOT_GPU_MB = "10840"
 PROD_DSPARK_HOT_GPU_MB = "13144"
 PROD_DSPARK_MEM_FRACTION_STATIC = "0.8623"
 PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
-# The pin01 arms' pinned tier (both_cpu_ab.PIN01_BUDGET): layers 0 and 1 whole, plus the old tier's rows elsewhere.
-PROD_DSPARK_PINNED_HOST_MB = "111530"
-PROD_DSPARK_PINNED_HOST_NUMA_MB = "0:59656,1:51874"
+# Since 2026-10-22 production's pinned tier holds every routed expert row (owner, after the 128 GB RAM upgrade; the request
+# was +90 GiB, the useful maximum is this). The pin01 arms' tier (both_cpu_ab.PIN01_BUDGET) was layers 0 and 1 whole plus
+# the old tier's rows elsewhere: 111,530 MiB, 0:59656,1:51874. Now every layer is a full layer
+# (SGLANG_MOE_PINNED_HOST_FULL_LAYERS 0-39), because a layer outside the list loses its staging and prefetch-pool slots
+# to the RAM-miss table and so cannot map all 384 experts. A full layer buys, per NUMA group (expert % 2 homes it): its
+# 384 / 2 = 192 homed experts, the slots its table holds back (min(victim lanes 8, MAX_LANES) + RAM prefetch spec share 2
+# = 10) and 2 seam slots (expert_stream.full_layer_group_rows): 204 rows, 408 a layer, 16,320 in all. At 13,315,596 B a
+# row (the 2026-10-17 startup log: 8,782 rows = 116,937,458,688 B) that is 108,655,263,360 B, 103,622 MiB a node and
+# 207,244 MiB in all (93.5 GiB over the old tier). No served A/B yet.
+PROD_PINNED_LAYERS = 40
+PROD_PINNED_ROW_BYTES = 13_315_596
+PROD_PINNED_ROWS_PER_NODE_PER_LAYER = 384 // 2 + (8 + 2) + 2
+PROD_DSPARK_PINNED_NODE_MB = -(-PROD_PINNED_LAYERS * PROD_PINNED_ROWS_PER_NODE_PER_LAYER * PROD_PINNED_ROW_BYTES // 2**20)
+PROD_DSPARK_PINNED_HOST_MB = str(2 * PROD_DSPARK_PINNED_NODE_MB)
+PROD_DSPARK_PINNED_HOST_NUMA_MB = f"0:{PROD_DSPARK_PINNED_NODE_MB},1:{PROD_DSPARK_PINNED_NODE_MB}"
+PROD_DSPARK_PINNED_FULL_LAYERS = ",".join(str(layer) for layer in range(PROD_PINNED_LAYERS))
 # launch_prod.sh's pre-launch floor (analysis/dsv41-drive/dspark/prelaunch_evict.py, the arms' logic): node 1 must hold
 # the HiCache host pools of the pinned 381,184-token pool (12.67 GiB, as the share-64 A/B ran it), the rest of the
 # server's node-1 need (arm A's 51.24 GiB) and 1 GiB of margin: 64.91 GiB, plus layer-major's StateStore when the env
-# prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production). Every served -mem arm started with node 0 at
-# 75.4 GiB free or more; below that the start only warns. The wait is bounded so a refusal comes in minutes.
+# prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production), plus the pinned tier's node-1 share
+# beyond arm A's. Arm A's rest was measured with its tier, 48 GiB on node 1 (PINNED_HOST_NUMA_MB "1:49152"), so that is
+# the baseline; the 51,874 MiB production ran until 2026-10-22 was never counted (2.66 GiB). Node 1 then wants
+# 69.91 + 53.19 = 123.10 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more, against production's old
+# 59,656 MiB node-0 share; below the warn level the start only warns, and the level rises with the node-0 share
+# (+42.94 GiB: 117.94). The wait is bounded so a refusal comes in minutes.
 PROD_NODE1_HICACHE_GIB = 12.67
 PROD_NODE1_MARGIN_GIB = 1.0
-PROD_NODE0_WARN_GIB = 75.0
+ARM_A_NODE1_PINNED_MB = 49152
+PROD_NODE1_PINNED_EXTRA_GIB = round((PROD_DSPARK_PINNED_NODE_MB - ARM_A_NODE1_PINNED_MB) / 1024, 2)
+PROD_NODE0_WARN_GIB = round(75.0 + (PROD_DSPARK_PINNED_NODE_MB - 59656) / 1024, 2)
 PROD_FLOOR_WAIT_MIN = 10
 # Layer-major prefill's pinned node-1 StateStore (layer_major/worker_entry.py, SGLANG_LAYER_MAJOR_STATE_NUMA_NODE=1),
 # which arm A's rest predates: CONTEXT_LENGTH tokens of DeepseekV4LayerMajorAdapter.field_specs, `hidden`
@@ -429,7 +448,7 @@ def prod_dspark_env() -> dict[str, str]:
         **PROD_DSPARK_CUT_ENV,
         # Whole layers 0 and 1 in the pinned tier, in a tier grown to hold them: 70.5 vs 76.2 ms/token, layers 0+1
         # 20.5 -> 13.0 ms a verify (DO 3.1; the OFF run was stall-flagged).
-        "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": "0,1",
+        "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": PROD_DSPARK_PINNED_FULL_LAYERS,
         "SGLANG_MOE_PINNED_HOST_MB": PROD_DSPARK_PINNED_HOST_MB,
         "SGLANG_MOE_PINNED_HOST_NUMA_MB": PROD_DSPARK_PINNED_HOST_NUMA_MB,
         # Each record's CPU/copy split from a cost model: 65.9 vs 67.9 ms/token, wait -9.4 ms a verify (DO 3.2, a pair).
