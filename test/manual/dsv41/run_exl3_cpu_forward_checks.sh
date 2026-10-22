@@ -24,7 +24,11 @@ if pgrep -f sglang.launch_server > /dev/null; then
   exit 2
 fi
 
-CPU_JOB_CORES=0-51,56-107  # arm_env.CPU_JOB_CORES
+CPU_JOB_CORES=${CPU_JOB_CORES:-0-51,56-107}  # arm_env.CPU_JOB_CORES; narrow it (0-27) to stay off node 1 while others time there
+BENCH_CORES=${BENCH_CORES:-$CPU_JOB_CORES}    # the bench validates need 22-27 and 28-43 in their mask
+# A command run before each bench validate (they use node 1's 28-43 for a few seconds), e.g. one that waits until
+# another job's binaries are off those cores.
+NODE1_GATE=${NODE1_GATE:-true}
 PY=/data/models/slang/.venv-upstream/bin/python
 GXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++
 SITE=/data/models/slang/.venv-upstream/lib/python3.13/site-packages
@@ -79,14 +83,18 @@ if [[ $mode == check ]]; then
   # The benches' default cores (bare 28-43; full stack writer 22, service 26, copy 27, workers 28-43) sit inside
   # CPU_JOB_CORES. Once at the host's tier (the variable unset), once capped at bw.
   unset EXL3_MOE_CPU_MAX_ISA
-  step bare-validate taskset -c "$CPU_JOB_CORES" "$build/exl3_cpu_optimized" --validate-only
-  step full-stack-validate taskset -c "$CPU_JOB_CORES" "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
+  gated() { eval "$NODE1_GATE"; "$@"; }
+  step bare-validate gated taskset -c "$BENCH_CORES" "$build/exl3_cpu_optimized" --validate-only
+  step full-stack-validate gated taskset -c "$BENCH_CORES" "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
   export EXL3_MOE_CPU_MAX_ISA=bw
-  step bare-validate-bw taskset -c "$CPU_JOB_CORES" "$build/exl3_cpu_optimized" --validate-only
-  step full-stack-validate-bw taskset -c "$CPU_JOB_CORES" "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
+  step bare-validate-bw gated taskset -c "$BENCH_CORES" "$build/exl3_cpu_optimized" --validate-only
+  step full-stack-validate-bw gated taskset -c "$BENCH_CORES" "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
   unset EXL3_MOE_CPU_MAX_ISA
   step pytest taskset -c "$CPU_JOB_CORES" "$PY" -m pytest -q -p no:randomly \
     test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py \
+    test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
+  # The multi-token plan test is documented to run at the host's tier and capped at bw.
+  step pytest-plan-bw env EXL3_MOE_CPU_MAX_ISA=bw taskset -c "$CPU_JOB_CORES" "$PY" -m pytest -q -p no:randomly \
     test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
 fi
 
