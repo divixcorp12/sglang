@@ -547,8 +547,9 @@ int main(int argc, char** argv) {
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
     // The tier is fixed from EXL3_MOE_CPU_MAX_ISA as set at launch: at load (baseline) or at this first query.
-    if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
-      throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
+    // Any AVX-512 tier runs the DSV4.1 plan; the scripts default to bw, and EXL3_MOE_CPU_MAX_ISA unset runs the host's.
+    if (!exl3_moe_cpu_has_avx512_bw())
+      throw std::runtime_error("This study requires AVX512BW");
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);

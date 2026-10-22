@@ -195,8 +195,8 @@ void StackFixture::preload_slots(int64_t row) const {
 
 void configure_cpu_kernel_runtime() {
   // The kernel detects its ISA tier at the first query, here, after EXL3_MOE_CPU_MAX_ISA was set at launch.
-  if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
-    throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
+  if (!exl3_moe_cpu_has_avx512_bw())
+    throw std::runtime_error("This study requires AVX512BW");
   at::set_num_threads(1);
   at::set_num_interop_threads(1);
   omp_set_dynamic(0);

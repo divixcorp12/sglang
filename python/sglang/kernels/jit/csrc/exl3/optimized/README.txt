@@ -94,7 +94,11 @@ tier, the worker cores and keep-warm are the CPU experts framework's ExpertForwa
 The tier is min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier query; EXL3_MOE_CPU_REPORT_ISA=1 prints
 "exl3 isa <tier>" to stderr then. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
 picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
-an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
+an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. On a VNNI host (tier Vnni or Vbmi) the same
+plan runs with its Vnni flag set: its register kernels (register_kernels.hpp, included once as reg_bw and once as
+reg_vnni by math_avx512.hpp) accumulate with vpdpwssd instead of vpmaddwd + vpaddd, bit-identically (the 16-bit byte sums
+and activation pairs are unchanged; both forms wrap mod 2^32). EXL3_MOE_CPU_MAX_ISA=bw runs the reg_bw copy, as before
+the VNNI copy existed. PlanTraits<Dsv41Shape, Isa::Bw> is the one
 specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and wide single-expert quantization (one token).
 MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile tables (kTiles) and the
 register dispatch (register_tiles_for) are generated from it. A plan reads every layer fact

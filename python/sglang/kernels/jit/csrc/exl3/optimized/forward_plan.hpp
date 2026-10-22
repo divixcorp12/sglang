@@ -106,18 +106,22 @@ void run_tiles_raw(const Exl3Projection& mat, const PreparedIn& in, float* tout,
     }
 }
 
-// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M.
-template <int... Ms>
+// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M. Vnni picks the vpdpwssd copy of
+// the register kernels (reg_vnni), else today's (reg_bw).
+template <bool Vnni, int... Ms>
 M1_ALWAYS_INLINE void register_tiles_for(std::integer_sequence<int, Ms...>, const Exl3Projection& mat,
                                          const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped)
 {
-    (void)((m == Ms + 1 && (register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
+    if constexpr (Vnni)
+        (void)((m == Ms + 1 && (reg_vnni::register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
+    else
+        (void)((m == Ms + 1 && (reg_bw::register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
 }
 
 // m token rows through the quantized kernels under the accuracy options (quantize_act's layout): per
 // k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
 // worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
-template <Isa I>
+template <Isa I, bool Vnni = false>
 void run_tiles(
     const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped = false)
 {
@@ -127,7 +131,7 @@ void run_tiles(
         // One token from either plan; several only as the DSV4.1 plan's compact input (PlanTraits::kCompactScratch).
         if ((m == 1 || in.compact) && mat.bits == 3 && act_blocked(mat.k))
         {
-            register_tiles_for(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
+            register_tiles_for<Vnni>(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
             return;
         }
     }
@@ -423,7 +427,7 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
 
 // Profile: time each phase (its barrier included) on worker 0 and print "moe_cpu phases(us)" after the forward. Off,
 // the plan holds no timing code at all.
-template <class Shape, Isa I, bool Profile = false, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0>
+template <class Shape, Isa I, bool Profile = false, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0, bool Vnni = false>
 struct ForwardPlan
 {
     using Traits = PlanTraits<Shape, I>;
@@ -602,7 +606,7 @@ private:
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
-                run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);
+                run_tiles<I, Vnni>(mat, p, tout, ch.m, t0, t1, grouped);
             }, E.params.row_weighted != 0);
         }
         else if constexpr (P == Phase::Middle)
@@ -632,7 +636,7 @@ private:
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
-                run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
+                run_tiles<I, Vnni>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
                 if constexpr (Traits::kSplitTiles == 8) {
                     transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
                 } else {
@@ -688,9 +692,12 @@ std::atomic<int64_t> g_plan_calls[2];
 void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team, Isa isa)
 {
     const ExpertLayer& l = *ctx.layer;
-    if (isa == Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
+    if (isa >= Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
         g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
-        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, Experts<Dsv41Shape>{&l, p}, ar, team);
+        // The plan is written for AVX-512BW. A VNNI host (Vnni, Vbmi) runs it with the vpdpwssd register kernels.
+        const Experts<Dsv41Shape> E{&l, p};
+        if (isa == Isa::Bw) ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, team);
+        else ForwardPlan<Dsv41Shape, Isa::Bw, false, EXL3_MOE_CPU_WORKER_TRACE != 0, true>::run(ctx, E, ar, team);
         return;
     }
     g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);

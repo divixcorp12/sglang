@@ -63,8 +63,8 @@ class StackFixture {
   std::unique_ptr<Impl> impl_;
 };
 
-// Configures cpu_forward.cpp's kernel runtime: AVX512BW exactly (EXL3_MOE_CPU_MAX_ISA=bw set at launch),
-// single-threaded ATen, no dynamic OpenMP. Throws if the kernel picked another ISA.
+// Configures cpu_forward.cpp's kernel runtime: an AVX-512 tier (EXL3_MOE_CPU_MAX_ISA=bw at launch, the scripts' default),
+// single-threaded ATen, no dynamic OpenMP. Throws if the host has no AVX512BW.
 void configure_cpu_kernel_runtime();
 
 // Frees the calling thread's OpenMP team. The kernel forks one team per calling thread (libgomp keeps a helper pool
