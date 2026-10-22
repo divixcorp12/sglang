@@ -268,6 +268,26 @@ def test_from_env_reads_every_core_setting(monkeypatch):
     }
 
 
+def test_from_env_gives_the_ram_prefetch_no_cores_when_every_streamed_layer_is_full(monkeypatch):
+    """Every expert mapped in RAM leaves the prefetch nothing to read, so its speculative threads get no cores."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import expert_stream
+
+    seen = {}
+    monkeypatch.setattr(ThreadingConfig, "resolve", staticmethod(lambda **kw: seen.update(kw) or "resolved"))
+    monkeypatch.setattr(Topology, "from_sysfs", classmethod(lambda cls, root=tc.SYSFS: "topology"))
+    monkeypatch.setattr(tc, "_affinity", lambda: frozenset({0, 1}))
+    monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
+    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
+            ThreadingConfig.from_env(cpu_experts=True, device=None)
+            assert seen["settings"].ram_prefetch is True
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+            ThreadingConfig.from_env(cpu_experts=True, device=None)
+            assert seen["settings"].ram_prefetch is False
+
+
 # The recipe's server cores (benchmarks/dsv41_baseline/arm_env.py SERVER_CORES): node 0's 6-17 and their siblings free.
 RECIPE_SERVER = frozenset(parse_cpu_list("0-5,36-41"))
 
