@@ -967,7 +967,7 @@ static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(s
 #ifndef EXL3_BENCH_PF_ROWS
 #define EXL3_BENCH_PF_ROWS 8
 #endif
-M1_ALWAYS_INLINE inline size_t reg_tile(int tile_k, int nt, int tiles_k, int tiles_n)
+M1_ALWAYS_INLINE size_t reg_tile(int tile_k, int nt, int tiles_k, int tiles_n)
 {
     if constexpr (EXL3_BENCH_LAYOUT == 1) return (size_t(nt >> 1) * tiles_k + tile_k) * 2 + (nt & 1);
     else if constexpr (EXL3_BENCH_LAYOUT == 2) return (size_t(nt >> 3) * tiles_k + tile_k) * 8 + (nt & 7);
