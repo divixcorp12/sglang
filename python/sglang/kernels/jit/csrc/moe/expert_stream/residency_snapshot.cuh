@@ -2,8 +2,8 @@
 // and inside its captured graph. Their record layouts are the host reference's
 // (python/sglang/srt/layers/moe/residency_capture_ref.py, module docstring); the kernels transcribe it.
 //
-//   exl3_residency_snapshot_kernel  the RAM map of the next kResidencyHorizons rows at T's prediction point
-//   exl3_route_labels_kernel        each route's lane kind after the post typed the lanes
+//   expert_stream_residency_snapshot_kernel  the RAM map of the next kResidencyHorizons rows at T's prediction point
+//   expert_stream_route_labels_kernel        each route's lane kind after the post typed the lanes
 //   ResidencySnapshotKernel         the checked host launchers for both
 #pragma once
 
@@ -38,7 +38,7 @@ struct ResidencySnapshotParams {
 
 // The snapshot kernel, one block of kResidencyThreads: warp h ballots horizon h's row 32 experts at a time into its
 // mask words (all zero for target -1), lane 0 stores them and copies valid[h]. A target past the bank traps.
-__global__ __launch_bounds__(device::expert_stream::kResidencyThreads, 1) void exl3_residency_snapshot_kernel(
+__global__ __launch_bounds__(device::expert_stream::kResidencyThreads, 1) void expert_stream_residency_snapshot_kernel(
     const __grid_constant__ ResidencySnapshotParams p) {
   using namespace device::expert_stream;
   if (threadIdx.x == 0) *p.stamp = global_ns();
@@ -73,7 +73,7 @@ struct RouteLabelParams {
 
 // The label kernel: a thread per route finds its lane among the first `count` planned ones (the last match, as the
 // reference's dict keeps) and writes that lane's kind, or kKindVramHot for a route outside the plan.
-__global__ __launch_bounds__(device::expert_stream::kLabelThreads) void exl3_route_labels_kernel(
+__global__ __launch_bounds__(device::expert_stream::kLabelThreads) void expert_stream_route_labels_kernel(
     const __grid_constant__ RouteLabelParams p) {
   using namespace device::expert_stream;
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -146,7 +146,7 @@ struct ResidencySnapshotKernel {
         .stamp = static_cast<uint64_t*>(stamp.data_ptr()),
     };
     const auto stream = LaunchKernel::resolve_device(masks.device());
-    LaunchKernel(dim3(1), dim3(kResidencyThreads), stream)(exl3_residency_snapshot_kernel, params);
+    LaunchKernel(dim3(1), dim3(kResidencyThreads), stream)(expert_stream_residency_snapshot_kernel, params);
   }
 
   /// \brief Launches the label kernel; see RouteLabelParams.
@@ -198,7 +198,7 @@ struct ResidencySnapshotKernel {
     };
     const auto blocks = static_cast<unsigned>((W_.unwrap() + kLabelThreads - 1) / kLabelThreads);
     const auto stream = LaunchKernel::resolve_device(kinds.device());
-    LaunchKernel(dim3(blocks), dim3(kLabelThreads), stream)(exl3_route_labels_kernel, params);
+    LaunchKernel(dim3(blocks), dim3(kLabelThreads), stream)(expert_stream_route_labels_kernel, params);
   }
 };
 

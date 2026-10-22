@@ -306,7 +306,7 @@ class ReaderCore {
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
         fault.ring_reset_fail || fault.nop_flush_refused) {
       // Fallback for a Reader that cannot inject submit faults. The instrumented instantiation
-      // (exl3_ram_miss_host_instr.cpp) pairs RowReader with FaultyReader<InstrUringReader>, which can, so no test
+      // (engine_host.cpp with SGLANG_EXPERT_STREAM_INSTR) pairs RowReader with FaultyReader<InstrUringReader>, which can, so no test
       // reaches this.
       throw std::runtime_error(error_prefix<Layout>() + "this reader cannot inject submit faults");
     }

@@ -1,6 +1,6 @@
 // Slot-map protocol kernels, independent of the streamed row's format.
 //
-//   PostParams / exl3_ram_miss_post_kernel   the post: applies the row's pending map delta, types the lanes and
+//   PostParams / expert_stream_post_kernel   the post: applies the row's pending map delta, types the lanes and
 //                                            publishes the demand record
 //   BulkApplyParams / ..._map_bulk_apply_kernel  applies every row's pending delta and the eager paths' map entries
 //                                            while the service is paused
@@ -141,7 +141,7 @@ SGL_DEVICE void stage_cpu_input(const PostParams& p) {
 // primary grid completed and flushed, as without PDL. The ordering is transitive down the chain
 // (analysis/dsv41-drive/LEASE_PROTOCOL.md, "PDL").
 template <bool kUsePDL>
-__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void expert_stream_post_kernel(
     const __grid_constant__ PostParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
@@ -383,7 +383,7 @@ struct BulkApplyParams {
 };
 
 // The bulk map apply: see BulkApplyParams. Traps on an entry outside the map bank.
-__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_map_bulk_apply_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void expert_stream_map_bulk_apply_kernel(
     const __grid_constant__ BulkApplyParams p) {
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
@@ -674,7 +674,7 @@ struct LeaseProtocolKernel {
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(
-            use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);
+            use_pdl != 0 ? expert_stream_post_kernel<true> : expert_stream_post_kernel<false>, params);
   }
 
   /// Launches the bulk map apply kernel; see BulkApplyParams. `lease_address` is the completion block's address.
@@ -722,7 +722,7 @@ struct LeaseProtocolKernel {
         .experts = E_.unwrap(),
         .row_capacity = static_cast<const int32_t*>(row_capacity.data_ptr()),
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_map_bulk_apply_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(expert_stream_map_bulk_apply_kernel, params);
   }
 };
 

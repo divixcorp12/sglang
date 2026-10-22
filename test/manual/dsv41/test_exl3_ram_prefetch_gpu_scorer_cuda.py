@@ -192,10 +192,10 @@ def test_seventeen_records_lap_the_first_slot_and_the_seqlock_shows_it():
 
 
 def test_the_seq_word_is_stored_last():
-    """With the closing store compiled out (EXL3_RAM_MISS_TEST_SPEC_NO_SEQ), a slot that already held this record's
+    """With the closing store compiled out (EXPERT_STREAM_TEST_SPEC_NO_SEQ), a slot that already held this record's
     seq reads as open, its payload written: the kernel opens the slot (seq 0, a release fence) before any payload store,
     and only the final release publishes it. Mutant: drop the opening store -- red (the stale seq reads ready)."""
-    module = es.device_module_with_hooks(["EXL3_RAM_MISS_TEST_SPEC_NO_SEQ"])
+    module = es.device_module_with_hooks(["EXPERT_STREAM_TEST_SPEC_NO_SEQ"])
     x, w, bias = exact_gate_case(0, tokens=1)
     page = es.new_candidate_page(pin=True)
     off = es.candidate_offset(5)

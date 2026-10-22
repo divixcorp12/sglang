@@ -23,7 +23,7 @@ class LaneKind(IntEnum):
 class LaneOverflow(ValueError):
     """Forced lanes (DIRECT found them no VRAM victim, the post's spill) cannot be CPU lanes: no host lanes (the copy
     engine is not armed) or no CPU layer. The post then serves the unforced prefix and flags the forward
-    (exl3_ram_miss_post_kernel)."""
+    (expert_stream_post_kernel)."""
 
 
 def split_miss_cut(cut: int, cut_max: int, *, cpu_experts: bool) -> tuple[int, int]:

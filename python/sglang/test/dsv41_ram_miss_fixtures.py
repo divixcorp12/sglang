@@ -320,8 +320,9 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
         ops._DEFAULT_VARIANT = conftest_default
     load_in_parallel(
         [
-            (_HOST_OPS, "_host_module", ("exl3", child_default, 8, 1)),  # what host_layout() loads: its default lanes, one node
-            (_HOST_OPS, "_host_module", ("exl3", variant or child_default, lanes, nodes)),
+            # what host_layout() loads: its default lanes, one node
+            (_HOST_OPS, "_host_module", (_EXL3_BUILD, child_default, 8, 1)),
+            (_HOST_OPS, "_host_module", (_EXL3_BUILD, variant or child_default, lanes, nodes)),
             # A child that serves a miss reads through this module, which the host modules do not load.
             (_URING_OPS, "_uring_file_reader_type", ()),
         ]
@@ -329,6 +330,7 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
 
 
 _HOST_OPS = "sglang.kernels.ops.moe.expert_stream_transport"
+_EXL3_BUILD = ("exl3", "sqrt_softplus")  # expert_stream_transport.EXL3_BUILD, as a literal: load_in_parallel crosses processes
 _URING_OPS = "sglang.kernels.ops.io.uring_file_reader"
 
 
@@ -338,7 +340,7 @@ def warm_host_module_set(variants: Sequence[str], lanes: Sequence[int], nodes: S
     from sglang.kernels.jit.utils.compile.warm import load_in_parallel
 
     load_in_parallel(
-        [(_HOST_OPS, "_host_module", ("exl3", v, l, n)) for v in variants for l in lanes for n in nodes]
+        [(_HOST_OPS, "_host_module", (_EXL3_BUILD, v, l, n)) for v in variants for l in lanes for n in nodes]
         + [(_URING_OPS, "_uring_file_reader_type", ())]
     )
 

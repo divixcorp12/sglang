@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "../router.h"
+
 namespace sglang::expert_stream {
 
 // IEEE half to float, exact. In software: the host may be built without F16C (SGLANG_JIT_HOST_MARCH).
@@ -43,12 +45,9 @@ inline float bf16_to_float(uint16_t b) {
   return std::bit_cast<float>(static_cast<uint32_t>(b) << 16);
 }
 
-// torch's softplus (threshold 20), through log1p as the DSV4.1 router computes it (sqrtsoftplus_log1p).
-inline float softplus(float z) {
-  return z > 20.0f ? z : std::log1p(std::exp(z));
-}
-
-class GateScorer {
+// The scorer for router R (router.h); R::score is the DSV4.1 router's torch-matching softplus for SqrtSoftplusBias.
+template <ExpertRouter R>
+class GateScorerFor {
  public:
   static constexpr int kDepth = 12;       // each token's ranks walked: the replay's (verify_gate_rankings --depth)
   static constexpr int kMaxPerLayer = 8;  // Python mirror: ram_prefetch.MAX_PER_LAYER
@@ -98,7 +97,7 @@ class GateScorer {
     for (int64_t e = 0; e < experts; ++e) {
       const uint16_t* we = w + e * hidden;
       for (int64_t t = 0; t < tokens; ++t) {
-        const float score = std::sqrt(softplus(dot(we, &x_[t * hidden], hidden))) + bias[e];
+        const float score = R::score(dot(we, &x_[t * hidden], hidden), bias[e]);
         score_[t * experts + e] = std::isnan(score) ? -std::numeric_limits<float>::infinity() : score;
       }
     }
@@ -162,6 +161,14 @@ class GateScorer {
   std::vector<int32_t> order_;
   std::vector<int32_t> picks_;
 };
+
+// The scorer every caller names. A translation unit that instantiates the engine for another router defines
+// SGLANG_EXPERT_STREAM_GATE_ROUTER before its first include (engine_host.cpp does, from -DSGLANG_EXPERT_ROUTER); each
+// host module is one translation unit, so the alias cannot differ within a module. Default: the DSV4 router.
+#ifndef SGLANG_EXPERT_STREAM_GATE_ROUTER
+#define SGLANG_EXPERT_STREAM_GATE_ROUTER ::sglang::expert_stream::SqrtSoftplusBias
+#endif
+using GateScorer = GateScorerFor<SGLANG_EXPERT_STREAM_GATE_ROUTER>;
 
 // Throws std::invalid_argument for a choice the scorer cannot make.
 inline void check_gate_choice(int64_t experts, int64_t top_k, int64_t per_token, int64_t per_layer) {

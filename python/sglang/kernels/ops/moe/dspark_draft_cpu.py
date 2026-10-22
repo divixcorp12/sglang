@@ -175,7 +175,7 @@ class DraftCpuHost:
         keep_warm_us: int,
         fatal_wait_s: float,
         variant: Optional[str] = None,
-        layout: str = "exl3",
+        layout: tuple[str, str] = ("exl3", "sqrt_softplus"),  # the transport build's (format, router) key
     ):
         from sglang.kernels.ops.moe import expert_stream_transport as ops
 

@@ -36,8 +36,10 @@ SUITES = [
     "test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py",
 ]
 PREFIX = "sgl_kernel_jit_"  # the JIT cache's module names
-DEVICE = re.compile(r"^(expert_stream_exl3_l8(_n2)?|expert_residency_direct_.*|(dsv41_)?exl3_moe_route_tables.*)$")
-HOST = re.compile(r"^expert_stream_host_exl3_(prod|instr)_l8(_n2)?$")
+DEVICE = re.compile(
+    r"^(expert_stream_exl3(_sqrt_softplus)?_l8(_n2)?|expert_residency_direct_.*|(dsv41_)?exl3_moe_route_tables.*)$"
+)
+HOST = re.compile(r"^expert_stream_host_exl3(_sqrt_softplus)?_(prod|instr)_l8(_n2)?$")
 # The wide template arguments this plan adds to shared kernels; their narrow instantiation is the old kernel.
 RENAMES = [
     # a function template demangles with its return type; the plain kernel it replaces has none
@@ -184,7 +186,7 @@ def main():
         raise SystemExit(2)
     kinds = ("device", "cpu") if args.permanent else ("device", "host", "cpu")
     diffs = [f"{kind} {key}" for kind in kinds for key, digest in golden.get(kind, {}).items()
-             if now.get(kind, {}).get(key) != digest and not (args.permanent and "exl3_ram_miss_post_kernel" in key)]
+             if now.get(kind, {}).get(key) != digest and not (args.permanent and ("expert_stream_post_kernel" in key or "exl3_ram_miss_post_kernel" in key))]
     print("\n".join(diffs) or "BS1 build unchanged")
     raise SystemExit(1 if diffs else 0)
 

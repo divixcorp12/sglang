@@ -246,9 +246,9 @@ def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
 # Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
 # the Python method that launches each. C1 and CC are plain launches.
 PDL_KERNELS = {
-    "exl3_ram_miss_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
-    "exl3_ram_miss_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
-    "exl3_ram_miss_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
+    "expert_stream_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
+    "expert_stream_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
+    "expert_stream_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
 }
 
 
@@ -295,9 +295,9 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     node ends)."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
     launcher = text[text.index("static void lease_copy_wait("):]
-    arm = launcher.index("exl3_ram_miss_lease_copy_wait_kernel<true>")
+    arm = launcher.index("expert_stream_lease_copy_wait_kernel<true>")
     wait = launcher.index("enqueue_gate_wait(")
-    commit = launcher.index("(exl3_ram_miss_lease_copy_commit_kernel, commit)")
+    commit = launcher.index("(expert_stream_lease_copy_commit_kernel, commit)")
     assert arm < wait < commit
     call = launcher[wait:launcher.index(";", wait)]
     assert "kLeaseCopyGate" in call, call
@@ -307,8 +307,8 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     enqueue = enqueue[: enqueue.index("\n}\n")]
     assert "channel::kGateOpen" in enqueue and "kStreamWaitValueGeq" in enqueue, enqueue
     assert "kStreamWaitValueGeq = 0;" in stream_wait and '"cuStreamWaitValue32_v2"' in stream_wait
-    assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(exl3_ram_miss_lease_copy_commit_kernel", launcher)
-    body = text[text.index("void exl3_ram_miss_lease_copy_commit_kernel("):]
+    assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(expert_stream_lease_copy_commit_kernel", launcher)
+    body = text[text.index("void expert_stream_lease_copy_commit_kernel("):]
     body = body[: body.index("\n}\n")]
     assert "PDL" not in body and "while" not in body and "__nanosleep" not in body, "the commit kernel must not wait"
     assert "channel::commit_or_trap<TargetChannel>(" in body
@@ -318,7 +318,7 @@ def test_cw_closes_the_gate_after_its_sm_reads_and_fences_before_the_copydone_lo
     """CW's SM reads of the kHitCopy lanes come before the gate close (behind the block barrier), and the Dekker fence
     separates the close from the CopyDone load. No Done word is left: nothing on the host waits for one."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
-    body = text[text.index("void exl3_ram_miss_lease_copy_wait_kernel("):]
+    body = text[text.index("void expert_stream_lease_copy_wait_kernel("):]
     body = body[: body.index("\n}\n")]
     reads = body.index("copy_wait_read(")
     barrier = body.index("__syncthreads();", reads)
@@ -531,16 +531,15 @@ def test_the_device_map_starts_empty_with_chain_one():
     assert bank["ce_ok"].tolist() == [0, 0] and bank["cpu_ok"].tolist() == [0, 0]
 
 
-@pytest.mark.parametrize("name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"])
-def test_the_exl3_host_file_is_only_bindings(name):
+def test_the_engine_host_file_is_only_bindings():
     """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
-    ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
-    back into one of them."""
-    path = CSRC / "exl3" / name
+    ffi_test_exports.h); the engine's one host file (both builds) only names its format, router, reader and build. Red
+    when a body grows back into it."""
+    path = CSRC / "expert_stream" / "engine_host.cpp"
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
     assert not bodies, f"{path.name} defines functions: {bodies}"
-    assert len(lines) < 40, f"{path.name} has {len(lines)} lines; it should hold only bindings"
+    assert len(lines) < 70, f"{path.name} has {len(lines)} lines; it should hold only bindings"
 
 
 if __name__ == "__main__":

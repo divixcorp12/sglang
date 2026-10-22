@@ -17,7 +17,8 @@
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
 //              pause_ns
-//   prefetch   score_gate: the RAM prefetch's gate scorer on given tensors, in both builds
+//   prefetch   score_gate: the RAM prefetch's gate scorer on given tensors, in both builds;
+//              router_score: a router's host score (router.h) on given dots and biases
 //   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host;
 //              draft_test_poll_pause: the draft source's poll path sleeps between its stop and head loads
 //   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
@@ -44,9 +45,9 @@ struct HostTestExports;
 ///
 /// Derived from HostExports, so a handle its open() returned resolves here: both use the same function-local
 /// registries.
-template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
-struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout, Reader, Build> {
-  using Base = HostExports<Layout, Reader, Build>;
+template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build, class CpuKernel>
+struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExports<Layout, Reader, Build, CpuKernel> {
+  using Base = HostExports<Layout, Reader, Build, CpuKernel>;
   using Base::check_table_tensors;
   using Base::find;
   using typename Base::Source;
@@ -1903,6 +1904,22 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
     return n;
   }
+
+  // R::score over `dots` and `biases` (fp32 [n]) into `out`; router 0 is SqrtSoftplusBias, 1 SigmoidBias.
+  static void router_score(int64_t router, TensorView dots, TensorView biases, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    auto N = SymbolicSize{"n"};
+    expert_stream::verify_named("dots", TensorMatcher({N}).with_dtype<float>().with_device<kDLCPU>(cpu), dots);
+    expert_stream::verify_named("biases", TensorMatcher({N}).with_dtype<float>().with_device<kDLCPU>(cpu), biases);
+    expert_stream::verify_named("out", TensorMatcher({N}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
+    if (router != 0 && router != 1) throw std::runtime_error("router_score: router is 0 (sqrt_softplus) or 1 (sigmoid)");
+    const auto* d = static_cast<const float*>(dots.data_ptr());
+    const auto* b = static_cast<const float*>(biases.data_ptr());
+    auto* o = static_cast<float*>(out.data_ptr());
+    for (int64_t i = 0; i < N.unwrap(); ++i)
+      o[i] = router == 0 ? SqrtSoftplusBias::score(d[i], b[i]) : SigmoidBias::score(d[i], b[i]);
+  }
 };
 
 }  // namespace sglang::expert_stream
@@ -1960,4 +1977,5 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_demand_load, Exports::inject_demand_load);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);                         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_score_gate, Exports::score_gate);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_score_gate, Exports::score_gate);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_router_score, Exports::router_score);

@@ -7,7 +7,7 @@
 //                          g = sigmoid(w_gate h + b_gate), hid = v + g r; v and gelu(r1) cross blocks through DSMEM
 //   spec_head_out_kernel   K3: logits = w_out hid + b_out
 //   spec_head_tail_kernel  K4 (spec_head_tail.cuh): block score, sigmoid, skips, threshold, cap-1 record
-//   SpecHeadKernel         the checked host launchers
+//   SpecHeadKernelFor<R>   the checked host launchers; R must set kSupportsLearnedHead (router.h)
 //
 // Weights are bf16, accumulation and the workspaces between launches fp32 (D3). Nothing under srt launches these.
 #pragma once
@@ -319,7 +319,12 @@ __global__ __launch_bounds__(device::expert_stream::kHeadThreads) void spec_head
 /// the stream of the tensors' device and without PDL, so the first starts after the native score kernel before it.
 ///
 /// Every input is checked before the first launch and nothing syncs the host, so `run` is graph-capturable.
-struct SpecHeadKernel {
+template <::sglang::expert_stream::ExpertRouter R>
+struct SpecHeadKernelFor {
+  static_assert(
+      R::kSupportsLearnedHead,
+      "the learned L+2 head was trained on DSV4 routing (SqrtSoftplusBias); this router has no trained head");
+
   /// \brief Launches K1, K2, K3 and the tail: the head's block scores and its cap-1 read for one record.
   /// \param x bf16 [tokens, hidden], 1 <= tokens <= kHeadMaxTokens: the source layer's MoE input.
   /// \param scores fp32 [tokens_max, experts], tokens <= tokens_max: the native score kernel's biased gate scores.
@@ -824,5 +829,8 @@ struct SpecHeadKernel {
     return p;
   }
 };
+
+// The DSV4 head, the name spec_head.py binds.
+using SpecHeadKernel = SpecHeadKernelFor<::sglang::expert_stream::SqrtSoftplusBias>;
 
 }  // namespace sglang

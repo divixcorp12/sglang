@@ -788,7 +788,7 @@ def test_the_layout_is_read_from_the_module_the_launch_builds(tiers, monkeypatch
     monkeypatch.setattr(module, "host_layout", lambda **kwargs: asked.append(kwargs) or (EXL3_STREAMED_NAMES, 0))
     service.plan_gather_width(12)
     service.ensure_started()
-    assert asked == [{"lanes": 16}]
+    assert asked == [{"layout": ("exl3", "sqrt_softplus"), "lanes": 16}]
 
 
 def test_the_wire_and_lanes_are_unreadable_before_the_service_starts(tiers):

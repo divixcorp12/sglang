@@ -16,7 +16,7 @@
 
 #include "aligned.h"
 #include "device_sim.h"
-#include "exl3/exl3_row_layout.h"
+#include "formats/exl3/row_layout.h"
 #include "expert_stream/host/build_policy.h"
 #include "expert_stream/host/core_topology.h"
 #include "expert_stream/host/ram_thread.h"
@@ -38,8 +38,8 @@ namespace es = ::sglang::expert_stream;
 using BenchBuild = std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>;
 static_assert(kNames == static_cast<int>(::sglang::exl3::Exl3RowLayout::kNames.size()));
 
-// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3/exl3_ram_miss_host.cpp and
-// exl3_ram_miss_host_instr.cpp, minus the instrumented build's FaultyReader.
+// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/expert_stream/engine_host.cpp, minus the
+// instrumented build's FaultyReader.
 template <class Build>
 struct ReaderFor;
 template <>

@@ -6,16 +6,17 @@ MOE = Path(__file__).resolve().parents[1] / "kernels" / "jit" / "csrc" / "moe"
 
 
 def host_sources() -> tuple[Path, ...]:
-    """The EXL3 host instantiations (production, instrumented) first, then every transport host header."""
+    """The engine's host translation unit (one file for the production and instrumented builds) first, then every
+    transport host header."""
     return (
-        MOE / "exl3" / "exl3_ram_miss_host.cpp",
-        MOE / "exl3" / "exl3_ram_miss_host_instr.cpp",
+        MOE / "expert_stream" / "engine_host.cpp",
         *sorted((MOE / "expert_stream" / "host").glob("*.h")),
     )
 
 
 def device_sources() -> tuple[Path, ...]:
-    return (MOE / "exl3" / "exl3_ram_miss.cuh", *sorted((MOE / "expert_stream").glob("*.cuh")))
+    """Every device header of the transport and the engine's device translation unit (engine_device.cuh)."""
+    return tuple(sorted((MOE / "expert_stream").glob("*.cuh")))
 
 
 def wire_header() -> Path:

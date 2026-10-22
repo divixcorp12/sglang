@@ -1,26 +1,51 @@
-// exl3_ram_miss_host.cpp -- the production build.
-// The EXL3 instantiation of the expert-stream host transport: its row layout, file reader and build policy
-// (ProdBuild, build_policy.h), and the FFI exports. exl3_ram_miss_host_instr.cpp is the instrumented build.
-// Production reads through the bare UringReader: no FaultyReader, no fault state (plan 2026-09-29-hotpath-zero-overhead
-// Task 10); every test-only export refuses, naming the instrumented build.
-#include "exl3_row_layout.h"
-#include "../expert_stream/host/build_policy.h"
-#include "../expert_stream/host/ffi_exports.h"
-#include "../expert_stream/host/ffi_test_exports.h"
-#include "../expert_stream/host/uring_reader.h"
+// engine_host.cpp -- the expert-stream engine's host module, one translation unit for every format and router.
+//
+// The format (-DSGLANG_EXPERT_FORMAT) and router (-DSGLANG_EXPERT_ROUTER) are picked by engine_select.h; this file binds
+// that format's row layout and CPU-kernel binding, the file reader and the build policy (build_policy.h) into
+// HostExports and expands the FFI exports. Two builds, as before the engine was generic:
+//   production (default)            the bare UringReader and ProdBuild: no FaultyReader, no fault state (plan
+//                                   2026-09-29-hotpath-zero-overhead Task 10); every test-only export refuses, naming
+//                                   the instrumented build.
+//   instrumented (-DSGLANG_EXPERT_STREAM_INSTR=1)   InstrBuild with stage trace, full counters and test-only faults. A
+//                                   service loads it when the process writes a stream trace or injects a RAM-miss fault
+//                                   (expert_stream_transport.host_variant).
+// The module's host gate scorer is the engine's router: SGLANG_EXPERT_STREAM_GATE_ROUTER (host/gate_scorer.h).
+#define SGLANG_EXPERT_STREAM_GATE_ROUTER ::sglang::expert_stream::routers::SGLANG_EXPERT_ROUTER
+
+#include "engine_select.h"
+#include "host/build_policy.h"
+#if defined(SGLANG_EXPERT_STREAM_INSTR) && SGLANG_EXPERT_STREAM_INSTR
+#include "host/faulty_reader.h"
+#endif
+#include "host/ffi_exports.h"
+#include "host/ffi_test_exports.h"
+#include "host/uring_reader.h"
 
 namespace sglang {
 
-using Exl3Reader = expert_stream::UringReader;
-static_assert(expert_stream::AsyncFileReader<Exl3Reader>);
-using Exl3HostExports = expert_stream::HostExports<exl3::Exl3RowLayout, Exl3Reader, expert_stream::ProdBuild>;
+#if defined(SGLANG_EXPERT_STREAM_INSTR) && SGLANG_EXPERT_STREAM_INSTR
+using EngineReader = expert_stream::FaultyReader<expert_stream::InstrUringReader>;
+using EngineBuild = expert_stream::InstrBuild;
+#else
+using EngineReader = expert_stream::UringReader;
+using EngineBuild = expert_stream::ProdBuild;
+#endif
+static_assert(expert_stream::AsyncFileReader<EngineReader>);
+using EngineHostExports = expert_stream::
+    HostExports<expert_stream::EngineLayout, EngineReader, EngineBuild, expert_stream::EngineFormat::CpuKernel>;
 
-static_assert(!expert_stream::HasRingFaultHooks<Exl3Reader>, "production reads through a reader with no fault hooks");
+#if defined(SGLANG_EXPERT_STREAM_INSTR) && SGLANG_EXPERT_STREAM_INSTR
 static_assert(
-    !Exl3HostExports::kReaderFaults && !Exl3HostExports::kSqeLog && !Exl3HostExports::kBallast,
+    EngineHostExports::kReaderFaults && EngineHostExports::kSqeLog && EngineHostExports::kBallast,
+    "the instrumented build keeps every fault");
+#else
+static_assert(!expert_stream::HasRingFaultHooks<EngineReader>, "production reads through a reader with no fault hooks");
+static_assert(
+    !EngineHostExports::kReaderFaults && !EngineHostExports::kSqeLog && !EngineHostExports::kBallast,
     "the production build carries no fault state");
+#endif
 
-EXPERT_STREAM_HOST_EXPORTS(Exl3HostExports)
-EXPERT_STREAM_HOST_TEST_EXPORTS(Exl3HostExports)
+EXPERT_STREAM_HOST_EXPORTS(EngineHostExports)
+EXPERT_STREAM_HOST_TEST_EXPORTS(EngineHostExports)
 
 }  // namespace sglang

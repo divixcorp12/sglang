@@ -29,7 +29,7 @@ CAPACITY = 1 << 20  # stage s's layer has capacity CAPACITY + s, which the fake 
 
 
 def _module():
-    return ops._host_module("exl3", VARIANT)
+    return ops._host_module(ops.EXL3_BUILD, VARIANT)
 
 
 def _u32(t: torch.Tensor, off: int) -> int:
@@ -250,7 +250,7 @@ from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
-m = ops._host_module("exl3", "instr")
+m = ops._host_module(ops.EXL3_BUILD, "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 1 if case == "fail" else 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]
@@ -298,7 +298,7 @@ from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
 mode = sys.argv[2]
-m = ops._host_module("exl3", "instr")
+m = ops._host_module(ops.EXL3_BUILD, "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]

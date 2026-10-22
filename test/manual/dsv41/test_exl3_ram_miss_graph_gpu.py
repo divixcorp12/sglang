@@ -469,7 +469,7 @@ def test_residency_capture_adds_exactly_its_nodes_to_the_graph_and_fills_its_rin
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
     layer, streamer, service, _ = _layers(tmp_path)
-    snapshot_kernel, label_kernel = "exl3_residency_snapshot_kernel", "exl3_route_labels_kernel"
+    snapshot_kernel, label_kernel = "expert_stream_residency_snapshot_kernel", "expert_stream_route_labels_kernel"
     try:
         backend = streamer.row_backend
         assert backend.residency_hook is None and backend.route_log is None

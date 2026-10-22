@@ -41,6 +41,7 @@ from sglang.kernels.ops.moe.expert_cache_transfer import (
 from sglang.kernels.ops.moe.expert_lease_block import MAX_LANES, WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DRIP_TABLE_SLOTS,
+    EXL3_BUILD,
     ExpertStreamDevice,
     ExpertStreamHost,
     device_stamps_enabled,
@@ -326,7 +327,7 @@ def sm_copy_mask(names: Sequence[str], lanes: int = 8) -> int:
     With ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` the copy wait moves the host
     layout's small tensors, wherever they sit in ``names``.
     """
-    layout_names, small = host_layout(lanes=lanes)
+    layout_names, small = host_layout(layout=EXL3_BUILD, lanes=lanes)
     small_names = {name for i, name in enumerate(layout_names) if small >> i & 1}
     return sum(1 << i for i, name in enumerate(names) if name in small_names)
 
@@ -1235,7 +1236,7 @@ class Exl3RamMissService:
             ),
         )
         lanes = self.resolved_lanes()
-        layout_names, _ = host_layout(lanes=lanes)
+        layout_names, _ = host_layout(layout=EXL3_BUILD, lanes=lanes)
         if layout_names != EXL3_STREAMED_NAMES:
             raise RuntimeError(
                 f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
@@ -1280,6 +1281,7 @@ class Exl3RamMissService:
             page=page,
             slot_map=slot_map,
             hot_page=hot_page,
+            layout=EXL3_BUILD,
             variant="instr" if instrumented else None,
             lanes=self.lanes,
             node_ranges=node_ranges,
@@ -1755,6 +1757,7 @@ class Exl3RamMissService:
                 self.page,
                 # The host allocates the lease block; the device reads the same one.
                 self.host.lease_block,
+                layout=EXL3_BUILD,
                 device=cache.device,
                 layers=len(self._rows),
                 experts=self.host.experts,

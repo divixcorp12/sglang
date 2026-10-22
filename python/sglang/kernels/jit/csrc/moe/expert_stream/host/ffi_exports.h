@@ -2,8 +2,8 @@
 //
 // HostExports is written once for every row layout and file reader. An instantiation file names a layout, a reader
 // and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and EXPERT_STREAM_HOST_TEST_EXPORTS (the
-// test and tool exports live in ffi_test_exports.h). See exl3/exl3_ram_miss_host.cpp (ProdBuild) and
-// exl3/exl3_ram_miss_host_instr.cpp (InstrBuild).
+// test and tool exports live in ffi_test_exports.h). See engine_host.cpp (ProdBuild, and InstrBuild under
+// SGLANG_EXPERT_STREAM_INSTR).
 //
 // Every export takes an opaque `handle` naming a service in a per-instantiation registry; each call holds its own
 // reference, so close() from another thread frees the service only after calls in flight return.
@@ -18,6 +18,7 @@
 #include "../tensor_checks.h"
 #include "build_policy.h"
 #include "core_topology.h"
+#include "cpu_experts/binding.hpp"
 #include "ram_thread.h"
 #include "row_reader.h"
 
@@ -30,7 +31,11 @@ using tvm::ffi::TensorView;
 ///
 /// The function-local registries are per instantiation, and each layout is its own module, so one layout's handles can
 /// never resolve in another's.
-template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
+///
+/// `CpuKernel` is the format's binding to a CPU expert kernel (format.h, cpu_experts/binding.hpp). The kernel itself
+/// still arrives by address from Python at enable_cpu_experts; the binding only says whether the format has one. Not
+/// usable: the CPU-expert and draft entry points refuse at startup (require_cpu_kernel), so no CPU lane exists.
+template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build, class CpuKernel = cpu_experts::ExternalCpuKernel<>>
 struct HostExports {
   static_assert(BuildPolicy<Build>);
   using CpuExpertEngine = BasicCpuExpertEngine<Build>;
@@ -429,6 +434,16 @@ struct HostExports {
     find(handle)->set_drip_scratch(std::move(list), static_cast<uint64_t>(table));
   }
 
+  // Refuses `what` (a request for CPU lanes or a draft's CPU experts) when the format's CpuKernel is not usable: the
+  // run must not start without work it asked for, and policy never sees a lane to route to.
+  static void require_cpu_kernel([[maybe_unused]] const char* what) {
+    if constexpr (!CpuKernel::usable()) {
+      throw std::runtime_error(
+          error_prefix<Layout>() + what + ": the " + std::string(Layout::kName) +
+          " format has no CPU expert kernel (UnsupportedCpuKernel)");
+    }
+  }
+
   // A slab table and a layer's scalars as the ExpertLayer make_layer takes (set_cpu_layer, the test export kernel_layer):
   // `slabs` int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab),
   // n <= kMaxSlabs.
@@ -493,6 +508,7 @@ struct HostExports {
       TensorView w13_weights,
       TensorView w2_weights) {
     using namespace host;
+    require_cpu_kernel("CPU experts");
     auto cpu = SymbolicDevice{};
     auto host_mem = SymbolicDevice{};
     auto rows = SymbolicSize{"rows"};
@@ -646,6 +662,7 @@ struct HostExports {
       int64_t keep_warm_ns,
       int64_t fatal_wait_ns) {
     using namespace host;
+    require_cpu_kernel("DSpark draft CPU experts");
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
     auto d = std::make_shared<DraftOnly>();
@@ -671,6 +688,7 @@ struct HostExports {
   static cpu_experts::ExpertLayer make_draft_layer(
       int64_t kernel, TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation,
       double act_limit, TensorView params) {
+    require_cpu_kernel("DSpark draft CPU experts");
     if (kernel == 0) throw std::runtime_error("DSpark draft CPU experts need the format's kernel");
     const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
     return k->make_layer(layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));

@@ -1,4 +1,9 @@
-"""Python wrappers for the RAM-miss expert-stream transport of EXL3 streamed experts.
+"""Python wrappers for the RAM-miss expert-stream transport of streamed experts.
+
+The transport is built per (format, router) pair (``LAYOUTS``: the engine's template
+translation units, ``csrc/moe/expert_stream/engine_{host.cpp,device.cuh}``, instantiated
+for ``csrc/moe/formats/<format>`` and the router of ``csrc/moe/expert_stream/router.h``);
+every entry point takes its pair as ``layout``.
 
 Streamed experts live in files and in pinned host RAM; the device kernels fetch the
 ones a layer needs through a request/response protocol with a C++ service thread.
@@ -48,31 +53,51 @@ if TYPE_CHECKING:
 
 
 class TransportBuild(msgspec.Struct, frozen=True):
-    """One instantiation of the transport for a row format.
+    """One instantiation of the transport for a (format, router) pair.
 
     ``host_sources`` maps each build variant (``VARIANTS``) to the host translation
     unit that binds the format's C++ layout and file reader. ``device_source`` is the
-    translation unit ``RowCopyKernel`` is compiled in, and ``device_layout`` the
-    layout type it is instantiated with.
+    translation unit ``RowCopyKernel`` is compiled in, ``device_layout`` the layout
+    type it is instantiated with and ``spec_score_kernel`` the GPU scorer launcher
+    (``spec_score.cuh``) the scorer exports bind. ``defines`` are the ``-D`` flags
+    both translation units take; the engine's pick the format and router.
     """
 
     host_sources: dict[str, str]
     device_source: str
     device_layout: str
+    spec_score_kernel: str = "SpecScoreKernel"
+    defines: tuple[str, ...] = ()
 
 
-# One entry per format the transport is built for. Adding a format adds an entry, its
-# instantiation files (``host_sources``, ``device_source``) and the layout type they
-# define.
-LAYOUTS = {
-    "exl3": TransportBuild(
-        host_sources={
-            "prod": "moe/exl3/exl3_ram_miss_host.cpp",
-            "instr": "moe/exl3/exl3_ram_miss_host_instr.cpp",
-        },
-        device_source="moe/exl3/exl3_ram_miss.cuh",
-        device_layout="sglang::exl3::Exl3RowLayout",
+# A transport build is named by its (format, router) pair, in this order.
+BuildKey = tuple[str, str]
+EXL3_BUILD: BuildKey = ("exl3", "sqrt_softplus")
+NVFP4_BUILD: BuildKey = ("nvfp4", "sqrt_softplus")
+MXFP4_BUILD: BuildKey = ("mxfp4", "sigmoid")
+
+_ENGINE_HOST = "moe/expert_stream/engine_host.cpp"
+_ENGINE_DEVICE = "moe/expert_stream/engine_device.cuh"
+
+
+def _engine_build(key: BuildKey) -> TransportBuild:
+    """The engine's template translation units for ``key``: one host file for both variants (the instrumented one adds
+    ``-DSGLANG_EXPERT_STREAM_INSTR``) and one device file, with the format and router chosen by macro."""
+    fmt, router = key
+    return TransportBuild(
+        host_sources={"prod": _ENGINE_HOST, "instr": _ENGINE_HOST},
+        device_source=_ENGINE_DEVICE,
+        device_layout="sglang::expert_stream::EngineLayout",
+        spec_score_kernel="SpecScoreKernelFor<sglang::expert_stream::EngineRouter>",
+        defines=(f"-DSGLANG_EXPERT_FORMAT={fmt}", f"-DSGLANG_EXPERT_ROUTER={router}"),
     )
+
+
+# One entry per (format, router) the transport is built for. A pair the engine does not
+# build is absent: ``_build_for`` raises with the JIT key it looked for. Adding a format
+# adds a ``csrc/moe/formats/<format>/format.h`` and an entry here.
+LAYOUTS: dict[BuildKey, TransportBuild] = {
+    key: _engine_build(key) for key in (EXL3_BUILD, NVFP4_BUILD, MXFP4_BUILD)
 }
 
 # The two host builds: production (ProdBuild) and instrumented (InstrBuild), selected
@@ -161,16 +186,16 @@ def _refuse_test_only(name: str, variant: Optional[str]) -> None:
         )
 
 
-# cache_once keys f(), f("exl3") and f(layout="exl3") apart, so each cached loader
-# below is called only positionally, through a wrapper: a layout and variant then have
-# exactly one module whatever the call form.
+# cache_once keys f(), f(EXL3_BUILD) and f(layout=EXL3_BUILD) apart, so each cached loader
+# below is called only positionally, through a wrapper: a (format, router) key and
+# variant then have exactly one module whatever the call form.
 def _suffix(lanes: int, nodes: int) -> str:
     """A build's module-name suffix: one node keeps the Phase 1 names, so its modules and caches are unchanged."""
     return f"_l{lanes}" if nodes == 1 else f"_l{lanes}_n{nodes}"
 
 
 def _host_module(
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     lanes: int = 8,
     nodes: int = 1,
@@ -185,24 +210,64 @@ def _host_module(
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
         )
-    if variant not in LAYOUTS[layout].host_sources:
-        raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
     trigger_only = os.environ.get("SGLANG_DRAFT_DELAY_TRIGGER_ONLY", "0") == "1"
+    if variant not in _build_for(layout, host_jit_key(layout, variant, lanes, nodes, trigger_only)).host_sources:
+        raise ValueError(f"build {layout!r} has no {variant!r} host build variant")
     if trigger_only and variant != "prod":
         raise ValueError("SGLANG_DRAFT_DELAY_TRIGGER_ONLY requires the production host build")
     return _host_module_cached(layout, variant, lanes, nodes, trigger_only)
 
 
+def _check_key(layout) -> BuildKey:
+    """``layout`` as a (format, router) key, or ValueError: a bare format name is refused so every caller states its router."""
+    if not (isinstance(layout, tuple) and len(layout) == 2 and all(isinstance(part, str) for part in layout)):
+        raise ValueError(
+            f"an expert-stream build is a (format, router) key such as {EXL3_BUILD}, got {layout!r}; "
+            f"registered: {sorted(LAYOUTS)}"
+        )
+    return layout
+
+
+def host_jit_key(layout: BuildKey, variant: str, lanes: int = 8, nodes: int = 1, trigger_only: bool = False) -> str:
+    """The JIT module name of the host build ``layout`` x ``variant`` x ``lanes`` x ``nodes``: it names both the format
+    and the router, so two pairs never share a module."""
+    fmt, router = _check_key(layout)
+    return f"expert_stream_host_{fmt}_{router}_{variant}{'_trigger' if trigger_only else ''}{_suffix(lanes, nodes)}"
+
+
+def device_jit_key(layout: BuildKey, lanes: int = 8, nodes: int = 1) -> str:
+    """The JIT module name of the device build of ``layout`` for ``lanes`` and ``nodes`` (test and stamped builds add a
+    marker after it)."""
+    fmt, router = _check_key(layout)
+    return f"expert_stream_{fmt}_{router}{_suffix(lanes, nodes)}"
+
+
+def _build_for(layout: BuildKey, jit_key: str) -> TransportBuild:
+    """The registered ``TransportBuild`` of ``layout``; ValueError naming ``jit_key``, the module it looked for, when the
+    (format, router) pair is not one of ``LAYOUTS``."""
+    try:
+        return LAYOUTS[_check_key(layout)]
+    except KeyError:
+        raise ValueError(
+            f"no expert-stream transport is registered for (format, router) {layout!r}: JIT key {jit_key!r} has no "
+            f"build; registered: {sorted(LAYOUTS)}"
+        ) from None
+
+
 @cache_once
-def _host_module_cached(layout: str, variant: str, lanes: int, nodes: int, trigger_only: bool = False) -> Module:
+def _host_module_cached(layout: BuildKey, variant: str, lanes: int, nodes: int, trigger_only: bool = False) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
+    key = host_jit_key(layout, variant, lanes, nodes, trigger_only)
+    build = _build_for(layout, key)
     return load_jit(
-        f"expert_stream_host_{layout}_{variant}{'_trigger' if trigger_only else ''}{_suffix(lanes, nodes)}",
-        cpp_files=[LAYOUTS[layout].host_sources[variant]],
+        key,
+        cpp_files=[build.host_sources[variant]],
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
+            *build.defines,
+            *(["-DSGLANG_EXPERT_STREAM_INSTR=1"] if variant == "instr" else []),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
             *(["-DSGLANG_DRAFT_DELAY_TRIGGER_ONLY=1"] if trigger_only else []),
@@ -221,13 +286,16 @@ _ALLOW_TSAN = False
 
 
 @cache_once
-def _host_module_tsan(layout: str, lanes: int, nodes: int) -> Module:
+def _host_module_tsan(layout: BuildKey, lanes: int, nodes: int) -> Module:
+    key = host_jit_key(layout, "instr_tsan", lanes, nodes)
     return load_jit(
-        f"expert_stream_host_{layout}_instr_tsan{_suffix(lanes, nodes)}",
-        cpp_files=[LAYOUTS[layout].host_sources["instr"]],
+        key,
+        cpp_files=[_build_for(layout, key).host_sources["instr"]],
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
+            *_build_for(layout, key).defines,
+            "-DSGLANG_EXPERT_STREAM_INSTR=1",
             "-fsanitize=thread",
             "-O1",
             "-g",
@@ -239,7 +307,7 @@ def _host_module_tsan(layout: str, lanes: int, nodes: int) -> Module:
     )
 
 
-def host_layout(layout: str = "exl3", lanes: int = 8) -> tuple[tuple[str, ...], int]:
+def host_layout(layout: BuildKey = EXL3_BUILD, lanes: int = 8) -> tuple[tuple[str, ...], int]:
     """Return the host module's row layout.
 
     That is its tensor names in copy-table order and a bit mask of the ones the SMs
@@ -250,7 +318,7 @@ def host_layout(layout: str = "exl3", lanes: int = 8) -> tuple[tuple[str, ...], 
 
 
 @cache_once
-def _host_layout_cached(layout: str, lanes: int) -> tuple[tuple[str, ...], int]:
+def _host_layout_cached(layout: BuildKey, lanes: int) -> tuple[tuple[str, ...], int]:
     # The default variant is enough: every variant of a layout has the same layout.
     module = _host_module(layout, lanes=lanes)
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(
@@ -351,7 +419,7 @@ def read_rows_once(
     slots,
     *,
     step: int = BOUNCE_ROWS,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++.
@@ -468,7 +536,7 @@ def read_rows_traced(
     *,
     step: int = BOUNCE_ROWS,
     owner_core: int = -1,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict]:
@@ -575,7 +643,7 @@ def read_rows_drive_load(
     nested: bool = False,
     step: int = BOUNCE_ROWS,
     preload: Sequence[tuple[int, int]] = (),
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> dict:
@@ -648,7 +716,7 @@ def read_rows_idle(
     spread: bool = False,
     pieces: int = 1,
     reads: int = 1,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> dict:
@@ -723,7 +791,7 @@ def read_rows_with_fault(
     *,
     cqes: Optional[list[int]] = None,
     stats: Optional[dict] = None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, int]:
@@ -837,7 +905,7 @@ def read_rows_sqes(
     step: int = BOUNCE_ROWS,
     max_sqes: int = 4096,
     span_weights=None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
@@ -907,7 +975,7 @@ def publish_piece(
     generation: int,
     bit: int,
     *,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[bool, int]:
     """Test only: the reader owner's publish primitive on one readiness word.
@@ -955,7 +1023,7 @@ def read_rows_pieces(
     reference: Optional[torch.Tensor] = None,
     ref_slots=None,
     step: int = BOUNCE_ROWS,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict, torch.Tensor, dict]:
@@ -1018,7 +1086,7 @@ def piece_geometry(
     *,
     two_span: bool = False,
     span_weights=None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> Optional[tuple[list[dict], list[dict]]]:
     """Test only: how the C++ reader cuts one expert under piece streaming.
@@ -1066,7 +1134,7 @@ def read_rows_two_span(
     ref_slots,
     step: int = BOUNCE_ROWS,
     span_weights=None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> dict:
@@ -1236,7 +1304,7 @@ STAGE_ORDER = (
 
 
 def _stage_words(
-    layout: str = "exl3", variant: Optional[str] = None, lanes: int = 8
+    layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None, lanes: int = 8
 ) -> int:
     """Return the C++ ``StageRecord`` word count of a ``lanes``-lane build, checked against ``stage_fields``."""
     words = int(_host_module(layout, variant, lanes).expert_stream_trace_words())
@@ -1375,7 +1443,7 @@ def hot_record_bytes(experts: int) -> int:
     """Return the size of one hot-bitmap record: header plus one bit per expert."""
     if experts <= 0 or experts > 65535:
         raise ValueError(
-            f"EXL3 hot bitmap expert count {experts} is outside [1, 65535]"
+            f"expert-stream hot bitmap expert count {experts} is outside [1, 65535]"
         )
     return (
         (HOT_HEADER_BYTES + (experts + 7) // 8 + HOT_ALIGNMENT - 1) // HOT_ALIGNMENT
@@ -1575,7 +1643,7 @@ DRIP_STATES = ("free", "filling", "published", "retiring", "publishing", "cleari
 def seqlock_stress(
     seconds: float,
     *,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     lanes: int = 8,
 ) -> tuple[int, int]:
@@ -1601,7 +1669,7 @@ def read_record_fields(
     record: torch.Tensor,
     expected: int,
     *,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     lanes: int = 8,
 ) -> dict:
@@ -1644,7 +1712,7 @@ def read_record_fields(
 _kernel_layer_keep: dict[int, tuple] = {}
 
 
-def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
+def kernel_layer(kernel: int, spec, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> int:
     """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
 
     ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: the DSpark draft's CPU experts
@@ -1678,7 +1746,7 @@ def kernel_forward(
     cores: Sequence[int] = (),
     accumulate: bool = False,
     store_first: bool = False,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[int, str]:
     """One forward of :func:`kernel_layer`'s ``layer`` over ``rows`` token rows (x ``[rows, H]``, slots and weights
@@ -1717,7 +1785,7 @@ def kernel_forward_two_stage(
     delay_s: float,
     cores: Sequence[int] = (),
     accumulate: bool = False,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[int, str, dict]:
     """Test only: :func:`kernel_forward` as a two-stage CPU miss runs it (``SGLANG_DSV41_CPU_TWO_STAGE``).
@@ -1748,13 +1816,13 @@ def kernel_forward_two_stage(
     return status, (str(module.expert_stream_kernel_error()) if status else ""), {"calls": calls, "waited_ns": waited}
 
 
-def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
+def kernel_drop(layer: int, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> None:
     """Release :func:`kernel_layer`'s ``layer``. Both builds."""
     _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
     _kernel_layer_keep.pop(int(layer), None)
 
 
-def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
+def pause_ns(*, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> float:
     """Test only: ns per ``_mm_pause`` on this core.
 
     That is the RAM-miss service's idle-poll quantum. Instrumented build only.
@@ -1774,7 +1842,7 @@ def score_gate(
     per_layer: int,
     top_k_only: bool = False,
     return_meta: bool = False,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> list:
     """The RAM prefetch's gate scorer (``host/gate_scorer.h``): ``x`` fp16 ``[tokens, >= hidden]`` (columns past
@@ -1804,6 +1872,30 @@ def score_gate(
     return out[:n].tolist()
 
 
+ROUTERS = {"sqrt_softplus": 0, "sigmoid": 1}  # router.h kName -> router_score's router index
+
+
+def router_score(
+    router: str,
+    dots: torch.Tensor,
+    biases: torch.Tensor,
+    *,
+    layout: BuildKey = EXL3_BUILD,
+    variant: Optional[str] = None,
+) -> torch.Tensor:
+    """The host score of router ``router`` (``ROUTERS``, ``csrc/moe/expert_stream/router.h``) for fp32 ``dots`` and
+    ``biases`` of one shape ``[n]``. Both builds."""
+    if router not in ROUTERS:
+        raise ValueError(f"router_score: router is one of {sorted(ROUTERS)}")
+    if dots.dtype != torch.float32 or biases.dtype != torch.float32 or dots.shape != biases.shape or dots.dim() != 1:
+        raise ValueError("router_score takes fp32 dots and biases of one 1-D shape")
+    out = torch.zeros_like(dots)
+    _host_module(layout, variant).expert_stream_router_score(
+        ROUTERS[router], dots.contiguous(), biases.contiguous(), out
+    )
+    return out
+
+
 def new_page(*, pin: bool, wire: expert_lease_block.WireLayout) -> torch.Tensor:
     """A zeroed request page of ``wire``; pinned (device-readable through UVA) for a real device."""
     return torch.zeros(wire.page_bytes, dtype=torch.uint8, pin_memory=pin)
@@ -1825,7 +1917,7 @@ def _stop_live() -> None:
         try:
             host.stop()
         except Exception as error:  # noqa: BLE001 - keep stopping the other hosts
-            sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
+            sys.stderr.write(f"{host.format_name} RAM miss: stopping a host failed: {error!r}\n")
 
 
 def _spin_ns(spin_us: int) -> int:
@@ -1870,7 +1962,7 @@ class ExpertStreamHost:
         slot_map: torch.Tensor,
         lease_block: Optional[torch.Tensor] = None,
         hot_page: Optional[torch.Tensor] = None,
-        layout: str = "exl3",
+        layout: BuildKey = EXL3_BUILD,
         variant: Optional[str] = None,
         lanes: int = 8,
         node_ranges: Optional[Sequence[Sequence[tuple[int, int]]]] = None,
@@ -1988,7 +2080,7 @@ class ExpertStreamHost:
         )
         if self.handle < 0:
             raise RuntimeError(
-                "exl3 RAM miss service failed to open (files, io_uring or bounce)"
+                f"{self.format_name} RAM miss service failed to open (files, io_uring or bounce)"
             )
         self.layout_names, self.small_mask = host_layout(self._layout)
         self._close = weakref.finalize(
@@ -2058,11 +2150,11 @@ class ExpertStreamHost:
         )
         if outcome == 2:
             raise RuntimeError(
-                "exl3 RAM miss: not paused, the copy thread still has a job (unsynchronized stream)"
+                f"{self.format_name} RAM miss: not paused, the copy thread still has a job (unsynchronized stream)"
             )
         if outcome != 1:
             raise RuntimeError(
-                f"exl3 RAM miss thread did not pause within {timeout_s} s"
+                f"{self.format_name} RAM miss thread did not pause within {timeout_s} s"
             )
 
     def resume(self) -> None:
@@ -2166,11 +2258,11 @@ class ExpertStreamHost:
         )
         if outcome == 0:
             raise RuntimeError(
-                f"exl3 RAM miss: a prefill fill failed before its first {rows} rows landed"
+                f"{self.format_name} RAM miss: a prefill fill failed before its first {rows} rows landed"
             )
         if outcome != 1:
             raise RuntimeError(
-                f"exl3 RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s"
+                f"{self.format_name} RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s"
             )
 
     def fill_landed(self) -> int:
@@ -2914,6 +3006,11 @@ class ExpertStreamHost:
         _refuse_test_only("hold_row", self.variant)
         self._module.expert_stream_hold_row(self.handle, int(row), int(group), int(hold))
 
+    @property
+    def format_name(self) -> str:
+        """The row format's name, the prefix of this host's messages (``<format> RAM miss: ``)."""
+        return self._layout[0]
+
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.
 
@@ -2933,7 +3030,7 @@ class ExpertStreamHost:
             # A refused row's runs are empty: the stream kernel would admit a READY hit
             # of it, copy nothing and commit.
             raise RuntimeError(
-                f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces"
+                f"{self.format_name} RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces"
             )
         return runs
 
@@ -3042,22 +3139,24 @@ class ExpertStreamHost:
                     self.threaded = False
                 # One line per window; benchmark arms grep it, so keep its shape.
                 sys.stderr.write(
-                    "exl3 RAM miss thread counters "
+                    f"{self.format_name} RAM miss thread counters "
                     + json.dumps(self.counters())
                     + "\n"
                 )
                 if self.nodes > 1:
                     for group in range(self.nodes):
                         sys.stderr.write(
-                            f"exl3 RAM miss group {group} counters " + json.dumps(self.group_counters(group)) + "\n"
+                            f"{self.format_name} RAM miss group {group} counters "
+                            + json.dumps(self.group_counters(group))
+                            + "\n"
                         )
                 # Per root: reads in flight (0 here), bytes landed and busy/overlap time by kind
                 # (analysis/dsv41-drive/dspark/drive_busy.py drive-load reads it).
-                sys.stderr.write("exl3 RAM miss drive load " + json.dumps(self.drive_load()) + "\n")
+                sys.stderr.write(f"{self.format_name} RAM miss drive load " + json.dumps(self.drive_load()) + "\n")
                 if getattr(self, "cpu_rows", None) is not None:
                     # Per group, the CPU expert thread's jobs, with the two-stage misses' waits for w2.
                     stats = [self.cpu_stats(group) for group in range(self.nodes)]
-                    sys.stderr.write("exl3 RAM miss cpu stats " + json.dumps(stats) + "\n")
+                    sys.stderr.write(f"{self.format_name} RAM miss cpu stats " + json.dumps(stats) + "\n")
             finally:
                 close()
 
@@ -3098,9 +3197,10 @@ SPEC_DEPTH = 12
 SPEC_SELECT_MAX_EXPERTS = 1024
 
 
-def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
+def _device_wrappers(layout: BuildKey = EXL3_BUILD) -> list[tuple[str, str]]:
     """Return the (FFI name, C++ symbol) pairs the device module exports."""
-    device_layout = LAYOUTS[layout].device_layout
+    build = _build_for(layout, device_jit_key(layout))
+    device_layout = build.device_layout
     return [
         (name, f"LeaseProtocolKernel::{method}")
         for name, method in _LEASE_METHODS.items()
@@ -3108,7 +3208,7 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
         (name, f"RowCopyKernel<{device_layout}>::{method}")
         for name, method in _ROW_COPY_METHODS.items()
     ] + [
-        (name, f"SpecScoreKernel::{method}")
+        (name, f"{build.spec_score_kernel}::{method}")
         for name, method in _SPEC_METHODS.items()
     ] + [
         (name, f"ResidencySnapshotKernel::{method}")
@@ -3128,27 +3228,29 @@ DEVICE_STAMP_WORDS = 8
 DEVICE_STAMP_POINTS = ("post_start", "post_end", "stream_start", "stream_end", "wait_start", "wait_end")
 
 
-def _device_module(layout: str = "exl3", lanes: int = 8, nodes: int = 1) -> Module:
+def _device_module(layout: BuildKey = EXL3_BUILD, lanes: int = 8, nodes: int = 1) -> Module:
     """Return the cached device module for ``layout``, ``lanes`` and ``nodes``."""
     wire = expert_lease_block.wire_layout(lanes, nodes)
     return _device_module_cached(layout, wire.lanes, wire.nodes, device_stamps_enabled())
 
 
 @cache_once
-def _device_module_cached(layout: str, lanes: int, nodes: int, stamps: bool) -> Module:
+def _device_module_cached(layout: BuildKey, lanes: int, nodes: int, stamps: bool) -> Module:
+    key = device_jit_key(layout, lanes, nodes)
+    build = _build_for(layout, key)
     wrappers = _device_wrappers(layout)
     if stamps:
-        device_layout = LAYOUTS[layout].device_layout
         wrappers = wrappers + [
-            ("expert_stream_set_device_stamps", f"RowCopyKernel<{device_layout}>::set_device_stamps")
+            ("expert_stream_set_device_stamps", f"RowCopyKernel<{build.device_layout}>::set_device_stamps")
         ]
     return load_jit(
-        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
+        key,
         *(["stamps"] if stamps else []),
-        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_files=[build.device_source],
         cuda_wrappers=wrappers,
         extra_cuda_cflags=[
-            *(["-DEXL3_RAM_MISS_DEVICE_STAMPS"] if stamps else []),
+            *build.defines,
+            *(["-DEXPERT_STREAM_DEVICE_STAMPS"] if stamps else []),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
@@ -3156,23 +3258,26 @@ def _device_module_cached(layout: str, lanes: int, nodes: int, stamps: bool) -> 
 
 
 def device_module_with_hooks(
-    defines: Sequence[str], layout: str = "exl3", lanes: int = 8, nodes: int = 1
+    defines: Sequence[str], layout: BuildKey = EXL3_BUILD, lanes: int = 8, nodes: int = 1
 ) -> Module:
-    """Test only: build the device kernels with the ``EXL3_RAM_MISS_TEST_*`` hooks on.
+    """Test only: build the device kernels with the ``EXPERT_STREAM_TEST_*`` hooks on.
 
     ``defines`` are ``NAME`` or ``NAME=value`` entries. The result is a module of its
     own; production builds with none, so its kernels carry no test knob.
     """
-    if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
-        raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
+    if not defines or not all(d.startswith("EXPERT_STREAM_TEST_") for d in defines):
+        raise ValueError(f"not a set of EXPERT_STREAM_TEST_* hooks: {defines}")
     wire = expert_lease_block.wire_layout(lanes, nodes)
     lanes, nodes = wire.lanes, wire.nodes
+    key = device_jit_key(layout, lanes, nodes)
+    build = _build_for(layout, key)
     return load_jit(
-        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
+        key,
         "test",
-        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_files=[build.device_source],
         cuda_wrappers=_device_wrappers(layout),
         extra_cuda_cflags=[
+            *build.defines,
             *(f"-D{d}" for d in defines),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
@@ -3402,7 +3507,7 @@ class ExpertStreamDevice:
         piece_runs: torch.Tensor,
         row_capacities: Sequence[int],
         hot_page=None,
-        layout: str = "exl3",
+        layout: BuildKey = EXL3_BUILD,
         lease_pdl: bool = False,
         hit_copy: str = "ce",
         cpu_misses: bool = False,
@@ -3967,7 +4072,7 @@ class ExpertStreamDevice:
             self._check_buffers(hot_slots=(hot_slots, torch.int64))
             if self._hot_address == 0 or not 0 < hot_capacity <= hot_slots.numel():
                 raise ValueError(
-                    "EXL3 DIRECT needs a hot sidecar and a valid slot capacity"
+                    "expert-stream DIRECT needs a hot sidecar and a valid slot capacity"
                 )
         cpu_x, cpu_weights, cpu_x_dst = self._no_cpu, self._no_cpu, 0
         if cpu_input is not None:
@@ -4136,7 +4241,7 @@ class ExpertStreamDevice:
         )
 
     def calibration_pull(self, table: torch.Tensor) -> None:
-        """The split model calibration's stand-in for S's host pulls (exl3_ram_miss_calibration_pull_kernel), on the
+        """The split model calibration's stand-in for S's host pulls (expert_stream_calibration_pull_kernel), on the
         current stream: ``table`` is int64 ``[n, 3]`` {source, destination, bytes} on this device, each source a pinned
         host address."""
         self._kernels().expert_stream_calibration_pull(table)

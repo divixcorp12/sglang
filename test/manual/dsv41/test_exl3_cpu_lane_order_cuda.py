@@ -315,7 +315,7 @@ def test_cpu_lanes_past_bit_7_reach_the_route_tables_and_the_direct_gather(miss_
     state[ops.STATE_WORDS["pending"]] = 1
     ce_mask = torch.full((3,), -1, dtype=torch.int32, device="cuda")
     cpu_lanes = torch.full((2,), -1, dtype=torch.int32, device="cuda")
-    ops._device_module("exl3", lanes).expert_stream_lease_copy_wait(
+    ops._device_module(ops.EXL3_BUILD, lanes).expert_stream_lease_copy_wait(
         state, torch.tensor([count], dtype=torch.int32, device="cuda"), int(block.data_ptr()), lane_kind, lane_slot,
         torch.zeros(w.lanes, dtype=torch.int32, device="cuda"), dst_slots, 0, 0, ce_mask, cpu_lanes, 0,
     )
