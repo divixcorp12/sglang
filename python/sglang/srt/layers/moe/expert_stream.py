@@ -839,6 +839,34 @@ def pinned_full_layers() -> tuple[int, ...]:
     return tuple(sorted(ids))
 
 
+# The streamed layer ids, recorded when the pinned tier is built (ExpertPinnedHostCacheManager.from_model); None
+# before. The RAM prefetch's pool, its held-back slots and its cores are all decided after that build.
+_streamed_layer_ids: frozenset[int] | None = None
+
+
+def record_streamed_layers(layer_ids: Iterable[int] | None) -> None:
+    global _streamed_layer_ids
+    _streamed_layer_ids = None if layer_ids is None else frozenset(layer_ids)
+
+
+def ram_prefetch_redundant() -> bool:
+    """True when SGLANG_MOE_PINNED_HOST_FULL_LAYERS covers every streamed layer: every expert is mapped in RAM, so
+    the RAM prefetch has nothing left to read from NVMe and only costs its pool slots, its scoring and its cores."""
+    if not _streamed_layer_ids:
+        return False
+    return _streamed_layer_ids <= set(pinned_full_layers())
+
+
+def ram_prefetch_active() -> bool:
+    """SGLANG_DSV41_RAM_PREFETCH, off when the full layers leave it nothing to read (ram_prefetch_redundant)."""
+    return envs.SGLANG_DSV41_RAM_PREFETCH.get() and not ram_prefetch_redundant()
+
+
+def ram_prefetch_spec_share() -> int:
+    """The RAM prefetch pool's slots per row and NUMA group: SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE while it runs."""
+    return envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if ram_prefetch_active() else 0
+
+
 def full_layer_group_rows(num_experts: int, *, groups: int, held_back: int) -> list[int]:
     """Slots per NUMA group of a tier that maps every expert at once.
 
@@ -958,6 +986,8 @@ class ExpertPinnedHostCacheManager:
                 f"SGLANG_MOE_PINNED_HOST_FULL_LAYERS names layers {unknown}, which are not streamed layers "
                 f"{sorted(streamers)}"
             )
+        # Before the full layers' tables report what they hold back: it includes the RAM prefetch's pool.
+        record_streamed_layers(streamers)
         # The format supplies tier options such as an is_pinned filter; the dense
         # format supplies none. A full layer's are read first: its table says what it holds back.
         options = {layer_id: _tier_options(streamers[layer_id]) for layer_id in full}

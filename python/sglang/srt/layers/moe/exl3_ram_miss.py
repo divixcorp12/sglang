@@ -69,7 +69,11 @@ from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
-from sglang.srt.layers.moe.expert_stream import pinned_full_layers
+from sglang.srt.layers.moe.expert_stream import (
+    pinned_full_layers,
+    ram_prefetch_redundant,
+    ram_prefetch_spec_share,
+)
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
 from sglang.srt.layers.moe.ram_slot_map import (
     split_miss_cut,
@@ -431,8 +435,7 @@ class NativePinnedSlotTable:
         """
         victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
         staging = victims or envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get() or MAX_LANES
-        pool = envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if envs.SGLANG_DSV41_RAM_PREFETCH.get() else 0
-        return min(staging, MAX_LANES) + pool
+        return min(staging, MAX_LANES) + ram_prefetch_spec_share()
 
     @property
     def reserved_rows(self) -> int:
@@ -1089,7 +1092,7 @@ class Exl3RamMissService:
         """Refuse a SGLANG_MOE_PINNED_HOST_FULL_LAYERS layer whose groups cannot map every expert past their staging
         and pool slots (full_layer_shortfall)."""
         full = pinned_full_layers()
-        share = envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if envs.SGLANG_DSV41_RAM_PREFETCH.get() else 0
+        share = ram_prefetch_spec_share()
         for row, layer_id in enumerate(tables.layer_ids):
             if layer_id not in full:
                 continue
@@ -1300,9 +1303,13 @@ class Exl3RamMissService:
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
             host.reserve_staging(self.staging_width())
-            spec_share = (
-                envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() if envs.SGLANG_DSV41_RAM_PREFETCH.get() else 0
-            )
+            spec_share = ram_prefetch_spec_share()
+            if envs.SGLANG_DSV41_RAM_PREFETCH.get() and ram_prefetch_redundant():
+                logger.info(
+                    "exl3 RAM miss prefetch: off although SGLANG_DSV41_RAM_PREFETCH=1: every streamed layer is in "
+                    "SGLANG_MOE_PINNED_HOST_FULL_LAYERS, so no expert is left on NVMe to prefetch (no pool, scorer "
+                    "or speculative cores)"
+                )
             if spec_share:
                 if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
                     raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")

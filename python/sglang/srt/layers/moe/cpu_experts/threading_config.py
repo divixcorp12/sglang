@@ -227,6 +227,7 @@ class ThreadingConfig:
     def from_env(cls, *, cpu_experts: bool, device: Optional[int]) -> "ThreadingConfig":
         """The machine's plan: its sysfs topology, this process's affinity and the core env vars."""
         from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_stream import ram_prefetch_active
         from sglang.srt.layers.moe.host_numa import parse_placement
 
         settings = CoreSettings(
@@ -241,7 +242,7 @@ class ThreadingConfig:
             draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get(),
             draft_cores=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get(),
             draft_threads=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get(),
-            ram_prefetch=envs.SGLANG_DSV41_RAM_PREFETCH.get(),
+            ram_prefetch=ram_prefetch_active(),
         )
         placement = parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get())
         gpu_node = gpu_numa_node(device)

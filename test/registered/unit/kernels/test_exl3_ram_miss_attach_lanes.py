@@ -514,6 +514,22 @@ def test_a_rows_reserved_slots_count_the_speculative_pool():
     assert module.NativePinnedSlotTable.reserved_rows.fget(SimpleNamespace(service=service, capacity=40)) == 12
 
 
+def test_held_back_slots_drop_the_pool_when_every_streamed_layer_is_full(monkeypatch):
+    """The pinned tier sizes each full layer from these slots; with every layer full the prefetch is off, so a row
+    holds back its staging alone."""
+    from sglang.srt.layers.moe import expert_stream
+
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
+    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(0), \
+            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.override(8), \
+            envs.SGLANG_DSV41_RAM_PREFETCH.override(True), \
+            envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+            assert module.NativePinnedSlotTable.held_back_per_group(None) == 10
+        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+            assert module.NativePinnedSlotTable.held_back_per_group(None) == 8
+
+
 @pytest.mark.parametrize(
     "ranges, width, short",
     [

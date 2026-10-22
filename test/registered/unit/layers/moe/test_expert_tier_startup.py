@@ -131,6 +131,25 @@ class TestFullLayers(unittest.TestCase):
         with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("2"), self.assertRaisesRegex(ValueError, "not streamed"):
             ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
 
+    def test_the_ram_prefetch_is_off_only_when_every_streamed_layer_is_full(self):
+        """The build records the streamed layers; the prefetch runs while any of them can still miss to NVMe."""
+        model, _ = _model(tier_options={"device": "cpu"})
+        row = model.get_submodule("0")._nvfp4_expert_streamer.host_bytes_per_expert
+        self.addCleanup(expert_stream.record_streamed_layers, None)
+        with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
+            self.assertTrue(expert_stream.ram_prefetch_active(), "before the build nothing is known: as requested")
+            with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+                ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
+                self.assertTrue(expert_stream.ram_prefetch_active())
+                self.assertEqual(expert_stream.ram_prefetch_spec_share(), 2)
+            with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+                ExpertPinnedHostCacheManager.from_model(model, budget_bytes=2 * EXPERTS * row)
+                self.assertTrue(expert_stream.ram_prefetch_redundant())
+                self.assertFalse(expert_stream.ram_prefetch_active())
+                self.assertEqual(expert_stream.ram_prefetch_spec_share(), 0)
+        with envs.SGLANG_DSV41_RAM_PREFETCH.override(False), envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+            self.assertFalse(expert_stream.ram_prefetch_active())
+
     def test_each_group_holds_its_homed_experts_and_what_its_table_holds_back(self):
         # Experts are homed expert % groups; the seam margin applies only between nodes.
         self.assertEqual(expert_stream.full_layer_group_rows(384, groups=2, held_back=10), [204, 204])
