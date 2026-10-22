@@ -67,16 +67,16 @@ void check_throws(F&& f, const std::string& needle, const char* what, const char
 
 // ---- placement ----
 
-// The reference machine (72 CPUs, two NUMA nodes): node 0 = 0-17,36-53; node 1 = 18-35,54-71; c and c + 36 are SMT
-// siblings. Allowed: the bench's partition, 16-33 and 52-69.
+// The reference machine (112 CPUs, two NUMA nodes): node 0 = 0-27,56-83; node 1 = 28-55,84-111; c and c + 56 are SMT
+// siblings. Allowed: the bench's partition, 22-43 and 78-99.
 Topology fake_topology() {
   Topology t;
-  t.node_of = [](int cpu) { return cpu % 36 < 18 ? 0 : 1; };
-  t.siblings_of = [](int cpu) { return std::vector<int>{cpu % 36, cpu % 36 + 36}; };
+  t.node_of = [](int cpu) { return cpu % 56 < 28 ? 0 : 1; };
+  t.siblings_of = [](int cpu) { return std::vector<int>{cpu % 56, cpu % 56 + 56}; };
   CPU_ZERO(&t.allowed);
-  for (int cpu = 16; cpu <= 33; ++cpu) {
+  for (int cpu = 22; cpu <= 43; ++cpu) {
     CPU_SET(cpu, &t.allowed);
-    CPU_SET(cpu + 36, &t.allowed);
+    CPU_SET(cpu + 56, &t.allowed);
   }
   return t;
 }
@@ -84,9 +84,9 @@ Topology fake_topology() {
 // The bench's default placement, which the fake topology accepts.
 Placement production_placement() {
   Placement p;
-  p.writer = 16;
-  p.copy = 52;
-  p.groups.push_back({17, parse_cpus("18-33"), 1});
+  p.writer = 22;
+  p.copy = 27;
+  p.groups.push_back({26, parse_cpus("28-43"), 1});
   return p;
 }
 
@@ -110,21 +110,21 @@ void test_placement() {
   CHECK(passes(production_placement(), t, true));
 
   Placement twice = production_placement();
-  twice.groups[0].service = 16;
+  twice.groups[0].service = 22;
   CHECK_THROWS(validate_placement(twice, t, true), "two roles");
 
   Placement sibling = production_placement();
-  sibling.copy = 53;  // 17's SMT sibling
-  CHECK_THROWS(validate_placement(sibling, t, true), "physical core of the service CPU 17");
+  sibling.copy = 82;  // 26's SMT sibling
+  CHECK_THROWS(validate_placement(sibling, t, true), "physical core of the service CPU 26");
 
   Placement outside = production_placement();
-  outside.copy = 34;
+  outside.copy = 44;
   CHECK_THROWS(validate_placement(outside, t, true), "outside the process's allowed CPUs");
 
   Placement writer_node = production_placement();
-  writer_node.writer = 19;
-  writer_node.groups[0].workers = parse_cpus("18,20-33");
-  CHECK_THROWS(validate_placement(writer_node, t, true), "writer CPU 19 is on NUMA node 1, not node 0");
+  writer_node.writer = 29;
+  writer_node.groups[0].workers = parse_cpus("28,30-43");
+  CHECK_THROWS(validate_placement(writer_node, t, true), "writer CPU 29 is on NUMA node 1, not node 0");
   CHECK(passes(writer_node, t, false));  // the self-test's mode: no node rules
 
   Topology wider = fake_topology();
@@ -134,11 +134,9 @@ void test_placement() {
   CHECK_THROWS(validate_placement(worker_node, wider, true), "worker CPU 10 is on NUMA node 0, not node 1");
 
   std::vector<int> expected = expected_threads(production_placement());
-  std::vector<int> want = {17};  // sorted: service, workers 18-33, then the copy CPU twice (copy thread, watchdog)
-  for (int cpu = 18; cpu <= 33; ++cpu)
+  std::vector<int> want = {26, 27, 27};  // sorted: service, the copy CPU twice (copy thread, watchdog), workers 28-43
+  for (int cpu = 28; cpu <= 43; ++cpu)
     want.push_back(cpu);
-  want.push_back(52);
-  want.push_back(52);
   CHECK(expected == want);
   CHECK(cpu_list({52, 16, 17}) == "16,17,52");
 }
@@ -147,7 +145,7 @@ void test_placement() {
 Topology wide_topology() {
   Topology t = fake_topology();
   CPU_ZERO(&t.allowed);
-  for (int cpu = 0; cpu < 72; ++cpu)
+  for (int cpu = 0; cpu < 112; ++cpu)
     CPU_SET(cpu, &t.allowed);
   return t;
 }
@@ -156,25 +154,25 @@ Topology wide_topology() {
 void test_two_group_placement() {
   const Topology t = wide_topology();
   Placement p;
-  p.writer = 16;
-  p.copy = 52;
-  p.groups.push_back({17, parse_cpus("8-15"), 0});
-  p.groups.push_back({35, parse_cpus("18-33"), 1});
+  p.writer = 22;
+  p.copy = 27;
+  p.groups.push_back({26, parse_cpus("8-15"), 0});
+  p.groups.push_back({51, parse_cpus("28-43"), 1});
   CHECK(passes(p, t, true));
-  CHECK(expected_threads(p) == std::vector<int>({8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35, 52, 52}));
+  CHECK(expected_threads(p) == std::vector<int>({8, 9, 10, 11, 12, 13, 14, 15, 26, 27, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 51}));
 
   Placement shared = p;
-  shared.groups[1].workers = parse_cpus("17-32");  // 17 is group 0's service
+  shared.groups[1].workers = parse_cpus("26-41");  // 26 is group 0's service
   CHECK_THROWS(validate_placement(shared, t, true), "two roles");
 
   Placement sibling = p;
-  sibling.copy = 53;  // 17's SMT sibling
-  CHECK_THROWS(validate_placement(sibling, t, true), "physical core of the service CPU 17");
+  sibling.copy = 82;  // 26's SMT sibling
+  CHECK_THROWS(validate_placement(sibling, t, true), "physical core of the service CPU 26");
 
   Placement own_node = p;
-  own_node.groups[1].service = 19;
-  own_node.groups[1].workers = parse_cpus("18,20-33");
-  CHECK(passes(own_node, t, true));  // 19 is on node 1, group 1's node
+  own_node.groups[1].service = 29;
+  own_node.groups[1].workers = parse_cpus("28,30-43");
+  CHECK(passes(own_node, t, true));  // 29 is on node 1, group 1's node
   own_node.groups[1].service = 0;  // node 0: not group 1's node
   CHECK_THROWS(validate_placement(own_node, t, true), "service CPU 0 is on NUMA node 0, not node 1");
 

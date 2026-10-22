@@ -66,7 +66,7 @@ bool benchmark_failed = false;
 struct Options {
   fs::path fixture = "/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin";
   fs::path references = "/data/models/exl3_exp/threading";
-  std::string cpus = "18-33";
+  std::string cpus = "28-43";  // node 1's first 16 physical cores; their SMT siblings 84-99 stay idle
   int workers = EXL3_BENCH_DEFAULT_WORKERS;
   int node = 1;
   int warmup = 128;
@@ -144,7 +144,7 @@ Options parse_options(int& argc, char** argv) {
     else if (arg == "--help") {
       std::cout << "Native DSV4.1 full-forward benchmark (" EXL3_BENCH_BACKEND
                    ")\n"
-                   "--fixture=FILE --reference-dir=DIR --cpus=18-33 --workers=N\n"
+                   "--fixture=FILE --reference-dir=DIR --cpus=28-43 --workers=N\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
                    "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
@@ -547,9 +547,11 @@ int main(int argc, char** argv) {
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
     // The tier is fixed from EXL3_MOE_CPU_MAX_ISA as set at launch: at load (baseline) or at this first query.
-    // Any AVX-512 tier runs the DSV4.1 plan; the scripts default to bw, and EXL3_MOE_CPU_MAX_ISA unset runs the host's.
+    // Any AVX-512 tier runs the DSV4.1 plan; EXL3_MOE_CPU_MAX_ISA unset runs the host's, which is what the scripts do.
     if (!exl3_moe_cpu_has_avx512_bw())
       throw std::runtime_error("This study requires AVX512BW");
+    const char* isa_tier = exl3_moe_cpu_has_avx512_vbmi() ? "vbmi" : exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
+    std::cerr << "isa tier " << isa_tier << '\n';
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
@@ -595,6 +597,7 @@ int main(int argc, char** argv) {
     std::cerr << "(NUMA " << options.node << "; memory policy inherited)\n";
     if (!options.validate_only) {
       benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
+      benchmark::AddCustomContext("isa_tier", isa_tier);
       benchmark::AddCustomContext("fixture", options.fixture.string());
       std::string assigned_cpus;
       for (int cpu : cores)
