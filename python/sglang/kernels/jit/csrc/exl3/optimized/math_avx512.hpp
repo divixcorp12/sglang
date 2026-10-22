@@ -915,32 +915,43 @@ M1_TARGET_BW M1_ALWAYS_INLINE __m512i register_word(__m512i p0,__m512i p1,__m512
 
 // The compact register kernels' register budget, one entry per tokens-per-chunk M = 1..CHUNK_M (register_tiles<M>):
 // pairs, the tile pairs one register_band call holds; traversal, whether whole 128-output groups take the grouped
-// traversal (its IntegerAccum holds one token's rows). Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
+// traversal (its IntegerAccum holds one token's rows); halves, whether each 128-input block runs once per output half
+// (register_band_halves), holding half the accumulators. Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
 // compile below until an entry is added.
 struct RegisterBudget
 {
     int pairs;
     bool traversal;
+    bool halves = false;
 };
 constexpr RegisterBudget kRegisterBudget[] = {
     {4, true},   // M = 1: today's kernels (register_band<1..4>, traversal_kblock's four bands)
     {2, false},  // M = 2
     {1, false},  // M = 3
     {1, false},  // M = 4
+    {1, false, true},  // M = 5..8: 4 * M accumulators per tile pair exceed the registers; 2 * M per half fit
+    {1, false, true},
+    {1, false, true},
+    {1, false, true},
 };
 // zmm registers register_rows keeps live besides the integer accumulators: prev, a, b, c, the state, its byte sum, two
 // products, the multiplier halves, the ones vector and the broadcast activation pair.
 constexpr int kRegisterDecodeZmm = 12;
 
+// Integer accumulators one register_band call holds for M tokens: two output halves of 2 * M rows per tile pair, or
+// one half at a time.
+constexpr int register_accumulators(int m, const RegisterBudget& b) { return (b.halves ? 2 : 4) * m * b.pairs; }
+
 constexpr bool register_budget_fits()
 {
     for (int m = 1; m <= int(std::size(kRegisterBudget)); ++m)
-        if (kRegisterBudget[m - 1].pairs < 1 || 4 * m * kRegisterBudget[m - 1].pairs + kRegisterDecodeZmm > 32)
+        if (kRegisterBudget[m - 1].pairs < 1
+            || register_accumulators(m, kRegisterBudget[m - 1]) + kRegisterDecodeZmm > 32)
             return false;
     return true;
 }
 static_assert(register_budget_fits(), "kRegisterBudget (math_avx512.hpp): an entry's integer accumulators "
-                                      "(4 * M * pairs) plus kRegisterDecodeZmm exceed the 32 zmm registers");
+                                      "(register_accumulators) plus kRegisterDecodeZmm exceed the 32 zmm registers");
 static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(std::size(kRegisterBudget)),
               "kRegisterBudget (math_avx512.hpp) has no entry for this CHUNK_M: add one before raising "
               "EXL3_MOE_CPU_MAX_M");

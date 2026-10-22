@@ -49,7 +49,7 @@ constexpr float HAD_SCALE = 0.088388347648f;
 // Quantized activation rows per chunk: CHUNK_M tokens times ACT_ROWS (below). Every per-chunk array, stride and tile
 // table derives from it. A build raises it with -DEXL3_MOE_CPU_MAX_M (SGLANG_EXL3_CPU_MAX_M; the bench's EXL3_MAX_M).
 constexpr int MAX_M = EXL3_MOE_CPU_MAX_M;
-static_assert(MAX_M >= 2 && MAX_M <= 8 && MAX_M % 2 == 0, "EXL3_MOE_CPU_MAX_M must be even, in [2, 8]");
+static_assert(MAX_M >= 2 && MAX_M <= 16 && MAX_M % 2 == 0, "EXL3_MOE_CPU_MAX_M must be even, in [2, 16]");
 
 #ifndef EXL3_MOE_CPU_ACT_RESIDUAL
 #define EXL3_MOE_CPU_ACT_RESIDUAL 0
