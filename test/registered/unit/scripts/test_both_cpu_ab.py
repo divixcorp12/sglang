@@ -727,11 +727,14 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     monkeypatch.setenv(FULL_LAYERS, "5")
     monkeypatch.setenv(SPLIT_LAYERS, "5:0")
     monkeypatch.setenv(SPLIT, "0:3,1:5")
+    # Production pins every layer whole since 2026-10-22 (owner): the arms built on it carry its list.
+    prod_full = ab.arm_env.prod_env()[FULL_LAYERS]
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
-                                                               PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
-                                                               *PIN01_HICACHE_ARMS)
+            assert overrides[FULL_LAYERS] == (prod_full if arm in PROD_ARMS
+                                              else "0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
+                                                                    PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                                    *PIN01_HICACHE_ARMS)
                                               else ""), arm
             assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
@@ -905,7 +908,7 @@ def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alo
 
 def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_alone(monkeypatch):
     """-expseg is -mergechunk with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and a hot cache sized from its smoke
-    (923 slots, 2,040 MiB free, 29.39 GiB) less 10 held-back slots: 994 slots, KV still pinned; every other arm states the
+    (923 slots, 2,040 MiB free, 29.39 GiB) less 3 held-back slots: 1035 slots, KV still pinned; every other arm states the
     allocator config empty against a shell's. Mutant: another arm inherits the shell's config, or the size moves -- red."""
     ab = _ab()
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
@@ -917,7 +920,7 @@ def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_
     e, m = ab.ARMS[expseg][0], ab.ARMS[merge][0]
     knobs = ("PYTORCH_CUDA_ALLOC_CONF", "SGLANG_MOE_HOT_GPU_MB")
     assert {k: v for k, v in e.items() if k not in knobs} == {k: v for k, v in m.items() if k not in knobs}
-    assert int(e["SGLANG_MOE_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 994
+    assert int(e["SGLANG_MOE_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 1035
     flags = ab.server_flags(expseg)
     assert flags[flags.index("--max-total-tokens") + 1] == "381184"
     assert flags[flags.index("--mem-fraction-static") + 1] == ab.fraction_keeping_kv(ab.EXPSEG_HOT_GPU_MB, 381184)
@@ -1179,15 +1182,22 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                                    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST")}
     # The live T(w) refit every 32 timed cut verifies: production since 2026-10-20 (owner); the non-prod arms leave it unset.
     cut["SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL"] = (None, "32")
+    # Owner, 2026-10-22, no served A/B: the pinned tier holds every routed expert row (all 40 layers whole), and the hot
+    # cache starts 41 slots smaller, because driver 615.71.10 and the 8280 build missed the KV pin at -expseg's size.
+    pinned = {k: (best.get(k), prod.get(k)) for k in ("SGLANG_MOE_PINNED_HOST_FULL_LAYERS", "SGLANG_MOE_PINNED_HOST_MB",
+                                                       "SGLANG_MOE_PINNED_HOST_NUMA_MB", "SGLANG_MOE_HOT_GPU_MB")}
+    assert pinned["SGLANG_MOE_HOT_GPU_MB"] == (str(ab.EXPSEG_HOT_GPU_MB), arm_env.PROD_DSPARK_HOT_GPU_MB)
     rest ={k: v for k, v in differs.items() if k not in prefetch}
-    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut, **pinned}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
     argv = arm_env.ServerArgs.prod().argv()
     flags = ab.server_flags(arm)
     assert flags == ("--weight-loader-drop-cache-after-load", "--mem-fraction-static",
                      arm_env.PROD_DSPARK_MEM_FRACTION_STATIC, "--max-total-tokens",
                      str(arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS))
-    assert ab.EXPSEG_HOT_GPU_MB == int(arm_env.PROD_DSPARK_HOT_GPU_MB)
+    # Production starts its hot cache below -expseg's (2026-10-22) and keeps -expseg's fraction, so the freed memory
+    # goes to the KV pool and the startup calibration grows the cache back into what remains.
+    assert int(arm_env.PROD_DSPARK_HOT_GPU_MB) < ab.EXPSEG_HOT_GPU_MB
     assert all(flag in argv for flag in flags)
 
 
