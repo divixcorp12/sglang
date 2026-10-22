@@ -1,7 +1,8 @@
 """The EXL3 CPU kernel's DSV4.1 plan on calls whose routes share an expert (csrc/exl3/optimized/forward_plan.hpp).
 
 Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_M tokens (sglang_exl3_cpu::chunk_m:
-MAX_M / 2, so 4 by default (SGLANG_EXL3_CPU_MAX_M=8) and 2 in a SGLANG_EXL3_CPU_MAX_M=0 build). Each case runs one call on a DeepSeek
+MAX_M / 2, so 8 by default (SGLANG_EXL3_CPU_MAX_M=16) and 2 in a SGLANG_EXL3_CPU_MAX_M=0 build; the generic plan's
+chunks stay at most 4 tokens). Each case runs one call on a DeepSeek
 V4.1-shaped layer:
   - unswizzled (native), which Dsv41Shape::accepts may take on AVX-512BW;
   - swizzled, which it always refuses, so it runs the generic plan;

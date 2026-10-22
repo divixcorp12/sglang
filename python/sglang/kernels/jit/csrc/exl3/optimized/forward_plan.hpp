@@ -58,13 +58,13 @@ constexpr std::array<TilesFn, sizeof...(R)> tiles_rows(std::integer_sequence<int
 }
 
 template <Isa I, int... B>
-constexpr std::array<std::array<TilesFn, MAX_M>, sizeof...(B)> tiles_table(std::integer_sequence<int, B...>)
+constexpr std::array<std::array<TilesFn, GENERIC_MAX_M>, sizeof...(B)> tiles_table(std::integer_sequence<int, B...>)
 {
-    return {tiles_rows<I, B + 1>(std::make_integer_sequence<int, MAX_M>{})...};
+    return {tiles_rows<I, B + 1>(std::make_integer_sequence<int, GENERIC_MAX_M>{})...};
 }
 
-// [bits - 1][rows - 1] for bits 1..8 and rows 1..MAX_M, generated from MAX_M: a larger MAX_M instantiates its rows
-// here with no hand-written case.
+// [bits - 1][rows - 1] for bits 1..8 and rows 1..GENERIC_MAX_M (the generic plan's chunks), generated from it: a
+// larger GENERIC_MAX_M instantiates its rows here with no hand-written case.
 template <Isa I>
 constexpr auto kTiles = tiles_table<I>(std::make_integer_sequence<int, 8>{});
 
@@ -711,7 +711,8 @@ void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Tea
     }
 }
 
-// The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M rows. This grouping, not the
+// The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M tokens (GENERIC_CHUNK_M for the
+// generic plan). This grouping, not the
 // framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then token, then route), so it reads the
 // call's slots as given and runs zero-weight routes. Each weight is rounded to FP16, the registered kernel's
 // convention. ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range).
@@ -742,12 +743,14 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     for (int i = 0; i < n; ++i)
         if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
     std::sort(routes.begin(), routes.end());
+    // The DSV4.1 plan takes chunks of up to CHUNK_M tokens, the generic plan up to GENERIC_CHUNK_M (math.hpp).
+    const int chunk_m = isa >= Isa::Bw && Dsv41Shape::accepts_layer(l, p) ? CHUNK_M : GENERIC_CHUNK_M;
     for (size_t i = 0; i < routes.size();)
     {
         Chunk ch;
         ch.expert = routes[i].first;
         ch.m = 0;
-        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < CHUNK_M; ++i, ++ch.m)
+        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < chunk_m; ++i, ++ch.m)
         {
             ch.token[ch.m] = routes[i].second / c.k;
             ch.weight[ch.m] = half_to_float(at::Half(c.weights[routes[i].second]));

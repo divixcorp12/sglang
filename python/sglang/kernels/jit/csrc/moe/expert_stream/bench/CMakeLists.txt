@@ -38,7 +38,7 @@ if(NOT EXPERT_STREAM_NODES MATCHES "^[0-9]+$" OR EXPERT_STREAM_NODES LESS 1 OR E
   message(FATAL_ERROR "EXPERT_STREAM_NODES must be 1..8")
 endif()
 add_compile_definitions(SGLANG_EXPERT_STREAM_NODES=${EXPERT_STREAM_NODES})
-set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (even, 2..8); empty: the source default")
+set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (even, 2..16; the server builds 16); empty: the source default")
 
 option(EXL3_ROW_WEIGHTED_ASSIGNMENT "Experimental row-weighted matrix assignment" OFF)
 

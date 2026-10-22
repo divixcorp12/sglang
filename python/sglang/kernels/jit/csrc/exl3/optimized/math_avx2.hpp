@@ -104,14 +104,14 @@ inline void avx2_row_codes(const __m256i (&preg)[bits], __m256i& codes_lo, __m25
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
-// Token rows I..MAX_M-1 below m: the maddwd of one pair-summed product against that row's activation. A template
-// recursion, so it unrolls to exactly MAX_M rows at any MAX_M (an unrolled call per row, no runtime loop).
+// Token rows I..GENERIC_MAX_M-1 below m: the maddwd of one pair-summed product against that row's activation. A template
+// recursion, so it unrolls to exactly GENERIC_MAX_M rows at any GENERIC_MAX_M (an unrolled call per row, no runtime loop).
 template <int I = 0>
 M1_TARGET_AVX2
 inline void avx2_accum_rows(const __m256i& p_lo, const __m256i& p_hi, const int32_t* splat_dup, int k, int m,
-    __m256i (&acc)[MAX_M][2], int row)
+    __m256i (&acc)[GENERIC_MAX_M][2], int row)
 {
-    if constexpr (I < MAX_M)
+    if constexpr (I < GENERIC_MAX_M)
     {
         if (I < m)
         {
@@ -125,7 +125,7 @@ inline void avx2_accum_rows(const __m256i& p_lo, const __m256i& p_hi, const int3
 
 M1_TARGET_AVX2
 inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
-    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
+    int m, __m256i (&acc)[GENERIC_MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
 {
     // Bytesum-first accumulate: maddubs(prod, 0x01010101) sums each product-byte pair into an
     // i16 lane ((b0+b1), (b2+b3), <= 510). x is OUTSIDE the pair so vpmaddubsw cannot saturate
@@ -147,7 +147,7 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
 template <int bits, int row = 0>
 M1_TARGET_AVX2
 inline void avx2_rows_accum(
-    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[GENERIC_MAX_M][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (bits == 8)
@@ -210,7 +210,7 @@ void avx2_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, in
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
-        __m256i acc[MAX_M][2];
+        __m256i acc[GENERIC_MAX_M][2];
         for (int i = 0; i < m; ++i)
         {
             acc[i][0] = _mm256_setzero_si256();

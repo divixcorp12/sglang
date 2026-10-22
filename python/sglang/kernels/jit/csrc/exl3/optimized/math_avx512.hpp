@@ -101,7 +101,7 @@ M1_TARGET_VNNI
 inline void vnni_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (dword_pair_wins<bits>())
@@ -165,7 +165,7 @@ void vnni_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -300,7 +300,7 @@ M1_TARGET_BW
 M1_ALWAYS_INLINE void bw_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat_dup, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (dword_pair_wins<bits>())
@@ -394,7 +394,7 @@ constexpr std::array<uint16_t, 32> bw3_word_shifts()
 template <int rows, int band, int P>
 M1_TARGET_BW
 M1_ALWAYS_INLINE void bw3_band_rows(__m512i p0, __m512i p1, int b,
-    const int32_t* splat_dup, int k, __m512i (&acc)[band][MAX_M], const char* future_weight)
+    const int32_t* splat_dup, int k, __m512i (&acc)[band][GENERIC_MAX_M], const char* future_weight)
 {
     if constexpr (P < 8)
     {
@@ -457,7 +457,7 @@ void bw_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -659,7 +659,7 @@ M1_TARGET_VBMI
 inline void vbmi_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (P < 8)
@@ -709,7 +709,7 @@ void vbmi_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -815,7 +815,7 @@ void bw3_blocked_band(const Exl3Projection& mat, const PreparedIn& in, float* to
     __m512 sums[band][rows];
     for (int kb = 0; kb < mat.k / B; ++kb)
     {
-        __m512i acc[band][MAX_M];
+        __m512i acc[band][GENERIC_MAX_M];
         for (int b = 0; b < band; ++b)
             for (int i = 0; i < rows; ++i)
                 acc[b][i] = _mm512_setzero_si512();

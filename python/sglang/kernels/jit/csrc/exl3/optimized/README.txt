@@ -8,12 +8,16 @@ There is no persistent weight repacking or increase in expert weight storage.
 Selection
 ---------
 For a call whose chunks each hold 1..CHUNK_M tokens (CHUNK_M = MAX_M / 2; MAX_M is
-EXL3_MOE_CPU_MAX_M: 4 in the source, 8 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304, residual activation rows,
+EXL3_MOE_CPU_MAX_M: 4 in the source, 16 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304, residual activation rows,
 128-element quantization blocks, 3-bit unswizzled matrices and AVX512BW:
   one expert, one token: range3_unroll (range-aware neighboring-band traversal);
   other one-token chunks: unroll_small (one-band traversal);
   chunks of M > 1 tokens: register_tiles<M>, all M tokens sharing each decoded tile,
-  kRegisterBudget[M - 1].pairs tile pairs per call.
+  kRegisterBudget[M - 1].pairs tile pairs per call; M = 5..8 through register_band_halves,
+  which runs each 128-input block once per output half to hold half the accumulators.
+On a VNNI host one-token chunks accumulate the decoded product bytes with vpdpbusd (no byte sum)
+and larger chunks with vpdpwssd; on AVX-512BW alone, vpmaddwd + vpaddd. The generic plan splits
+calls into chunks of at most 4 tokens (GENERIC_CHUNK_M) whatever MAX_M.
 kRegisterBudget (math_avx512.hpp) holds one entry per M and a static_assert keeps each
 within 32 zmm; raising MAX_M needs an entry per new M. The measured multiple-expert
 counts are 3 and 5; counts 2, 4 and above 5 use the same default but have no
