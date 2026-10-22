@@ -174,6 +174,28 @@ def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_a
                 assert all(slot < 0 for slot in service.host.mapping(1))
 
 
+def test_a_fully_pinned_model_starts_without_staging_and_maps_every_expert_in_exactly_its_count(
+    tmp_path, monkeypatch, caplog
+):
+    """Every streamed layer full (model_fully_pinned): the start reserves no staging slot and says so, so a tier of
+    exactly the expert count maps every expert and no slot is kStaging. Mutation: staging_width keeps the planned width
+    (start refuses the layers as short of every expert)."""
+    from sglang.srt.layers.moe import expert_stream
+
+    monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, entries: None)
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset(range(LAYERS)))
+    caplog.set_level("INFO", logger=module.logger.name)
+    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+        for service, streamers in _built_tiers(tmp_path, monkeypatch, [EXPERTS] * LAYERS):
+            for streamer in streamers.values():
+                _attach(service, streamer, 1)
+            with paused(service.host):
+                for row in range(LAYERS):
+                    assert sorted(service.host.mapping(row)) == list(range(EXPERTS))
+                    assert all(state != 3 for state, _, _ in service.host.slot_info(row))
+    assert "staging is off (0 staging slots a row)" in caplog.text
+
+
 def test_full_layer_room_is_every_homed_expert_past_staging_and_pool():
     """Each group keeps min(width, slots - 1) staging and the pool share, and must still hold the experts homed on it
     (expert % groups): 384 experts on 2 groups need 192 + 8 + 2 slots each."""
@@ -514,9 +536,10 @@ def test_a_rows_reserved_slots_count_the_speculative_pool():
     assert module.NativePinnedSlotTable.reserved_rows.fget(SimpleNamespace(service=service, capacity=40)) == 12
 
 
-def test_held_back_slots_drop_the_pool_when_every_streamed_layer_is_full(monkeypatch):
-    """The pinned tier sizes each full layer from these slots; with every layer full the prefetch is off, so a row
-    holds back its staging alone."""
+def test_held_back_slots_are_none_when_every_streamed_layer_is_full(monkeypatch):
+    """The pinned tier sizes each full layer from these slots. While any layer can miss, a row holds back its staging
+    and the prefetch pool; with every layer full (model_fully_pinned) nothing can miss, so it holds back neither and a
+    DSV4.1 full layer is 192 homed experts + 2 seam slots a group. Mutation: the fully pinned branch is gone (8)."""
     from sglang.srt.layers.moe import expert_stream
 
     monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
@@ -525,9 +548,33 @@ def test_held_back_slots_drop_the_pool_when_every_streamed_layer_is_full(monkeyp
             envs.SGLANG_DSV41_RAM_PREFETCH.override(True), \
             envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
         with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+            assert not expert_stream.model_fully_pinned()
             assert module.NativePinnedSlotTable.held_back_per_group(None) == 10
         with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
-            assert module.NativePinnedSlotTable.held_back_per_group(None) == 8
+            assert expert_stream.model_fully_pinned()
+            held_back = module.NativePinnedSlotTable.held_back_per_group(None)
+            assert held_back == 0
+            assert expert_stream.full_layer_group_rows(384, groups=2, held_back=held_back) == [194, 194]
+
+
+def test_a_fully_pinned_model_stages_nothing_and_its_checks_accept_zero(tiers, monkeypatch):
+    """staging_width is 0 once every streamed layer is full, whatever the gather planned, and every check sized from
+    it takes 0: a group then maps every slot of its range. Mutation: staging_width ignores model_fully_pinned."""
+    from sglang.srt.layers.moe import expert_stream
+
+    service, streamers = tiers
+    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(2):
+        streamers[0].format.plan_graph_gather(streamers[0], 36)
+    assert service.staging_width() == 2
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0}))
+    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
+        assert service.staging_width() == 0 and service.staging_for(CAPACITY) == 0
+    ranges = [(0, 193), (194, 388)]  # 194 rows a group, one slot lost to the seam
+    assert module.full_layer_shortfall(ranges, staging_width=0, share=0, experts=384) == []
+    assert module.full_layer_shortfall([(0, 191), (191, 383)], staging_width=0, share=0, experts=384) == [(0, 191, 192)]
+    assert module.usable_rows(ranges, staging_width=0, share=0) == 193 + 194
+    assert module.pool_room_shortfall(ranges, staging_width=0, share=0) == []
+    assert module.spill_room_shortfall(ranges, staging=0, lanes=36, hot=100) == []
 
 
 @pytest.mark.parametrize(

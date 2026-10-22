@@ -849,17 +849,19 @@ def record_streamed_layers(layer_ids: Iterable[int] | None) -> None:
     _streamed_layer_ids = None if layer_ids is None else frozenset(layer_ids)
 
 
-def ram_prefetch_redundant() -> bool:
+def model_fully_pinned() -> bool:
     """True when SGLANG_MOE_PINNED_HOST_FULL_LAYERS covers every streamed layer: every expert is mapped in RAM, so
-    the RAM prefetch has nothing left to read from NVMe and only costs its pool slots, its scoring and its cores."""
+    nothing is ever read from NVMe after startup. No RAM miss can happen, so the RAM-miss staging slots are off
+    (Exl3RamMissService.staging_width is 0), and the RAM prefetch has nothing to read and only costs its pool slots,
+    its scoring and its cores (ram_prefetch_active). False until the tier records its streamed layers."""
     if not _streamed_layer_ids:
         return False
     return _streamed_layer_ids <= set(pinned_full_layers())
 
 
 def ram_prefetch_active() -> bool:
-    """SGLANG_DSV41_RAM_PREFETCH, off when the full layers leave it nothing to read (ram_prefetch_redundant)."""
-    return envs.SGLANG_DSV41_RAM_PREFETCH.get() and not ram_prefetch_redundant()
+    """SGLANG_DSV41_RAM_PREFETCH, off when the model is fully pinned (model_fully_pinned): nothing is left to read."""
+    return envs.SGLANG_DSV41_RAM_PREFETCH.get() and not model_fully_pinned()
 
 
 def ram_prefetch_spec_share() -> int:
