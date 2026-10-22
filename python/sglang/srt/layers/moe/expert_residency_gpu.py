@@ -100,6 +100,7 @@ class GpuResidencyUpdater:
         insert_on_miss: bool | int = False,
         insert_on_miss_decay: float = 0.98,
         fused_insert: bool = False,
+        insert_eager_counts: bool = True,
     ) -> None:
         layer_ids = [
             layer_id
@@ -232,6 +233,15 @@ class GpuResidencyUpdater:
         self.insert_direct = self.insert_stage == _STAGE_DIRECT
         self.insert_on_miss_decay = float(insert_on_miss_decay)
         self.fused_insert = bool(fused_insert)
+        self.insert_eager_counts = bool(insert_eager_counts)
+        if not self.insert_eager_counts and not self.insert_on_miss:
+            raise ValueError(
+                "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0 shapes the insert-on-miss score; "
+                "it needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"
+            )
+        # SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0: the eager (record_routes) share of route_counts since each layer's
+        # last boundary, which the insert score leaves out.
+        self.eager_counts = None
         self.insert_scores = None
         self.insert_tensors = None
         self.insert_active = None
@@ -293,11 +303,16 @@ class GpuResidencyUpdater:
             self.miss_rows, dtype=torch.long, device=device
         )
         self.insert_scores = self.scores.clone()
+        if not self.insert_eager_counts:
+            self.eager_counts = torch.zeros_like(self.route_counts)
+            for row, policy in enumerate(self.policies):
+                policy._eager_counts = self.eager_counts[row]
+        # 1 << 18 tokens reaches a float32 zero for any decay up to about 0.9996 (0.999 needs ~103k).
         values = (
             [1.0, 1.0]
             if self.insert_on_miss_decay == 1.0
             else self._tabulate_decay(
-                lambda tokens: self.insert_on_miss_decay**tokens, 1 << 16
+                lambda tokens: self.insert_on_miss_decay**tokens, 1 << 18
             )
         )
         self.insert_decay_table_tokens = len(values) - 1
@@ -600,6 +615,8 @@ class GpuResidencyUpdater:
             # measures serving, not the warm-up.
             self.gather_insertions.zero_()
             self.gather_evictions.zero_()
+            if self.eager_counts is not None:
+                self.eager_counts.zero_()
             # Rank a shortlist eagerly: the first replay reads it before any boundary
             # runs, and a capture-time shortlist would name pre-warm-up slots.
             self._rank_victims(self.route_counts > 0)
@@ -663,6 +680,12 @@ class GpuResidencyUpdater:
         if getattr(self.manager, "prefill_lend_active", False):
             raise RuntimeError("a residency boundary ran while a layer-major pass has hot-cache slots lent")
         inserting = self.insert_on_miss and phase == _DECODE_PHASE
+        insert_counts = self.route_counts
+        if self.eager_counts is not None:
+            # Eager routes are recorded before an eager forward's first gather flushes the pending boundary, so they
+            # can sit in any boundary's window; whichever window holds them, the insert score skips them.
+            insert_counts = self.route_counts - self.eager_counts
+            self.eager_counts.masked_fill_(gate, 0.0)
         if self.insert_on_miss:
             insert_decay = self.insert_decay_table.index_select(
                 0, self.tokens.clamp(max=self.insert_decay_table_tokens)
@@ -670,11 +693,11 @@ class GpuResidencyUpdater:
             self.insert_scores.copy_(
                 torch.where(
                     gate,
-                    self.insert_scores * insert_decay + self.route_counts,
+                    self.insert_scores * insert_decay + insert_counts,
                     self.insert_scores,
                 )
             )
-        routed = self.route_counts > 0 if self.insert_on_miss else None
+        routed = insert_counts > 0 if self.insert_on_miss else None
         decay = self.decay_table.index_select(
             0, self.tokens.clamp(max=self.decay_table_tokens)
         )

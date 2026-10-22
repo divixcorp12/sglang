@@ -852,13 +852,15 @@ def test_the_hicache_and_engram_arms_add_their_knob_alone(monkeypatch):
 
 
 def test_the_decay_arm_is_arm_a_with_the_hot_decay_alone(monkeypatch):
-    """-decay995 is -hicache1 with SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995; every other arm states 0.98 against a
-    shell's. Mutant: another arm inherits the shell's decay, or the arm changes another knob -- red."""
+    """-decay995 is -hicache1 with SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.995; the arms on production's env state its
+    0.999 (2026-10-22), every other arm 0.98, against a shell's. Mutant: another arm inherits the shell's decay, or the
+    arm changes another knob -- red."""
     ab = _ab()
     monkeypatch.setenv("SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY", "0.9")
     decay, arm_a = PIN01_HICACHE_ARMS[2], PIN01_HICACHE_ARMS[0]
     for arm in ab.ARMS:
-        assert ab._overrides(arm, "/out")["SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"] == ("0.995" if arm == decay else "0.98")
+        expected = "0.995" if arm == decay else "0.999" if arm in PROD_ARMS else "0.98"
+        assert ab._overrides(arm, "/out")["SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"] == expected, arm
     d, a = ab.ARMS[decay][0], ab.ARMS[arm_a][0]
     assert {k: v for k, v in d.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"} == \
         {k: v for k, v in a.items() if k != "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"}
@@ -1167,8 +1169,11 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
         "SGLANG_DSV41_GPU_DRIP_SLOTS": "0",
         "SGLANG_MOE_EXPERT_MIRROR_CAPS": "",
         "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": "0",
-        "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY": "0.98",
     }
+    # Owner, 2026-10-22, no served A/B: the DIRECT insert score without eager (prefill) routes, at decay 0.999 (offline
+    # replay +15.6 hits a verify, hot-cache-replay-1022).
+    hot_insert = {"SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY": ("0.98", "0.999"),
+                  "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS": (None, "0")}
     calibrations = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": ("0", "1"),
                     "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
     # Layer-major prefill under DSpark: production since 2026-10-17 (owner), never served on the best arm.
@@ -1188,7 +1193,8 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
                                                        "SGLANG_MOE_PINNED_HOST_NUMA_MB", "SGLANG_MOE_HOT_GPU_MB")}
     assert pinned["SGLANG_MOE_HOT_GPU_MB"] == (str(ab.EXPSEG_HOT_GPU_MB), arm_env.PROD_DSPARK_HOT_GPU_MB)
     rest ={k: v for k, v in differs.items() if k not in prefetch}
-    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut, **pinned}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut, **pinned,
+                    **hot_insert}
     # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
     argv = arm_env.ServerArgs.prod().argv()
     flags = ab.server_flags(arm)
