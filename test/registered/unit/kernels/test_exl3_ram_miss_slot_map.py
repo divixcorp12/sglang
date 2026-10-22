@@ -91,6 +91,38 @@ def test_reserve_staging_clamps_to_the_rows_capacity_minus_one(tmp_path, capacit
         host.stop()
 
 
+def test_reserve_staging_zero_reserves_no_slot_and_publishes_empty_lists(tmp_path):
+    """A fully pinned model (expert_stream.model_fully_pinned) stages nothing: tag 1 still publishes, every list is
+    empty, and a fill can map every slot. Mutation: k == 0 is refused, or it still reserves a slot."""
+    s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=1, experts=EXPERTS)
+    page = new_page(pin=False, wire=wire_layout(8))
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr")
+    try:
+        host.reserve_staging(0)
+        sim = ChainSim(host, page, s.slabs)
+        tag, staging, entries = sim.delta(0)
+        assert tag == 1 and entries == [] and staging == [-1] * 8
+        assert sorted(host.assign(0, expert)[0] for expert in range(CAPACITY)) == list(range(CAPACITY))
+        with pytest.raises(RuntimeError, match=r"a row has 0\.\.\d+ staging slots"):
+            host.reserve_staging(-1)
+    finally:
+        host.stop()
+
+
+def test_a_miss_on_a_row_without_staging_slots_fail_stops(tmp_path):
+    """reserve_staging(0) leaves no slot a miss could land in; a record that names one anyway (here slot 0, now a
+    mapped expert's) must stop the service, not read over that expert. Mutation: the empty-list check is gone, so the
+    host fails with the generic "is not a staging slot" (or, for a forced miss, would evict a victim)."""
+    body = (
+        "assert host.assign(0, 0)[0] == 0\n"
+        "sim.post(0, [1], kinds=[LaneKind.MISS_GPU], slots=[0])\nhost.pump()\nprint('reached')\n"
+    )
+    result = run_host_script(
+        tmp_path, "from sglang.srt.layers.moe.ram_slot_map import LaneKind\n" + body, capacity=4, staging=0
+    )
+    assert_aborted(result, "is a RAM miss on a row with no staging slots (staging is off")
+
+
 def test_reserve_staging_refuses_a_row_with_one_slot(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=1, layers=1, experts=EXPERTS)
     host = ExpertStreamHost(

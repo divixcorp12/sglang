@@ -330,13 +330,16 @@ PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
 # the old tier's rows elsewhere: 111,530 MiB, 0:59656,1:51874. Now every layer is a full layer
 # (SGLANG_MOE_PINNED_HOST_FULL_LAYERS 0-39), because a layer outside the list loses its staging and prefetch-pool slots
 # to the RAM-miss table and so cannot map all 384 experts. A full layer buys, per NUMA group (expert % 2 homes it): its
-# 384 / 2 = 192 homed experts, the slots its table holds back (min(victim lanes 8, MAX_LANES) + RAM prefetch spec share 2
-# = 10) and 2 seam slots (expert_stream.full_layer_group_rows): 204 rows, 408 a layer, 16,320 in all. At 13,315,596 B a
-# row (the 2026-10-17 startup log: 8,782 rows = 116,937,458,688 B) that is 108,655,263,360 B, 103,622 MiB a node and
-# 207,244 MiB in all (93.5 GiB over the old tier). No served A/B yet.
+# 384 / 2 = 192 homed experts, the slots its table holds back and 2 seam slots (expert_stream.full_layer_group_rows).
+# With every streamed layer full the model is fully pinned (expert_stream.model_fully_pinned): no expert can miss, so the
+# table holds back nothing, neither staging (it was min(victim lanes 8, MAX_LANES)) nor a RAM prefetch pool (it was the
+# spec share 2): 194 rows a group, 388 a layer, 15,520 in all (it was 204, 408, 16,320 and 207,244 MiB). A row is
+# 13,315,584 B, the pinned host row (the six streamed tensors; the 2026-10-17 startup log: 8,782 rows =
+# 116,937,458,688 B; the 13,315,596 used until 2026-10-22 was the on-disk row, three mul1 scalars more). So a node holds
+# 40 x 194 x 13,315,584 = 103,328,931,840 B, rounded up to 98,543 MiB, and the tier 197,086 MiB. No served A/B yet.
 PROD_PINNED_LAYERS = 40
-PROD_PINNED_ROW_BYTES = 13_315_596
-PROD_PINNED_ROWS_PER_NODE_PER_LAYER = 384 // 2 + (8 + 2) + 2
+PROD_PINNED_ROW_BYTES = 13_315_584
+PROD_PINNED_ROWS_PER_NODE_PER_LAYER = 384 // 2 + 2
 PROD_DSPARK_PINNED_NODE_MB = -(-PROD_PINNED_LAYERS * PROD_PINNED_ROWS_PER_NODE_PER_LAYER * PROD_PINNED_ROW_BYTES // 2**20)
 PROD_DSPARK_PINNED_HOST_MB = str(2 * PROD_DSPARK_PINNED_NODE_MB)
 PROD_DSPARK_PINNED_HOST_NUMA_MB = f"0:{PROD_DSPARK_PINNED_NODE_MB},1:{PROD_DSPARK_PINNED_NODE_MB}"
@@ -347,9 +350,9 @@ PROD_DSPARK_PINNED_FULL_LAYERS = ",".join(str(layer) for layer in range(PROD_PIN
 # prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production), plus the pinned tier's node-1 share
 # beyond arm A's. Arm A's rest was measured with its tier, 48 GiB on node 1 (PINNED_HOST_NUMA_MB "1:49152"), so that is
 # the baseline; the 51,874 MiB production ran until 2026-10-22 was never counted (2.66 GiB). Node 1 then wants
-# 69.91 + 53.19 = 123.10 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more, against production's old
-# 59,656 MiB node-0 share; below the warn level the start only warns, and the level rises with the node-0 share
-# (+42.94 GiB: 117.94). The wait is bounded so a refusal comes in minutes.
+# 69.91 + (98,543 - 49,152 MiB = 48.23) = 118.14 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more,
+# against production's old 59,656 MiB node-0 share; below the warn level the start only warns, and the level rises with
+# the node-0 share (+37.98 GiB: 112.98). The wait is bounded so a refusal comes in minutes.
 PROD_NODE1_HICACHE_GIB = 12.67
 PROD_NODE1_MARGIN_GIB = 1.0
 ARM_A_NODE1_PINNED_MB = 49152

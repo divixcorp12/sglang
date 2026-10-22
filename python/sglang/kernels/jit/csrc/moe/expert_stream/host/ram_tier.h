@@ -1201,13 +1201,14 @@ class RamTier {
   // group's range the first min(k, slots - 1) FREE slots become kStaging, and the tag-1 delta names them, which the
   // device's first post of the row applies. Runs once, on the tier's owner, before any slot is filled, so no row is
   // evicted and no unmap needs a bulk delta. A group's range with fewer than 2 slots could serve no miss and no hit at
-  // once, so it is refused.
+  // once, so it is refused. k == 0 (every streamed layer fully pinned, so no expert can miss) reserves none: the lists
+  // stay empty, the device traps on an unforced miss (type_lanes) and the RAM thread fail-stops on any other.
   void reserve_staging(int64_t k) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("reserve_staging");
-    if (k < 1 || k > Wire::kLanes)
+    if (k < 0 || k > Wire::kLanes)
       throw std::runtime_error(
-          error_prefix<Layout>() + "a row has 1.." + std::to_string(Wire::kLanes) + " staging slots");
+          error_prefix<Layout>() + "a row has 0.." + std::to_string(Wire::kLanes) + " staging slots");
     for (int64_t row = 0; row < layers_; ++row) {
       const Tier& tier = tiers_[row];
       for (int g = 0; g < dist_.size(); ++g) {
@@ -2399,6 +2400,9 @@ class RamTier {
         continue;
       }
       if (is_miss(lane.kind)) {
+        // Only reserve_staging(0) leaves a reserved row no staging slot: every expert is mapped, so a miss is a bug.
+        if (own.staging_reserved && own.staging.empty())
+          fail(" is a RAM miss on a row with no staging slots (staging is off: every streamed layer is fully pinned)");
         if (lane.slot < 0) {
           // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim or swaps
           // in its pool row.

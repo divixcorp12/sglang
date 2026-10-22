@@ -230,6 +230,22 @@ def test_calibrate_runs_every_nodes_cells_and_fits_them():
     assert (costs.stream_lane, costs.stream_base) == (0.0, 0.0)  # no GPU: no stream side
 
 
+def test_a_fully_pinned_model_calibrates_without_landing_reads():
+    """staging_width 0 (model_fully_pinned): no row stages, so no landing cell runs and the model, which reads
+    first_byte and per_expert only for misses, takes their lower bounds instead of failing the fit. Mutation: assemble
+    still requires landing points (the split model would stay off on a fully pinned model)."""
+    host = _FakeHost(TRUE)
+    costs, clamped, _ = calib.calibrate(host, _services(), None, device=-1, reps=3, staging_width=0)
+    assert all(kind != SPLIT_CELL_LANDING for c in host.calls for kind, _, _ in c[2])
+    assert (costs.first_byte, costs.per_expert) == (calib.RANGES_MS["first_byte"][0], calib.RANGES_MS["per_expert"][0])
+    assert clamped == []
+    for key in ("hit_a", "hit_b", "hit_c", "miss_a", "miss_c"):
+        assert _close(getattr(costs, key), getattr(TRUE, key)), key
+    assert math.isclose(costs.copy_lane, TRUE.copy_lane)
+    with pytest.raises(calib.SplitModelCalibrationError, match="two sizes"):
+        calib.assemble([{"landing": []}], (0.0, 0.0))
+
+
 def test_calibrate_refuses_a_group_count_the_model_does_not_price_and_unregistered_groups():
     with pytest.raises(calib.SplitModelCalibrationError, match="2 nodes"):
         calib.calibrate(_FakeHost(TRUE), _services(nodes=1), None, device=-1, reps=1, staging_width=4)

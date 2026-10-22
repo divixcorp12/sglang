@@ -70,8 +70,8 @@ from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.layers.moe.expert_stream import (
+    model_fully_pinned,
     pinned_full_layers,
-    ram_prefetch_redundant,
     ram_prefetch_spec_share,
 )
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
@@ -431,8 +431,11 @@ class NativePinnedSlotTable:
         """HeldBackSlots, before the service starts: an upper bound on each group's staging and pool slots.
 
         Staging is at most the victim lanes under spill, else the miss lanes, else the widest wire
-        (plan_graph_gather); the pool is the RAM prefetch's share.
+        (plan_graph_gather); the pool is the RAM prefetch's share. A fully pinned model holds back neither: no expert
+        can miss, so it has no staging (staging_width) and no prefetch (ram_prefetch_spec_share).
         """
+        if model_fully_pinned():
+            return 0
         victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
         staging = victims or envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get() or MAX_LANES
         return min(staging, MAX_LANES) + ram_prefetch_spec_share()
@@ -1047,8 +1050,11 @@ class Exl3RamMissService:
         return wire_layout(self._gather_planned or 1).lanes
 
     def staging_width(self) -> int:
-        """The staging slots every row asks for: the planned victim lanes under spill, the planned gather width, else
+        """The staging slots every row asks for: none when the model is fully pinned (model_fully_pinned: every expert
+        is mapped, so no RAM miss can happen), else the planned victim lanes under spill, the planned gather width, else
         the build's lanes."""
+        if model_fully_pinned():
+            return 0
         return self._staging_planned or self._gather_planned or self.resolved_lanes()
 
     def _check_spill_room(self, row: int, streamer, width: int) -> None:
@@ -1304,11 +1310,14 @@ class Exl3RamMissService:
             # plan_gather_width.
             host.reserve_staging(self.staging_width())
             spec_share = ram_prefetch_spec_share()
-            if envs.SGLANG_DSV41_RAM_PREFETCH.get() and ram_prefetch_redundant():
+            if model_fully_pinned():
                 logger.info(
-                    "exl3 RAM miss prefetch: off although SGLANG_DSV41_RAM_PREFETCH=1: every streamed layer is in "
-                    "SGLANG_MOE_PINNED_HOST_FULL_LAYERS, so no expert is left on NVMe to prefetch (no pool, scorer "
-                    "or speculative cores)"
+                    "exl3 RAM miss: every streamed layer is in SGLANG_MOE_PINNED_HOST_FULL_LAYERS, so every expert is "
+                    "mapped in RAM and none can miss: staging is off (0 staging slots a row)%s",
+                    "; the RAM prefetch is off although SGLANG_DSV41_RAM_PREFETCH=1, as no expert is left on NVMe to "
+                    "prefetch (no pool, scorer or speculative cores)"
+                    if envs.SGLANG_DSV41_RAM_PREFETCH.get()
+                    else "",
                 )
             if spec_share:
                 if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
@@ -1831,7 +1840,7 @@ class Exl3RamMissService:
         victims = getattr(manager.gpu_residency, "victim_lanes", None)
         want = max(1, min(streamer.graph_miss_width, victims) if victims else streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
-        if staged < want:
+        if staged < want and not model_fully_pinned():  # fully pinned: no miss, so no staging (staging_width)
             logger.warning(
                 "exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d",
                 row,

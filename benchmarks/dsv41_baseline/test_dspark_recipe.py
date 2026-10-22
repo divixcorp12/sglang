@@ -31,8 +31,8 @@ def test_prod_serves_the_dspark_mode_with_its_own_settings():
 # MERGE_PLAN_1016.md: production is the best served arm, RAM prefetch included, with both startup calibrations on.
 PROD_DSPARK_SETTINGS = {
     "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": ",".join(str(layer) for layer in range(40)),
-    "SGLANG_MOE_PINNED_HOST_MB": "207244",
-    "SGLANG_MOE_PINNED_HOST_NUMA_MB": "0:103622,1:103622",
+    "SGLANG_MOE_PINNED_HOST_MB": "197086",
+    "SGLANG_MOE_PINNED_HOST_NUMA_MB": "0:98543,1:98543",
     "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL": "1",
     "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS": "",
     "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES": "0",
