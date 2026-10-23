@@ -108,6 +108,11 @@ def _ab():
     return module
 
 
+def _arm(ab, name):
+    """An arm's overrides as the launch sees them: ARMS holds `GROUP.key` members, collapse() builds the group JSON."""
+    return ab.collapse(ab.ARMS[name][0])
+
+
 def test_the_probe_server_writes_its_own_metrics_file_and_keeps_the_arms_env():
     ab = _ab()
     for arm in ab.ARMS:
@@ -432,7 +437,7 @@ MISS_CUT = {(CPU_SPLIT, "miss_cut"): 1, (CPU_SPLIT, "miss_cut_max"): 3}
 
 def test_the_miss_cut_arm_is_dspark_both_with_the_cut_on_against_dspark_both():
     ab = _ab()
-    a, c = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-misscut"][0]
+    a, c = _arm(ab, "dspark-both"), _arm(ab, "dspark-both-misscut")
     assert {k: _get(c, k) for k in MISS_CUT} == MISS_CUT
     assert _strip(c, *MISS_CUT) == _strip(a, *MISS_CUT)
     assert ab.ARMS["dspark-both-misscut"][1] is True
@@ -441,7 +446,7 @@ def test_the_miss_cut_arm_is_dspark_both_with_the_cut_on_against_dspark_both():
 
 def test_the_prefetch_miss_cut_arm_is_the_gpu_prefetch_arm_with_the_cut_on():
     ab = _ab()
-    a, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut"][0]
+    a, c = _arm(ab, "dspark-both-prefetch-gpu"), _arm(ab, "dspark-both-prefetch-gpu-misscut")
     assert {k: _get(c, k) for k in MISS_CUT} == MISS_CUT
     assert _strip(c, *MISS_CUT) == _strip(a, *MISS_CUT)
     assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut"] == "dspark-both"
@@ -449,7 +454,7 @@ def test_the_prefetch_miss_cut_arm_is_the_gpu_prefetch_arm_with_the_cut_on():
 
 def test_the_weights_arm_is_the_miss_cut_arm_with_the_mirror_weighted_by_drive_speed():
     ab = _ab()
-    a, w = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-weights-misscut"][0]
+    a, w = _arm(ab, "dspark-both-misscut"), _arm(ab, "dspark-both-weights-misscut")
     assert _get(w, (MIRROR, "weights")) == "16:10:16"  # nvme0 : nvme4 (SPCC) : nvme2, by fio rate
     assert _strip(w, (MIRROR, "weights")) == _strip(a, (MIRROR, "weights"))
     assert ab.ARMS["dspark-both-weights-misscut"][1] is True
@@ -740,8 +745,8 @@ def test_the_cores13_arm_differs_from_its_base_in_node_1s_cpu_expert_cores_alone
     assert len(plan[1]["cpu"]) == int(cores["SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS"]) == 13
     # Node 1's RAM core is 51 and its spec thread's 50; its FREE cores 52-55 are never named.
     assert set(plan[1]["cpu"]) <= set(range(28, 50)) and plan[1]["ram"] == [51]
-    # The launch refuses node 0's RAM core named both here and by the spin core the recipe sets.
-    assert "ram" not in plan[0]  # the spin core is now the "ram" entry of SGLANG_EXPERT_STREAM_NUMA_CORES, asserted above
+    # The spin core is node 0's "ram" entry of this one NUMA_CORES value (it was a separate env); no CPU worker holds it.
+    assert plan[0]["ram"] == [ab.arm_env.SPIN_CORE] and ab.arm_env.SPIN_CORE not in plan[0]["cpu"]
 
 
 def test_the_gate_arm_is_its_fixed_split_reference_with_the_gate_alone_and_every_other_arm_pins_it_off(monkeypatch):
@@ -808,9 +813,9 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
                                                                     *PIN01_HICACHE_ARMS)
                                               else ""), arm
             assert (_get(overrides, SPLIT_LAYERS) or "") == (
-                _get(ab.ARMS[arm][0], SPLIT_LAYERS) if arm == PIN01_GPU01_ARM else ""), arm
+                _get(_arm(ab, arm), SPLIT_LAYERS) if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
-    pin, plain, gpu = ab.ARMS[PIN01_ARM][0], ab.ARMS[reference][0], ab.ARMS[PIN01_GPU01_ARM][0]
+    pin, plain, gpu = _arm(ab, PIN01_ARM), _arm(ab, reference), _arm(ab, PIN01_GPU01_ARM)
     budget = {"SGLANG_EXPERT_STREAM_PINNED_HOST_MB", "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB"}
     knobs = budget | {FULL_LAYERS}
     assert {k: v for k, v in pin.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
@@ -845,7 +850,7 @@ def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins
             assert (_get(overrides, SPLIT_MODEL_COSTS) or "") == (
                 ab.SPLIT_MODEL_FIXED_COSTS if arm == PIN01_SPLIT_MODEL_FIXED_COSTS_ARM else ""), arm
             assert (_get(overrides, SPLIT_MODEL_REFINE) or 0) == (50 if arm == PIN01_SPLIT_MODEL_REFINE_ARM else 0), arm
-    model, pin = ab.ARMS[PIN01_SPLIT_MODEL_ARM][0], ab.ARMS[PIN01_ARM][0]
+    model, pin = _arm(ab, PIN01_SPLIT_MODEL_ARM), _arm(ab, PIN01_ARM)
     assert _strip(model, SPLIT_MODEL) == _strip(pin, SPLIT_MODEL)
     assert ab.REFERENCE[PIN01_SPLIT_MODEL_ARM] == PIN01_ARM and ab.ARMS[PIN01_SPLIT_MODEL_ARM][1] is True
 
@@ -861,10 +866,10 @@ def test_the_fixed_cost_and_refine_arms_are_hicache1_with_one_knob_each():
     )
 
     ab = _ab()
-    base = ab.ARMS[PIN01_HICACHE_ARMS[0]][0]
+    base = _arm(ab, PIN01_HICACHE_ARMS[0])
     for arm, key in ((PIN01_SPLIT_MODEL_FIXED_COSTS_ARM, SPLIT_MODEL_COSTS), (PIN01_SPLIT_MODEL_REFINE_ARM,
                                                                             SPLIT_MODEL_REFINE)):
-        other = ab.ARMS[arm][0]
+        other = _arm(ab, arm)
         assert _strip(other, key) == _strip(base, key), arm
         assert ab.server_flags(arm) == ("--weight-loader-drop-cache-after-load",) and ab.ARMS[arm][1] is True
     assert split_model_overrides_complete(ab.SPLIT_MODEL_FIXED_COSTS, 2)
@@ -945,7 +950,7 @@ def test_the_tiebreak_arm_is_arm_a_with_the_tiebreak_alone(monkeypatch):
     tiebreak, arm_a = PIN01_HICACHE_ARMS[3], PIN01_HICACHE_ARMS[0]
     for arm in ab.ARMS:
         assert bool(_get(ab._overrides(arm, "/out"), key)) == (arm == tiebreak), arm
-    t, a = ab.ARMS[tiebreak][0], ab.ARMS[arm_a][0]
+    t, a = _arm(ab, tiebreak), _arm(ab, arm_a)
     assert _strip(t, key) == _strip(a, key)
     assert ab.REFERENCE[tiebreak] == arm_a and ab.server_flags(tiebreak) == ("--weight-loader-drop-cache-after-load",)
 
@@ -1143,7 +1148,7 @@ def test_the_cap_arm_is_the_gpu_arm_with_the_per_drive_in_flight_cap(monkeypatch
     """Design 2026-10-09-dsv41-drive-aware-reads change (3): roots nvme0, nvme4 (the SPCC), nvme2 capped at 4, 2, 4
     sub-reads in flight; compared with dspark-both like the other prefetch arms."""
     ab = _ab()
-    g, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-cap"][0]
+    g, c = _arm(ab, "dspark-both-prefetch-gpu"), _arm(ab, "dspark-both-prefetch-gpu-cap")
     assert (_get(c, DYNAMIC), _get(c, CAPS)) == (True, "4,2,4")
     assert _strip(c, DYNAMIC, CAPS) == _strip(g, DYNAMIC, CAPS)
     # The caps follow the roots' order in the recipe the arms run on.
@@ -1171,7 +1176,7 @@ TWO_STAGE = (CPU_TWO_STAGE, "enabled")
 
 def test_the_two_stage_arm_is_the_miss_cut_arm_with_the_two_stage_cpu_miss_on():
     ab = _ab()
-    a, t = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-misscut-twostage"][0]
+    a, t = _arm(ab, "dspark-both-misscut"), _arm(ab, "dspark-both-misscut-twostage")
     assert _get(t, TWO_STAGE) is True
     assert _strip(t, TWO_STAGE) == _strip(a, TWO_STAGE)
     assert ab.ARMS["dspark-both-misscut-twostage"][1] is True
@@ -1192,7 +1197,7 @@ SPAN = ((CPU_TWO_STAGE, "w13_weights"), (CPU_TWO_STAGE, "w2_weights"))
 
 def test_the_spcc13_arm_is_the_two_stage_arm_with_the_spcc_on_w13_only():
     ab = _ab()
-    t, c = ab.ARMS["dspark-both-misscut-twostage"][0], ab.ARMS["dspark-both-misscut-twostage-spcc13"][0]
+    t, c = _arm(ab, "dspark-both-misscut-twostage"), _arm(ab, "dspark-both-misscut-twostage-spcc13")
     assert (_get(c, SPAN[0]), _get(c, SPAN[1])) == ("6:10:6", "1:0:1")  # nvme0 : nvme4 (SPCC) : nvme2
     assert _strip(c, *SPAN) == _strip(t, *SPAN)
     assert ab.ARMS["dspark-both-misscut-twostage-spcc13"][1] is True
@@ -1215,7 +1220,7 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
     ab = _ab()
     arm_env = ab.arm_env
     arm = ab.MERGE_CHUNK_EXPSEG_ARM
-    best, prod = _flat(arm_env.arm_env(ab.ARMS[arm][0])), _flat(arm_env.prod_env())
+    best, prod = _flat(arm_env.arm_env(ab.collapse(ab.ARMS[arm][0]))), _flat(arm_env.prod_env())
     differs = {k: (best.get(k), prod.get(k)) for k in set(best) | set(prod) if best.get(k) != prod.get(k)}
     head = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
     assert differs.pop(head) == (ab.T3_HEAD, arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD)
@@ -1276,7 +1281,7 @@ def test_the_prod_arm_is_production_with_the_arms_stated_defaults_and_takes_no_f
     ab = _ab()
     arm_env = ab.arm_env
     assert ab.PROD_ARM == PROD_ARM and ab.PROD_ARMS == PROD_ARMS
-    env, prod = _flat(arm_env.arm_env(ab.ARMS[PROD_ARM][0])), _flat(arm_env.prod_env())
+    env, prod = _flat(arm_env.arm_env(ab.collapse(ab.ARMS[PROD_ARM][0]))), _flat(arm_env.prod_env())
     assert {k: v for k, v in env.items() if k in prod} == prod
     extra = {k: v for k, v in env.items() if k not in prod}
     assert all(v in ("", "0", "5", "0.98", False) for v in extra.values()), extra  # stated off or at the library default

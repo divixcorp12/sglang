@@ -104,8 +104,9 @@ class TestValidateDeepseekV41FeaturesLayerMajorGate(unittest.TestCase):
             with envs.SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS.override(4):
                 with self.assertRaisesRegex(ValueError, "GPU_DRIP_SLOTS"):
                     _run(_cfg())
-            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always"}'):
-                with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE"):
+            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"predictor": "llapor", "pull_mode": "always"}'):
+                # A pull mode needs a predictor, so the group names one; the gate names the group's pull_mode.
+                with self.assertRaisesRegex(ValueError, "SHADOW_PREFETCH's pull_mode"):
                     _run(_cfg())
 
     def test_drip_and_pull_mode_are_fine_without_lending(self):

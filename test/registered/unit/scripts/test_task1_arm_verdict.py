@@ -24,9 +24,9 @@ MIRRORS = "/mnt/nvme0/x:/mnt/nvme4/x"
 def _report(mirror=True, traced=True):
     env = {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1"}
     if mirror:
-        env[verdict.MIRRORS_ENV] = MIRRORS
+        env[verdict.MIRRORS_ENV] = json.dumps({"dirs": MIRRORS})  # group envs are JSON objects since F145
     if traced:
-        env[verdict.TRACE_ENV] = "/out/x.trace"
+        env[verdict.TRACE_ENV] = json.dumps({"expert_path": "/out/x.trace"})
     session = {"cpu_s": 3.0, "step_latency": {"steps": 127, "multi_token_chunks": 0, "step_s_p50": 0.3}}
     return {
         "provenance": {

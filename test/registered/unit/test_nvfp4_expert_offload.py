@@ -1303,6 +1303,10 @@ class HotCacheStartupTests(unittest.TestCase):
             ),
             patch.object(ExpertHotCacheManager, "from_model") as factory,
         ):
+            # ModelRunner.__init__ resolves the config once; this runner skips __init__, so resolve it as it does.
+            from sglang.srt.layers.moe.expert_engine.config import stream_config
+
+            runner.expert_stream_config = stream_config()
             runner.maybe_init_expert_hot_cache()
         self.assertIsNone(runner.expert_hot_cache_manager)
         factory.assert_not_called()

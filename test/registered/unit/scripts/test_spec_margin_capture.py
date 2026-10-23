@@ -126,7 +126,7 @@ def test_the_default_client_is_the_greedy_session_probe_and_prompts_files_make_i
     assert argv[argv.index("--temperature") + 1] == "0.6" and argv[argv.index("--top-p") + 1] == "0.95"
     assert argv[argv.index("--max-tokens") + 1] == "768" and argv[argv.index("--top-logprobs") + 1] == "0"
     assert argv[argv.index("--prompts-file") + 1] == str(prompts)
-    assert _trace(cap.capture_env(a))["job"]["capacity"] == cap.LONG_TRACE_CAPACITY
+    assert _trace(cap.capture_env(a))["job"]["capacity"] == int(cap.LONG_TRACE_CAPACITY)  # a JSON integer in the group env
 
 
 def test_sampling_flags_need_a_long_prompt_or_a_prompts_file(tmp_path):
