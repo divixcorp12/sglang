@@ -463,19 +463,15 @@ def test_sm_entries_skip_the_dma(tmp_path):
 def test_sm_small_copies_are_refused_without_the_copy_engine():
     import msgspec
 
-    from sglang.srt.dsv41_config import Dsv41Config
+    from sglang.srt.layers.moe.expert_engine.config import CopyConfig, CopyMode
     from sglang.srt.layers.moe.expert_engine.row_backend import check_sm_small_copies
 
-    base = Dsv41Config.from_envs()
+    base = CopyConfig()
     check_sm_small_copies(base)  # off: nothing to check
     with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_COPY_MODE"):
-        check_sm_small_copies(
-            msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True)
-        )
+        check_sm_small_copies(msgspec.structs.replace(base, sm_small_copies=True))
     check_sm_small_copies(
-        msgspec.structs.replace(
-            base, enable_ram_miss_sm_small_copies=True, enable_ram_miss_copy_engine=True
-        )
+        msgspec.structs.replace(base, sm_small_copies=True, mode=CopyMode.COPY_ENGINE)
     )
 
 
@@ -588,7 +584,14 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
 
     host = Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host"
     # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
-    tier = " ".join((host / "ram_tier.h").read_text().split())
+    # ram_tier.h's class body is split into the .inc.h fragments it includes (a pure move), and Tier into ram_tier_slots.h.
+    tier = " ".join(
+        " ".join((host / name).read_text().split())
+        for name in (
+            "ram_tier.h", "ram_tier_slots.h", "ram_tier_fill_copy_cpu.inc.h", "ram_tier_record_support.inc.h",
+            "ram_tier_spec_serve.inc.h",
+        )
+    )
     assert "store_release(lease_ + Wire::kLeaseCopyGate" not in tier
     assert (
         tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1

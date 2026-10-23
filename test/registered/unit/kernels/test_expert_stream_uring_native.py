@@ -182,7 +182,14 @@ int main(int argc, char** argv) {
     // destinations: READV_FIXED has one buffer index, not an index per iovec.
     const std::vector<int> fds{second.fd, first.fd};
     const std::vector<RegisteredRegion> buffers{{arena.data, kArenaBytes, kArenaBytes}};
+    // The host reads no environment: install SGLANG_EXPERT_STREAM_URING's members as Python would, and give the
+    // ring its SQPOLL core as the thread plan does (set_sq_thread_cpu).
+    sglang::expert_stream::set_uring_options(sglang::expert_stream::UringOptions::parse(
+        mode, configured_depth, setting("URING_TEST_FIXED_FILES", "0") == "1", read_mode,
+        setting("URING_TEST_WAIT_MODE", "block"), std::stoll(setting("URING_TEST_SQ_THREAD_IDLE_MS", "10000")),
+        setting("URING_TEST_DIAGNOSTICS", "0") == "1", "auto"));
     UringReader reader;
+    reader.set_sq_thread_cpu(std::stoi(setting("URING_TEST_SQ_THREAD_CPU", "-1")));
     if (!unsupported.empty()) {
       bool rejected = false;
       try {

@@ -11,6 +11,7 @@ from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.expert_engine import row_backend
+from sglang.srt.layers.moe.expert_engine.config import resolved_config
 from sglang.srt.layers.moe.expert_engine import service as module
 from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
@@ -226,11 +227,14 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
 
 def test_cpu_experts_refuse_the_generic_route_plan():
     """Only the fused plan sorts the miss lanes; refused before the host is touched."""
-    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
+    cfg = SimpleNamespace(enable_layer_fusion=True)
     with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'), \
+            envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"), \
             envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False):
         with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"):
-            module.ExpertEngineService._start_cpu_experts(cfg, None, None, {}, False, None)
+            module.ExpertEngineService._start_cpu_experts(
+                cfg, None, None, {}, False, None, stream=resolved_config().stream
+            )
 
 
 def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(tiers, monkeypatch):
@@ -399,6 +403,7 @@ def test_victim_lanes_stage_their_width_not_the_lanes(tiers):
     reserves V staging slots (Exl3ExpertFormat.plan_graph_gather plans it)."""
     service, streamers = tiers
     with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(2):
+        service.config = resolved_config()  # the service resolves its config once, when it is built
         streamers[0].format.plan_graph_gather(streamers[0], 36)
     assert service.resolved_lanes() == 40
     assert service.staging_width() == 2
@@ -533,10 +538,13 @@ def test_held_back_slots_drop_the_pool_when_every_streamed_layer_is_full(monkeyp
             envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES.override(8), \
             envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), \
             envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(2):
+        # The table reads its service's config, resolved when the service was built: one per setting here.
         with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
-            assert row_backend.NativePinnedSlotTable.held_back_per_group(None) == 10
+            table = SimpleNamespace(service=SimpleNamespace(config=resolved_config()))
+            assert row_backend.NativePinnedSlotTable.held_back_per_group(table) == 10
         with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
-            assert row_backend.NativePinnedSlotTable.held_back_per_group(None) == 8
+            table = SimpleNamespace(service=SimpleNamespace(config=resolved_config()))
+            assert row_backend.NativePinnedSlotTable.held_back_per_group(table) == 8
 
 
 @pytest.mark.parametrize(

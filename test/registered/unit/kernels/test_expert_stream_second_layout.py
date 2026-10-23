@@ -71,8 +71,8 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     real = transport._host_module
     monkeypatch.setattr(
         transport, "_host_module",
-        lambda layout=EXL3, variant=None, lanes=8, nodes=1: (
-            loaded.append(layout) or real(layout, variant, lanes, nodes)
+        lambda layout=EXL3, variant=None, lanes=8, nodes=1, config=None: (
+            loaded.append(layout) or real(layout, variant, lanes, nodes, config)
         ),
     )
     page = new_page(pin=False, wire=wire_layout(8))

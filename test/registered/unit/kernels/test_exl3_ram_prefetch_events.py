@@ -26,11 +26,11 @@ def _counts(events):
 
 
 def test_a_speculative_row_leaves_submit_land_and_use_events_and_the_scorer_counts(tmp_path, monkeypatch):
+    # The host copies the trace options installed when it is built, so the prefix is set before the rig.
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
-        # Read when enable_ram_prefetch builds each group's trace; the rig's other engines were built without it.
-        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         trig = trigger(rig)
         assert rig.host.spec_pump(0)
@@ -51,10 +51,10 @@ def test_a_speculative_row_leaves_submit_land_and_use_events_and_the_scorer_coun
 
 
 def test_the_events_still_join_when_another_rows_record_posts_between_source_and_demand(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig", rows=3)
     try:
-        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         trig = trigger(rig)
         other = rig.sim.post(2, [])
@@ -71,10 +71,10 @@ def test_the_events_still_join_when_another_rows_record_posts_between_source_and
 
 
 def test_a_failed_speculative_read_emits_submit_but_no_land(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
-        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         load(rig, 0, [5])
         rig.host.inject_fault(part=0, part_error=5)
@@ -92,10 +92,10 @@ def test_a_failed_speculative_read_emits_submit_but_no_land(tmp_path, monkeypatc
 def test_spec_submit_carries_the_picks_rank_and_margin_in_gen(tmp_path, monkeypatch):
     """gen = rank << 32 | the margin's fp32 bits, for spec_margin.py. LOGITS' top_k 2 ranks 2 (40) then 4 (35): the
     pick is 2, rank 0, margin sqrt(40) - sqrt(35) in fp32. Mutant: emit 0 for gen -- red."""
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
-        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         trigger(rig)
         assert rig.host.spec_pump(0)
