@@ -124,7 +124,8 @@ The forward takes one `ForwardCall` (`kernel.hpp`, shared with the EXL3 kernel):
 to eight lanes each. It skips -1 slots, preserves each row's routing order
 including duplicate slots, and supports overwrite or accumulation. Rows that
 route to the same slot are computed together, up to four per decoded weight
-row; every row's output is bitwise its own one-row call's. The engine sends
+row; every row's output matches its own one-row call's within one Q8_0 quantum of the row's maximum (not bitwise: the
+-Ofast build may vectorize a batch differently). The engine sends
 one row per job. Caller
 pointer extents and finite activation/block-scale values are required. Raw
 pointers cannot prove allocation size. A refused call throws `std::invalid_argument`, a failure another

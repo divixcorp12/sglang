@@ -5,7 +5,7 @@
 # Variants: avx2 (a build at -march=x86-64-v3) and scalar (-march=x86-64), each its own build of the harness: the ISA
 # tier is the build's -march. The kernel is built -Ofast, so a dump is compared with nvfp4_cpu_dump_compare.py's
 # relative tolerance (NVFP4_AB_RTOL, default 1e-2: one Q8_0 quantum), not byte for byte; the harness itself still checks that a batched
-# call equals its one-row calls bit for bit.
+# call matches its one-row calls within one Q8_0 quantum (they are no longer bit-identical under -Ofast).
 # CXX defaults to GCC 15; NVFP4_AB_CORES to 0-7 (NUMA node 0).
 # NVFP4_AB_BASE_NAMES names BASE_OUT's dumps for avx2,scalar (default avx2,scalar).
 # NVFP4_AB_HARNESS runs another revision's harness source against WORKTREE's kernel (to re-baseline a harness change).

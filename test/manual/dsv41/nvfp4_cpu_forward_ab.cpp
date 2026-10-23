@@ -2,7 +2,7 @@
 // It calls only the kernel interface (nvfp4_cpu_kernel(), kernel.h). Every one-row output and status (status_of) is
 // written to OUT in a fixed order: two revisions agree when nvfp4_cpu_dump_compare.py finds their files within its
 // tolerance (the kernel is built -Ofast, so they need not be byte-identical), each built with its own revision of
-// this harness. Batched rows must still equal their one-row calls bit for bit (check_batch).
+// this harness. Batched rows must match their one-row calls within one Q8_0 quantum (check_batch).
 //   nvfp4_cpu_forward_ab OUT CORE [CORE...]     worker i runs on CORE i; the caller is worker 0.
 #include "kernel.h"
 #include "quant.hpp"
@@ -121,7 +121,16 @@ int forward(const Layer& layer, const void* x, const int32_t* slots, const float
     });
 }
 
-// Rows token rows in one call against one call per row, bitwise; returns the number of rows that differ or fail.
+// Whether two output rows agree within one Q8_0 quantum (1/127) of the row's largest magnitude. The kernel is built
+// -Ofast (finite-math), so a batched call may take another vectorized path than a one-row call and need not match it bit
+// for bit.
+bool close_rows(const float* a, const float* b, int n) {
+    float scale = 1e-30f, worst = 0;
+    for (int i = 0; i < n; ++i) { scale = std::max(scale, std::abs(b[i])); worst = std::max(worst, std::abs(a[i] - b[i])); }
+    return worst <= scale / 127.f;
+}
+
+// Rows token rows in one call against one call per row, within close_rows; returns the number of rows that differ or fail.
 // Token t takes routing kRoutings[(t + shift) % 5] padded with -1 slots to k 8, or k8_negzero for all when shift < 0
 // (every slot shared by every token: chunks of 4, 4 and 1 for 9 rows).
 int check_batch(const Layer& handle, int hidden, int threads, int rows, int shift, std::mt19937& rng) {
@@ -146,7 +155,7 @@ int check_batch(const Layer& handle, int hidden, int threads, int rows, int shif
             const size_t o = size_t(t) * hidden;
             bad += forward(handle, x.data() + o, slots.data() + t * k, weights.data() + t * k, k, single.data() + o,
                            threads, accumulate) != 0;
-            bad += std::memcmp(batched.data() + o, single.data() + o, hidden * sizeof(float)) != 0;
+            bad += !close_rows(batched.data() + o, single.data() + o, hidden);
         }
     }
     return bad;

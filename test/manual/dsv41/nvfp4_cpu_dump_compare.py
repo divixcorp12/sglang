@@ -5,7 +5,8 @@ bits. Statuses and case names must match exactly; each case's values must satisf
 over that case's output row (plus a floor of 1e-30 for an all-zero row). Default RTOL 1e-2: an fp32 rounding change
 anywhere before a Q8_0 requantization (input, or the gated-SiLU intermediate) can flip one value to the next
 quantum, which is 1/127 = 7.9e-3 of its block's amax, and that flip is the largest single change the forward can
-see. Measured against the pre-change bit-exact build (2026-10-23, divix01): worst 3.03e-3 at x86-64-v3 and x86-64.
+see. Measured against the pre-change bit-exact build (2026-10-23, divix01, -Ofast finite-math): worst 3.03e-3 at
+x86-64-v3 and x86-64; new avx2 against new scalar 3.95e-4.
 """
 
 import struct
