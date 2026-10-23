@@ -1,0 +1,21 @@
+{
+  "status": "bounded_incremental_verification_passed",
+  "protected_files_unchanged": 195,
+  "full_calibration_launched": false,
+  "production_merger_implemented": false,
+  "native_precision_verified": false,
+  "selection_allowed": false,
+  "artifacts_sha256": {
+    "verify_incremental.py": "9d9a511d04a5bd39f41357897301e77e84e2851b226a7283f22884959a4e5479",
+    "prepared.json": "90f603edc62c9f92c923c0f184775e3bf5a96cef426158b9581b0f05c2e9fba1",
+    "input-pins.json": "3a885488f87a8c9ebc3db3ceeac506cf85db827d4fc324742d37070362afae43",
+    "cpu-audit.json": "f8f8e4d94c5b68149767a7b17d53e69b9be3ad8c2a7b3a01d253a287ee3c653d",
+    "gpu-parity.json": "464c3d1dbb0c66453fe6b5e4da3da7c0df024e61ad5820931e7acf8460225b5e",
+    "commands.json": "6133beea4cebc3d95b52b044483fd278c240926050f943e555b62201cb90264f",
+    "status.json": "1afaad229ce28925b059069ead0679683f52e35f01240b747c216b02f482edb5",
+    "protected-before.json": "89e0cd71492188488864e76c9712fddf2d48b6b69c3b7df0f16d85dadf0ffc7b",
+    "protected-after.json": "89e0cd71492188488864e76c9712fddf2d48b6b69c3b7df0f16d85dadf0ffc7b",
+    "REPORT.md": "3351a06c085c65fd75d2c7f39e171d910dcb2c1b2655d9116d1a9c1e968bd259",
+    "RUNBOOK.md": "b6eaba57921c1512141ded4148256d76f6fc0afd6b8d952ea65f293df69e8997"
+  }
+}

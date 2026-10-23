@@ -1,0 +1,42 @@
+{
+  "status": "passed",
+  "parent_records_preserved": 621,
+  "parent_annotations_preserved": true,
+  "additions": 46,
+  "exact_retokenized": 667,
+  "all_selected_sha256": "36d16dea628b2ecc5ad309da2ccc6d7a7352a919ebca79b804392314bdf88d97",
+  "manifests_verified": 295,
+  "unchanged_domain_weights": true,
+  "repository_and_lineage_separation": true,
+  "source_review_bound": true,
+  "admission_checks": 7,
+  "scoring_launched": false,
+  "selection_allowed": false,
+  "native_precision_verified": false,
+  "coverage_scope_pending": [
+    {
+      "gap": "primary:coding:scientific_numeric:quota_154068_below_224000",
+      "inherited_reported_tokens": 154068,
+      "recomputed_parent_tokens": 333958,
+      "current_tokens": 520835,
+      "floor": 224000,
+      "status": "requires_separate_review"
+    },
+    {
+      "gap": "repeat:coding:concurrency_async:quota_89655_below_96000",
+      "inherited_reported_tokens": 89655,
+      "recomputed_parent_tokens": 357777,
+      "current_tokens": 397272,
+      "floor": 96000,
+      "status": "requires_separate_review"
+    },
+    {
+      "gap": "repeat:coding:scientific_numeric:quota_188553_below_224000",
+      "inherited_reported_tokens": 188553,
+      "recomputed_parent_tokens": 669667,
+      "current_tokens": 725572,
+      "floor": 224000,
+      "status": "requires_separate_review"
+    }
+  ]
+}
