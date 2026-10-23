@@ -88,7 +88,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.expert_engine.config import CopyMode, stream_config
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -811,6 +811,7 @@ class ModelRunner:
                     "size of 1: padded batches would add graph rows as tokens"
                 )
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+        from sglang.srt.layers.moe.expert_transfer import legacy_copy_backend
 
         manager = ExpertHotCacheManager.from_model(
             self.model,
@@ -826,7 +827,7 @@ class ModelRunner:
             log_interval=config.hot_cache.log_interval,
             metrics_path=config.trace.hot_metrics_file or None,
             # The legacy streamer's backend: its copy engine under dma, the SM copy otherwise.
-            copy_backend="dma" if config.copy.mode is CopyMode.DMA else "gpu",
+            copy_backend=legacy_copy_backend(config),
             graph_gather_batch_size=graph_gather_batch_size,
             graph_gather_max_rows=config.copy.graph_gather_scratch_rows,
             async_promotions=residency.async_promotions,

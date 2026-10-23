@@ -517,7 +517,7 @@ def test_a_span_weight_without_the_two_stage_flag_is_refused(model_dir, tmp_path
 
 @pytest.mark.parametrize(
     "value, why",
-    [("1:1", "lists 2 weights but mirror.dirs lists 3 roots"), ("0:0:0", "every weight is zero"),
+    [("1:1", "lists 2 weights but SGLANG_EXPERT_STREAM_MIRROR dirs lists 3 roots"), ("0:0:0", "every weight is zero"),
      ("1:x:1", "is not a number")],
     ids=["root_count", "all_zero", "malformed"],
 )
@@ -532,7 +532,7 @@ def test_a_bad_span_weight_list_is_refused(model_dir, tmp_path, name, value, why
 def test_a_span_weight_on_a_root_the_mirror_reads_nothing_from_is_refused(model_dir, tmp_path):
     """A root with mirror weight 0 has no extent to read a span from."""
     mirror = _group(MIRROR, dirs=_three_roots(tmp_path), weights="1:0:1")
-    with pytest.raises(ValueError, match=f"{W2} gives root 1 a share, but mirror.weights gives it 0"):
+    with pytest.raises(ValueError, match=f"{W2} gives root 1 a share, but SGLANG_EXPERT_STREAM_MIRROR weights gives it 0"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **mirror,
               **_group(CPU_TWO_STAGE, enabled=True, **{W2: "1:1:1"}))
 
