@@ -107,6 +107,5 @@ def test_a_layer_of_any_k_matches_the_gpu_loop_on_the_generic_plan(monkeypatch, 
     rel = float((got - want).norm() / want.norm())
     print(f"K w13 {bits_w13} K w2 {bits_w2} rows {rows}: relative error {rel:.4f}")
     assert torch.isfinite(got).all()
-    # The same bound as test_dspark_hybrid_draft_gpu's CPU share against this loop; a projection decoded at the
-    # wrong K is uncorrelated with the reference (relative error ~1).
+    # The same bound as test_dspark_hybrid_draft_gpu's CPU share against this loop; measured 0.0075-0.014 here.
     assert rel < 0.02
