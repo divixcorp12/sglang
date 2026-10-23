@@ -106,7 +106,7 @@ def _host(request, mode, *, keep_warm_us=0, fatal_wait_s=30.0, ns_per_expert=0):
 
 
 # The shared engine's thread: RamTier::enable_cpu_experts names it "<layout>-cpu-exp" (one node: no group suffix).
-THREAD = {"draft_only": "dspark-cpu", "shared": "fake-cpu-exp"}
+THREAD = {"draft_only": "dspark-cpu", "shared": "exl3-cpu-exp"}
 
 
 def _draft_cpu_s(mode) -> float:

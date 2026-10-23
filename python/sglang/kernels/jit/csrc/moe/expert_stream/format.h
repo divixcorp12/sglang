@@ -7,7 +7,7 @@
 //               policy never routes work to a stub.
 //   Staging     the dtype of the activations the host stages for CPU experts and the draft channel
 //   kName       the format's name, the directory name -DSGLANG_EXPERT_FORMAT selects it by. A real format's Layout
-//               has the same kName, the prefix of every service error; the test format `fake` borrows EXL3's layout.
+//               has the same kName, the prefix of every service error; a test format (kTestFormat) borrows one.
 //
 // Concrete traits live in ../formats/<name>/format.h; the engine's translation units pick one with
 // -DSGLANG_EXPERT_FORMAT=<name> (engine_host.cpp, engine_device.cuh).
