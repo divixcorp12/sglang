@@ -80,7 +80,7 @@ def register_slabs(s, limit):
     trait = Exl3CpuQuantTrait(act_limit=limit)
     trait.attach_host(es.cpu_kernel_options(variant="instr"))
     try:
-        return es.kernel_layer(0, trait.layer_spec(s, CAP), variant="instr"), trait
+        return es.kernel_layer(trait.layer_spec(s, CAP), variant="instr"), trait
     except RuntimeError as error:
         sys.exit(f"kernel_layer refused the slabs: {error}")
 

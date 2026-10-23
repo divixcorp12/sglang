@@ -16,6 +16,7 @@
 
 #include "aligned.h"
 #include "device_sim.h"
+#include "entry.h"
 #include "formats/exl3/row_layout.h"
 #include "expert_stream/host/build_policy.h"
 #include "expert_stream/host/core_topology.h"
@@ -35,20 +36,20 @@
 namespace fullstack {
 
 namespace es = ::sglang::expert_stream;
-using BenchBuild = std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>;
+// The host build with the EXL3 CPU kernel (kernel.cpp, linked into this binary), as the host module's engine_host.cpp
+// builds it.
+template <class Kernel>
+using BuildOf = es::BuildWithKernel<
+    std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>,
+    Kernel>;
+using BenchBuild = BuildOf<::sglang::exl3_cpu::Exl3CpuKernel>;
 static_assert(kNames == static_cast<int>(::sglang::exl3::Exl3RowLayout::kNames.size()));
 
 // The reader of each build, as in python/sglang/kernels/jit/csrc/moe/expert_stream/engine_host.cpp, minus the
 // instrumented build's FaultyReader.
 template <class Build>
-struct ReaderFor;
-template <>
-struct ReaderFor<es::ProdBuild> {
-  using type = es::UringReader;
-};
-template <>
-struct ReaderFor<es::InstrBuild> {
-  using type = es::InstrUringReader;
+struct ReaderFor {
+  using type = std::conditional_t<Build::kMetrics, es::InstrUringReader, es::UringReader>;
 };
 
 // Builds the reader's tables as python/sglang/srt/layers/moe/exl3_ram_miss.py `_row_image_tables` does for one root:
@@ -95,14 +96,11 @@ inline es::Tables image_tables(const RowSet& set) {
 struct StackConfig {
   RowSet rows;
   int64_t staging = 3;
-  const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;  // the format's kernel, every group's
   int64_t keep_warm_ns = 0;  // register work this long after each job before the held team falls back to PAUSE
   // One NUMA group's CPU lanes: its service thread, its cores and its split table.
   struct Group {
     int service_cpu = -1;
     std::vector<int> cores;  // worker 0 first: its CPU expert thread pins itself there; the kernel's workers run there
-    // null: the stack's kernel (set only to provoke the one-kernel refusal)
-    const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;
     std::array<int64_t, es::Wire::kLanes + 1> split{};
   };
   std::vector<Group> groups;                        // one per Wire::kNodes
@@ -168,8 +166,7 @@ class Stack {
     std::vector<int> service_cpus;
     for (int g = 0; g < es::Wire::kNodes; ++g) {
       const StackConfig::Group& group = config_.groups[g];
-      es::CpuExpertConfig cpu;
-      cpu.kernel = group.kernel != nullptr ? group.kernel : config_.kernel;
+      typename es::BasicCpuExpertEngine<Build>::Config cpu;
       cpu.x_base = config_.x_base;
       cpu.x_stride = config_.x_stride;
       // Group g's parts are parts 2 g and 2 g + 1 of the row's output.
@@ -233,7 +230,7 @@ class Stack {
   }
 
   // Installs the row's CPU layer (StackFixture::make_layer), made by the stack's kernel.
-  void set_cpu_layer(int64_t row, const ::sglang::cpu_experts::ExpertLayer& layer) {
+  void set_cpu_layer(int64_t row, const typename Build::CpuKernel::Layer& layer) {
     tier_->set_cpu_layer(row, layer);
   }
 

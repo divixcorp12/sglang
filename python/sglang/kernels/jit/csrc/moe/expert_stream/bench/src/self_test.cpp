@@ -7,7 +7,6 @@
 //   test_image_stamp        row-image layout and stamp reuse
 //   test_stack              the real stack (this binary's build) on synthetic rows with a fake kernel
 //   test_two_groups         two NUMA groups' stacks, each with its own cores and slots (a Wire::kNodes == 2 build)
-//   test_groups_must_share_one_kernel  a group naming a second kernel is refused (a Wire::kNodes == 2 build)
 //   test_a_kernel_takes_a_jobs_lanes   an engine whose kernel takes fewer routes than a job's lanes is refused
 // Each failed check prints "FAIL file:line" and counts toward run_self_test's return value.
 #include "self_test.h"
@@ -513,29 +512,31 @@ struct FakeCall {
 
 // The kernel's stand-in: out[h] = h + x[0] + sum_i weights[i] * (slots[i] + 1), x[0] read as an integer, so the output
 // proves the row's x, the slots and the weights reached it.
-class FakeKernel final : public ce::CpuExpertKernel {
- public:
-  explicit FakeKernel(const char* name = "bench-fake", int32_t max_routes = 1 << 10)
-      : name_(name), max_routes_(max_routes) {}
-  const char* name() const noexcept override {
-    return name_;
+struct FakeKernel {
+  struct Params {};
+  using Layer = ce::ExpertLayer<Params>;
+  static constexpr bool usable() noexcept {
+    return true;
   }
-  ce::ExpertLayer make_layer(const ce::ExpertLayer& shape, std::span<const std::byte>) const override {
-    ce::ExpertLayer layer = shape;
-    layer.kernel = this;
-    return layer;
+  static const char* name() noexcept {
+    return "bench-fake";
   }
-  int32_t max_routes() const noexcept override {
-    return max_routes_;
+  static Params params(std::span<const int64_t>) {
+    return {};
   }
-  int32_t max_rows() const noexcept override {
+  static Layer make_layer(const Layer& shape) {
+    return shape;
+  }
+  // What a forward takes per job; test_a_kernel_takes_a_jobs_lanes narrows it.
+  static inline int32_t routes = 1 << 10;
+  static int32_t max_routes() noexcept {
+    return routes;
+  }
+  static int32_t max_rows() noexcept {
     return 1;
   }
-  void check(const ce::ExpertLayer& layer, const ce::ForwardCall&) const override {
-    if (layer.kernel != this) throw std::invalid_argument("bench fake: another kernel's layer");
-  }
-  using ce::CpuExpertKernel::forward;
-  void forward(const ce::ExpertLayer&, const ce::ForwardCall& c, ce::Team& team) const override {
+  static void check(const Layer&, const ce::ForwardCall&) {}
+  static void forward(const Layer&, const ce::ForwardCall& c, ce::Team& team) {
     team.run([](int, int) {});
     uint16_t x0;
     std::memcpy(&x0, c.x, 2);
@@ -552,18 +553,22 @@ class FakeKernel final : public ce::CpuExpertKernel {
          c.accumulate,
          c.cores.empty() ? -1 : c.cores.front()});
   }
-  int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override {
+  static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
     while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < deadline_ns) _mm_pause();
     return 0;
   }
 
-  mutable std::mutex mutex;
-  mutable std::vector<FakeCall> calls;
-
- private:
-  const char* name_;
-  int32_t max_routes_;
+  static inline std::mutex mutex;
+  static inline std::vector<FakeCall> calls;
+  // Forgets the recorded calls and restores the lane limit, for the next test.
+  static void reset() {
+    std::lock_guard<std::mutex> guard(mutex);
+    calls.clear();
+    routes = 1 << 10;
+  }
 };
+// The host build the self test's stacks run: the production headers with the fake kernel.
+using SelfBuild = BuildOf<FakeKernel>;
 
 // The byte filling expert `expert`'s `name` slab row in row `row`'s image, so a landed slot identifies its source.
 uint8_t pattern(int64_t row, int64_t expert, int name) {
@@ -610,10 +615,10 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   AlignedBuffer out = aligned_zeroed(kSelfRows * 2 * kSelfHidden * 4);
   auto* part0 = reinterpret_cast<float*>(out.get());  // row 0, part 0
   FakeKernel fake;
+  fake.reset();
   StackConfig config;
   config.rows = set;
   config.staging = 3;
-  config.kernel = &fake;
   config.x_base = x.get();
   config.x_stride = 2 * kSelfHidden;
   config.out_base = out.get();
@@ -629,7 +634,7 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   const int64_t timeout = 1'000'000'000;
   {
     PinScope writer(placement.writer);
-    Stack<BenchBuild> stack(std::move(config));
+    Stack<SelfBuild> stack(std::move(config));
     DeviceSim sim(stack.page(), stack.lease(), kSelfRows, kSelfExperts);
 
     // Load three experts: one uncaptured post of three misses, into staging slots 0, 1, 2; the victims 3, 4, 5 (the
@@ -659,7 +664,7 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
     }
 
     // Registered: split[3] = 3, every lane is the CPU's; one CPU job computes slots 2, 0, 1 into part 0.
-    stack.set_cpu_layer(0, fake.make_layer({}, {}));
+    stack.set_cpu_layer(0, fake.make_layer({}));
     sim.set_row_cpu(0);
     uint16_t mark = 100;
     std::memcpy(x.get(), &mark, 2);  // the post kernel's x store, before the record
@@ -766,11 +771,10 @@ struct TwoGroupRig {
     }
   }
 
-  StackConfig config(const Placement& placement, const ce::CpuExpertKernel& kernel) const {
+  StackConfig config(const Placement& placement) const {
     StackConfig c;
     c.rows = set;
     c.staging = 3;
-    c.kernel = &kernel;
     c.x_base = x.get();
     c.x_stride = 2 * kSelfHidden;
     c.out_base = out.get();
@@ -798,9 +802,10 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
     constexpr int64_t kGroup = TwoGroupRig::kGroup;
     TwoGroupRig rig(dir, "selftest2");
     FakeKernel fake;
-    StackConfig config = rig.config(placement, fake);
+    fake.reset();
+    StackConfig config = rig.config(placement);
     PinScope writer(placement.writer);
-    Stack<BenchBuild> stack(std::move(config));
+    Stack<SelfBuild> stack(std::move(config));
     DeviceSim sim(stack.page(), stack.lease(), kSelfRows, kSelfExperts);
     const int32_t four[] = {0, 1, 2, 3};
     // One load per group, so no post mixes groups' misses: a mixed post leaves the tier's staging order unlike the
@@ -809,7 +814,7 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
     const int32_t home1[] = {1, 3};
     load_experts(sim, 0, home0, 3, soon());
     load_experts(sim, 0, home1, 3, soon());
-    stack.set_cpu_layer(0, fake.make_layer({}, {}));
+    stack.set_cpu_layer(0, fake.make_layer({}));
     sim.set_row_cpu(0);
     const float ones[] = {1.0f, 1.0f, 1.0f, 1.0f};
     const SimRequest r = sim.post(0, four, ones, /*captured=*/true, soon());
@@ -843,30 +848,14 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
   }
 }
 
-// Review Focus 2: one tier runs one kernel. Group 1 naming a second kernel is refused while the stack is built, the
-// message naming both kernels. Runs only in the two-node build: BENCH kiface-bench-n2 gates it, kiface-bench (one node)
-// returns at once.
-void test_groups_must_share_one_kernel(const Placement& placement, const std::filesystem::path& dir) {
-  if constexpr (w::Wire::kNodes != 2) {
-    return;
-  } else {
-    TwoGroupRig rig(dir, "selftest-kernels");
-    FakeKernel first("fake-a"), second("fake-b");
-    StackConfig config = rig.config(placement, first);
-    config.groups[1].kernel = &second;
-    PinScope writer(placement.writer);
-    CHECK_THROWS(Stack<BenchBuild> stack(std::move(config)), "group 1 names fake-b, another group fake-a");
-  }
-}
-
 // The engine's forwards take its jobs unchecked, so it refuses, when built, a kernel that cannot take a job's lanes.
 void test_a_kernel_takes_a_jobs_lanes() {
-  FakeKernel narrow("fake-narrow", w::Wire::kLanes - 1);
-  es::CpuExpertConfig config;
-  config.kernel = &narrow;
+  FakeKernel::routes = w::Wire::kLanes - 1;
+  es::BasicCpuExpertEngine<SelfBuild>::Config config;
   CHECK_THROWS(
-      es::CpuExpertEngine engine(std::move(config), "bench: ", "bench-cpu"),
-      "kernel fake-narrow takes");
+      es::BasicCpuExpertEngine<SelfBuild> engine(std::move(config), "bench: ", "bench-cpu"),
+      "kernel bench-fake takes");
+  FakeKernel::reset();
 }
 
 }  // namespace
@@ -885,7 +874,6 @@ int run_self_test(const Placement& placement, const std::filesystem::path& image
   test_image_stamp(image_dir);
   test_stack(placement, image_dir);
   test_two_groups(placement, image_dir);
-  test_groups_must_share_one_kernel(placement, image_dir);
   test_a_kernel_takes_a_jobs_lanes();
   std::fprintf(
       stderr, "self-test (%s): %d checks, %d failed\n", std::string(BenchBuild::kName).c_str(), checks, failures);

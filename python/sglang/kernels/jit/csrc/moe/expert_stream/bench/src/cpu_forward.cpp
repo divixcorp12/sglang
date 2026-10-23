@@ -16,7 +16,9 @@
 
 #include "fixture.h"
 #include "kernel.h"
-#include "moe_mul1.h"
+#ifdef EXL3_BENCH_BASELINE
+#include "baseline_moe_mul1.h"
+#endif
 #include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include "../../moe/expert_stream/host/core_topology.h"
 #include "tile_assignment.hpp"
@@ -59,7 +61,7 @@ std::vector<int> g_cores;  // the bench's worker cores, worker 0 first
 ::sglang::cpu_experts::Team& bench_team(int workers) {
   static std::unique_ptr<::sglang::cpu_experts::Team> team;
   if (!team)
-    team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::exl3_cpu::exl3_cpu_kernel(), 0);
+    team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0);
   return *team;
 }
 bool benchmark_failed = false;
@@ -205,11 +207,11 @@ struct SlabLayer {
     }
   };
   std::array<std::unique_ptr<uint8_t, Free>, 6> slabs;
-  ::sglang::cpu_experts::ExpertLayer layer;
+  ::sglang::exl3_cpu::Exl3CpuKernel::Layer layer;
 
   SlabLayer(const LayerFixture& f, int hidden, int slots) {
     const int experts = static_cast<int>(f.matrices[0].size());
-    ::sglang::cpu_experts::ExpertLayer shape;
+    ::sglang::exl3_cpu::Exl3CpuKernel::Layer shape;
     shape.capacity = slots;
     shape.hidden = hidden;
     shape.intermediate = static_cast<int32_t>(f.matrices[0][0].size(1)) * 16;
@@ -237,11 +239,10 @@ struct SlabLayer {
       shape.slot_bytes[n] = row;
     }
     // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
-    const SglangExl3CpuParams params{
+    shape.params = SglangExl3CpuParams{
         3, 3, 0, 0,
         ::sglang::exl3_cpu::exl3_cpu_match_plan(shape.hidden, shape.intermediate, 3, 3, 0, shape.act_limit)};
-    layer = ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(
-        shape, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
+    layer = ::sglang::exl3_cpu::Exl3CpuKernel::make_layer(shape);
   }
 };
 #endif
@@ -330,7 +331,7 @@ struct Workload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call, bench_team(options.workers));
+    ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
 #endif
   }
 
@@ -450,7 +451,7 @@ struct RoutedWorkload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call, bench_team(options.workers));
+    ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
   }
 
   void validate() {
@@ -566,13 +567,19 @@ int main(int argc, char** argv) {
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
 #else
-    ::sglang::exl3_cpu::exl3_cpu_configure({});
+    ::sglang::exl3_cpu::Exl3CpuKernel::configure({}, 65536, 6000, {}, {});
 #endif
     // The optimized kernel's tier is its build's -march (CMake EXL3_MARCH); the baseline detects at load.
     // Any AVX-512 tier runs the DSV4.1 plan.
+#ifdef EXL3_BENCH_BASELINE
     if (!exl3_moe_cpu_has_avx512_bw())
       throw std::runtime_error("This study requires AVX512BW");
     const char* isa_tier = exl3_moe_cpu_has_avx512_vbmi() ? "vbmi" : exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
+#else
+    const std::string isa_tier = ::sglang::exl3_cpu::Exl3CpuKernel::isa();
+    if (isa_tier == "scalar" || isa_tier == "avx2")
+      throw std::runtime_error("This study requires AVX512BW");
+#endif
     std::cerr << "isa tier " << isa_tier << '\n';
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
@@ -634,7 +641,7 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("compiler", __VERSION__);
 #ifndef EXL3_BENCH_BASELINE
       benchmark::AddCustomContext("row_weighted_assignment", std::to_string(EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT));
-      benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::exl3_cpu_chunk_m()));
+      benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::Exl3CpuKernel::chunk_m()));
 #endif
       for (auto& workload : workloads) {
         auto* w = workload.get();

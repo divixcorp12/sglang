@@ -194,7 +194,6 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   StackConfig c;
   c.rows = f.row_set();
   c.staging = StackFixture::kStaging;
-  c.kernel = &::sglang::exl3_cpu::exl3_cpu_kernel();
   c.keep_warm_ns = static_cast<int64_t>(o.keep_warm_us) * 1000;
   c.x_base = f.x_row(0);
   c.x_stride = f.x_stride();
@@ -218,7 +217,7 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
 
 // The bare forwards' layers, made before the stack exists (BM_bare runs first); the stack gets its own per row.
 struct BareLayers {
-  std::vector<::sglang::cpu_experts::ExpertLayer> layers;
+  std::vector<::sglang::exl3_cpu::Exl3CpuKernel::Layer> layers;
 };
 
 // One timed request: t0 is taken before the x store, t1 when CopyDone is seen.
@@ -367,7 +366,7 @@ class Bench {
     if (!team) {
       const std::vector<int32_t>& workers = placement_.groups[group].workers;
       team = std::make_unique<::sglang::cpu_experts::Team>(
-          workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::exl3_cpu_kernel(), 0);
+          workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0);
     }
     return *team;
   }
@@ -400,7 +399,7 @@ class Bench {
     call.accumulate = false;
     call.cores = placement_.groups[group].workers;
     try {
-      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(
+      ::sglang::exl3_cpu::Exl3CpuKernel::forward(
           bare_layers_.layers[static_cast<size_t>(row)], call, bare_team(group));
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("the bare CPU forward failed: ") + e.what());
