@@ -25,9 +25,7 @@ class _Checkpoint:
         self.s = ram_miss_setup(tmp_path, capacity=2, layers=LAYERS, experts=EXPERTS, mirror_weights=weights)
         self.source = str(tmp_path)
         self.weights = (1.0,) if weights is None else tuple(weights)
-        self.images = ri.open_row_images(
-            self.s.roots, self.s.layout, self.s.fmt.segment_map(), self.source, range(LAYERS)
-        )
+        self.images = ri.open_row_images(self.s.roots, self.s.layout, self.source, range(LAYERS))
         self.image = self.images.layout
 
     @property

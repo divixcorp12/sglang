@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
     Exl3ExpertRecord,
+    Exl3RowGeometry,
     Exl3TensorSpan,
     build_exl3_expert_layout,
 )
@@ -44,7 +45,7 @@ def _synthetic_layout(hidden, inter):
         spans.append(Exl3TensorSpan(suffix, cursor, nbytes, dtype, tuple(shape)))
         cursor += nbytes
     record = Exl3ExpertRecord(0, 0, "unused.safetensors", 0, cursor)
-    return Exl3ExpertLayout(tuple(spans), cursor, {(0, 0): record}, 1, 1)
+    return Exl3ExpertLayout((Exl3RowGeometry(tensors=tuple(spans), row_bytes=cursor),), (0,), {(0, 0): record}, 1, 1)
 
 
 def test_specs_are_the_six_streamed_names(tmp_path):
@@ -126,9 +127,31 @@ def test_rejects_a_layer_outside_the_checkpoint(tmp_path):
 
 def test_rejects_an_unexpected_row(tmp_path):
     layout = _layout(tmp_path)
-    broken = dataclasses.replace(layout, tensors=layout.tensors[:-1])
+    short = layout.tensors[:-1]
+    broken = dataclasses.replace(
+        layout, geometries=(Exl3RowGeometry(tensors=short, row_bytes=sum(t.nbytes for t in short)),)
+    )
     with pytest.raises(ValueError, match="expected"):
         Exl3ExpertFormat(broken, 0)
+
+
+def test_each_layer_of_a_mixed_k_checkpoint_gets_its_own_row_schema(tmp_path):
+    """Layer 1 is K2 throughout and layer 2 has a K2 w2 under K3 w1/w3: each layer's specs and segment map follow its
+    own trellises, so a pinned slab is sized for the row it will hold."""
+    write_fake_exl3(str(tmp_path), num_layers=3, num_experts=2, layer_bits={1: (2, 2), 2: (3, 2)})
+    layout = build_exl3_expert_layout(str(tmp_path))
+    trellis = {
+        layer: {s.name: s.row_shape[-1] for s in Exl3ExpertFormat(layout, layer).tensor_specs(None) if "trellis" in s.name}
+        for layer in range(3)
+    }
+    assert trellis == {
+        0: {"w13_trellis": 48, "w2_trellis": 48},
+        1: {"w13_trellis": 32, "w2_trellis": 32},
+        2: {"w13_trellis": 48, "w2_trellis": 32},
+    }
+    for layer in range(3):
+        segments = Exl3ExpertFormat(layout, layer).segment_map()
+        assert sum(s.nbytes for s in segments) == layout.geometry(layer).row_bytes - 12  # all but the three mul1s
 
 
 def test_the_exl3_format_serves_graph_gathers_from_its_pinned_tier():

@@ -244,7 +244,7 @@ def _row_image_tables(
 
 
 def open_service_row_images(
-    layout, segments, mirrors: dict, direct: bool, streamers
+    layout, mirrors: dict, direct: bool, streamers
 ) -> RowImageSet:
     """Open the row images the service reads with; they are its only row source.
 
@@ -273,5 +273,5 @@ def open_service_row_images(
     from sglang.srt.layers.moe.exl3_row_image import open_row_images
 
     return open_row_images(
-        mirrors["roots"], layout, segments, mirrors["source_root"], list(streamers)
+        mirrors["roots"], layout, mirrors["source_root"], list(streamers)
     )

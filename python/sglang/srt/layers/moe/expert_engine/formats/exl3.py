@@ -31,6 +31,7 @@ import torch
 
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
+    Exl3RowGeometry,
     build_exl3_expert_layout,
 )
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
@@ -74,15 +75,15 @@ class RowSegment:
 
 
 def _row_schema(
-    layout: Exl3ExpertLayout,
+    geometry: Exl3RowGeometry,
 ) -> tuple[tuple[ExpertTensorSpec, ...], tuple[RowSegment, ...]]:
-    """Validate ``layout`` and derive the streamed specs and the byte map.
+    """Validate one layer's row ``geometry`` and derive the streamed specs and the byte map.
 
     Returns the six specs in ``EXL3_STREAMED_NAMES`` order and the segments sorted
     by on-disk offset. Raises ``ValueError`` if the row is not the expected 12
-    tensors or w1 and w3 disagree.
+    tensors or w1 and w3 disagree (they share the w13 slabs); w2's K may differ.
     """
-    spans = {span.name: span for span in layout.tensors}
+    spans = {span.name: span for span in geometry.tensors}
     expected = {f"{w}.{kind}" for w in _PARTS for kind in _KINDS + ("mul1",)}
     if set(spans) != expected:
         raise ValueError(
@@ -122,6 +123,11 @@ def _row_schema(
         tuple(specs[name] for name in EXL3_STREAMED_NAMES),
         tuple(sorted(segments, key=lambda segment: segment.src_offset)),
     )
+
+
+def layer_segments(layout: Exl3ExpertLayout, layer: int) -> tuple[RowSegment, ...]:
+    """Layer ``layer``'s segment map: where each streamed byte of its on-disk row sits."""
+    return _row_schema(layout.geometry(layer))[1]
 
 
 class Exl3ExpertFormat:
@@ -174,7 +180,7 @@ class Exl3ExpertFormat:
         self.layer_id = layer_id
         self.direct = direct
         self.source_root = source_root
-        self._specs, self._segments = _row_schema(layout)
+        self._specs, self._segments = _row_schema(layout.geometry(layer_id))
 
     def tensor_specs(self, layer: torch.nn.Module) -> tuple[ExpertTensorSpec, ...]:
         return self._specs
@@ -393,9 +399,7 @@ class Exl3ExpertFormat:
                 for layer_id, s in streamers.items()
             },
             **mirrors,
-            row_images=open_service_row_images(
-                self.layout, self.segment_map(), mirrors, direct, streamers
-            ),
+            row_images=open_service_row_images(self.layout, mirrors, direct, streamers),
         )
 
     @staticmethod

@@ -279,10 +279,11 @@ def check_sizes(
 
 class _Comparer:
     """Reads a batch of one layer's rows from the source and from a mirror and
-    compares the six streamed tensors byte for byte."""
+    compares the six streamed tensors byte for byte. Serves every layer of
+    ``layer``'s row geometry."""
 
-    def __init__(self, layout: Exl3ExpertLayout, source: str, batch_rows: int) -> None:
-        fmt = Exl3ExpertFormat(layout, 0, direct=False)
+    def __init__(self, layout: Exl3ExpertLayout, layer: int, source: str, batch_rows: int) -> None:
+        fmt = Exl3ExpertFormat(layout, layer, direct=False)
         self.layout = layout
         self.source = source
         self.segments = fmt.segment_map()
@@ -290,7 +291,7 @@ class _Comparer:
         self.names = tuple(spec.name for spec in self.specs)
         self.streamed_row_bytes = sum(segment.nbytes for segment in self.segments)
         self.batch_rows = batch_rows
-        self._spans = sorted(layout.tensors, key=lambda span: span.rel_offset)
+        self._spans = sorted(layout.geometry(layer).tensors, key=lambda span: span.rel_offset)
         self._source_buffers = self._buffers()
         self._mirror_buffers = self._buffers()
 
@@ -468,7 +469,12 @@ def verify_mirror(
     reports = {
         root: RootReport(root, size_problems=size_problems[root]) for root in roots
     }
-    comparer = _Comparer(layout, source, batch_rows)
+    # One comparer per row geometry (a mixed-K checkpoint's layers differ), shared by the layers that have it.
+    comparers: dict[int, _Comparer] = {}
+    for layer in chosen:
+        g = layout.layer_geometry[layer]
+        if g not in comparers:
+            comparers[g] = _Comparer(layout, layer, source, batch_rows)
     layer_paths: dict[int, set[str]] = {}
     for (layer, _expert), record in layout.records.items():
         layer_paths.setdefault(layer, set()).add(record.path)
@@ -484,7 +490,8 @@ def verify_mirror(
         direct=direct,
         keep_going=keep_going,
         files_checked=files_checked,
-        streamed_row_bytes=comparer.streamed_row_bytes,
+        # The header's per-row figure: the largest geometry's (each row's own bytes are what bytes_compared counts).
+        streamed_row_bytes=max((c.streamed_row_bytes for c in comparers.values()), default=0),
         root_reports=[],
     )
     log(render_header(result))
@@ -501,6 +508,7 @@ def verify_mirror(
         )
 
     for layer in chosen:
+        comparer = comparers[layout.layer_geometry[layer]]
         live, mirrors = [], {}
         for root in roots:
             report = reports[root]

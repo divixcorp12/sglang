@@ -17,9 +17,13 @@ On disk, under ``<mirror root>/exl3_row_images/``:
 * ``layer-LLL.rows`` per layer: expert ``e``'s image at byte ``e * row_stride``,
   zero-padded to ``row_stride`` (``image_bytes`` rounded up to a page). A reader
   reads exactly ``image_bytes``; the padding is never read.
-* ``manifest.json``, written last (by rename): the format, the image layout, the
-  source it was built from, and a digest per row. A root without a complete
-  manifest that matches the live layout is refused, never read.
+* ``manifest.json``, written last (by rename): the format, the image layouts (one per
+  distinct row geometry; each layer names its own), the source it was built from, and
+  a digest per row. A root without a complete manifest that matches the live layout is
+  refused, never read.
+
+Layers of a mixed-K checkpoint have different rows, so each layer's image layout is
+derived from its own geometry (``Exl3ExpertLayout.geometry``).
 
 This file holds the layout (:class:`RowImageLayout`), the packing and digest helpers,
 the manifest read/write, and :func:`open_row_images`, which validates a set of roots.
@@ -35,12 +39,17 @@ from typing import Iterable, Mapping, Sequence
 
 import msgspec
 
-from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, RowSegment
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
+    EXL3_STREAMED_NAMES,
+    RowSegment,
+    layer_segments,
+)
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 
 ROW_IMAGE_SUBDIR = "exl3_row_images"
 FORMAT = "exl3-row-images"
-VERSION = 1
+# 2: a layout per row geometry, named by each layer (mixed-K checkpoints).
+VERSION = 2
 MANIFEST = "manifest.json"
 # O_DIRECT alignment on the mirror drives (XFS and ext4, 512 B logical blocks), for
 # file offsets and segment lengths.
@@ -137,6 +146,18 @@ def row_image_layout(segments: Sequence[RowSegment]) -> RowImageLayout:
     )
 
 
+def row_image_layouts(layout: Exl3ExpertLayout, layer_ids: Iterable[int]) -> dict[int, RowImageLayout]:
+    """Each of ``layer_ids``' image layout, from its own row geometry (layers sharing a geometry share the object)."""
+    by_geometry: dict[int, RowImageLayout] = {}
+    out = {}
+    for layer in sorted(layer_ids):
+        g = layout.layer_geometry[layer]
+        if g not in by_geometry:
+            by_geometry[g] = row_image_layout(layer_segments(layout, layer))
+        out[layer] = by_geometry[g]
+    return out
+
+
 def image_of_row(
     layout: RowImageLayout, row: bytes | bytearray | memoryview
 ) -> bytearray:
@@ -173,40 +194,54 @@ def source_fingerprint(layout: Exl3ExpertLayout, source_root: str) -> dict:
         records.update(
             f"{r.layer},{r.expert},{os.path.relpath(r.path, source_root)},{r.file_offset},{r.nbytes};".encode()
         )
-    for t in layout.tensors:
-        records.update(
-            f"{t.name},{t.rel_offset},{t.nbytes},{t.dtype},{tuple(t.shape)};".encode()
-        )
+    for geometry in layout.geometries:
+        for t in geometry.tensors:
+            records.update(
+                f"{t.name},{t.rel_offset},{t.nbytes},{t.dtype},{tuple(t.shape)};".encode()
+            )
+        records.update(b"|")
     return {
         "shards": [
             [os.path.relpath(p, source_root), os.path.getsize(p)] for p in shards
         ],
         "num_layers": layout.num_layers,
         "num_experts": layout.num_experts,
-        "row_bytes": layout.row_bytes,
+        "row_bytes": [geometry.row_bytes for geometry in layout.geometries],
+        "layer_geometry": list(layout.layer_geometry),
         "records_sha256": records.hexdigest(),
     }
 
 
 def manifest_json(
-    image_layout: RowImageLayout,
+    image_layouts: RowImageLayout | Mapping[int, RowImageLayout],
     fingerprint: dict,
     digests: Mapping[int, Sequence[str]],
 ) -> dict:
     """The manifest of a complete image set.
 
+    ``image_layouts`` is each layer's image layout, or one layout every layer shares.
     ``digests[layer_id][expert]`` is ``row_digest`` of that expert's image.
     """
+    if isinstance(image_layouts, RowImageLayout):
+        image_layouts = {layer: image_layouts for layer in digests}
+    distinct: list[dict] = []
+    layers = {}
+    for layer, d in sorted(digests.items()):
+        form = image_layouts[layer].to_json()
+        if form not in distinct:
+            distinct.append(form)
+        layers[str(layer)] = {
+            "file": layer_file_name(layer),
+            "layout": distinct.index(form),
+            "digests": list(d),
+        }
     return {
         "format": FORMAT,
         "version": VERSION,
         "complete": True,
-        "layout": image_layout.to_json(),
+        "layouts": distinct,
         "source": fingerprint,
-        "layers": {
-            str(layer): {"file": layer_file_name(layer), "digests": list(d)}
-            for layer, d in sorted(digests.items())
-        },
+        "layers": layers,
     }
 
 
@@ -246,35 +281,44 @@ def read_manifest(root: str) -> dict:
 class RowImageSet(msgspec.Struct, frozen=True, kw_only=True):
     """Validated row images on one or more roots.
 
-    ``paths[layer_id][p]`` is root ``p``'s file for that layer. Only
-    :func:`open_row_images` builds one.
+    ``paths[layer_id][p]`` is root ``p``'s file for that layer, and ``layouts[layer_id]``
+    its image layout. Only :func:`open_row_images` builds one.
     """
 
     roots: tuple[str, ...]
-    layout: RowImageLayout
+    layouts: Mapping[int, RowImageLayout]
     num_experts: int
     paths: Mapping[int, tuple[str, ...]]
+
+    @property
+    def layout(self) -> RowImageLayout:
+        """The one image layout of a set whose layers all share it; raises for a mixed-K set."""
+        distinct = set(self.layouts.values())
+        if len(distinct) != 1:
+            raise ValueError(
+                f"these row images have {len(distinct)} image layouts (a mixed-K checkpoint); "
+                "read each layer's from layouts[layer]"
+            )
+        return distinct.pop()
 
 
 def open_row_images(
     roots: Sequence[str],
     layout: Exl3ExpertLayout,
-    segments: Sequence[RowSegment],
     source_root: str,
     layer_ids: Iterable[int],
 ) -> RowImageSet:
     """The images of ``layer_ids`` on every root.
 
     Raises ``ValueError`` unless each root's manifest is complete, describes this
-    exact layout and source, carries the same row digests as the others, and its
-    files have their full size.
+    exact layout and source (each layer's image layout from its own row geometry),
+    carries the same row digests as the others, and its files have their full size.
     """
     if not roots:
         raise ValueError("row images need at least one root")
-    image_layout = row_image_layout(segments)
-    want_layout = image_layout.to_json()
-    want_source = source_fingerprint(layout, source_root)
     layer_ids = sorted(layer_ids)
+    image_layouts = row_image_layouts(layout, layer_ids)
+    want_source = source_fingerprint(layout, source_root)
     first_digests = None
     paths: dict[int, list[str]] = {layer: [] for layer in layer_ids}
     for root in roots:
@@ -288,10 +332,6 @@ def open_row_images(
             raise ValueError(
                 f"row images at {where}: the manifest is not marked complete"
             )
-        if m.get("layout") != want_layout:
-            raise ValueError(
-                f"row images at {where}: built for a different image layout than this checkpoint's"
-            )
         if m.get("source") != want_source:
             raise ValueError(
                 f"row images at {where}: built from a different source than {source_root}"
@@ -300,18 +340,27 @@ def open_row_images(
         missing = [layer for layer in layer_ids if str(layer) not in layers]
         if missing:
             raise ValueError(f"row images at {where}: no images for layers {missing}")
+        written = m.get("layouts", [])
         digests = {layer: layers[str(layer)]["digests"] for layer in layer_ids}
         for layer in layer_ids:
+            entry = layers[str(layer)]
+            index = entry.get("layout")
+            if not isinstance(index, int) or not 0 <= index < len(written):
+                raise ValueError(f"row images at {where}: layer {layer} names no image layout")
+            if written[index] != image_layouts[layer].to_json():
+                raise ValueError(
+                    f"row images at {where}: layer {layer} was built for a different image layout than this "
+                    "checkpoint's"
+                )
             if len(digests[layer]) != layout.num_experts:
                 raise ValueError(
                     f"row images at {where}: layer {layer} has {len(digests[layer])} digests for {layout.num_experts} experts"
                 )
-            path = os.path.join(where, layers[str(layer)]["file"])
+            path = os.path.join(where, entry["file"])
             size = os.path.getsize(path) if os.path.exists(path) else -1
-            if size != layout.num_experts * image_layout.row_stride:
-                raise ValueError(
-                    f"row images: {path} is {size} B, expected {layout.num_experts * image_layout.row_stride}"
-                )
+            want = layout.num_experts * image_layouts[layer].row_stride
+            if size != want:
+                raise ValueError(f"row images: {path} is {size} B, expected {want}")
             paths[layer].append(path)
         if first_digests is None:
             first_digests = digests
@@ -321,7 +370,7 @@ def open_row_images(
             )
     return RowImageSet(
         roots=tuple(roots),
-        layout=image_layout,
+        layouts=image_layouts,
         num_experts=layout.num_experts,
         paths={layer: tuple(p) for layer, p in paths.items()},
     )

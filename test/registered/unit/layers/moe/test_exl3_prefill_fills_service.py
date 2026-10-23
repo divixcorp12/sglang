@@ -39,8 +39,7 @@ def _build(tmp_path, *, fills=True, device="cpu"):
     layout = build_exl3_expert_layout(str(source))
     root = tmp_path / "mirror"
     shutil.copytree(source, root)
-    fmt0 = Exl3ExpertFormat(layout, 0, direct=True, source_root=str(source))
-    write_row_images(layout, fmt0.segment_map(), str(source), [str(root)])
+    write_row_images(layout, str(source), [str(root)])
     stack = contextlib.ExitStack()
     for env, value in (
         (envs.SGLANG_EXPERT_STREAM_ROW_SOURCE, "shards"),

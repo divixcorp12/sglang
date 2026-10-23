@@ -8,7 +8,12 @@ import pytest
 
 from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, RowSegment
-from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout, Exl3ExpertRecord, Exl3TensorSpan
+from sglang.srt.layers.moe.exl3_expert_layout import (
+    Exl3ExpertLayout,
+    Exl3ExpertRecord,
+    Exl3RowGeometry,
+    Exl3TensorSpan,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -20,11 +25,21 @@ _ORDER = [(w, k) for w in ("w1", "w2", "w3") for k in ("suh", "svh", "mul1", "tr
 _PREFIX = {"w1": ("w13", 0), "w3": ("w13", 1), "w2": ("w2", 0)}
 
 
-def _spans():
+def _span(name, at, nbytes):
+    kind = name.split(".")[1]
+    if kind == "mul1":
+        return Exl3TensorSpan(name, at, nbytes, "I32", ())
+    if kind == "trellis":  # [k/16, n/16, 16 * K] int16
+        return Exl3TensorSpan(name, at, nbytes, "I16", (4, 2, nbytes // 16))
+    return Exl3TensorSpan(name, at, nbytes, "F16", (nbytes // 2,))
+
+
+def _spans(trellis=_SIZES["trellis"]):
     spans, at = [], 0
     for w, k in _ORDER:
-        spans.append(Exl3TensorSpan(f"{w}.{k}", at, _SIZES[k], "I32" if k == "mul1" else "F16", ()))
-        at += _SIZES[k]
+        nbytes = trellis if k == "trellis" else _SIZES[k]
+        spans.append(_span(f"{w}.{k}", at, nbytes))
+        at += nbytes
     return spans, at
 
 
@@ -40,29 +55,40 @@ def _segments():
     return sorted(out, key=lambda s: s.src_offset)
 
 
-def _checkpoint(tmp_path, layers=2, experts=3, head=13):
-    """A one-shard checkpoint whose rows start at odd offsets (a ``head``-byte preamble)."""
-    spans, row = _spans()
+def _checkpoint(tmp_path, layers=2, experts=3, head=13, trellis=None):
+    """A one-shard checkpoint whose rows start at odd offsets (a ``head``-byte preamble). ``trellis[layer]`` sizes a
+    layer's trellises (a mixed-K checkpoint); every layer has the default size without it."""
+    trellis = trellis or [_SIZES["trellis"]] * layers
+    geometries, layer_geometry = [], []
+    for layer in range(layers):
+        spans, row = _spans(trellis[layer])
+        geometry = Exl3RowGeometry(tensors=tuple(spans), row_bytes=row)
+        if geometry not in geometries:
+            geometries.append(geometry)
+        layer_geometry.append(geometries.index(geometry))
     src = tmp_path / "src"
     src.mkdir()
     shard = src / "model.safetensors"
-    data = bytearray(os.urandom(head + layers * experts * row + 7))
+    records, at = {}, head
+    for layer in range(layers):
+        row = geometries[layer_geometry[layer]].row_bytes
+        for e in range(experts):
+            records[(layer, e)] = Exl3ExpertRecord(layer, e, str(shard), at, row)
+            at += row
+    data = bytearray(os.urandom(at + 7))
     shard.write_bytes(data)
-    records = {
-        (layer, e): Exl3ExpertRecord(layer, e, str(shard), head + (layer * experts + e) * row, row)
-        for layer in range(layers)
-        for e in range(experts)
-    }
-    layout = Exl3ExpertLayout(tuple(spans), row, records, layers, experts)
+    layout = Exl3ExpertLayout(tuple(geometries), tuple(layer_geometry), records, layers, experts)
     return layout, str(src), data
 
 
 def _build(layout, source_root, data, root, layer_ids=None):
     """A reference build of one root's images: what the converter must produce."""
-    image_layout = ri.row_image_layout(_segments())
+    layer_ids = list(layer_ids if layer_ids is not None else range(layout.num_layers))
+    image_layouts = ri.row_image_layouts(layout, layer_ids)
     os.makedirs(ri.row_image_dir(root), exist_ok=True)
     digests = {}
-    for layer in layer_ids if layer_ids is not None else range(layout.num_layers):
+    for layer in layer_ids:
+        image_layout = image_layouts[layer]
         out = bytearray()
         digests[layer] = []
         for e in range(layout.num_experts):
@@ -72,8 +98,8 @@ def _build(layout, source_root, data, root, layer_ids=None):
             out += image + bytes(image_layout.row_stride - image_layout.image_bytes)
         with open(os.path.join(ri.row_image_dir(root), ri.layer_file_name(layer)), "wb") as f:
             f.write(out)
-    ri.write_manifest(root, ri.manifest_json(image_layout, ri.source_fingerprint(layout, source_root), digests))
-    return image_layout
+    ri.write_manifest(root, ri.manifest_json(image_layouts, ri.source_fingerprint(layout, source_root), digests))
+    return image_layouts
 
 
 def test_layout_puts_names_back_to_back_on_512_byte_boundaries():
@@ -115,9 +141,34 @@ def test_open_accepts_matching_roots_and_names_every_layer_file(tmp_path):
     roots = [str(tmp_path / "a"), str(tmp_path / "b")]
     for root in roots:
         _build(layout, source, data, root)
-    images = ri.open_row_images(roots, layout, _segments(), source, [0, 1])
+    images = ri.open_row_images(roots, layout, source, [0, 1])
     assert images.paths[1] == tuple(os.path.join(ri.row_image_dir(r), "layer-001.rows") for r in roots)
     assert images.layout.image_bytes == 16896 and images.num_experts == 3
+
+
+def test_a_mixed_k_checkpoint_gets_each_layers_own_image_layout(tmp_path):
+    """Layer 1's trellises are half the size (a K2 layer beside K4 ones): its image and its file stride are smaller,
+    the manifest records both layouts, and the set refuses to report a single one."""
+    layout, source, data = _checkpoint(tmp_path, trellis=[4096, 2048])
+    root = str(tmp_path / "a")
+    _build(layout, source, data, root)
+    images = ri.open_row_images([root], layout, source, [0, 1])
+    assert images.layouts[0].image_bytes == 16896 and images.layouts[1].image_bytes == 16896 - 3 * 2048
+    assert os.path.getsize(images.paths[1][0]) == 3 * images.layouts[1].row_stride
+    assert len(ri.read_manifest(root)["layouts"]) == 2
+    with pytest.raises(ValueError, match="mixed-K"):
+        images.layout
+
+
+def test_a_manifest_that_maps_a_layer_to_another_layers_layout_is_refused(tmp_path):
+    """The layer-to-layout map is what keeps a K4 layout's offsets off a K2 layer's slabs: swapping it must not pass
+    on file size or digests alone."""
+    layout, source, data = _checkpoint(tmp_path, trellis=[4096, 2048])
+    root = str(tmp_path / "a")
+    _build(layout, source, data, root)
+    _corrupt_manifest(root, lambda m: m["layers"]["1"].update(layout=m["layers"]["0"]["layout"]))
+    with pytest.raises(ValueError, match="layer 1 was built for a different image layout"):
+        ri.open_row_images([root], layout, source, [0, 1])
 
 
 def _corrupt_manifest(root, edit):
@@ -132,7 +183,7 @@ def _corrupt_manifest(root, edit):
     [
         (lambda m: m.update(complete=False), "not marked complete"),
         (lambda m: m.update(version=99), "format"),
-        (lambda m: m["layout"].update(row_stride=4096), "different image layout"),
+        (lambda m: m["layouts"][0].update(row_stride=4096), "different image layout"),
         (lambda m: m["source"].update(records_sha256="0" * 64), "different source"),
         (lambda m: m["layers"].pop("1"), "no images for layers"),
         (lambda m: m["layers"]["0"]["digests"].__setitem__(0, "0" * 16), "digests differ"),
@@ -145,19 +196,19 @@ def test_open_refuses_a_root_whose_manifest_does_not_match(tmp_path, edit, messa
         _build(layout, source, data, root)
     _corrupt_manifest(roots[1], edit)
     with pytest.raises(ValueError, match=message):
-        ri.open_row_images(roots, layout, _segments(), source, [0, 1])
+        ri.open_row_images(roots, layout, source, [0, 1])
 
 
 def test_open_refuses_a_missing_manifest_or_a_short_file(tmp_path):
     layout, source, data = _checkpoint(tmp_path)
     root = str(tmp_path / "a")
     with pytest.raises(ValueError, match="missing"):
-        ri.open_row_images([root], layout, _segments(), source, [0])
+        ri.open_row_images([root], layout, source, [0])
     _build(layout, source, data, root)
     with open(os.path.join(ri.row_image_dir(root), "layer-000.rows"), "r+b") as f:
         f.truncate(4096)
     with pytest.raises(ValueError, match="expected"):
-        ri.open_row_images([root], layout, _segments(), source, [0])
+        ri.open_row_images([root], layout, source, [0])
 
 
 def test_open_refuses_images_of_a_changed_checkpoint(tmp_path):
@@ -167,4 +218,4 @@ def test_open_refuses_images_of_a_changed_checkpoint(tmp_path):
     with open(os.path.join(source, "model.safetensors"), "ab") as f:
         f.write(b"x")  # the shard's size no longer matches what the images were built from
     with pytest.raises(ValueError, match="different source"):
-        ri.open_row_images([root], layout, _segments(), source, [0])
+        ri.open_row_images([root], layout, source, [0])

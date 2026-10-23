@@ -134,7 +134,7 @@ def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_pat
     for root in roots:
         shutil.copytree(tmp_path, root)
     fmt = streamers[1].format
-    write_row_images(fmt.layout, fmt.segment_map(), str(tmp_path), [str(root) for root in roots])
+    write_row_images(fmt.layout, str(tmp_path), [str(root) for root in roots])
     mirror = {"dirs": os.pathsep.join(map(str, roots)), "weights": "3:1"}
     with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps(mirror)):
         caches[1].ensure_rows(torch.tensor([4, 2]))

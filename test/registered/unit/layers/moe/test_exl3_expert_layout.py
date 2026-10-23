@@ -7,11 +7,13 @@ import struct
 import pytest
 
 from sglang.srt.layers.moe.exl3_expert_layout import (
+    K_MAP_FILENAME,
     Exl3ExpertRecord,
     build_exl3_expert_layout,
     read_safetensors_header,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -136,6 +138,33 @@ def test_layout_mismatch_raises(tmp_path):
         {"model-00001.safetensors": _expert(0, 0) + _expert(0, 1, spec=other)},
     )
     with pytest.raises(ValueError, match="layout differs"):
+        build_exl3_expert_layout(str(tmp_path))
+
+
+def test_layers_may_differ_and_each_keeps_its_own_geometry(tmp_path):
+    """A mixed-K checkpoint (DeepSeek-V4.1-Flash-1017: routed layers 18-22 at K2) used to be refused outright. Layers
+    sharing a geometry share one entry; the uniform accessors refuse to pick one, so no caller sizes every layer by
+    layer 0."""
+    write_fake_exl3(str(tmp_path), num_layers=4, num_experts=2, layer_bits={1: (2, 2), 3: (2, 2)})
+    layout = build_exl3_expert_layout(str(tmp_path))
+    assert layout.layer_geometry == (0, 1, 0, 1)
+    assert [layout.geometry(layer).trellis_bits("w2") for layer in range(4)] == [3, 2, 3, 2]
+    assert layout.max_row_bytes == layout.geometry(0).row_bytes > layout.geometry(1).row_bytes
+    assert layout.records[(1, 0)].nbytes == layout.geometry(1).row_bytes
+    with pytest.raises(ValueError, match="mixed-K"):
+        layout.row_bytes
+
+
+def test_a_k_map_that_disagrees_with_the_trellises_refuses_the_checkpoint(tmp_path):
+    """exl3_k_map.json is a side file some exports write; when present it must match the headers, so a stale or
+    hand-edited map cannot hide a checkpoint that is not the one it describes."""
+    write_fake_exl3(str(tmp_path), num_layers=2, num_experts=2, layer_bits={1: (2, 2)})
+    with open(tmp_path / K_MAP_FILENAME, "w") as f:
+        json.dump({"routed": {"0": 3, "1": 2}}, f)
+    build_exl3_expert_layout(str(tmp_path))
+    with open(tmp_path / K_MAP_FILENAME, "w") as f:
+        json.dump({"routed": {"0": 3, "1": 3}}, f)
+    with pytest.raises(ValueError, match="layer 1 has K 3"):
         build_exl3_expert_layout(str(tmp_path))
 
 

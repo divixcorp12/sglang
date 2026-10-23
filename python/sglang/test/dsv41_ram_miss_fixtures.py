@@ -54,14 +54,16 @@ class RamMissSetup:
 ROW_IMAGE_DIM = 256
 
 
-def write_row_images(layout, segments, source_root: str, roots: Sequence[str], layer_ids: Optional[Iterable[int]] = None):
+def write_row_images(layout, source_root: str, roots: Sequence[str], layer_ids: Optional[Iterable[int]] = None):
     """A reference build of row images on every root, from exl3_row_image's primitives only (the converter,
     scripts/dsv41/build_row_images.py, is what production uses; tests must not depend on it): each row's image by
-    ``image_of_row`` of its checkpoint bytes, zero-padded to ``row_stride``, then the manifest. Returns the layout."""
-    image_layout = ri.row_image_layout(segments)
+    ``image_of_row`` of its checkpoint bytes under its layer's image layout, zero-padded to ``row_stride``, then the
+    manifest. Returns each layer's image layout."""
     layer_ids = list(range(layout.num_layers)) if layer_ids is None else list(layer_ids)
+    image_layouts = ri.row_image_layouts(layout, layer_ids)
     digests, files = {}, {}
     for layer in layer_ids:
+        image_layout = image_layouts[layer]
         out = bytearray()
         digests[layer] = []
         for expert in range(layout.num_experts):
@@ -79,8 +81,8 @@ def write_row_images(layout, segments, source_root: str, roots: Sequence[str], l
         for layer, data in files.items():
             with open(os.path.join(ri.row_image_dir(root), ri.layer_file_name(layer)), "wb") as f:
                 f.write(data)
-        ri.write_manifest(root, ri.manifest_json(image_layout, fingerprint, digests))
-    return image_layout
+        ri.write_manifest(root, ri.manifest_json(image_layouts, fingerprint, digests))
+    return image_layouts
 
 
 def _takes_o_direct(path: str) -> bool:
@@ -117,9 +119,7 @@ def service_row_images(source) -> contextlib.ExitStack:
     root = source.parent / f"{source.name}_images_mirror"
     if not root.exists():  # built once per checkpoint: a harness may start the service more than once over it
         shutil.copytree(source, root)
-        layout = build_exl3_expert_layout(str(source))
-        segments = Exl3ExpertFormat(layout, 0, direct=False, source_root=str(source)).segment_map()
-        write_row_images(layout, segments, str(source), [str(root)])
+        write_row_images(build_exl3_expert_layout(str(source)), str(source), [str(root)])
     require_o_direct(os.path.join(ri.row_image_dir(str(root)), ri.layer_file_name(0)))
     stack = contextlib.ExitStack()
     for env, value in (
@@ -152,8 +152,8 @@ def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=N
     source = str(source_root).rstrip("/")
     roots = tuple(f"{source}_images{i}" for i in range(len(weights)))
     layers = sorted(slabs_by_layer)
-    write_row_images(layout, segments, source, roots, layers)
-    images = open_row_images(roots, layout, segments, source, layers)
+    write_row_images(layout, source, roots, layers)
+    images = open_row_images(roots, layout, source, layers)
     tables = exl3_ram_miss_tables(
         layout, segments, slabs_by_layer, roots=roots, policy=StaticSplitPolicy(weights), row_images=images
     )

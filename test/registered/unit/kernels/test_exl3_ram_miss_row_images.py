@@ -305,7 +305,7 @@ def test_an_image_whose_names_are_not_512_byte_rows_is_refused(tmp_path):
 
 def test_the_tables_refuse_images_opened_for_other_roots(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3, mirror_weights=(1.0, 1.0))
-    images = ri.open_row_images(s.roots, s.layout, s.fmt.segment_map(), str(tmp_path), [0, 1])
+    images = ri.open_row_images(s.roots, s.layout, str(tmp_path), [0, 1])
     with pytest.raises(ValueError, match="row images are on"):
         exl3_ram_miss_tables(
             s.layout, s.fmt.segment_map(), s.slabs, roots=s.roots[::-1], policy=StaticSplitPolicy((1.0, 1.0)),

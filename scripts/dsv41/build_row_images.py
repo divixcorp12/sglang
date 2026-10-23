@@ -44,7 +44,7 @@ from verify_expert_mirror import parse_layers
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_row_image as ri
-from sglang.srt.layers.moe.expert_engine.formats.exl3 import _row_schema, parse_mirror_roots
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import parse_mirror_roots
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
     build_exl3_expert_layout,
@@ -69,25 +69,25 @@ class Source:
 
     model_dir: str
     layout: Exl3ExpertLayout
-    segments: tuple
-    image: ri.RowImageLayout
+    # Every layer's image layout (layers of one row geometry share one).
+    images: dict
     fingerprint: dict
 
     @classmethod
     def load(cls, model_dir: str) -> "Source":
         layout = build_exl3_expert_layout(model_dir)
-        _, segments = _row_schema(layout)
         return cls(
             model_dir=model_dir,
             layout=layout,
-            segments=segments,
-            image=ri.row_image_layout(segments),
+            images=ri.row_image_layouts(layout, range(layout.num_layers)),
             fingerprint=ri.source_fingerprint(layout, model_dir),
         )
 
-    @property
-    def layer_bytes(self) -> int:
-        return self.layout.num_experts * self.image.row_stride
+    def image(self, layer: int) -> ri.RowImageLayout:
+        return self.images[layer]
+
+    def layer_bytes(self, layer: int) -> int:
+        return self.layout.num_experts * self.image(layer).row_stride
 
     def sidecar(self, layer: int, digests: Sequence[str]) -> dict:
         return {
@@ -95,7 +95,7 @@ class Source:
             "version": ri.VERSION,
             "layer": layer,
             "file": ri.layer_file_name(layer),
-            "layout": self.image.to_json(),
+            "layout": self.image(layer).to_json(),
             "source": self.fingerprint,
             "digests": list(digests),
         }
@@ -204,9 +204,9 @@ def _gb(nbytes: float) -> str:
 class _Progress:
     """Per-layer progress lines of one phase, with throughput and an ETA."""
 
-    def __init__(self, log: Callable[[str], None], phase: str, total_units: int, unit_bytes: int) -> None:
+    def __init__(self, log: Callable[[str], None], phase: str, total_units: int, total_bytes: int) -> None:
         self.log, self.phase = log, phase
-        self.total, self.unit_bytes = total_units, unit_bytes
+        self.total, self.total_bytes = total_units, total_bytes
         self.done = 0
         self.start = time.monotonic()
         self.lock = threading.Lock()
@@ -215,7 +215,8 @@ class _Progress:
         with self.lock:
             self.done += 1
             elapsed = time.monotonic() - self.start
-            moved = self.done * self.unit_bytes
+            # Units (layer files) differ in size on a mixed-K checkpoint: an average, for the log only.
+            moved = self.total_bytes * self.done // max(self.total, 1)
             eta = elapsed / self.done * (self.total - self.done)
             self.log(
                 f"[{self.phase}] {what}: {self.done}/{self.total}, {_gb(moved)} in {elapsed:.0f} s "
@@ -232,7 +233,7 @@ class _Progress:
 
 def _readback_chunk(src: Source, root: str, layer: int, first: int, count: int, expected: Sequence[str]) -> list[Mismatch]:
     """O_DIRECT read of experts ``first..first+count`` of a layer file; the rows whose digest is not ``expected``."""
-    stride, image_bytes = src.image.row_stride, src.image.image_bytes
+    stride, image_bytes = src.image(layer).row_stride, src.image(layer).image_bytes
     view = _BUFFERS.get("back", CHUNK_ROWS * stride)[: count * stride]
     fd = os.open(layer_path(root, layer), os.O_RDONLY | os.O_DIRECT)
     try:
@@ -255,7 +256,7 @@ def _readback(
     phase: str,
 ) -> dict[tuple[int, str], list[Mismatch]]:
     """Read back every (layer, root) of ``pairs`` against its expected digests; mismatches per pair."""
-    progress = _Progress(log, phase, len(pairs), src.layer_bytes)
+    progress = _Progress(log, phase, len(pairs), sum(src.layer_bytes(layer) for layer, _, _ in pairs))
     chunks = _chunks(src.layout.num_experts)
     remaining = {(layer, root): len(chunks) for layer, root, _ in pairs}
     found: dict[tuple[int, str], list[Mismatch]] = {(layer, root): [] for layer, root, _ in pairs}
@@ -303,7 +304,7 @@ class _LayerJob:
                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT,
                     0o644,
                 )
-                os.posix_fallocate(fd, 0, self.src.layer_bytes)
+                os.posix_fallocate(fd, 0, self.src.layer_bytes(self.layer))
                 self.fds[root] = fd
 
     def chunk_done(self) -> bool:
@@ -325,15 +326,16 @@ def _finish_layer(job: _LayerJob) -> None:
 
 def _build_chunk(job: _LayerJob, first: int, count: int, src_fds: dict[str, int], progress: _Progress) -> None:
     src, layer = job.src, job.layer
-    stride, image_bytes = src.image.row_stride, src.image.image_bytes
+    image_layout = src.image(layer)
+    stride, image_bytes = image_layout.row_stride, image_layout.image_bytes
     job.open_files()
-    raw = _BUFFERS.get("src", src.layout.row_bytes + 2 * ri.PAGE)
+    raw = _BUFFERS.get("src", src.layout.geometry(layer).row_bytes + 2 * ri.PAGE)
     out = _BUFFERS.get("out", CHUNK_ROWS * stride)
     for i in range(count):
         record = src.layout.records[(layer, first + i)]
         start, length, lead = record.aligned_read(ri.PAGE)
         _read_at_least(src_fds[record.path], raw[:length], start, lead + record.nbytes)
-        image = ri.image_of_row(src.image, raw[lead : lead + record.nbytes])
+        image = ri.image_of_row(image_layout, raw[lead : lead + record.nbytes])
         job.digests[first + i] = ri.row_digest(image)
         # The padding after each image in ``out`` is never written, so it stays the zeros mmap gave it.
         out[i * stride : i * stride + image_bytes] = image
@@ -350,7 +352,7 @@ def _build_layers(src: Source, todo: dict[int, list[str]], threads: int, log: Ca
         return {}, 0.0
     shard_paths = sorted({src.layout.records[(layer, e)].path for layer in jobs for e in range(src.layout.num_experts)})
     src_fds = {path: os.open(path, os.O_RDONLY | os.O_DIRECT) for path in shard_paths}
-    progress = _Progress(log, "build", len(jobs), src.layer_bytes)
+    progress = _Progress(log, "build", len(jobs), sum(src.layer_bytes(layer) for layer in jobs))
     try:
         tasks = [
             (lambda job=job, first=first, count=count: _build_chunk(job, first, count, src_fds, progress))
@@ -374,7 +376,6 @@ def check_roots(src: Source, roots: Sequence[str]) -> None:
     """Refuse a root the build must not write: the source itself, or images of another source or layout."""
     shards = {r.path for r in src.layout.records.values()}
     forbidden = {os.path.realpath(src.model_dir)} | {os.path.dirname(os.path.realpath(p)) for p in shards}
-    want_layout = src.image.to_json()
     for root in roots:
         if os.path.realpath(root) in forbidden:
             raise ValueError(f"{root!r} is the source checkpoint directory (or holds its shards); images go on a mirror root")
@@ -387,7 +388,7 @@ def check_roots(src: Source, roots: Sequence[str]) -> None:
             m = ri.read_manifest(root)
         except json.JSONDecodeError as error:
             raise ValueError(f"{manifest} is not a readable manifest ({error}); remove it to rebuild") from None
-        if (m.get("format"), m.get("version")) != (ri.FORMAT, ri.VERSION) or m.get("layout") != want_layout:
+        if (m.get("format"), m.get("version")) != (ri.FORMAT, ri.VERSION) or not _manifest_layouts_match(src, m):
             raise ValueError(f"{manifest} describes another format or image layout; remove {ri.row_image_dir(root)} to rebuild")
         if m.get("source") != src.fingerprint:
             raise ValueError(
@@ -396,9 +397,29 @@ def check_roots(src: Source, roots: Sequence[str]) -> None:
             )
 
 
+def _layers_by_image(src: Source) -> dict[int, list[int]]:
+    """The checkpoint's layers grouped by row geometry, keyed by geometry index."""
+    groups: dict[int, list[int]] = {}
+    for layer, g in enumerate(src.layout.layer_geometry):
+        groups.setdefault(g, []).append(layer)
+    return groups
+
+
+def _manifest_layouts_match(src: Source, m: dict) -> bool:
+    """Whether every layer ``m`` lists names this source's image layout for that layer."""
+    layouts = m.get("layouts", [])
+    for layer, entry in m.get("layers", {}).items():
+        index = entry.get("layout")
+        if not (layer.isdigit() and int(layer) in src.images and isinstance(index, int) and 0 <= index < len(layouts)):
+            return False
+        if layouts[index] != src.image(int(layer)).to_json():
+            return False
+    return True
+
+
 def check_space(src: Source, todo: dict[int, list[str]], roots: Sequence[str]) -> None:
     for root in roots:
-        need = sum(src.layer_bytes for layer_roots in todo.values() if root in layer_roots)
+        need = sum(src.layer_bytes(layer) for layer, layer_roots in todo.items() if root in layer_roots)
         if need == 0:
             continue
         free = _free_bytes(ri.row_image_dir(root))
@@ -411,7 +432,7 @@ def check_space(src: Source, todo: dict[int, list[str]], roots: Sequence[str]) -
 def _valid_sidecar(src: Source, root: str, layer: int) -> Optional[list[str]]:
     """The digests of a finished layer file on ``root``, if its sidecar describes this source and layout."""
     path, side = layer_path(root, layer), sidecar_path(root, layer)
-    if not (os.path.exists(path) and os.path.exists(side)) or os.path.getsize(path) != src.layer_bytes:
+    if not (os.path.exists(path) and os.path.exists(side)) or os.path.getsize(path) != src.layer_bytes(layer):
         return None
     try:
         with open(side) as f:
@@ -448,10 +469,13 @@ def build(src: Source, roots: Sequence[str], layers: Sequence[int], threads: int
             log(f"removed the existing manifest of {directory}; it is rewritten when this run completes")
         _remove(os.path.join(directory, ri.MANIFEST + TMP_SUFFIX))
         _fsync_dir(directory)
-    log(
-        f"source {src.model_dir}: {src.layout.num_layers} layers x {src.layout.num_experts} experts; image "
-        f"{src.image.image_bytes} B, stride {src.image.row_stride} B, {_gb(src.layer_bytes)} per layer per root"
-    )
+    log(f"source {src.model_dir}: {src.layout.num_layers} layers x {src.layout.num_experts} experts")
+    for geometry_layers in _layers_by_image(src).values():
+        image = src.image(geometry_layers[0])
+        log(
+            f"  layers {geometry_layers}: image {image.image_bytes} B, stride {image.row_stride} B, "
+            f"{_gb(src.layer_bytes(geometry_layers[0]))} per layer per root"
+        )
 
     candidates = [(layer, root, d) for layer in layers for root in roots if (d := _valid_sidecar(src, root, layer)) is not None]
     kept: dict[tuple[int, str], list[str]] = {}
@@ -469,9 +493,9 @@ def build(src: Source, roots: Sequence[str], layers: Sequence[int], threads: int
     log(f"build: {rebuilt} layer file(s) to write, {len(kept)} kept")
 
     jobs, build_s = _build_layers(src, todo, threads, log)
-    written = sum(len(job.roots) for job in jobs.values()) * src.layer_bytes
+    written = sum(len(job.roots) * src.layer_bytes(layer) for layer, job in jobs.items())
     if jobs:
-        read = len(jobs) * src.layer_bytes
+        read = sum(src.layer_bytes(layer) for layer in jobs)
         log(
             f"build: {len(jobs)} layer(s), {_gb(read)} of images from the source, {_gb(written)} written in "
             f"{build_s:.0f} s ({read / build_s / 1e9:.2f} GB/s of rows, {written / build_s / 1e9:.2f} GB/s written)"
@@ -497,8 +521,8 @@ def build(src: Source, roots: Sequence[str], layers: Sequence[int], threads: int
             log(f"FAIL: layer {layer}'s row digests differ between roots; no manifest written")
             return EXIT_MISMATCH
     for root in roots:
-        ri.write_manifest(root, ri.manifest_json(src.image, src.fingerprint, {layer: kept[(layer, root)] for layer in layers}))
-    ri.open_row_images(roots, src.layout, src.segments, src.model_dir, layers)
+        ri.write_manifest(root, ri.manifest_json(src.images, src.fingerprint, {layer: kept[(layer, root)] for layer in layers}))
+    ri.open_row_images(roots, src.layout, src.model_dir, layers)
     for root in roots:
         log(f"manifest: {os.path.join(ri.row_image_dir(root), ri.MANIFEST)} ({len(layers)} layers)")
     log(f"done in {time.monotonic() - t0:.0f} s")
@@ -508,7 +532,7 @@ def build(src: Source, roots: Sequence[str], layers: Sequence[int], threads: int
 def verify(src: Source, roots: Sequence[str], layers: Sequence[int], threads: int, log: Callable[[str], None]) -> int:
     t0 = time.monotonic()
     try:
-        ri.open_row_images(roots, src.layout, src.segments, src.model_dir, layers)
+        ri.open_row_images(roots, src.layout, src.model_dir, layers)
     except ValueError as error:
         log(f"FAIL: {error}")
         return EXIT_MISMATCH
@@ -518,7 +542,7 @@ def verify(src: Source, roots: Sequence[str], layers: Sequence[int], threads: in
         pairs += [(layer, root, m["layers"][str(layer)]["digests"]) for layer in layers]
     found = _readback(src, pairs, threads, log, "verify")
     elapsed = time.monotonic() - t0
-    total = len(pairs) * src.layer_bytes
+    total = sum(src.layer_bytes(layer) for layer, _, _ in pairs)
     log(f"verify: {_gb(total)} read back with O_DIRECT in {elapsed:.0f} s ({total / elapsed / 1e9:.2f} GB/s)")
     if _report_mismatches(found, log):
         log("FAIL")
