@@ -71,9 +71,6 @@ struct Options {
   int workers = EXL3_BENCH_DEFAULT_WORKERS;
   // --smt: the workers' SMT siblings join the team after them (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT)
   bool smt = false;
-  // --max-isa=TIER: the optimized kernel's ISA cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA in a server); empty, the host's.
-  // The baseline reads its own EXL3_MOE_CPU_MAX_ISA at load instead.
-  std::string max_isa;
   int node = 1;
   int warmup = 128;
   int gap_us = 0;
@@ -129,8 +126,6 @@ Options parse_options(int& argc, char** argv) {
       opt.workers = number(value("--workers="));
     else if (arg == "--smt")
       opt.smt = true;
-    else if (arg.starts_with("--max-isa="))
-      opt.max_isa = value("--max-isa=");
     else if (arg.starts_with("--numa-node="))
       opt.node = number(value("--numa-node="));
     else if (arg.starts_with("--warmup-forwards="))
@@ -156,8 +151,6 @@ Options parse_options(int& argc, char** argv) {
                    ")\n"
                    "--fixture=FILE --reference-dir=DIR --cpus=28-43 --workers=N\n"
                    "--smt adds each of the N workers' SMT siblings to the team, after them (2N workers)\n"
-                   "--max-isa=scalar|avx2|bw|vnni|vbmi caps the optimized kernel's tier (the baseline reads\n"
-                   "  EXL3_MOE_CPU_MAX_ISA at load)\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
                    "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
@@ -570,15 +563,13 @@ int main(int argc, char** argv) {
 #ifdef EXL3_BENCH_BASELINE
     // The vendored baseline reads its own variables (moe_mul1.cpp): these two at its first forward, and
     // EXL3_MOE_CPU_MAX_ISA at load, so the scripts export that one.
-    if (!options.max_isa.empty())
-      throw std::runtime_error("--max-isa caps the optimized kernel; the baseline reads EXL3_MOE_CPU_MAX_ISA at load");
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
 #else
-    ::sglang::exl3_cpu::exl3_cpu_configure({.max_isa = options.max_isa});
+    ::sglang::exl3_cpu::exl3_cpu_configure({});
 #endif
-    // The tier is fixed at load (baseline) or at this first query (optimized, from --max-isa).
-    // Any AVX-512 tier runs the DSV4.1 plan; no cap runs the host's, which is what the scripts do.
+    // The optimized kernel's tier is its build's -march (CMake EXL3_MARCH); the baseline detects at load.
+    // Any AVX-512 tier runs the DSV4.1 plan.
     if (!exl3_moe_cpu_has_avx512_bw())
       throw std::runtime_error("This study requires AVX512BW");
     const char* isa_tier = exl3_moe_cpu_has_avx512_vbmi() ? "vbmi" : exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";

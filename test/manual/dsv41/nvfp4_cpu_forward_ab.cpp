@@ -1,9 +1,9 @@
-// Bit-exact A/B harness for the NVFP4 CPU expert kernel; run_nvfp4_cpu_forward_checks.sh builds and runs it.
+// A/B harness for the NVFP4 CPU expert kernel; run_nvfp4_cpu_forward_checks.sh builds and runs it.
 // It calls only the kernel interface (nvfp4_cpu_kernel(), kernel.h). Every one-row output and status (status_of) is
-// written to OUT in a fixed order: two
-// revisions agree when their files are byte-identical, each built with its own revision of this harness.
-//   nvfp4_cpu_forward_ab [--max-isa=TIER] [--report-isa] OUT CORE [CORE...]     worker i runs on CORE i; the caller is
-//   worker 0; --max-isa caps the tier and --report-isa prints it ("nvfp4 isa <tier>" on stderr) at its first query.
+// written to OUT in a fixed order: two revisions agree when nvfp4_cpu_dump_compare.py finds their files within its
+// tolerance (the kernel is built -Ofast, so they need not be byte-identical), each built with its own revision of
+// this harness. Batched rows must still equal their one-row calls bit for bit (check_batch).
+//   nvfp4_cpu_forward_ab OUT CORE [CORE...]     worker i runs on CORE i; the caller is worker 0.
 #include "kernel.h"
 #include "quant.hpp"
 #include "../upstream/kernels.h"
@@ -163,20 +163,12 @@ void put(FILE* f, const std::string& name, int status, const std::vector<float>&
 }  // namespace
 
 int main(int argc, char** argv) {
-    // The kernel reads no environment: the ISA cap and report are passed to its configure call, before the first forward.
-    std::string max_isa;
-    bool report_isa = false;
-    int first = 1;
-    for (; first < argc && std::strncmp(argv[first], "--", 2) == 0; ++first) {
-        if (std::strncmp(argv[first], "--max-isa=", 10) == 0) max_isa = argv[first] + 10;
-        else if (std::strcmp(argv[first], "--report-isa") == 0) report_isa = true;
-        else { std::fprintf(stderr, "unknown option %s\n", argv[first]); return 2; }
-    }
+    // The ISA tier is the build's -march (build.py --march), not an option.
+    const int first = 1;
     if (argc - first < 2) {
-        std::fprintf(stderr, "usage: %s [--max-isa=TIER] [--report-isa] OUT CORE [CORE...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s OUT CORE [CORE...]\n", argv[0]);
         return 2;
     }
-    ::sglang::nvfp4_cpu::nvfp4_cpu_configure(max_isa, report_isa);
     std::vector<int32_t> cores;
     for (int i = first + 1; i < argc; ++i) cores.push_back(std::atoi(argv[i]));
     g_cores.assign(cores.begin(), cores.end());

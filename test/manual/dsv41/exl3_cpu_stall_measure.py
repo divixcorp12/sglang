@@ -46,7 +46,7 @@ def arm(args):
     cores = list(range(6, 16)) if args.group == 0 else list(range(18, 28))
     # Allocate/fill tensors on this group's node, before the team pins worker 0.
     os.sched_setaffinity(0, {cores[0]})
-    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = "bw"
+    os.environ["SGLANG_JIT_HOST_MARCH"] = "skylake-avx512"  # the bw tier
     import torch
     import sglang
     import exl3_cpu_forward_ab as fixture

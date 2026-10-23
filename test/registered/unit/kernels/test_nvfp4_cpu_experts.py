@@ -1,7 +1,7 @@
 """The NVFP4 CPU expert kernel under its team (cpu_experts/team.hpp), through the expert-stream host's kernel test
 exports (Linux, GCC).
 
-Each case runs in its own process: the ISA cap and a preloaded pin shim are process-wide. The child makes the sanitizer
+Each case runs in its own process: a preloaded pin shim is process-wide. The child makes the sanitizer
 harness's 80 x 80 layer (every weight nibble 1.0, every scale 1.0) and prints one line per call.
 """
 
@@ -101,32 +101,35 @@ def built(tmp_path_factory):
 
 
 def _host_has_avx2() -> bool:
-    # What detect_isa requires for the AVX2 tier (expert_stream/host/cpu_experts/isa.hpp).
+    # What an x86-64-v3 build needs: the AVX2 tier of isa.hpp plus the rest of the v3 level.
     try:
         cpuinfo = Path("/proc/cpuinfo").read_text()
     except OSError:
         return False
     flags = next((line.split(":", 1)[1].split() for line in cpuinfo.splitlines() if line.startswith("flags")), [])
-    return {"avx2", "fma", "f16c"} <= set(flags)
+    return {"avx2", "fma", "f16c", "bmi1", "bmi2", "abm", "movbe"} <= set(flags)
 
 
-# One library holds every tier; each case runs at each, capped by SGLANG_EXPERT_STREAM_CPU_MAX_ISA. A cap never raises the tier, so
-# the avx2 case is skipped where it would silently run the scalar tier again.
-@pytest.fixture(params=["avx2", "scalar"])
-def library(built, request):
-    if request.param == "avx2" and not _host_has_avx2():
-        pytest.skip("the host has no AVX2/FMA/F16C, so the avx2 cap would run the scalar tier")
-    return built, request.param
+# A tier is a build at its -march; each case runs against the AVX2 build and the scalar one.
+@pytest.fixture(scope="module", params=["x86-64-v3", "x86-64"], ids=["avx2", "scalar"])
+def library(request, tmp_path_factory):
+    if request.param == "x86-64-v3" and not _host_has_avx2():
+        pytest.skip("the host has no AVX2/FMA/F16C, so it cannot run an x86-64-v3 build")
+    spec = importlib.util.spec_from_file_location(
+        "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4/build.py"
+    )
+    build = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build)
+    return build.build(tmp_path_factory.mktemp("nvfp4") / "libnvfp4.so", cxx=CXX, march=request.param)
 
 
 def _run(library, calls, cores=(), alpha=1.0, groups=1, **env):
-    path, isa = library
     result = subprocess.run(
-        [sys.executable, "-c", CHILD, str(path), calls, ",".join(map(str, cores)), str(alpha), str(groups)],
+        [sys.executable, "-c", CHILD, str(library), calls, ",".join(map(str, cores)), str(alpha), str(groups)],
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "SGLANG_EXPERT_STREAM_CPU_MAX_ISA": isa, **env},
+        env={**os.environ, **env},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.split("\n")[:-1]

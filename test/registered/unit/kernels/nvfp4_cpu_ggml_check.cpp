@@ -1,4 +1,5 @@
-// Differential GGML/layout check of both dot product tiers; C++ only, no CUDA or Python runtime.
+// Differential GGML/layout check of the dot product tiers the build compiles; C++ only, no CUDA or Python runtime.
+// The kernel is built -Ofast, so its sums are not bit-identical to GGML's: every comparison is at a tolerance.
 #include "math_scalar.hpp"
 #include "math_avx2.hpp"
 #include <algorithm>
@@ -10,9 +11,7 @@
 using namespace sglang::nvfp4_cpu;
 
 int main() {
-    // The scalar tier runs everywhere; the AVX2 tier only where the host has it (the library dispatches the same way).
-    __builtin_cpu_init();
-    const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+    // The scalar tier is always compiled; the AVX2 tier only when the build's -march has AVX2/FMA/F16C.
     std::mt19937 rng(42);
     constexpr float fp4[]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
     for (int k:{16,32,48,64,80,144,512}) for (int row:{0,31,32,127,128}) {
@@ -53,17 +52,23 @@ int main() {
             float scalar, upstream;
             dot_rows<Isa::Scalar,1>(padded,view,&xs,&scalar);
             ggml_vec_dot_nvfp4_q8_0(padded,&upstream,0,blocks.data(),0,x.data(),0,1);
-            const double tolerance=1e-5+1e-6*magnitude;
+            // Each fp32 sum is at most 4 * (k / 16) terms deep (k <= 512 here) and every add or fused multiply-add
+            // may round by 2^-24 of the running sum, which is at most `magnitude`: about 130 * 6e-8 = 8e-6 of it in
+            // the worst reassociation, and the typical error is far smaller. 1e-5 sits just above that bound; 1e-5
+            // absolute covers a gold near zero.
+            const double tolerance=1e-5+1e-5*magnitude;
             assert(std::isfinite(scalar) && std::abs(scalar-gold)<=tolerance);
             assert(std::isfinite(upstream) && std::abs(upstream-gold)<=tolerance);
             assert(std::abs(scalar-upstream)<=tolerance);
-            if (avx2) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+            {
                 float vector;
                 dot_rows<Isa::Avx2,1>(padded,view,&xs,&vector);
                 assert(std::isfinite(vector) && std::abs(vector-gold)<=tolerance);
                 assert(std::abs(vector-upstream)<=tolerance);
                 assert(std::abs(vector-scalar)<=tolerance);
             }
+#endif
         }
     }
 }

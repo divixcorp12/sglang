@@ -8,7 +8,7 @@ zeroed rows and the new one into rows full of NaN (whatever an earlier record le
 (store_first off, the memset inside the team), and compares the bits (int32 views, so a -0 against +0 fails). A
 second, accumulating job on the same rows (a record's later CPU misses into part 1) must then agree too.
 
-Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and the bw tier (SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw on a host above it). Run on
+Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier (SGLANG_JIT_HOST_MARCH=skylake-avx512 builds the bw tier on a host above it). Run on
 divix01 under taskset -c 0-51,56-107.
 """
 

@@ -7,9 +7,8 @@ records. No Python, PyTorch or CUDA is required; the kernel needs OpenMP, and `r
 
 `nvfp4_cpu_optimized` times the kernel, which adapts the pinned GGML
 `ggml_vec_dot_nvfp4_q8_0` to read the packed GPU weight bytes and
-128x4-swizzled scales directly. It compiles for baseline x86-64 like the
-library and runs the AVX2 tier on an AVX2/FMA host (`--max-isa=scalar`
-times the scalar tier); scratch
+128x4-swizzled scales directly. It compiles at `-march=native` like the
+library; `-DNVFP4_MARCH=x86-64` times the scalar tier and `x86-64-v3` the AVX2 one; scratch
 allocation is performed during warmup, and no repacked weight cache is
 retained. See [source provenance](../upstream/README.md).
 

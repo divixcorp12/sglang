@@ -14,13 +14,12 @@ python python/sglang/srt/layers/quantization/nvfp4/build.py \
 
 `--main HARNESS.cpp` links a native harness into an executable instead. Inside SGLang,
 `sglang.srt.layers.quantization.nvfp4.ext.nvfp4_cpu_module()` builds the library on first use with `$CXX`
-and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags and compiler. The build targets
-baseline x86-64 and holds both ISA tiers: at the first forward the library picks AVX2 on an AVX2/FMA host, else the
-scalar loop. `SGLANG_EXPERT_STREAM_CPU_MAX_ISA=scalar` caps the tier (it never raises it) and
-`SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1` prints the tier chosen (`nvfp4 isa avx2`) to stderr; Python passes both to the
-library's `nvfp4_cpu_configure` export before the first forward, and a native harness calls `nvfp4_cpu_configure`
-(kernel.h) itself. The arithmetic needs `-ffp-contract=off` and must never be built with
-`-Ofast`.
+and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags and compiler. The build is
+`-Ofast -fno-finite-math-only -march=<resolved>` (`SGLANG_JIT_HOST_MARCH`, else this machine's) for the C++ and the
+vendored C, and compiles one ISA tier, chosen at compile time from that `-march`: AVX2 when it has AVX2/FMA/F16C,
+else the scalar loop. A lower tier is a build at a lower `-march` (`x86-64-v3` AVX2, `x86-64` scalar); the library
+runs only on CPUs that have its `-march`. The results are not bit-identical to GGML's (FMA contraction and fast math);
+the GGML check compares at a tolerance.
 
 The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
 `test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
@@ -137,14 +136,14 @@ Layer and argument validation, worker cores and keep-warm are the shared CPU exp
 (`expert_stream/host/cpu_experts/`, `ExpertForward<Nvfp4Quant>`). `quant.hpp` holds `Nvfp4Quant` (slab names and
 `row_bytes`, each slab's minimum stride; parameter validation; `Expert`, a slot's three projections read from its
 `ExpertRow`); `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and
-`dot_rows<Isa, M>`, whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (compiled for AVX2 by function attribute); `forward_plan.hpp`
+`dot_rows<Isa, M>`, whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (present when the `-march` has AVX2); `forward_plan.hpp`
 holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-thread scratch, `ForwardArena`;
 `kernel.cpp` defines `Nvfp4Quant::dispatch` and the kernel's accessor (`nvfp4_cpu_kernel`). A forward is
-`ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the tier
-`ExpertForward` detected: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer at the
-AVX2 tier, else `ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.
-An AVX2 plan enters its gate/up and down row loops through `gate_up_avx2`/`down_avx2`, compiled for AVX2 with
-everything they call inlined (`flatten`), once per phase per worker; the rest of the library is baseline x86-64.
+`ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the build's
+tier: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer at the AVX2 tier, else
+`ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.
+An AVX2 plan enters its gate/up and down row loops through `gate_up_avx2`/`down_avx2`, with everything they call
+inlined (`flatten`), once per phase per worker.
 `kRowUnit` is the plans' split unit. The plan builds the call's `RouteTable` and groups a call's routes into
 units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows<Isa, M>` decodes
 each weight row once per chunk. A plan reads every layer fact it may fix
@@ -152,8 +151,8 @@ through its Shape (`shapes.hpp`): `GenericShape` from the `ExpertLayer`, `MimoV2
 (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp); the W13 layout and input scales are the layer's params.
 Plans read a slot's projections through `Nvfp4Quant::expert(layer[slot])`.
 
-Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (the avx2 and scalar tiers
-of one build against a baseline worktree's dumps), and
+Checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (the avx2 and scalar tiers, each its
+own build, against a baseline worktree's dumps at a tolerance), and
 `test/registered/unit/kernels/test_nvfp4_cpu_{build,experts}.py`.
 
 ## Validation boundaries
@@ -164,7 +163,7 @@ benchmark checks every selected layer/count against
 an independent decoded-weight Q8 reference before and after timing, and
 reports error against a separate FP64 W4A16 reference. The differential GGML
 test covers every finite signed scale, varying nibbles, GPU scale row
-boundaries, and all partial 64-value block lengths, for both tiers (AVX2 where the host has it). The
+boundaries, and all partial 64-value block lengths, at a tolerance, for the build's tier. The
 standalone sanitizer harness is in
 `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`; compile it together with
 `kernel.cpp` and the vendored C source; `test_nvfp4_cpu_build.py` also runs it under ASan/UBSan where the

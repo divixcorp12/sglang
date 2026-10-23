@@ -10,8 +10,8 @@ V4.1-shaped layer:
 The three must agree bit for bit. The plan counter (sglang_exl3_cpu::plan_calls) shows which plan each call took. The
 chunk-size cases are generated from the build's CHUNK_M, so a larger MAX_M widens them with no edit here.
 
-Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier. Run it once with SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw and once
-with it unset (the host's tier, vnni on divix01): both must show the "dsv41" plan, which at vnni accumulates with
+Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier. Run it once with SGLANG_JIT_HOST_MARCH=skylake-avx512 (the bw
+tier) and once with it unset (the host's tier, vnni on divix01): both must show the "dsv41" plan, which at vnni accumulates with
 vpdpwssd and is compared bit for bit with the generic plan at that tier (the swizzled layer). Run on divix01 under
 taskset -c 0-51,56-107 (CPU jobs; the node-0 cores 0-27 or the bench's node-1 cores 28-43 are enough).
 """

@@ -87,12 +87,8 @@ if [[ ! $rounds =~ ^[1-9][0-9]*$ ]]; then
 fi
 export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
 export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
-# The ISA tier is the host's unless the caller sets EXL3_BENCH_MAX_ISA (scalar|avx2|bw|vnni|vbmi), passed to each binary
-# as --max-isa. The kernel ignores an unrecognized value and runs the host's tier. Each binary prints the tier it ran
-# ("isa tier <tier>") into its log; isa.txt gathers them.
-max_isa=${EXL3_BENCH_MAX_ISA-}
-isa_flag=()
-[[ -z $max_isa ]] || isa_flag=(--max-isa="$max_isa")
+# The ISA tier is the build's -march (cmake -DEXL3_MARCH=...). Each binary prints the tier it ran ("isa tier <tier>")
+# into its log; isa.txt gathers them.
 export MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 fixture=/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin
 references=/data/models/exl3_exp/threading
@@ -116,7 +112,6 @@ fi
   printf 'Arguments:'
   printf ' %q' "$@"
   printf '\n'
-  echo "EXL3_BENCH_MAX_ISA=${max_isa:-<unset: the host tier>}"
   sha256sum "${binaries[@]}"
   sha256sum "$fixture" "$references"/reference-e{1,3,5}.bin
   echo "Images: $images"
@@ -132,7 +127,7 @@ for ((round=0; round<rounds; ++round)); do
     "$build/exl3_full_stack_$variant" \
       --benchmark_min_time=512x --benchmark_repetitions=1 \
       --benchmark_out="$results/round-$round-$variant.json" \
-      --benchmark_out_format=json "${isa_flag[@]}" "$@" \
+      --benchmark_out_format=json "$@" \
       > "$results/round-$round-$variant.log" 2>&1 || status=$?
     cat "$results/round-$round-$variant.log"
     echo "round $round $variant exit $status" | tee -a "$results/status.txt"
@@ -140,7 +135,6 @@ for ((round=0; round<rounds; ++round)); do
   done
 done
 {
-  echo "EXL3_BENCH_MAX_ISA=${max_isa:-<unset: the host tier>}"
   grep -H '^isa tier ' "$results"/round-*.log || true
 } > "$results/isa.txt"
 echo "Results: $results"

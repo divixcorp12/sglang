@@ -5,8 +5,8 @@
 #       At the merge-base: exl3_cpu_forward_ab.py dumps per ISA tier (vnni, bw, avx2, scalar), through slab layers.
 #   run_exl3_cpu_forward_checks.sh check WORKTREE OUT BASELINE_OUT
 #       (1) the same dumps, compared bitwise with BASELINE_OUT's; (2) the bare-forward bench's 24 frozen DSV4.1 outputs;
-#       (3) the full-stack bench's 48; (4) the CPU expert engine and service tests. (2) and (3) run twice: at the
-#       host's tier (SGLANG_EXPERT_STREAM_CPU_MAX_ISA unset) and capped at bw.
+#       (3) the full-stack bench's 48; (4) the CPU expert engine and service tests. (2) and (3) run twice: built for
+#       the host's tier and at -march=skylake-avx512 (bw). The dumps' tiers are builds at -march too (exl3_cpu_forward_ab.py).
 #
 # Builds into OUT: a private copy of the extension's build directory (~670 MB) and the bench. Exits nonzero when any
 # step fails; each step's log is OUT/<step>.log. CPU jobs run under taskset -c 0-51,56-107 (the bench's 22-43 sit
@@ -77,24 +77,25 @@ if [[ $mode == check ]]; then
   [[ -d $gbench ]] && configure+=("-DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=$gbench")
   step bench-configure taskset -c "$CPU_JOB_CORES" cmake -S "$bench" -B "$build" "${configure[@]}"
   step bench-build taskset -c "$CPU_JOB_CORES" cmake --build "$build" -j16 --target exl3_cpu_optimized exl3_full_stack_prod
+  # The bw tier is its own build, at -march=skylake-avx512.
+  build_bw=$out/bench-build-bw
+  step bench-configure-bw taskset -c "$CPU_JOB_CORES" cmake -S "$bench" -B "$build_bw" "${configure[@]}" -DEXL3_MARCH=skylake-avx512
+  step bench-build-bw taskset -c "$CPU_JOB_CORES" cmake --build "$build_bw" -j16 --target exl3_cpu_optimized exl3_full_stack_prod
   export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
   export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
   mkdir -p "$out/images"
   # The benches' default cores (bare 28-43; full stack writer 22, service 26, copy 27, workers 28-43) sit inside
-  # CPU_JOB_CORES. Once at the host's tier (the variable unset), once capped at bw.
-  unset SGLANG_EXPERT_STREAM_CPU_MAX_ISA
+  # CPU_JOB_CORES. Once at the host's tier (the default build), once at bw (its own build).
   gated() { eval "$NODE1_GATE"; "$@"; }
   step bare-validate gated taskset -c "$BENCH_CORES" "$build/exl3_cpu_optimized" --validate-only
   step full-stack-validate gated taskset -c "$BENCH_CORES" "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
-  export SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw
-  step bare-validate-bw gated taskset -c "$BENCH_CORES" "$build/exl3_cpu_optimized" --validate-only
-  step full-stack-validate-bw gated taskset -c "$BENCH_CORES" "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
-  unset SGLANG_EXPERT_STREAM_CPU_MAX_ISA
+  step bare-validate-bw gated taskset -c "$BENCH_CORES" "$build_bw/exl3_cpu_optimized" --validate-only
+  step full-stack-validate-bw gated taskset -c "$BENCH_CORES" "$build_bw/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
   step pytest taskset -c "$CPU_JOB_CORES" "$PY" -m pytest -q -p no:randomly \
     test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py \
     test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
-  # The multi-token plan test is documented to run at the host's tier and capped at bw.
-  step pytest-plan-bw env SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw taskset -c "$CPU_JOB_CORES" "$PY" -m pytest -q -p no:randomly \
+  # The multi-token plan test is documented to run at the host's tier and built at bw.
+  step pytest-plan-bw env SGLANG_JIT_HOST_MARCH=skylake-avx512 taskset -c "$CPU_JOB_CORES" "$PY" -m pytest -q -p no:randomly \
     test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
 fi
 
