@@ -33,8 +33,9 @@ The 2026-10-04 reasons for that shape no longer hold:
   `if constexpr`) and its generic plan. A mixed-K checkpoint (DSV4.1-1017: K3 layers on the DSV4.1 plan, layers 18-22
   K2 on the generic plan) needs both in one process. No per-model plan selection in the build.
 - D3. Two flag sets, chosen per source file (owner, 2026-10-23, after step 1's bisection). Kernel files: `-Ofast
-  -march=<resolved>`, exactly EXL3's flags today. Host files: `-Ofast -fno-finite-math-only -march=<resolved>`, so host
-  NaN checks (`gate_scorer.h`, `ram_tier_fill_copy_cpu.inc.h`) keep their meaning. One flag set was tried first:
+  -march=<resolved>`, exactly EXL3's flags today. Host files keep the host module's current flags (no fast-math), so
+  host numerics (calibration fits, the gate scorer) and NaN checks (`gate_scorer.h`, `ram_tier_fill_copy_cpu.inc.h`)
+  do not change. One flag set was tried first:
   `-fno-finite-math-only` in the EXL3 kernel made 70 of 72 VNNI cases differ, because glibc declares the vector `expf`
   (`_ZGVdN8v_expf`, `_ZGVbN4v_expf`) only under full fast-math, so SiLU fell back to scalar `expf`. A kernel file's own
   finite checks (the call check's non-finite-weight refusal, `cpu_experts/expert_forward.hpp`) use a bit-pattern test
@@ -75,11 +76,13 @@ Each step lands as commits on `cpu-kernel-in-host` and is verified before the ne
    extension's `-march=native` becomes the resolved `-march` so `SGLANG_JIT_HOST_MARCH` reaches it. Python drops the
    cap/report envs and options (`environ.py`, `expert_engine/config.py`, `removed_env.py` gets the migration entry).
    Tests and benches that capped the tier build at a lower `-march` instead.
-2. Kernels into the host module (D5): the host's `load_jit` takes the format's kernel sources; NVFP4's `nvfp4.c` is
-   compiled as C++ or ported (the loader has no C sources).
-3. Concrete kernel type and typed params (D6), Python plumbing (D7).
-4. Fake-kernel test format (D8); delete the old interface, the address path and the extension stubs; docs (both kernel
-   READMEs, the 2026-10-04 spec marked superseded).
+2. Kernels into the host module (D5) and the Python plumbing (D7): per-source flags in `load_jit` (NVFP4's vendored
+   `nvfp4.c` compiled as C through them); the EXL3 kernel without torch; its torch ops become host exports; the
+   exllamav3 extension compiles upstream's `cpu/moe_mul1.cpp` again and the link stubs go; Python passes no kernel
+   address. The virtual interface stays for this step, so tests keep injecting a fake kernel (an override honoured
+   only outside the prod variant).
+3. Concrete kernel type and typed params (D6) with the fake-kernel test format (D8); delete the old interface and the
+   override; docs (both kernel READMEs, the 2026-10-04 spec marked superseded).
 
 ## Verification
 
