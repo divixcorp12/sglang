@@ -8,6 +8,7 @@
 // (EXL3's Exl3Projection, NVFP4's Projection), made from an ExpertRow's pointers and its Params.
 #pragma once
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,10 @@
 #include <type_traits>
 
 namespace sglang::cpu_experts {
+// Whether v is neither NaN nor infinite, from its exponent bits: a kernel file is built -Ofast (finite-math-only), under
+// which std::isfinite may fold to true.
+inline bool is_finite_bits(float v) { return (std::bit_cast<uint32_t>(v) & 0x7f800000u) != 0x7f800000u; }
+
 inline constexpr int kMaxSlabs = 8;
 inline constexpr size_t kMaxParamBytes = 16;
 

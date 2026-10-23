@@ -117,9 +117,9 @@ struct Nvfp4Quant
             return "hidden and intermediate must be multiples of 16 in [16, 2^20]";
         if (p.w13_layout < 0 || p.w13_layout > 2 || (p.w13_layout == 2 && l.intermediate % 64))
             return "w13_layout must be 0, 1 or 2 (2 needs intermediate % 64 == 0)";
-        if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0)
+        if (l.activation != 0 || !is_finite_bits(l.act_limit) || l.act_limit < 0)
             return "the activation must be gated SiLU with a finite, non-negative act_limit";
-        if (!std::isfinite(p.inv_input_scale13) || p.inv_input_scale13 <= 0 || !std::isfinite(p.inv_input_scale2)
+        if (!is_finite_bits(p.inv_input_scale13) || p.inv_input_scale13 <= 0 || !is_finite_bits(p.inv_input_scale2)
             || p.inv_input_scale2 <= 0)
             return "the inverse input scales must be finite and positive";
         return nullptr;
@@ -129,7 +129,7 @@ struct Nvfp4Quant
     static bool usable(const ExpertLayer& l, const Params&, int slot)
     {
         const Expert e = expert(l[slot]);
-        return std::isfinite(e.gate.alpha) && std::isfinite(e.up.alpha) && std::isfinite(e.down.alpha);
+        return is_finite_bits(e.gate.alpha) && is_finite_bits(e.up.alpha) && is_finite_bits(e.down.alpha);
     }
 
     // Defined in kernel.cpp after forward_plan.hpp.

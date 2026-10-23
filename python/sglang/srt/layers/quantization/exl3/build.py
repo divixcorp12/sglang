@@ -23,7 +23,7 @@ def main():
     from sglang.kernels.jit.utils.compile.toolchain import host_arch_flags
 
     os.environ["CXX"] = args.cxx  # host_arch_flags resolves -march with $CXX
-    cmd = [args.cxx, "-Ofast", "-fno-finite-math-only", *host_arch_flags(), "-std=c++20", "-fPIC", "-shared", "-pthread", "-fopenmp",
+    cmd = [args.cxx, "-Ofast",*host_arch_flags(), "-std=c++20", "-fPIC", "-shared", "-pthread", "-fopenmp",
            "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128",
            f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
            "-I" + str(src), "-isystem", str(torch_root / "include"),

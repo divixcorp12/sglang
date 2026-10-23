@@ -47,7 +47,7 @@ inline void dot_rows(int n, const GpuRow& x, const block_q8_0* const* ys, float*
 inline bool q8_representable(const float* v)
 {
     for (int j = 0; j < 32; ++j)
-        if (!std::isfinite(v[j]) || std::abs(v[j]) > 65504.f * 127.f) return false;
+        if (!is_finite_bits(v[j]) || std::abs(v[j]) > 65504.f * 127.f) return false;
     return true;
 }
 

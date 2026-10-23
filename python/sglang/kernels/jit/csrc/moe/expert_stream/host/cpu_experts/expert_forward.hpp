@@ -90,7 +90,7 @@ public:
         const size_t n = size_t(c.rows) * size_t(c.k);
         for (size_t j = 0; j < n; ++j) {
             const int32_t slot = c.slots[j];
-            if (slot < -1 || slot >= layer.capacity || !std::isfinite(c.weights[j]))
+            if (slot < -1 || slot >= layer.capacity || !is_finite_bits(c.weights[j]))
                 refuse("slot " + std::to_string(slot) + " outside the layer's " + std::to_string(layer.capacity)
                        + " or a non-finite weight");
             if (slot >= 0 && !Quant::usable(layer, p, slot)) refuse("slot " + std::to_string(slot) + " is unusable");

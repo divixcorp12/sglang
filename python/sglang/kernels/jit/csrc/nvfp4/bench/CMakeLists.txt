@@ -25,14 +25,14 @@ if(NOT benchmark_FOUND)
     GIT_TAG eddb0241389718a23a42db6af5f0164b6e0139af) # same v1.9.4 as expert_stream/bench
   FetchContent_MakeAvailable(google_benchmark)
 endif()
-# The library's flags (quantization/nvfp4/build.py): -Ofast -fno-finite-math-only -march=<resolved>. The ISA tier is
+# The library's flags (quantization/nvfp4/build.py): -Ofast -march=<resolved>. The ISA tier is
 # the -march (NVFP4_MARCH: x86-64-v3 builds the AVX2 tier, x86-64 the scalar one), so the benchmark times the code
 # production runs.
 set(NVFP4_MARCH "native" CACHE STRING "-march of the kernel, which fixes its ISA tier")
 set(NVFP4_ARCH_FLAGS -march=${NVFP4_MARCH})
 add_library(nvfp4_kernel OBJECT ../optimized/kernel.cpp ../upstream/nvfp4.c)
 target_link_libraries(nvfp4_kernel PRIVATE OpenMP::OpenMP_CXX)
-target_compile_options(nvfp4_kernel PRIVATE -g -Ofast -fno-finite-math-only ${NVFP4_ARCH_FLAGS})
+target_compile_options(nvfp4_kernel PRIVATE -g -Ofast ${NVFP4_ARCH_FLAGS})
 add_executable(nvfp4_cpu_optimized src/cpu_forward.cpp $<TARGET_OBJECTS:nvfp4_kernel>)
 target_include_directories(nvfp4_cpu_optimized PRIVATE ../optimized)
 target_compile_definitions(nvfp4_cpu_optimized PRIVATE NVFP4_BENCH_BACKEND="optimized")

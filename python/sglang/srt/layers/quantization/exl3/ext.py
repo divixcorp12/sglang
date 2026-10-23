@@ -244,7 +244,7 @@ def exl3_ext():
             extra_cflags=_EXTRA_CFLAGS
             + defines
             + trace_defines
-            + (["-fno-finite-math-only", *march_flags, "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
+            + ([*march_flags,"-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
             extra_ldflags=["-fopenmp"] if optimized else [],
             extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
             build_directory=build_dir,

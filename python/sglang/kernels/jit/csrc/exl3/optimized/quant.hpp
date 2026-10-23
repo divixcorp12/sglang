@@ -82,7 +82,7 @@ struct Exl3Quant
         if (l.hidden < 128 || l.intermediate < 128 || l.hidden % 128 || l.intermediate % 128 || l.hidden > 8192
             || l.intermediate > 8192)
             return "hidden and intermediate must be multiples of 128 in [128, 8192]";
-        if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0.0f)
+        if (l.activation != 0 || !is_finite_bits(l.act_limit) || l.act_limit < 0.0f)
             return "the activation must be gated SiLU with a finite, non-negative act_limit";
         return plan_rejects(l, p);
     }

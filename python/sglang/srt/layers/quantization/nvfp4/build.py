@@ -1,8 +1,8 @@
 """Build the NVFP4 CPU expert library (or a native harness linked with it) without CMake.
 
 The kernel is optimized/kernel.cpp plus the vendored GGML C subset (../upstream/nvfp4.c, compiled as C: it relies on
-C's implicit void* conversions). Both build with ``-Ofast -fno-finite-math-only -march=<resolved>``, the flag set of
-every CPU expert kernel. The ISA tier (scalar or AVX2) is compile-time, from the resolved ``-march``
+C's implicit void* conversions). Both build with ``-Ofast -march=<resolved>``, the kernel flag set of every CPU
+expert kernel. The ISA tier (scalar or AVX2) is compile-time, from the resolved ``-march``
 (``SGLANG_JIT_HOST_MARCH``, else this machine's): a library runs only on CPUs that have its -march. A lower tier is
 built at a lower -march (``x86-64-v3`` AVX2, ``x86-64`` scalar). The kernel's results are not bit-identical to GGML's.
 The shared library also links tvm-ffi for its exports (optimized/ffi.cpp: the kernel's address and params); a harness
@@ -19,8 +19,8 @@ from typing import Sequence
 
 SRC = Path(__file__).resolve().parents[4] / "kernels/jit/csrc/nvfp4/optimized"
 UPSTREAM = SRC.parent / "upstream"
-CXX_FLAGS = ["-std=c++20", "-Ofast", "-fno-finite-math-only", "-fPIC", "-pthread", "-fopenmp"]
-C_FLAGS = ["-x", "c", "-std=c11", "-Ofast", "-fno-finite-math-only", "-fPIC"]
+CXX_FLAGS = ["-std=c++20", "-Ofast", "-fPIC", "-pthread", "-fopenmp"]
+C_FLAGS = ["-x", "c", "-std=c11", "-Ofast", "-fPIC"]
 
 
 def arch_flags(cxx: str, march: str | None = None) -> list[str]:

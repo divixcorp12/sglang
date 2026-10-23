@@ -15,7 +15,7 @@ python python/sglang/srt/layers/quantization/nvfp4/build.py \
 `--main HARNESS.cpp` links a native harness into an executable instead. Inside SGLang,
 `sglang.srt.layers.quantization.nvfp4.ext.nvfp4_cpu_module()` builds the library on first use with `$CXX`
 and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags and compiler. The build is
-`-Ofast -fno-finite-math-only -march=<resolved>` (`SGLANG_JIT_HOST_MARCH`, else this machine's) for the C++ and the
+`-Ofast -march=<resolved>` (`SGLANG_JIT_HOST_MARCH`, else this machine's) for the C++ and the
 vendored C, and compiles one ISA tier, chosen at compile time from that `-march`: AVX2 when it has AVX2/FMA/F16C,
 else the scalar loop. A lower tier is a build at a lower `-march` (`x86-64-v3` AVX2, `x86-64` scalar); the library
 runs only on CPUs that have its `-march`. The results are not bit-identical to GGML's (FMA contraction and fast math);

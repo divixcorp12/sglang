@@ -219,6 +219,8 @@ int main()
         Call bad_slot(layer, 1, 1, {kCapacity}, {1.0f});
         Call negative_slot(layer, 1, 1, {-2}, {1.0f});
         Call nan_weight(layer, 1, 1, {0}, {nan});
+        Call inf_weight(layer, 1, 1, {0}, {std::numeric_limits<float>::infinity()});
+        Call neg_inf_weight(layer, 1, 1, {0}, {-std::numeric_limits<float>::infinity()});
         Call wide(layer, 1, max_routes + 1, std::vector<int32_t>(max_routes + 1, 0),
                   std::vector<float>(max_routes + 1, 1.0f));
         Call tall(layer, max_rows + 1, 1, std::vector<int32_t>(max_rows + 1, 0),
@@ -231,7 +233,7 @@ int main()
         null_slots.c.slots = nullptr;
         Call null_out(layer, 1, 1, {0}, {1.0f});
         null_out.c.out = nullptr;
-        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
+        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &inf_weight, &neg_inf_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
             CHECK(c->run() == 2);
             CHECK(c->untouched());
         }

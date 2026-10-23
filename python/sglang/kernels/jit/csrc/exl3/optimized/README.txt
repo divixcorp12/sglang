@@ -37,7 +37,7 @@ stopped. Keep-warm takes no lock, so its callers must not overlap it with a forw
 Build and link
 --------------
 Requires Linux, GCC 15, OpenMP and the same PyTorch installation/ABI as the
-consumer. The build is -Ofast -fno-finite-math-only -march=<resolved> (SGLANG_JIT_HOST_MARCH, else this machine's,
+consumer. The build is -Ofast -march=<resolved> (SGLANG_JIT_HOST_MARCH, else this machine's,
 via jit/utils/compile/toolchain.py): it targets the build machine, so rebuild on another CPU. The extension's
 module name and build directory carry the -march.
 GCC 17 is deliberately not selected: it was not a consistent performance win

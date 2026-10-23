@@ -9,6 +9,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -127,6 +128,14 @@ int main() {
     assert(forward(*layer_ptr, x.data(), &skipped, weights, 1, out.data(), 3, 0) == 0);
     for (float v : out) assert(v == 0);
     assert(forward(*layer_ptr, x.data(), nullptr, nullptr, 0, out.data(), 3, 1) == 0);
+    // The kernel is built -Ofast: a non-finite routing weight must still be refused (bit-pattern test, not isfinite).
+    for (float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                      -std::numeric_limits<float>::infinity()}) {
+        const int32_t slot0 = 0;
+        std::fill(out.begin(), out.end(), 123);
+        assert(forward(*layer_ptr, x.data(), &slot0, &bad, 1, out.data(), 3, 0) == 2);
+        for (float v : out) assert(v == 123);
+    }
     const int32_t invalid = capacity;
     std::fill(out.begin(), out.end(), 123);
     assert(forward(*layer_ptr, x.data(), &invalid, weights, 1, out.data(), 3, 0) == 2);

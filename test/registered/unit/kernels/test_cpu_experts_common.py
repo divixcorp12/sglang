@@ -50,7 +50,8 @@ def _links_sanitizers(tmp_path) -> bool:
 
 @pytest.mark.parametrize(
     "flags",
-    [["-march=x86-64"], ["-march=native"], ["-march=x86-64", *SANITIZERS]],
+    # -Ofast as the kernels build, where a std::isfinite weight check would fold away.
+    [["-Ofast", "-march=x86-64"], ["-Ofast", "-march=native"], ["-march=x86-64", *SANITIZERS]],
     ids=["scalar-tier", "host-tier", "asan-ubsan"],
 )
 def test_the_native_harness_passes(tmp_path, flags):
