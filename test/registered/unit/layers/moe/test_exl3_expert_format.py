@@ -250,7 +250,7 @@ def test_unusable_weights_are_refused_naming_the_knob(tmp_path, weights):
 def test_weights_without_roots_are_refused_rather_than_ignored(tmp_path):
     fmt, _ = _mirrored(tmp_path)
     with _mirror_env("", "1:1"):
-        with pytest.raises(ValueError, match="MIRROR_WEIGHTS is set.*MIRROR_DIRS"):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_MIRROR weights is set but SGLANG_EXPERT_STREAM_MIRROR dirs is not"):
             _row_source(fmt)
 
 

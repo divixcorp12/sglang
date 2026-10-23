@@ -113,14 +113,16 @@ def test_cache_uses_shared_arena_only_with_explicit_opt_in(
         cache.close()
 
 
-@pytest.mark.parametrize("value", ["", "true", "2"])
-def test_cache_rejects_invalid_arena_option(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+@pytest.mark.parametrize("value", ["", "true", "2", 2], ids=["empty", "string-true", "string-2", "int-2"])
+def test_cache_rejects_invalid_arena_option(monkeypatch: pytest.MonkeyPatch, value) -> None:
+    """slab_arena is a boolean member of the URING group env; anything else is refused when the config resolves
+    (the string 0/1 spelling of the retired SLAB_ARENA env is not a boolean), naming the env and the key."""
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING", json.dumps({"slab_arena": value}))
     layer = torch.nn.Module()
     layer.weights = torch.nn.Parameter(torch.ones(4, 8))
     layer._nvfp4_file_source_bytes_per_expert = 32
-    streamer = ExpertStreamer(layer, ("weights",))
-    with pytest.raises(ValueError, match="SLAB_ARENA must be 0 or 1"):
+    with pytest.raises(ValueError, match=r"SGLANG_EXPERT_STREAM_URING.*slab_arena"):
+        streamer = ExpertStreamer(layer, ("weights",))
         ExpertPinnedHostCache(streamer, 2, device="cpu")
 
 

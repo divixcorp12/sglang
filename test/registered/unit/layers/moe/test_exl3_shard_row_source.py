@@ -187,7 +187,18 @@ def test_shared_row_reader_is_keyed_by_source_root(tmp_path):
     assert shared_row_reader(layout, True) is plain
 
 
-def test_pinned_tier_options_protect_hot_cache_experts(tmp_path):
+@pytest.fixture
+def bound_engine(monkeypatch):
+    """The bound expert engine service that is_pinned consults once a hot cache exists (quant_hook.attach binds it
+    in a launch); a stand-in without GPU-resident hot experts, so the hot cache's slot map decides."""
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
+
+    service = SimpleNamespace(gpu_hot_enabled=False, hot_experts=lambda layer_id: [])
+    monkeypatch.setattr(ExpertEngineService, "_instance", service)
+    return service
+
+
+def test_pinned_tier_options_protect_hot_cache_experts(tmp_path, bound_engine):
     layout = _checkpoint(tmp_path)
     fmt = Exl3ExpertFormat(layout, 1, direct=False)
     assert fmt.inclusive_pinned_tier is True
@@ -200,6 +211,10 @@ def test_pinned_tier_options_protect_hot_cache_experts(tmp_path):
     assert is_pinned(3) and not is_pinned(4)
     layer._nvfp4_expert_streamer.hot_cache.slot_to_expert[0] = 4  # residency moved
     assert is_pinned(4) and not is_pinned(3)
+    # With the GPU-resident hot set on, the engine's snapshot decides instead of the slot map.
+    bound_engine.gpu_hot_enabled = True
+    bound_engine.hot_experts = lambda layer_id: [1]
+    assert is_pinned(1) and not is_pinned(4)
 
 
 def test_streamer_reads_shards_through_a_cpu_pinned_tier(tmp_path):
@@ -226,7 +241,7 @@ def test_streamer_reads_shards_through_a_cpu_pinned_tier(tmp_path):
         assert _same(output, reference[name][ids]), name
 
 
-def test_an_inclusive_cpu_pinned_tier_keeps_hot_experts(tmp_path):
+def test_an_inclusive_cpu_pinned_tier_keeps_hot_experts(tmp_path, bound_engine):
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 
     layout = _checkpoint(tmp_path)

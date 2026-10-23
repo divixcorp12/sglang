@@ -121,6 +121,7 @@ class GraphGatherScratchArithmeticTests(unittest.TestCase):
 
 class GraphGatherStartupSizingTests(unittest.TestCase):
     def sized_options(self, speculative, environment):
+        from sglang.srt.layers.moe.expert_engine.config import stream_config
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
         from sglang.srt.model_executor import model_runner
         from sglang.srt.speculative import spec_utils
@@ -169,6 +170,8 @@ class GraphGatherStartupSizingTests(unittest.TestCase):
             ),
             patch.object(ExpertHotCacheManager, "from_model", side_effect=allocate),
         ):
+            # ModelRunner resolves the engine config once in __init__, before the hot cache is sized.
+            runner.expert_stream_config = stream_config()
             runner.maybe_init_expert_hot_cache()
         return captured
 
