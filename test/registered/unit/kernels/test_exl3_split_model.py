@@ -243,7 +243,7 @@ def test_the_gate_accepts_the_split_model_and_refuses_costs_without_it():
         with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": true}'):
             _check_slot_map()
         with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model_costs": "copy_lane=1"}'):
-            with pytest.raises(ValueError, match="ENABLE_CPU_SPLIT_MODEL=1"):
+            with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_CPU_SPLIT.*model_costs needs model=true"):
                 _check_slot_map()
 
 

@@ -15,20 +15,31 @@ def trace_probe(tmp_path_factory):
     source = work / "probe.cpp"
     source.write_text(r'''
 #include "job_trace.h"
+#include <cstdlib>
 #include <thread>
 using namespace sglang::expert_stream;
+// The host reads no environment: the probe installs the trace options as the module's expert_stream_set_trace_options
+// export does, from argv: mode (concurrent|gate|resources), job prefix, job capacity, job resources (0/1), gate path.
 int main(int argc, char** argv) {
+  if (argc != 6) return 4;
+  TraceOptions options;
+  options.job_prefix = argv[2];
+  options.job_capacity = std::strtoll(argv[3], nullptr, 10);
+  options.job_resources = argv[4][0] == '1';
+  options.gate_path = argv[5];
+  set_trace_options(options);
+  const std::string_view mode = argv[1];
   { JobTrace<false> prod("prod"); prod.emit("forbidden", 0, 0, 0, 0);
     prod.resources("forbidden", "forbidden", 0, 0, 0); }
   JobTrace<true> trace("probe");
-  if (argc > 1 && std::string_view(argv[1]) == "gate") {
+  if (mode == "gate") {
     for (int i=0; i<140000; ++i) trace.emit("closed", i, 0, 0, 0);
     puts("ready"); fflush(stdout);
     getchar();
     trace.emit("open", 1, 0, 0, 0);
     return 0;
   }
-  if (argc > 1) {
+  if (mode == "resources") {
     trace.resources("cpu_faults_start", "cpu_switches_start", 0, 0, 1);
     volatile char* memory = new char[4 << 20];
     for (int i=0; i<(4 << 20); i+=4096) memory[i] = 1;
@@ -51,10 +62,18 @@ int main(int argc, char** argv) {
     return binary
 
 
+def probe_args(mode="concurrent", prefix="", capacity=131072, resources=False, gate=""):
+    """The probe's argv: the TraceOptions it installs (trace.job.prefix / capacity / resources, trace.gate_path)."""
+    return [mode, str(prefix), str(capacity), "1" if resources else "0", str(gate)]
+
+
+def clean_env():
+    return {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_TRACE"}
+
+
 def test_bounded_trace_preserves_distinct_concurrent_events(trace_probe, tmp_path):
     prefix = tmp_path / "events"
-    subprocess.run([str(trace_probe)], check=True,
-                   env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps({"job": {"prefix": str(prefix)}})})
+    subprocess.run([str(trace_probe), *probe_args(prefix=prefix)], check=True, env=clean_env())
     files = list(tmp_path.glob("events.*.jsonl"))
     assert len(files) == 1 and ".probe." in files[0].name
     records = [json.loads(line) for line in files[0].read_text().splitlines()]
@@ -66,39 +85,51 @@ def test_bounded_trace_preserves_distinct_concurrent_events(trace_probe, tmp_pat
 
 
 def test_disabled_trace_writes_nothing(trace_probe, tmp_path):
-    env = dict(os.environ)
-    env.pop("SGLANG_EXPERT_STREAM_TRACE", None)
-    subprocess.run([str(trace_probe)], check=True, env=env, cwd=tmp_path)
+    subprocess.run([str(trace_probe), *probe_args()], check=True, env=clean_env(), cwd=tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_host_reads_no_trace_env(trace_probe, tmp_path):
+    """The env alone configures nothing: the options come from the installer, so a set group env changes no probe."""
+    env = {**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps({"job": {"prefix": str(tmp_path / "events")}})}
+    subprocess.run([str(trace_probe), *probe_args()], check=True, env=env, cwd=tmp_path)
     assert not list(tmp_path.iterdir())
 
 
 def test_configured_capacity_bounds_concurrent_writers(trace_probe, tmp_path):
-    subprocess.run([str(trace_probe)], check=True, env={**os.environ,
-                   "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
-                       {"job": {"prefix": str(tmp_path / "events"), "capacity": 512}})})
+    subprocess.run([str(trace_probe), *probe_args(prefix=tmp_path / "events", capacity=512)], check=True,
+                   env=clean_env())
     records = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).read_text().splitlines()]
     assert len(records[1:-1]) == 512 and records[-1] == {"dropped": 140000 - 512}
     assert len({(r["group"], r["seq"]) for r in records[1:-1]}) == 512
 
 
-@pytest.mark.parametrize("capacity", ["0", "1048577", "-1", "", "2x", "999999999999999999999999"])
+@pytest.mark.parametrize("capacity", ["0", "1048577", "-1"])
 def test_invalid_capacity_is_rejected(trace_probe, tmp_path, capacity):
     import resource
     def no_core():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    result = subprocess.run([str(trace_probe)], cwd=tmp_path, preexec_fn=no_core, capture_output=True,
-                            env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
-                                {"job": {"prefix": str(tmp_path / "events"),
-                                         "capacity": int(capacity) if capacity.lstrip("-").isdigit() else capacity}})})
+    result = subprocess.run([str(trace_probe), *probe_args(prefix=tmp_path / "events", capacity=capacity)],
+                            cwd=tmp_path, preexec_fn=no_core, capture_output=True, env=clean_env())
     assert result.returncode != 0
     assert b"trace capacity must be" in result.stderr
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("capacity", ["", "2x", "999999999999999999999999"])
+def test_a_capacity_that_is_not_an_integer_is_refused_before_the_host_sees_it(capacity):
+    """Python decodes the group env: a capacity that is no integer never reaches the host's installer."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig
+
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"job": {"prefix": "/x/events", "capacity": capacity}})):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_TRACE"):
+            ExpertStreamConfig.from_envs()
+
+
 def test_thread_resource_snapshots_observe_faults_and_sleep(trace_probe, tmp_path):
-    subprocess.run([str(trace_probe), "resources"], check=True, env={**os.environ,
-                   "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
-                       {"job": {"prefix": str(tmp_path / "events"), "resources": True}})})
+    subprocess.run([str(trace_probe), *probe_args("resources", tmp_path / "events", resources=True)], check=True,
+                   env=clean_env())
     records = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).read_text().splitlines()]
     events = {r["event"]: r for r in records[1:-1]}
     assert len(events) == 4 and records[-1]["dropped"] == 0
@@ -146,10 +177,8 @@ def test_gate_opens_across_process_without_spending_closed_capacity(trace_probe,
     gate = tmp_path / "gate"
     gate.write_bytes(bytes(4))
     with gate.open("r+b") as fd, mmap.mmap(fd.fileno(), 4) as flag:
-        child = subprocess.Popen([str(trace_probe), "gate"], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, text=True, env={**os.environ,
-            "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
-                {"gate_path": str(gate), "job": {"prefix": str(tmp_path / "events"), "capacity": 1}})})
+        child = subprocess.Popen([str(trace_probe), *probe_args("gate", tmp_path / "events", capacity=1, gate=gate)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=clean_env())
         try:
             assert child.stdout.readline().strip() == "ready"
             ctypes.c_uint32.from_buffer(flag).value = 1
@@ -171,8 +200,7 @@ def test_gate_invalid_or_missing_file_refuses_capture(trace_probe, tmp_path, con
     gate = tmp_path / "gate"
     if contents is not None:
         gate.write_bytes(contents)
-    child = subprocess.run([str(trace_probe)], capture_output=True, preexec_fn=no_core,
-                           env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
-                               {"gate_path": str(gate), "job": {"prefix": str(tmp_path / "events")}})})
+    child = subprocess.run([str(trace_probe), *probe_args(prefix=tmp_path / "events", gate=gate)],
+                           capture_output=True, preexec_fn=no_core, env=clean_env())
     assert child.returncode != 0 and b"trace gate" in child.stderr
     assert not list(tmp_path.glob("events.*"))

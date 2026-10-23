@@ -148,10 +148,10 @@ void ok(const char* name) { std::printf("ok %s\n", name); std::fflush(stdout); }
 
 int main()
 {
-    // isa() is computed once, at the first forward: the cap and the report switch must be in the environment before
-    // it. The Python test reads the report ("toy isa scalar") from stderr.
-    CHECK(setenv("TOY_CPU_MAX_ISA", "scalar", 1) == 0);
-    CHECK(setenv("TOY_CPU_REPORT_ISA", "1", 1) == 0);
+    // isa() is computed once, at the first forward: the cap and the report switch are configured before it, as
+    // Python passes them to a library's configure export. Nothing reads the environment. The Python test reads the
+    // report ("toy isa scalar") from stderr.
+    sglang::cpu_experts::ExpertForward<toy::ToyQuant>::configure_isa("scalar", true);
     Fixture f;
     const CpuExpertKernel& kernel = toy::toy_kernel();
     CHECK(std::string(kernel.name()) == "toy");
@@ -279,18 +279,17 @@ int main()
     {
         CHECK(toy::ToyQuant::last_isa == Isa::Scalar);
         CHECK(sglang::cpu_experts::ExpertForward<toy::ToyQuant>::isa() == Isa::Scalar);
-        const Isa hw = sglang::cpu_experts::detect_isa(Isa::Vbmi, nullptr);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, nullptr) <= Isa::Avx2);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Scalar, nullptr) == Isa::Scalar);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "TOY_CPU_MAX_ISA") == Isa::Scalar);
-        CHECK(setenv("TOY_CPU_BOGUS_ISA", "avx9000", 1) == 0);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "TOY_CPU_BOGUS_ISA") == hw);
+        const Isa hw = sglang::cpu_experts::detect_isa(Isa::Vbmi, "");
+        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "") <= Isa::Avx2);
+        CHECK(sglang::cpu_experts::detect_isa(Isa::Scalar, "") == Isa::Scalar);
+        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "scalar") == Isa::Scalar);
+        // An unrecognized cap is ignored.
+        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "avx9000") == hw);
         // A cap above the hardware never raises the tier.
-        CHECK(setenv("TOY_CPU_HIGH_ISA", "VBMI", 1) == 0);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "TOY_CPU_HIGH_ISA") == hw);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "TOY_CPU_HIGH_ISA") <= Isa::Avx2);
+        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "VBMI") == hw);
+        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "VBMI") <= Isa::Avx2);
         std::printf("detected %d\n", int(hw));
-        ok("isa_cap_env_lowers_the_tier");
+        ok("isa_cap_lowers_the_tier");
     }
 
     if (allowed.size() >= 2) {

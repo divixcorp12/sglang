@@ -22,7 +22,11 @@ def probes(tmp_path_factory):
 #include <omp.h>
 #include <vector>
 using namespace sglang::exl3_cpu::worker_trace;
-int main() {
+// The kernel reads no environment: install the trace options as the library's configure op does, from argv: prefix,
+// capacity, min_us, scratch prefix and gate path (the trace group's cpu_worker members and gate_path).
+int main(int argc, char** argv) {
+  if (argc != 6) return 4;
+  set_options(Options{argv[1], atoll(argv[2]), atoll(argv[3]), argv[4], argv[5]});
   std::vector<float> scratch;
   for (int f=0; f<2; ++f) {
     Capture<ON> capture(4, 6, 3);
@@ -74,13 +78,13 @@ int main() { Capture<false> c(4,6,3); std::vector<int> v; c.grow(v,8,"production
 
 
 def run(probes, tmp_path, gate_path=None, **worker):
-    """``worker`` overrides keys of the trace group's ``cpu_worker`` object; ``gate_path`` is its top-level key."""
-    trace = {"cpu_worker": {"prefix": str(tmp_path / "phases"), "min_us": 0, **worker}}
-    if gate_path is not None:
-        trace["gate_path"] = gate_path
-    env = {**os.environ, "OMP_NUM_THREADS": "4", "OMP_DYNAMIC": "FALSE",
-           "SGLANG_EXPERT_STREAM_TRACE": json.dumps(trace)}
-    subprocess.run([str(probes[0])], check=True, env=env)
+    """``worker`` overrides keys of the trace group's ``cpu_worker`` object; ``gate_path`` is its top-level key. The
+    probe installs them through the kernel's options (set_options), the way the library's configure op does."""
+    member = {"prefix": str(tmp_path / "phases"), "capacity": 65536, "min_us": 0, "scratch_prefix": "", **worker}
+    env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_TRACE"}
+    env.update(OMP_NUM_THREADS="4", OMP_DYNAMIC="FALSE")
+    args = [member["prefix"], str(member["capacity"]), str(member["min_us"]), member["scratch_prefix"], gate_path or ""]
+    subprocess.run([str(probes[0]), *args], check=True, env=env)
     return [json.loads(line) for line in next(tmp_path.glob("phases.*.jsonl")).open()]
 
 

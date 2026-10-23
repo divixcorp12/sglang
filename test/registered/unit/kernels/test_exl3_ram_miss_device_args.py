@@ -477,16 +477,19 @@ def test_the_service_builds_its_device_side_with_the_split_model_words():
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]
     for call in calls:
         assert {k.arg: ast.unparse(k.value) for k in call.keywords}["split_model"] == "self._split_model_words()"
-    stub = SimpleNamespace(cpu_experts=object(), wire=SimpleNamespace(nodes=2))
-    words = service.ExpertEngineService._split_model_words
     from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
 
+    words = service.ExpertEngineService._split_model_words
+    wire = SimpleNamespace(nodes=2)
+    # A service resolves its config once, when it is built: a stand-in made inside an override has it.
     with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": false}'):
-        assert words(stub) is None
+        assert words(SimpleNamespace(cpu_experts=object(), wire=wire, config=resolved_config())) is None
     with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": true, "model_costs": "copy_lane=2"}'):
+        stub = SimpleNamespace(cpu_experts=object(), wire=wire, config=resolved_config())
         got = words(stub)
         assert len(got) == 16 and got[10] < 0 and not any(got[:10] + got[11:])
-        assert words(SimpleNamespace(cpu_experts=None, wire=stub.wire)) is None
+        assert words(SimpleNamespace(cpu_experts=None, wire=wire, config=stub.config)) is None
 
 
 @pytest.mark.parametrize("name", ["miss_cut", "miss_cut_max"])

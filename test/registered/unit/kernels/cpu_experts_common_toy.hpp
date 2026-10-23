@@ -27,8 +27,6 @@ struct ToyQuant {
     static constexpr int kMaxRoutes = 8;
     static constexpr int kMaxRows = 64;
     static constexpr Isa kTopIsa = Isa::TOY_TOP_ISA;
-    static constexpr const char* kIsaCapEnv = "TOY_CPU_MAX_ISA";
-    static constexpr const char* kIsaReportEnv = "TOY_CPU_REPORT_ISA";
     using Params = ToyParams;
     static std::array<uint64_t, 1> row_bytes(const ExpertLayer& l, const Params&) { return {uint64_t(l.hidden) * 4}; }
     static const char* validate(const ExpertLayer& l, Params& p)
