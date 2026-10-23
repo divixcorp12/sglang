@@ -52,7 +52,7 @@ def two_groups(tmp_path, monkeypatch):
     caches = {}
     with contextlib.ExitStack() as stack:
         stack.enter_context(service_row_images(tmp_path))
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id

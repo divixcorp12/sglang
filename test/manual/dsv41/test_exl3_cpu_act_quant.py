@@ -1,6 +1,6 @@
 """The optimized EXL3 CPU MoE kernel (residual int8 activations, 128-wide blocks) against the scalar tier.
 
-The CPU kernel's ops (sglang_exl3_cpu::*) exist only in the optimized extension, which SGLANG_DSV41_CPU_EXPERTS=1
+The CPU kernel's ops (sglang_exl3_cpu::*) exist only in the optimized extension, which SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1
 builds, so each tier's child process runs with it set. Checks on random DSV4.1-shaped experts against the scalar tier
 (fp32 activations, which ignores the options):
   - the swizzled layout gives the same bits as the native one (the k-block sub-view addresses both);
@@ -68,8 +68,8 @@ def _slabs(torch, w, tr):
 
 
 def _run(tier, out_path):
-    os.environ["EXL3_MOE_CPU_MAX_ISA"] = tier
-    os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
+    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = tier
+    os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 
     from sglang.kernels.ops.moe import expert_stream_transport as es
@@ -105,7 +105,7 @@ def _tier(tier, tmp_path):
     import torch
 
     out = tmp_path / f"{tier}.pt"
-    env = {**os.environ, "SGLANG_DSV41_CPU_EXPERTS": "1"}
+    env = {**os.environ, "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": "1"}
     subprocess.run([sys.executable, __file__, tier, str(out)], check=True, env=env)
     return torch.load(out)
 

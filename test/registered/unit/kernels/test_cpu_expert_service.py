@@ -1,6 +1,7 @@
 """CPU expert split policy, the RAM-miss service over a fake host and trait, and the EXL3 trait's layer spec (CPU)."""
 
 import itertools
+import json
 
 import pytest
 import torch
@@ -145,10 +146,10 @@ def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(name, bad):
 
 def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch):
     trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0)
-    monkeypatch.delenv("EXL3_MOE_CPU_PIN", raising=False)
-    with pytest.raises(ValueError, match="EXL3_MOE_CPU_PIN=0"):
+    monkeypatch.delenv("SGLANG_EXL3_MOE_CPU_PIN", raising=False)
+    with pytest.raises(ValueError, match="SGLANG_EXL3_MOE_CPU_PIN=0"):
         trait.check_environment()
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait.check_environment()
 
 
@@ -310,51 +311,51 @@ def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
     host = FakeHost()
     _service(host, FakeServiceTrait())
     assert host.enabled[0] == 0x1234 and host.keep_warm_us == 2000
-    with envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.override(0):
+    with envs.SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US.override(0):
         host = FakeHost()
         _service(host, FakeServiceTrait())
     assert host.keep_warm_us == 0
 
 
 def test_service_passes_the_two_stage_flag_to_the_host_and_logs_it(caplog):
-    """SGLANG_DSV41_CPU_TWO_STAGE reaches enable_cpu_experts, off by default, and the startup log names it."""
+    """SGLANG_EXPERT_STREAM_CPU_TWO_STAGE reaches enable_cpu_experts, off by default, and the startup log names it."""
     from sglang.srt.environ import envs
 
     host = FakeHost()
     with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
         _service(host, FakeServiceTrait())
-    assert host.two_stage is False and "two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): off" in caplog.text
+    assert host.two_stage is False and "two-stage misses (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): off" in caplog.text
     caplog.clear()
-    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True), caplog.at_level(
+    with envs.SGLANG_EXPERT_STREAM_CPU_TWO_STAGE.override(json.dumps({"enabled": True})), caplog.at_level(
         "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
     ):
         host = FakeHost()
         _service(host, FakeServiceTrait())
-    assert host.two_stage is True and "two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): on" in caplog.text
+    assert host.two_stage is True and "two-stage misses (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): on" in caplog.text
 
 
 def test_service_passes_the_store_out_flag_to_the_host_and_logs_it(caplog):
-    """SGLANG_DSV41_CPU_EXPERTS_STORE_OUT reaches enable_cpu_experts, off by default, and the startup log names it."""
+    """SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT reaches enable_cpu_experts, off by default, and the startup log names it."""
     from sglang.srt.environ import envs
 
     host = FakeHost()
     with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
         _service(host, FakeServiceTrait())
-    assert host.store_out is False and "output rows (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT): off" in caplog.text
+    assert host.store_out is False and "output rows (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT): off" in caplog.text
     caplog.clear()
-    with envs.SGLANG_DSV41_CPU_EXPERTS_STORE_OUT.override(True), caplog.at_level(
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT.override(True), caplog.at_level(
         "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
     ):
         host = FakeHost()
         _service(host, FakeServiceTrait())
-    assert host.store_out is True and "output rows (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT): on" in caplog.text
+    assert host.store_out is True and "output rows (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT): on" in caplog.text
 
 
 def test_service_passes_the_span_weights_to_the_host_and_logs_them(caplog):
     """Unset: no per-span weights (the mirror's shares), named so on the line; set: parsed per root and logged."""
     from sglang.srt.environ import envs
 
-    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True), caplog.at_level(
+    with envs.SGLANG_EXPERT_STREAM_CPU_TWO_STAGE.override(json.dumps({"enabled": True})), caplog.at_level(
         "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
     ):
         host = FakeHost()
@@ -362,9 +363,9 @@ def test_service_passes_the_span_weights_to_the_host_and_logs_them(caplog):
     assert host.two_stage_weights == (None, None)
     assert "on, w13 weights mirror, w2 weights mirror" in caplog.text
     caplog.clear()
-    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True), envs.SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS.override(
-        "3"
-    ), envs.SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS.override(""), caplog.at_level(
+    with envs.SGLANG_EXPERT_STREAM_CPU_TWO_STAGE.override(
+        json.dumps({"enabled": True, "w13_weights": "3", "w2_weights": ""})
+    ), caplog.at_level(
         "INFO", logger="sglang.srt.layers.moe.cpu_experts.service"
     ):
         host = FakeHost()
@@ -378,8 +379,8 @@ def test_service_logs_the_two_stage_waits_with_the_stats(caplog):
     from sglang.srt.environ import envs
 
     host = FakeHost()
-    with envs.SGLANG_DSV41_CPU_TWO_STAGE.override(True):
-        svc = _service(host, FakeServiceTrait())
+    with envs.SGLANG_EXPERT_STREAM_CPU_TWO_STAGE.override(json.dumps({"enabled": True})):
+        svc =_service(host, FakeServiceTrait())
     host.stats = {"jobs": 3, "lanes": 8, "forward_ns": 8 * 500_000, "staged_jobs": 2, "stage_two_waits": 1,
                   "stage_two_wait_ns": 250_000}
     with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
@@ -395,9 +396,10 @@ def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
     host.stats = {"jobs": 10, "lanes": 63, "forward_ns": 63 * 10_000_000}
     assert svc.retune() is None and host.splits == []
     host.stats = {"jobs": 11, "lanes": 64, "forward_ns": 64 * 100_000}  # 0.1 ms per expert since the start
-    expected = split_table(
-        8, 0.1, envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(), envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get()
-    ).tolist()
+    from sglang.srt.layers.moe.expert_engine.config import CpuSplitConfig
+
+    split_defaults = CpuSplitConfig()
+    expected = split_table(8, 0.1, split_defaults.link_ms, split_defaults.handoff_ms).tolist()
     assert svc.retune() == expected and host.splits == [expected]
     # The next window is measured from here: 64 more lanes at 10 ms each, a CPU slower than any link.
     host.stats = {"jobs": 12, "lanes": 128, "forward_ns": 64 * 100_000 + 64 * 10_000_000}
@@ -420,24 +422,26 @@ def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.cpu_experts.service import configured_split
 
-    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override(spec):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"table": spec})):
         with pytest.raises(ValueError, match="0 <= split"):
             configured_split(8)
 
 
 def test_configured_layer_splits_maps_each_listed_layer_and_refuses_a_bad_entry():
-    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: ';' separates entries and ',' both a LAYERS list and its TABLE, so the
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT key layer_tables: ';' separates entries and ',' both a LAYERS list and its TABLE, so the
     first ':' splits them; a layer named twice, an entry without ':' or a bad table is refused. Empty lists none."""
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.cpu_experts.service import configured_layer_splits
 
     a, b = "0,0,1,2,3,3,4,5,5", "0,0,0,1,2,3,3,4,5"
-    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.override(f"0,1:{a}; 5:{b}"):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"layer_tables": f"0,1:{a}; 5:{b}"})):
         splits = configured_layer_splits(8)
     assert splits == {0: [int(v) for v in a.split(",")], 1: [int(v) for v in a.split(",")], 5: [int(v) for v in b.split(",")]}
     assert configured_layer_splits(8) == {}
     for spec, match in ((f"0:{a};0:{b}", "twice"), (a, "LAYERS:TABLE"), ("0:0,1,1", "0 <= split")):
-        with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.override(spec), pytest.raises(ValueError, match=match):
+        with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"layer_tables": spec})), pytest.raises(
+            ValueError, match=match
+        ):
             configured_layer_splits(8)
 
 
@@ -513,7 +517,7 @@ def test_calibration_pushes_the_measured_split_once_and_stops_retuning(capsys):
     host = FakeHost()
     host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
     svc = _calibrating_service(host)
-    with envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.override(3):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"calibration_reps": 3})):
         split = svc.calibrate(-1)
     assert split == split_from_grid(host.grid)
     assert host.splits == [split] and svc.split == split and svc.calibrated
@@ -534,7 +538,7 @@ def test_calibration_measures_the_job_shape_the_split_decides(tokens):
     host = FakeHost()
     host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
     svc = _calibrating_service(host, tokens=tokens)
-    with envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.override(1):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"calibration_reps": 1})):
         svc.calibrate(-1)
     assert host.calibration_tokens == [tokens]
 
@@ -560,7 +564,7 @@ def test_the_configured_split_lists_one_count_per_lane_plus_one(lanes, count, ok
     from sglang.srt.layers.moe.cpu_experts.service import configured_split
 
     spec = ",".join("0" for _ in range(count))
-    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override(spec):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"table": spec})):
         if ok:
             assert configured_split(lanes) == [0] * count
         else:
@@ -574,9 +578,9 @@ def test_calibration_is_skipped_when_off_or_when_the_split_is_fixed():
     host = FakeHost()
     host.grid = _grid(lambda n, k: 1.0)
     svc = _calibrating_service(host)
-    with envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.override(False):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"calibration": False})):
         assert svc.calibrate(-1) is None
-    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override("0,1,1,2,3,3,4,5,5"):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"table": "0,1,1,2,3,3,4,5,5"})):
         assert svc.calibrate(-1) is None
     assert host.calibrations == [] and host.splits == [] and not svc.calibrated
 

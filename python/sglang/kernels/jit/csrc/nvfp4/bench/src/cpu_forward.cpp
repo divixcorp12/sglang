@@ -62,6 +62,7 @@ std::vector<int32_t> list(const std::string& s, bool ranges) {
 }
 struct Options {
     std::string cpus = "18-33", experts = "1,3,5", fixture, write_fixture;
+    std::string max_isa;  // --max-isa: the tier's cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA in a server); empty, the host's
     int workers = 16, node = 1, warmup = 128, gap_us = 0, rows = 1;
     int hidden = 5120, intermediate = 2304, capacity = 5, layers = 1, layout = 0;
     int seed = 20261002;
@@ -89,12 +90,13 @@ Options parse(int& argc, char** argv) {
         else if (key == "--layers") o.layers=number(value);
         else if (key == "--w13-layout") o.layout=number(value);
         else if (key == "--seed") o.seed=number(value);
+        else if (key == "--max-isa") o.max_isa=value;
         else if (arg == "--validate-only") o.validate_only=true;
         else if (arg == "--help") {
             std::cout << "NVFP4 CPU forward (" NVFP4_BENCH_BACKEND ")\n"
                 "--cpus=18-33 --workers=16 --numa-node=1 --experts=1,3,5\n"
                 "--fixture=FILE or synthetic --hidden=5120 --intermediate=2304\n"
-                "--capacity=5 --layers=1 --w13-layout=0|1|2 --seed=20261002\n"
+                "--capacity=5 --layers=1 --w13-layout=0|1|2 --seed=20261002 --max-isa=scalar|avx2\n"
                 "--write-fixture=NEW_FILE --validate-only --warmup-forwards=128 --gap-us=0\n"
                 "--rows=1 (token rows per forward: the layer's x repeated, every row on the same experts)\n"
                 "Memory policy is inherited; Google Benchmark flags also accepted.\n";
@@ -392,6 +394,7 @@ void run(benchmark::State& state,Workload& w) {
 int main(int argc,char** argv) {
     try {
         const auto o=parse(argc,argv); benchmark::Initialize(&argc,argv);
+        ::sglang::nvfp4_cpu::nvfp4_cpu_configure(o.max_isa, false);  // before the first forward fixes the tier
         benchmark::AddCustomContext("ggml_commit","889edf43ddae0cfe9a4564a882764dc879759870");
         if (benchmark::ReportUnrecognizedArguments(argc,argv)) return 1;
         auto cores=list(o.cpus,true), counts=list(o.experts,false);

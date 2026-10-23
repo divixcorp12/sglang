@@ -103,7 +103,7 @@ def engine_profile_name_for(prefix: str) -> Optional[str]:
     None when the engine's streaming switch is off (``expert_stream_enabled``, the one the models' skip hooks read, so
     the loader and this method agree), or the process's model resolves to no engine profile (every model that is not
     DSV4.1 or MiMo, Qwen included, keeps ``ModelOptNvFp4FusedMoEMethod._attach_expert_streamer`` under the legacy
-    ``SGLANG_MOE_EXPERT_STREAM``). The model config is read only when streaming is on, so a process that never streams
+    ``SGLANG_EXPERT_STREAM_ENABLE``). The model config is read only when streaming is on, so a process that never streams
     never needs one.
     """
     from sglang.srt.layers.moe.expert_engine.formats.mxfp4 import expert_stream_enabled

@@ -519,7 +519,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     load.snapshot(o + 4 + 2 * kDriveLoadWords, parts);
   }
 
-  // Test only, InstrBuild: one speculative read under IdleRoots (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE), recording its
+  // Test only, InstrBuild: one speculative read under IdleRoots (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE), recording its
   // SQEs into `sqes` (rows of file, offset, length, bounce, as read_rows_sqes). `fault` as read_rows_faulted's (piece
   // streaming is always on). `preload` (2 * kMaxDrives int64: demand reads, then bytes, per root) stands for other
   // readers' demand in flight for the whole read. With `follow`, a demand read arrives on the root of the first piece

@@ -129,16 +129,18 @@ class StaticSplitPolicy(SplitPolicy):
 # The dynamic root choice's settings (design 2026-10-09-dsv41-drive-aware-reads, change (3)): the reader picks each
 # sub-read's root late, skipping roots at their in-flight cap. Its drive load counts at most this many roots.
 MAX_DYNAMIC_ROOTS = 4
-_DYNAMIC = "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC"
-_CAPS = "SGLANG_MOE_EXPERT_MIRROR_CAPS"
+# Fields of SGLANG_EXPERT_STREAM_MIRROR (config tiers.mirror).
+_DYNAMIC = "mirror.dynamic"
+_CAPS = "mirror.caps"
+_DIRS = "mirror.dirs"
 
 
 def mirror_caps(dynamic: bool, caps: str, dirs: str) -> Optional[tuple[int, ...]]:
-    """The in-flight cap per mirror root of ``SGLANG_MOE_EXPERT_MIRROR_CAPS`` when
-    ``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC`` is on, else None.
+    """The in-flight cap per mirror root of ``tiers.mirror.caps`` when
+    ``tiers.mirror.dynamic`` is on, else None.
 
     ``caps`` is comma-separated, one positive integer per root of ``dirs``
-    (``SGLANG_MOE_EXPERT_MIRROR_DIRS``, ``os.pathsep``-separated), in that order. Caps
+    (``tiers.mirror.dirs``, ``os.pathsep``-separated), in that order. Caps
     set with the choice off are refused, since they would be silently ignored.
     """
     if not dynamic:
@@ -146,7 +148,7 @@ def mirror_caps(dynamic: bool, caps: str, dirs: str) -> Optional[tuple[int, ...]
             raise ValueError(f"{_CAPS} is set but {_DYNAMIC} is off; the caps would be silently ignored")
         return None
     if not dirs:
-        raise ValueError(f"{_DYNAMIC}=1 needs SGLANG_MOE_EXPERT_MIRROR_DIRS: it chooses among the mirror roots")
+        raise ValueError(f"{_DYNAMIC}=1 needs {_DIRS}: it chooses among the mirror roots")
     roots = len(dirs.split(os.pathsep))
     if roots > MAX_DYNAMIC_ROOTS:
         raise ValueError(f"{_DYNAMIC}=1 chooses among at most {MAX_DYNAMIC_ROOTS} mirror roots, not {roots}")
@@ -159,5 +161,5 @@ def mirror_caps(dynamic: bool, caps: str, dirs: str) -> Optional[tuple[int, ...]
             raise ValueError(f"{_CAPS}={caps!r}: {token!r} is not a positive integer")
         values.append(int(token))
     if len(values) != roots:
-        raise ValueError(f"{_CAPS} lists {len(values)} caps but SGLANG_MOE_EXPERT_MIRROR_DIRS lists {roots} roots")
+        raise ValueError(f"{_CAPS} lists {len(values)} caps but {_DIRS} lists {roots} roots")
     return tuple(values)

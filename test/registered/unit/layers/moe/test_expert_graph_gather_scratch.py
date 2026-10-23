@@ -66,17 +66,17 @@ class GraphGatherScratchValidationTests(unittest.TestCase):
             ("1", "24", "NEXTN", None),
             ("1", "0", None, None),
             ("1", "-1", "NEXTN", "must be nonnegative"),
-            ("0", "24", "NEXTN", "requires SGLANG_MOE_EXPERT_GRAPH_GATHER=1"),
+            ("0", "24", "NEXTN", "requires SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1"),
             ("1", "24", None, "requires speculative decoding"),
         ):
             environment = dict(
-                SGLANG_MOE_EXPERT_STREAM="1",
-                SGLANG_MOE_HOT_GPU_MB="1",
-                SGLANG_MOE_EXPERT_HOST_ARENA="1",
-                SGLANG_MOE_EXPERT_GRAPH_GATHER=graph_gather,
+                SGLANG_EXPERT_STREAM_ENABLE="1",
+                SGLANG_EXPERT_STREAM_HOT_GPU_MB="1",
+                SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA="1",
+                SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=graph_gather,
             )
             if rows is not None:
-                environment["SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS"] = rows
+                environment["SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS"] = rows
             args = self.args(speculative)
             if graph_gather == "0":
                 args.cuda_graph_config.decode.backend = "disabled"
@@ -154,8 +154,8 @@ class GraphGatherStartupSizingTests(unittest.TestCase):
             patch.dict(
                 os.environ,
                 dict(
-                    SGLANG_MOE_HOT_GPU_MB="1024",
-                    SGLANG_MOE_EXPERT_GRAPH_GATHER="1",
+                    SGLANG_EXPERT_STREAM_HOT_GPU_MB="1024",
+                    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="1",
                     **environment,
                 ),
                 clear=True,
@@ -186,7 +186,7 @@ class GraphGatherStartupSizingTests(unittest.TestCase):
         for cap in ("40", "60"):
             with self.subTest(cap=cap):
                 options = self.sized_options(
-                    True, {"SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS": cap}
+                    True, {"SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS": cap}
                 )
                 self.assertEqual(options["graph_gather_batch_size"], 8)
                 self.assertEqual(options["graph_gather_max_rows"], int(cap))
@@ -198,7 +198,7 @@ class GraphGatherStartupSizingTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "below one verify request's 40 routes"),
             ):
                 self.sized_options(
-                    True, {"SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS": cap}
+                    True, {"SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS": cap}
                 )
 
 

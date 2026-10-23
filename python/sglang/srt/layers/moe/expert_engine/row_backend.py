@@ -24,8 +24,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
     host_layout,
 )
-from sglang.srt.dsv41_config import Dsv41Config
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import CopyConfig, CopyMode
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.layers.moe.expert_stream import ram_prefetch_spec_share
 
@@ -79,9 +78,9 @@ class NativePinnedSlotTable:
         Staging is at most the victim lanes under spill, else the miss lanes, else the widest wire
         (plan_graph_gather); the pool is the RAM prefetch's share.
         """
-        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
-        staging = victims or envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get() or MAX_LANES
-        return min(staging, MAX_LANES) + ram_prefetch_spec_share()
+        stream = self.service.config.stream
+        staging = stream.copy.graph_gather_victim_lanes or stream.copy.graph_gather_miss_lanes or MAX_LANES
+        return min(staging, MAX_LANES) + ram_prefetch_spec_share(config=stream)
 
     @property
     def reserved_rows(self) -> int:
@@ -139,7 +138,7 @@ class NativePinnedSlotTable:
     def mapping(self, num_experts: int) -> list[int]:
         return self.service.host.mapping(self._row)
 
-    # PinnedRowFills (SGLANG_DSV41_ENABLE_PREFILL_FILLS): the service's reader fills
+    # PinnedRowFills (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS): the service's reader fills
     # this layer's slots while the tier's host use holds the thread paused.
     def fill_begin(self, experts, protected, fallback: bool) -> tuple[list[int], int]:
         return self.service.host.fill_begin(self._row, experts, protected, fallback)
@@ -199,7 +198,7 @@ class NativePinnedSlotTable:
 def sm_copy_mask(names: Sequence[str], lanes: int = 8, *, build: BuildKey) -> int:
     """Bitmask of the copy-table entries the copy wait copies itself.
 
-    With ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` the copy wait moves the host
+    With ``SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES`` the copy wait moves the host
     layout's small tensors, wherever they sit in ``names``. ``build`` is the
     transport's (format, router) key.
     """
@@ -227,15 +226,15 @@ def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
     return table
 
 
-def check_sm_small_copies(cfg: Dsv41Config) -> None:
-    """Refuse ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` without the copy engine.
+def check_sm_small_copies(copy: CopyConfig) -> None:
+    """Refuse ``SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES`` without the copy engine.
 
     It moves part of the copy engine's work into the copy wait, which only the
     copy-engine chain runs.
     """
-    if cfg.enable_ram_miss_sm_small_copies and not cfg.enable_ram_miss_copy_engine:
+    if copy.sm_small_copies and copy.mode is not CopyMode.COPY_ENGINE:
         raise RuntimeError(
-            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"
+            "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES needs SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine"
         )
 
 
@@ -248,7 +247,7 @@ def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int, pool: in
     """The node ranges of a layer that cannot give every forced CPU miss a RAM victim, as (group, slots, needed).
 
     A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor a speculative pool
-    slot (`pool`, SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE), nor an expert the record routes (at most `lanes` less the
+    slot (`pool`, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE), nor an expert the record routes (at most `lanes` less the
     forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a range of at least
     staging + pool + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
     need = staging + pool + lanes + hot
@@ -363,9 +362,9 @@ class ExpertEngineRowBackend(PinnedTierRowBackend):
         # The service may copy a captured post's hits with its copy engine, which the
         # copy wait waits for.
         self.copy_engine = copy_engine
-        # SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: rows the copy wait copies.
+        # SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES: rows the copy wait copies.
         self.copy_sm_table = copy_sm_table
-        # SGLANG_DSV41_CPU_EXPERTS: the service may compute resident lanes on the CPU.
+        # SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS: the service may compute resident lanes on the CPU.
         if cpu_experts and not copy_engine:
             raise ValueError("CPU experts are completed by the copy engine's copy wait")
         if cpu_experts and streamer_of is None:
@@ -383,9 +382,10 @@ class ExpertEngineRowBackend(PinnedTierRowBackend):
         # once the target row attached.
         self.spec_expected = False
         self.spec_score = None
-        # SGLANG_DSV41_RESIDENCY_CAPTURE: a ResidencyHook set by ExpertEngineService.attach; None is the uncaptured post.
+        # SGLANG_EXPERT_STREAM_TRACE's residency_capture: a ResidencyHook set by ExpertEngineService.attach; None is the
+        # uncaptured post.
         self.residency_hook = None
-        # SGLANG_DSV41_GPU_DRIP_SLOTS: C1s's segments, from the drip's scratch slots to this row's destinations (set by
+        # SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS: C1s's segments, from the drip's scratch slots to this row's destinations (set by
         # ExpertEngineService.attach); None: no C1s.
         self.drip_segments = None
 

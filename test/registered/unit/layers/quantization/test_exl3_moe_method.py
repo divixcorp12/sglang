@@ -172,7 +172,7 @@ def _cpu_draft_moe(monkeypatch, tmp_path, resident, fused_shared=0):
     method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False, draft=True, cpu_draft=True)
     method.create_weights(layer, E, HIDDEN, INTER, torch.bfloat16)
     _load_all(layer)
-    with envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.override(str(path)):
         method.process_weights_after_loading(layer)
     return layer, method, registered
 

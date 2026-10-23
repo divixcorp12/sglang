@@ -11,7 +11,7 @@ comparing V2 storage changes one arm at a time, over the real HTTP server
 The current benchmark uses a **32,768-token context and prefix caching**, matching the
 saved production launcher. Earlier arms used a 4,096-token context with prefix caching
 disabled. The larger context can change KV-pool sizing and the VRAM available for the
-hot expert cache (`SGLANG_MOE_HOT_GPU_MB=14336`); prefix caching can also change
+hot expert cache (`SGLANG_EXPERT_STREAM_HOT_GPU_MB=14336`); prefix caching can also change
 prefill work. Treat this as a new benchmark recipe and compare only matched arms.
 Historical 2.781 tok/s and V2 storage step breakdowns are useful context, not a
 same-configuration baseline. The short corpus below is retained for continuity.
@@ -142,7 +142,7 @@ the spec sheet again:
 | **during active decode** | **~2572 MHz** |
 
 **These three numbers are from a single-drive, pre-mirror smoke run** (`smoke.sh`
-predates `SGLANG_MOE_EXPERT_MIRROR_DIRS` being set), the same regime as the ~2.09
+predates `SGLANG_EXPERT_STREAM_MIRROR` (key `dirs`) being set), the same regime as the ~2.09
 tok/s throughput it also showed. With mirrors on and decode at ~3.92 tok/s
 (`DSV41_REFERENCE.md` section 19), the step is materially shorter and nobody has
 re-measured whether the clock still dips below rest, by how much, or at all — do not
@@ -224,7 +224,7 @@ this instability, not just failed to check for it.
 **untraced** mirrored baseline of 3.905-3.933 tok/s (`DSV41_REFERENCE.md` section 19,
 "Task 1 matched baselines"). Both are mirrors-**on** cells; the matched mirrors-off cell
 is 2.903-2.919. Since 2026-09-22 mirroring is **on by default** in `arm_env.base_env()`,
-so it is an arm that overrides `SGLANG_MOE_EXPERT_MIRROR_DIRS` to the empty string that
+so it is an arm that overrides `SGLANG_EXPERT_STREAM_MIRROR` (key `dirs`) to the empty string that
 belongs against the mirrors-off cell. Section 20 records what this harness measures against both.
 Tracing overhead is unmeasured for this configuration (`PIPELINE_BASELINE.md` section
 3.2 notes the same gap for the Engine path). Read this table as warm-up *shape*
@@ -488,7 +488,7 @@ task's to make).
 
 ## Resolved: the mirror row source is now the default (2026-09-22)
 
-`base_env()` sets `SGLANG_MOE_EXPERT_MIRROR_DIRS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash`
+`base_env()` sets `SGLANG_EXPERT_STREAM_MIRROR='{"dirs": "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash"}'`
 (`arm_env.EXPERT_MIRROR_DIRS`; both roots verified present at 205 GB / 50 entries).
 Mirroring is a property of the box's storage and production reads mirrored, so an arm
 that omitted it was measuring a drive layout nobody runs. To measure the unmirrored
@@ -500,7 +500,7 @@ That last point is why the verdict's `mirror` flag tests the *value* and not the
 (`run_arm.sh`, the `verdict.judge` call): a key-presence test would now judge every
 unmirrored arm against the mirrored baseline.
 
-`SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` is still unset, which means equal shares; the recorded
+`SGLANG_EXPERT_STREAM_MIRROR` key `weights` is still unset, which means equal shares; the recorded
 split was 49.6/50.4 (`DSV41_REFERENCE.md` section 20). `run-manifest.json` records the
 commit and the full merged environment either way.
 

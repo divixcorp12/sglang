@@ -106,9 +106,11 @@ def service_row_images(source) -> contextlib.ExitStack:
     them with. Returns the entered env overrides; close the stack when the test is done.
 
     The formats must be built inside the stack with ``source_root=source`` and no ``direct`` (so
-    SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production). Row images and lease mode need no env:
-    both are unconditional (plan 2026-09-29-hotpath-zero-overhead Task 7). Modelled on
+    SGLANG_EXPERT_STREAM_FILE_READER=uring_direct decides it, as in production). Row images and lease mode need no
+    env: both are unconditional (plan 2026-09-29-hotpath-zero-overhead Task 7). Modelled on
     test_exl3_prefill_fills_service._build."""
+    import json
+
     from sglang.srt.environ import envs
 
     source = pathlib.Path(source)
@@ -121,8 +123,8 @@ def service_row_images(source) -> contextlib.ExitStack:
     require_o_direct(os.path.join(ri.row_image_dir(str(root)), ri.layer_file_name(0)))
     stack = contextlib.ExitStack()
     for env, value in (
-        (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
-        (envs.SGLANG_MOE_EXPERT_FILE_READER, "uring_direct"),
+        (envs.SGLANG_EXPERT_STREAM_MIRROR, json.dumps({"dirs": str(root)})),
+        (envs.SGLANG_EXPERT_STREAM_FILE_READER, "uring_direct"),
     ):
         stack.enter_context(env.override(value))
     return stack
@@ -369,7 +371,7 @@ def spawn_child(
     as there), so the timeout measures the child; its core dumps are off (``NO_CORE_DUMP``), so a child that is meant
     to abort, or dies when its test is red, is not held up writing one. The pytest process's own limit is untouched.
 
-    ``env`` must not change what picks the child's default build (``SGLANG_DSV41_EXPERT_TRACE_PATH``,
+    ``env`` must not change what picks the child's default build (``SGLANG_EXPERT_STREAM_TRACE``'s ``expert_path``,
     ``SGLANG_TEST_DSV41_RAM_MISS_FAULT``): the warm-up reads this process's."""
     warm_host_modules(variant, lanes=lanes, nodes=nodes)
     return subprocess.run(

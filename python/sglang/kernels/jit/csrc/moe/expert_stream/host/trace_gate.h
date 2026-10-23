@@ -1,9 +1,10 @@
 // Diagnostic admission gate. Create a four-byte uint32 file before launching; keep it
 // mapped and never truncate/replace it. Zero closes admission, one opens admission.
+// The path is SGLANG_EXPERT_STREAM_TRACE's gate_path (TraceOptions); an empty one always admits.
 #pragma once
 #include <cstdint>
-#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -12,10 +13,9 @@
 namespace sglang::expert_stream {
 class TraceGate {
  public:
-    TraceGate() {
-        const char* path = std::getenv("SGLANG_CPU_EXPERT_TRACE_GATE");
-        if (!path || !*path) return;
-        const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    explicit TraceGate(const std::string& path) {
+        if (path.empty()) return;
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) throw std::runtime_error("cannot open CPU expert trace gate");
         struct stat st{};
         if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size != sizeof(uint32_t)) {

@@ -302,7 +302,7 @@ MISS_CUT_CASES = [
 
 @pytest.mark.parametrize("experts, hits, forced_from", MISS_CUT_CASES)
 def test_the_split_miss_cut_types_lanes_like_the_reference(tmp_path, experts, hits, forced_from):
-    """Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, _MAX=3): the CUDA typing is ram_slot_map.type_lanes's with the
+    """Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT '{"miss_cut": 1, "miss_cut_max": 3}'): the CUDA typing is ram_slot_map.type_lanes's with the
     cut, and the cut changes the kinds exactly where the reference says. Mutations: drop the miss_cut_max bound (the
     4-miss case goes red); count forced hits as misses (the forced-hit case goes red)."""
     c = Chain(tmp_path, start=False, copy_engine=True, hit_copy="ce", cpu_misses=False, miss_cut=1, miss_cut_max=3)

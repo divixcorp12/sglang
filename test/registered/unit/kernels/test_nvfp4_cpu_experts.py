@@ -110,7 +110,7 @@ def _host_has_avx2() -> bool:
     return {"avx2", "fma", "f16c"} <= set(flags)
 
 
-# One library holds every tier; each case runs at each, capped by NVFP4_CPU_MAX_ISA. A cap never raises the tier, so
+# One library holds every tier; each case runs at each, capped by SGLANG_EXPERT_STREAM_CPU_MAX_ISA. A cap never raises the tier, so
 # the avx2 case is skipped where it would silently run the scalar tier again.
 @pytest.fixture(params=["avx2", "scalar"])
 def library(built, request):
@@ -126,7 +126,7 @@ def _run(library, calls, cores=(), alpha=1.0, groups=1, **env):
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "NVFP4_CPU_MAX_ISA": isa, **env},
+        env={**os.environ, "SGLANG_EXPERT_STREAM_CPU_MAX_ISA": isa, **env},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.split("\n")[:-1]

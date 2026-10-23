@@ -13,7 +13,7 @@ import msgspec
 import torch
 from torch import nn
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 from sglang.srt.layers.moe.expert_prediction.adapters import install_pre_mixer_taps
 from sglang.srt.layers.moe.async_telemetry import AsyncTelemetry, TorchTelemetryBackend
 from sglang.srt.layers.moe.expert_prediction.base import ExpertPredictor
@@ -79,9 +79,9 @@ class ExpertPredictionRuntime:
         prefetch: PrefetchScoring | None = None,
     ) -> None:
         if log_interval < 1:
-            raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL must be positive")
+            raise ValueError("trace.predictor_log_interval must be positive")
         if score_interval < 1:
-            raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL must be positive")
+            raise ValueError("prefetch.shadow.score_interval must be positive")
         self.store = store
         self.metrics = metrics
         self.forwards = 0
@@ -119,104 +119,107 @@ class ExpertPredictionRuntime:
         attn_dp_size: int | None,
         pp_size: int,
         expert_hot_cache_manager: Any | None,
+        config: ExpertStreamConfig | None = None,
     ) -> "ExpertPredictionRuntime":
+        """Build from ``prefetch.shadow`` and the trace's predictor fields; ``config`` defaults to the process's
+        ``stream_config()``."""
+        config = stream_config() if config is None else config
+        shadow = config.prefetch.shadow
+        trace = config.trace
         if tp_size > 1 or moe_ep_size > 1 or (attn_dp_size or 1) > 1 or pp_size > 1:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_PREDICTOR supports a single GPU; got "
+                "the expert predictors (SGLANG_EXPERT_STREAM_SHADOW_PREFETCH) support a single GPU; got "
                 f"tp={tp_size} moe_ep={moe_ep_size} attn_dp={attn_dp_size} pp={pp_size}"
             )
-        max_rows = (
-            envs.SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS.get()
-            or decode_max_bs * tokens_per_request
-        )
+        max_rows = shadow.max_rows or decode_max_bs * tokens_per_request
         if max_rows < 1:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_PREDICTOR needs decode CUDA graphs or "
-                "SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS to size its tap buffers"
+                "the expert predictors need decode CUDA graphs or "
+                "prefetch.shadow.max_rows to size their tap buffers"
             )
-        metrics_file = envs.SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE.get()
-        capture_dir = envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.get()
+        metrics_file = trace.predictor_metrics_file
+        capture_dir = trace.predictor_capture.dir
         capture = None
         if capture_dir:
             if tokens_per_request != 1:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR does not support speculative decoding"
+                    "trace.predictor_capture.dir does not support speculative decoding"
                 )
             if max_prefill_rows < 1:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR needs --chunked-prefill-size"
+                    "trace.predictor_capture.dir needs --chunked-prefill-size"
                 )
             capture = CaptureSettings(
                 directory=Path(capture_dir),
                 capacity=max(max_rows, max_prefill_rows),
-                frames=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES.get(),
-                shard_rows=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS.get(),
-                max_bytes=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB.get() * 2**30,
+                frames=trace.predictor_capture.frames,
+                shard_rows=trace.predictor_capture.shard_rows,
+                max_bytes=trace.predictor_capture.max_gb * 2**30,
             )
-        prefetch_predictor = envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
-        pull_mode = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get()
+        prefetch_predictor = shadow.predictor
+        pull_mode = shadow.pull_mode.value
         if pull_mode != "off" and not prefetch_predictor:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"
+                "prefetch.shadow.pull_mode needs prefetch.shadow.predictor"
             )
         prefetch = None
         if prefetch_predictor:
             if tokens_per_request != 1:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR does not support speculative decoding"
+                    "prefetch.shadow.predictor does not support speculative decoding"
                 )
             if decode_max_bs < 1:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR needs decode CUDA graphs"
+                    "prefetch.shadow.predictor needs decode CUDA graphs"
                 )
             if expert_hot_cache_manager is None:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR needs SGLANG_MOE_HOT_GPU_MB"
+                    "prefetch.shadow.predictor needs SGLANG_EXPERT_STREAM_HOT_GPU_MB"
                 )
-            model_dir = envs.SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR.get()
+            model_dir = shadow.model_dir
             if not model_dir:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR needs SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR"
+                    "prefetch.shadow.predictor needs prefetch.shadow.model_dir"
                 )
             if capture_dir:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR cannot run with SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR"
+                    "prefetch.shadow.predictor cannot run with trace.predictor_capture.dir"
                 )
-            if envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get() != 0:
+            if config.prefetch.legacy_max_candidates != 0:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR cannot run with SGLANG_MOE_PREFETCH_MAX_CANDIDATES"
+                    "prefetch.shadow.predictor cannot run with SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES"
                 )
-            if pull_mode != "off" and not envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+            if pull_mode != "off" and not config.copy.graph_gather:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_GRAPH_GATHER; the join it "
+                    "prefetch.shadow.pull_mode needs SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER; the join it "
                     "drives lives in ExpertStreamer._gather_graph"
                 )
             prefetch = PrefetchSettings(
                 predictor=prefetch_predictor,
                 model_dir=Path(model_dir),
-                width=envs.SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES.get(),
-                budget=envs.SGLANG_MOE_EXPERT_PREFETCH_BUDGET.get(),
-                tau=envs.SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU.get(),
+                width=shadow.candidates,
+                budget=shadow.budget,
+                tau=shadow.apex_tau,
                 pull_mode=pull_mode,
-                shadow_recall=envs.SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL.get(),
-                fused_top1=envs.SGLANG_MOE_EXPERT_PREFETCH_FUSED_TOP1.get(),
-                calibration=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get(),
-                calibration_file=(Path(envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE.get()) if envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE.get() else None),
-                calibration_provenance=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE.get(),
+                shadow_recall=shadow.shadow_recall,
+                fused_top1=shadow.fused_top1,
+                calibration=shadow.calibration,
+                calibration_file=Path(shadow.calibration_file) if shadow.calibration_file else None,
+                calibration_provenance=shadow.calibration_provenance,
             )
         return cls.build(
             model=model,
-            predictor_names=envs.SGLANG_MOE_EXPERT_PREDICTOR.get(),
+            predictor_names=shadow.predictors,
             device=torch.device("cuda", gpu_id),
             hidden_dtype=hidden_dtype,
             max_rows=max_rows,
-            max_candidates=envs.SGLANG_MOE_EXPERT_PREDICTOR_CANDIDATES.get(),
+            max_candidates=shadow.predictor_candidates,
             hot_caches=(
                 {} if expert_hot_cache_manager is None else expert_hot_cache_manager.caches
             ),
-            log_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL.get(),
+            log_interval=trace.predictor_log_interval,
             metrics_path=Path(metrics_file) if metrics_file else None,
-            score_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL.get(),
+            score_interval=shadow.score_interval,
             capture=capture,
             prefetch=prefetch,
         )

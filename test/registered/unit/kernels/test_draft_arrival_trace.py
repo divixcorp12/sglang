@@ -77,9 +77,9 @@ def test_independent_trigger_retained_without_metrics_and_gate(trigger_only_prob
     with gate.open("r+b") as file, mmap.mmap(file.fileno(), 4) as flag:
         binary = trigger_only_probe[int(enabled)]
         process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            env={**os.environ, "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
-                 "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(threshold),
-                 "SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX": str(tmp_path / "trigger")})
+            env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps({
+                     "gate_path": str(gate),
+                     "draft_trigger": {"forward_us": threshold, "report_prefix": str(tmp_path / "trigger")}})})
         try:
             assert process.stdout.readline().strip() == "ready"
             flag[:] = (1).to_bytes(4, "little")
@@ -146,9 +146,10 @@ int main() {
 @pytest.mark.parametrize("pending,forward,reason", [(1000,0,0), (0,1000,1), (0,0,2), (10000,10000,None)])
 def test_first_observation_and_threshold(arrival_probe, tmp_path, pending, forward, reason):
     subprocess.run([str(arrival_probe[0])], input="x", text=True, check=True, env={**os.environ,
-        "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-        "SGLANG_DRAFT_PENDING_TRIGGER_US": str(pending), "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(forward),
-        "SGLANG_DRAFT_ARRIVAL_TRIGGER_US": "1000" if reason == 2 else "0"})
+        "SGLANG_EXPERT_STREAM_TRACE": json.dumps({
+            "job": {"prefix": str(tmp_path / "events")},
+            "draft_trigger": {"pending_us": pending, "forward_us": forward,
+                              "arrival_us": 1000 if reason == 2 else 0}})})
     records = [json.loads(l) for l in next(tmp_path.glob("events.*")).read_text().splitlines()]
     events = records[1:-1]
     assert records[-1] == {"dropped": 0}
@@ -181,8 +182,9 @@ def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path, worker):
         pytest.skip("set SGLANG_TEST_MAGIC_TRACE for a live Intel PT smoke capture")
     probe = subprocess.Popen([str(arrival_probe[0])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True, env={**os.environ, **({"WORKER_PROBE":"1"} if worker else {}),
-                       "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path/"events"),
-                       "SGLANG_DRAFT_PENDING_TRIGGER_US":"1000"})
+                       "SGLANG_EXPERT_STREAM_TRACE": json.dumps({
+                           "job": {"prefix": str(tmp_path/"events")},
+                           "draft_trigger": {"pending_us": 1000}})})
     trace = None
     try:
         assert probe.stdout.readline().strip() == "ready"

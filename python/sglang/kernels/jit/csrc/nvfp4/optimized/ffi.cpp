@@ -1,12 +1,17 @@
 // The NVFP4 CPU expert library's tvm-ffi exports: its kernel's address (nvfp4_cpu_kernel), which Python hands to the
-// expert-stream host, and a layer's params as make_layer reads them. Linked into the shared library only; a harness
-// executable calls nvfp4_cpu_kernel() itself.
+// expert-stream host, its ISA options (nvfp4_cpu_configure, called before the address), and a layer's params as
+// make_layer reads them. Linked into the shared library only; a harness executable calls nvfp4_cpu_kernel() itself.
 #include "kernel.h"
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/string.h>
 
 namespace {
 int64_t kernel_address() { return reinterpret_cast<int64_t>(&::sglang::nvfp4_cpu::nvfp4_cpu_kernel()); }
+
+void configure(std::string max_isa, bool report_isa)
+{
+    ::sglang::nvfp4_cpu::nvfp4_cpu_configure(max_isa, report_isa);
+}
 
 tvm::ffi::Bytes params(int64_t w13_layout, double inv_input_scale13, double inv_input_scale2)
 {
@@ -17,4 +22,5 @@ tvm::ffi::Bytes params(int64_t w13_layout, double inv_input_scale13, double inv_
 }  // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cpu_kernel_address, kernel_address);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cpu_configure, configure);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cpu_params, params);

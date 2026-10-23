@@ -41,11 +41,11 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
     write_fake_exl3(str(tmp_path), num_layers=2, num_experts=NUM_EXPERTS, finite=True)
     exl3_expert_layout_for.cache_clear()
     with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_EXPERT_DIR.override(str(tmp_path)),
-        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
+        envs.SGLANG_EXPERT_STREAM_ENABLE.override(True),
+        envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.override(str(tmp_path)),
+        envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+        envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = torch.nn.Module()
@@ -133,11 +133,11 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
     write_fake_exl3(str(tmp_path), num_layers=2, num_experts=num_experts, finite=True)
     exl3_expert_layout_for.cache_clear()
     with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_EXPERT_DIR.override(str(tmp_path)),
-        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
+        envs.SGLANG_EXPERT_STREAM_ENABLE.override(True),
+        envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.override(str(tmp_path)),
+        envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+        envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = torch.nn.Module()

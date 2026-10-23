@@ -34,28 +34,28 @@ _MINI_CONFIG = {
 # The offload variables of divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh as
 # of 2026-09-19, minus site-specific paths. The graph-gather preset must reproduce them.
 PROD_OFFLOAD_ENV = {
-    "SGLANG_MOE_EXPERT_STREAM": "1",
-    "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
+    "SGLANG_EXPERT_STREAM_ENABLE": "1",
+    "SGLANG_EXPERT_STREAM_FILE_READER": "uring_direct",
     "SGLANG_QWEN4_PLE_FILE_READER": "uring",
     "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY": "1",
     "SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING": "1",
-    "SGLANG_MOE_HOT_GPU_MB": "15360",
-    "SGLANG_MOE_PINNED_HOST_MB": "0",
-    "SGLANG_MOE_EXPERT_HOST_ARENA": "1",
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
-    "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
+    "SGLANG_EXPERT_STREAM_HOT_GPU_MB": "15360",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "0",
+    "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA": "1",
+    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1",
+    "SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN": "1",
     "SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT": "1",
-    "SGLANG_MOE_HOT_DYNAMIC": "1",
-    "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
-    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "2",
-    "SGLANG_MOE_HOT_DECAY_TOKENS": "1",
-    "SGLANG_MOE_HOT_PROMOTION_SIGMAS": "0",
-    "SGLANG_MOE_HOT_BENEFIT_RATIO": "2",
-    "SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS": "0",
-    "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "1",
-    "SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS": "64",
-    "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
-    "SGLANG_MOE_EXPERT_COPY_BACKEND": "dma",
+    "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": "1",
+    "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS": "1",
+    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": "2",
+    "SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS": "1",
+    "SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS": "0",
+    "SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO": "2",
+    "SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS": "0",
+    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": "1",
+    "SGLANG_EXPERT_STREAM_GPU_RESIDENCY_MAX_PROMOTIONS": "64",
+    "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES": "0",
+    "SGLANG_EXPERT_STREAM_COPY_MODE": "dma",
 }
 
 def parsed(values):
@@ -103,13 +103,13 @@ class TestPresetValues(unittest.TestCase):
 
 class TestResolution(unittest.TestCase):
     def test_an_explicit_variable_wins_over_the_preset(self):
-        resolved = presets.resolve_offload_env(presets.GRAPH_GATHER_PRESET, {"SGLANG_MOE_HOT_GPU_MB": "12288"})
-        self.assertEqual(resolved.effective["SGLANG_MOE_HOT_GPU_MB"], "12288")
-        self.assertNotIn("SGLANG_MOE_HOT_GPU_MB", resolved.filled)
-        self.assertEqual(resolved.overridden, {"SGLANG_MOE_HOT_GPU_MB": "15360"})
+        resolved = presets.resolve_offload_env(presets.GRAPH_GATHER_PRESET, {"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "12288"})
+        self.assertEqual(resolved.effective["SGLANG_EXPERT_STREAM_HOT_GPU_MB"], "12288")
+        self.assertNotIn("SGLANG_EXPERT_STREAM_HOT_GPU_MB", resolved.filled)
+        self.assertEqual(resolved.overridden, {"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "15360"})
 
     def test_an_explicit_variable_equal_to_the_preset_is_not_an_override(self):
-        resolved = presets.resolve_offload_env(presets.GRAPH_GATHER_PRESET, {"SGLANG_MOE_HOT_BENEFIT_RATIO": "2"})
+        resolved = presets.resolve_offload_env(presets.GRAPH_GATHER_PRESET, {"SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO": "2"})
         self.assertEqual(resolved.overridden, {})
 
     def test_off_with_no_offload_env_sets_nothing(self):
@@ -117,28 +117,28 @@ class TestResolution(unittest.TestCase):
         self.assertEqual((resolved.effective, resolved.filled, resolved.overridden), ({}, {}, {}))
 
     def test_insert_on_miss_derives_the_residency_update_and_its_boundary_cadence(self):
-        resolved = presets.resolve_offload_env(None, {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "2"})
+        resolved = presets.resolve_offload_env(None, {"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": "2"})
         self.assertEqual(
             parsed(resolved.filled),
             {
-                "SGLANG_MOE_GPU_RESIDENCY_UPDATE": True,
-                "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": 1,
-                "SGLANG_MOE_HOT_DYNAMIC": True,
+                "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": True,
+                "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS": 1,
+                "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": True,
             },
         )
 
     def test_an_explicit_value_contradicting_a_derivation_is_refused(self):
         for explicit, culprit in (
-            ({"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "1", "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "0"}, "SGLANG_MOE_GPU_RESIDENCY_UPDATE"),
-            ({"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "2", "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "4"}, "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS"),
-            ({"SGLANG_MOE_GPU_RESIDENCY_UPDATE": "1", "SGLANG_MOE_HOT_DYNAMIC": "0"}, "SGLANG_MOE_HOT_DYNAMIC"),
+            ({"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": "1", "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": "0"}, "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"),
+            ({"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": "2", "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS": "4"}, "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS"),
+            ({"SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": "1", "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": "0"}, "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC"),
         ):
             with self.subTest(culprit=culprit), self.assertRaisesRegex(ValueError, culprit):
                 presets.resolve_offload_env(None, explicit)
 
     def test_explicit_offload_env_keeps_only_offload_variables(self):
-        environ = {"SGLANG_MOE_HOT_GPU_MB": "1024", "PATH": "/bin", "SGLANG_LOG_MS": "1"}
-        self.assertEqual(presets.explicit_offload_env(environ), {"SGLANG_MOE_HOT_GPU_MB": "1024"})
+        environ = {"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "1024", "PATH": "/bin", "SGLANG_LOG_MS": "1"}
+        self.assertEqual(presets.explicit_offload_env(environ), {"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "1024"})
 
 
 class TestOverlapRule(unittest.TestCase):
@@ -147,11 +147,11 @@ class TestOverlapRule(unittest.TestCase):
         self.assertFalse(presets.needs_overlap_off(graph, nvfp4_hot_cache=True))
 
     def test_a_hot_cache_without_graph_gather_and_the_residency_update_turns_overlap_off(self):
-        self.assertTrue(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=True))
+        self.assertTrue(presets.needs_overlap_off({"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=True))
         self.assertFalse(presets.needs_overlap_off({}, nvfp4_hot_cache=True))
 
     def test_the_hot_cache_rule_is_nvfp4s_only(self):
-        self.assertFalse(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=False))
+        self.assertFalse(presets.needs_overlap_off({"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=False))
 
 
 class TestValidation(unittest.TestCase):
@@ -163,16 +163,16 @@ class TestValidation(unittest.TestCase):
         cases = (
             (graph, dict(decode_graphs_disabled=True), "decode CUDA graphs"),
             (graph, dict(decode_max_bs=2), "cuda-graph-max-bs-decode 1"),
-            (dict(graph, SGLANG_MOE_EXPERT_STREAM="0"), {}, "SGLANG_MOE_EXPERT_STREAM=1"),
+            (dict(graph, SGLANG_EXPERT_STREAM_ENABLE="0"), {}, "SGLANG_EXPERT_STREAM_ENABLE=1"),
         )
         for values, context, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 check(values, **context)
 
     def test_another_format_streams_experts_without_the_nvfp4_stream_variable(self):
-        # DSV4.1's EXL3 experts stream under SGLANG_DSV41_EXPERT_STREAM.
+        # DSV4.1's EXL3 experts stream under SGLANG_EXPERT_STREAM_ENABLE.
         check(
-            {"SGLANG_MOE_HOT_GPU_MB": "14336", "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1"},
+            {"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "14336", "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1"},
             nvfp4_hot_cache=False,
         )
 
@@ -212,9 +212,9 @@ class TestPresetHook(unittest.TestCase):
         return SimpleNamespace(**values)
 
     def test_graph_gather_sets_every_unset_variable_and_keeps_overlap(self):
-        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "12288"
+        os.environ["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] = "12288"
         moe_offload_hook.handle_moe_offload_preset(self.args("graph-gather", speculative_algorithm="NEXTN"))
-        expected = dict(presets.preset_env(presets.GRAPH_GATHER_PRESET), SGLANG_MOE_HOT_GPU_MB="12288")
+        expected = dict(presets.preset_env(presets.GRAPH_GATHER_PRESET), SGLANG_EXPERT_STREAM_HOT_GPU_MB="12288")
         self.assertEqual(presets.explicit_offload_env(os.environ), expected)
         self.assertEqual(self.declared, [])
 
@@ -229,18 +229,18 @@ class TestPresetHook(unittest.TestCase):
         self.assertEqual(self.declared, [])
 
     def test_an_exl3_hot_cache_keeps_overlap_and_passes_without_the_nvfp4_stream_variable(self):
-        os.environ.update(SGLANG_MOE_HOT_GPU_MB="14336", SGLANG_MOE_EXPERT_GRAPH_GATHER="1")
+        os.environ.update(SGLANG_EXPERT_STREAM_HOT_GPU_MB="14336", SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="1")
         args = self.args("off", quantization="exl3")
         moe_offload_hook.handle_moe_offload_preset(args)
         self.assertEqual(self.declared, [])
         moe_offload_hook.check_moe_offload_config(args)
 
     def test_a_hot_cache_of_unknown_format_gets_the_nvfp4_rules(self):
-        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "14336"
+        os.environ["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] = "14336"
         args = self.args("off")
         moe_offload_hook.handle_moe_offload_preset(args)
         self.assertEqual(self.declared, [{"disable_overlap_schedule": True}])
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM=1"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE=1"):
             moe_offload_hook.check_moe_offload_config(args)
 
     def test_a_refusal_names_the_preset(self):

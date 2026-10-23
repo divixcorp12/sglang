@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ShadowPrefetchConfig, TraceConfig
 from sglang.srt.layers.moe.expert_prediction.contracts import (
     MoeLayerSpec,
     RouteFeature,
@@ -110,16 +111,20 @@ class TestContracts(unittest.TestCase):
         )
 
     def test_predictor_env_parses_comma_list_and_empty_is_off(self):
-        with envs.SGLANG_MOE_EXPERT_PREDICTOR.override("affinity, popularity"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(
+            '{"predictors": ["affinity", "popularity"]}'
+        ):
             self.assertEqual(
-                envs.SGLANG_MOE_EXPERT_PREDICTOR.get(), ("affinity", "popularity")
+                ShadowPrefetchConfig.from_envs().predictors, ("affinity", "popularity")
             )
-        with envs.SGLANG_MOE_EXPERT_PREDICTOR.override(""):
-            self.assertEqual(envs.SGLANG_MOE_EXPERT_PREDICTOR.get(), ())
-        self.assertEqual(envs.SGLANG_MOE_EXPERT_PREDICTOR_CANDIDATES.get(), 16)
-        self.assertEqual(envs.SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS.get(), 0)
-        self.assertEqual(envs.SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL.get(), 100)
-        self.assertEqual(envs.SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE.get(), "")
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(""):
+            self.assertEqual(ShadowPrefetchConfig.from_envs().predictors, ())
+        defaults = ShadowPrefetchConfig.from_envs()
+        self.assertEqual(defaults.predictor_candidates, 16)
+        self.assertEqual(defaults.max_rows, 0)
+        trace = TraceConfig.from_envs()
+        self.assertEqual(trace.predictor_log_interval, 100)
+        self.assertEqual(trace.predictor_metrics_file, "")
 
 
 class TestFeatureStore(unittest.TestCase):

@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
 def test_bounded_trace_preserves_distinct_concurrent_events(trace_probe, tmp_path):
     prefix = tmp_path / "events"
     subprocess.run([str(trace_probe)], check=True,
-                   env={**os.environ, "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(prefix)})
+                   env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps({"job": {"prefix": str(prefix)}})})
     files = list(tmp_path.glob("events.*.jsonl"))
     assert len(files) == 1 and ".probe." in files[0].name
     records = [json.loads(line) for line in files[0].read_text().splitlines()]
@@ -67,15 +67,15 @@ def test_bounded_trace_preserves_distinct_concurrent_events(trace_probe, tmp_pat
 
 def test_disabled_trace_writes_nothing(trace_probe, tmp_path):
     env = dict(os.environ)
-    env.pop("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", None)
+    env.pop("SGLANG_EXPERT_STREAM_TRACE", None)
     subprocess.run([str(trace_probe)], check=True, env=env, cwd=tmp_path)
     assert not list(tmp_path.iterdir())
 
 
 def test_configured_capacity_bounds_concurrent_writers(trace_probe, tmp_path):
     subprocess.run([str(trace_probe)], check=True, env={**os.environ,
-                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-                   "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "512"})
+                   "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                       {"job": {"prefix": str(tmp_path / "events"), "capacity": 512}})})
     records = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).read_text().splitlines()]
     assert len(records[1:-1]) == 512 and records[-1] == {"dropped": 140000 - 512}
     assert len({(r["group"], r["seq"]) for r in records[1:-1]}) == 512
@@ -87,8 +87,9 @@ def test_invalid_capacity_is_rejected(trace_probe, tmp_path, capacity):
     def no_core():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     result = subprocess.run([str(trace_probe)], cwd=tmp_path, preexec_fn=no_core, capture_output=True,
-                            env={**os.environ, "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-                                 "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": capacity})
+                            env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                                {"job": {"prefix": str(tmp_path / "events"),
+                                         "capacity": int(capacity) if capacity.lstrip("-").isdigit() else capacity}})})
     assert result.returncode != 0
     assert b"trace capacity must be" in result.stderr
     assert not list(tmp_path.iterdir())
@@ -96,8 +97,8 @@ def test_invalid_capacity_is_rejected(trace_probe, tmp_path, capacity):
 
 def test_thread_resource_snapshots_observe_faults_and_sleep(trace_probe, tmp_path):
     subprocess.run([str(trace_probe), "resources"], check=True, env={**os.environ,
-                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-                   "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE": "1"})
+                   "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                       {"job": {"prefix": str(tmp_path / "events"), "resources": True}})})
     records = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).read_text().splitlines()]
     events = {r["event"]: r for r in records[1:-1]}
     assert len(events) == 4 and records[-1]["dropped"] == 0
@@ -147,9 +148,8 @@ def test_gate_opens_across_process_without_spending_closed_capacity(trace_probe,
     with gate.open("r+b") as fd, mmap.mmap(fd.fileno(), 4) as flag:
         child = subprocess.Popen([str(trace_probe), "gate"], stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, text=True, env={**os.environ,
-            "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
-            "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-            "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "1"})
+            "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                {"gate_path": str(gate), "job": {"prefix": str(tmp_path / "events"), "capacity": 1}})})
         try:
             assert child.stdout.readline().strip() == "ready"
             ctypes.c_uint32.from_buffer(flag).value = 1
@@ -172,7 +172,7 @@ def test_gate_invalid_or_missing_file_refuses_capture(trace_probe, tmp_path, con
     if contents is not None:
         gate.write_bytes(contents)
     child = subprocess.run([str(trace_probe)], capture_output=True, preexec_fn=no_core,
-                           env={**os.environ, "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
-                                "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events")})
+                           env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                               {"gate_path": str(gate), "job": {"prefix": str(tmp_path / "events")}})})
     assert child.returncode != 0 and b"trace gate" in child.stderr
     assert not list(tmp_path.glob("events.*"))

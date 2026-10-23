@@ -3,7 +3,7 @@
 Two arms share every environment variable and Engine argument except SGLANG_DSV41_ENABLE_RAM_MISS_LEASES,
 which ExpertEngineService reads once at start, so each arm is its own process.
 
-The phase3a env.sh sets SGLANG_MOE_EXPERT_GRAPH_GATHER=0 and decodes eagerly. Lease mode lives in the in-graph
+The phase3a env.sh sets SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0 and decodes eagerly. Lease mode lives in the in-graph
 RAM-miss path, so that recipe as it stands makes both arms identical by construction. recipe_env applies the
 phase3b env-full.sh override (GRAPH_GATHER=1) and check_recipe refuses anything else.
 
@@ -14,6 +14,7 @@ the wrong tree.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -25,8 +26,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DSV41 = REPO_ROOT / "scripts" / "dsv41"
 
 LEASE_ENV = "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
-GRAPH_GATHER_ENV = "SGLANG_MOE_EXPERT_GRAPH_GATHER"
-TRACE_ENV = "SGLANG_DSV41_EXPERT_TRACE_PATH"
+GRAPH_GATHER_ENV = "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"
+# A group env: its value is a JSON object, so a trace path is set as trace_env_value(path).
+TRACE_ENV = "SGLANG_EXPERT_STREAM_TRACE"
+
+
+def trace_env_value(path: str) -> str:
+    return json.dumps({"expert_path": path})
+
+
 ARMS = ("lease_off", "lease_on")
 # Differs per run, not per arm; kept out of the arm diff.
 PER_RUN_ENV = frozenset({TRACE_ENV})
@@ -98,25 +106,25 @@ def recipe_env(*, paths: Paths, res: Resources) -> dict[str, str]:
         "SGLANG_DSV41_ENGRAM_TABLE_DIR": paths.engram_table_dir,
         "SGLANG_DSV41_TORCH_PREFILL_INDEXER": "1",
         "SGLANG_DSV41_ENGRAM_RAM_GIB": "5",
-        "SGLANG_DSV41_EXPERT_STREAM": "1",
-        "SGLANG_DSV41_EXPERT_DIR": paths.expert_dir,
-        "SGLANG_MOE_EXPERT_ROW_SOURCE": "shards",
-        "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
-        "SGLANG_MOE_PINNED_HOST_MB": str(res.pinned_host_mb),
-        "SGLANG_MOE_HOT_GPU_MB": str(res.hot_gpu_mb),
-        "SGLANG_MOE_HOT_DYNAMIC": "1",
-        "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
-        "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "32",
-        "SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS": "8",
-        "SGLANG_MOE_HOT_ASYNC_PROMOTIONS": "0",
-        "SGLANG_MOE_HOT_LOG_INTERVAL": "64",
-        "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "0",
-        "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
+        "SGLANG_EXPERT_STREAM_ENABLE": "1",
+        "SGLANG_EXPERT_STREAM_EXPERT_DIR": paths.expert_dir,
+        "SGLANG_EXPERT_STREAM_ROW_SOURCE": "shards",
+        "SGLANG_EXPERT_STREAM_FILE_READER": "uring_direct",
+        "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": str(res.pinned_host_mb),
+        "SGLANG_EXPERT_STREAM_HOT_GPU_MB": str(res.hot_gpu_mb),
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": "1",
+        "SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS": "256",
+        "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS": "32",
+        "SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS": "8",
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS": "0",
+        "SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL": "64",
+        "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": "0",
+        "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES": "0",
         GRAPH_GATHER_ENV: "1",
-        "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
+        "SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS": "2000",
     }
     if paths.mirror_dirs:
-        env["SGLANG_MOE_EXPERT_MIRROR_DIRS"] = paths.mirror_dirs
+        env["SGLANG_EXPERT_STREAM_MIRROR"] = json.dumps({"dirs": paths.mirror_dirs})
     return env
 
 

@@ -243,7 +243,7 @@ def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
         _device(layers=1, experts=384, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
 
 
-# Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
+# Lease-chain PDL (SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
 # the Python method that launches each. C1 and CC are plain launches.
 PDL_KERNELS = {
     "expert_stream_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
@@ -390,7 +390,7 @@ def test_the_device_side_passes_each_rows_capacity_to_the_post_launch():
 
 @pytest.mark.parametrize("kwargs, want", [({}, (0, 3)), ({"miss_cut": 1, "miss_cut_max": 2}, (1, 2))])
 def test_the_device_side_passes_the_split_miss_cut_after_cpu_misses(kwargs, want):
-    """SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX reach the post as the two arguments after cpu_misses (index 25); off,
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT miss_cut / miss_cut_max reach the post as the two arguments after cpu_misses (index 25); off,
     the cut is 0 and the post types lanes as before it existed."""
     dev = _device(**kwargs)
     recorder = _Recorder()
@@ -401,7 +401,7 @@ def test_the_device_side_passes_the_split_miss_cut_after_cpu_misses(kwargs, want
 
 
 def test_a_row_split_reaches_the_post_of_its_row_only():
-    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: the post's row_split bank (before use_pdl) holds the table on every node
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables: the post's row_split bank (before use_pdl) holds the table on every node
     of the row it was set for, and -1 first (the lease's tables) for every other row; a table the build cannot read is
     refused. Mutations: set_row_split writing one node or every row -- red."""
     dev = _device(lanes=8, nodes=2)
@@ -422,7 +422,7 @@ def test_a_row_split_reaches_the_post_of_its_row_only():
 
 
 def test_the_split_model_reaches_the_post_before_use_pdl_with_room_for_its_counters():
-    """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL: off, the post's split_model argument (after row_split) is empty; on, it
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT model: off, the post's split_model argument (after row_split) is empty; on, it
     holds the cost words and zeroed counters (records, then per node to_cpu and to_copy), which split_model_stats
     reads back; a word count the build cannot read is refused. Mutation: the counters not appended -- red."""
     for nodes in (1, 2):
@@ -468,7 +468,7 @@ def test_set_split_model_costs_replaces_the_cost_words_and_keeps_the_counters():
 
 
 def test_the_service_builds_its_device_side_with_the_split_model_words():
-    """exl3_ram_miss passes _split_model_words(): with SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL on and CPU experts running,
+    """exl3_ram_miss passes _split_model_words(): with SGLANG_EXPERT_STREAM_CPU_SPLIT model on and CPU experts running,
     words that hold the model off until the calibration publishes its costs (whatever the env's costs say), else
     None."""
     import sglang.srt.layers.moe.expert_engine.service as service
@@ -481,10 +481,9 @@ def test_the_service_builds_its_device_side_with_the_split_model_words():
     words = service.ExpertEngineService._split_model_words
     from sglang.srt.environ import envs
 
-    with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(False):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": false}'):
         assert words(stub) is None
-    with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True), \
-            envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=2"):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": true, "model_costs": "copy_lane=2"}'):
         got = words(stub)
         assert len(got) == 16 and got[10] < 0 and not any(got[:10] + got[11:])
         assert words(SimpleNamespace(cpu_experts=None, wire=stub.wire)) is None
@@ -508,10 +507,10 @@ def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
         assert kw["miss_cut"] == "miss_cut"
         assert kw["miss_cut_max"] == "miss_cut_max"
     text = Path(service.__file__).read_text()
-    assert (
-        "miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(), "
-        "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(), cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get())"
-    ) in " ".join(text.split())
+    # The cut and its cap come from the CPU-split config group, the CPU-experts switch from its own env or config.
+    assert re.search(
+        r"miss_cut, miss_cut_max = split_miss_cut\([^)]*miss_cut[^)]*miss_cut_max[^)]*cpu_experts=", " ".join(text.split())
+    )
 
 
 def test_the_chain_has_no_hit_wait_and_the_post_fills_c1s_compaction():

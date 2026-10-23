@@ -355,7 +355,7 @@ def test_the_service_opens_images_only_with_mirrors_and_o_direct(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3)
     mirrors = dict(roots=s.roots, policy=StaticSplitPolicy((1.0,)), source_root=str(tmp_path))
     segments, layers = s.fmt.segment_map(), {0: None, 1: None}
-    with pytest.raises(RuntimeError, match="SGLANG_MOE_EXPERT_MIRROR_DIRS"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_MIRROR"):
         open_service_row_images(s.layout, segments, {}, True, layers)
     with pytest.raises(RuntimeError, match="uring_direct"):
         open_service_row_images(s.layout, segments, mirrors, False, layers)

@@ -24,10 +24,10 @@ def test_each_verify_of_a_request_gets_its_ordinal_and_correct_draft_count(tmp_p
 
 def test_the_log_exists_only_when_its_path_is_set(tmp_path):
     verify_accept_log.reset_for_test()
-    with envs.SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH.override(""):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(""):
         assert verify_accept_log.get_verify_accept_log() is None
     verify_accept_log.reset_for_test()
-    with envs.SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH.override(str(tmp_path / "accept")):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"verify_accept_path": str(tmp_path / "accept")})):
         log = verify_accept_log.get_verify_accept_log()
         assert log is not None and log is verify_accept_log.get_verify_accept_log()
     verify_accept_log.reset_for_test()

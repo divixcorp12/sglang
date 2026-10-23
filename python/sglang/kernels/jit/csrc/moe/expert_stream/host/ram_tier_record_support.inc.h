@@ -12,7 +12,7 @@
     // The shared reader only: one demand read (read_rows) or one speculative read at a time on the group's reader.
     std::mutex turn;
     std::atomic<int> demand_waiting{0};  // demand reads blocked on `turn`, which spec_read lets go first
-    // SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE: the group's speculative reader, its own ring (null: the group's reader,
+    // SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE: the group's speculative reader, its own ring (null: the group's reader,
     // under `turn`). The speculative thread's alone, and the owner's while it is quiesced.
     std::unique_ptr<Source> spec_reader;
     std::promise<int> pinned;  // start_spec: 0 pinned, else the errno; a member, so it outlives the set_value
@@ -178,7 +178,7 @@
     throw std::runtime_error(
         error_prefix<Layout>() +
         "the stage trace is in the instrumented host build only "
-        "(set SGLANG_DSV41_EXPERT_TRACE_PATH so the service loads it)");
+        "(set SGLANG_EXPERT_STREAM_TRACE's expert_path so the service loads it)");
   }
 
   template <Counter K>

@@ -2,6 +2,8 @@
 trace or fault state on the request path, and instrumented. A service loads the instrumented one exactly when this
 process writes a stream trace or injects a RAM-miss fault."""
 
+import json
+
 import pytest
 import torch
 
@@ -24,12 +26,12 @@ def no_override(monkeypatch):
 
 
 def test_the_production_build_is_the_default(no_override):
-    with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(""), envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.override(""):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(""), envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.override(""):
         assert ops.host_variant() == "prod"
 
 
 def test_a_stream_trace_selects_the_instrumented_build(no_override, tmp_path):
-    with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(str(tmp_path / "t")):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"expert_path": str(tmp_path / "t")})):
         assert ops.host_variant() == "instr"
 
 

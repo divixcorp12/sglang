@@ -47,7 +47,7 @@ class ExpertFormat(Protocol):
     (the host arena rebinds layer tensors after startup), or None when the format
     has no dense source and only its row source can read rows.
     ``default_row_source`` builds the row source for a knob kind (see
-    ``SGLANG_MOE_EXPERT_ROW_SOURCE``) and raises for kinds it does not know.
+    ``SGLANG_EXPERT_STREAM_ROW_SOURCE``) and raises for kinds it does not know.
     ``file_source_bytes_per_expert`` returns the file bytes one expert row reads, or
     None; None keeps eager gathers out of the pinned host tier and reports file
     counters as unknown.
@@ -63,7 +63,7 @@ class ExpertFormat(Protocol):
         engine_served: Whether the native engine service serves this format's rows (leased gathers, DIRECT
             residency) instead of dense host tensors.
         supports_graph_gather: Whether dense host sources can serve graph gathers.
-        supports_host_arena: Whether ``SGLANG_MOE_EXPERT_HOST_ARENA`` applies.
+        supports_host_arena: Whether ``SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA`` applies.
         supports_transfer_executor: Whether one expert's rows move as the transfer executor's fixed bundle of
             row copies.
         supports_cpu_experts: Whether a real CPU kernel computes this format (False: a stub or none).

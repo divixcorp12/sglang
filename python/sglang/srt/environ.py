@@ -152,63 +152,6 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
-class EnvPrefetchPullMode(EnvField):
-    """Resolve the prefetch-pull delivery mode and its temporary boolean alias."""
-
-    _MODES = frozenset({"off", "count_zero", "always"})
-
-    def __init__(self, legacy_name: str):
-        super().__init__("off")
-        self.legacy_name = legacy_name
-
-    def parse(self, value: str) -> str:
-        mode = value.lower()
-        if mode not in self._MODES:
-            raise ValueError(
-                f'"{value}" is not a valid pull mode; expected one of "off", "count_zero", or "always"'
-            )
-        return mode
-
-    def get(self) -> str:
-        mode_value = os.getenv(self.name)
-        legacy_value = os.getenv(self.legacy_name)
-        if mode_value is None:
-            if legacy_value is None:
-                return "off"
-            try:
-                return "always" if EnvBool(False).parse(legacy_value) else "off"
-            except ValueError as error:
-                raise ValueError(f"{self.legacy_name}: {error}") from error
-        try:
-            mode = self.parse(mode_value)
-        except ValueError as error:
-            raise ValueError(f"{self.name}: {error}") from error
-        if legacy_value is None:
-            return mode
-        try:
-            legacy_mode = "always" if EnvBool(False).parse(legacy_value) else "off"
-        except ValueError as error:
-            raise ValueError(f"{self.legacy_name}: {error}") from error
-        if mode != legacy_mode:
-            raise ValueError(
-                f"{self.name}={mode!r} contradicts {self.legacy_name}={legacy_value!r}; "
-                "set only one, or use matching off/false or always/true values"
-            )
-        return mode
-
-
-class EnvPrefetchPredictor(EnvStr):
-    """Reject a configured pull mode before ModelRunner skips prediction setup."""
-
-    def get(self) -> str:
-        predictor = super().get()
-        if not predictor and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
-            raise ValueError(
-                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"
-            )
-        return predictor
-
-
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -374,110 +317,6 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
-    # Stream ModelOpt NVFP4 routed experts from host memory; required for hot caching.
-    SGLANG_MOE_EXPERT_STREAM = EnvBool(False)
-    SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
-    SGLANG_MOE_PINNED_HOST_MB = EnvInt(0)
-    # Where the pinned host tier lives: "node:MiB,node:MiB" (e.g. "0:65536,1:30720"),
-    # summing to SGLANG_MOE_PINNED_HOST_MB. Every layer's rows are bound to the nodes
-    # in that proportion, and startup refuses a node without the memory. Empty keeps
-    # first-touch placement.
-    SGLANG_MOE_PINNED_HOST_NUMA_MB = EnvStr("")
-    # Layer ids whose every expert stays in the pinned host tier ("0,1"): each is bought first, per node, with the
-    # slots its tier's reader holds back on top, and filled at start; the rest of the budget is split as without.
-    # Empty: no layer is held whole.
-    SGLANG_MOE_PINNED_HOST_FULL_LAYERS = EnvTuple(tuple())
-    SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
-    SGLANG_MOE_HOT_GPU_MB = EnvInt(0)
-    SGLANG_MOE_HOT_SEED = EnvStr("")
-    SGLANG_MOE_HOT_DYNAMIC = EnvBool(False)
-    SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS = EnvInt(1024)
-    # Also update dynamic residency every this many decode forwards; 0 leaves
-    # updates to qualifying prefills only.
-    SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS = EnvInt(0)
-    SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS = EnvInt(8)
-    SGLANG_MOE_HOT_BENEFIT_RATIO = EnvFloat(1.0)
-    # Decay residency scores by 0.95 once per this many routed tokens instead
-    # of once per boundary; 0 keeps per-boundary decay.
-    SGLANG_MOE_HOT_DECAY_TOKENS = EnvInt(0)
-    # Standard deviations of routing-count noise a candidate expert must lead
-    # the expert it replaces by, on top of SGLANG_MOE_HOT_BENEFIT_RATIO.
-    SGLANG_MOE_HOT_PROMOTION_SIGMAS = EnvFloat(0.0)
-    # Return from a residency boundary once promotion copies are submitted and
-    # publish the promoted slots on a later forward after the copies complete.
-    SGLANG_MOE_HOT_ASYNC_PROMOTIONS = EnvBool(False)
-    # Copy CPU-policy scores to a pinned host buffer at residency boundaries
-    # and apply decisions only after a nonblocking CUDA event query succeeds.
-    SGLANG_MOE_ASYNC_RESIDENCY_SCORES = EnvBool(False)
-    # Run the decode residency update as device ops inside the captured decode
-    # graph; requires SGLANG_MOE_HOT_DYNAMIC and SGLANG_MOE_EXPERT_GRAPH_GATHER.
-    SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
-    # Most experts one layer promotes at a decode boundary on the GPU path.
-    SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
-    # Decode boundaries serve misses out of residency instead of promoting host
-    # rows; see InsertOnMissStage. Requires SGLANG_MOE_GPU_RESIDENCY_UPDATE and
-    # SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1. The deprecated boolean
-    # SGLANG_MOE_HOT_INSERT_ON_MISS still selects stage 1 (SCRATCH), because the
-    # enum keeps that boolean's 0/1 values.
-    SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE = EnvIntWithAlias(
-        InsertOnMissStage.OFF, deprecated_name="SGLANG_MOE_HOT_INSERT_ON_MISS"
-    )
-    # Per-token decay of the scores that pick insert-on-miss victims.
-    SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
-    # Run stage 1's boundary insert copies through the fused masked Triton
-    # kernel instead of index_select + index_copy_. Byte-identical output; one
-    # pass instead of two, and idle lanes move no bytes. Off by default until a
-    # serving arm accepts it, so the measured stage-1 config stays reproducible.
-    SGLANG_MOE_HOT_FUSED_INSERT = EnvBool(False)
-    SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
-    SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
-    SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)
-    # Shadow-score these registered MoE expert predictors against native routes
-    # (comma list, e.g. "affinity,popularity"); empty installs no hooks or buffers.
-    SGLANG_MOE_EXPERT_PREDICTOR = EnvTuple(tuple())
-    SGLANG_MOE_EXPERT_PREDICTOR_CANDIDATES = EnvInt(16)
-    # Score and update predictors on every Nth eligible forward; raise it to
-    # cut the per-step host overhead of shadow scoring.
-    SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL = EnvInt(1)
-    # Rows per tap buffer; 0 uses decode CUDA-graph max_bs x tokens per request.
-    SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS = EnvInt(0)
-    SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL = EnvInt(100)
-    SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE = EnvStr("")
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR = EnvStr("")
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB = EnvInt(500)
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS = EnvInt(4096)
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES = EnvInt(2)
-    # In-graph expert prefetch candidate scoring (shadow until the shared copy layer consumes it): "", "llapor" or "apex".
-    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR = EnvPrefetchPredictor("")
-    SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR = EnvStr("")
-    # Candidates per target layer kept in the device bank.
-    SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES = EnvInt(16)
-    # Rows per layer the shadow budget-recall metric credits.
-    SGLANG_MOE_EXPERT_PREFETCH_BUDGET = EnvInt(3)
-    SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU = EnvFloat(0.95)
-    # Post the candidate bank's best non-resident target-layer expert onto the
-    # captured side stream (expert_gpu_pull.py) and join it into the covered/
-    # residual remap; requires SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR and a hot
-    # cache allocated with the trailing DedicatedPrefetchSlot row. Default off:
-    # the plan forbids enabling this by default on synthetic evidence.
-    SGLANG_MOE_EXPERT_PREFETCH_PULL = EnvBool(False)
-    # Delivery-mode replacement for the legacy boolean above. ``count_zero``
-    # preserves the captured post/join graph while publishing a no-payload plan.
-    SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE = EnvPrefetchPullMode(
-        "SGLANG_MOE_EXPERT_PREFETCH_PULL"
-    )
-    # Keep BudgetRecall enabled by default for compatibility, but let matched
-    # performance arms exclude its device work independently of pull telemetry.
-    SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL = EnvBool(True)
-    # Serving-only BS1 fp32 candidate selection. When disabled (or when any
-    # recall/calibration/analysis consumer is active), use the reference
-    # stable top-W candidate bank instead.
-    SGLANG_MOE_EXPERT_PREFETCH_FUSED_TOP1 = EnvBool(True)
-    # Profiling-only graph-captured score/margin histograms. Timed throughput
-    # arms leave this false so the observer has no allocation or device work.
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION = EnvBool(False)
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE = EnvStr("")
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE = EnvStr("")
     # mmap | uring | uring_direct; see sglang.srt.model_loader.file_row_reader.
     SGLANG_QWEN4_PLE_FILE_READER = EnvStr("mmap")
     # Stage file-backed PLE rows before decode CUDA-graph replay instead of
@@ -486,62 +325,7 @@ class Envs:
     # Keep the Qwen4-Exp token embedding in pinned host memory and gather its
     # rows over PCIe; a speculative draft binds the same host table.
     SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING = EnvBool(False)
-    SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
-    # Where host expert rows are read from: auto | files | tensor, or a kind the
-    # expert format defines. auto keeps each format's default (dense NVFP4 layers:
-    # their expert files through io_uring, unless SGLANG_MOE_EXPERT_FILE_READER=mmap).
-    SGLANG_MOE_EXPERT_ROW_SOURCE = EnvStr("auto")
-    # Mirror roots for EXL3 expert rows, os.pathsep-separated: each holds a
-    # byte-identical copy of the checkpoint (one per drive). Non-empty selects the
-    # mirror row source, which reads every row from all roots at once; one entry
-    # reads everything from that root. Rows are read from the roots, while the
-    # layout is still built from SGLANG_DSV41_EXPERT_DIR. Check the copies with
-    # scripts/dsv41/verify_expert_mirror.py before trusting them.
-    SGLANG_MOE_EXPERT_MIRROR_DIRS = EnvStr("")
-    # Colon-separated relative read shares, one per root of
-    # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
-    SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
-    # Pick each RAM-miss sub-read's mirror root when it is issued instead of by the
-    # static split: a root whose sub-reads in flight reach its cap in
-    # SGLANG_MOE_EXPERT_MIRROR_CAPS is skipped, the fewest bytes in flight wins, and
-    # with every root capped a sub-read keeps its own root.
-    SGLANG_MOE_EXPERT_MIRROR_DYNAMIC = EnvBool(False)
-    # Comma-separated in-flight sub-read caps, one positive integer per root of
-    # SGLANG_MOE_EXPERT_MIRROR_DIRS in its order (e.g. 4,2,4); required with DYNAMIC.
-    SGLANG_MOE_EXPERT_MIRROR_CAPS = EnvStr("")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
-    # Copy all host expert rows into registered memory (replaces the pinned LRU).
-    SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
-    # Serve decode-sized expert gathers without host syncs so CUDA graphs capture
-    # them; requires SGLANG_MOE_EXPERT_HOST_ARENA and SGLANG_MOE_HOT_GPU_MB.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER = EnvBool(False)
-    # Plan a graph-gather's BS1, unique-ID, top_k<=32 routes with one fused
-    # CUDA kernel launch instead of the general tensor-op sequence; requires
-    # SGLANG_MOE_EXPERT_GRAPH_GATHER. Shapes/dtypes outside that specialization
-    # fall back to the general path unchanged.
-    SGLANG_MOE_EXPERT_FUSED_PLAN = EnvBool(False)
-    # Speculative decoding only: cap each layer's graph-gather scratch rows below
-    # one per verify route (decode max_bs x draft tokens x top_k); 0 keeps that bound.
-    # Startup rejects a cap below one request's routes: that needs phase 3's overflow path.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
-    # Speculative decoding with DIRECT residency (SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2) only: each layer's graph gather
-    # serves at most this many distinct misses (the RAM-miss lanes and the victim shortlist), below one per verify
-    # route. A gather with more serves the lanes that find a victim and sets the residency's overflow flag; its output
-    # is then not a verify result. 0 keeps one lane per route.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)
-    # Spill (SGLANG_DSV41_CPU_EXPERTS, a DSpark verify with a lane per route: MISS_LANES unset): only the first V of a
-    # gather's miss lanes in plan order take a VRAM victim and a staging slot; the post makes every later lane a CPU
-    # lane, a miss of which the host reads into a RAM victim. 0: every miss lane may take a victim. 1 <= V < the routes.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
-    # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
-    # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
-    SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")
-    SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS = EnvInt(2048)
-    # Ignored unless SGLANG_MOE_ROUTE_TRACE_DIR is set. Traces target verify forwards
-    # and MTP draft hidden states (<dir>/mtp) under eager NEXTN; startup requires
-    # --speculative-eagle-topk 1 passed explicitly, --cuda-graph-backend-prefill
-    # disabled and --disable-flashinfer-autotune.
-    SGLANG_MOE_ROUTE_TRACE_SPECULATIVE = EnvBool(False)
     # Debug only: append per-request speculative verify rows (draft, argmax, accept
     # length, committed tokens, top-2 logit gap, sampling flags) to this JSONL file,
     # suffixed .rank<N> when several ranks run; empty disables and adds no work.
@@ -1010,8 +794,6 @@ class Envs:
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
-    # Appends each DSpark draft MoE call's topk ids as a JSON line; the routes probe the draft resident set is made from.
-    SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
@@ -2293,60 +2075,12 @@ class Envs:
     # On since DSV41_REFERENCE.md 33.35: the two break gaps (~8 ms per verify) are gone.
     SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH = EnvBool(True)
 
-    # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
-    # checkpoint loader skips them and each MoE layer gathers the experts it
-    # routes to through the MoE expert streaming framework. Its knobs size the
-    # tiers: SGLANG_MOE_PINNED_HOST_MB (host RAM), SGLANG_MOE_HOT_GPU_MB (VRAM),
-    # SGLANG_MOE_HOT_SEED (startup residency, a {"count": [[...]]} JSON).
-    SGLANG_DSV41_EXPERT_STREAM = EnvBool(False)
-    # Directory whose EXL3 shards the streamed experts are read from (required
-    # when streaming; the experts may live on a different drive than the model).
-    SGLANG_DSV41_EXPERT_DIR = EnvStr("")
-    # When set, append one JSON line per streamed MoE layer call (forward, layer,
-    # tokens, experts and route counts, VRAM and RAM misses, read and split time)
-    # for offline tier simulation (scripts/dsv41/tier_sim.py).
-    SGLANG_DSV41_EXPERT_TRACE_PATH = EnvStr("")
-    # With the trace above on and EXL3 graph decode: also capture every graph forward's per-layer router
-    # input and top-k weights into binary side files at this path prefix (exl3_stream_trace.RouterCapture,
-    # ~410 KB per token). Setting it without the trace is refused.
-    SGLANG_DSV41_ROUTER_CAPTURE_PATH = EnvStr("")
-    # With the router capture above on: also record, per layer, the RAM residency of the next four layers'
-    # experts and each routed lane's demand kind into side files at the same prefix. Refused without it.
-    SGLANG_DSV41_RESIDENCY_CAPTURE = EnvBool(False)
-    # Trace runs: a path prefix for one JSON line per request per verify step (its ordinal and correct drafts,
-    # speculative/verify_accept_log.py), which joins the route log's verify forwards to split misses by verified
-    # position (analysis/dsv41-drive/dspark/verify_split.py). Empty: nothing is written.
-    SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH = EnvStr("")
+    # DeepSeek-V4.1 EXL3 routed experts are streamed from disk by the expert engine; every streaming knob is a
+    # SGLANG_EXPERT_STREAM_* name in the "Expert streaming engine" sections. The names below are the DSV4.1 profile's.
     # Trace runs: a path prefix for one JSON line per request per DSpark verify step with the draft's top-1/top-2
     # probability at each draft position (speculative/dspark_components/dspark_draft_top_prob_log.py); recomputes the
     # draft's step logits, one extra LM-head pass per verify. Empty: nothing is computed or written.
     SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH = EnvStr("")
-    # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
-    # thread may take per MoE layer, in ms, before the process fails stop. The
-    # thread's watchdog aborts after max(30 s, 3x this) (expert_engine.service.watchdog_wait_s),
-    # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
-    # With the copy engine, the copy wait gets this again, timed by that watchdog from
-    # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
-    # then take about 2x this (+20 ms).
-    SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
-    # How long an idle RAM-miss service thread (one per NUMA group) polls before it sleeps 50 us between polls; a
-    # parked thread then sleeps 20 us between checks too. -1: never sleep (spin, with PAUSE or busy-polling).
-    SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US = EnvInt(5000)
-    # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
-    SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US = EnvInt(5000)
-    # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
-    # (ThreadingConfig.resolve). Refused unless it is outside cores 52-55,108-111 and the server's affinity, on a node of the
-    # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
-    # core); also refused with SGLANG_EXPERT_NUMA_CORES naming that node's ram=. Unset: with several nodes or CPU
-    # experts each node's thread takes the node's highest free physical core; with one node and no CPU experts it
-    # inherits the server's affinity and spins with PAUSE, then sleeps. Checked once, at start.
-    SGLANG_DSV41_RAM_MISS_SPIN_CORE = EnvInt(None)
-    # io_uring options the C++ reader also reads itself (host/uring_options.h); declared here because
-    # ThreadingConfig resolves the SQPOLL thread's core from them. The service passes every ring its core explicitly.
-    SGLANG_EXPERT_STREAM_URING_MODE = EnvStr("default")
-    # The SQPOLL thread's core with one NUMA group, -1 or unset unpinned; refused above one group (use
-    # SGLANG_EXPERT_NUMA_CORES's sq=).
-    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU = EnvInt(None)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
@@ -2365,191 +2099,17 @@ class Envs:
     # kernel. Bit-identical to the unfused casts. Read once when each module is built, and per BS1 call where the
     # sublayer input is combined. Off by default.
     SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
-    # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md "Copy engine"): the RAM-miss
-    # service copies each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on
-    # its own thread) instead of the in-graph SM copy C1, and the graph waits for its completion word. Captured decode
-    # graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in flight can still
-    # deadlock it into a fail-stop. Read once at service start. Off by default.
-    SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
-    # What moves a captured decode post's RAM hits once the copy engine is armed (LEASE_PROTOCOL.md, lane kinds): "ce",
-    # the copy engine's DMA (kHitCopy), or "sm", the in-graph SM copy C1 (kHitSm), with no host thread on the hit path.
-    # CPU lanes still complete through the copy thread either way. Read once at service start. Default "ce".
-    SGLANG_DSV41_RAM_HIT_COPY = EnvStr("ce")
-    # SM small copies: the copy engine copies only each RAM-hit row's two trellis tensors; the copy wait (CW) reads the
-    # four small ones (44.5 KB a row) from the pinned slot with SM loads, and the lease is released only once both the
-    # DMA completed and CW published Done. Needs the copy engine (refused without it). Read once at service start.
-    # Off by default.
-    SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES = EnvBool(False)
-    # Lease-chain PDL (LEASE_PROTOCOL.md "PDL"): the lease-chain kernels post, W1, S and CW launch with programmatic
-    # dependent launch, each waiting on its predecessor as its first statement and letting the next one launch right
-    # after that wait, so a layer's kernels overlap their launch latency. Outputs unchanged; at most ~1 us per layer
-    # (analysis/dsv41-drive/chain-pdl/results.md). Read once at service start. Off by default.
-    SGLANG_DSV41_ENABLE_LEASE_PDL = EnvBool(False)
-    # Prefill fills (plan 2026-09-25-dsv41-prefill-fills): eager pinned-tier misses are read by the RAM-miss service's
-    # native reader straight into the pinned slabs (row images, every mirror drive at once) instead of the Python bounce
-    # read and CPU copy. A layer's misses are all issued once its routing is known, on a helper thread, and each gather
-    # chunk waits only for its own rows. Needs the native slot table (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when
-    # the service starts. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_FILLS = EnvBool(False)
-    # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
-    # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own
-    # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
-    # Off by default. The share's size is set at start from the tier's layout (expert_engine.row_backend.prefill_share_rows).
-    SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
-    # With the prefill share on: a fixed share in rows per layer instead of the size computed at start, for A/B arms.
-    # Unset (the default) uses the computed size.
-    SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS = EnvInt(None)
     # Test only: test/manual/dsv41/test_bs1_build_digest.py skips, instead of failing, when nvcc or the GPU arch differs
     # from its golden's (the golden is then stale: re-record it). Off by default.
     SGLANG_TEST_BS1_DIGEST_TOOLCHAIN_ACKNOWLEDGED = EnvBool(False)
-    # Prefill route plan (plan 2026-09-25-dsv41-prefill-route-plan): the eager streamed MoE reads a layer's topk_ids
-    # to the host once, before any of its gathers, groups the routes by expert, and takes each chunk's expert ids and
-    # row_of_source as host lists, so no readback sits between a chunk's gather and its compute and the host runs
-    # ahead of the gather. Outputs are bitwise those of the per-expert torch.where loop. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
-    # Split fill gather (plan 2026-09-26-dsv41-split-fill-gather): a prefill gather chunk holding rows the layer's
-    # prefill fill is still reading copies its other rows first, then waits for the fill and copies the filled rows,
-    # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
-    # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
-    # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
-    SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
-    # Optional override of the CPU expert pool's cores, as a taskset list ("36-47,50") on one node, at least two.
-    # Unset or empty derives each node's pool from its free physical cores (ThreadingConfig.resolve).
-    SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
-    # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
-    SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
-    # Each node's CPU expert pool also takes the SMT sibling of every one of its cores (after THREADS caps them), so
-    # a pool of n cores runs 2n workers, siblings after the cores. A sibling that the server's affinity, a reserved
-    # core or another role holds refuses the plan. Off by default; measured to help chunks of several tokens only.
-    SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT = EnvBool(False)
-    # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
-    # "1:ram=51,cpu=28-43,sq=50;0:ram=26": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
-    # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
-    SGLANG_EXPERT_NUMA_CORES = EnvStr("")
-    # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
-    # computes k*(n) from the three costs below (policy.split_table).
-    SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")
-    # Per-layer tables replacing the group's split on every node of the listed layers: "LAYERS:TABLE;LAYERS:TABLE",
-    # e.g. "0:0,0,0,1,...;1:0,0,1,..." or "0,1:0,0,1,...", each TABLE shaped as SGLANG_DSV41_CPU_EXPERTS_SPLIT.
-    # Calibration and the retune never change them. Empty: every layer uses its group's table.
-    SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS = EnvStr("")
-    # ms per expert on the CPU pool, per resident row over the link, and per layer handoff. Defaults are P0's native
-    # resid+b128 build at 12 node-1 threads and the measured link (plan 2026-09-29-dsv41-cpu-experts, P0 results).
-    SGLANG_DSV41_CPU_EXPERTS_CPU_MS = EnvFloat(0.52)
-    SGLANG_DSV41_CPU_EXPERTS_LINK_MS = EnvFloat(1.0)
-    SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS = EnvFloat(0.02)
-    # Batches between re-tunes of the split from the CPU's measured cost per expert; 0 keeps the startup table.
-    SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES = EnvInt(0)
-    # Measure the split once when the copy engine arms (spec 2026-10-01-cpu-split-calibration): the CPU, the link and
-    # both together on the loaded model, then keep it. Off: the three costs above, and the retune.
-    SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION = EnvBool(True)
-    # Timed runs per calibration cell, after one discarded warm-up.
-    SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS = EnvInt(10)
-    # CPU-computed NVMe misses: the CPU's split[n] tail counts every missing lane, not only RAM hits, and a miss on the
-    # CPU is computed from its staging slot once its read lands (it still enters the RAM tier, never VRAM). Needs
-    # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
-    # (slot-map plan, Task 0), so a served A/B decides.
-    SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
-    # A miss-aware split. A forced CPU miss runs on its node's CPU behind the record's CPU-hit job, so a node with
-    # 1.._MAX forced misses takes this many fewer of its split's lanes (they go to the copy engine or the GPU). 0 is
-    # off. Applies only with SGLANG_DSV41_CPU_EXPERTS; on by default after three A/Bs (DSV41_REFERENCE.md 33.17).
-    SGLANG_DSV41_CPU_SPLIT_MISS_CUT = EnvInt(1)
-    # The most forced misses on a node for which the cut applies.
-    SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX = EnvInt(3)
-    # Experiment: a model-based split. The post picks each record's CPU hits from per-team costs, each lane's tokens, the
-    # forced lanes and a miss landing estimate (ram_slot_map.model_cpu_lanes) in place of the split table and the miss
-    # cut. Its costs are measured on the loaded model when the copy engine arms (split_model_calibration.py), whatever
-    # SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION says, with SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS runs a cell; if
-    # that fails the split table types the lanes. Needs SGLANG_DSV41_CPU_EXPERTS and the copy engine (RAM_HIT_COPY=ce).
-    # Off until a served A/B decides.
-    SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL = EnvBool(False)
-    # Experiments only: costs replacing the calibrated ones, name[.node]=ms pairs, comma-separated
-    # (ram_slot_map.split_model_overrides). Naming every cost of every node skips the calibration.
-    SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS = EnvStr("")
-    # Batches between live refinements of the split model's CPU costs from the CPU jobs served (SplitModelRefiner in
-    # split_model_calibration.py); 0 keeps the calibrated costs. Off by default.
-    SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES = EnvInt(0)
-    # With it, among a node's lanes the model prices alike (same tokens) the CPU takes the lowest residency keys, so
-    # the copy engine, whose lanes become VRAM residents, gets the highest. Off until a served A/B decides.
-    SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK = EnvBool(False)
-    # Experiment: a two-stage CPU miss. The reader fetches a CPU-computed miss's w13 prefix across the mirror roots
-    # before its w2 suffix, and the CPU job starts once w13 has landed: it runs the gate/up GEMVs while w2 is still being
-    # read and waits for w2 before anything reads it. Needs SGLANG_DSV41_CPU_EXPERTS. Off until a served A/B decides.
-    SGLANG_DSV41_CPU_TWO_STAGE = EnvBool(False)
-    # Its row's w13 and w2 spans divided over the mirror roots by these weights, in SGLANG_MOE_EXPERT_MIRROR_WEIGHTS's
-    # format and root order, rather than both by the mirror's (empty: the mirror's). A root weighted 0 in a span reads
-    # none of it, so 1:0:1 for w2 leaves the middle root one contiguous piece of w13. Only with the flag.
-    SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS = EnvStr("")
-    SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS = EnvStr("")
-    # DSpark draft experts on the CPU (plan 2026-10-05-dsv41-dspark-port): each draft stage keeps the experts its
-    # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
-    # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.
-    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS = EnvBool(False)
-    # Cores of the draft's CPU expert kernel, as a taskset list ("6-15"). At least two, none of the reserved 52-55,108-111.
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
-    # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
     # Keeps an EXL3 DSpark draft eager (no decode graph); the draft MoE then runs the same graph-safe path eagerly.
     # For A/B only.
     SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH = EnvBool(False)
-    # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
-    # Empty keeps none: every routed draft expert runs on the CPU.
-    SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
-    # For this many us after its last job, the idle CPU expert team runs the kernel's register-only AVX-512 loop
-    # instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap costs about
-    # 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03: a 1 ms or
-    # 3 ms gap then costs nothing). 0: PAUSE only. The team never sleeps either way.
-    SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
-    # A verify's CPU job leaves the overwrite of its token rows to the kernel, which stores each token's first sum and
-    # zeroes only the tokens no lane routes, instead of the CPU expert thread zeroing every token row (6 x 5120 fp32 of
-    # pinned memory, 19-38 us a job) before an accumulating forward. The same bits. Needs SGLANG_DSV41_CPU_EXPERTS;
-    # off until an A/B decides.
-    SGLANG_DSV41_CPU_EXPERTS_STORE_OUT = EnvBool(False)
-    # NVMe-to-RAM prefetch: per NUMA group a thread scores a later layer's gate (the next by default)
-    # and reads its pick into a pool of RAM slots the device never maps; a forced CPU miss on a pooled
-    # expert swaps it in. Needs SGLANG_DSV41_CPU_EXPERTS.
-    SGLANG_DSV41_RAM_PREFETCH = EnvBool(False)
-    # Candidates per live token, in its score order past the hot, mapped and pooled experts.
-    SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN = EnvInt(1)
-    # Speculative rows per layer over both NUMA groups: the replay's best budget (DSV41_REFERENCE.md section 33.13).
-    SGLANG_DSV41_RAM_PREFETCH_PER_LAYER = EnvInt(1)
-    # Pool slots per row and NUMA group, taken out of the tier at start.
-    SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE = EnvInt(2)
-    # Pick only among each token's predicted top_k: a layer whose predicted experts are all cached reads nothing,
-    # rather than an expert the gate ranks below top_k (the 2026-10-08 A/B's unused reads, DSV41_REFERENCE.md 33.14).
-    SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
-    # Where the target layer's gate is scored: "cpu", each group's speculative thread on the record's staged input, or
-    # "gpu", two kernels after the layer's post inside the decode graph (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer).
-    # gpu is the prefetch's best measured arm (DSV41_REFERENCE.md 33.14-33.18) and needs the RAM-miss copy engine.
-    SGLANG_DSV41_RAM_PREFETCH_SCORER = EnvStr("gpu")
     # The GPU scorer's margin floors: a JSON file {"min_margin": {"<target row>": floor}} from spec_margin.py's admission
     # sweep. A candidate whose margin is under its target row's floor is not read and does not count toward the layer's
     # budget; a row the file omits keeps every candidate. Unset: the GPU scorer's packaged table
     # (layers/moe/ram_prefetch_margin_floors.json), the CPU scorer none. Empty: no floors.
     SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS = EnvStr(None)
-    # Speculative reads only to an idle drive (design 2026-10-09-dsv41-drive-aware-reads, change (2)): each NUMA group
-    # reads its pool rows through a reader of its own, one piece at a time, from a mirror root no demand read is on,
-    # instead of taking turns with the demand reads on the group's reader. A forced miss waiting on a row lifts that.
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
-    # How long such a read waits for an idle drive before it is abandoned (its pool entry stays empty).
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
-    # With idle-drive reads: spread each row's pieces over the idle drives, ties rotating from row to row, instead of
-    # keeping the row on one drive with ties to the lowest-numbered (which took 179 of 249 GB in the A/B of
-    # DSV41_REFERENCE.md 33.18).
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD = EnvBool(False)
-    # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4), each on a drive no demand
-    # reads. One read rows too slowly in that A/B: 35% abandoned, 82% of promotions boosted.
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
-    # Defer each row's map delta to the previous row's next record and fold landed pool rows into it, so the GPU types
-    # them as RAM hits. Needs SGLANG_DSV41_RAM_PREFETCH=1.
-    SGLANG_DSV41_RAM_PREFETCH_PROMOTE = EnvBool(False)
-    # Serve a GPU miss whose row already landed in the prefetch pool by streaming it to the GPU straight from the pool
-    # slot instead of reading it again from NVMe. Needs SGLANG_DSV41_RAM_PREFETCH=1.
-    SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE = EnvBool(False)
-    # How many layers ahead the speculative scorer targets (1 to 4): 1 scores the next layer's gate, 2 the one after.
-    # Above 1 needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS set, since the packaged floors were fit for 1.
-    SGLANG_DSV41_RAM_PREFETCH_HORIZON = EnvInt(1)
     # Path of a folded learned L+2 head file (analysis/dsv41-drive/prefetch-replay/l2_head_export.py) that replaces
     # the native candidate select. Unset or empty means the native select.
     SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD = EnvStr(None)
@@ -2557,20 +2117,9 @@ class Envs:
     # graph gather, between the router and the fused route plan, that keys the miss lanes by how likely each routed
     # expert is to be routed again by the next verify, so the GPU copies (and the VRAM hot cache keeps) those and the
     # CPU computes the rest. Unset or empty keeps the residency-ranking key. Needs DIRECT residency, CPU experts and
-    # the fused plan; its device bytes (~29 MB with a bf16 PCA) come out of SGLANG_MOE_HOT_GPU_MB before the cache is
-    # sized. A missing or mismatched file is a ValueError at startup.
+    # the fused plan; its device bytes (~29 MB with a bf16 PCA) come out of SGLANG_EXPERT_STREAM_HOT_GPU_MB before the
+    # cache is sized. A missing or mismatched file is a ValueError at startup.
     SGLANG_OPT_LANE_HEAD_PATH = EnvStr(None)
-    # GPU drip (host/gpu_drip.h): this many VRAM scratch slots, one expert row each (~13 MB at DSV4.1's EXL3 rows),
-    # which the copy engine fills from pinned RAM, while no demand copy is pending, with experts the GPU scorer
-    # predicts for its target layer; that layer's post copies a landed one from VRAM instead of computing it on the
-    # CPU or copying it on demand. 0 is off. Needs SGLANG_DSV41_RAM_PREFETCH with the GPU scorer, whose target
-    # (SGLANG_DSV41_RAM_PREFETCH_HORIZON) is the drip's, and the copy engine.
-    SGLANG_DSV41_GPU_DRIP_SLOTS = EnvInt(0)
-    # Drips per scored record: the target layer's best-scored experts that are mapped in RAM and not VRAM-hot (1 to 8).
-    SGLANG_DSV41_GPU_DRIP_PICKS = EnvInt(4)
-    # The most one drip copy submission carries, in KiB: a demand copy issued meanwhile waits behind at most this.
-    # Arbitrary; ~75 us at the slot's 13.7 GB/s.
-    SGLANG_DSV41_GPU_DRIP_CHUNK_KB = EnvInt(1024)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

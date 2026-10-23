@@ -346,7 +346,7 @@ def test_a_launch_off_the_training_distribution_is_refused():
         lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.4, confidence_cut=False)
     with pytest.raises(ValueError, match="SGLANG_DSPARK_CONFIDENCE_CUT"):
         lh.check_serving_matches_training(meta, insert_decay=0.98, top_prob_gate=0.0, confidence_cut=True)
-    with pytest.raises(ValueError, match="SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is 0.995"):
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY is 0.995"):
         lh.check_serving_matches_training(meta, insert_decay=0.995, top_prob_gate=0.0, confidence_cut=False)
 
 

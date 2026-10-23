@@ -82,8 +82,8 @@ def _phase(tmp, env_extra, cap=0):
     work = Path(os.environ["IOPOLL_CUTS_DIR"]) / tmp
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("SGLANG_EXPERT_STREAM_URING_")}
-    env |= {"SGLANG_EXPERT_STREAM_URING_MODE": "iopoll", **env_extra}
+    env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_URING"}
+    env |= {"SGLANG_EXPERT_STREAM_URING": json.dumps({"mode": "iopoll", **env_extra})}
     done = subprocess.run([sys.executable, "-c", _PHASE, str(work), str(cap)], env=env, text=True,
                           capture_output=True, timeout=600)
     shutil.rmtree(work, ignore_errors=True)
@@ -93,8 +93,8 @@ def _phase(tmp, env_extra, cap=0):
 
 @pytest.mark.skipif("IOPOLL_CUTS_DIR" not in os.environ, reason="set IOPOLL_CUTS_DIR to a dir on an NVMe root")
 def test_iopoll_punts_uncut_reads_and_never_cut_ones():
-    cut = _phase("cut", {"SGLANG_EXPERT_STREAM_URING_READ_CUTS": "1"})
-    uncut = _phase("uncut", {"SGLANG_EXPERT_STREAM_URING_READ_CUTS": "0"})
+    cut = _phase("cut", {"read_cuts": True})
+    uncut = _phase("uncut", {"read_cuts": False})
     # The control must punt, or the check proves nothing: its reads must exceed the device's limit.
     assert uncut["ok"] and uncut["max_len"] > 520192, f"raise hidden/inter: reads of {uncut['max_len']} B"
     assert uncut["workers"] > 0, uncut

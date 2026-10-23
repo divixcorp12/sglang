@@ -1,4 +1,4 @@
-"""The split model's costs (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL), measured at startup and refined while serving.
+"""The split model's costs (cpu_experts.split.model), measured at startup and refined while serving.
 
 The model (ram_slot_map.model_cpu_lanes) prices each record's CPU and copy sides from cost words in ns. None of them is a
 constant: when the model is on, the RAM-miss service measures every one on the loaded model just before it arms the copy
@@ -24,7 +24,7 @@ engine (``calibrate``), publishes the fitted words to the device, and can refine
 
 Guardrails: every fitted value is clamped to its RANGES_MS range, and a value outside it by more than the range's width,
 or not finite, is nonsense (SplitModelCalibrationError): the service then keeps the model off and the split table types
-the lanes, never fixture or offline constants. SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS still names costs for experiments: the
+the lanes, never fixture or offline constants. cpu_experts.split.model_costs still names costs for experiments: the
 ones it names replace the fitted ones, and when it names every cost the calibration does not run.
 """
 
@@ -107,7 +107,7 @@ class SplitModelCosts:
         }
 
     def words(self, overrides: str = "", residency_tiebreak: bool = False) -> list[int]:
-        """The device's cost words (ns) and flags word, the costs ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS)
+        """The device's cost words (ns) and flags word, the costs ``overrides`` (cpu_experts.split.model_costs)
         names replaced."""
         return split_model_words(self.nodes, overrides, base=self.base(), residency_tiebreak=residency_tiebreak)
 
@@ -133,7 +133,7 @@ def costs_from_words(words: Sequence[int], nodes: int) -> SplitModelCosts:
 
 
 def apply_overrides(costs: SplitModelCosts, overrides: str) -> SplitModelCosts:
-    """``costs`` with the ones SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS names replaced, as ms."""
+    """``costs`` with the ones cpu_experts.split.model_costs names replaced, as ms."""
     return costs_from_words(costs.words(overrides), costs.nodes)
 
 
@@ -299,10 +299,10 @@ def refine_fit(moments: Sequence[int], prior: Sequence[float], miss: bool) -> Op
 
 
 class SplitModelRefiner:
-    """The live refinement of the CPU costs (SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES): each ``refine`` fits every
+    """The live refinement of the CPU costs (cpu_experts.split.model_refine_batches): each ``refine`` fits every
     node's hit and miss jobs since the last call (the engines' fit moments) and moves the running costs REFINE_WEIGHT of
     the way to the fit, clamped to RANGES_MS. The copy lane, landing and stream costs keep their startup values: the
-    production host reads no clock on those paths. Costs SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS names stay as named."""
+    production host reads no clock on those paths. Costs cpu_experts.split.model_costs names stay as named."""
 
     def __init__(self, costs: SplitModelCosts, moments: Sequence, overrides: str = ""):
         self.costs = costs

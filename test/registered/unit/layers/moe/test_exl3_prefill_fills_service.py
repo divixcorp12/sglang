@@ -1,9 +1,10 @@
-"""SGLANG_DSV41_ENABLE_PREFILL_FILLS wired through option C (CPU): the native slot table is the pinned tier's
+"""SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS wired through option C (CPU): the native slot table is the pinned tier's
 row_fills, eager reads land from the row images through the service's reader, and the flag is refused where the
 service cannot serve it."""
 
 import contextlib
 import faulthandler
+import json
 import shutil
 
 import pytest
@@ -42,10 +43,10 @@ def _build(tmp_path, *, fills=True, device="cpu"):
     write_row_images(layout, fmt0.segment_map(), str(source), [str(root)])
     stack = contextlib.ExitStack()
     for env, value in (
-        (envs.SGLANG_MOE_EXPERT_ROW_SOURCE, "shards"),
-        (envs.SGLANG_MOE_EXPERT_GRAPH_GATHER, True),
-        (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
-        (envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS, fills),
+        (envs.SGLANG_EXPERT_STREAM_ROW_SOURCE, "shards"),
+        (envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER, True),
+        (envs.SGLANG_EXPERT_STREAM_MIRROR, json.dumps({"dirs": str(root)})),
+        (envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS, fills),
     ):
         stack.enter_context(env.override(value))
     module.ExpertEngineService._instance = None
@@ -137,7 +138,7 @@ def test_the_flag_is_refused_without_the_native_slot_table(tmp_path):
     layer = torch.nn.Module()
     layer.layer_id = 0
     fmt = Exl3ExpertFormat(layout, 0, direct=False, source_root=str(tmp_path))
-    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(False), envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(False), envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS.override(True):
         with pytest.raises(RuntimeError, match="GRAPH_GATHER"):
             fmt.pinned_tier_options(layer)
 

@@ -2,8 +2,8 @@
 # Bit-exact gate for a change to the NVFP4 CPU expert kernel, on divix01 (CPU only, no GPU lock).
 #   run_nvfp4_cpu_forward_checks.sh WORKTREE OUT              build from WORKTREE, dump every variant into OUT
 #   run_nvfp4_cpu_forward_checks.sh WORKTREE OUT BASE_OUT     ... then compare each dump bitwise with BASE_OUT's
-# Variants, both from one build: avx2 (the AVX2 tier) and scalar (NVFP4_CPU_MAX_ISA=scalar). Each run must report the
-# tier it names (NVFP4_CPU_REPORT_ISA=1), so an avx2 run on a host without AVX2 fails instead of dumping scalar output.
+# Variants, both from one build: avx2 (the AVX2 tier) and scalar (SGLANG_EXPERT_STREAM_CPU_MAX_ISA=scalar). Each run must report the
+# tier it names (SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1), so an avx2 run on a host without AVX2 fails instead of dumping scalar output.
 # CXX defaults to GCC 15; NVFP4_AB_CORES to 0-7 (NUMA node 0).
 # NVFP4_AB_BASE_NAMES names BASE_OUT's dumps for avx2,scalar (default avx2,scalar). Baselines from before the runtime
 # tiers named them native,portable: NVFP4_AB_BASE_NAMES=native,portable.
@@ -28,7 +28,7 @@ fi
 fail=0
 for i in "${!variants[@]}"; do
   variant=${variants[$i]}; base_name=${base_names[$i]}
-  if ! NVFP4_CPU_MAX_ISA=$variant NVFP4_CPU_REPORT_ISA=1 OMP_WAIT_POLICY=ACTIVE taskset -c "$cores" \
+  if ! SGLANG_EXPERT_STREAM_CPU_MAX_ISA=$variant SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1 OMP_WAIT_POLICY=ACTIVE taskset -c "$cores" \
       "$exe" "$out/$variant.bin" ${cores//,/ } > "$out/run-$variant.log" 2>&1; then
     echo "FAIL $variant: run (see $out/run-$variant.log)"; fail=1; continue
   fi

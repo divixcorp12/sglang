@@ -25,13 +25,14 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, **json.loads(args.reference.read_text())}
     for k in tuple(env):
-        if k.startswith(("SGLANG_DSV41_EXPERT_JOB_TRACE", "SGLANG_EXL3_CPU_WORKER_TRACE")) or k == "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE":
+        if k == "SGLANG_EXPERT_STREAM_TRACE":
             env.pop(k)
     root = Path(__file__).resolve().parents[3]
     env.update(PYTHONPATH=str(root / "python"), OMP_NUM_THREADS="10", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
-               MAX_JOBS="4", EXL3_MOE_CPU_PIN="0", SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=str(args.output / "unused-events"),
-               SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=str(args.output / "worker-phases"),
-               SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US="0", SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="131072")
+               MAX_JOBS="4", SGLANG_EXL3_MOE_CPU_PIN="0",
+               SGLANG_EXPERT_STREAM_TRACE=json.dumps({
+                   "job": {"prefix": str(args.output / "unused-events")},
+                   "cpu_worker": {"prefix": str(args.output / "worker-phases"), "min_us": 0, "capacity": 131072}}))
     ready, start = args.output / "ready.json", args.output / "start"
     command = [sys.executable, str(Path(__file__).with_name("exl3_cpu_stall_measure.py")), "arm", "--measurement", "wake",
                "--group", "1", "--reps", "100", "--warmups", "5", "--library", str(args.library),

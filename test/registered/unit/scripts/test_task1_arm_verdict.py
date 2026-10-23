@@ -22,7 +22,7 @@ MIRRORS = "/mnt/nvme0/x:/mnt/nvme4/x"
 
 
 def _report(mirror=True, traced=True):
-    env = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "1"}
+    env = {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1"}
     if mirror:
         env[verdict.MIRRORS_ENV] = MIRRORS
     if traced:
@@ -34,7 +34,7 @@ def _report(mirror=True, traced=True):
             "git": {"head": HEAD, "dirty": False, "untracked_in_package_count": 0},
             "unavailable": {},
             "sglang_env": env,
-            "sglang_env_resolved": {verdict.READER: "uring_direct", "SGLANG_MOE_EXPERT_GRAPH_GATHER": True},
+            "sglang_env_resolved": {verdict.READER: "uring_direct", "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": True},
             "drive_idle_check": {"idle": True},
             "sglang_env_drift_at_engine_ready": {},
         },
@@ -85,7 +85,7 @@ def test_each_way_an_arm_can_be_unattributable_is_named(mutation, needle):
 def test_a_filter_that_over_redacts_fails_the_arm():
     """Bug: the first Task 1 arm lost 35 knob values to a substring TOKEN filter and still passed."""
     r = _report()
-    r["provenance"]["sglang_env_resolved"]["SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS"] = verdict.REDACTED
+    r["provenance"]["sglang_env_resolved"]["SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS"] = verdict.REDACTED
     r["provenance"]["sglang_env_resolved"]["EXA_API_KEY"] = verdict.REDACTED  # a real secret is fine
     problems, _ = _check(r)
     assert any("PREFILL_TOKENS" in p and "not secrets" in p for p in problems)

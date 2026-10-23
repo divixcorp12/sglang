@@ -11,9 +11,8 @@ Graph mode is refused when the arm runs the RAM-miss copy engine: graph-mode CUP
 from __future__ import annotations
 
 GRAPH_TRACE_MODES = ("graph", "node")
-COPY_ENGINE_ENV = "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"
-# The spellings sglang's EnvBool reads as true (python/sglang/srt/environ.py).
-_TRUE = ("true", "1", "yes", "y")
+COPY_ENGINE_ENV = "SGLANG_EXPERT_STREAM_COPY_MODE"
+COPY_ENGINE_VALUE = "copy_engine"
 # nsys scratch and reports go here, never to divix01's root volume (~88% full): a full capture exhausts /tmp there
 # and the server dies mid-run with a ~361 KB report (CLAUDE.md, DSV41_REFERENCE.md section 22).
 NSYS_TMPDIR = "/mnt/nvme1/nsys-tmp"
@@ -72,7 +71,7 @@ def gpu_metrics_unavailable(devices_help: str) -> str | None:
 
 
 def copy_engine_on(env: dict[str, str]) -> bool:
-    return env.get(COPY_ENGINE_ENV, "").strip().lower() in _TRUE
+    return env.get(COPY_ENGINE_ENV, "").strip().lower() == COPY_ENGINE_VALUE
 
 
 def graph_trace_mode(requested: str | None, env: dict[str, str]) -> str:

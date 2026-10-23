@@ -933,8 +933,12 @@ class VerifyMarkers:
         self._begin_ns = 0
 
     @classmethod
-    def from_env(cls, tp_rank: int) -> Optional["VerifyMarkers"]:
-        prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
+    def from_env(cls, tp_rank: int, *, prefix: Optional[str] = None) -> Optional["VerifyMarkers"]:
+        """The markers beside the job trace at ``prefix`` (``trace.job.prefix``; None resolves the process's)."""
+        if prefix is None:
+            from sglang.srt.layers.moe.expert_engine.config import stream_config
+
+            prefix = stream_config().trace.job.prefix
         if not prefix or tp_rank != 0:
             return None
         return cls(f"{prefix}.{os.getpid()}.verify.jsonl")

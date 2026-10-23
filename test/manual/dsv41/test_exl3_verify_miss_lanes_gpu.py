@@ -45,10 +45,10 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
     try:
         with (
             service_row_images(tmp_path),
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
-            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
+            envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused),
             envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused),
         ):
             model = torch.nn.Module()

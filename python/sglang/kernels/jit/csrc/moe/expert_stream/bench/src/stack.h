@@ -109,7 +109,7 @@ struct StackConfig {
   int64_t out_stride = 0;  // bytes; two parts of `hidden` floats per group per row, group g's at [2 g, 2 g + 2) parts
   int64_t hidden = 0;
   int copy_cpu = -1;
-  int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)
+  int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS)
   int64_t fatal_wait_ns = 30'000'000'000;   // the watchdog's hung-request deadline
   size_t trace_capacity = 0;  // InstrBuild: the stage trace's ring, 0 off
 };
@@ -148,7 +148,7 @@ class Stack {
         /*hot_page=*/nullptr,
         0,
         group_ranges(),
-        std::vector<int>(es::Wire::kNodes, -2));  // -2: the ring's SQPOLL core stays the uring env's, as before NUMA groups
+        std::vector<int>(es::Wire::kNodes, -2));  // -2: the ring's SQPOLL core stays the uring options', as before NUMA groups
     if (!tier_->open()) throw std::runtime_error("the tier's reader did not open (its error is on stderr)");
     tier_->reserve_staging(config_.staging);
     // The copy engine's thread and RamThread's watchdog inherit this thread's affinity: the copy CPU.

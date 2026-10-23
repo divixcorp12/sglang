@@ -1,5 +1,5 @@
 """The per-drive in-flight cap (design 2026-10-09-dsv41-drive-aware-reads, change (3), counts only): with
-SGLANG_MOE_EXPERT_MIRROR_DYNAMIC each piece-stream sub-read picks its mirror root when it is first prepared. A root is
+SGLANG_EXPERT_STREAM_MIRROR {"dynamic": true} each piece-stream sub-read picks its mirror root when it is first prepared. A root is
 open while its sub-reads in flight (demand and speculative, every reader of the tier's DriveLoad) are below its cap;
 among the open roots the one with the fewest bytes in flight wins, ties going to the sub-read's own root, and with every
 root at its cap the sub-read keeps its own root (never blocks). Only the file changes: offset, length and destination

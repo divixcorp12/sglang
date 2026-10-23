@@ -151,11 +151,11 @@ def test_a_server_affinity_covering_a_node_is_refused(divix01):
         ({"numa_cores": "1:ram=35,cpu=18-33,sq=34"}, "node 1 sets an SQPOLL core, but .* is not sqpoll"),
         (
             {"numa_cores": "1:ram=34,cpu=18-33", "spin_core": 35},
-            "node 1's RAM core is set both by SGLANG_DSV41_RAM_MISS_SPIN_CORE and SGLANG_EXPERT_NUMA_CORES",
+            "node 1's RAM core is set both by SGLANG_EXPERT_STREAM_NUMA_CORES and SGLANG_EXPERT_STREAM_NUMA_CORES",
         ),
         (
             {"numa_cores": "0:sq=15,cpu=8-14", "nodes": (0,), "sq_thread_cpu": 14},
-            "node 0's SQPOLL core is set both by SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU and SGLANG_EXPERT_NUMA_CORES",
+            "node 0's SQPOLL core is set both by SGLANG_EXPERT_STREAM_NUMA_CORES and SGLANG_EXPERT_STREAM_NUMA_CORES",
         ),
     ],
 )
@@ -186,7 +186,7 @@ def test_an_engine_core_refusal_names_the_node(divix01):
 )
 def test_a_malformed_core_list_names_the_variable_and_the_entry(spec, entry):
     """Mutation: parse_cpu_list's bare `invalid literal for int()` escapes."""
-    with pytest.raises(ValueError, match=r"SGLANG_EXPERT_NUMA_CORES") as caught:
+    with pytest.raises(ValueError, match=r"SGLANG_EXPERT_STREAM_NUMA_CORES") as caught:
         parse_numa_cores(spec)
     assert entry in str(caught.value) and "invalid literal" not in str(caught.value)
 
@@ -243,18 +243,15 @@ def test_from_env_reads_every_core_setting(monkeypatch):
     monkeypatch.setattr(Topology, "from_sysfs", classmethod(lambda cls, root=tc.SYSFS: "topology"))
     monkeypatch.setattr(tc, "_affinity", lambda: frozenset({0, 1}))
     monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
-    with envs.SGLANG_DSV41_CPU_EXPERTS_CORES.override("18-29"), \
-            envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.override(4), \
-            envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT.override(True), \
-            envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.override(17), \
-            envs.SGLANG_EXPERT_STREAM_URING_MODE.override("sqpoll_iopoll"), \
-            envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.override(15), \
-            envs.SGLANG_EXPERT_NUMA_CORES.override("1:ram=35,cpu=18-33"), \
-            envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"), \
-            envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.override(True), \
-            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override("6-11"), \
-            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.override(3), \
-            envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
+    with envs.SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS.override(4), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT.override(True), \
+            envs.SGLANG_EXPERT_STREAM_URING.override('{"mode": "sqpoll_iopoll"}'), \
+            envs.SGLANG_EXPERT_STREAM_NUMA_CORES.override("1:ram=35,cpu=18-33,sq=15"), \
+            envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS.override(True), \
+            envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override("6-11"), \
+            envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS.override(3), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True):
         assert ThreadingConfig.from_env(cpu_experts=True, device=None) == "resolved"
     assert seen == {
         "nodes": [1, 0],
@@ -279,11 +276,11 @@ def test_from_env_gives_the_ram_prefetch_no_cores_when_every_streamed_layer_is_f
     monkeypatch.setattr(tc, "_affinity", lambda: frozenset({0, 1}))
     monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
     monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0"):
             ThreadingConfig.from_env(cpu_experts=True, device=None)
             assert seen["settings"].ram_prefetch is True
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
             ThreadingConfig.from_env(cpu_experts=True, device=None)
             assert seen["settings"].ram_prefetch is False
 
@@ -478,7 +475,7 @@ def test_without_the_spin_core_the_8280_derives_the_same_ram_cores(xeon8280):
     assert [p.ram for p in config.plans] == [26, 51] and config.copy_cpus == (27,)
 
 
-# --- SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: each pool core's SMT sibling joins the pool, after the cores ---
+# --- SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT: each pool core's SMT sibling joins the pool, after the cores ---
 
 
 def test_smt_adds_each_pool_cores_sibling_after_the_cores(xeon8280):
@@ -512,7 +509,7 @@ def test_smt_applies_to_named_cpu_cores(xeon8280):
 def test_smt_refuses_a_sibling_in_the_servers_affinity(xeon8280):
     """The server's affinity reaching 62 and 63, the siblings of cores 6 and 7. The copy thread takes 7 (it prefers a
     core whose sibling is the server's), so pool core 6 brings 62, which the pool cannot take."""
-    with pytest.raises(ValueError, match=r"node 0: SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT adds core 6's SMT sibling 62"):
+    with pytest.raises(ValueError, match=r"node 0: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT adds core 6's SMT sibling 62"):
         resolve(xeon8280, affinity=SERVER_8280 | {62, 63}, cpu_experts=True, threads=10, smt=True, spin_core=26)
 
 

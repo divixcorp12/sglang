@@ -48,7 +48,7 @@ The rest of this file describes the harness as built, with DSV4.1 figures (~360 
 
 ## The GRAPH_GATHER trap
 
-The phase3a `env.sh` sets `SGLANG_MOE_EXPERT_GRAPH_GATHER=0` and decodes eagerly. Lease mode lives in the
+The phase3a `env.sh` sets `SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0` and decodes eagerly. Lease mode lives in the
 in-graph RAM-miss path (`Exl3RamMissRowBackend.post` runs it only from a captured decode graph). Launch with
 that recipe and both arms take the eager path: they report the same number, and the delta is zero because the
 switch reached nothing. This harness uses `GRAPH_GATHER=1` (the phase3b `env-full.sh` override) with a
@@ -172,7 +172,7 @@ arms' fractions differ by more than 5 points it warns, because then they did dif
 
 The service lives in the scheduler subprocess, so the driver cannot call `service.host.counters()` as
 `open11_serving_path.py` does. The channel that exists is the stream trace: `bench_arm.py` sets
-`SGLANG_DSV41_EXPERT_TRACE_PATH`, each decode graph step appends the service's cumulative counters, and
+the `expert_path` key of `SGLANG_EXPERT_STREAM_TRACE`, each decode graph step appends the service's cumulative counters, and
 `counters.verify_lease` reads them (line-buffered, so the scheduler's SIGKILL at shutdown loses nothing).
 
 - both arms: at least one decode graph step reached the trace, the service served requests, `read_errors == 0`, and
@@ -199,8 +199,8 @@ the verification with it.
 
 ## Fixed choices, and where they come from
 
-Model `dsv41-full40`, experts `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw`, `SGLANG_MOE_HOT_GPU_MB=14336`,
-`--mem-fraction-static 0.80`, no mirror dirs (`--mirror-dirs` adds `SGLANG_MOE_EXPERT_MIRROR_DIRS`): phase3a `env.sh`
-and phase3b `prof-graph.sh`. `SGLANG_MOE_HOT_GPU_MB=16384` failed on this card
+Model `dsv41-full40`, experts `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw`, `SGLANG_EXPERT_STREAM_HOT_GPU_MB=14336`,
+`--mem-fraction-static 0.80`, no mirror dirs (`--mirror-dirs` adds the `dirs` key of `SGLANG_EXPERT_STREAM_MIRROR`): phase3a `env.sh`
+and phase3b `prof-graph.sh`. `SGLANG_EXPERT_STREAM_HOT_GPU_MB=16384` failed on this card
 (`analysis/dsv41-phase3a/smoke-attempt1-hot16384.log`). Engine kwargs are `scripts/dsv41/trace_corpus.engine_kwargs`
 with `--graphs`, the launch the EXL3 gate was written for.

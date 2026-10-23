@@ -167,12 +167,12 @@ def test_reader_mode_follows_the_file_reader_knob(tmp_path):
     layout = _checkpoint(tmp_path)
     fmt = Exl3ExpertFormat(layout, 0)
     specs = fmt.tensor_specs(None)
-    with envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"):
-        with pytest.raises(ValueError, match="SGLANG_MOE_EXPERT_FILE_READER=uring_direct"):
+    with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("mmap"):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_FILE_READER=uring_direct"):
             fmt.default_row_source(None, specs, "shards")
-    with envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring_direct"):
+    with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring_direct"):
         assert fmt.default_row_source(None, specs, "shards").reader is shared_row_reader(layout, True)
-    with envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"):
+    with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"):
         assert fmt.default_row_source(None, specs, "shards").reader is shared_row_reader(layout, False)
 
 
@@ -210,7 +210,7 @@ def test_streamer_reads_shards_through_a_cpu_pinned_tier(tmp_path):
     layer = torch.nn.Module()
     layer.layer_id = 1
     fmt = Exl3ExpertFormat(layout, 1)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"):
+    with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"):
         streamer = ExpertStreamer(layer, fmt.names, layer_id=1, format=fmt)
     assert isinstance(streamer.row_source, Exl3ShardRowSource)
     assert streamer.has_spec_only_tensors
@@ -234,7 +234,7 @@ def test_an_inclusive_cpu_pinned_tier_keeps_hot_experts(tmp_path):
     layer = torch.nn.Module()
     layer.layer_id = 1
     fmt = Exl3ExpertFormat(layout, 1, direct=False)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+    with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
         streamer = ExpertStreamer(layer, fmt.names, layer_id=1, format=fmt)
     layer._nvfp4_expert_streamer = streamer
     cache = ExpertPinnedHostCache(streamer, 3, device="cpu", **fmt.pinned_tier_options(layer))

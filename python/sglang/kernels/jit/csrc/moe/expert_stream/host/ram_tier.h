@@ -719,7 +719,7 @@ class RamTier {
     }
   }
 
-  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC: every group's reader picks each sub-read's root under `caps`, one in-flight cap
+  // SGLANG_EXPERT_STREAM_MIRROR dynamic: every group's reader picks each sub-read's root under `caps`, one in-flight cap
   // per mirror root (ReaderCore::set_mirror_caps); empty turns it off. Demand and speculative reads both go through
   // the groups' readers, so both choose. On the owner (before the thread starts, or paused).
   void set_mirror_caps(std::span<const int64_t> caps) {
@@ -823,7 +823,7 @@ class RamTier {
   CpuExpertEngine& draft_cpu(int g) {
     if (g < 0 || g >= groups() || dist_.group(g).cpu == nullptr)
       throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "group " + std::to_string(g) +
-                               " has no CPU expert engine (SGLANG_DSV41_CPU_EXPERTS)");
+                               " has no CPU expert engine (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS)");
     return *dist_.group(g).cpu;
   }
   std::array<std::unique_ptr<DraftSource>, Wire::kNodes> pending_draft_;

@@ -51,7 +51,7 @@ def _built_tiers(tmp_path, monkeypatch, capacities):
     module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     streamers = {}
     with service_row_images(tmp_path):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
@@ -164,12 +164,12 @@ def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
 def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_all(
     tmp_path, monkeypatch, extra, refused
 ):
-    """SGLANG_MOE_PINNED_HOST_FULL_LAYERS: the host keeps a row's staging slot out of assign, so a tier of exactly
+    """SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS: the host keeps a row's staging slot out of assign, so a tier of exactly
     the expert count cannot map them all and start refuses it; one slot more maps every expert at attach, and a layer
     not listed is not filled. Mutations: the check ignoring staging, or attach skipping the fill -- red."""
     # The device side's map apply is a CUDA kernel; the host's map is what is under test.
     monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, entries: None)
-    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0"):
         for service, streamers in _built_tiers(tmp_path, monkeypatch, [EXPERTS + extra, CAPACITY]):
             if refused:
                 with pytest.raises(ValueError, match=r"short of every expert"):
@@ -227,8 +227,9 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
 def test_cpu_experts_refuse_the_generic_route_plan():
     """Only the fused plan sorts the miss lanes; refused before the host is touched."""
     cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
-        with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
+    with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False):
+        with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"):
             module.ExpertEngineService._start_cpu_experts(cfg, None, None, {}, False, None)
 
 
@@ -397,7 +398,7 @@ def test_victim_lanes_stage_their_width_not_the_lanes(tiers):
     """Spill: the post types up to 36 lanes, but only the V victim lanes stage (a forced miss never does), so a row
     reserves V staging slots (Exl3ExpertFormat.plan_graph_gather plans it)."""
     service, streamers = tiers
-    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(2):
+    with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(2):
         streamers[0].format.plan_graph_gather(streamers[0], 36)
     assert service.resolved_lanes() == 40
     assert service.staging_width() == 2
@@ -528,13 +529,13 @@ def test_held_back_slots_drop_the_pool_when_every_streamed_layer_is_full(monkeyp
     from sglang.srt.layers.moe import expert_stream
 
     monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
-    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(0), \
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.override(8), \
-            envs.SGLANG_DSV41_RAM_PREFETCH.override(True), \
-            envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+    with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(0), \
+            envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES.override(8), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), \
+            envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(2):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
             assert row_backend.NativePinnedSlotTable.held_back_per_group(None) == 10
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
             assert row_backend.NativePinnedSlotTable.held_back_per_group(None) == 8
 
 

@@ -1,6 +1,6 @@
 """EXL3 expert streaming applies only to the target model's routed experts:
 the DSpark draft's stages (module names like ``stages.<S>.mlp.experts``) must
-load resident even when SGLANG_DSV41_EXPERT_STREAM is on."""
+load resident even when SGLANG_EXPERT_STREAM_ENABLE is on."""
 
 import pytest
 import torch
@@ -38,7 +38,7 @@ def test_only_target_routed_experts_stream(prefix, expected):
 
 def test_a_non_streamed_module_never_streams_even_with_the_env_on():
     layer = torch.nn.Module()
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True):
         method = Exl3MoEMethod(Exl3Config(3.0, 6, "mul1", "1.4"), streamed=False)
         method.create_weights(layer, 128, 64, 32, torch.bfloat16)
     assert layer.exl3_streamed is False
@@ -52,7 +52,7 @@ def test_draft_routes_are_appended_one_json_line_per_call(tmp_path):
 
     path = tmp_path / "routes.jsonl"
     ids = torch.tensor([[3, 7, 9], [3, 1, 2]], dtype=torch.int32)
-    with envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.override(str(path)):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"draft_routes_path": str(path)})):
         record_draft_routes(1, ids)
         record_draft_routes(2, ids[:1])
     lines = [json.loads(line) for line in path.read_text().splitlines()]
@@ -65,7 +65,7 @@ def test_draft_routes_are_appended_one_json_line_per_call(tmp_path):
 def test_draft_routes_are_not_written_when_the_path_is_unset(tmp_path):
     from sglang.srt.layers.quantization.exl3.exl3 import record_draft_routes
 
-    with envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.override(""):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(""):
         record_draft_routes(1, torch.zeros(1, 3, dtype=torch.int32))
     assert list(tmp_path.iterdir()) == []
 

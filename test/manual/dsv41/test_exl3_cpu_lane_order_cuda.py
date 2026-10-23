@@ -45,7 +45,7 @@ PART_HITS, PART_MISSES = 1, 2  # CC's cpu_lanes[1] bits: which CPU output part h
 
 @pytest.mark.parametrize("miss", [False, True], ids=["ram_hit", "nvme_miss"])
 def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_coldest_victim(tmp_path, miss):
-    """``miss``: the low-key expert is not in the RAM tier either, and SGLANG_DSV41_CPU_EXPERTS_MISSES is on. It is
+    """``miss``: the low-key expert is not in the RAM tier either, and SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES is on. It is
     typed kMissCpu, read into its staging slot, computed there by the CPU into part 1, inserted in the RAM tier by the
     record's delta, and still left out of VRAM by DIRECT's commit. Mutations: the miss is computed before its read
     landed (the forward sees the wrong slot's bytes -- here: the late job never runs, and the forward count is 0); CC

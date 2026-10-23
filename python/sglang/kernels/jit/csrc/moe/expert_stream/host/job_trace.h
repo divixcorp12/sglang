@@ -3,10 +3,10 @@
 
 #include "build_policy.h"
 #include "trace_gate.h"
+#include "trace_options.h"
 #include <time.h>
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -21,34 +21,29 @@ void sglang_draft_delay_trigger(uint32_t seq, int64_t delay_ns, int reason) {
   asm volatile("" : : "r"(seq), "r"(delay_ns), "r"(reason) : "memory");
 }
 
-#ifndef SGLANG_DRAFT_DELAY_TRIGGER_ONLY
-#define SGLANG_DRAFT_DELAY_TRIGGER_ONLY 0
+// The trigger-only host build (SGLANG_EXPERT_STREAM_TRACE's draft_trigger.trigger_only selects it in Python).
+#ifndef SGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY
+#define SGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY 0
 #endif
-inline constexpr bool kDraftDelayTriggerOnly = SGLANG_DRAFT_DELAY_TRIGGER_ONLY != 0;
+inline constexpr bool kDraftDelayTriggerOnly = SGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY != 0;
 
 // Independent of Build::kMetrics: reuse the production forward clocks, with no
 // event buffers, counters or extra clock reads. The default specialization is empty.
+// The name-only constructors copy the module's installed TraceOptions (trace_options.h).
 template <bool On> class DraftDelayTrigger;
 template <> class DraftDelayTrigger<false> {
  public:
   explicit DraftDelayTrigger(const std::string&) {}
+  DraftDelayTrigger(const std::string&, const TraceOptions&) {}
   void finished(uint32_t, int64_t) {}
 };
 template <> class DraftDelayTrigger<true> {
  public:
-  explicit DraftDelayTrigger(const std::string& name) {
-    if (const char* value = std::getenv("SGLANG_DRAFT_FORWARD_TRIGGER_US")) {
-      const std::string_view text(value);
-      if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
-        throw std::invalid_argument("SGLANG_DRAFT_FORWARD_TRIGGER_US must be an integer in [0, 1000000000]");
-      char* end = nullptr;
-      const auto parsed = std::strtoull(value, &end, 10);
-      if (*end || parsed > 1000000000)
-        throw std::invalid_argument("SGLANG_DRAFT_FORWARD_TRIGGER_US must be an integer in [0, 1000000000]");
-      threshold_ns_ = static_cast<int64_t>(parsed) * 1000;
-    }
-    if (const char* prefix = std::getenv("SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX"); prefix && *prefix)
-      report_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + ".json";
+  explicit DraftDelayTrigger(const std::string& name) : DraftDelayTrigger(name, installed_trace_options()) {}
+  DraftDelayTrigger(const std::string& name, const TraceOptions& options) : gate_(options.gate_path) {
+    threshold_ns_ = trigger_threshold_ns(options.forward_us, "forward_us");
+    if (!options.trigger_report_prefix.empty())
+      report_ = options.trigger_report_prefix + "." + std::to_string(getpid()) + "." + name + ".json";
   }
   ~DraftDelayTrigger() {
     if (report_.empty()) return;
@@ -80,6 +75,7 @@ template <>
 class JobTrace<false> {
  public:
   explicit JobTrace(const std::string&) {}
+  JobTrace(const std::string&, const TraceOptions&) {}
   bool enabled() const { return false; }
   void emit(const char*, int64_t, uint64_t, uint32_t, int, int64_t = 0, int64_t = 0, int64_t = 0) {}
   void resources(const char*, const char*, int64_t, uint64_t, uint32_t) {}
@@ -90,27 +86,19 @@ class JobTrace<false> {
 template <>
 class JobTrace<true> {
  public:
-  explicit JobTrace(const std::string& name) {
-    const char* prefix = std::getenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX");
-    if (!prefix || !*prefix) return;
-    path_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + "." +
+  explicit JobTrace(const std::string& name) : JobTrace(name, installed_trace_options()) {}
+  JobTrace(const std::string& name, const TraceOptions& options) : gate_(options.gate_path) {
+    if (options.job_prefix.empty()) return;
+    path_ = options.job_prefix + "." + std::to_string(getpid()) + "." + name + "." +
             std::to_string(instances_.fetch_add(1, std::memory_order_relaxed)) + ".jsonl";
-    if (const char* value = std::getenv("SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY")) {
-      const std::string_view text(value);
-      if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
-        throw std::invalid_argument("expert job trace capacity must be an integer in [1, 1048576]");
-      char* end = nullptr;
-      const unsigned long long parsed = std::strtoull(value, &end, 10);
-      if (*end || parsed < 1 || parsed > 1048576)
-        throw std::invalid_argument("expert job trace capacity must be an integer in [1, 1048576]");
-      capacity_ = static_cast<size_t>(parsed);
-    }
-    pending_threshold_ = threshold("SGLANG_DRAFT_PENDING_TRIGGER_US");
-    arrival_threshold_ = threshold("SGLANG_DRAFT_ARRIVAL_TRIGGER_US");
-    forward_threshold_ = threshold("SGLANG_DRAFT_FORWARD_TRIGGER_US");
+    if (options.job_capacity < 1 || options.job_capacity > 1048576)
+      throw std::invalid_argument("expert job trace capacity must be an integer in [1, 1048576]");
+    capacity_ = static_cast<size_t>(options.job_capacity);
+    pending_threshold_ = trigger_threshold_ns(options.pending_us, "pending_us");
+    arrival_threshold_ = trigger_threshold_ns(options.arrival_us, "arrival_us");
+    forward_threshold_ = trigger_threshold_ns(options.forward_us, "forward_us");
     events_ = std::make_unique<Event[]>(capacity_);
-    const char* resources = std::getenv("SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE");
-    resources_ = resources && std::string_view(resources) == "1";
+    resources_ = options.job_resources;
     monotonic_ns_ = clock_ns();
     timespec wall{};
     clock_gettime(CLOCK_REALTIME, &wall);
@@ -192,18 +180,6 @@ class JobTrace<true> {
     emit(switches, row, gen, seq, -1, usage.ru_nvcsw, usage.ru_nivcsw, cpu_ns);
   }
  private:
-  static int64_t threshold(const char* name) {
-    const char* value = std::getenv(name);
-    if (!value) return 0;
-    const std::string_view text(value);
-    if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
-      throw std::invalid_argument(std::string(name) + " must be an integer in [0, 1000000000]");
-    char* end = nullptr;
-    const auto parsed = std::strtoull(value, &end, 10);
-    if (*end || parsed > 1000000000)
-      throw std::invalid_argument(std::string(name) + " must be an integer in [0, 1000000000]");
-    return static_cast<int64_t>(parsed) * 1000;
-  }
   void trigger(int reason, int64_t elapsed, int64_t threshold_ns, int stage, uint32_t epoch, uint32_t seq) {
     if (!threshold_ns || elapsed < threshold_ns || triggered_) return;
     triggered_ = true;  // one snapshot per engine; admission gate keeps warm-up from consuming it

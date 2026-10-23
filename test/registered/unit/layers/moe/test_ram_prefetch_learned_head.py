@@ -154,13 +154,13 @@ def test_serving_head_holds_static_buffers(tmp_path):
 
 
 LAUNCH_ENV = {
-    "SGLANG_DSV41_RAM_PREFETCH": True,
-    "SGLANG_DSV41_CPU_EXPERTS": True,
-    "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": True,
-    "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu",
-    "SGLANG_DSV41_RAM_PREFETCH_HORIZON": 2,
+    "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": True,
+    "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": True,
+    "SGLANG_EXPERT_STREAM_COPY_MODE": "copy_engine",
+    "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "gpu",
+    "SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON": 2,
     "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
-    "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": 1,
+    "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": 1,
 }  # fmt: skip
 
 
@@ -179,25 +179,25 @@ def test_gate_accepts_a_complete_learned_head_launch(tmp_path):
 
 def test_gate_refuses_the_head_without_the_prefetch(tmp_path):
     """Mutant: the prefetch-off early return skips the head check; the variable would pass unused."""
-    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH=1"):
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
         _gate(
             _write(tmp_path),
-            SGLANG_DSV41_RAM_PREFETCH=False,
-            SGLANG_DSV41_RAM_PREFETCH_HORIZON=1,
-            SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu",
+            SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=False,
+            SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=1,
+            SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="cpu",
         )
 
 
 def test_gate_refuses_the_head_with_the_cpu_scorer(tmp_path):
     """Mutant: the scorer condition is dropped; the head would be set but the CPU scorer would run."""
-    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu"):
-        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu"):
+        _gate(_write(tmp_path), SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="cpu")
 
 
 def test_gate_refuses_the_head_at_horizon_one(tmp_path):
     """Mutant: the horizon condition is dropped; an L+2 head would score L+1 targets."""
-    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_HORIZON=2"):
-        _gate(_write(tmp_path), SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+    with pytest.raises(ValueError, match="LEARNED_HEAD needs SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=2"):
+        _gate(_write(tmp_path), SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=1)
 
 
 def test_gate_refuses_the_head_with_a_floors_table(tmp_path):
@@ -212,9 +212,9 @@ def test_gate_takes_per_layer_up_to_the_heads_picks(tmp_path):
     """The head publishes at most HEAD_MAX_PICKS (3) blocks per record. Mutant: the per-layer condition is dropped (4
     would launch and silently read 3) or still pinned to 1 (the cap-2 and cap-3 arms are refused)."""
     path = _write(tmp_path)
-    _gate(path, SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=3)
-    with pytest.raises(ValueError, match=r"LEARNED_HEAD needs SGLANG_DSV41_RAM_PREFETCH_PER_LAYER in 1\.\.3, got 4"):
-        _gate(path, SGLANG_DSV41_RAM_PREFETCH_PER_LAYER=4)
+    _gate(path, SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER=3)
+    with pytest.raises(ValueError, match=r"LEARNED_HEAD needs SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER in 1\.\.3, got 4"):
+        _gate(path, SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER=4)
 
 
 def test_gate_refuses_an_unreadable_head_file(tmp_path):
@@ -232,7 +232,7 @@ def test_gate_refuses_a_head_file_of_another_format_version(tmp_path):
 
 def test_gate_ignores_an_empty_head_variable():
     """Mutant: '' is treated as a path; the off state (unset or empty) would refuse launches."""
-    _gate("", SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu", SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+    _gate("", SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="cpu", SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=1)
 
 
 def _enable(path: str, host) -> GpuScorer:
@@ -247,8 +247,8 @@ def _enable(path: str, host) -> GpuScorer:
         register_router_gate(2, w, torch.arange(4, dtype=torch.float32), 6)
         with ExitStack() as stack:
             for name, value in (
-                ("SGLANG_DSV41_RAM_PREFETCH_SCORER", "gpu"),
-                ("SGLANG_DSV41_RAM_PREFETCH_HORIZON", 2),
+                ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER", "gpu"),
+                ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON", 2),
                 ("SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS", ""),
                 ("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD", path),
             ):
@@ -286,11 +286,11 @@ def test_enable_returns_the_learned_head_and_logs_it(tmp_path, caplog):
 
 
 def test_per_layer_reaches_the_serving_heads_picks(tmp_path):
-    """The kernel's pick count comes from SGLANG_DSV41_RAM_PREFETCH_PER_LAYER through GpuScorer and serving_head.
+    """The kernel's pick count comes from SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER through GpuScorer and serving_head.
     Mutant: either hop drops it; a cap-2 launch would publish one block and the host would read one row per layer."""
     host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: None)
     path = _write(tmp_path, tensors=_tensors(rows=1), meta=_meta(rows=(head_file.HeadRow(0, 2, 0),)))
-    with envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.override(2):
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER.override(2):
         scorer = _enable(path, host)
     assert scorer.per_layer == 2
     serving = head_file.serving_head(scorer.learned_head, device="cpu", top_k=3, picks=scorer.per_layer)

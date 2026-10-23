@@ -3,6 +3,7 @@ check, residency pushes and the per-step graph trace (CPU; the thread runs, no d
 
 import contextlib
 import faulthandler
+import json
 import os
 import shutil
 import time
@@ -56,11 +57,11 @@ def tiers(tmp_path, monkeypatch):
     streamers, caches = {}, {}
     with contextlib.ExitStack() as stack:
         stack.enter_context(service_row_images(tmp_path))
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
-                # No ``direct`` with images: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
+                # No ``direct`` with images: SGLANG_EXPERT_STREAM_FILE_READER=uring_direct decides it, as in production.
                 fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
@@ -122,9 +123,9 @@ def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_pat
         shutil.copytree(tmp_path, root)
     fmt = streamers[1].format
     write_row_images(fmt.layout, fmt.segment_map(), str(tmp_path), [str(root) for root in roots])
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(os.pathsep.join(map(str, roots))):
-        with envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override("3:1"):
-            caches[1].ensure_rows(torch.tensor([4, 2]))
+    mirror = {"dirs": os.pathsep.join(map(str, roots)), "weights": "3:1"}
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps(mirror)):
+        caches[1].ensure_rows(torch.tensor([4, 2]))
     tables = service.host.tables
     assert tables.parts == 2
     assert all(path.startswith(str(root)) for path, root in zip(tables.paths, roots * len(tables.paths)))
@@ -139,7 +140,7 @@ def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_pat
 
 def test_the_service_refuses_a_mirror_configuration_the_eager_source_refuses(tiers, tmp_path):
     service, streamers, caches = tiers
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)):  # the checkpoint itself
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": str(tmp_path)})):  # the checkpoint itself
         with pytest.raises(ValueError, match="not a mirror of it"):
             caches[1].ensure_rows(torch.tensor([4]))
 
@@ -151,7 +152,7 @@ def _start_service_on_mirrors_without_images(tiers, tmp_path):
     root = tmp_path.parent / f"{tmp_path.name}_mirror_without_images"
     shutil.copytree(tmp_path, root)
     assert not (root / "exl3_row_images").exists()
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(root)):
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": str(root)})):
         service.ensure_started()
 
 
@@ -393,7 +394,7 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
     updater = object.__new__(GpuResidencyUpdater)
     updater.insert_direct = True
     updater.streamers = [streamer]
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"):
+    with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "off"})):
         # Leases are unconditional (the RAM-miss service always runs in lease mode), so DIRECT needs no lease switch.
         updater.check_miss_plans()
         streamer.row_backend = SimpleNamespace(leased=False)
@@ -401,7 +402,7 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
             updater.check_miss_plans()
         streamer.row_backend = backend
         updater.check_miss_plans()
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+    with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always"})):
         with pytest.raises(ValueError, match="PREFETCH_PULL_MODE=off"):
             updater.check_miss_plans()
 
@@ -462,7 +463,7 @@ def test_expert_to_slot_and_slot_to_expert_read_the_published_map_not_a_snapshot
 
 
 def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, monkeypatch):
-    """Minor 5: the watchdog's limit follows SGLANG_DSV41_RAM_MISS_TIMEOUT_MS, so a slow drive's
+    """Minor 5: the watchdog's limit follows SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS, so a slow drive's
     demand fails stop through the device wait, not the watchdog's abort."""
     service, streamers, caches = tiers
     for timeout_ms in (50, 2000, 14_000, 40_000, 120_000):
@@ -474,7 +475,7 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     monkeypatch.setattr(
         module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
     )
-    with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
+    with envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(40_000):
         service.ensure_started()
     assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000), "spin_us": 5000}]
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
@@ -482,14 +483,14 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
 
 @pytest.mark.parametrize("spin_us", [-1, 0, 777])
 def test_the_service_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
-    """SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US reaches start_thread: -1 never sleeps, else the spin before the idle sleep."""
+    """SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US reaches start_thread: -1 never sleeps, else the spin before the idle sleep."""
     service, streamers, caches = tiers
     started = []
     start = module.ExpertStreamHost.start_thread
     monkeypatch.setattr(
         module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
     )
-    with envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.override(spin_us):
+    with envs.SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US.override(spin_us):
         service.ensure_started()
     assert [kw["spin_us"] for kw in started] == [spin_us]
 
@@ -574,8 +575,8 @@ def test_router_capture_is_refused_without_the_stage_trace(tiers, monkeypatch, t
 
     service, streamers, caches = tiers
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: exl3_stream_trace.Exl3StreamTrace(""))
-    with envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.override(str(tmp_path / "router")):
-        with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_EXPERT_TRACE_PATH"):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"router_capture_path": str(tmp_path / "router")})):
+        with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_TRACE expert_path"):
             service.ensure_started()
     assert service.host is None
 
@@ -590,7 +591,7 @@ def test_router_capture_rides_the_route_log_only_when_its_path_is_set(tiers, mon
     trace = exl3_stream_trace.Exl3StreamTrace(str(tmp_path / "trace.jsonl"))
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
     prefix = str(tmp_path / "router")
-    with envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.override(prefix if router else ""):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"router_capture_path": prefix if router else ""})):
         _attach_all(service, streamers, capacity=12)
     log = service.route_log
     assert all(streamer.row_backend.route_log is log for streamer in streamers.values())
@@ -675,13 +676,13 @@ def tier_sim_load_forwards(path):
 
 @pytest.mark.parametrize("pdl", [False, True], ids=["pdl_off", "pdl_on"])
 def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl):
-    """SGLANG_DSV41_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
+    """SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
     it to the six chain launchers (test_exl3_ram_miss_device_args.py)."""
     service, streamers, caches = tiers
-    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(pdl):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(pdl):
         _attach_all(service, streamers)
     assert service.lease_pdl is pdl and service.device_side.lease_pdl is pdl
-    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(not pdl):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(not pdl):
         service.ensure_started()
     assert service.device_side.lease_pdl is pdl
 
@@ -1311,7 +1312,8 @@ def test_the_quiet_probes_read_the_ram_thread_copy_engine_tier_reads_and_the_dri
     service.host = _quiet_host({"ram_miss_thread": 1, "copy_engine_jobs": 1, "tier_drive_reads": 1})
     monkeypatch.setattr(module, "block_device_inflight_paths", lambda dirs: {"nvme9n1": "/x"} if list(dirs) else {})
     monkeypatch.setattr(module, "inflight_busy", lambda path: path == "/x")
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)), envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.override(""):
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": str(tmp_path)})), \
+            envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.override(""):
         probes = service.quiet_probes()
     assert list(probes) == ["ram_miss_thread", "copy_engine_jobs", "tier_drive_reads", "nvme9n1_inflight"]
     assert [probe() for probe in probes.values()] == [True, True, True, True]
@@ -1391,7 +1393,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
     # reaches enable_copy_engine here would leak the copy-engine config into every later test.
-    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_COPY_MODE", "copy_engine")
     if value == "EAGER":
         with pytest.raises(_CopyEngineReached):
             service.ensure_started()
@@ -1403,7 +1405,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
 
 @pytest.mark.parametrize("spin_us", [None, -1, 321])
 def test_the_copy_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
-    """SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US reaches enable_copy_engine (default 5000 us; -1 never sleeps)."""
+    """SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US reaches enable_copy_engine (default 5000 us; -1 never sleeps)."""
     service, streamers, caches = tiers
     monkeypatch.setenv("CUDA_MODULE_LOADING", "EAGER")
     seen = []
@@ -1414,11 +1416,11 @@ def test_the_copy_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us)
 
     monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_COPY_MODE", "copy_engine")
     if spin_us is None:
-        monkeypatch.delenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", raising=False)
+        monkeypatch.delenv("SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US", raising=False)
     else:
-        monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", str(spin_us))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US", str(spin_us))
     with pytest.raises(_CopyEngineReached):
         service.ensure_started()
     assert [kw["spin_us"] for kw in seen] == [5000 if spin_us is None else spin_us]
@@ -1482,7 +1484,7 @@ def _prefill_share_service(tiers, monkeypatch, *, on, share=1):
     service, _, caches = tiers
     recorder = _Recorder()
     monkeypatch.setattr(expert_distribution, "get_global_expert_distribution_recorder", lambda: recorder)
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(on), envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.override(share):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE.override(on), envs.SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS.override(share):
         service.ensure_started()
     return service, caches, recorder
 
@@ -1549,17 +1551,17 @@ def test_the_share_sized_at_start_reaches_set_prefill_share(tiers, monkeypatch):
 
 
 def test_a_forced_share_below_one_is_refused(tiers, monkeypatch):
-    with pytest.raises(ValueError, match="SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"):
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS"):
         _prefill_share_service(tiers, monkeypatch, on=True, share=0)
 
 
 def test_a_tier_of_only_full_layers_sizes_no_prefill_share():
     """Every layer full (production's whole-model tier): no layer admits, so the share is 0 and the start goes on."""
     tables = SimpleNamespace(layer_ids=[0, 1, 2])
-    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1,2"):
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1,2"):
         assert module.ExpertEngineService._size_prefill_share(SimpleNamespace(), tables, 2) == 0
-    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1,2"), envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.override(0):
-        with pytest.raises(ValueError, match="SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"):
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1,2"), envs.SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS.override(0):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS"):
             module.ExpertEngineService._size_prefill_share(SimpleNamespace(), tables, 2)
 
 
@@ -1573,8 +1575,8 @@ def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
         "get_global_expert_distribution_recorder",
         lambda: expert_distribution._ExpertDistributionRecorderNoop(),
     )
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(True):
-        with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_PREFILL_SHARE"):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE"):
             service.ensure_started()
 
 
@@ -1596,7 +1598,7 @@ def test_draft_host_starts_the_service_first(tiers, monkeypatch):
     started = []
     ensure_started = service.ensure_started
     monkeypatch.setattr(service, "ensure_started", lambda: (started.append(True), ensure_started())[1])
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_CPU_EXPERTS is off"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS is off"):
         service.draft_host([], fatal_wait_s=1.0)
     assert started == [True]
     assert service.host is not None
@@ -1606,12 +1608,12 @@ def test_draft_host_refuses_without_cpu_experts(tiers):
     service, _, _ = tiers
     service.ensure_started()
     assert service.cpu_experts is None
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_CPU_EXPERTS is off"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS is off"):
         service.draft_host([], fatal_wait_s=1.0)
 
 
 def test_a_tier_placement_without_the_gpu_node_starts_without_a_draft(tiers, monkeypatch):
-    """The GPU node's group is needed only by the DSpark draft: a launch whose SGLANG_MOE_PINNED_HOST_NUMA_MB leaves the
+    """The GPU node's group is needed only by the DSpark draft: a launch whose SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB leaves the
     GPU's node out must still start (it did before the draft channel existed)."""
     service, _, _ = tiers
     _place_tier_off_the_gpu_node(monkeypatch)
@@ -1625,7 +1627,7 @@ def test_draft_host_names_the_placement_when_the_gpu_node_has_no_group(tiers, mo
     service.ensure_started()
     service.cpu_experts = object()  # as if the CPU experts had started
     try:
-        with pytest.raises(RuntimeError, match=r"GPU's node 99.*SGLANG_MOE_PINNED_HOST_NUMA_MB"):
+        with pytest.raises(RuntimeError, match=r"GPU's node 99.*SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB"):
             service.draft_host([], fatal_wait_s=1.0)
     finally:
         service.cpu_experts = None
@@ -1648,7 +1650,7 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
             pinned_host_cache=SimpleNamespace(tensors={}), layer=SimpleNamespace(layer_id=3), graph_gather_rows=36
         )
     }
-    with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(True):
         with pytest.raises(RuntimeError, match="layer 3.*top_k"):
             module.ExpertEngineService._start_cpu_experts(
                 cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36
@@ -1658,13 +1660,13 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
 
 def test_ram_prefetch_without_cpu_experts_is_refused_at_start(tiers):
     service, _, _ = tiers
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
-        with pytest.raises(RuntimeError, match="SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS"):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"):
             service.ensure_started()
 
 
 def _prefetch_with_cpu_expert_stand_in(service, monkeypatch):
-    """SGLANG_DSV41_CPU_EXPERTS on, with a stand-in engine (hidden ROW_IMAGE_DIM) and plans without CPU cores."""
+    """SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS on, with a stand-in engine (hidden ROW_IMAGE_DIM) and plans without CPU cores."""
     from sglang.srt.layers.moe.ram_prefetch import clear_router_gates
 
     clear_router_gates()
@@ -1683,8 +1685,8 @@ def test_a_failed_ram_prefetch_enable_stops_the_host_and_leaves_the_service_unst
     stopped = []
     stop = module.ExpertStreamHost.stop
     monkeypatch.setattr(module.ExpertStreamHost, "stop", lambda host: (stopped.append(host), stop(host))[1])
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(1):
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(1):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True):
             with pytest.raises(ValueError, match="no streamed row has a next layer"):
                 service.ensure_started()
     assert len(stopped) == 1 and not stopped[0]._close.alive
@@ -1695,9 +1697,9 @@ def test_a_ram_prefetch_share_that_leaves_a_row_too_few_slots_is_refused_at_star
     """CAPACITY + 1 slots, one staging: a share of 2 leaves one assignable slot, the host needs 2 per group."""
     service, _, _ = tiers
     _prefetch_with_cpu_expert_stand_in(service, monkeypatch)
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
-            refused = r"SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's group 0 slots \[0, 4\)"
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(2):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True):
+            refused = r"SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's group 0 slots \[0, 4\)"
             with pytest.raises(RuntimeError, match=refused):
                 service.ensure_started()
     assert service.host is None

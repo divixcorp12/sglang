@@ -84,10 +84,10 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     with (
         # The service reads row images with O_DIRECT, in lease mode (always on), as in production.
         service_row_images(tmp_path),
-        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-        envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
+        envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
         # Read when attach builds the device side, so attach runs inside this block.
-        envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
+        envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
     ):
         pairs, hots = [], []
         # Every pinned tier registers before the service starts, and a tier built after it is refused.
@@ -95,7 +95,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
             layer = torch.nn.Module()
             layer.layer_id = layer_id
             layer.top_k = TOP_K
-            # No ``direct``: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
+            # No ``direct``: SGLANG_EXPERT_STREAM_FILE_READER=uring_direct decides it, as in production.
             fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
@@ -156,10 +156,10 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     try:
         with (
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
-            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
+            envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused),
         ):
             model = torch.nn.Module()
             layer = torch.nn.Module()

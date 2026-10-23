@@ -172,7 +172,7 @@ def test_draft_shape_counts_the_cpu_routes_and_their_distinct_experts(request, m
     repeated slot twice -- red."""
     import json
 
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     areas, host = _host(request, mode)
     slots = [[0, 1, 2], [2, -1, 5]]
     _stage(areas, 0, len(slots), 3)

@@ -14,7 +14,6 @@ from sglang.srt.distributed.naive_distributed import (
     get_naive_distributed,
     set_naive_distributed,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.runtime_context import (
     get_exec,
@@ -46,12 +45,6 @@ NVFP4_OFFLOAD_PARAMETER_NAMES = (
     "w2_blockscale_swizzled",
 )
 NVFP4_FILE_PARAMETER_NAMES = NVFP4_OFFLOAD_PARAMETER_NAMES[:4]
-
-
-def _expert_streaming_enabled() -> bool:
-    from sglang.srt.layers.moe.expert_stream import expert_streaming_enabled
-
-    return expert_streaming_enabled()
 
 
 def _iter_streamed_nvfp4_parameters(
@@ -415,8 +408,11 @@ class OffloaderV1(BaseOffloader):
         return [self.maybe_offload_to_cpu(module) for module in all_modules_generator]
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
-        if _expert_streaming_enabled():
-            directory = envs.SGLANG_MOE_EXPERT_FILE_DIR.get()
+        from sglang.srt.layers.moe.expert_engine.config import stream_config
+
+        config = stream_config()
+        if config.enabled:
+            directory = config.tiers.file_cache_dir
             names = (
                 NVFP4_FILE_PARAMETER_NAMES
                 if directory

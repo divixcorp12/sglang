@@ -139,10 +139,10 @@ inline int64_t second_stage_start(const Tables& t, uint32_t second) {
   return start == INT64_MAX || first_end > start ? 0 : start;
 }
 
-// A two-stage CPU miss's cut (SGLANG_DSV41_CPU_TWO_STAGE): the row's needed bytes as two spans, the first stage's
+// A two-stage CPU miss's cut (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): the row's needed bytes as two spans, the first stage's
 // [0, split) and the second's [split, need_end), each divided over the reading parts, each part's file read at its own
 // offsets (a mirror root holds the whole file). Span s is divided by `weights[s]` (one integer weight per part,
-// SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS), or when it is null in the shares the row's parts read today;
+// SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights), or when it is null in the shares the row's parts read today;
 // a part that reads none of the row today, or weighs 0 in a span, gets none of that span. The split is rounded up to a
 // page, so the first span holds every first-stage byte, and the inner cuts are pages. Sub-reads are in dest order, the
 // first span's first: queued in that order, every root reads its first-span bytes before its second-span bytes. A
@@ -200,7 +200,7 @@ inline bool row_geometry_two_span(
   return cut_pieces(t, g, runs);
 }
 
-// SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS as row_geometry_two_span takes them: each weight in units of
+// SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights as row_geometry_two_span takes them: each weight in units of
 // 2^-16 (empty: no weights for that span). Throws on a list that is not one non-negative weight per part, or whose
 // weights are all 0.
 inline std::vector<int64_t> span_weight_units(const std::vector<double>& weights, int64_t parts, const char* name) {

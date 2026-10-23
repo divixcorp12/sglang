@@ -113,7 +113,7 @@ class TestExpertGraphGather(unittest.TestCase):
         layer = _layer()
         streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
         routes = 4 * TOP_K
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"):
             cache = ExpertHotCache(streamer, 3, scratch_rows=routes)
             cache.reassign([1, 4, 6])
             streamer.enable_graph_gather(routes)
@@ -859,8 +859,8 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
         layer.layer_id = layer_id
         streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
         with (
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"),
-            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(str(fused).lower()),
+            envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always"}'),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(str(fused).lower()),
         ):
             cache = ExpertHotCache(streamer, capacity=capacity, scratch_rows=max_rows)
             streamer.enable_graph_gather(max_rows)

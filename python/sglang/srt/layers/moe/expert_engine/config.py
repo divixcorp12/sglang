@@ -18,6 +18,7 @@ struct (a nested struct is a nested object), for example::
 from __future__ import annotations
 
 import enum
+import os
 import typing
 from typing import Any, ClassVar, Optional
 
@@ -665,3 +666,50 @@ class Exl3FormatConfig(_Config):
 
     build: Exl3BuildConfig = msgspec.field(default_factory=Exl3BuildConfig)
     cpu: Exl3CpuConfig = msgspec.field(default_factory=Exl3CpuConfig)
+
+
+# --- the process's resolved config ------------------------------------------------------------------------------
+
+
+class ResolvedConfig(msgspec.Struct, frozen=True):
+    """Everything one process resolves from the env: the generic engine, the DSV4.1 profile and the EXL3 format."""
+
+    stream: ExpertStreamConfig
+    dsv41: Dsv41ProfileConfig
+    exl3: Exl3FormatConfig
+
+    @classmethod
+    def from_envs(cls) -> "ResolvedConfig":
+        return cls(
+            stream=ExpertStreamConfig.from_envs(),
+            dsv41=Dsv41ProfileConfig.from_envs(),
+            exl3=Exl3FormatConfig.from_envs(),
+        )
+
+
+_resolved: Optional[tuple[tuple, ResolvedConfig]] = None
+
+
+def _env_names() -> tuple[str, ...]:
+    names: dict[str, None] = {}
+    for config_type in (ExpertStreamConfig, Dsv41ProfileConfig, Exl3FormatConfig):
+        names.update(dict.fromkeys(env_fields(config_type)))
+    return tuple(names)
+
+
+def resolved_config() -> ResolvedConfig:
+    """The config of this process, resolved from the env on first use and handed to every component.
+
+    The env names are read once and the result is reused for as long as none of them changes, so a launcher's late
+    edit or a test's ``envs.X.override`` is observed on the next call and a steady process never resolves twice.
+    """
+    global _resolved
+    snapshot = tuple(os.environ.get(name) for name in _env_names())
+    if _resolved is None or _resolved[0] != snapshot:
+        _resolved = (snapshot, ResolvedConfig.from_envs())
+    return _resolved[1]
+
+
+def stream_config() -> ExpertStreamConfig:
+    """The generic engine config of this process (``resolved_config().stream``)."""
+    return resolved_config().stream

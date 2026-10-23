@@ -11,7 +11,7 @@ This file holds:
   (The ``ExpertFormat`` protocol and the EXL3 format live in
   ``expert_engine/formats``.)
 * Helpers that find a layer's streamer, resolve the row source kind
-  (``SGLANG_MOE_EXPERT_ROW_SOURCE``) and check graph-gather and pinned-tier support.
+  (``SGLANG_EXPERT_STREAM_ROW_SOURCE``) and check graph-gather and pinned-tier support.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from typing import (
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 from sglang.srt.layers.moe.expert_transfer import NVFP4_TRANSFER_TENSOR_COUNT
 
 if TYPE_CHECKING:
@@ -211,11 +211,11 @@ class DenseLayerFormat:
         if kind == "auto":
             return ExpertFileRowReader.from_layer(layer, names)
         if kind == "files":
-            mode = validate_file_reader_mode(envs.SGLANG_MOE_EXPERT_FILE_READER.get())
+            mode = validate_file_reader_mode(stream_config().tiers.file_reader)
             if mode == "mmap":
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_ROW_SOURCE=files needs "
-                    "SGLANG_MOE_EXPERT_FILE_READER=uring or uring_direct"
+                    "SGLANG_EXPERT_STREAM_ROW_SOURCE=files needs "
+                    "SGLANG_EXPERT_STREAM_FILE_READER=uring or uring_direct"
                 )
             return ExpertFileRowReader.from_layer(layer, names, mode=mode)
         if kind == "tensor":
@@ -252,14 +252,15 @@ def iter_expert_streamers(model: torch.nn.Module) -> Iterator[ExpertStreamer]:
             yield streamer
 
 
-def resolve_row_source_kind() -> str:
-    """The row source kind ``SGLANG_MOE_EXPERT_ROW_SOURCE`` selects (default ``auto``).
+def resolve_row_source_kind(config: Optional[ExpertStreamConfig] = None) -> str:
+    """The row source kind ``SGLANG_EXPERT_STREAM_ROW_SOURCE`` selects (default ``auto``); ``config`` defaults to
+    ``stream_config()``.
 
     Raises if the variable is blank.
     """
-    kind = envs.SGLANG_MOE_EXPERT_ROW_SOURCE.get().strip()
+    kind = (stream_config() if config is None else config).tiers.row_source.strip()
     if not kind:
-        raise ValueError("SGLANG_MOE_EXPERT_ROW_SOURCE must name a row source kind")
+        raise ValueError("SGLANG_EXPERT_STREAM_ROW_SOURCE must name a row source kind")
     return kind
 
 
@@ -274,7 +275,7 @@ def graph_source_kind_of(expert_format: Any) -> str:
 
 
 def graph_gather_needs_host_arena(model: torch.nn.Module) -> bool:
-    """Whether ``model``'s graph gathers need ``SGLANG_MOE_EXPERT_HOST_ARENA``.
+    """Whether ``model``'s graph gathers need ``SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA``.
 
     True unless every attached streamer's format serves them from its pinned host
     tier.
@@ -308,7 +309,7 @@ def require_graph_gather_support(
             if streamer.pinned_host_cache is None:
                 raise ValueError(
                     f"expert format {key!r} of layer {streamer.layer_id} serves graph "
-                    "gathers from its pinned host tier; set SGLANG_MOE_PINNED_HOST_MB"
+                    "gathers from its pinned host tier; set SGLANG_EXPERT_STREAM_PINNED_HOST_MB"
                 )
             continue
         unsupported = (
@@ -317,8 +318,8 @@ def require_graph_gather_support(
         if unsupported:
             raise ValueError(
                 f"expert format {key!r} of layer {streamer.layer_id} does not support "
-                "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER and "
-                "SGLANG_MOE_GPU_RESIDENCY_UPDATE"
+                "graph gather; unset SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER and "
+                "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"
             )
 
 

@@ -40,7 +40,7 @@ struct TableRoots {
   static constexpr bool kGated = false;
 };
 
-// A speculative read's root policy (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE; design 2026-10-09-dsv41-drive-aware-reads,
+// A speculative read's root policy (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE; design 2026-10-09-dsv41-drive-aware-reads,
 // change (2)), passed to read() by the speculative reader. The row reads one piece at a time, all from one root
 // with no demand sub-read in flight on any reader of the drive load: the first piece picks the demand-free root with
 // the fewest bytes in flight, and each later piece rechecks it and moves to another demand-free root when demand
@@ -49,10 +49,10 @@ struct TableRoots {
 // this row) drops all of that for the rest of the row: its pieces read their table roots, as many as credit allows.
 // Needs the mirror file map (set_mirror_map).
 //
-// `spread` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) drops the row's root: every piece takes the demand-free root with
+// `spread` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD) drops the row's root: every piece takes the demand-free root with
 // the fewest bytes in flight, a tie going to the first root from the one after the row's previous piece (the row's
 // first piece: from the reader's rotating start, one root further per read), so idle drives share the rows rather
-// than the lowest-numbered one taking them all. `max_inflight` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES) lets that many
+// than the lowest-numbered one taking them all. `max_inflight` (SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES) lets that many
 // pieces be in flight at once, each gated as the first.
 struct IdleRoots {
   static constexpr bool kGated = true;
@@ -70,7 +70,7 @@ struct IdleRoots {
   bool abandoned = false;
 };
 
-// SGLANG_DSV41_CPU_TWO_STAGE, for one read(): `rows[o]` nonzero reads row ordinal o in two spans
+// SGLANG_EXPERT_STREAM_CPU_TWO_STAGE, for one read(): `rows[o]` nonzero reads row ordinal o in two spans
 // (row_geometry_two_span), and the read sets `(*prefix)[o]` to 1 once the first span's pieces are all published, before
 // the row is whole. Piece streaming only; null rows read every row in one span.
 struct TwoSpanRows {
@@ -210,12 +210,12 @@ class ReaderCore {
     fill_ = fill;
   }
 
-  // SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (design 2026-10-09-dsv41-drive-aware-reads, change (3)): `caps`, one positive
+  // SGLANG_EXPERT_STREAM_MIRROR dynamic (design 2026-10-09-dsv41-drive-aware-reads, change (3)): `caps`, one positive
   // in-flight cap per mirror root, turns the dynamic root choice on (choose_root); empty turns it off, and the reader
   // then reads every sub-read from its own root, as before. Piece streaming only (set it first). Builds the mirror file
   // map (set_mirror_map). Call it on an idle reader.
   void set_mirror_caps(std::span<const int64_t> caps) {
-    const std::string prefix = error_prefix<Layout>() + "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC: ";
+    const std::string prefix = error_prefix<Layout>() + "SGLANG_EXPERT_STREAM_MIRROR dynamic: ";
     if (caps.empty()) {
       dynamic_ = false;
       alt_file_.clear();
@@ -450,7 +450,7 @@ class ReaderCore {
       if (configured_queue_depth_ < scaled)
         std::fprintf(
             stderr,
-            "expert stream io_uring: read cuts: SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=%u is below the cut default %u "
+            "expert stream io_uring: read cuts: SGLANG_EXPERT_STREAM_URING queue_depth=%u is below the cut default %u "
             "(16 x %zu parts x %u legs): fewer reads fit in flight than uncut\n",
             configured_queue_depth_,
             scaled,
@@ -461,7 +461,7 @@ class ReaderCore {
       throw std::runtime_error(
           error_prefix<Layout>() + "reads fanned out or cut into legs need a queue depth of at least " +
           std::to_string(leg_stride_) +
-          " (the widest read's legs); SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=" + std::to_string(queue_depth()));
+          " (the widest read's legs); SGLANG_EXPERT_STREAM_URING queue_depth=" + std::to_string(queue_depth()));
     }
     if constexpr (requires(
                       Reader& reader, const std::vector<int>& files, const std::vector<RegisteredRegion>& buffers) {
@@ -659,13 +659,14 @@ class ReaderCore {
   }
 
  protected:
-  // `direct` opens the files with O_DIRECT. Queue depth, read cuts and the read mode come from
-  // UringOptions::from_env().
+  // `direct` opens the files with O_DIRECT. Queue depth, read cuts and the read mode come from the module's
+  // installed uring options (installed_uring_options).
   ReaderCore(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {
     if constexpr (requires { Layout::kSecondStageMask; }) second_stage_ = second_stage_start(t_, Layout::kSecondStageMask);
-    configured_queue_depth_ = UringOptions::from_env().queue_depth;
-    cuts_requested_ = UringOptions::from_env().read_cuts_on();
-    fixed_requested_ = UringOptions::from_env().read_mode != UringReadMode::Normal;
+    const UringOptions options = installed_uring_options();
+    configured_queue_depth_ = options.queue_depth;
+    cuts_requested_ = options.read_cuts_on();
+    fixed_requested_ = options.read_mode != UringReadMode::Normal;
   }
 
   ~ReaderCore() {
@@ -887,7 +888,7 @@ class ReaderCore {
   // refill() means this bounds concurrency, not batch size: a batch larger than the ring waits for credit rather than
   // overrunning it. The default scales with the mirror parts, so splitting a row across roots does not halve the rows
   // in flight, and with the legs per read when reads are cut (credit counts SQEs), so the rows in flight stay what
-  // they were uncut. SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH overrides it.
+  // they were uncut. SGLANG_EXPERT_STREAM_URING's queue_depth overrides it.
   unsigned queue_depth() const {
     if (configured_queue_depth_ != 0) return configured_queue_depth_;
     const size_t per_read = cuts_ ? leg_stride_ : 1;
@@ -1187,7 +1188,7 @@ class ReaderCore {
       // below is shortened for it. A row that needs bytes the file does not have is corrupt and must fail, not publish
       // stale bytes.
       // The head is the row's FIRST READING part, not part 0. A root whose split weight is 0 gives a zero-length part 0
-      // (SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=0:1 is a supported setting), and the eager reader (exl3_row_reader.py) skips
+      // (SGLANG_EXPERT_STREAM_MIRROR weights "0:1" is a supported setting), and the eager reader (exl3_row_reader.py) skips
       // zero-length parts before computing offsets, so a table builder may leave them zeroed. Reading the base and
       // the file size from such an extent would silently aim this check at the wrong file; every part the head can be
       // is one the reader submits.

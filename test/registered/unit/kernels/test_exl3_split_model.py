@@ -1,4 +1,4 @@
-"""The model-based CPU split (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): its cost words, the greedy, the Python lane typing
+"""The model-based CPU split (SGLANG_EXPERT_STREAM_CPU_SPLIT '{"model": true}'): its cost words, the greedy, the Python lane typing
 the device transcribes, and the launch gate (CPU). The device parity is test/manual/dsv41/test_exl3_lease_kernels_cuda.py
 test_the_split_model_*."""
 
@@ -218,27 +218,31 @@ def _check_slot_map():
 
 
 @pytest.mark.parametrize("overrides, match", [
-    ({"SGLANG_DSV41_CPU_EXPERTS": False}, "CPU_EXPERTS=1"),
-    ({"SGLANG_DSV41_CPU_EXPERTS": True, "SGLANG_DSV41_RAM_HIT_COPY": "sm"}, "RAM_HIT_COPY=ce"),
-    ({"SGLANG_DSV41_CPU_EXPERTS": True, "SGLANG_DSV41_CPU_EXPERTS_MISSES": True}, "MISSES"),
-    ({"SGLANG_DSV41_CPU_EXPERTS": True, "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS": "nope=1"}, "cannot read"),
+    ({"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": False}, "CPU_EXPERTS=1"),
+    ({"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": True, "SGLANG_EXPERT_STREAM_RAM_HIT_COPY": "sm"}, "RAM_HIT_COPY=ce"),
+    ({"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": True, "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES": True}, "MISSES"),
+    ({"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": True, "SGLANG_EXPERT_STREAM_CPU_SPLIT": {"model_costs": "nope=1"}}, "cannot read"),
 ])
 def test_the_gate_refuses_a_split_model_it_cannot_run(overrides, match):
+    import json
     from contextlib import ExitStack
 
     with ExitStack() as stack:
-        stack.enter_context(envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True))
+        split = {"model": True, **overrides.get("SGLANG_EXPERT_STREAM_CPU_SPLIT", {})}
+        stack.enter_context(envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps(split)))
         for name, value in overrides.items():
+            if name == "SGLANG_EXPERT_STREAM_CPU_SPLIT":
+                continue
             stack.enter_context(getattr(envs, name).override(value))
         with pytest.raises(ValueError, match=match):
             _check_slot_map()
 
 
 def test_the_gate_accepts_the_split_model_and_refuses_costs_without_it():
-    with envs.SGLANG_DSV41_CPU_EXPERTS.override(True), envs.SGLANG_DSV41_RAM_HIT_COPY.override("ce"):
-        with envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True), envs.SGLANG_EXPERT_STREAM_RAM_HIT_COPY.override("ce"):
+        with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": true}'):
             _check_slot_map()
-        with envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=1"):
+        with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model_costs": "copy_lane=1"}'):
             with pytest.raises(ValueError, match="ENABLE_CPU_SPLIT_MODEL=1"):
                 _check_slot_map()
 
@@ -247,7 +251,7 @@ def test_the_fixture_costs_cover_every_key():
     from sglang.srt.layers.moe.ram_slot_map import SPLIT_MODEL_KEYS, SPLIT_MODEL_NODE_KEYS
 
     assert set(SPLIT_MODEL_FIXTURE_MS) == set(SPLIT_MODEL_NODE_KEYS + SPLIT_MODEL_KEYS)
-    assert not envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get()  # off by default
+    assert "model" not in (envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.get() or "")  # off by default
 
 
 def test_off_words_type_lanes_as_the_table_and_count_nothing():

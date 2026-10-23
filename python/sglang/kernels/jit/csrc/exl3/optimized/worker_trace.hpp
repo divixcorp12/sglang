@@ -1,14 +1,15 @@
 // Diagnostic-only per-worker work and barrier timing. The normal plan instantiates the empty specialization.
+// Its options are SGLANG_EXPERT_STREAM_TRACE's cpu_worker and gate_path members, which Python passes through the
+// library's configure op (exl3_cpu_configure) before the first forward.
 #pragma once
 #include "../../moe/expert_stream/host/trace_gate.h"
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <type_traits>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -26,17 +27,40 @@ inline int64_t clock_ns(clockid_t clock = CLOCK_MONOTONIC) {
     if (clock_gettime(clock, &t)) return -1;
     return int64_t(t.tv_sec) * 1'000'000'000 + t.tv_nsec;
 }
-inline size_t option(const char* name, size_t fallback, size_t maximum) {
-    const char* raw = std::getenv(name);
-    if (!raw) return fallback;
-    const std::string_view text(raw);
-    if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
-        throw std::invalid_argument(std::string(name) + " must be a nonnegative integer");
-    char* end = nullptr;
-    const auto value = std::strtoull(raw, &end, 10);
-    if (*end || value > maximum) throw std::invalid_argument(std::string(name) + " exceeds its bound");
+// trace.cpu_worker (prefix empty: no trace) and trace.gate_path.
+struct Options {
+    std::string prefix;
+    int64_t capacity = 65536;
+    int64_t min_us = 6000;
+    std::string scratch_prefix;
+    std::string gate_path;
+};
+inline size_t option(int64_t value, const char* field, int64_t maximum) {
+    if (value < 0)
+        throw std::invalid_argument(std::string("SGLANG_EXPERT_STREAM_TRACE cpu_worker.") + field +
+                                    " must be a nonnegative integer");
+    if (value > maximum)
+        throw std::invalid_argument(std::string("SGLANG_EXPERT_STREAM_TRACE cpu_worker.") + field + " exceeds its bound");
     return size_t(value);
 }
+// Internal linkage: each quant library's translation unit owns its installed options.
+namespace {
+struct InstalledOptions {
+    std::mutex mutex;
+    Options options;
+};
+inline InstalledOptions& installed_options_state() { static InstalledOptions state; return state; }
+inline void set_options(Options options) {
+    auto& state = installed_options_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.options = std::move(options);
+}
+inline Options installed_options() {
+    auto& state = installed_options_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.options;
+}
+}  // namespace
 // Keep the plan's phase IDs: 0,1,2,3,5 (4 is an old, now-fused output-transform phase).
 inline constexpr int kWorkers = 64, kPhases = 6, kActivePhases = 5;
 struct PhaseStamp {
@@ -82,22 +106,20 @@ inline int64_t delta(long first, long last, const rusage& a, const rusage& b) {
 // One writer: the forward's calling thread, after its team joined. A separate buffer per OS leader in this DSO.
 class Buffer {
  public:
-    Buffer() {
-        const char* prefix = std::getenv("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX");
-        if (!prefix || !*prefix) return;
-        capacity = option("SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY", 65536, 1048576);
+    Buffer() : Buffer(installed_options()) {}
+    explicit Buffer(const Options& options) : gate(options.gate_path) {
+        if (options.prefix.empty()) return;
+        capacity = option(options.capacity, "capacity", 1048576);
         if (!capacity) throw std::invalid_argument("worker trace capacity must be positive");
-        min_ns = int64_t(option("SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US", 6000, 1000000000)) * 1000;
-        path = std::string(prefix) + "." + std::to_string(getpid()) + "." +
+        min_ns = int64_t(option(options.min_us, "min_us", 1000000000)) * 1000;
+        path = options.prefix + "." + std::to_string(getpid()) + "." +
                std::to_string(syscall(SYS_gettid)) + ".jsonl";
         events = std::make_unique<Record[]>(capacity);
-        if (const char* scratch_prefix = std::getenv("SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX")) {
-            if (*scratch_prefix) {
-                scratch_path = std::string(scratch_prefix) + "." + std::to_string(getpid()) + "." +
-                               std::to_string(syscall(SYS_gettid)) + ".jsonl";
-                scratch = std::make_unique<ScratchRecord[]>(capacity / kActivePhases);
-                growth = std::make_unique<GrowthRecord[]>(kGrowthCapacity);
-            }
+        if (!options.scratch_prefix.empty()) {
+            scratch_path = options.scratch_prefix + "." + std::to_string(getpid()) + "." +
+                           std::to_string(syscall(SYS_gettid)) + ".jsonl";
+            scratch = std::make_unique<ScratchRecord[]>(capacity / kActivePhases);
+            growth = std::make_unique<GrowthRecord[]>(kGrowthCapacity);
         }
     }
     ~Buffer() {

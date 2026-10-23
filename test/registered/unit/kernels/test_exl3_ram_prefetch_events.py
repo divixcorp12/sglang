@@ -30,7 +30,7 @@ def test_a_speculative_row_leaves_submit_land_and_use_events_and_the_scorer_coun
     rig = prefetch_rig(tmp_path / "rig")
     try:
         # Read when enable_ram_prefetch builds each group's trace; the rig's other engines were built without it.
-        monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         trig = trigger(rig)
         assert rig.host.spec_pump(0)
@@ -54,7 +54,7 @@ def test_the_events_still_join_when_another_rows_record_posts_between_source_and
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig", rows=3)
     try:
-        monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         trig = trigger(rig)
         other = rig.sim.post(2, [])
@@ -74,7 +74,7 @@ def test_a_failed_speculative_read_emits_submit_but_no_land(tmp_path, monkeypatc
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
-        monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         load(rig, 0, [5])
         rig.host.inject_fault(part=0, part_error=5)
@@ -95,7 +95,7 @@ def test_spec_submit_carries_the_picks_rank_and_margin_in_gen(tmp_path, monkeypa
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
-        monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
         enable(rig, LOGITS)
         trigger(rig)
         assert rig.host.spec_pump(0)
@@ -113,7 +113,7 @@ def test_spec_submit_carries_the_picks_rank_and_margin_in_gen(tmp_path, monkeypa
 def test_every_forced_miss_leaves_a_miss_expert_event_on_its_group(tmp_path, monkeypatch):
     """miss_expert: row, gen and seq of the record, a = the expert, b = its lane in the record. A hit leaves none. The
     group's trace is built with the tier, so the prefix is set before the rig."""
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig", capacity=9, share=1)  # room for two victims
     try:
@@ -138,7 +138,7 @@ def test_each_lane_leaves_its_kind_and_each_record_its_routed_and_lane_counts(tm
     """lane_kind: a = the expert, b = its kind | 256 when spilled (destination -1), c = its lane. svc_routed, also for a
     lane-less record: a = the group's routed experts, b = all routed, c = all lanes, so expert 0 (routed, no lane) is
     VRAM-hot. Mutants: report the slot as b, drop the spill bit, or skip svc_routed on a lane-less record -- red."""
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig", capacity=9, share=1)  # room for the two misses' victims
     try:
@@ -173,7 +173,7 @@ def test_each_read_miss_leaves_a_miss_land_event_with_its_expert_and_the_pool_st
     """miss_land (stage trace on): a = the expert, b = when its row landed, within the record's read, c = 1 for a miss
     whose row had landed in the pool when planned (pool serve would have copied it), 0 for one the pool lacked.
     Mutant: drop the pool state -- red on c."""
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
@@ -195,7 +195,7 @@ def test_with_pool_serve_a_pooled_miss_leaves_a_pool_point_and_the_read_one_its_
     pooled in its place) instead of a miss_land; the read miss's miss_land carries its own row's landing although its
     read ordinal (0) is not its miss index (1). Mutant: take the stage record's row by miss index -- red on b; report
     the staging slot as b -- red on the slot."""
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
@@ -226,7 +226,7 @@ def test_with_pool_serve_a_pooled_miss_leaves_a_pool_point_and_the_read_one_its_
 def test_a_demand_miss_on_a_full_tier_evicts_the_least_recently_used_expert_and_says_so(tmp_path, monkeypatch):
     """evict: a = the evicted expert (-1: a free slot), b = its age in use ticks, c = the expert moving in. Loading one
     expert at a time, the evictions take them in load order. Mutant: report the incoming expert as a -- red."""
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     order = [0, 1, 2, 3, 5]

@@ -328,18 +328,18 @@ SGL_DEVICE void match_scratch(
 // Everything besides the map that decides a lane's kind, loaded before type_lanes runs.
 struct LanePolicy {
   bool host_lanes;   // a captured post while the copy engine is armed (Wire::kCopyArmed)
-  bool hit_copy_ce;  // SGLANG_DSV41_RAM_HIT_COPY=ce
+  bool hit_copy_ce;  // SGLANG_EXPERT_STREAM_RAM_HIT_COPY=ce
   bool cpu_on;       // CPU experts are enabled
-  bool cpu_misses;   // a miss may also be a CPU lane (SGLANG_DSV41_CPU_EXPERTS_MISSES)
+  bool cpu_misses;   // a miss may also be a CPU lane (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES)
   bool ce_ok;        // the row's copy table is set
   bool cpu_ok;       // the row's CPU layer is registered
   int32_t dst_rows;
-  // Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX): a node with 1..miss_cut_max forced CPU misses takes miss_cut
+  // Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT miss_cut / miss_cut_max): a node with 1..miss_cut_max forced CPU misses takes miss_cut
   // fewer of its split's lanes. 0: no cut.
   int32_t miss_cut;
   int32_t miss_cut_max;
   int32_t split[Wire::kNodes][Wire::kLanes + 1];  // Wire::kSplit: per node, CPU lanes per n eligible lanes
-  // Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): the split model's words in device memory, kSplitModelCosts cost
+  // Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT model): the split model's words in device memory, kSplitModelCosts cost
   // words then kSplitModelStats counters (ram_slot_map.split_model_words); nullptr: the split and the miss cut.
   int64_t* split_model = nullptr;
 };
@@ -352,7 +352,7 @@ struct LanePolicy {
 constexpr int kSplitModelCosts = 5 * Wire::kNodes + 6;
 constexpr int kSplitModelStats = 1 + 2 * Wire::kNodes;
 constexpr int kSplitModelWords = 7 * Wire::kNodes + 7;  // kSplitModelCosts + kSplitModelStats
-// SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK: among a node's candidates with the same tokens (the model prices
+// SGLANG_EXPERT_STREAM_CPU_SPLIT model_residency_tiebreak: among a node's candidates with the same tokens (the model prices
 // them alike), the CPU takes the highest plan indexes (lowest residency keys) and the copy engine the rest.
 constexpr int64_t kSplitModelResidencyTiebreak = 1;
 static_assert(kSplitModelWords == kSplitModelCosts + kSplitModelStats, "split model words");

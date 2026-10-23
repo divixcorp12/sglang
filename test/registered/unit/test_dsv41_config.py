@@ -102,9 +102,9 @@ def test_the_config_is_frozen():
 
 def test_from_envs_observes_an_override_and_reverts_after():
     assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is False
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.override(True):
+    with envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"):
         assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is True
-        with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
+        with envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(40_000):
             inner = Dsv41Config.from_envs()
             assert inner.ram_miss_timeout_ms == 40_000 and inner.enable_ram_miss_copy_engine is True
         assert Dsv41Config.from_envs().ram_miss_timeout_ms == 2000
@@ -163,9 +163,9 @@ def test_removed_ram_miss_knobs_warn(monkeypatch):
 
 
 def test_the_lease_pdl_flag_is_off_by_default_and_observed_when_overridden():
-    assert envs.SGLANG_DSV41_ENABLE_LEASE_PDL.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.get() is False
     assert Dsv41Config.from_envs().enable_lease_pdl is False
-    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(True):
         assert Dsv41Config.from_envs().enable_lease_pdl is True
     assert Dsv41Config.from_envs().enable_lease_pdl is False
 

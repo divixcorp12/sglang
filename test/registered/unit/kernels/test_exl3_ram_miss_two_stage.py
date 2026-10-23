@@ -1,4 +1,4 @@
-"""Two-stage CPU misses (SGLANG_DSV41_CPU_TWO_STAGE; CPU).
+"""Two-stage CPU misses (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE enabled; CPU).
 
 A CPU-computed miss's row image is w13 then w2 (EXL3_STREAMED_NAMES order). With the flag on the reader cuts such a row
 in two spans, w13 over every mirror root and then w2 over every root, queued in that order, and reports when the first
@@ -222,7 +222,7 @@ def test_every_root_reads_a_two_span_rows_w13_before_any_of_its_w2(tmp_path, wei
     split._assert_rows(s, 1, experts, slots)
 
 
-# ---- Per-span weights (SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS) ----
+# ---- Per-span weights (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights) ----
 
 MIRROR3 = (16.0, 10.0, 16.0)  # nvme0 : nvme4 (SPCC) : nvme2, the served mirror
 SPCC13 = ((6.0, 10.0, 6.0), (1.0, 0.0, 1.0))
@@ -491,7 +491,7 @@ def test_a_two_stage_cpu_miss_starts_on_w13_and_reads_w2_only_after_it_landed(tm
 
 
 def test_with_the_flag_off_a_cpu_miss_runs_once_its_row_is_whole(tmp_path):
-    """The same record with SGLANG_DSV41_CPU_TWO_STAGE off: no job is staged, none waits, and the sums are the
+    """The same record with SGLANG_EXPERT_STREAM_CPU_TWO_STAGE disabled: no job is staged, none waits, and the sums are the
     reference's."""
     s, host, sim, out_rows = _host(tmp_path, two_stage=False)
     try:

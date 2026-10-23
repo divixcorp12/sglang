@@ -29,7 +29,6 @@ from __future__ import annotations
 import atexit
 import functools
 import json
-import os
 import struct
 import sys
 import weakref
@@ -42,6 +41,7 @@ from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
 from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKENS_MAX, cpu_row_bytes
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 
 # Rows per io_uring batch and per bounce bank. The C++ reader has kBanks = 2 banks of
 # kBounceRows = 8 row slots each; a bank is reused only after every row read into it
@@ -114,21 +114,19 @@ VARIANTS = ("prod", "instr")
 _DEFAULT_VARIANT: Optional[str] = None
 
 
-def host_variant() -> str:
+def host_variant(config: Optional[ExpertStreamConfig] = None) -> str:
     """Return the host build a new service loads.
 
     The instrumented build when this process writes a stream trace
-    (``SGLANG_DSV41_EXPERT_TRACE_PATH`` or ``SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX``)
+    (``SGLANG_EXPERT_STREAM_TRACE``'s ``expert_path`` or ``job.prefix``)
     or injects a RAM-miss fault
-    (``SGLANG_TEST_DSV41_RAM_MISS_FAULT``); production otherwise.
+    (``SGLANG_TEST_DSV41_RAM_MISS_FAULT``); production otherwise. ``config``
+    defaults to the process's (``stream_config()``).
     """
     if _DEFAULT_VARIANT is not None:
         return _DEFAULT_VARIANT
-    if (
-        envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get()
-        or os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
-        or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get()
-    ):
+    trace = (config or stream_config()).trace
+    if trace.expert_path or trace.job.prefix or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get():
         return "instr"
     return "prod"
 
@@ -202,23 +200,62 @@ def _host_module(
     variant: Optional[str] = None,
     lanes: int = 8,
     nodes: int = 1,
+    config: Optional[ExpertStreamConfig] = None,
 ) -> Module:
-    """Return the cached host module for ``layout``, ``variant`` (default build), ``lanes`` and ``nodes``."""
-    variant = host_variant() if variant is None else variant
+    """Return the cached host module for ``layout``, ``variant`` (default build), ``lanes`` and ``nodes``, with the
+    options of ``config`` (default ``stream_config()``) installed: the C++ host reads no env, and each object it
+    builds copies the options installed when it is built."""
+    config = config or stream_config()
+    variant = host_variant(config) if variant is None else variant
     wire = expert_lease_block.wire_layout(lanes, nodes)
     lanes, nodes = wire.lanes, wire.nodes
     if variant == "instr_tsan" and _ALLOW_TSAN:
-        return _host_module_tsan(layout, lanes, nodes)
+        return _install_host_options(_host_module_tsan(layout, lanes, nodes), config)
     if variant not in VARIANTS:
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
         )
-    trigger_only = os.environ.get("SGLANG_DRAFT_DELAY_TRIGGER_ONLY", "0") == "1"
+    trigger_only = config.trace.draft_trigger.trigger_only
     if variant not in _build_for(layout, host_jit_key(layout, variant, lanes, nodes, trigger_only)).host_sources:
         raise ValueError(f"build {layout!r} has no {variant!r} host build variant")
     if trigger_only and variant != "prod":
-        raise ValueError("SGLANG_DRAFT_DELAY_TRIGGER_ONLY requires the production host build")
-    return _host_module_cached(layout, variant, lanes, nodes, trigger_only)
+        raise ValueError("SGLANG_EXPERT_STREAM_TRACE draft_trigger.trigger_only requires the production host build")
+    return _install_host_options(_host_module_cached(layout, variant, lanes, nodes, trigger_only), config)
+
+
+# The options last installed in each loaded host module, by id(module): a module is cached for the process, so an
+# unchanged config costs no FFI call.
+_INSTALLED_OPTIONS: dict[int, tuple] = {}
+
+
+def _install_host_options(module: Module, config: ExpertStreamConfig) -> Module:
+    """Install ``config``'s C++ options in ``module`` (trace_options.h, uring_options.h); returns the module."""
+    trace, uring = config.trace, config.tiers.uring
+    trace_args = (
+        trace.job.prefix,
+        int(trace.job.capacity),
+        bool(trace.job.resources),
+        int(trace.draft_trigger.arrival_us),
+        int(trace.draft_trigger.pending_us),
+        int(trace.draft_trigger.forward_us),
+        trace.draft_trigger.report_prefix,
+        trace.gate_path,
+    )
+    uring_args = (
+        uring.mode,
+        int(uring.queue_depth),
+        bool(uring.fixed_files),
+        uring.read_mode,
+        uring.wait_mode,
+        int(uring.sq_thread_idle_ms),
+        bool(uring.diagnostics),
+        uring.read_cuts,
+    )
+    if _INSTALLED_OPTIONS.get(id(module)) != (trace_args, uring_args):
+        module.expert_stream_set_trace_options(*trace_args)
+        module.expert_stream_set_uring_options(*uring_args)
+        _INSTALLED_OPTIONS[id(module)] = (trace_args, uring_args)
+    return module
 
 
 def _check_key(layout) -> BuildKey:
@@ -273,7 +310,7 @@ def _host_module_cached(layout: BuildKey, variant: str, lanes: int, nodes: int, 
             *(["-DSGLANG_EXPERT_STREAM_INSTR=1"] if variant == "instr" else []),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
-            *(["-DSGLANG_DRAFT_DELAY_TRIGGER_ONLY=1"] if trigger_only else []),
+            *(["-DSGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY=1"] if trigger_only else []),
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
@@ -482,7 +519,7 @@ def _fault_tensor(
     documented at ``read_rows_with_fault``; ``root`` narrows the per-extent faults to
     the drive a sub-read reads (``file % parts``), and ``mirror_caps`` (one cap per
     mirror root, at most 4 roots and 255 each; empty: off) turns the dynamic root
-    choice of ``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC`` on in the entry points that take it
+    choice of ``SGLANG_EXPERT_STREAM_MIRROR`` dynamic on in the entry points that take it
     (``read_rows_sqes``, ``read_rows_drive_load``).
     """
     caps = [int(c) for c in mirror_caps]
@@ -588,7 +625,7 @@ def read_rows_traced(
 # instantaneous; ``*_bytes`` landed and ``*_busy_ns`` accumulate over the load's life.
 # ``overlap_ns`` is the time a root had demand and speculative reads in flight at once;
 # ``moved_from``/``moved_to`` count the sub-reads the dynamic root choice
-# (``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``) sent away from and to the root.
+# (``SGLANG_EXPERT_STREAM_MIRROR`` dynamic) sent away from and to the root.
 # ``DRIVE_TAIL_FIELDS`` follow every root's ``DRIVE_FIELDS``, field-major, and decode
 # into the same per-root dict: ``fill_bytes`` are the bytes of the tier's fills (prefill
 # fills, hot-cache promotions, full layers), already counted in ``demand_bytes``.
@@ -724,13 +761,14 @@ def read_rows_idle(
     **faults,
 ) -> dict:
     """Test only: one speculative C++ read of ``experts`` into ``slots`` under the idle-drive root policy
-    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, ``IdleRoots``), with the fault keywords of ``read_rows_with_fault`` (piece
+    (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE, ``IdleRoots``), with the fault keywords of ``read_rows_with_fault`` (piece
     streaming always on).
 
     ``preload`` (demand reads per root) stands for other readers' demand in flight for the whole read. ``follow``: a
     demand read arrives on the first piece's root once it is in flight, and stays. ``boost`` boosts the read from its
     start. ``give_up_after`` > 0 gives up once that many pieces were issued. ``deadline_s``: the longest wait for an
-    idle root. ``spread`` and ``pieces``: SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD and _IDLE_PIECES. ``reads`` repeats the
+    idle root. ``spread`` and ``pieces``: SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD and
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES. ``reads`` repeats the
     read on the one reader, as its speculative reader reads row after row (stopping at the first that does not return
     1); the counts and SQEs add up over them.
 
@@ -859,7 +897,7 @@ def read_rows_with_fault(
       ``READ_CUTS`` says (see ``analysis/dsv41-drive/iopoll-cuts/results.md``);
       ``leg`` then narrows the faults to a cut leg as well.
 
-    Two spans (``SGLANG_DSV41_CPU_TWO_STAGE``, piece streaming only):
+    Two spans (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``, piece streaming only):
 
     - ``two_span_rows`` (a bit per row ordinal) reads those rows in two spans, the
       layout's first stage over every root before its second (``piece_geometry``'s
@@ -1100,7 +1138,7 @@ def piece_geometry(
     ``{deps, runs}``: ``deps`` is the bitmask of sub-reads the piece depends on and
     ``runs`` holds one ``(dst_lo, dst_hi)`` per segment, in segment destination
     coordinates. ``two_span`` cuts it as a two-stage CPU miss
-    (``SGLANG_DSV41_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
+    (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
     second's ``k`` 1, each span divided by ``span_weights`` (w13's, w2's) when given.
     """
     segments = int(tables.segments.shape[0])
@@ -1791,7 +1829,7 @@ def kernel_forward_two_stage(
     layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[int, str, dict]:
-    """Test only: :func:`kernel_forward` as a two-stage CPU miss runs it (``SGLANG_DSV41_CPU_TWO_STAGE``).
+    """Test only: :func:`kernel_forward` as a two-stage CPU miss runs it (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``).
 
     The forward's stage-two wait holds until a helper thread, ``delay_s`` after the call, has copied each ``restore``
     row ``(dst, src, bytes)`` (the second-stage bytes the caller held back) and opened the gate. Returns the status, the
@@ -1970,9 +2008,11 @@ class ExpertStreamHost:
         lanes: int = 8,
         node_ranges: Optional[Sequence[Sequence[tuple[int, int]]]] = None,
         sq_thread_cpus: Optional[Sequence[int]] = None,
+        config: Optional[ExpertStreamConfig] = None,
     ) -> None:
         # NUMA groups: node_ranges[g][row] = (lo, hi), group g's slots of the row; one group owning every slot by
-        # default. sq_thread_cpus: each group's SQPOLL core (-1 unpinned); None keeps the uring env's.
+        # default. sq_thread_cpus: each group's SQPOLL core (-1 unpinned); None keeps the uring options' (unpinned).
+        # config: the engine config whose C++ options (uring, trace) the module takes; None is stream_config().
         capacity = [int(c) for c in tables.capacity.tolist()]
         if node_ranges is None:
             node_ranges = [[(0, c) for c in capacity]]
@@ -2013,9 +2053,10 @@ class ExpertStreamHost:
                 "slot_map must start filled with -1 (the C++ tiers start empty)"
             )
         self._layout = layout
+        self.config = config or stream_config()
         # The host build is chosen once here: every later call goes to this module.
-        self.variant = host_variant() if variant is None else variant
-        self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes)
+        self.variant = host_variant(self.config) if variant is None else variant
+        self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes, self.config)
         self.threaded = False
         # set_cpu_layer's specs' tensors, kept alive while the host's layers read them.
         self._cpu_layer_keep: dict[int, tuple] = {}
@@ -2120,7 +2161,7 @@ class ExpertStreamHost:
         affinity. Cores 52-55,108-111 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
         or with ``busy_poll`` with no PAUSE (which the C++ side refuses unless each physical core is its service's
         alone), for ``spin_us``, then sleeps 50 us between polls; parked, it sleeps 20 us between checks. -1 never
-        sleeps (``SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`` in a server).
+        sleeps (``SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US`` in a server).
         """
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
@@ -2303,7 +2344,7 @@ class ExpertStreamHost:
         self._module.expert_stream_reserve_staging(self.handle, int(k))
 
     def reserve_spec_pool(self, share: int) -> None:
-        """Reserve every row's speculative pool (SGLANG_DSV41_RAM_PREFETCH): ``share`` slots per row and NUMA group
+        """Reserve every row's speculative pool (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH): ``share`` slots per row and NUMA group
         after its staging slots, never mapped, never a victim, never released. Once, after ``reserve_staging``, before
         any slot fills and before the thread starts."""
         self._module.expert_stream_reserve_spec_pool(self.handle, int(share))
@@ -2347,17 +2388,17 @@ class ExpertStreamHost:
         GPU scorer: ``candidates`` (``new_candidate_page``), which the select kernel writes, and no gates; optional
         ``min_margin`` fp32 ``[layers]``, per target row the least margin a candidate needs to be read.
 
-        ``idle_drive`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE): each group reads its pool rows through a reader of its
+        ``idle_drive`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE): each group reads its pool rows through a reader of its
         own, one piece at a time from a drive no demand reads, abandoning a read that waited ``idle_deadline_s`` for
         one; off, the speculative reads take turns with the demand reads on the group's reader. With it,
-        ``idle_spread`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
-        rotating from row to row, and ``idle_pieces`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
+        ``idle_spread`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
+        rotating from row to row, and ``idle_pieces`` (SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
         row's pieces may be in flight at once.
 
-        ``promote`` (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
+        ``promote`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
         that layer's map delta, so the device types them as RAM hits.
 
-        ``pool_serve`` (SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE) serves a GPU miss whose row landed in the pool by naming
+        ``pool_serve`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE) serves a GPU miss whose row landed in the pool by naming
         the pool slot in the lane's PieceSource word, so the stream kernel copies from it, instead of reading it from
         NVMe."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
@@ -2519,9 +2560,9 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The idle copy thread polls for
+        (``SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS`` in a server). The idle copy thread polls for
         ``spin_us``, then sleeps on its doorbell until the next submit; -1 never sleeps
-        (``SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US`` in a server). ``cpus`` is its core
+        (``SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US`` in a server). ``cpus`` is its core
         (``ThreadingConfig.copy_cpus``); empty inherits the caller's affinity.
         """
         self._module.expert_stream_enable_copy_engine(
@@ -2654,11 +2695,11 @@ class ExpertStreamHost:
         register work for ``keep_warm_us`` after each job and PAUSE after that, until the
         next submit. With ``[rows, 2 * nodes, tokens, hidden]`` rows a record's CPU job runs
         one forward of its tokens from the row's token table. ``two_stage``
-        (``SGLANG_DSV41_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
+        (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
         its job once w13 has landed: the gate/up GEMVs run while w2 is still being read.
         ``two_stage_weights`` (w13's, w2's, each one weight per mirror root or None for the
         mirror's shares) divides those two spans over the roots. ``store_out``
-        (``SGLANG_DSV41_CPU_EXPERTS_STORE_OUT``) leaves a job's overwrite of its token rows to
+        (``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT``) leaves a job's overwrite of its token rows to
         the kernel, which stores each token's first sum, instead of zeroing the rows first.
         """
         lanes = self.wire.lanes
@@ -3109,7 +3150,7 @@ class ExpertStreamHost:
         return dict(zip(COUNTERS, out.tolist()))
 
     def set_mirror_caps(self, caps: Sequence[int]) -> None:
-        """``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``: every NUMA group's reader picks each sub-read's mirror root, skipping
+        """``SGLANG_EXPERT_STREAM_MIRROR`` dynamic: every NUMA group's reader picks each sub-read's mirror root, skipping
         roots with ``caps[q]`` sub-reads in flight (demand and speculative, every group) and preferring the fewest bytes
         in flight; with every root at its cap a sub-read keeps its own root. One positive cap per mirror root; empty
         turns it off. Refused when the tables' files are not a full mirror set. Paused, or before the thread starts."""
@@ -3219,10 +3260,10 @@ def _device_wrappers(layout: BuildKey = EXL3_BUILD) -> list[tuple[str, str]]:
     ]
 
 
-def device_stamps_enabled() -> bool:
-    """Whether this process loads the stamped device module (device_stamps.cuh): with a job trace, as host_variant
-    picks the instrumented host build."""
-    return bool(os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"))
+def device_stamps_enabled(config: Optional[ExpertStreamConfig] = None) -> bool:
+    """Whether this process loads the stamped device module (device_stamps.cuh): with a job trace
+    (``SGLANG_EXPERT_STREAM_TRACE``'s ``job.prefix``), as host_variant picks the instrumented host build."""
+    return bool((config or stream_config()).trace.job.prefix)
 
 
 # device_stamps.cuh's ring: kStampRing rows of kStampWords int64, the seq then one %globaltimer ns per point.
@@ -3231,10 +3272,13 @@ DEVICE_STAMP_WORDS = 8
 DEVICE_STAMP_POINTS = ("post_start", "post_end", "stream_start", "stream_end", "wait_start", "wait_end")
 
 
-def _device_module(layout: BuildKey = EXL3_BUILD, lanes: int = 8, nodes: int = 1) -> Module:
-    """Return the cached device module for ``layout``, ``lanes`` and ``nodes``."""
+def _device_module(
+    layout: BuildKey = EXL3_BUILD, lanes: int = 8, nodes: int = 1, config: Optional[ExpertStreamConfig] = None
+) -> Module:
+    """Return the cached device module for ``layout``, ``lanes`` and ``nodes``; ``config`` (default
+    ``stream_config()``) says whether it is the stamped build."""
     wire = expert_lease_block.wire_layout(lanes, nodes)
-    return _device_module_cached(layout, wire.lanes, wire.nodes, device_stamps_enabled())
+    return _device_module_cached(layout, wire.lanes, wire.nodes, device_stamps_enabled(config))
 
 
 @cache_once
@@ -3480,11 +3524,11 @@ class ExpertStreamDevice:
     ``host.piece_runs()``; ``row_capacities`` is each row's pinned slot count
     (``tables.capacity``), which the post and S bound every host slot by.
     ``timeout_ms`` is the post's delta wait and S's deadline. ``hit_copy`` ("ce" or
-    "sm") and ``cpu_misses`` carry ``SGLANG_DSV41_RAM_HIT_COPY`` and
-    ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
-    ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` (ram_slot_map.type_lanes); ``split_model`` carries the experiment
-    ``SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL``'s cost words (ram_slot_map.split_model_words); ``lease_pdl``
-    (``SGLANG_DSV41_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
+    "sm") and ``cpu_misses`` carry ``SGLANG_EXPERT_STREAM_RAM_HIT_COPY`` and
+    ``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
+    ``SGLANG_EXPERT_STREAM_CPU_SPLIT``'s miss_cut/miss_cut_max (ram_slot_map.type_lanes); ``split_model`` carries the
+    experiment ``SGLANG_EXPERT_STREAM_CPU_SPLIT`` model's cost words (ram_slot_map.split_model_words); ``lease_pdl``
+    (``SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
     PDL.
 
     ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
@@ -3519,8 +3563,11 @@ class ExpertStreamDevice:
         lanes: int = 8,
         nodes: int = 1,
         split_model: Optional[Sequence[int]] = None,
+        config: Optional[ExpertStreamConfig] = None,
     ) -> None:
         self.wire = expert_lease_block.wire_layout(lanes, nodes)
+        # Whether the device module is the stamped build (device_stamps_enabled); None is stream_config().
+        self._config = config
         if (
             page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
@@ -3695,15 +3742,17 @@ class ExpertStreamDevice:
         """Return the device module, loading it on first use."""
         if self._module is None:
             self._module = _device_module(
-                self._layout, self.wire.lanes, self.wire.nodes
+                self._layout, self.wire.lanes, self.wire.nodes, self._config
             )
         return self._module
 
     def enable_device_stamps(self) -> None:
         """Point the stamped module's chain kernels at a pinned ring (device_stamps.cuh). Needs
         ``device_stamps_enabled()``; the ring lives as long as this object."""
-        if not device_stamps_enabled():
-            raise RuntimeError("device stamps need SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX (the stamped device module)")
+        if not device_stamps_enabled(self._config):
+            raise RuntimeError(
+                "device stamps need SGLANG_EXPERT_STREAM_TRACE's job.prefix (the stamped device module)"
+            )
         ring = torch.zeros(DEVICE_STAMP_RING * DEVICE_STAMP_WORDS, dtype=torch.int64).pin_memory()
         self._kernels().expert_stream_set_device_stamps(ring)
         self._stamp_ring = ring
@@ -3805,7 +3854,7 @@ class ExpertStreamDevice:
         self.map_bank["cpu_ok"][row] = 1
 
     def enable_spec_scorer(self, candidates: torch.Tensor, *, top_k: int, per_token: int, top_k_only: bool) -> None:
-        """The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu): ``candidates`` is the host's candidate page
+        """The GPU scorer (SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu): ``candidates`` is the host's candidate page
         (``new_candidate_page``); scores go to an fp32 [cpu_tokens_max, experts] scratch allocated here, so this runs
         after ``enable_cpu_experts`` and before any graph captures ``spec_score``."""
         if self._spec is not None:
@@ -4061,7 +4110,7 @@ class ExpertStreamDevice:
         a lane is the CPU's, and the weights in the record.
 
         ``spill`` is DIRECT's ``(overflow_flag int32 [1], gather_overflow int64 [1])`` for this row, given when lanes
-        may have no VRAM victim (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES): a lane whose ``dst_slots`` entry is -1
+        may have no VRAM victim (SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES): a lane whose ``dst_slots`` entry is -1
         becomes a CPU lane, or, when one cannot, the post serves the live prefix, lowers ``count`` and flags both words.
         """
         self._check_row(row)

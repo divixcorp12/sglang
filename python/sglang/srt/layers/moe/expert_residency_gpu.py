@@ -24,6 +24,11 @@ import torch
 
 from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import (
+    ExpertStreamConfig,
+    PullMode,
+    stream_config,
+)
 from sglang.srt.layers.moe.expert_residency import (
     decide_residency_on_device,
     residency_rank_keys,
@@ -39,7 +44,7 @@ _READY = 3
 # Index into the [2, layers] promotion and eviction counters.
 _DECODE_PHASE = 0
 _PREFILL_PHASE = 1
-# SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE values.
+# residency.insert_on_miss_stage values.
 _STAGE_OFF = 0
 _STAGE_SCRATCH = 1
 _STAGE_DIRECT = 2
@@ -100,7 +105,9 @@ class GpuResidencyUpdater:
         insert_on_miss: bool | int = False,
         insert_on_miss_decay: float = 0.98,
         fused_insert: bool = False,
+        config: ExpertStreamConfig | None = None,
     ) -> None:
+        self.stream_config = stream_config() if config is None else config
         layer_ids = [
             layer_id
             for layer_id in manager._layer_ids
@@ -268,7 +275,7 @@ class GpuResidencyUpdater:
                 return values
         raise ValueError(
             "GPU residency update cannot tabulate this decay exactly; "
-            "lower SGLANG_MOE_HOT_DECAY_TOKENS"
+            "lower SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS"
         )
 
     def _init_insert_on_miss(self) -> None:
@@ -373,21 +380,21 @@ class GpuResidencyUpdater:
         ``victim_lanes`` shortlist columns are victims, so the floor is ``2 * victim_lanes``.
         """
         width = self.miss_rows
-        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
-        if victims and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        victims = self.stream_config.copy.graph_gather_victim_lanes
+        if victims and not self.stream_config.cpu_experts.enabled:
             raise ValueError(
-                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} needs SGLANG_DSV41_CPU_EXPERTS=1: only the "
-                "CPU serves the lanes that take no victim"
+                f"SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES={victims} needs "
+                "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1: only the CPU serves the lanes that take no victim"
             )
         if victims and not 1 <= victims < width:
             raise ValueError(
-                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {width} miss lanes"
+                f"SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {width} miss lanes"
             )
         if victims and any(s.graph_miss_width != s.graph_gather_rows for s in self.streamers):
             # A lane per route: a verify's distinct misses never outnumber its lanes, so nothing is clamped.
             raise ValueError(
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"
+                "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
+                "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES"
             )
         # Lanes that may take a victim; the rest are the CPU's (the post's spill).
         self.victim_lanes = victims or width
@@ -402,15 +409,15 @@ class GpuResidencyUpdater:
                 and not streamer.format.engine_served
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
                     f"layer {layer_id} keeps every streamed tensor on the device"
                 )
         for layer_id, cache in zip(self.layer_ids, self.caches):
             if cache.capacity < 2 * self.victim_lanes:
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
                     f"twice its graph-gather victim lanes; layer {layer_id} has {cache.capacity} "
-                    f"slots for {self.victim_lanes} lanes. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
+                    f"slots for {self.victim_lanes} lanes. Raise SGLANG_EXPERT_STREAM_HOT_GPU_MB or use stage 1."
                 )
         device, layers = self.device, self.num_layers
         # Shortlisted slots per layer, and which of those columns name a real slot.
@@ -451,7 +458,7 @@ class GpuResidencyUpdater:
             for dtype in (torch.int32, torch.int64)
         }
 
-    def check_miss_plans(self) -> None:
+    def check_miss_plans(self, config: ExpertStreamConfig | None = None) -> None:
         """Refuse every backend that could write a cache row this mode does not control.
 
         The refusals are one guard because together they are the whole safety
@@ -467,7 +474,10 @@ class GpuResidencyUpdater:
           overwrite a slot the mapping has already committed.
         * A prefetch pull owns a dedicated row, covers routes that then never enter
           residency, and reads cache rows from a side stream.
+
+        ``config`` defaults to the process's ``stream_config()``.
         """
+        config = stream_config() if config is None else config
         if self.insert_direct:
             engine_served = [s.format.engine_served for s in self.streamers]
             if any(engine_served) and not all(engine_served):
@@ -477,11 +487,11 @@ class GpuResidencyUpdater:
 
         if (
             self.insert_direct
-            and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
+            and config.prefetch.shadow.pull_mode is not PullMode.OFF
         ):
             raise ValueError(
-                "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs "
-                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE=off: a side-stream pull reads and writes "
+                "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 needs "
+                "SGLANG_EXPERT_STREAM_SHADOW_PREFETCH pull_mode=off: a side-stream pull reads and writes "
                 "cache rows this mode commits residency for"
             )
         for streamer in self.streamers:
@@ -496,7 +506,7 @@ class GpuResidencyUpdater:
                 or plan.count.data_ptr() != streamer._graph_miss_count.data_ptr()
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan, "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan, "
                     "not plan buffers posted by another backend"
                 )
             if (
@@ -505,7 +515,7 @@ class GpuResidencyUpdater:
                 and not streamer.format.engine_served
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
                     "pinned host cache"
                 )
 

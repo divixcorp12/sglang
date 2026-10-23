@@ -3,7 +3,7 @@
 // ram_tier.h, never this file.
 #pragma once
 
-  // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS) ----
+  // ---- Prefill fills (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS) ----
   //
   // A prefill fill reads the rows of many experts into RAM slots on a helper thread while the caller gathers.
   //   - fill_begin: a caller that owns the tier claims slots for `experts` of `row`, in order, until one cannot be
@@ -119,7 +119,7 @@
   }
 
   // Sets the number of rows a prefill may own per layer: the share for a prefill, 0 for decode, set before each
-  // forward. 0 (the default, and always with SGLANG_DSV41_ENABLE_PREFILL_SHARE off) admits as take_slot_locked always
+  // forward. 0 (the default, and always with SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE off) admits as take_slot_locked always
   // has. Any thread: a relaxed store, read relaxed only by the owner's admissions (a paused caller's, in practice).
   void set_prefill_share(int64_t share) {
     if (share < 0) throw std::runtime_error(error_prefix<Layout>() + "a prefill share cannot be negative");
@@ -170,7 +170,7 @@
   // Creates the copy engine (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Copy engine"), a thread that copies a record's
   // HIT_COPY lanes with the DMA engine. `device` < 0 selects the CPU test backend (HostCopyBackend). Must run before
   // the service thread starts, and the engine stays unarmed until arm_copy_engine(). `wait_timeout_ns` is how long a
-  // closed gate may hold the decode stream before the watchdog aborts the process (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS).
+  // closed gate may hold the decode stream before the watchdog aborts the process (SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS).
   void enable_copy_engine(int64_t device, int64_t spin_ns, int64_t wait_timeout_ns, std::vector<int> cpus) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
@@ -229,7 +229,7 @@
   }
 
   // Sets row `row`'s copy table: `count` entries of {source slab address, destination tensor address, row bytes}. Bit i
-  // of `sm_mask` leaves entry i to the copy wait's SM reads (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
+  // of `sm_mask` leaves entry i to the copy wait's SM reads (SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES).
   // Precondition (row_layout.h, ExpertRowLayout): `entries` holds one entry per Layout::kNames name, in kNames order,
   // so sm_mask (a copy-table entry index) and Layout::kSmallMask (a layout-name index bitmask) share one index space.
   void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows, int64_t sm_mask) {
@@ -346,8 +346,8 @@
       Source& reader = dist_.group(g).reader;
       const int64_t parts = reader.tables().parts;
       reader.set_span_weights(
-          span_weight_units(config.span_weights[0], parts, "SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS"),
-          span_weight_units(config.span_weights[1], parts, "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS"));
+          span_weight_units(config.span_weights[0], parts, "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights"),
+          span_weight_units(config.span_weights[1], parts, "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w2_weights"));
     }
     if (cpu_kernel_ != nullptr && cpu_kernel_ != config.kernel)
       throw std::runtime_error(

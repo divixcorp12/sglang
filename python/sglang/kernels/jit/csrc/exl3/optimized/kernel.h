@@ -4,6 +4,7 @@
 #pragma once
 #include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include <cstdint>
+#include <string>
 
 // Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape, Bw>;
 // generic, ForwardPlan<GenericShape, *>. Read by tests and benches to see which plan a call took.
@@ -30,4 +31,18 @@ __attribute__((visibility("hidden"))) const ::sglang::cpu_experts::CpuExpertKern
 __attribute__((visibility("hidden"))) SglangExl3CpuPlanCalls exl3_cpu_plan_calls();
 // The most tokens a chunk holds in this build (math.hpp's CHUNK_M = MAX_M / ACT_ROWS).
 __attribute__((visibility("hidden"))) int32_t exl3_cpu_chunk_m();
+
+// The kernel's options from Python's config, before its first forward: the ISA cap ("" none) and report
+// (SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA), and the worker trace (SGLANG_EXPERT_STREAM_TRACE's cpu_worker and
+// gate_path; worker_trace.hpp), which only a -DEXL3_MOE_CPU_WORKER_TRACE=1 build records.
+struct Exl3CpuOptions {
+    std::string max_isa;
+    bool report_isa = false;
+    std::string worker_trace_prefix;
+    int64_t worker_trace_capacity = 65536;
+    int64_t worker_trace_min_us = 6000;
+    std::string scratch_trace_prefix;
+    std::string trace_gate_path;
+};
+__attribute__((visibility("hidden"))) void exl3_cpu_configure(const Exl3CpuOptions& options);
 }  // namespace sglang::exl3_cpu

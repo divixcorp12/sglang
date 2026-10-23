@@ -40,9 +40,9 @@ def test_no_arm_names_a_core_by_hand(tmp_path, arm):
     """ThreadingConfig derives the RAM thread's and the draft's cores from the arm's affinity. The recipe's spin core 17
     and ab_cpu_draft's draft cores 6-17 were chosen for other affinities, and the graphed arm was refused for them."""
     env = graphed_verify.arm_environment(arm, str(tmp_path))
-    assert "SGLANG_DSV41_RAM_MISS_SPIN_CORE" not in env
-    assert "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES" not in env
-    assert env["SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"] == "1"
+    assert "SGLANG_EXPERT_STREAM_NUMA_CORES" not in env
+    assert "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES" not in env
+    assert env["SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS"] == "1"
 
 
 def test_the_summary_reads_every_arm(tmp_path):
@@ -88,5 +88,5 @@ def test_the_draft_eager_arm_only_differs_by_the_switch(tmp_path):
     graph = graphed_verify.arm_environment("draft-graph", str(tmp_path))
     assert eager.pop("SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH") == "1"
     assert "SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH" not in graph
-    assert eager.pop("SGLANG_MOE_HOT_METRICS_FILE") != graph.pop("SGLANG_MOE_HOT_METRICS_FILE")
+    assert eager.pop("SGLANG_EXPERT_STREAM_TRACE") != graph.pop("SGLANG_EXPERT_STREAM_TRACE")
     assert eager == graph

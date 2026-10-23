@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.exl3_stream_trace import (
     get_exl3_stream_trace,
 )
 from sglang.srt.layers.moe.expert_engine import quant_hook
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.layers.moe.expert_engine.formats import format_for_quantization_config
 from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
@@ -113,7 +114,7 @@ class Exl3Config(QuantizationConfig):
             return Exl3LinearMethod(self)
         if isinstance(layer, FusedMoE):
             profile = get_profile_by_name(self.expert_profile_name)
-            cpu_draft_requested = envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get()
+            cpu_draft_requested = stream_config().draft.cpu_experts
             if cpu_draft_requested:
                 check_requested_capabilities(
                     expert_format=format_for_quantization_config(self),
@@ -360,10 +361,12 @@ EXL3_ROW_VIEWS = Exl3RowViews()
 _DRAFT_ROUTES_LOCK = threading.Lock()
 
 
-def record_draft_routes(layer_id: int, topk_ids: torch.Tensor) -> None:
-    """Append one draft MoE call's topk ids to ``SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH`` as a JSON line (the probe
-    ``draft_resident.top_n_resident_set`` calibrates from); a no-op when the path is unset."""
-    path = envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get()
+def record_draft_routes(layer_id: int, topk_ids: torch.Tensor, path: Optional[str] = None) -> None:
+    """Append one draft MoE call's topk ids to ``path`` (``SGLANG_EXPERT_STREAM_TRACE``'s ``draft_routes_path`` when
+    None) as a JSON line (the probe ``draft_resident.top_n_resident_set`` calibrates from); a no-op when it is
+    empty."""
+    if path is None:
+        path = stream_config().trace.draft_routes_path
     if not path:
         return
     import json
@@ -398,7 +401,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.cpu_draft = cpu_draft
         self.moe_runner_config = None
         self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
-        self.route_plan = envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get()
+        stream = stream_config()
+        self.route_plan = stream.copy.prefill.route_plan
+        # SGLANG_EXPERT_STREAM_TRACE's draft_routes_path, read here so a draft forward reads no config.
+        self._draft_routes_path = stream.trace.draft_routes_path
         # [max_rows, 1] bool: a speculative verify's dead rows (layers/moe/verify_dead_rows.py), or None.
         self.verify_dead_rows: Optional[torch.Tensor] = None
 
@@ -429,7 +435,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden = hidden_size
         layer.exl3_inter = intermediate_size_per_partition
         layer.exl3_loaded = set()
-        layer.exl3_streamed = self.streamed and envs.SGLANG_DSV41_EXPERT_STREAM.get()
+        layer.exl3_streamed = self.streamed and stream_config().enabled
         if layer.exl3_streamed:
             # Routed experts stay on disk. With no parameters, load_weights skips
             # them (deepseek_v4.load_weights' skip_unmaterialized_expert_param),
@@ -665,8 +671,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 route_plan=self.route_plan,
             )
         elif self.draft:
-            if envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get() and not _capturing():
-                record_draft_routes(layer.layer_id, topk_ids)
+            if self._draft_routes_path and not _capturing():
+                record_draft_routes(layer.layer_id, topk_ids, self._draft_routes_path)
             out = self._apply_draft(layer, x, topk_weights, topk_ids, cfg.swiglu_limit)
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
@@ -723,7 +729,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # Warmup and capture forwards route dummy tokens; they must not move residency.
             streamer.record_routes(routed)
         if route_plan:
-            # SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN: one readback before any gather of this layer, then none
+            # SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN: one readback before any gather of this layer, then none
             # between a chunk's gather and its compute, so the host queues the compute behind the gather.
             plan = Exl3RoutePlan.from_topk(topk_ids)
             source_ids = plan.source_ids
@@ -731,7 +737,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             source_ids = torch.unique(routed)
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         gathered = False
-        # A no-op unless SGLANG_DSV41_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
+        # A no-op unless SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
         with streamer.prefill_fills(source_ids):
             if route_plan:
                 for experts, row_of_source, rows in streamer.iter_gather_experts_host(

@@ -401,9 +401,8 @@ def _expected_config(recipe: str):
 def test_the_recipe_under_the_new_names_resolves_to_the_base_commits_settings(monkeypatch, recipe):
     import arm_env
 
-    old_env = {"base": arm_env.base_env(), "dspark": arm_env.arm_env(arm_env.dspark_env()), "prod": arm_env.prod_env()}[recipe]
-    new_env = arm_env.new_names_env(old_env)
-    rem.check_removed_env(new_env)  # the new recipe sets no removed name
+    new_env = {"base": arm_env.base_env(), "dspark": arm_env.arm_env(arm_env.dspark_env()), "prod": arm_env.prod_env()}[recipe]
+    rem.check_removed_env(new_env)  # the recipe sets no removed name
     assert "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US" not in new_env
     _set(monkeypatch, {k: v for k, v in new_env.items() if k.startswith(("SGLANG_", "EXL3_"))})
     flat, dsv41, exl3 = _expected_config(recipe)
@@ -413,22 +412,27 @@ def test_the_recipe_under_the_new_names_resolves_to_the_base_commits_settings(mo
 
 
 def test_the_recipe_still_means_what_the_fixture_froze():
-    # The fixture's raw env is the base commit's recipe; today's arm_env must not have drifted from it on the in-scope
-    # names, or the test above would compare two different recipes.
+    # The fixture's raw env is the base commit's recipe under the removed names. Translated to the new names it must
+    # still be what today's arm_env sets on the in-scope names, or the test above would compare two different recipes.
     import arm_env
 
     now = {"base": arm_env.base_env(), "dspark": arm_env.arm_env(arm_env.dspark_env()), "prod": arm_env.prod_env()}
+    sizes = ("SGLANG_EXPERT_STREAM_PINNED_HOST_MB", "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB",
+             "SGLANG_EXPERT_STREAM_HOT_GPU_MB")
     for recipe, frozen in FIXTURE["recipes"].items():
-        for key, value in frozen["raw"].items():
-            if key in ("SGLANG_MOE_PINNED_HOST_MB", "SGLANG_MOE_PINNED_HOST_NUMA_MB", "SGLANG_MOE_HOT_GPU_MB"):
+        for key, value in arm_env.new_names_env(frozen["raw"]).items():
+            if key in sizes:
                 continue  # the recipe's sizes move with the hardware; the resolved comparison above is what counts
-            assert now[recipe].get(key) == value, (recipe, key)
+            if key in rem.GROUP_PATHS:
+                assert json.loads(now[recipe][key]) == json.loads(value), (recipe, key)
+            else:
+                assert now[recipe].get(key) == value, (recipe, key)
 
 
 def test_the_prod_recipe_group_and_merged_values():
     import arm_env
 
-    new = arm_env.prod_env_new_names()
+    new = arm_env.prod_env()
     assert new["SGLANG_EXPERT_STREAM_NUMA_CORES"] == "0:ram=26"
     assert new["SGLANG_EXPERT_STREAM_COPY_MODE"] == "copy_engine"
     assert new["SGLANG_EXPERT_STREAM_ENABLE"] == "1"
@@ -438,10 +442,9 @@ def test_the_prod_recipe_group_and_merged_values():
     assert json.loads(new["SGLANG_EXPERT_STREAM_MIRROR"]) == {"dirs": arm_env.EXPERT_MIRROR_DIRS}
 
 
-# --- engine modules read no env (fails until the wiring step) ---------------------------------------------------
+# --- engine modules read no env ---------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="wiring in P3-H2", strict=False)
 def test_no_engine_module_but_config_reads_the_env():
     package = REPO / "python/sglang/srt/layers/moe/expert_engine"
     # removed_env.py is the startup check itself: it reads the process env by definition.

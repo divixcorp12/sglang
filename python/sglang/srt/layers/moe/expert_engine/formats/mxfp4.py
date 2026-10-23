@@ -56,19 +56,18 @@ DIM_ALIGNMENT = 128
 def expert_stream_enabled() -> bool:
     """Whether expert streaming is on for this process.
 
-    The one place the MXFP4 model and quant method ask. It reads the streaming switch the engine config will own; when
-    ``ExpertStreamConfig`` lands, change only this function.
+    The one place the MXFP4 model and quant method ask: ``ExpertStreamConfig.enabled``.
     """
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.expert_engine.config import stream_config
 
-    return bool(envs.SGLANG_DSV41_EXPERT_STREAM.get())
+    return stream_config().enabled
 
 
 def ram_prefetch_enabled() -> bool:
     """Whether the RAM prefetch (which scores the next layer with the registered gates) is on; see ``expert_stream_enabled``."""
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.expert_engine.config import stream_config
 
-    return bool(envs.SGLANG_DSV41_RAM_PREFETCH.get())
+    return stream_config().prefetch.ram.enabled
 
 
 def streams_experts(quant_config: Any, prefix: str) -> bool:

@@ -52,8 +52,9 @@ def build(args):
     if args.seed_build:
         shutil.copytree(args.seed_build, args.output / "exl3-build", dirs_exist_ok=True)
     os.environ.update(SGLANG_EXL3_BUILD_DIR=str(args.output / "exl3-build"),
-                      SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=str(args.output / "unused-job"),
-                      SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=str(args.output / "unused-worker"))
+                      SGLANG_EXPERT_STREAM_TRACE=json.dumps({
+                          "job": {"prefix": str(args.output / "unused-job")},
+                          "cpu_worker": {"prefix": str(args.output / "unused-worker")}}))
     ext = exl3_ext()
     tvm_lib = Path(tvm_ffi.libinfo.find_libtvm_ffi())
     command = [os.environ.get("CXX", "g++"), "-std=c++20", "-O3", "-shared", "-fPIC", "-pthread",

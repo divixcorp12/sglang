@@ -262,12 +262,13 @@ def open_service_row_images(
     """
     if not mirrors:
         raise RuntimeError(
-            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_MIRROR_DIRS (roots "
+            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_EXPERT_STREAM_MIRROR's dirs (roots "
             "holding images built by scripts/dsv41/build_row_images.py)"
         )
     if not direct:
         raise RuntimeError(
-            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_FILE_READER=uring_direct"
+            "exl3 RAM miss: the RAM-miss service reads row images and needs "
+            "SGLANG_EXPERT_STREAM_FILE_READER=uring_direct"
         )
     from sglang.srt.layers.moe.exl3_row_image import open_row_images
 

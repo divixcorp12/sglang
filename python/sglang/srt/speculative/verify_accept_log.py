@@ -1,4 +1,4 @@
-"""A trace run's per-verify accept log (``SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH``).
+"""A trace run's per-verify accept log (``trace.verify_accept_path`` of ``SGLANG_EXPERT_STREAM_TRACE``).
 
 One JSON line per request per verify step, in the scheduler's order: the request's ``rid``, ``k`` (its verifies
 before this one), ``num_correct_drafts`` (drafts only, no bonus token), ``settled`` (False for a request retracted or
@@ -15,7 +15,7 @@ import os
 import time
 from typing import Optional
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 
 
 class VerifyAcceptLog:
@@ -51,7 +51,7 @@ def get_verify_accept_log() -> Optional[VerifyAcceptLog]:
     """The process's log, opened on first use when the path is set; None otherwise."""
     global _log, _resolved
     if not _resolved:
-        prefix = envs.SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH.get()
+        prefix = stream_config().trace.verify_accept_path
         _log = VerifyAcceptLog(prefix) if prefix else None
         _resolved = True
     return _log

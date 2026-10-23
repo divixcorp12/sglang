@@ -321,7 +321,7 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
               split_model=None):
     """One post of the node-aware device build over one row: ``ram`` its slot map, ``staging`` node-major, ``split``
     node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes.
-    ``row_split``: the row's own node-major table (SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS), else -1 (the block's).
+    ``row_split``: the row's own node-major table (SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables), else -1 (the block's).
     ``scratch_words``: the GPU drip's scratch table (u64 per slot), written to the block and read by the post as that
     many slots; ``scratch_out`` (a list) then receives C1s's compacted (rows, dst slots, count).
     ``copy_ce``: the copy engine may take hits (hit_copy ce, the row's copy table set, w.lanes destination rows);
@@ -435,7 +435,7 @@ def test_the_split_is_per_node_and_a_zero_split_keeps_a_node_off_the_cpu():
 
 
 def test_a_row_split_replaces_the_lease_split_for_its_row_only():
-    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: a row with its own table types its lanes by it on every node, whatever
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables: a row with its own table types its lanes by it on every node, whatever
     the lease's tables say (what calibration and the retune write); -1 at its first word keeps the lease's. Mutations:
     the post ignoring row_split, or reading it for every row -- red on one of the two posts."""
     lanes, nodes = 8, 2
@@ -488,7 +488,7 @@ def _split_model_want(w, planned, ram, staging, split, forced_from, dst, routes,
 
 @pytest.mark.parametrize("lanes, nodes", [(8, 1), (8, 2), (16, 2), (40, 2)])
 def test_the_split_model_types_lanes_like_the_reference(lanes, nodes):
-    """Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): 300 random records -- hits, NVMe misses, forced lanes from a
+    """Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT model): 300 random records -- hits, NVMe misses, forced lanes from a
     spill point, destinations past the row's, routes naming experts 1-4 times, cost words on a grid that makes ties --
     type kind for kind and slot for slot as ram_slot_map.type_lanes(split_model=...), counters included; with the
     copy engine off the table and the miss cut type them. Mutations: ties broken last-lane first, a forced miss's

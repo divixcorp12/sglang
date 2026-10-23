@@ -440,7 +440,11 @@ class TestDumpCrossesMsgpackIpc(CustomTestCase):
         self.assertEqual(decoded, output)
 
 
-_JOB_TRACE_PREFIX = "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"
+_JOB_TRACE_PREFIX = "SGLANG_EXPERT_STREAM_TRACE"
+
+
+def _job_trace(prefix):
+    return json.dumps({"job": {"prefix": prefix}})
 
 
 class TestVerifyMarkers(CustomTestCase):
@@ -451,12 +455,12 @@ class TestVerifyMarkers(CustomTestCase):
         env = {k: v for k, v in os.environ.items() if k != _JOB_TRACE_PREFIX}
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertIsNone(VerifyMarkers.from_env(0))
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {_JOB_TRACE_PREFIX: f"{tmp}/jobs"}):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {_JOB_TRACE_PREFIX: _job_trace(f"{tmp}/jobs")}):
             self.assertIsNone(VerifyMarkers.from_env(1))
 
     def test_each_verify_writes_a_begin_and_an_end_in_the_job_event_format(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {_JOB_TRACE_PREFIX: f"{tmp}/jobs"}):
-            markers = VerifyMarkers.from_env(0)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {_JOB_TRACE_PREFIX: _job_trace(f"{tmp}/jobs")}):
+            markers =VerifyMarkers.from_env(0)
             for forward_ct in (7, 8):
                 markers.begin()
                 markers.end(forward_ct=forward_ct, bs=1)

@@ -7,6 +7,7 @@ instr build's fake CPU kernel and the test copy backend. The GPU half is test/ma
 """
 
 import dataclasses
+import json
 import logging
 import math
 import os
@@ -270,7 +271,7 @@ def _service_stub(nodes=2, fail=None):
 def test_the_service_publishes_calibrated_words_and_starts_a_refiner(monkeypatch):
     stub, published, cls = _service_stub()
     monkeypatch.setattr(calib, "calibrate", lambda *a, **k: (TRUE, ["hit_b.1 2.5->2.0"], 0.5))
-    with envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override("copy_lane=1.2"):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"model_costs": "copy_lane=1.2"})):
         cls._calibrate_split_model(stub)
     assert published == [calib.apply_overrides(TRUE, "copy_lane=1.2").words()]
     assert stub._split_model_refiner is not None and stub._split_model_refiner.costs.copy_lane == 1.2
@@ -295,7 +296,7 @@ def test_a_complete_override_skips_the_calibration(monkeypatch):
     stub, published, cls = _service_stub()
     monkeypatch.setattr(calib, "calibrate", lambda *a, **k: pytest.fail("calibrated despite a complete override"))
     every = ",".join(f"{k}=0.5" for k in SPLIT_MODEL_FIXTURE_MS)
-    with envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.override(every):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"model_costs": every})):
         cls._calibrate_split_model(stub)
     assert published == [split_model_words(2, every)]
 
@@ -313,7 +314,7 @@ def test_the_service_refines_and_publishes_and_a_failure_stops_the_refinement():
     stub._split_model_refiner = SimpleNamespace(refine=lambda m: TRUE, refines=1)
     cls._refine_split_model(stub)
     assert published == [TRUE.words()]
-    with envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.override(True):
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"model_residency_tiebreak": True})):
         cls._refine_split_model(stub)  # the flags word carries the tiebreak through every publish
     assert published[-1] == TRUE.words(residency_tiebreak=True) and published[-1][-1] == 1
     del published[1:]
@@ -327,7 +328,9 @@ def test_the_service_refines_and_publishes_and_a_failure_stops_the_refinement():
 
 
 def test_refinement_is_off_by_default():
-    assert envs.SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES.get() == 0
+    from sglang.srt.layers.moe.expert_engine.config import CpuSplitConfig
+
+    assert CpuSplitConfig().model_refine_batches == 0
 
 
 # The native half: RamTier::calibrate_split_model and the engine's fit moments on the fake kernel (k * FORWARD_NS a

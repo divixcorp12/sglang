@@ -1,4 +1,4 @@
-"""SGLANG_DSV41_CPU_EXPERTS_STORE_OUT on the CPU expert engine (cpu_experts.h run_job): a verify's per-token job leaves
+"""SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT on the CPU expert engine (cpu_experts.h run_job): a verify's per-token job leaves
 its overwrite to the kernel instead of zeroing its token rows and then accumulating.
 
 The kernel is the instr build's fake CpuExpertKernel (ExpertStreamHost.test_kernel_address), driven by the split

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace fullstack {
@@ -63,12 +64,12 @@ class StackFixture {
   std::unique_ptr<Impl> impl_;
 };
 
-// The tier the kernel settled on (min(host, EXL3_MOE_CPU_MAX_ISA)): "bw", "vnni" or "vbmi". Needs AVX512BW.
+// The tier the kernel settled on (min(host, the --max-isa cap)): "bw", "vnni" or "vbmi". Needs AVX512BW.
 const char* kernel_isa_tier();
 
-// Configures cpu_forward.cpp's kernel runtime: an AVX-512 tier (the host's, or EXL3_MOE_CPU_MAX_ISA's cap at launch),
+// Configures cpu_forward.cpp's kernel runtime: an AVX-512 tier (the host's, or `max_isa`'s cap; empty for none),
 // single-threaded ATen, no dynamic OpenMP. Prints "isa tier <tier>" to stderr. Throws if the host has no AVX512BW.
-void configure_cpu_kernel_runtime();
+void configure_cpu_kernel_runtime(const std::string& max_isa);
 
 // Bit-exact comparison against a reference file (fixture.h's compare_reference); throws naming the file.
 void check_reference(const std::filesystem::path& path, const std::vector<float>& actual);

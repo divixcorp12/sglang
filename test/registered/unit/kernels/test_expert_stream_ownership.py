@@ -149,9 +149,9 @@ def test_the_tier_declares_only_the_callers_mutex():
     The RAM prefetch (ram_prefetch.h) adds two, off the request path's own state: the pool's per-group mutex
     (SpecPool::mutex, taken as pool_->mutex(g)) over its entries' transitions, and SpecGroup::turn, the shared
     reader's turn between a demand read and a speculative one, which an idle-drive group
-    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes.
+    (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes.
 
-    The promote flag (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) adds NumaGroup::row_mutex[row], declared in numa_group.h: the
+    The promote flag (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE) adds NumaGroup::row_mutex[row], declared in numa_group.h: the
     claimer locks it (owner.row_mutex[row]) beside the pool mutex(g), and an InstrBuild test hold takes
     dist_.group(g).row_mutex[row]. Order is fixed: row_mutex[row] of g, then pool mutex(g)."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")

@@ -1,15 +1,18 @@
-// The io_uring options of the expert-stream reader, read from SGLANG_EXPERT_STREAM_URING_* environment variables.
+// The io_uring options of the expert-stream reader: SGLANG_EXPERT_STREAM_URING's members (config.py's UringConfig),
+// passed from Python. The host reads no environment variable.
 //
-// Every variable is optional: unset ones keep the production defaults, and an invalid value throws
-// std::invalid_argument naming the variable. UringOptions also derives the behaviors that follow from the
+// A module installs one UringOptions (set_uring_options, from the expert_stream_set_uring_options export) before it
+// builds any reader, and each reader copies it (installed_uring_options). The defaults are production's; an invalid
+// value throws std::invalid_argument naming the member. UringOptions also derives the behaviors that follow from the
 // combination of options (polling, wait strategy, read cuts), so the reader asks it rather than re-deriving them.
 //
-//   QUEUE_DEPTH, MODE, FIXED_FILES, READ_MODE, WAIT_MODE, SQ_THREAD_IDLE_MS, SQ_THREAD_CPU, DIAGNOSTICS, READ_CUTS
+//   mode, queue_depth, fixed_files, read_mode, wait_mode, sq_thread_idle_ms, diagnostics, read_cuts
+// The SQPOLL core is not here: each ring takes it from the thread plan (BasicUringReader::set_sq_thread_cpu).
 #pragma once
 
-#include <charconv>
-#include <cstdlib>
+#include <cstdint>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,7 +32,7 @@ enum class UringWaitMode { Block, Spin };
 // Whether reads are cut into legs the block device takes whole (READ_CUTS): Auto follows IOPOLL.
 enum class UringReadCuts { Auto, Off, On };
 
-// The parsed options. Build one with from_env(); the const members derive the behavior the options imply.
+// The parsed options. Build one with parse(); the const members derive the behavior the options imply.
 struct UringOptions {
   unsigned queue_depth = 0;  // 0 keeps RowReader's 16 * parts credit limit
   UringMode mode = UringMode::Default;
@@ -37,7 +40,7 @@ struct UringOptions {
   UringReadMode read_mode = UringReadMode::Normal;
   UringWaitMode wait_mode = UringWaitMode::Block;
   unsigned sq_thread_idle_ms = 10000;
-  int sq_thread_cpu = -1;
+  int sq_thread_cpu = -1;  // unpinned unless the ring's set_sq_thread_cpu names a core
   bool diagnostics = false;
   // Cut every read into legs the block device takes whole (read_cuts.h). Auto: on exactly when IOPOLL is, where an
   // uncut read is punted to io-wq (analysis/dsv41-drive/iopoll/diagnosis.md).
@@ -98,11 +101,11 @@ struct UringOptions {
     return "invalid";
   }
 
-  // Reads and validates every SGLANG_EXPERT_STREAM_URING_* variable. Throws std::invalid_argument on a bad value.
-  static UringOptions from_env() {
+  // Validates SGLANG_EXPERT_STREAM_URING's members as Python passes them. Throws std::invalid_argument on a bad value.
+  static UringOptions parse(std::string_view mode, int64_t queue_depth, bool fixed_files, std::string_view read,
+                            std::string_view wait, int64_t sq_thread_idle_ms, bool diagnostics, std::string_view cuts) {
     UringOptions o;
-    o.queue_depth = number<unsigned>("QUEUE_DEPTH", 0, 0, 32768);
-    const auto mode = value("MODE", "default");
+    o.queue_depth = number<unsigned>("queue_depth", queue_depth, 0, 32768);
     if (mode == "default")
       o.mode = UringMode::Default;
     else if (mode == "iopoll")
@@ -112,9 +115,8 @@ struct UringOptions {
     else if (mode == "sqpoll_iopoll")
       o.mode = UringMode::SqPollIoPoll;
     else
-      invalid("MODE", "expected default, iopoll, sqpoll, or sqpoll_iopoll");
-    o.fixed_files = boolean("FIXED_FILES", false);
-    const auto read = value("READ_MODE", "normal");
+      invalid("mode", "expected default, iopoll, sqpoll, or sqpoll_iopoll");
+    o.fixed_files = fixed_files;
     if (read == "normal")
       o.read_mode = UringReadMode::Normal;
     else if (read == "fixed")
@@ -122,19 +124,16 @@ struct UringOptions {
     else if (read == "readv_fixed")
       o.read_mode = UringReadMode::ReadvFixed;
     else
-      invalid("READ_MODE", "expected normal, fixed, or readv_fixed");
-    const auto wait = value("WAIT_MODE", "block");
+      invalid("read_mode", "expected normal, fixed, or readv_fixed");
     if (wait == "block")
       o.wait_mode = UringWaitMode::Block;
     else if (wait == "spin")
       o.wait_mode = UringWaitMode::Spin;
     else
-      invalid("WAIT_MODE", "expected block or spin");
-    o.sq_thread_idle_ms = number<unsigned>("SQ_THREAD_IDLE_MS", 10000, 0, std::numeric_limits<unsigned>::max());
-    o.sq_thread_cpu = number<int>("SQ_THREAD_CPU", -1, -1, std::numeric_limits<int>::max());
-    if (o.sq_thread_cpu != -1 && !o.sqpoll()) invalid("SQ_THREAD_CPU", "requires a sqpoll mode");
-    o.diagnostics = boolean("DIAGNOSTICS", false);
-    const auto cuts = value("READ_CUTS", "auto");
+      invalid("wait_mode", "expected block or spin");
+    o.sq_thread_idle_ms =
+        number<unsigned>("sq_thread_idle_ms", sq_thread_idle_ms, 0, std::numeric_limits<unsigned>::max());
+    o.diagnostics = diagnostics;
     if (cuts == "auto")
       o.read_cuts = UringReadCuts::Auto;
     else if (cuts == "0")
@@ -142,38 +141,49 @@ struct UringOptions {
     else if (cuts == "1")
       o.read_cuts = UringReadCuts::On;
     else
-      invalid("READ_CUTS", "expected auto, 0, or 1");
+      invalid("read_cuts", "expected auto, 0, or 1");
     return o;
   }
 
+  // The name an error gives a member, as the group env spells it.
+  static std::string key(const char* member) {
+    return std::string("SGLANG_EXPERT_STREAM_URING ") + member;
+  }
+
  private:
-  static std::string key(const char* name) {
-    return std::string("SGLANG_EXPERT_STREAM_URING_") + name;
-  }
-  static std::string_view value(const char* name, const char* fallback) {
-    const char* found = std::getenv(key(name).c_str());
-    return found ? found : fallback;
-  }
-  [[noreturn]] static void invalid(const char* name, const char* reason) {
-    throw std::invalid_argument(key(name) + ": " + reason);
-  }
-  static bool boolean(const char* name, bool fallback) {
-    const auto v = value(name, fallback ? "1" : "0");
-    if (v == "0") return false;
-    if (v == "1") return true;
-    invalid(name, "expected 0 or 1");
+  [[noreturn]] static void invalid(const char* member, const char* reason) {
+    throw std::invalid_argument(key(member) + ": " + reason);
   }
   template <typename T>
-  static T number(const char* name, T fallback, T low, T high) {
-    const char* v = std::getenv(key(name).c_str());
-    if (!v) return fallback;
-    const std::string_view s(v);
-    T result{};
-    const auto parsed = std::from_chars(s.data(), s.data() + s.size(), result);
-    if (s.empty() || parsed.ec != std::errc{} || parsed.ptr != s.data() + s.size() || result < low || result > high)
-      invalid(name, "invalid integer or value outside supported range");
-    return result;
+  static T number(const char* member, int64_t value, T low, T high) {
+    if (value < static_cast<int64_t>(low) || value > static_cast<int64_t>(high))
+      invalid(member, "invalid integer or value outside supported range");
+    return static_cast<T>(value);
   }
 };
+
+// Internal linkage: each module's translation unit owns its installed options, never merged with another library's.
+namespace {
+struct InstalledUringOptions {
+  std::mutex mutex;
+  UringOptions options;
+};
+inline InstalledUringOptions& installed_uring_options_state() {
+  static InstalledUringOptions state;
+  return state;
+}
+
+inline void set_uring_options(const UringOptions& options) {
+  auto& state = installed_uring_options_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.options = options;
+}
+
+inline UringOptions installed_uring_options() {
+  auto& state = installed_uring_options_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.options;
+}
+}  // namespace
 
 }  // namespace sglang::expert_stream

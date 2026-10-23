@@ -1,6 +1,7 @@
 """Shared host slab allocations preserve layout, placement, and ownership."""
 
 import gc
+import json
 import os
 import sys
 import weakref
@@ -94,7 +95,7 @@ def test_empty_arena_and_scalar_rows(rows: int) -> None:
 def test_cache_uses_shared_arena_only_with_explicit_opt_in(
     monkeypatch: pytest.MonkeyPatch, enabled: bool,
 ) -> None:
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_SLAB_ARENA", "1" if enabled else "0")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING", json.dumps({"slab_arena": enabled}))
     layer = torch.nn.Module()
     layer.weights = torch.nn.Parameter(torch.arange(32, dtype=torch.float32).reshape(4, 8))
     layer.scales = torch.nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(4, 2))
@@ -114,7 +115,7 @@ def test_cache_uses_shared_arena_only_with_explicit_opt_in(
 
 @pytest.mark.parametrize("value", ["", "true", "2"])
 def test_cache_rejects_invalid_arena_option(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_SLAB_ARENA", value)
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING", json.dumps({"slab_arena": value}))
     layer = torch.nn.Module()
     layer.weights = torch.nn.Parameter(torch.ones(4, 8))
     layer._nvfp4_file_source_bytes_per_expert = 32

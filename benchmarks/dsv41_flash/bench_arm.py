@@ -111,7 +111,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     r.add_argument(
         "--mirror-dirs",
         default="",
-        help="SGLANG_MOE_EXPERT_MIRROR_DIRS; empty (default) runs without a mirror",
+        help="the \"dirs\" key of SGLANG_EXPERT_STREAM_MIRROR; empty (default) runs without a mirror",
     )
     r.add_argument("--gpu-run", default=ac.DEFAULT_GPU_RUN)
     r.add_argument("--hot-gpu-mb", type=int, default=ac.Resources().hot_gpu_mb)

@@ -129,15 +129,15 @@ def _layer(method, num_experts=NUM_EXPERTS, hidden=HIDDEN, inter=INTER):
 
 def _streaming_env(ckpt):
     return (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_EXPERT_DIR.override(str(ckpt)),
-        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("auto"),
-        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+        envs.SGLANG_EXPERT_STREAM_ENABLE.override(True),
+        envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.override(str(ckpt)),
+        envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("auto"),
+        envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"),
     )
 
 
 def test_stream_mode_registers_no_expert_parameters():
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True):
         layer = _layer(Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True))
     assert list(layer.named_parameters()) == []
     assert layer.exl3_streamed is True
@@ -164,11 +164,11 @@ def test_process_attaches_an_exl3_streamer(ckpt):
     [
         ({"num_experts": NUM_EXPERTS + 1}, True, "disable_shared_experts_fusion"),
         ({"hidden": 2 * HIDDEN}, True, "do not match the layer"),
-        ({}, False, "needs SGLANG_DSV41_EXPERT_DIR"),
+        ({}, False, "needs SGLANG_EXPERT_STREAM_EXPERT_DIR"),
     ],
 )
 def test_process_rejects_a_mismatched_layer(ckpt, kwargs, env_dir, match):
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True), envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.override(
         str(ckpt) if env_dir else ""
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
@@ -181,16 +181,16 @@ def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
     from sglang.srt.layers.moe.expert_engine.formats import exl3 as exl3_expert_format
 
     monkeypatch.setattr(exl3_expert_format, "_WARNED_WITHOUT_PINNED_TIER", False)
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True), envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.override(
         str(ckpt)
-    ), envs.SGLANG_MOE_PINNED_HOST_MB.override(0):
+    ), envs.SGLANG_EXPERT_STREAM_PINNED_HOST_MB.override(0):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.expert_engine.formats.exl3"):
             for _ in range(2):
                 layer = _layer(method, hidden=2 * HIDDEN)  # fails after the warning
                 with pytest.raises(ValueError, match="do not match the layer"):
                     method.process_weights_after_loading(layer)
-    warnings = [r for r in caplog.records if "SGLANG_MOE_PINNED_HOST_MB" in r.getMessage()]
+    warnings = [r for r in caplog.records if "SGLANG_EXPERT_STREAM_PINNED_HOST_MB" in r.getMessage()]
     assert len(warnings) == 1
 
 
@@ -213,8 +213,8 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows,
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
     with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
+        envs.SGLANG_EXPERT_STREAM_ENABLE.override(True),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
@@ -254,7 +254,7 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
 
     monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
     monkeypatch.setattr(exl3_mod, "assert_not_capturing", refuse)
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = types.SimpleNamespace(serves_graph_gather=lambda topk: topk.topk_ids.numel() <= 6)
@@ -324,7 +324,7 @@ def test_apply_hands_a_verifys_dead_rows_to_the_graph_gather_and_masks_them_on_t
 
     monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
     monkeypatch.setattr(Exl3MoEMethod, "_apply_streamed", staticmethod(fake_apply_streamed))
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     graph_gather = [True]
@@ -377,7 +377,7 @@ def test_apply_routes_every_topk_format_alike(monkeypatch, kind):
         return torch.ones_like(x)
 
     monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
 
@@ -431,7 +431,7 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     _, w13, w2 = _reference(ckpt, 1)
     _fake_accumulates(monkeypatch)
     a, b, c, d = _streaming_env(ckpt)
-    with a, b, c, d, envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan):
+    with a, b, c, d, envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
         method.process_weights_after_loading(layer)
@@ -493,8 +493,8 @@ def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch,
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
     with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
+        envs.SGLANG_EXPERT_STREAM_ENABLE.override(True),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
@@ -519,8 +519,8 @@ def test_route_plan_all_dropped_routes_give_zeros(ckpt, monkeypatch):
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
     with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(True),
+        envs.SGLANG_EXPERT_STREAM_ENABLE.override(True),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN.override(True),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)

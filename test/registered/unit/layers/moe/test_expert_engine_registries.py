@@ -307,7 +307,7 @@ def test_the_exl3_quant_config_asks_for_cpu_draft_experts_through_the_profile(mo
         def __init__(self):
             torch.nn.Module.__init__(self)
 
-    with envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS.override(True):
         draft = EXL3_CONFIG.get_quant_method(_Stub(), "stages.0.mlp.experts")
         target = EXL3_CONFIG.get_quant_method(_Stub(), "model.layers.3.mlp.experts")
     assert draft.draft and draft.cpu_draft and not draft.streamed

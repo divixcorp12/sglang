@@ -34,6 +34,13 @@ SglangExl3CpuPlanCalls exl3_cpu_plan_calls()
 }
 
 int32_t exl3_cpu_chunk_m() { return CHUNK_M; }
+
+void exl3_cpu_configure(const Exl3CpuOptions& options)
+{
+    ::sglang::cpu_experts::ExpertForward<Exl3Quant>::configure_isa(options.max_isa, options.report_isa);
+    worker_trace::set_options({options.worker_trace_prefix, options.worker_trace_capacity, options.worker_trace_min_us,
+                               options.scratch_trace_prefix, options.trace_gate_path});
+}
 }  // namespace sglang::exl3_cpu
 
 // Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).

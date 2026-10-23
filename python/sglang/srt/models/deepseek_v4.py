@@ -93,6 +93,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -4325,6 +4326,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        self.expert_stream_config = stream_config()
         # None unless streamed EXL3 experts can be skipped; see Source.init_new.
         self.skip_checkpoint_weight = self._streamed_expert_skip_hook()
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
@@ -4777,8 +4779,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
         if (
-            envs.SGLANG_DSV41_RAM_PREFETCH.get()
-            or envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get()
+            self.expert_stream_config.prefetch.ram.enabled
+            or self.expert_stream_config.trace.residency_capture
         ):
             from sglang.srt.layers.moe.expert_engine.profiles import (
                 profile_for_hf_config,
@@ -4960,7 +4962,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         from sglang.srt.layers.moe.expert_engine.profiles import profile_for_hf_config
 
         return profile_for_hf_config(self.config).streamed_weight_skip_hook(
-            streaming=envs.SGLANG_DSV41_EXPERT_STREAM.get(),
+            streaming=self.expert_stream_config.enabled,
             expert_format=format_for_quantization_config(self.quant_config),
         )
 

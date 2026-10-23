@@ -396,15 +396,15 @@ class TestManagerPlacement(unittest.TestCase):
         self.model = _cpu_model()
 
     def test_unset_keeps_first_touch_and_reports_no_placement(self):
-        with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override(""):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override(""):
             self.assertEqual(expert_stream.pinned_host_placement(4 * MIB), ())
 
     def test_a_placement_that_disagrees_with_the_budget_is_refused(self):
-        with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:3"), self.assertRaisesRegex(ValueError, "must agree"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override("0:3"), self.assertRaisesRegex(ValueError, "must agree"):
             expert_stream.pinned_host_placement(4 * MIB)
 
     def test_the_capacity_check_runs_before_anything_is_allocated(self):
-        with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(
             host_numa, "check_capacity", side_effect=ValueError("short")
         ), patch.object(host_numa, "allocate_bound") as allocate:
             with self.assertRaisesRegex(ValueError, "short"):
@@ -413,7 +413,7 @@ class TestManagerPlacement(unittest.TestCase):
 
     def test_a_model_without_streamed_experts_checks_no_capacity(self):
         # A DSpark draft runner shares the target's budget env but streams nothing; the target already holds the tier.
-        with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(
             host_numa, "check_capacity", side_effect=ValueError("short")
         ) as check:
             manager = ExpertPinnedHostCacheManager.from_model(torch.nn.Linear(2, 2), budget_bytes=4 * MIB)
@@ -422,7 +422,7 @@ class TestManagerPlacement(unittest.TestCase):
 
     @unittest.skipUnless(MBIND_PERMITTED, "mbind is not permitted here")
     def test_the_manager_binds_every_slab_and_logs_the_placement(self):
-        with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(host_numa, "check_capacity"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(host_numa, "check_capacity"):
             with self.assertLogs(expert_stream.logger, "INFO") as logs:
                 manager = ExpertPinnedHostCacheManager.from_model(self.model, budget_bytes=4 * MIB)
         self.assertTrue(manager.caches)

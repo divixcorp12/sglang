@@ -73,10 +73,13 @@ int main() { Capture<false> c(4,6,3); std::vector<int> v; c.grow(v,8,"production
     return outputs
 
 
-def run(probes, tmp_path, **options):
+def run(probes, tmp_path, gate_path=None, **worker):
+    """``worker`` overrides keys of the trace group's ``cpu_worker`` object; ``gate_path`` is its top-level key."""
+    trace = {"cpu_worker": {"prefix": str(tmp_path / "phases"), "min_us": 0, **worker}}
+    if gate_path is not None:
+        trace["gate_path"] = gate_path
     env = {**os.environ, "OMP_NUM_THREADS": "4", "OMP_DYNAMIC": "FALSE",
-           "SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX": str(tmp_path / "phases"),
-           "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US": "0", **options}
+           "SGLANG_EXPERT_STREAM_TRACE": json.dumps(trace)}
     subprocess.run([str(probes[0])], check=True, env=env)
     return [json.loads(line) for line in next(tmp_path.glob("phases.*.jsonl")).open()]
 
@@ -102,19 +105,19 @@ def test_workers_distinguish_sleep_from_compute(probes, tmp_path):
 
 
 def test_capacity_admits_only_complete_forwards(probes, tmp_path):
-    records = run(probes, tmp_path, SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="25")
+    records = run(probes, tmp_path, capacity=25)
     assert len(records[1:-1]) == 20
     assert records[-1]["forwards_retained"] == records[-1]["dropped_forwards"] == 1
 
 
 def test_duration_filter_retains_no_fast_forwards(probes, tmp_path):
-    records = run(probes, tmp_path, SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US="1000000000")
+    records = run(probes, tmp_path, min_us=1000000000)
     assert len(records) == 2 and records[-1]["forwards_seen"] == 2
 
 
 def test_production_has_no_timing_resource_or_file_symbols(probes, tmp_path):
     subprocess.run([str(probes[1])], check=True, cwd=tmp_path,
-                   env={**os.environ, "SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX": str(tmp_path / "forbidden")})
+                   env={**os.environ, "SGLANG_EXPERT_STREAM_TRACE": json.dumps({"cpu_worker": {"prefix": str(tmp_path / "forbidden")}})})
     assert not list(tmp_path.iterdir())
     symbols = subprocess.check_output(["nm", "-u", str(probes[1])], text=True)
     assert not any(s in symbols for s in ("clock_gettime", "getrusage", "fopen", "getenv", "syscall"))
@@ -122,19 +125,19 @@ def test_production_has_no_timing_resource_or_file_symbols(probes, tmp_path):
 
 def test_build_flag_requires_job_attribution(monkeypatch):
     from sglang.srt.layers.quantization.exl3.ext import worker_trace_defines
-    monkeypatch.setenv("SGLANG_DSV41_CPU_EXPERTS", "1")
-    monkeypatch.delenv("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX", raising=False)
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS", "1")
+    monkeypatch.delenv("SGLANG_EXPERT_STREAM_TRACE", raising=False)
     assert worker_trace_defines() == []
-    monkeypatch.setenv("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX", "/diagnostic/phases")
-    monkeypatch.delenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", raising=False)
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"cpu_worker": {"prefix": "/diagnostic/phases"}}))
     with pytest.raises(ValueError, match="attribution"):
         worker_trace_defines()
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", "/diagnostic/events")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps(
+        {"cpu_worker": {"prefix": "/diagnostic/phases"}, "job": {"prefix": "/diagnostic/events"}}))
     assert worker_trace_defines() == ["-DEXL3_MOE_CPU_WORKER_TRACE=1"]
 
 
 def test_scratch_growth_is_attributed_before_team_entry(probes, tmp_path):
-    run(probes, tmp_path, SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX=str(tmp_path / "scratch"))
+    run(probes, tmp_path, scratch_prefix=str(tmp_path / "scratch"))
     data = [json.loads(line) for line in next(tmp_path.glob("scratch.*.jsonl")).open()]
     summaries = [r for r in data if r.get("kind") == "scratch"]
     growth = [r for r in data if r.get("kind") == "growth"]
@@ -152,7 +155,6 @@ def test_scratch_growth_is_attributed_before_team_entry(probes, tmp_path):
 def test_closed_gate_does_not_consume_worker_capacity(probes, tmp_path):
     gate = tmp_path / "gate"
     gate.write_bytes(bytes(4))
-    data = run(probes, tmp_path, SGLANG_CPU_EXPERT_TRACE_GATE=str(gate),
-               SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="1")
+    data = run(probes, tmp_path, gate_path=str(gate), capacity=1)
     assert len(data) == 2 and data[-1]["dropped_forwards"] == 0
     assert data[-1]["forwards_seen"] == 2

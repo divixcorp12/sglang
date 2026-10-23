@@ -7,7 +7,7 @@ run the same plans: a ``table`` dump there equals its ``slabs`` dump.) ``--regis
 as an alias) runs the host's ``kernel_forward`` on two core groups at once (the first and second half of ``--cores``),
 exits 1 naming the case when they differ, and saves the first group's outputs. A dump made at the merge-base is the
 reference a kernel refactor must reproduce exactly, on every ISA tier the host can run. The kernel reads
-EXL3_MOE_CPU_MAX_ISA once, at its first forward or tier query, so each tier is its own process.
+SGLANG_EXPERT_STREAM_CPU_MAX_ISA once, at its first forward or tier query, so each tier is its own process.
 
 Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build environment.
 """
@@ -44,7 +44,7 @@ ROUTES = {
 }
 WEIGHTS = (0.5, 0.3, 0.2, 0.15, 0.1)
 SCALES = (1.0, 8.0)
-# (avx2, avx512bw, avx512vnni) the kernel reports at each EXL3_MOE_CPU_MAX_ISA; vnni needs a VNNI host (no VBMI is used)
+# (avx2, avx512bw, avx512vnni) the kernel reports at each SGLANG_EXPERT_STREAM_CPU_MAX_ISA; vnni needs a VNNI host (no VBMI is used)
 TIERS = {"scalar": (False, False, False), "avx2": (True, False, False), "bw": (True, True, False),
          "vnni": (True, True, True)}
 
@@ -150,8 +150,8 @@ def run_two_core_groups(torch, handle, hidden, cases, halves):
 
 
 def dump(args):
-    os.environ["EXL3_MOE_CPU_MAX_ISA"] = args.isa  # read once, at the kernel's first use
-    os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
+    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = args.isa  # read once, at the kernel's first use
+    os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 
     import sglang

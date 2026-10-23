@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import json
 import os
 import shutil
 
@@ -137,7 +138,7 @@ def test_the_exl3_format_serves_graph_gathers_from_its_pinned_tier():
     assert graph_source_kind_of(Exl3ExpertFormat) == "pinned_tier"
 
 
-# --- Mirror row source selection (SGLANG_MOE_EXPERT_MIRROR_DIRS / _WEIGHTS) ----
+# --- Mirror row source selection (SGLANG_EXPERT_STREAM_MIRROR dirs / weights) ----
 
 
 def _mirrored(tmp_path, num_roots=2):
@@ -161,8 +162,7 @@ def _row_source(fmt):
 
 def _mirror_env(dirs, weights=""):
     stack = contextlib.ExitStack()
-    stack.enter_context(envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(dirs))
-    stack.enter_context(envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override(weights))
+    stack.enter_context(envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": dirs, "weights": weights})))
     return stack
 
 
@@ -212,8 +212,7 @@ def test_mirror_dirs_unset_keeps_the_shard_source(tmp_path):
         source = fmt.default_row_source(None, fmt.tensor_specs(None), kind)
         assert type(source) is Exl3ShardRowSource
     # Unset is the default, and a source root is not needed to read one root.
-    assert envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get() == ""
-    assert envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.get() == ""
+    assert envs.SGLANG_EXPERT_STREAM_MIRROR.get() == ""
     plain = Exl3ExpertFormat(fmt.layout, 1, direct=False)
     assert type(_row_source(plain)) is Exl3ShardRowSource
 
@@ -231,8 +230,8 @@ def test_weights_and_roots_of_different_length_are_refused_naming_both(tmp_path)
         with pytest.raises(ValueError) as caught:
             _row_source(fmt)
     message = str(caught.value)
-    assert "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS lists 3 weights" in message
-    assert "SGLANG_MOE_EXPERT_MIRROR_DIRS lists 2 roots" in message
+    assert "SGLANG_EXPERT_STREAM_MIRROR weights lists 3 weights" in message
+    assert "SGLANG_EXPERT_STREAM_MIRROR dirs lists 2 roots" in message
     with _mirror_env(os.pathsep.join(roots), "1"):
         with pytest.raises(ValueError, match="lists 1 weights.*lists 2 roots"):
             _row_source(fmt)
@@ -244,7 +243,7 @@ def test_weights_and_roots_of_different_length_are_refused_naming_both(tmp_path)
 def test_unusable_weights_are_refused_naming_the_knob(tmp_path, weights):
     fmt, roots = _mirrored(tmp_path)
     with _mirror_env(os.pathsep.join(roots), weights):
-        with pytest.raises(ValueError, match="SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_MIRROR"):
             _row_source(fmt)
 
 
@@ -380,7 +379,7 @@ def test_the_streamer_builder_hands_the_format_the_real_source_root(
     assert built.source_root != str(link)
     with (
         _mirror_env(os.pathsep.join(roots)),
-        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+        envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"),
     ):
         source = built.default_row_source(None, built.tensor_specs(None), "auto")
     assert isinstance(source, Exl3MirrorRowSource)

@@ -63,6 +63,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.removed_env import check_removed_env
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -275,6 +276,9 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
         """
+
+        # A stale launch script must fail first, naming the replacement of each removed expert-streaming env.
+        check_removed_env()
 
         # Ensure plugins are loaded before ServerArgs construction,
         # so hooks on ServerArgs.__post_init__ fire correctly.

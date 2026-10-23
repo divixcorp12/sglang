@@ -199,8 +199,9 @@ const char* kernel_isa_tier() {
   return exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
 }
 
-void configure_cpu_kernel_runtime() {
-  // The kernel detects its ISA tier at the first query, here, after EXL3_MOE_CPU_MAX_ISA was set at launch.
+void configure_cpu_kernel_runtime(const std::string& max_isa) {
+  // The kernel detects its ISA tier at the first query, here, under the cap configured just before it.
+  ::sglang::exl3_cpu::exl3_cpu_configure({.max_isa = max_isa});
   if (!exl3_moe_cpu_has_avx512_bw())
     throw std::runtime_error("This study requires AVX512BW");
   std::cerr << "isa tier " << kernel_isa_tier() << '\n';

@@ -13,6 +13,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 SCRIPT = os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "run_capture_pair.sh")
 BASE = "dspark-both-misscut"
+# No spaces: the dry run prints each arm's env on one whitespace-separated line.
+SPLIT = json.dumps({"table": "0,1,2"}, separators=(",", ":"))
 
 
 def _dry(tmp_path, *args, env=None):
@@ -25,7 +27,7 @@ def test_a_dry_run_of_two_arms_resolves_their_envs_commands_and_outputs_and_laun
     prompt.write_text("a prompt")
     out = tmp_path / "out"
     capture = ["--no-verify-split", "--long-prompt", str(prompt), "--decode-seconds", "300", "--ttft-repeats", "3"]
-    r = _dry(tmp_path, "--env", "SGLANG_DSV41_CPU_EXPERTS_SPLIT=0,1,2", "ab-64=SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS=64",
+    r = _dry(tmp_path, "--env", f"SGLANG_EXPERT_STREAM_CPU_SPLIT={SPLIT}", "ab-64=SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS=64",
              "ab-start=", "--", *capture, env={"SGLANG_LEAKED_FROM_SHELL": "1"})
     assert r.returncode == 0, r.stderr + r.stdout
     lines = r.stdout.splitlines()
@@ -34,18 +36,19 @@ def test_a_dry_run_of_two_arms_resolves_their_envs_commands_and_outputs_and_laun
     resolved = json.loads(next(x for x in lines if x.startswith("resolved-env.json: ")).split(": ", 1)[1])
     assert set(resolved) == {"ab-64", "ab-start", "argv"}
     a, b = resolved["ab-64"], resolved["ab-start"]
-    assert a["SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"] == "64" and "SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS" not in b
-    assert a["SGLANG_DSV41_CPU_EXPERTS_SPLIT"] == b["SGLANG_DSV41_CPU_EXPERTS_SPLIT"] == "0,1,2"
+    assert a["SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS"] == "64" and "SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS" not in b
+    assert a["SGLANG_EXPERT_STREAM_CPU_SPLIT"] == b["SGLANG_EXPERT_STREAM_CPU_SPLIT"] == SPLIT
     assert "SGLANG_LEAKED_FROM_SHELL" not in a
-    assert a["SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"] == f"{out}/ab-64/events"
-    assert b["SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"] == f"{out}/ab-start/events"
-    assert a["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] == "1048576"
-    assert "SGLANG_DSV41_EXPERT_TRACE_PATH" not in a
+    trace_a, trace_b = json.loads(a["SGLANG_EXPERT_STREAM_TRACE"]), json.loads(b["SGLANG_EXPERT_STREAM_TRACE"])
+    assert trace_a["job"]["prefix"] == f"{out}/ab-64/events"
+    assert trace_b["job"]["prefix"] == f"{out}/ab-start/events"
+    assert trace_a["job"]["capacity"] == 1048576
+    assert "expert_path" not in trace_a
     assert resolved["argv"][resolved["argv"].index("--port") + 1] == "30032"
-    for name, extra in (("ab-64", "SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS=64"), ("ab-start", "")):
+    for name, extra in (("ab-64", "SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS=64"), ("ab-start", "")):
         i = lines.index(f"ARM {name}")
         env_line, prelaunch, cap, outputs = lines[i + 1:i + 5]
-        assert env_line.split() == ["env:", "SGLANG_DSV41_CPU_EXPERTS_SPLIT=0,1,2", *extra.split()]
+        assert env_line.split() == ["env:", f"SGLANG_EXPERT_STREAM_CPU_SPLIT={SPLIT}", *extra.split()]
         assert f"--log {out}/{name}.prelaunch.json --hicache-gib 12.67" in prelaunch
         assert cap.endswith(f"analysis/dsv41-drive/dspark/spec_margin_capture.py {out}/{name} --arm {BASE} "
                             + " ".join(capture))
@@ -58,12 +61,12 @@ def test_a_single_arm_with_the_default_probe_is_a_diagnostic(tmp_path):
     assert r.returncode == 0, r.stderr + r.stdout
     resolved = json.loads(next(x for x in r.stdout.splitlines() if x.startswith("resolved-env.json: ")).split(": ", 1)[1])
     assert set(resolved) == {"diag", "argv"}
-    assert resolved["diag"]["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] == "524288"
+    assert json.loads(resolved["diag"]["SGLANG_EXPERT_STREAM_TRACE"])["job"]["capacity"] == 524288
 
 
 def test_an_arm_setting_the_capture_would_override_is_refused(tmp_path):
-    r = _dry(tmp_path, "a=SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=8")
-    assert r.returncode == 2 and "a: SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY" in r.stderr
+    r = _dry(tmp_path, 'a=SGLANG_EXPERT_STREAM_TRACE={"job":{"capacity":8}}')
+    assert r.returncode == 2 and "a: SGLANG_EXPERT_STREAM_TRACE" in r.stderr
 
 
 def test_malformed_arms_and_missing_arguments_are_refused(tmp_path):

@@ -1,4 +1,4 @@
-// The residency capture's kernels (SGLANG_DSV41_RESIDENCY_CAPTURE), launched right after layer T's post on its stream
+// The residency capture's kernels (SGLANG_EXPERT_STREAM_TRACE residency_capture), launched right after layer T's post on its stream
 // and inside its captured graph. Their record layouts are the host reference's
 // (python/sglang/srt/layers/moe/residency_capture_ref.py, module docstring); the kernels transcribe it.
 //

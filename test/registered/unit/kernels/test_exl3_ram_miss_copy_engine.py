@@ -372,7 +372,7 @@ def test_a_stale_hot_record_on_a_hit_only_record_is_an_overrun_not_fatal(tmp_pat
         host.stop()
 
 
-# ---- SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: CW reads the small tensors itself ----
+# ---- SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES: CW reads the small tensors itself ----
 
 
 def _sm_copy_engine(s, host):
@@ -468,7 +468,7 @@ def test_sm_small_copies_are_refused_without_the_copy_engine():
 
     base = Dsv41Config.from_envs()
     check_sm_small_copies(base)  # off: nothing to check
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_COPY_MODE"):
         check_sm_small_copies(
             msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True)
         )

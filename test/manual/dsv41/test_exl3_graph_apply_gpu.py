@@ -50,7 +50,7 @@ def _layer(tmp_path):
     layer.top_k = TOP_K
     layout = build_exl3_expert_layout(str(tmp_path))
     fmt = Exl3ExpertFormat(layout, 0, direct=False)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+    with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
         streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
     pinned = ExpertPinnedHostCache(streamer, PINNED_EXPERTS)
     hot = ExpertHotCache(streamer, 3, scratch_rows=TOP_K)

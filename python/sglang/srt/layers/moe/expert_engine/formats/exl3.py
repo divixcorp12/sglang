@@ -11,8 +11,7 @@ This file holds:
 * :class:`RowSegment` and ``_row_schema``, which derive the streamed tensor specs
   and the byte map from an on-disk layout.
 * :class:`Exl3ExpertFormat`, the ``ExpertFormat`` of one layer.
-* The ``SGLANG_MOE_EXPERT_MIRROR_DIRS`` / ``SGLANG_MOE_EXPERT_MIRROR_WEIGHTS``
-  parsers.
+* The parsers of ``SGLANG_EXPERT_STREAM_MIRROR``'s ``dirs`` and ``weights``.
 * :func:`build_exl3_expert_streamer`, the entry point a quantization method calls.
 
 See DSV41_REFERENCE.md section 9.1 for the pinned-tier budget these formats use.
@@ -30,12 +29,12 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
     build_exl3_expert_layout,
 )
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 from sglang.srt.layers.moe.expert_format import ExpertTensorSpec, expert_streamer_of
 
 if TYPE_CHECKING:
@@ -130,7 +129,7 @@ class Exl3ExpertFormat:
 
     Spec-only: there is no dense ``[experts, ...]`` source, so every host row comes
     from the row source. ``direct`` picks O_DIRECT shard reads; None takes it from
-    ``SGLANG_MOE_EXPERT_FILE_READER``. ``source_root`` is the checkpoint directory
+    ``SGLANG_EXPERT_STREAM_FILE_READER``. ``source_root`` is the checkpoint directory
     the layout was read from; mirrored reads need it to find each root's copy of a
     shard.
 
@@ -198,10 +197,11 @@ class Exl3ExpertFormat:
         Always ``is_pinned``: an expert is pinned while the layer's hot cache holds
         it, or is loading it, into a slot. The callable looks the hot cache up at
         eviction time, because the pinned tier is built before the hot cache and
-        residency changes. With ``SGLANG_MOE_EXPERT_GRAPH_GATHER`` it also returns
+        residency changes. With ``SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER`` it also returns
         ``slot_table`` (and ``row_fills`` under
-        ``SGLANG_DSV41_ENABLE_PREFILL_FILLS``).
+        ``SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS``).
         """
+        copy = stream_config().copy
 
         def is_pinned(expert_id: int) -> bool:
             # Called O(pinned rows) times per miss chunk; each call scans the
@@ -220,7 +220,7 @@ class Exl3ExpertFormat:
             return hot is not None and expert_id in hot.slot_to_expert
 
         options = {"is_pinned": is_pinned}
-        if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+        if copy.graph_gather:
             # The C++ RAM-miss thread owns this tier's slots;
             # ExpertPinnedHostCache binds the tier's capacity into the table.
             from sglang.srt.layers.moe.expert_engine.row_backend import (
@@ -235,12 +235,12 @@ class Exl3ExpertFormat:
                 self.layer_id,
                 lambda: expert_streamer_of(layer),
             )
-            if envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get():
+            if copy.prefill.fills:
                 options["row_fills"] = options["slot_table"]
-        elif envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get():
+        elif copy.prefill.fills:
             raise RuntimeError(
-                "exl3: SGLANG_DSV41_ENABLE_PREFILL_FILLS needs SGLANG_MOE_EXPERT_GRAPH_GATHER: the fills are the "
-                "RAM-miss service's reads, and only option C runs that service"
+                "exl3: SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS needs SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER: the "
+                "fills are the RAM-miss service's reads, and only option C runs that service"
             )
         return options
 
@@ -257,10 +257,11 @@ class Exl3ExpertFormat:
 
         tier = getattr(streamer, "pinned_host_cache", None)
         if isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
-            ExpertEngineService.get().plan_gather_width(rows, routes)
-            victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
+            service = ExpertEngineService.get()
+            service.plan_gather_width(rows, routes)
+            victims = service.config.stream.copy.graph_gather_victim_lanes
             if victims and victims < rows:
-                ExpertEngineService.get().plan_staging_width(victims)
+                service.plan_staging_width(victims)
 
     def attach_hot_cache_manager(self, manager, streamer) -> None:
         """Attach the RAM-miss service (fail-stop check, residency pushes, row backend).
@@ -285,8 +286,8 @@ class Exl3ExpertFormat:
     ) -> Optional[ExpertRowSource]:
         """Build the row source for ``kind`` (``auto`` or ``shards``).
 
-        Reads the original EXL3 shards, or, when ``SGLANG_MOE_EXPERT_MIRROR_DIRS`` is
-        set, the mirrored copies of them. Raises for any other kind.
+        Reads the original EXL3 shards, or, when ``SGLANG_EXPERT_STREAM_MIRROR``'s ``dirs``
+        is set, the mirrored copies of them. Raises for any other kind.
         """
         if kind in ("auto", "shards"):
             mirror = exl3_mirror_config()
@@ -335,9 +336,9 @@ class Exl3ExpertFormat:
         """
         if self.source_root is None:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_MIRROR_DIRS needs the format built with "
+                f"{_MIRROR_DIRS} needs the format built with "
                 "source_root, the checkpoint directory the layout was read from "
-                "(SGLANG_DSV41_EXPERT_DIR), to find each root's copy of a shard"
+                "(SGLANG_EXPERT_STREAM_EXPERT_DIR), to find each root's copy of a shard"
             )
         for root in roots:
             if os.path.realpath(root) == os.path.realpath(self.source_root):
@@ -349,7 +350,7 @@ class Exl3ExpertFormat:
     def mirror_table_args(self) -> dict:
         """The mirror keyword arguments of ``exl3_ram_miss_tables``.
 
-        Empty without ``SGLANG_MOE_EXPERT_MIRROR_DIRS``; otherwise the same
+        Empty without ``SGLANG_EXPERT_STREAM_MIRROR``'s ``dirs``; otherwise the same
         validated roots and split policy ``default_row_source`` builds its mirror
         source from.
         """
@@ -459,21 +460,22 @@ class Exl3ExpertFormat:
             return self.direct
         from sglang.srt.model_loader.file_row_reader import validate_file_reader_mode
 
-        mode = validate_file_reader_mode(envs.SGLANG_MOE_EXPERT_FILE_READER.get())
+        mode = validate_file_reader_mode(stream_config().tiers.file_reader)
         if mode == "mmap":
             raise ValueError(
                 "the exl3 shard row source reads with io_uring; set "
-                "SGLANG_MOE_EXPERT_FILE_READER=uring_direct (or uring for buffered reads)"
+                "SGLANG_EXPERT_STREAM_FILE_READER=uring_direct (or uring for buffered reads)"
             )
         return mode == "uring_direct"
 
 
-_MIRROR_DIRS = "SGLANG_MOE_EXPERT_MIRROR_DIRS"
-_MIRROR_WEIGHTS = "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"
+# The env members these parsers name in their errors (SGLANG_EXPERT_STREAM_MIRROR is one JSON object).
+_MIRROR_DIRS = "SGLANG_EXPERT_STREAM_MIRROR dirs"
+_MIRROR_WEIGHTS = "SGLANG_EXPERT_STREAM_MIRROR weights"
 
 
 def parse_mirror_roots(value: str) -> tuple[str, ...]:
-    """Parse the ``os.pathsep``-separated ``SGLANG_MOE_EXPERT_MIRROR_DIRS`` roots.
+    """Parse the ``os.pathsep``-separated ``SGLANG_EXPERT_STREAM_MIRROR`` ``dirs`` roots.
 
     Each must be a readable directory. An empty entry (``a::b``, a trailing
     separator) is refused rather than dropped: it changes the root count the
@@ -505,7 +507,8 @@ def parse_mirror_roots(value: str) -> tuple[str, ...]:
 
 
 def parse_mirror_weights(value: str, num_roots: int, name: str = _MIRROR_WEIGHTS) -> tuple[float, ...]:
-    """Parse ``SGLANG_MOE_EXPERT_MIRROR_WEIGHTS`` (or another list in its format, ``name``): one weight per root.
+    """Parse ``SGLANG_EXPERT_STREAM_MIRROR``'s ``weights`` (or another list in its format, ``name``): one weight per
+    root.
 
     Colon-separated, non-negative and not all zero; empty means equal weights.
     """
@@ -536,21 +539,25 @@ def parse_mirror_weights(value: str, num_roots: int, name: str = _MIRROR_WEIGHTS
     return tuple(weights)
 
 
-_SPAN_WEIGHTS = ("SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS")
-
-
-def two_stage_span_weights() -> tuple[Optional[tuple[float, ...]], Optional[tuple[float, ...]]]:
-    """``SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS`` and ``_W2_WEIGHTS``, each one weight per mirror root (one root
-    without a mirror), or None when unset (the span keeps the mirror's shares).
+def two_stage_span_weights(
+    config: Optional[ExpertStreamConfig] = None,
+) -> tuple[Optional[tuple[float, ...]], Optional[tuple[float, ...]]]:
+    """``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``'s ``w13_weights`` and ``w2_weights``, each one weight per mirror root
+    (one root without a mirror), or None when unset (the span keeps the mirror's shares). ``config`` defaults to
+    ``stream_config()``.
 
     Raises for a list the mirror cannot take: another root count, all zero, or a share for a root the mirror weighs 0
     (that root reads none of a row, so the tables give it nothing to read from).
     """
-    mirror = exl3_mirror_config()
+    config = stream_config() if config is None else config
+    mirror = exl3_mirror_config(config)
     roots, mirror_weights = (len(mirror[0]), mirror[1]) if mirror is not None else (1, (1.0,))
+    two_stage = config.cpu_experts.two_stage
     out = []
-    for name in _SPAN_WEIGHTS:
-        value = getattr(envs, name).get()
+    for name, value in (
+        ("SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights", two_stage.w13_weights),
+        ("SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w2_weights", two_stage.w2_weights),
+    ):
         if not value.strip():
             out.append(None)
             continue
@@ -562,13 +569,16 @@ def two_stage_span_weights() -> tuple[Optional[tuple[float, ...]], Optional[tupl
     return out[0], out[1]
 
 
-def exl3_mirror_config() -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:
-    """``(roots, weights)`` from the environment, or None when mirroring is off.
+def exl3_mirror_config(
+    config: Optional[ExpertStreamConfig] = None,
+) -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:
+    """``(roots, weights)`` from ``config.tiers.mirror`` (``stream_config()`` when None), or None when mirroring is off.
 
     Raises if weights are set without roots, since they would be silently ignored.
     """
-    dirs = envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get()
-    weights = envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.get()
+    mirror = (stream_config() if config is None else config).tiers.mirror
+    dirs = mirror.dirs
+    weights = mirror.weights
     if not dirs:
         if weights.strip():
             raise ValueError(
@@ -606,23 +616,22 @@ def build_exl3_expert_streamer(
 ):
     """An ``ExpertStreamer`` for an EXL3 MoE layer whose routed experts stay on disk.
 
-    ``expert_dir`` defaults to ``SGLANG_DSV41_EXPERT_DIR``. The row source comes
-    from ``SGLANG_MOE_EXPERT_ROW_SOURCE`` (``auto`` means the shards). Raises if the
+    ``expert_dir`` defaults to ``SGLANG_EXPERT_STREAM_EXPERT_DIR``. The row source comes
+    from ``SGLANG_EXPERT_STREAM_ROW_SOURCE`` (``auto`` means the shards). Raises if the
     checkpoint's expert count or trellis shapes do not match the layer.
     """
     # Imported here: expert_stream imports Triton kernels and the model loader.
     from sglang.srt.layers.moe.expert_stream import ExpertStreamer
 
     global _WARNED_WITHOUT_PINNED_TIER
-    expert_dir = expert_dir or envs.SGLANG_DSV41_EXPERT_DIR.get()
+    tiers = stream_config().tiers
+    expert_dir = expert_dir or tiers.expert_dir
     if not expert_dir:
-        raise ValueError("SGLANG_DSV41_EXPERT_STREAM needs SGLANG_DSV41_EXPERT_DIR")
-    if not envs.SGLANG_MOE_PINNED_HOST_MB.get() and not _WARNED_WITHOUT_PINNED_TIER:
-        # SGLANG_DSV41_EXPERT_RAM_GIB is retired; warn so an old launch script
-        # setting it does not silently run with no RAM tier.
+        raise ValueError("SGLANG_EXPERT_STREAM_ENABLE needs SGLANG_EXPERT_STREAM_EXPERT_DIR")
+    if not tiers.pinned_host_mb and not _WARNED_WITHOUT_PINNED_TIER:
         _WARNED_WITHOUT_PINNED_TIER = True
         logger.warning(
-            "EXL3 expert streaming without SGLANG_MOE_PINNED_HOST_MB: there is no "
+            "EXL3 expert streaming without SGLANG_EXPERT_STREAM_PINNED_HOST_MB: there is no "
             "host RAM tier, so every VRAM miss reads the shards"
         )
     layout = exl3_expert_layout_for(os.path.realpath(expert_dir))

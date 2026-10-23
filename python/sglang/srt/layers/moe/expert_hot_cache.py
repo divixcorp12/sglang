@@ -39,6 +39,11 @@ import torch
 
 from sglang.srt.environ import InsertOnMissStage, envs
 from sglang.srt.layers.moe.async_telemetry import AsyncTelemetry, TorchTelemetryBackend
+from sglang.srt.layers.moe.expert_engine.config import (
+    ExpertStreamConfig,
+    PullMode,
+    stream_config,
+)
 from sglang.srt.layers.moe.expert_format import (
     inclusive_hot_slot_limit,
     iter_expert_streamers,
@@ -74,12 +79,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
-# Diagnostic switches read once at import; they only add NVTX ranges or readiness
-# samples and never change what is copied.
-_SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
-_PREFORWARD_READINESS_DIAGNOSTIC = (
-    os.environ.get("SGLANG_MOE_PREFORWARD_READINESS_DIAGNOSTIC") == "1"
-)
 
 
 def graph_gather_scratch_rows(tokens: int, top_k: int, max_rows: int = 0) -> int:
@@ -142,7 +141,7 @@ class ExpertHotCache:
     are resident.
 
     Each tensor has ``capacity`` slot rows, then ``scratch_rows`` rows that receive
-    graph-gather misses. With a non-off ``SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE`` one
+    graph-gather misses. With a non-off ``prefetch.shadow.pull_mode`` one
     more trailing row, at index ``capacity + scratch_rows``, is the dedicated side-pull
     slot of ``PrefetchPuller``; its setup-time ``assert_within_allocation`` accepts
     the row only when the allocation is exactly one row larger than the flag-off
@@ -155,19 +154,24 @@ class ExpertHotCache:
     visible only when the promotion completes.
     """
 
+    # Diagnostic only: NVTX ranges around the chunked promotion's host waits (trace.sync_wait_nvtx).
+    _sync_wait_nvtx = False
+
     def __init__(
         self,
         streamer: ExpertStreamer,
         capacity: int,
         scratch_rows: int = 0,
-        upper_capacity: Optional[int] = None,
+        upper_capacity: int | None = None,
+        config: ExpertStreamConfig | None = None,
     ):
         """Allocate ``capacity`` slots plus ``scratch_rows`` graph-gather rows.
 
         With SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP and ``upper_capacity`` (and no scratch or side-pull rows),
         the tensors reserve address space for ``upper_capacity`` slots but back only ``capacity``, and the index
         buffers are sized for the upper bound, so startup calibration can grow or shrink the slot count in place
-        (hot_cache_retire.set_hot_capacity)."""
+        (hot_cache_retire.set_hot_capacity). ``config`` defaults to the process's ``stream_config()``."""
+        config = stream_config() if config is None else config
         capacity = index(capacity)
         scratch_rows = index(scratch_rows)
         if not 0 <= capacity <= streamer.num_experts:
@@ -177,9 +181,8 @@ class ExpertHotCache:
         self.streamer = streamer
         self.capacity = capacity
         self.scratch_rows = scratch_rows
-        self.reserves_prefetch_pull_row = (
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
-        )
+        self._sync_wait_nvtx = config.trace.sync_wait_nvtx
+        self.reserves_prefetch_pull_row = config.prefetch.shadow.pull_mode is not PullMode.OFF
         allocation_rows = capacity + scratch_rows + int(self.reserves_prefetch_pull_row)
         resizable = (
             envs.SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP.get()
@@ -562,7 +565,7 @@ class ExpertHotCache:
             with (
                 (
                     torch.cuda.nvtx.range("dsv41.hot_cache.host_use")
-                    if _SYNC_WAIT_NVTX
+                    if self._sync_wait_nvtx
                     else nullcontext()
                 ),
                 pinned_cache.host_use(),
@@ -587,7 +590,7 @@ class ExpertHotCache:
                     self._transfer_executor.wait(ticket, current_stream)
                     with (
                         torch.cuda.nvtx.range("dsv41.hot_cache.promotion_stream_sync")
-                        if _SYNC_WAIT_NVTX
+                        if self._sync_wait_nvtx
                         else nullcontext()
                     ):
                         current_stream.synchronize()
@@ -1035,7 +1038,7 @@ class _OperationalCounters:
     host_read_ns: int = 0
     host_split_ns: int = 0
     # Rows prefill fills read for the gathers (ExpertGatherStats.host_fill_rows): with
-    # SGLANG_DSV41_ENABLE_PREFILL_FILLS, a prefill's reads are host_read_rows plus these.
+    # SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS, a prefill's reads are host_read_rows plus these.
     host_fill_rows: int = 0
 
 
@@ -1125,6 +1128,7 @@ class ExpertHotCacheManager:
         insert_on_miss_decay: float | None = None,
         fused_insert: bool | None = None,
         graph_gather_miss_lanes: int | None = None,
+        config: ExpertStreamConfig | None = None,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1145,47 +1149,50 @@ class ExpertHotCacheManager:
         standard deviations of count noise to the lead a promotion needs; see
         :class:`ExpertResidencyPolicy`.
         ``insert_on_miss`` is an :class:`InsertOnMissStage` and, with
-        ``insert_on_miss_decay``, defaults to ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE``
+        ``insert_on_miss_decay``, defaults to ``residency.insert_on_miss_stage``
         and its decay; see :class:`GpuResidencyUpdater`. Stage DIRECT reserves no
         graph-gather scratch, because its gathers copy into victim slots.
-        ``fused_insert`` defaults to ``SGLANG_MOE_HOT_FUSED_INSERT`` and runs
+        ``fused_insert`` defaults to ``residency.fused_insert`` and runs
         stage SCRATCH's boundary copies through the fused masked kernel; it is
         byte-identical to the index copy it replaces and only changes its cost.
         ``graph_gather_miss_lanes`` caps each layer's distinct misses per graph gather
         below its routes (a verify); ``None`` reads
-        ``SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES``, and 0 keeps one lane per route.
-        It needs stage DIRECT.
+        ``copy.graph_gather_miss_lanes``, and 0 keeps one lane per route.
+        It needs stage DIRECT. ``config`` defaults to the process's ``stream_config()``.
         """
+        config = stream_config() if config is None else config
         if fused_insert is None:
-            fused_insert = envs.SGLANG_MOE_HOT_FUSED_INSERT.get()
+            fused_insert = config.residency.fused_insert
         fused_insert = bool(fused_insert)
         if insert_on_miss is None:
-            insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
+            insert_on_miss = config.residency.insert_on_miss_stage
         insert_on_miss = int(insert_on_miss)
         if graph_gather_miss_lanes is None:
-            graph_gather_miss_lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
+            graph_gather_miss_lanes = config.copy.graph_gather_miss_lanes
         graph_gather_miss_lanes = index(graph_gather_miss_lanes)
         if graph_gather_miss_lanes < 0:
             raise ValueError(f"graph gather miss lanes cannot be negative, got {graph_gather_miss_lanes}")
         if insert_on_miss not in tuple(InsertOnMissStage):
             raise ValueError(
-                f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE must be one of "
+                f"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE must be one of "
                 f"{[int(stage) for stage in InsertOnMissStage]}, not {insert_on_miss}"
             )
         if insert_on_miss_decay is None:
-            insert_on_miss_decay = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.get()
+            insert_on_miss_decay = config.residency.insert_on_miss_decay
         if insert_on_miss:
             if not gpu_residency_update:
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE requires SGLANG_MOE_GPU_RESIDENCY_UPDATE"
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE requires "
+                    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"
                 )
             if index(update_decode_forwards) != 1:
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE requires SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE requires "
+                    "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS=1"
                 )
             if not 0.0 < insert_on_miss_decay <= 1.0:
                 raise ValueError(
-                    "insert-on-miss decay (SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY) must be in (0, 1]"
+                    "insert-on-miss decay (SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY) must be in (0, 1]"
                 )
         if fused_insert and insert_on_miss != InsertOnMissStage.SCRATCH:
             # The fused kernel replaces only stage SCRATCH's boundary copy loop: stage
@@ -1193,15 +1200,15 @@ class ExpertHotCacheManager:
             # the flag would be a silent no-op, and a "fused" run would have measured
             # the unfused path, so refuse it.
             raise ValueError(
-                "SGLANG_MOE_HOT_FUSED_INSERT only applies to "
-                f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE={int(InsertOnMissStage.SCRATCH)} "
+                "SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT only applies to "
+                f"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE={int(InsertOnMissStage.SCRATCH)} "
                 f"({InsertOnMissStage.SCRATCH.name}), not stage {insert_on_miss}"
             )
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
         # The lane head's device bytes come out of the hot-cache budget before the cache is sized, so the recipe's
-        # SGLANG_MOE_HOT_GPU_MB stays the whole VRAM the two take together and the calibration sees the head.
+        # SGLANG_EXPERT_STREAM_HOT_GPU_MB stays the whole VRAM the two take together and the calibration sees the head.
         lane_head_path = envs.SGLANG_OPT_LANE_HEAD_PATH.get() or None
         lane_head_bytes = 0
         if lane_head_path:
@@ -1313,9 +1320,9 @@ class ExpertHotCacheManager:
         }
         if not direct and any(miss_lanes[layer_id] < rows for layer_id, rows in gather_rows.items()):
             raise ValueError(
-                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES={graph_gather_miss_lanes} below a layer's graph-gather "
-                "routes needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 (DIRECT): only its gathers flag the misses they "
-                "cannot serve"
+                f"SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES={graph_gather_miss_lanes} below a layer's graph-gather "
+                "routes needs SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 (DIRECT): only its gathers flag the "
+                "misses they cannot serve"
             )
         # Runs before enable_graph_gather so a format that stages per post learns the
         # gather width first.
@@ -1324,7 +1331,7 @@ class ExpertHotCacheManager:
             if rows and plan is not None:
                 plan(streamers[layer_id], miss_lanes[layer_id], rows)
         selected = {layer_id: [] for layer_id in streamers}
-        pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
+        pull_row_enabled = config.prefetch.shadow.pull_mode is not PullMode.OFF
         allocated_layers = {
             layer_id for layer_id, rows in gather_rows.items() if rows and not direct
         }
@@ -1350,7 +1357,7 @@ class ExpertHotCacheManager:
         # let the scores spend the rest; if every layer clears the floor anyway, the
         # selection is unchanged.
         # Spill: only the victim lanes need VRAM slots (GpuResidencyUpdater._init_insert_direct's floor).
-        victim_lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
+        victim_lanes = config.copy.graph_gather_victim_lanes
         floors = {
             layer_id: 2 * (min(miss_lanes[layer_id], victim_lanes) if victim_lanes else miss_lanes[layer_id])
             if direct
@@ -1360,7 +1367,7 @@ class ExpertHotCacheManager:
         for layer_id, floor in floors.items():
             if floor > streamers[layer_id].num_experts:
                 raise ValueError(
-                    f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
+                    f"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
                     f"{streamers[layer_id].num_experts} experts cannot provide the "
                     f"required capacity {floor}"
                 )
@@ -1383,7 +1390,7 @@ class ExpertHotCacheManager:
                 if limit is not None and len(chosen[layer_id]) >= limit:
                     if floor_pass and floors[layer_id] > limit:
                         raise ValueError(
-                            f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
+                            f"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
                             f"pinned-tier limit {limit} resident slots is below "
                             f"required capacity {floors[layer_id]}"
                         )
@@ -1405,7 +1412,7 @@ class ExpertHotCacheManager:
         for layer_id, floor in floors.items():
             if len(selected[layer_id]) < floor:
                 raise ValueError(
-                    f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
+                    f"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
                     f"budget provides {len(selected[layer_id])} resident slots; "
                     f"required capacity is {floor} (twice its graph-gather miss lanes)"
                 )
@@ -1441,11 +1448,10 @@ class ExpertHotCacheManager:
         manager._async_residency_event = None
         manager._async_residency_pending = None
         manager._async_residency_refresh = None
-        manager._pre_forward_readiness_path = os.environ.get(
-            "SGLANG_MOE_PREFORWARD_READINESS_PATH"
-        )
+        readiness = config.trace.preforward_readiness
+        manager._pre_forward_readiness_path = readiness.path or None
         manager._pre_forward_readiness_enabled = (
-            _PREFORWARD_READINESS_DIAGNOSTIC
+            readiness.enabled
             and async_residency_scores
             and manager._pre_forward_readiness_path is not None
         )
@@ -1578,7 +1584,7 @@ class ExpertHotCacheManager:
         for layer_id, rows in gather_rows.items():
             if rows:
                 streamers[layer_id].enable_graph_gather(
-                    rows, scratch_destinations=not direct, miss_lanes=miss_lanes[layer_id]
+                    rows, scratch_destinations=not direct, miss_lanes=miss_lanes[layer_id], config=config
                 )
         manager._share_graph_counters()
         manager.gpu_residency = None
@@ -1597,6 +1603,7 @@ class ExpertHotCacheManager:
                 insert_on_miss=int(insert_on_miss),
                 insert_on_miss_decay=float(insert_on_miss_decay),
                 fused_insert=fused_insert,
+                config=config,
             )
         devices = {cache.device for cache in manager.caches.values()}
         manager.lane_head = None
@@ -1613,8 +1620,8 @@ class ExpertHotCacheManager:
             updater = manager.gpu_residency
             if updater is None or not updater.insert_direct:
                 raise ValueError(
-                    "SGLANG_OPT_LANE_HEAD_PATH needs DIRECT residency (SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): the head keys the miss lanes its gathers insert"
+                    "SGLANG_OPT_LANE_HEAD_PATH needs DIRECT residency (SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1, "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2): the head keys the miss lanes its gathers insert"
                 )
             head_file = read_lane_head_file(
                 lane_head_path,
@@ -1661,7 +1668,7 @@ class ExpertHotCacheManager:
         )
         manager._attach_formats()
         if manager.gpu_residency is not None and manager.gpu_residency.insert_on_miss:
-            manager.gpu_residency.check_miss_plans()
+            manager.gpu_residency.check_miss_plans(config)
         return manager
 
     def on_pre_forward(self, forward_pass_id: int, forward_batch: ForwardBatch) -> None:

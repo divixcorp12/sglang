@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -170,7 +171,8 @@ class TestRouteCapture(unittest.TestCase):
             expert_hot_cache_manager=None,
         )
         with tempfile.TemporaryDirectory() as tmp, \
-                envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.override(str(Path(tmp) / "c")):
+                envs.SGLANG_EXPERT_STREAM_TRACE.override(
+                    json.dumps({"predictor_capture": {"dir": str(Path(tmp) / "c")}})):
             with self.assertRaisesRegex(ValueError, "speculative"):
                 ExpertPredictionRuntime.from_env(
                     tokens_per_request=2, max_prefill_rows=4096, **common

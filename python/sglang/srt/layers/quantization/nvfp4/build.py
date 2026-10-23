@@ -3,7 +3,8 @@
 The kernel is optimized/kernel.cpp plus the vendored GGML C subset (../upstream/nvfp4.c, compiled as C: it relies on
 C's implicit void* conversions). -ffp-contract=off is part of the arithmetic contract: never build it with -Ofast.
 One build holds every ISA tier (scalar, and AVX2 by function attribute) and picks one at run time, so it runs on any
-x86-64 host; NVFP4_CPU_MAX_ISA=scalar caps the tier and NVFP4_CPU_REPORT_ISA=1 prints the one chosen.
+x86-64 host; SGLANG_EXPERT_STREAM_CPU_MAX_ISA=scalar caps the tier and SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1 prints
+the one chosen.
 The shared library also links tvm-ffi for its one export (optimized/ffi.cpp: the kernel's address); a harness
 executable (``main``) calls the kernel accessor itself and links neither.
 """

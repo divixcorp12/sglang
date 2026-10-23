@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import resolved_config
 from sglang.srt.layers.moe.expert_engine.formats import (
     SlotApplyArgs,
     format_for_quant_method,
@@ -44,15 +44,16 @@ def attach(layer: torch.nn.Module, quant_method) -> None:
             f"expert_profile_name={quant_method.expert_profile_name!r})"
         )
     profile = get_profile_by_name(quant_method.expert_profile_name)
+    config = resolved_config()
     check_requested_capabilities(
         expert_format=expert_format,
         profile=profile,
-        cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
+        cpu_experts=config.stream.cpu_experts.enabled,
         draft=False,
     )
     experts, hidden = expert_format.layer_dims(layer)
     check_profile_caps(profile, experts=experts, top_k=_top_k_of(layer), hidden=hidden)
-    ExpertEngineService.bind(expert_format=expert_format, profile=profile)
+    ExpertEngineService.bind(expert_format=expert_format, profile=profile, config=config)
     setattr(layer, STREAMER_ATTRIBUTE, expert_format.build_streamer(layer))
 
 
@@ -95,7 +96,7 @@ def apply(
             "reads the pinned tier, but option C is not installed (the row backend is a "
             "plain PinnedTierRowBackend, not ExpertEngineRowBackend), so a RAM miss inside a "
             "replay would be neither served nor fail-stopped. Option C installs when "
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER is on at load and the hot cache manager "
+            "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER is on at load and the hot cache manager "
             "attaches the EXL3 format."
         )
     if swiglu_limit is None and getattr(streamer.format, "requires_swiglu_limit", True):

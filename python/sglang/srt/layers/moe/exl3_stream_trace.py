@@ -15,7 +15,7 @@ the shards (DSV41_REFERENCE.md section 9.4). This file holds:
   Python never runs, into a device ring for the trace.
 * :class:`RouterCapture`, the binary side files of the router's input.
 
-The trace is enabled by ``SGLANG_DSV41_EXPERT_TRACE_PATH``.
+The trace is enabled by ``trace.expert_path`` (``SGLANG_EXPERT_STREAM_TRACE``).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 from sglang.srt.layers.moe.residency_capture import (
     ResidencyCapture,
     ResidencyRings,
@@ -681,7 +681,7 @@ class Exl3StreamTrace:
 
     @property
     def enabled(self) -> bool:
-        """A trace file is open (SGLANG_DSV41_EXPERT_TRACE_PATH was set)."""
+        """A trace file is open (trace.expert_path was set)."""
         return self._file is not None
 
     def record_graph_step(
@@ -943,11 +943,13 @@ _TRACE: Optional[Exl3StreamTrace] = None
 _TRACE_LOCK = threading.Lock()
 
 
-def get_exl3_stream_trace() -> Exl3StreamTrace:
-    """The process-wide trace, writing to SGLANG_DSV41_EXPERT_TRACE_PATH when set."""
+def get_exl3_stream_trace(*, config: Optional[ExpertStreamConfig] = None) -> Exl3StreamTrace:
+    """The process-wide trace, writing to ``trace.expert_path`` when set; ``config`` (default: the process's
+    ``stream_config()``) is read only by the first call, which opens it."""
     global _TRACE
     with _TRACE_LOCK:
         if _TRACE is None:
-            _TRACE = Exl3StreamTrace(envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get())
+            config = stream_config() if config is None else config
+            _TRACE = Exl3StreamTrace(config.trace.expert_path)
             atexit.register(_TRACE.close)
         return _TRACE

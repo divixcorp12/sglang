@@ -1,5 +1,5 @@
 """The prefill share of the C++ RAM tier (CPU): a prefill owns at most K rows per layer, so its admissions stop
-evicting decode's rows once it holds K (SGLANG_DSV41_ENABLE_PREFILL_SHARE, plan 2026-09-25-dsv41-prefill-eviction).
+evicting decode's rows once it holds K (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE, plan 2026-09-25-dsv41-prefill-eviction).
 
 Prefill admissions go through ``assign`` (ExpertPinnedHostCache.ensure_rows, a chunk protected at a time); decode
 rows through served demands. Each test names the mutation it must fail under.
@@ -207,7 +207,7 @@ def test_a_negative_share_is_refused(tier):
         host.set_prefill_share(-1)
 
 
-# ---- with SGLANG_DSV41_ENABLE_PREFILL_FILLS: the native fill claims through the same rule ----
+# ---- with SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS: the native fill claims through the same rule ----
 
 
 def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefills_own_rows(tier):
