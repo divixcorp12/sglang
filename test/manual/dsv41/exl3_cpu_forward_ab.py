@@ -6,8 +6,8 @@ equality. (Revisions before 2026-10-05 also took ``--registration table``, upstr
 run the same plans: a ``table`` dump there equals its ``slabs`` dump.) ``--registration cores`` (``engines`` is accepted
 as an alias) runs the host's ``kernel_forward`` on two core groups at once (the first and second half of ``--cores``),
 exits 1 naming the case when they differ, and saves the first group's outputs. A dump made at the merge-base is the
-reference a kernel refactor must reproduce exactly, on every ISA tier the host can run. The kernel reads
-SGLANG_EXPERT_STREAM_CPU_MAX_ISA once, at its first forward or tier query, so each tier is its own process.
+reference a kernel refactor must reproduce exactly, on every ISA tier the host can run. A tier is a build at its
+-march (MARCH below), so each tier is its own process.
 
 Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build environment.
 """
@@ -44,9 +44,12 @@ ROUTES = {
 }
 WEIGHTS = (0.5, 0.3, 0.2, 0.15, 0.1)
 SCALES = (1.0, 8.0)
-# (avx2, avx512bw, avx512vnni) the kernel reports at each SGLANG_EXPERT_STREAM_CPU_MAX_ISA; vnni needs a VNNI host (no VBMI is used)
+# (avx2, avx512bw, avx512vnni) the kernel reports at each tier; vnni needs a VNNI host (no VBMI is used)
 TIERS = {"scalar": (False, False, False), "avx2": (True, False, False), "bw": (True, True, False),
          "vnni": (True, True, True)}
+# The -march each tier is built at (SGLANG_JIT_HOST_MARCH); vnni keeps the host's own, which is VNNI without VBMI on a
+# Xeon 8280.
+MARCH = {"scalar": "x86-64", "avx2": "x86-64-v3", "bw": "skylake-avx512", "vnni": None}
 
 
 def random_slabs(torch, hidden, inter, seed):
@@ -150,7 +153,8 @@ def run_two_core_groups(torch, handle, hidden, cases, halves):
 
 
 def dump(args):
-    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = args.isa  # the resolved config's cap, which configure passes
+    if MARCH[args.isa]:
+        os.environ["SGLANG_JIT_HOST_MARCH"] = MARCH[args.isa]  # the tier is the build's -march
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 
@@ -161,8 +165,6 @@ def dump(args):
 
     print(f"sglang {sglang.__file__}")
     ext = exl3_ext()
-    # The kernel takes its ISA cap from configure (kernel_address passes it), not the environment: before the first
-    # tier query below fixes the tier.
     Exl3CpuQuantTrait(ext, act_limit=None).kernel_address()
     tier = (
         bool(ext.exl3_moe_cpu_has_avx2()),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import subprocess
 from typing import Optional
 
@@ -123,6 +124,12 @@ def build_flavor(defines: list[str]) -> str:
     return flavor
 
 
+def march_suffix(march_flags: list[str]) -> str:
+    """A name suffix for the build's ``-march`` flags, so two marches never share a module name or build directory."""
+    name = march_flags[0].split("=", 1)[1] if march_flags else "default"
+    return "_march_" + re.sub(r"[^A-Za-z0-9]", "_", name)
+
+
 def worker_trace_defines(config: Optional[ResolvedConfig] = None) -> list[str]:
     """A separate diagnostic CPU build; normal forwards compile no worker trace state or clock reads.
 
@@ -140,18 +147,15 @@ def worker_trace_defines(config: Optional[ResolvedConfig] = None) -> list[str]:
 def set_vendored_kernel_env(config: ResolvedConfig) -> None:
     """Set the environment variables the vendored and upstream CPU kernels (moe_mul1.cpp) read for themselves.
 
-    Those kernels are exllamav3's code, whose thread pinning, small-job worker cap and ISA cap are read with getenv
-    (the ISA cap at library load), so they cannot take a parameter. This is the one place the engine config reaches
-    them: EXL3_MOE_CPU_PIN from SGLANG_EXL3_MOE_CPU_PIN, EXL3_MOE_CPU_SMALL_WORKERS from
-    SGLANG_EXL3_MOE_CPU_SMALL_WORKERS and EXL3_MOE_CPU_MAX_ISA from SGLANG_EXPERT_STREAM_CPU_MAX_ISA, each only when
-    configured, so an unconfigured launch leaves the kernels' defaults. The optimized kernel takes the ISA cap through
-    its configure op instead and reads none of these.
+    Those kernels are exllamav3's code, whose thread pinning and small-job worker cap are read with getenv, so they
+    cannot take a parameter. This is the one place the engine config reaches them: EXL3_MOE_CPU_PIN from
+    SGLANG_EXL3_MOE_CPU_PIN and EXL3_MOE_CPU_SMALL_WORKERS from SGLANG_EXL3_MOE_CPU_SMALL_WORKERS, each only when
+    configured, so an unconfigured launch leaves the kernels' defaults. The optimized kernel reads none of these.
     """
     cpu = config.exl3.cpu
     vendored = {
         "EXL3_MOE_CPU_PIN": cpu.pin,
         "EXL3_MOE_CPU_SMALL_WORKERS": str(cpu.small_workers) if cpu.small_workers else None,
-        "EXL3_MOE_CPU_MAX_ISA": config.stream.cpu_experts.max_isa or None,
     }
     set_names = []
     for name, value in vendored.items():
@@ -201,8 +205,13 @@ def exl3_ext():
     defines = cpu_act_defines(config)
     flavor = build_flavor(defines)
     optimized = optimized_cpu(defines)
+    march_flags: list[str] = []
     if optimized:
+        from sglang.kernels.jit.utils.compile.toolchain import host_arch_flags
+
         check_cpu_compiler()
+        march_flags = host_arch_flags()
+        flavor += march_suffix(march_flags)
     else:
         set_vendored_kernel_env(config)
     # One build directory per flavor: extensions sharing a directory overwrite each other's build.ninja.
@@ -235,7 +244,7 @@ def exl3_ext():
             extra_cflags=_EXTRA_CFLAGS
             + defines
             + trace_defines
-            + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
+            + ([*march_flags,"-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
             extra_ldflags=["-fopenmp"] if optimized else [],
             extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
             build_directory=build_dir,

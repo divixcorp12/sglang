@@ -37,7 +37,9 @@ stopped. Keep-warm takes no lock, so its callers must not overlap it with a forw
 Build and link
 --------------
 Requires Linux, GCC 15, OpenMP and the same PyTorch installation/ABI as the
-consumer. -march=native targets the build machine; rebuild on another CPU.
+consumer. The build is -Ofast -march=<resolved> (SGLANG_JIT_HOST_MARCH, else this machine's,
+via jit/utils/compile/toolchain.py): it targets the build machine, so rebuild on another CPU. The extension's
+module name and build directory carry the -march.
 GCC 17 is deliberately not selected: it was not a consistent performance win
 and its experimental compiler changed arithmetic in the earlier comparison.
 
@@ -96,18 +98,20 @@ math.hpp holds the arithmetic every tier shares (state decode, Hadamard, activat
 math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; forward_plan.hpp holds the tier
 dispatch, the forward driver and the plans; kernel.cpp holds the public API. Registration, validation, the ISA
 tier, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp).
-The tier is min(host, SGLANG_EXPERT_STREAM_CPU_MAX_ISA), fixed at the first forward, tier query, plan listing or
-make_layer;
-SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1 prints "exl3 isa <tier>" to stderr then. Python passes both through the torch op
-sglang_exl3_cpu::configure before it takes the kernel's address; a native harness calls exl3_cpu_configure (kernel.h). A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
-picked once per layer, at registration: the layer's params name a plan id (ForwardPlan<Dsv41Shape, Isa::Bw> or
-ForwardPlan<GenericShape, I> for the host's tier), Python choosing it from the list sglang_exl3_cpu::plans returns (each
-plan's facts, ISA floor and availability) by the layer's facts, and make_layer refusing a plan that does not accept the
-layer (plan_rejects, forward_plan.hpp). Exl3Quant::dispatch then runs p.plan with no per-call check. On a VNNI host (tier Vnni or Vbmi) the same
+The tier is compile-time: the build's -march (isa.hpp's kBuildIsa: AVX512VBMI+VNNI Vbmi, AVX512VNNI Vnni, AVX512BW Bw,
+AVX2 Avx2, else Scalar), and only that tier's plans are compiled. A lower tier is a build at a lower -march
+(SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). Python passes the worker-trace options through
+the torch op sglang_exl3_cpu::configure before it takes the kernel's address; a native harness calls exl3_cpu_configure
+(kernel.h). A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
+picked once per layer, at registration: the layer's params name a plan id (ForwardPlan<Dsv41Shape, Isa::Bw>, compiled
+from the Bw tier up, or ForwardPlan<GenericShape, I> for the build's tier), Python choosing it from the list
+sglang_exl3_cpu::plans returns (each plan's facts, ISA floor and availability) by the layer's facts, and make_layer
+refusing a plan that does not accept the layer or that this build does not compile (plan_rejects, forward_plan.hpp).
+Exl3Quant::dispatch then runs p.plan with no per-call check. In a VNNI build (tier Vnni or Vbmi) the same
 plan runs with its Vnni flag set: its register kernels (register_kernels.hpp, included once as reg_bw and once as
 reg_vnni by math_avx512.hpp) accumulate with vpdpwssd instead of vpmaddwd + vpaddd, bit-identically (the 16-bit byte sums
-and activation pairs are unchanged; both forms wrap mod 2^32). SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw runs the reg_bw copy, as before
-the VNNI copy existed. PlanTraits<Dsv41Shape, Isa::Bw> is the one
+and activation pairs are unchanged; both forms wrap mod 2^32). A Bw build runs the reg_bw copy.
+PlanTraits<Dsv41Shape, Isa::Bw> is the one
 specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and wide single-expert quantization (one token).
 MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile tables (kTiles) and the
 register dispatch (register_tiles_for) are generated from it. A plan reads every layer fact
@@ -118,8 +122,8 @@ Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and dow
 slot's ExpertRow. Exl3Quant::dispatch groups the call's routes by expert itself (a sort of the call's live routes), which
 fixes the accumulation order.
 
-Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier
-against the merge-base, the bare and full-stack benches' frozen references, the CPU expert pool tests).
+Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier, each
+a build at its -march, against the merge-base, the bare and full-stack benches' frozen references, the CPU expert pool tests).
 
 Provenance and validation
 -------------------------

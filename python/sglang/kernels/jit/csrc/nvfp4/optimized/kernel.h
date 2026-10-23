@@ -21,6 +21,4 @@ struct SglangNvfp4CpuParams {
 namespace sglang::nvfp4_cpu {
 // Hidden: another library defining it in the same process (the library and a standalone build) never interposes.
 __attribute__((visibility("hidden"))) const ::sglang::cpu_experts::CpuExpertKernel& nvfp4_cpu_kernel();
-// The kernel's ISA cap ("" none) and report (SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA); before its first forward.
-__attribute__((visibility("hidden"))) void nvfp4_cpu_configure(const std::string& max_isa, bool report_isa);
 }  // namespace sglang::nvfp4_cpu

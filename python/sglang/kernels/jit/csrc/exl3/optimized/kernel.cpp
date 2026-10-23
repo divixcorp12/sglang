@@ -50,7 +50,6 @@ int32_t exl3_cpu_chunk_m() { return CHUNK_M; }
 
 void exl3_cpu_configure(const Exl3CpuOptions& options)
 {
-    ::sglang::cpu_experts::ExpertForward<Exl3Quant>::configure_isa(options.max_isa, options.report_isa);
     worker_trace::set_options({options.worker_trace_prefix, options.worker_trace_capacity, options.worker_trace_min_us,
                                options.scratch_trace_prefix, options.trace_gate_path});
 }
@@ -88,7 +87,6 @@ bool exl3_moe_cpu_has_avx2() { return Exl3Forward::isa() != ::sglang::cpu_expert
 bool exl3_moe_cpu_has_avx512_bw() { return Exl3Forward::isa() >= ::sglang::cpu_experts::Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return Exl3Forward::isa() >= ::sglang::cpu_experts::Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return Exl3Forward::isa() == ::sglang::cpu_experts::Isa::Vbmi; }
-
 // Upstream's per-expert tensor API: its layers are tables of tensors anywhere in memory, which the kernel does not take
 // (its layers are slab layers, made by its make_layer). bindings.cpp still binds these, so they exist and refuse.
 

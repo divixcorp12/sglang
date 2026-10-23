@@ -339,6 +339,22 @@ def test_the_kernel_refuses_what_it_cannot_run(monkeypatch):
         es.kernel_drop(layer, variant="instr")
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_a_non_finite_weight_is_refused_in_the_finite_math_build(monkeypatch, bad):
+    """The kernel is built -Ofast, where std::isfinite may fold to true; the call check tests the weight's exponent bits."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
+    trait, cores = _kernel()
+    layer = _layer(trait, 1)
+    x, slots, weights = _inputs()[0]
+    try:
+        rc, out = _forward(trait, layer, x, slots, [bad] + list(weights[1:]), cores[:2], 2)
+        assert rc == 2 and out.isnan().all()
+    finally:
+        es.kernel_drop(layer, variant="instr")
+
+
 _LIMIT_SCRIPT = """
 import os, sys, threading
 sys.path.insert(0, sys.argv[1])

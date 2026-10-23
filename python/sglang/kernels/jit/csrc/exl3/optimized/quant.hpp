@@ -60,7 +60,7 @@ struct Exl3Quant
     static constexpr uint32_t kOptionalSlabs = 0;
     static constexpr int kMaxRoutes = 64;     // the forward's k limit: a job's lanes, up to the wire's 64 (dispatch sizes everything from k)
     static constexpr int kMaxRows = 65536;    // the forward's rows limit
-    // The library holds every tier and runs min(host, the configured cap: SGLANG_EXPERT_STREAM_CPU_MAX_ISA).
+    // The library compiles one tier, the build's (isa.hpp's kBuildIsa).
     static constexpr Isa kTopIsa = Isa::Vbmi;
     // dispatch calls ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh, so it waits there.
     static constexpr bool kStagedForward = true;
@@ -82,7 +82,7 @@ struct Exl3Quant
         if (l.hidden < 128 || l.intermediate < 128 || l.hidden % 128 || l.intermediate % 128 || l.hidden > 8192
             || l.intermediate > 8192)
             return "hidden and intermediate must be multiples of 128 in [128, 8192]";
-        if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0.0f)
+        if (l.activation != 0 || !is_finite_bits(l.act_limit) || l.act_limit < 0.0f)
             return "the activation must be gated SiLU with a finite, non-negative act_limit";
         return plan_rejects(l, p);
     }

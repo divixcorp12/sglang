@@ -7,7 +7,6 @@ loads it). The two native harnesses are the ones the removed CMake build ran und
 
 import importlib.util
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -86,74 +85,43 @@ def test_the_module_is_loaded_once_and_kept(tmp_path):
     assert nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path)) is first
 
 
-def test_the_scalar_cap_runs_the_scalar_tier(tmp_path):
-    """nvfp4_cpu_configure("scalar", ...) (what SGLANG_EXPERT_STREAM_CPU_MAX_ISA=scalar passes it) must select the scalar
-    tier in a library that also holds the AVX2 one. The kernel reads no env: the harness's --max-isa and --report-isa
-    flags call the configure function."""
-    exe = _build_module().build(
-        tmp_path / "ab", cxx=CXX, main=REPO / "test/manual/dsv41/nvfp4_cpu_forward_ab.cpp"
-    )
-    cores = sorted(os.sched_getaffinity(0))[:1]
-    env = {k: v for k, v in os.environ.items() if k not in ("SGLANG_EXPERT_STREAM_CPU_MAX_ISA", "SGLANG_EXPERT_STREAM_CPU_REPORT_ISA")}
-    capped = subprocess.run(
-        [str(exe), "--max-isa=scalar", "--report-isa", str(tmp_path / "scalar.bin"), str(cores[0])],
-        env=env, capture_output=True, text=True, timeout=900,
-    )
-    assert capped.returncode == 0, capped.stdout + capped.stderr
-    assert "nvfp4 isa scalar" in capped.stderr
-
-    # The report prints when the tier is detected, before dispatch reads it: the dumps prove dispatch ran that tier. The
-    # AVX2 tier's FMA accumulation rounds differently from the scalar loop, so on an AVX2 host the uncapped dump differs.
-    uncapped = subprocess.run(
-        [str(exe), "--report-isa", str(tmp_path / "default.bin"), str(cores[0])],
-        env=env, capture_output=True, text=True, timeout=900,
-    )
-    # The env names alone configure nothing: the kernel reads none (a set MAX_ISA must not cap the tier).
-    ignored = subprocess.run(
-        [str(exe), "--report-isa", str(tmp_path / "ignored.bin"), str(cores[0])],
-        env={**env, "SGLANG_EXPERT_STREAM_CPU_MAX_ISA": "scalar"}, capture_output=True, text=True, timeout=900,
-    )
-    assert ignored.returncode == 0 and ignored.stderr == uncapped.stderr
-    assert uncapped.returncode == 0, uncapped.stdout + uncapped.stderr
-    if "nvfp4 isa scalar" in uncapped.stderr:
-        pytest.skip("this host runs the scalar tier uncapped, so there is no second tier to tell apart")
-    assert "nvfp4 isa avx2" in uncapped.stderr, uncapped.stderr
-    assert (tmp_path / "default.bin").read_bytes() != (tmp_path / "scalar.bin").read_bytes()
+def test_the_march_picks_the_tier(tmp_path):
+    """A build at x86-64 holds the scalar tier and one at x86-64-v3 the AVX2 tier: the AVX2 tier's FMA accumulation
+    rounds differently from the scalar loop, so the two builds' forwards dump different bytes."""
+    if not _host_has_avx2():
+        pytest.skip("the host cannot run an x86-64-v3 build")
+    harness = REPO / "test/manual/dsv41/nvfp4_cpu_forward_ab.cpp"
+    core = str(sorted(os.sched_getaffinity(0))[0])
+    dumps = {}
+    for march in ("x86-64", "x86-64-v3"):
+        exe = _build_module().build(tmp_path / f"ab-{march}", cxx=CXX, main=harness, march=march)
+        result = subprocess.run(
+            [str(exe), str(tmp_path / f"{march}.bin"), core], capture_output=True, text=True, timeout=900
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        dumps[march] = (tmp_path / f"{march}.bin").read_bytes()
+    assert dumps["x86-64"] != dumps["x86-64-v3"]
 
 
-# Functions allowed to hold AVX registers: the AVX2 tier's dot product and its helpers, the plan's AVX2 entries (which
-# inline them), and the framework's AVX2 keep-warm loop. Matched on demangled names, with any GCC clone suffix.
-AVX2_TIER = [
-    re.compile(r"DotRows<\(sglang::cpu_experts::\(anonymous namespace\)::Isa\)1>::rows<"),
-    re.compile(r"::avx2_detail::"),
-    re.compile(r"ForwardPlan<[^>]*Isa\)1>::(gate_up|down)_avx2\("),
-    re.compile(r"::keep_warm_detail::avx2\("),
-]
+def _host_has_avx2() -> bool:
+    flags = next((l.split(":", 1)[1].split() for l in Path("/proc/cpuinfo").read_text().splitlines() if l.startswith("flags")), [])
+    return {"avx2", "fma", "f16c", "bmi1", "bmi2", "abm", "movbe"} <= set(flags)
 
 
-def _functions_using(disassembly: str, registers=("%ymm", "%zmm")) -> set[str]:
-    found, current = set(), None
-    for line in disassembly.splitlines():
-        header = re.match(r"^[0-9a-f]+ <(.*)>:$", line)
-        if header:
-            current = header.group(1)
-        elif current and any(r in line for r in registers):
-            found.add(current)
-    return found
-
-
-def test_only_the_avx2_tier_uses_avx_registers(tmp_path):
-    # The library is built for baseline x86-64 and must run on a host without AVX: vector registers may appear only in
-    # the AVX2 tier's functions, which run only after detection chose that tier.
-    library = _build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)
-    disassembly = subprocess.run(
+def _disassembly(library: Path) -> str:
+    return subprocess.run(
         ["objdump", "-d", "-C", "--no-show-raw-insn", str(library)], capture_output=True, text=True, check=True
     ).stdout
-    used = _functions_using(disassembly)
-    assert used, "the AVX2 tier is missing from the library"
-    outside = sorted(f for f in used if not any(p.search(f) for p in AVX2_TIER))
-    assert not outside, outside
-    assert not _functions_using(disassembly, ("%zmm",)), "NVFP4 has no AVX-512 tier"
+
+
+def test_the_library_holds_only_its_march_tier(tmp_path):
+    # The tier is compile-time: a build at x86-64 must run on a host without AVX, so it holds no vector register at
+    # all; a build at x86-64-v3 holds the AVX2 tier and no AVX-512 register (NVFP4 has no AVX-512 tier).
+    scalar = _disassembly(_build_module().build(tmp_path / "libscalar.so", cxx=CXX, march="x86-64"))
+    assert "%ymm" not in scalar and "%zmm" not in scalar
+    avx2 = _disassembly(_build_module().build(tmp_path / "libavx2.so", cxx=CXX, march="x86-64-v3"))
+    assert "%ymm" in avx2, "the AVX2 tier is missing from the x86-64-v3 library"
+    assert "%zmm" not in avx2
 
 
 SANITIZERS = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
@@ -166,16 +134,17 @@ def _links_sanitizers(tmp_path) -> bool:
     return probe.returncode == 0
 
 
-# The sanitizer harness forwards through the library, so it runs at each tier (cap None: the host's); the GGML check
-# calls both tiers' dot products itself.
+# Each harness runs at the host's tier (march None: the resolved -march) and at the scalar tier (x86-64); the GGML
+# check calls both tiers' dot products itself where its build has them.
 @pytest.mark.parametrize(
-    "harness, flags, cap",
+    "harness, flags, march",
     [
         ("nvfp4_cpu_sanitizer.cpp", [], None),
-        ("nvfp4_cpu_sanitizer.cpp", [], "scalar"),
+        ("nvfp4_cpu_sanitizer.cpp", [], "x86-64"),
         ("nvfp4_cpu_sanitizer.cpp", SANITIZERS, None),
-        ("nvfp4_cpu_sanitizer.cpp", SANITIZERS, "scalar"),
+        ("nvfp4_cpu_sanitizer.cpp", SANITIZERS, "x86-64"),
         ("nvfp4_cpu_ggml_check.cpp", [], None),
+        ("nvfp4_cpu_ggml_check.cpp", [], "x86-64"),
     ],
     ids=[
         "sanitizer-harness",
@@ -183,16 +152,18 @@ def _links_sanitizers(tmp_path) -> bool:
         "sanitizer-harness-asan-ubsan",
         "sanitizer-harness-asan-ubsan-scalar",
         "ggml-check",
+        "ggml-check-scalar",
     ],
 )
-def test_the_native_harness_passes(tmp_path, harness, flags, cap):
+def test_the_native_harness_passes(tmp_path, harness, flags, march):
     if flags and not _links_sanitizers(tmp_path):
         pytest.skip(f"{CXX} cannot link ASan/UBSan (its sanitizer runtimes are not installed)")
     exe = _build_module().build(
-        tmp_path / Path(harness).stem, cxx=CXX, main=REPO / "test/registered/unit/kernels" / harness, extra_flags=flags
+        tmp_path / Path(harness).stem,
+        cxx=CXX,
+        main=REPO / "test/registered/unit/kernels" / harness,
+        extra_flags=flags,
+        march=march,
     )
-    env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_CPU_MAX_ISA"}
-    if cap:
-        env["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = cap
-    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=900, env=env)
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=900)
     assert result.returncode == 0, result.stdout + result.stderr

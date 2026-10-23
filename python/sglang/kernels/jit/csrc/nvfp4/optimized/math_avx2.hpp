@@ -1,24 +1,25 @@
-// dot_rows<Isa::Avx2, M>: GGML's AVX2 dot product, compiled for AVX2/FMA by attribute (SGLANG_TARGET_AVX2) so a
-// baseline x86-64 library carries it beside the scalar tier and runs it only where the host has AVX2.
+// dot_rows<Isa::Avx2, M>: GGML's AVX2 dot product, present only in a build whose -march has AVX2 and FMA (kBuildIsa).
 // Derived from GGML x86 quants.c, llama.cpp 889edf43ddae0cfe9a4564a882764dc879759870.
 // MIT, ggml authors; see ../upstream/LICENSE.llama.cpp.
 // Changes: GPU row/scale access, adjacent-nibble interleave, return signature, several Q8_0 vectors per weight row;
-// the helpers upstream defines under __AVX2__ are restated here under the target attribute.
+// the helpers upstream defines under __AVX2__ are restated here.
 #pragma once
 #include "math.hpp"
 #include <immintrin.h>
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 
 namespace sglang::nvfp4_cpu {
 namespace {
 namespace avx2_detail {
 
 // GGML's MM256_SET_M128I(hi, lo).
-SGLANG_TARGET_AVX2 inline __m256i set_m128i(__m128i hi, __m128i lo)
+inline __m256i set_m128i(__m128i hi, __m128i lo)
 {
     return _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
 }
 
-SGLANG_TARGET_AVX2 inline float hsum_float_8(const __m256 x)
+inline float hsum_float_8(const __m256 x)
 {
     __m128 res = _mm256_extractf128_ps(x, 1);
     res = _mm_add_ps(res, _mm256_castps256_ps128(x));
@@ -27,7 +28,7 @@ SGLANG_TARGET_AVX2 inline float hsum_float_8(const __m256 x)
     return _mm_cvtss_f32(res);
 }
 
-SGLANG_TARGET_AVX2 inline __m256i mul_add_epi8(const __m256i x, const __m256i y)
+inline __m256i mul_add_epi8(const __m256i x, const __m256i y)
 {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
@@ -40,7 +41,7 @@ template <>
 struct DotRows<Isa::Avx2>
 {
     template <int M>
-    SGLANG_TARGET_AVX2 static void rows(int n, const GpuRow& x, const block_q8_0* const* ys, float* out)
+    static void rows(int n, const GpuRow& x, const block_q8_0* const* ys, float* out)
     {
         using namespace avx2_detail;
         assert(n % QK_NVFP4 == 0);
@@ -100,3 +101,5 @@ struct DotRows<Isa::Avx2>
 
 }  // namespace
 }  // namespace sglang::nvfp4_cpu
+
+#endif  // __AVX2__ && __FMA__ && __F16C__

@@ -42,6 +42,14 @@ class RemovedEnvError(ValueError):
     """A removed env name is set; the message names each one and its replacement."""
 
 
+# Replacement.env of a name that was removed outright: nothing is set in its place.
+NO_REPLACEMENT = ""
+ISA_CAP_NOTE = (
+    "the CPU kernel's ISA tier is compile-time now, from the JIT host -march: set SGLANG_JIT_HOST_MARCH to "
+    "skylake-avx512 (bw), x86-64-v3 (avx2) or x86-64 (scalar) for a lower tier"
+)
+ISA_REPORT_NOTE = "the CPU kernel's ISA tier is compile-time now, the JIT host -march (SGLANG_JIT_HOST_MARCH)"
+
 # A group env is one JSON object decoded into the config struct at this path; its members are keyed by their field
 # path below it.
 GROUP_PATHS = {
@@ -184,10 +192,12 @@ REMOVED_ENV: dict[str, Replacement] = {
     "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS": _R("SGLANG_EXPERT_STREAM_CPU_TWO_STAGE", "cpu_experts.two_stage.w2_weights"),
     "SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US": _R("SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US", "cpu_experts.keep_warm_us"),
     "SGLANG_DSV41_CPU_EXPERTS_STORE_OUT": _R("SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT", "cpu_experts.store_out"),
-    "EXL3_MOE_CPU_MAX_ISA": _R("SGLANG_EXPERT_STREAM_CPU_MAX_ISA", "cpu_experts.max_isa"),
-    "NVFP4_CPU_MAX_ISA": _R("SGLANG_EXPERT_STREAM_CPU_MAX_ISA", "cpu_experts.max_isa"),
-    "EXL3_MOE_CPU_REPORT_ISA": _R("SGLANG_EXPERT_STREAM_CPU_REPORT_ISA", "cpu_experts.report_isa"),
-    "NVFP4_CPU_REPORT_ISA": _R("SGLANG_EXPERT_STREAM_CPU_REPORT_ISA", "cpu_experts.report_isa"),
+    "EXL3_MOE_CPU_MAX_ISA": _R(NO_REPLACEMENT, "", ISA_CAP_NOTE),
+    "NVFP4_CPU_MAX_ISA": _R(NO_REPLACEMENT, "", ISA_CAP_NOTE),
+    "SGLANG_EXPERT_STREAM_CPU_MAX_ISA": _R(NO_REPLACEMENT, "", ISA_CAP_NOTE),
+    "EXL3_MOE_CPU_REPORT_ISA": _R(NO_REPLACEMENT, "", ISA_REPORT_NOTE),
+    "NVFP4_CPU_REPORT_ISA": _R(NO_REPLACEMENT, "", ISA_REPORT_NOTE),
+    "SGLANG_EXPERT_STREAM_CPU_REPORT_ISA": _R(NO_REPLACEMENT, "", ISA_REPORT_NOTE),
     "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": _R("SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS", "draft.cpu_experts"),
     "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": _R("SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES", "draft.cores"),
     "SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS": _R("SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS", "draft.threads"),
@@ -235,6 +245,8 @@ def _group_snippet(group_env: str, field: str) -> str:
 def describe(old_name: str) -> str:
     """One line saying what replaces ``old_name`` (a name in REMOVED_ENV)."""
     replacement = REMOVED_ENV[old_name]
+    if replacement.env == NO_REPLACEMENT:
+        return f"{old_name} (removed, no replacement): {replacement.note}"
     if replacement.env in GROUP_PATHS:
         use = _group_snippet(replacement.env, replacement.field)
     else:
@@ -324,6 +336,8 @@ def translate_env(old_env: Mapping[str, str], node_of_cpu) -> dict[str, str]:
             new[name] = value
             continue
         target = REMOVED_ENV[name]
+        if target.env == NO_REPLACEMENT:
+            continue
         if target.env == "SGLANG_EXPERT_STREAM_ENABLE":
             enable = bool(enable) or _flag(name, value)
         elif name == "SGLANG_MOE_EXPERT_COPY_BACKEND":

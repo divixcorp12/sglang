@@ -1,19 +1,15 @@
-// The x86 vector tiers a CPU expert quant may implement, and the tier one runs at: min(hardware, the quant's top
-// tier, the configured cap). The cap and the report are SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA, which Python
-// passes to each quant library's configure export (ExpertForward::configure_isa); nothing here reads the environment.
+// The x86 vector tiers a CPU expert quant may implement, and the tier a build runs at: min(the build's tier, the quant's
+// top tier). The build's tier comes from the compiler's macros under the build's -march (kBuildIsa); nothing is
+// detected or configured at run time, and a lower tier is tested by building at a lower -march.
 #pragma once
-#include <cctype>
-#include <cstdio>
-#include <string>
 
 #if !defined(__GNUC__) || !defined(__linux__) || !defined(__x86_64__)
 #error "the CPU experts framework needs GCC or Clang on x86-64 Linux"
 #endif
 
+// For code that must compile its tier's instructions whatever the build's -march (keep_warm.hpp's loops).
 #define SGLANG_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
 #define SGLANG_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
-#define SGLANG_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
-#define SGLANG_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
 
 namespace sglang::cpu_experts {
 // Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
@@ -24,43 +20,24 @@ namespace {
 enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
 template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I == Isa::Vbmi;
 
-// cap (empty: none) is scalar|avx2|bw|avx512bw|vnni|avx512|vbmi, case-insensitive, and caps the tier for testing; it
-// never raises the tier, and an unrecognized value is ignored.
-inline Isa detect_isa(Isa top, const std::string& cap)
-{
-    __builtin_cpu_init();
-    // Each tier needs every feature its SGLANG_TARGET_* attribute compiles for (fma and f16c included).
-    const bool fma_f16c = __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
-    Isa hw;
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")
-        && fma_f16c) {
-        if (__builtin_cpu_supports("avx512vnni"))
-            hw = __builtin_cpu_supports("avx512vbmi") ? Isa::Vbmi : Isa::Vnni;
-        else
-            hw = Isa::Bw;
-    } else if (__builtin_cpu_supports("avx2") && fma_f16c)
-        hw = Isa::Avx2;
-    else
-        hw = Isa::Scalar;
-    if (top < hw) hw = top;
+// Each tier needs every feature its code is written for, fma and f16c included.
+constexpr Isa kBuildIsa =
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__FMA__) && defined(__F16C__)
+#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    Isa::Vbmi;
+#elif defined(__AVX512VNNI__)
+    Isa::Vnni;
+#else
+    Isa::Bw;
+#endif
+#elif defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    Isa::Avx2;
+#else
+    Isa::Scalar;
+#endif
 
-    if (!cap.empty()) {
-        std::string s(cap);
-        for (char& c : s) c = (char) std::tolower((unsigned char) c);
-        Isa cap;
-        if (s == "scalar") cap = Isa::Scalar;
-        else if (s == "avx2") cap = Isa::Avx2;
-        else if (s == "bw" || s == "avx512bw") cap = Isa::Bw;
-        else if (s == "vnni" || s == "avx512") cap = Isa::Vnni;
-        else if (s == "vbmi") cap = Isa::Vbmi;
-        else return hw;
-        if (cap < hw) hw = cap;
-    }
-    return hw;
-}
-
-// The tier's name, as a cap variable spells it.
-inline const char* isa_name(Isa isa)
+// The tier's name: scalar, avx2, bw, vnni or vbmi.
+constexpr const char* isa_name(Isa isa)
 {
     switch (isa) {
         case Isa::Scalar: return "scalar";
@@ -70,12 +47,6 @@ inline const char* isa_name(Isa isa)
         case Isa::Vbmi: return "vbmi";
     }
     return "unknown";
-}
-
-// When report is set, prints "<name> isa <tier>" to stderr.
-inline void report_isa(const char* name, Isa isa, bool report)
-{
-    if (report) std::fprintf(stderr, "%s isa %s\n", name, isa_name(isa));
 }
 
 }  // namespace

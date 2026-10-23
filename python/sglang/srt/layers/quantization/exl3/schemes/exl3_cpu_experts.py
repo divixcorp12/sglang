@@ -85,7 +85,7 @@ class Exl3CpuQuantTrait:
     ``None``. ``swizzled`` selects the band-contiguous weight layout, which is
     bit-identical to the native one. ``row_weighted`` splits the layers' output tiles among the workers by chunk row
     count (tile_assignment.hpp), bit-identical too. ``config`` is the process's resolved config (default
-    ``resolved_config()`` when first needed): its CPU ISA cap and report and its worker trace go to the kernel.
+    ``resolved_config()`` when first needed): its worker trace goes to the kernel.
     """
 
     name = "exl3"
@@ -184,12 +184,10 @@ class Exl3CpuQuantTrait:
             ) from error
 
     def _configure(self) -> None:
-        """Pass the kernel its options (``sglang_exl3_cpu::configure``), before anything fixes its ISA tier."""
+        """Pass the kernel its options (``sglang_exl3_cpu::configure``), before its first forward."""
         stream = self._resolved().stream
         worker = stream.trace.cpu_worker
         self._op("configure")(
-            stream.cpu_experts.max_isa,
-            bool(stream.cpu_experts.report_isa),
             worker.prefix,
             int(worker.capacity),
             int(worker.min_us),
@@ -199,13 +197,13 @@ class Exl3CpuQuantTrait:
 
     def kernel_address(self) -> int:
         """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``),
-        once the kernel has its options (``sglang_exl3_cpu::configure``, before its first forward fixes the tier)."""
+        once the kernel has its options (``sglang_exl3_cpu::configure``, before its first forward)."""
         self._configure()
         return int(self._op("kernel_address")())
 
     def _plans(self) -> tuple[Exl3CpuPlan, ...]:
-        """The kernel's compiled plans (``sglang_exl3_cpu::plans``), read once; their availability depends on the
-        ISA tier, which listing them fixes, so the kernel is configured first."""
+        """The kernel's compiled plans (``sglang_exl3_cpu::plans``), read once; their availability follows the
+        extension's -march."""
         if self._plan_list is None:
             self._configure()
             self._plan_list = tuple(msgspec.json.decode(self._op("plans")(), type=list[Exl3CpuPlan]))

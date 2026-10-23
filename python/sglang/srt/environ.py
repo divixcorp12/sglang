@@ -566,10 +566,6 @@ class Envs:
     SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
     # A verify's CPU job leaves the overwrite of its token rows to the kernel. Needs CPU experts.
     SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT = EnvBool(False)
-    # Caps the CPU kernel's ISA tier: scalar | avx2 | bw | vnni | vbmi, never raising it; empty keeps the host's.
-    SGLANG_EXPERT_STREAM_CPU_MAX_ISA = EnvStr("")
-    # Print the CPU kernel's chosen ISA tier to stderr.
-    SGLANG_EXPERT_STREAM_CPU_REPORT_ISA = EnvBool(False)
     # JSON object -> CpuExpertsConfig.split: table, layer_tables, cpu_ms, link_ms, handoff_ms, retune_batches,
     # calibration, calibration_reps, miss_cut, miss_cut_max, model, model_costs, model_refine_batches,
     # model_residency_tiebreak.

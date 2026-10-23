@@ -9,7 +9,7 @@ builds, so each tier's child process runs with it set. Checks on random DSV4.1-s
 
 Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU, and builds the expert-stream host module's instrumented variant for its
 test exports (kernel_layer, kernel_forward; CXX the kernels' GCC 15, as run_exl3_cpu_forward_checks.sh sets it). Each
-ISA tier runs in its own process, since the tier is fixed at the first kernel call. Run on divix01 under taskset, e.g.
+ISA tier runs in its own process, built at its own -march (SGLANG_JIT_HOST_MARCH). Run on divix01 under taskset, e.g.
   taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
 """
 
@@ -68,7 +68,7 @@ def _slabs(torch, w, tr):
 
 
 def _run(tier, out_path):
-    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = tier
+    os.environ["SGLANG_JIT_HOST_MARCH"] = {"bw": "skylake-avx512", "scalar": "x86-64"}[tier]  # a tier is a build
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 

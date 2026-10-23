@@ -148,10 +148,6 @@ void ok(const char* name) { std::printf("ok %s\n", name); std::fflush(stdout); }
 
 int main()
 {
-    // isa() is computed once, at the first forward: the cap and the report switch are configured before it, as
-    // Python passes them to a library's configure export. Nothing reads the environment. The Python test reads the
-    // report ("toy isa scalar") from stderr.
-    sglang::cpu_experts::ExpertForward<toy::ToyQuant>::configure_isa("scalar", true);
     Fixture f;
     const CpuExpertKernel& kernel = toy::toy_kernel();
     CHECK(std::string(kernel.name()) == "toy");
@@ -223,6 +219,8 @@ int main()
         Call bad_slot(layer, 1, 1, {kCapacity}, {1.0f});
         Call negative_slot(layer, 1, 1, {-2}, {1.0f});
         Call nan_weight(layer, 1, 1, {0}, {nan});
+        Call inf_weight(layer, 1, 1, {0}, {std::numeric_limits<float>::infinity()});
+        Call neg_inf_weight(layer, 1, 1, {0}, {-std::numeric_limits<float>::infinity()});
         Call wide(layer, 1, max_routes + 1, std::vector<int32_t>(max_routes + 1, 0),
                   std::vector<float>(max_routes + 1, 1.0f));
         Call tall(layer, max_rows + 1, 1, std::vector<int32_t>(max_rows + 1, 0),
@@ -235,7 +233,7 @@ int main()
         null_slots.c.slots = nullptr;
         Call null_out(layer, 1, 1, {0}, {1.0f});
         null_out.c.out = nullptr;
-        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
+        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &inf_weight, &neg_inf_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
             CHECK(c->run() == 2);
             CHECK(c->untouched());
         }
@@ -277,19 +275,15 @@ int main()
     }
 
     {
-        CHECK(toy::ToyQuant::last_isa == Isa::Scalar);
-        CHECK(sglang::cpu_experts::ExpertForward<toy::ToyQuant>::isa() == Isa::Scalar);
-        const Isa hw = sglang::cpu_experts::detect_isa(Isa::Vbmi, "");
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "") <= Isa::Avx2);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Scalar, "") == Isa::Scalar);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "scalar") == Isa::Scalar);
-        // An unrecognized cap is ignored.
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "avx9000") == hw);
-        // A cap above the hardware never raises the tier.
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "VBMI") == hw);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "VBMI") <= Isa::Avx2);
-        std::printf("detected %d\n", int(hw));
-        ok("isa_cap_lowers_the_tier");
+        // The quant runs at the build's tier (the compiler's -march macros), lowered to its top tier.
+        constexpr Isa expected = sglang::cpu_experts::kBuildIsa < toy::ToyQuant::kTopIsa
+                                     ? sglang::cpu_experts::kBuildIsa
+                                     : toy::ToyQuant::kTopIsa;
+        static_assert(sglang::cpu_experts::ExpertForward<toy::ToyQuant>::isa() == expected);
+        CHECK(toy::ToyQuant::last_isa == expected);
+        std::printf("build tier %s, quant top %s, runs %s\n", sglang::cpu_experts::isa_name(sglang::cpu_experts::kBuildIsa),
+                    sglang::cpu_experts::isa_name(toy::ToyQuant::kTopIsa), sglang::cpu_experts::isa_name(expected));
+        ok("isa_is_the_build_tier_lowered_to_the_quants_top");
     }
 
     if (allowed.size() >= 2) {
@@ -398,17 +392,19 @@ int main()
             CHECK(warm(&word, 5, start + 60LL * 1000000000) == 0);
             CHECK(now_ns() - start < 100000000);
         }
-        // Every tier's loop, as far as this CPU runs them, through the free function.
-        for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
-            if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, "")) break;
+        // Every loop up to the build's tier (a tier runs on a CPU that has the build's -march), through the free function.
+        auto each = [&](auto tier) {
             word = 5;
             std::thread mover([&] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
                 __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
             });
-            sglang::cpu_experts::keep_warm_loop<Isa::Vbmi>(tier, &word, 5, now_ns() + 60LL * 1000000000);
+            sglang::cpu_experts::keep_warm_loop<decltype(tier)::value>(&word, 5, now_ns() + 60LL * 1000000000);
             mover.join();
-        }
+        };
+        each(std::integral_constant<Isa, Isa::Scalar>{});
+        if constexpr (sglang::cpu_experts::kBuildIsa >= Isa::Avx2) each(std::integral_constant<Isa, Isa::Avx2>{});
+        if constexpr (sglang::cpu_experts::kBuildIsa >= Isa::Bw) each(std::integral_constant<Isa, Isa::Bw>{});
         ok("warm_returns_when_the_word_moves");
     }
 

@@ -28,7 +28,7 @@ CHECKS = (
     "a_layer_of_another_kernel_is_refused",
     "routes_are_validated",
     "forwards_run_at_once",
-    "isa_cap_lowers_the_tier",
+    "isa_is_the_build_tier_lowered_to_the_quants_top",
     "cores_are_validated_and_bound_the_team",
     "each_calls_team_runs_on_its_own_cores",
     "a_failed_pin_throws_runtime_error_and_leaves_out_untouched",
@@ -48,23 +48,22 @@ def _links_sanitizers(tmp_path) -> bool:
     return probe.returncode == 0
 
 
-@pytest.mark.parametrize("flags", [[], SANITIZERS], ids=["plain", "asan-ubsan"])
+@pytest.mark.parametrize(
+    "flags",
+    # -Ofast as the kernels build, where a std::isfinite weight check would fold away.
+    [["-Ofast", "-march=x86-64"], ["-Ofast", "-march=native"], ["-march=x86-64", *SANITIZERS]],
+    ids=["scalar-tier", "host-tier", "asan-ubsan"],
+)
 def test_the_native_harness_passes(tmp_path, flags):
-    if flags and not _links_sanitizers(tmp_path):
+    if SANITIZERS[0] in flags and not _links_sanitizers(tmp_path):
         pytest.skip(f"{CXX} cannot link ASan/UBSan (its sanitizer runtimes are not installed)")
     exe = tmp_path / "cpu_experts_common_check"
     subprocess.run([CXX, *CXX_FLAGS, *flags, str(HARNESS), "-o", str(exe)], check=True)
-    # The harness passes the cap and the report to the kernel's configure call itself; the kernel reads no
-    # environment, so a TOY_CPU_* value inherited from the caller must change nothing (it is passed on to prove it).
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TOY_CPU_")}
-    env.update(TOY_CPU_MAX_ISA="vbmi", TOY_CPU_REPORT_ISA="0")
-    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=300, env=env)
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
     passed = set(result.stdout.split("\n"))
     missing = [name for name in CHECKS if f"ok {name}" not in passed]
     assert not missing, f"checks that did not report ok: {missing}\n{result.stdout}{result.stderr}"
-    # The harness configures the report on: isa() reports the tier it settled on, once.
-    assert result.stderr.count("toy isa ") == 1 and "toy isa scalar\n" in result.stderr, result.stderr
 
 
 def _build_toy_library(output: Path, *flags: str) -> Path:
@@ -92,18 +91,28 @@ def test_two_libraries_refuse_each_others_layers_across_the_so_boundary(tmp_path
     assert result.returncode == 0 and "ok cross_library" in result.stdout, result.stdout + result.stderr
 
 
-def test_a_scalar_quant_library_uses_no_avx_registers(tmp_path):
-    # A quant whose top tier is Scalar must compile no vector code from the framework, so a portable (baseline x86-64)
-    # build stays free of AVX registers; the Avx2 build is the control that the scan finds them.
-    portable = ["-march=x86-64", "-mtune=generic"]
-    scalar = _build_toy_library(tmp_path / "libtoy_scalar.so", *portable, "-DTOY_TOP_ISA=Scalar")
-    avx2 = _build_toy_library(tmp_path / "libtoy_avx2.so", *portable)
+def _disassembly(library: Path) -> str:
+    return subprocess.run(["objdump", "-d", "-C", str(library)], capture_output=True, text=True, check=True).stdout
 
-    def disassembly(library: Path) -> str:
-        return subprocess.run(["objdump", "-d", str(library)], capture_output=True, text=True, check=True).stdout
 
-    assert "%ymm" not in disassembly(scalar) and "%zmm" not in disassembly(scalar)
-    assert "%ymm" in disassembly(avx2)
+@pytest.mark.parametrize(
+    "march, loops",
+    [("x86-64", set()), ("x86-64-v3", {"avx2"}), ("skylake-avx512", {"bw"})],
+    ids=["scalar", "avx2", "bw"],
+)
+def test_the_keep_warm_loop_compiled_is_the_build_tiers(tmp_path, march, loops):
+    # The tier is the build's -march: a library holds only its tier's loop, so a baseline x86-64 build carries no AVX.
+    library = _build_toy_library(tmp_path / "libtoy.so", f"-march={march}", "-DTOY_TOP_ISA=Vbmi")
+    text = _disassembly(library)
+    assert {name for name in ("avx2", "bw") if f"keep_warm_detail::{name}(" in text} == loops
+    if march == "x86-64":
+        assert "%ymm" not in text and "%zmm" not in text
+
+
+def test_a_quants_top_tier_lowers_the_keep_warm_loop(tmp_path):
+    library = _build_toy_library(tmp_path / "libtoy.so", "-march=skylake-avx512", "-DTOY_TOP_ISA=Avx2")
+    text = _disassembly(library)
+    assert "keep_warm_detail::avx2(" in text and "keep_warm_detail::bw(" not in text
 
 
 if __name__ == "__main__":
