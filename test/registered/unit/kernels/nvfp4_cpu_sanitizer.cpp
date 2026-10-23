@@ -14,8 +14,8 @@
 #include <span>
 #include <stdexcept>
 
-using Layer = ::sglang::cpu_experts::ExpertLayer;
-const ::sglang::cpu_experts::CpuExpertKernel& kernel = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel();
+using Kernel = ::sglang::nvfp4_cpu::Nvfp4CpuKernel;
+using Layer = Kernel::Layer;
 
 // The C ABI's status for what a kernel call threw: 0 none, 2 std::invalid_argument, 1 any other exception.
 template <class F>
@@ -37,8 +37,8 @@ int forward(const Layer& layer, const void* x, const int32_t* slots, const float
     call.rows = rows; call.x = x; call.slots = slots; call.weights = weights;
     call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate != 0;
     return status_of([&] {
-        kernel.check(layer, call);
-        kernel.forward(layer, call);
+        Kernel::check(layer, call);
+        ::sglang::cpu_experts::forward_alone<Kernel>(layer, call);
     });
 }
 
@@ -82,10 +82,8 @@ int main() {
     std::vector<unsigned char> sf13(capacity*256*8, 56), sf2(capacity*128*8, 56);
     std::vector<float> alpha(capacity, 1), out(h, 123);
     std::vector<unsigned short> x(h, 0x3c00);
-    SglangNvfp4CpuParams params{};
-    params.inv_input_scale13 = .5f; params.inv_input_scale2 = .25f;
-    const auto params_bytes = std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1));
-    ::sglang::cpu_experts::ExpertLayer d;
+    Layer d;
+    d.params.inv_input_scale13 = .5f; d.params.inv_input_scale2 = .25f;
     d.capacity = capacity; d.hidden = h; d.intermediate = n;
     d.slab_count = 7;
     d.slabs[0] = w13.data(); d.slabs[1] = w2.data();
@@ -95,7 +93,7 @@ int main() {
     d.slot_bytes[2] = 256*8; d.slot_bytes[3] = 128*8;
     d.slot_bytes[4] = 4; d.slot_bytes[5] = 4;
     Layer owned;
-    assert(status_of([&] { owned = kernel.make_layer(d, params_bytes); }) == 0);
+    assert(status_of([&] { owned = Kernel::make_layer(d); }) == 0);
     const Layer* layer_ptr = &owned;
     const int32_t slots[] = {1,-1,0}; const float weights[] = {.5f,1,.25f};
     const double g0=h*.5*quantized_constant(1);
@@ -115,7 +113,7 @@ int main() {
     d.act_limit=8; // Keep Q8 intermediate deltas representable at large scales.
     // Every finite E4M3 encoding, including signed zeros, subnormals and
     // max-normal scales. Compare with an independent double scalar oracle.
-    assert(status_of([&] { owned = kernel.make_layer(d, params_bytes); }) == 0);
+    assert(status_of([&] { owned = Kernel::make_layer(d); }) == 0);
     layer_ptr = &owned;
     for (int code = 0; code < 256; ++code) {
         if ((code & 127) == 127) continue;
@@ -152,7 +150,7 @@ int main() {
     d.act_limit=0;
     std::fill(sf13.begin(),sf13.end(),126);
     std::fill(out.begin(),out.end(),123);
-    assert(status_of([&] { owned = kernel.make_layer(d, params_bytes); }) == 0);
+    assert(status_of([&] { owned = Kernel::make_layer(d); }) == 0);
     layer_ptr = &owned;
     // An overflowing Q8 FP16 delta rejects the job without publishing output.
     assert(forward(*layer_ptr,x.data(),slots,weights,3,out.data(),3,0)==2);
@@ -161,11 +159,13 @@ int main() {
     assert(forward(*layer_ptr,x.data(),slots,weights,3,out.data(),3,0)==2);
     for (float v:out) assert(v==123);
     owned = {};
-    assert(status_of([&] { kernel.make_layer(d, {}); }) == 2);  // no params
+    const int64_t two[] = {0, 0};  // params() takes [w13_layout, scale bits, scale bits]
+    assert(status_of([&] { Kernel::params(std::span<const int64_t>(two, 2)); }) == 2);
+    assert(status_of([&] { Kernel::params(std::span<const int64_t>{}); }) == 2);
     d.slab_count = 6;
-    assert(status_of([&] { kernel.make_layer(d, params_bytes); }) == 2);
+    assert(status_of([&] { Kernel::make_layer(d); }) == 2);
     d.slab_count = 7;
     // The warm loop returns at once when the word has already moved past `seen`.
     const uint32_t word = 1;
-    assert(status_of([&] { kernel.warm(&word, 0, INT64_MAX); }) == 0);
+    assert(status_of([&] { Kernel::warm(&word, 0, INT64_MAX); }) == 0);
 }

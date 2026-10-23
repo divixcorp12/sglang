@@ -1,8 +1,7 @@
 """The header-only CPU experts framework (host/cpu_experts) passes its native harness (Linux, GCC with OpenMP).
 
-``cpu_experts_common_check.cpp`` drives a toy quant through ``ExpertForward`` as a ``CpuExpertKernel`` and prints
-``ok <check>`` per contract it holds, and ``cpu_experts_cross_library_check.cpp`` links two toy libraries and passes a
-layer between them.
+``cpu_experts_common_check.cpp`` drives a toy quant through ``ExpertForward`` (a kernel type, binding.hpp) and prints
+``ok <check>`` per contract it holds.
 """
 
 import os
@@ -25,7 +24,6 @@ SANITIZERS = ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined",
 CHECKS = (
     "make_layer_then_forward_overwrites_and_accumulates",
     "params_and_slabs_are_validated",
-    "a_layer_of_another_kernel_is_refused",
     "routes_are_validated",
     "forwards_run_at_once",
     "isa_is_the_build_tier_lowered_to_the_quants_top",
@@ -69,26 +67,6 @@ def test_the_native_harness_passes(tmp_path, flags):
 def _build_toy_library(output: Path, *flags: str) -> Path:
     subprocess.run([CXX, *CXX_FLAGS, "-fPIC", "-shared", *flags, str(TOY_LIBRARY), "-o", str(output)], check=True)
     return output
-
-
-CROSS = Path(__file__).resolve().parent / "cpu_experts_cross_library_check.cpp"
-# As the expert-stream host module builds (expert_stream_transport._host_module_cached): the interface must cross a
-# hidden-visibility library.
-HIDDEN = ["-fvisibility=hidden", "-fvisibility-inlines-hidden"]
-
-
-def test_two_libraries_refuse_each_others_layers_across_the_so_boundary(tmp_path):
-    for name in ("a", "b"):
-        _build_toy_library(
-            tmp_path / f"libtoy_{name}.so", *HIDDEN, f"-DTOY_KERNEL=toy_kernel_{name}", f'-DTOY_NAME="toy_{name}"'
-        )
-    exe = tmp_path / "cross_library"
-    subprocess.run(
-        [CXX, *CXX_FLAGS, str(CROSS), f"-L{tmp_path}", "-ltoy_a", "-ltoy_b", f"-Wl,-rpath,{tmp_path}", "-o", str(exe)],
-        check=True,
-    )
-    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0 and "ok cross_library" in result.stdout, result.stdout + result.stderr
 
 
 def _disassembly(library: Path) -> str:

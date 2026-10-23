@@ -1,6 +1,7 @@
 """Two CPU expert core groups of the EXL3 kernel on disjoint cores (spec 2026-10-03-numa-node-distributor-design,
 Testing 4). Each group runs its own OpenMP team on its own cores; two running at once give, bit for bit, what one
-gives alone. Needs the optimized ext build (RUN_EXT) and 4 cores in the affinity mask.
+gives alone. Needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 (the kernel is compiled into the host module) and 4
+cores in the affinity mask.
 
 Every pinned forward runs on a helper thread: a forward pins its calling thread (worker 0), and a pinned pytest thread
 would leave the next test one core."""
@@ -14,8 +15,6 @@ import time
 
 import pytest
 import torch
-
-pytestmark = pytest.mark.skipif(not os.environ.get("SGLANG_EXL3_SRC"), reason="needs SGLANG_EXL3_SRC")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -47,15 +46,30 @@ REPEATS = 40
 CORES = sorted(os.sched_getaffinity(0))  # read at import, before any forward could pin this thread
 
 
-def _kernel():
+def _trait(**kwargs):
+    """An EXL3 trait over the host module's plan list."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
-    if not optimized_cpu(cpu_act_defines()):
+    trait = Exl3CpuQuantTrait(**{"act_limit": LIMIT, **kwargs})
+    trait.attach_host(es.cpu_kernel_options(variant="instr"))
+    return trait
+
+
+def _has_bw():
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
+    return es.cpu_kernel_options(variant="instr").cpu_kernel_isa() in ("bw", "vnni", "vbmi")
+
+
+def _kernel():
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
+
+    if not resolved_config().stream.cpu_experts.enabled:
         pytest.skip("the kernel under test is the optimized one: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1")
     if len(CORES) < 4:
         pytest.skip("needs 4 cores in the affinity mask")
-    return Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT), CORES[:4]
+    return _trait(), CORES[:4]
 
 
 def _forward(trait, layer, x, slots, weights, cores, threads):
@@ -73,7 +87,7 @@ def _forward(trait, layer, x, slots, weights, cores, threads):
 def _layer(trait, seed):
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    return es.kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(seed, HIDDEN, INTER), CAP), variant="instr")
+    return es.kernel_layer(trait.layer_spec(_random_slabs(seed, HIDDEN, INTER), CAP), variant="instr")
 
 
 def _inputs():
@@ -99,12 +113,6 @@ def _on_threads(fn, args):
     return results
 
 
-def test_the_extension_hands_out_one_kernel_address():
-    trait, _ = _kernel()
-    address = trait.kernel_address()
-    assert address != 0 and trait.kernel_address() == address
-
-
 def _facts(bits_w13, bits_w2, swizzled=0):
     from sglang.srt.layers.quantization.exl3.schemes.exl3_cpu_experts import Exl3LayerFacts
 
@@ -113,25 +121,20 @@ def _facts(bits_w13, bits_w2, swizzled=0):
     )
 
 
-# SglangExl3CpuParams (kernel.h): int16 bits_w13, bits_w2, swizzled, row_weighted; int32 plan; little-endian.
-PARAMS = "<hhhhi"
+# The kernel's parameter list (Exl3CpuKernel::params): bits_w13, bits_w2, swizzled, row_weighted, plan.
 GENERIC, DSV41 = 0, 1  # kernel.h's SglangExl3CpuPlan
 
 
-def test_the_extension_packs_the_params_make_layer_reads():
-    import struct
-
-    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
-
+def test_the_trait_lists_the_params_make_layer_reads():
     trait, _ = _kernel()
-    weighted = Exl3CpuQuantTrait(trait.ext, act_limit=10.0, row_weighted=True)
-    assert trait._params(_facts(3, 3), DSV41) == struct.pack(PARAMS, 3, 3, 0, 0, DSV41)
-    assert trait._params(_facts(4, 2, swizzled=1), GENERIC) == struct.pack(PARAMS, 4, 2, 1, 0, GENERIC)
-    assert weighted._params(_facts(3, 5), GENERIC) == struct.pack(PARAMS, 3, 5, 0, 1, GENERIC)
+    weighted = _trait(row_weighted=True)
+    assert trait._params(_facts(3, 3), DSV41) == (3, 3, 0, 0, DSV41)
+    assert trait._params(_facts(4, 2, swizzled=1), GENERIC) == (4, 2, 1, 0, GENERIC)
+    assert weighted._params(_facts(3, 5), GENERIC) == (3, 5, 0, 1, GENERIC)
 
 
-def test_the_extension_lists_its_plans_generic_first():
-    """sglang_exl3_cpu::plans: the generic plan first, which any layer may take, then the DSV4.1 plan with exactly the
+def test_the_host_lists_the_kernels_plans_generic_first():
+    """cpu_kernel_plans: the generic plan first, which any layer may take, then the DSV4.1 plan with exactly the
     facts its Shape fixes; on an AVX-512 build of the residual block-128 activations, it is available."""
     trait, _ = _kernel()
     plans = trait._plans()
@@ -141,7 +144,7 @@ def test_the_extension_lists_its_plans_generic_first():
         5120, 2304, 3, 3, 0, 10.0
     )
     assert (dsv41.min_isa, plans[0].available) == ("bw", True)
-    assert dsv41.available == bool(trait.ext.exl3_moe_cpu_has_avx512_bw())
+    assert dsv41.available == _has_bw()
 
 
 def _refused(trait, slabs, params):
@@ -151,15 +154,13 @@ def _refused(trait, slabs, params):
 
     spec = dataclasses.replace(trait.layer_spec(slabs, CAP), params=params)
     with pytest.raises(Exception) as refused:
-        es.kernel_layer(trait.kernel_address(), spec, variant="prod")
+        es.kernel_layer(spec, variant="prod")
     return str(refused.value)
 
 
 def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
-    import struct
-
     trait, _ = _kernel()
-    why = _refused(trait, _random_slabs(20261008, HIDDEN, INTER), struct.pack(PARAMS, 3, 3, 0, 2, GENERIC))
+    why = _refused(trait, _random_slabs(20261008, HIDDEN, INTER), (3, 3, 0, 2, GENERIC))
     assert "row_weighted must be 0 or 1" in why
 
 
@@ -177,16 +178,12 @@ def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
 def test_registration_refuses_a_plan_that_does_not_accept_the_layer(bits_w13, bits_w2, swizzled, limit, plan, why):
     """A layer's params name its plan; make_layer refuses one whose facts the layer does not have, so a forward never
     runs a plan whose compiled shape, K or layout differs from the slabs'."""
-    import struct
-
-    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
-
-    trait, _ = _kernel()
-    if not trait.ext.exl3_moe_cpu_has_avx512_bw():
+    _kernel()
+    if not _has_bw():
         pytest.skip("the DSV4.1 plan needs AVX-512BW")
-    trait = Exl3CpuQuantTrait(trait.ext, act_limit=limit)
+    trait = _trait(act_limit=limit)
     slabs = _random_slabs(20261008, HIDDEN, INTER, bits_w13=bits_w13, bits_w2=bits_w2)
-    assert why in _refused(trait, slabs, struct.pack(PARAMS, bits_w13, bits_w2, swizzled, 0, plan))
+    assert why in _refused(trait, slabs, (bits_w13, bits_w2, swizzled, 0, plan))
 
 
 def _seeded_routes(seed, rows, k):
@@ -215,17 +212,17 @@ def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slot
     the production build, a layer made with row_weighted gives the original layer's output bit for bit, through the
     DSV4.1 plan the serving kernel runs."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
-    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, _ = _kernel()
     if len(CORES) < threads:
         pytest.skip(f"needs {threads} cores in the affinity mask")
     cores = CORES[:threads]  # ten workers: a serving group's team
-    weighted = Exl3CpuQuantTrait(trait.ext, act_limit=LIMIT, row_weighted=True)
+    weighted = _trait(row_weighted=True)
+    options = es.cpu_kernel_options(variant="prod")  # the module the layers below run on
     slabs = _random_slabs(20261008, HIDDEN, INTER)
     layers = {
-        name: es.kernel_layer(t.kernel_address(), t.layer_spec(slabs, CAP), variant="prod")
+        name: es.kernel_layer(t.layer_spec(slabs, CAP), variant="prod")
         for name, t in [("original", trait), ("weighted", weighted)]
     }
     g = torch.Generator().manual_seed(20261008)
@@ -241,9 +238,9 @@ def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slot
         return out
 
     def run(_):
-        before = trait._op("plan_calls")()[0]
+        before = options.cpu_kernel_plan_calls()[0]  # [dsv41, generic]
         outs = [forward(layers["original"]), forward(layers["weighted"]), forward(layers["original"])]
-        return outs, trait._op("plan_calls")()[0] - before
+        return outs, options.cpu_kernel_plan_calls()[0] - before
 
     try:
         ((original, weighted_out, again), dsv41_calls),  = _on_threads(run, [None])
@@ -395,8 +392,7 @@ def test_a_multi_row_forward_on_prod_matches_one_row_forwards(monkeypatch):
 
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
-    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(20261005, HIDDEN, INTER), CAP),
-                            variant="prod")
+    layer = es.kernel_layer(trait.layer_spec(_random_slabs(20261005, HIDDEN, INTER), CAP), variant="prod")
     inputs = _inputs()[:6]
 
     def forward(rows):

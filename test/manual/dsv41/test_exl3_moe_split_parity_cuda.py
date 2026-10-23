@@ -450,30 +450,30 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
 
 
 def _optimized_cpu_build() -> bool:
-    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, optimized_cpu
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
 
-    return optimized_cpu(cpu_act_defines())
+    return resolved_config().stream.cpu_experts.enabled
 
 
 @pytest.mark.skipif(
     not _optimized_cpu_build(),
-    reason="the CPU kernel's ops exist only in the optimized EXL3 extension: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1",
+    reason="the optimized CPU kernel is built into the host module only with SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1",
 )
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
     """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
     slots, lands the output within the kernel's own error of the full GPU run, far closer than dropping those routes."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     threads = min(4, len(os.sched_getaffinity(0)))
     device = slot_rows["w13_trellis"].device
     fused = _fused(slot_rows, device, True)
     hidden = slot_rows["w13_suh"].shape[-1]
-    trait = Exl3CpuQuantTrait(exl3_ext(), act_limit=ACT_LIMIT)
+    trait = Exl3CpuQuantTrait(act_limit=ACT_LIMIT)
+    trait.attach_host(es.cpu_kernel_options(variant="instr"))
     host_rows = {name: t.cpu() for name, t in slot_rows.items()}
-    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(host_rows, fused.slots), variant="instr")
+    layer = es.kernel_layer(trait.layer_spec(host_rows, fused.slots), variant="instr")
     partial = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
     zero = torch.zeros_like(partial).pin_memory()
     keep = torch.ones(1, device=device)

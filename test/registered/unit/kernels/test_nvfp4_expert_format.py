@@ -263,11 +263,7 @@ def test_the_trait_reads_the_shape_off_the_slabs():
 
 
 def test_a_layer_without_activation_scales_is_refused_and_one_with_them_gets_the_kernels_slab_order():
-    module = SimpleNamespace(
-        nvfp4_cpu_params=lambda layout, s13, s2: f"{layout}:{s13}:{s2}".encode(),
-        nvfp4_cpu_kernel_address=lambda: 4242,
-    )
-    trait = Nvfp4EngineCpuTrait(module=module)
+    trait = Nvfp4EngineCpuTrait()
     trait.act_limit = 0.0
     slabs = _slabs(4)
     with pytest.raises(ValueError, match="activation-scale reciprocals"):
@@ -280,11 +276,12 @@ def test_a_layer_without_activation_scales_is_refused_and_one_with_them_gets_the
         (slabs[name].data_ptr(), slabs[name][0].numel() * slabs[name].element_size()) for name in NVFP4_STREAMED_NAMES
     )
     assert spec.slabs[4][1] == spec.slabs[5][1] == 512 and spec.slabs[6] == (0, 0)
-    assert spec.params == b"0:0.25:4.0" and trait.kernel_address() == 4242
+    assert spec.params == (0, 0x3E800000, 0x40800000)  # w13_layout, then 0.25 and 4.0 as binary32 bits
+    assert not hasattr(trait, "kernel_address")
 
 
 def test_the_trait_needs_the_layers_activation_limit_first():
-    trait = Nvfp4EngineCpuTrait(module=SimpleNamespace(nvfp4_cpu_params=lambda *a: b""))
+    trait = Nvfp4EngineCpuTrait()
     slabs = _slabs(2)
     trait.set_layer_scales(slabs["w13_weight"], 1.0, 1.0)
     with pytest.raises(ValueError, match="activation limit"):

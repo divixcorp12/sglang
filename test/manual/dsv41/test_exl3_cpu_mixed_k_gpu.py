@@ -2,7 +2,7 @@
 exl3_moe_loop on the GPU: a K2 layer and layers with K(w13) = 3 and K(w2) = 2 or 4, as the mixed-K checkpoint holds
 them. Each runs the generic plan (the plan counter), with every projection decoded at its own K.
 
-Needs CUDA, SGLANG_EXL3_SRC and the optimized CPU kernel (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1). Short GPU work:
+Needs CUDA, SGLANG_EXL3_SRC (the GPU reference) and the optimized CPU kernel (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1). Short GPU work:
 it shares the card. Run on divix01 under taskset -c 0-51,56-107 with OMP_NUM_THREADS set.
 """
 
@@ -20,12 +20,15 @@ HIDDEN, INTER, CAP, TOPK, LIMIT, THREADS = 512, 256, 6, 3, 10.0, 4
 
 
 def _trait():
-    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-    if not optimized_cpu(cpu_act_defines()):
+    if not resolved_config().stream.cpu_experts.enabled:
         pytest.skip("the kernel under test is the optimized one: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1")
-    return Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT)
+    trait = Exl3CpuQuantTrait(act_limit=LIMIT)
+    trait.attach_host(es.cpu_kernel_options(variant="instr"))
+    return trait
 
 
 def _experts(bits_w13, bits_w2, seed):
@@ -87,7 +90,7 @@ def test_a_layer_of_any_k_matches_the_gpu_loop_on_the_generic_plan(monkeypatch, 
     experts = _experts(bits_w13, bits_w2, seed=10 * bits_w13 + bits_w2)
     spec = trait.layer_spec(_slabs(experts), CAP)
     assert spec.plan.startswith("EXL3 CPU plan generic (")
-    layer = es.kernel_layer(trait.kernel_address(), spec, variant="instr")
+    layer = es.kernel_layer(spec, variant="instr")
     g = torch.Generator().manual_seed(rows)
     x = (torch.randn(rows, HIDDEN, generator=g) * 0.5).half()
     ids = torch.stack([torch.randperm(CAP, generator=g)[:TOPK] for _ in range(rows)])

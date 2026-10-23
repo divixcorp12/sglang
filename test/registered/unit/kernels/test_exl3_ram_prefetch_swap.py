@@ -71,7 +71,7 @@ def test_a_pool_row_is_invisible_to_the_device_until_a_forced_miss_swaps_it_in(t
         victim = _pooled_victim(before, rig.host.slot_info(1))
         assert before[victim][0] == FREE, "the victim is a free slot (nothing loaded)"
         assert {"group": 0, "slot": victim, "state": "empty", "expert": -1} in rig.host.spec_pool(1)
-        calls = rig.host.test_kernel_calls()
+        calls = rig.host.fake_kernel_calls()
         assert calls[-1]["slots"] == [slot] and calls[-1]["accumulate"] is False
         assert _same_row(rig, 1, slot, 4)
     finally:
@@ -150,7 +150,7 @@ def test_a_record_mixing_a_pooled_and_a_read_forced_miss_sends_the_pooled_one_fi
         rows = rig.host.counters()["rows_read"]
         req = forced(rig, 1, [4, 2])
         assert req.kinds == [LaneKind.MISS_CPU, LaneKind.MISS_CPU]
-        calls = rig.host.test_kernel_calls()[-2:]
+        calls = rig.host.fake_kernel_calls()[-2:]
         assert calls[0]["slots"] == [slot] and calls[0]["accumulate"] is False
         assert calls[1]["slots"] == [rig.host.mapping(1)[2]] and calls[1]["accumulate"] is True
         assert rig.host.counters()["rows_read"] == rows + 1 and rig.host.counters()["spec_used"] == 1
@@ -320,7 +320,7 @@ def test_a_gpu_miss_beside_a_pooled_forced_miss_publishes_its_pieces(tmp_path):
         assert counters["rows_read"] == rows + 1 and counters["spec_used"] == 1
         assert rig.host.mapping(1)[4] == slot and _same_row(rig, 1, slot, 4)
         assert _same_row(rig, 1, req.slots[0], 2), "the GPU miss's staging slot holds its row"
-        assert rig.host.test_kernel_calls()[-1]["slots"] == [slot]
+        assert rig.host.fake_kernel_calls()[-1]["slots"] == [slot]
     finally:
         rig.host.stop()
 
@@ -420,7 +420,7 @@ def test_a_promoted_row_is_a_cpu_hit_on_a_forced_lane_and_is_not_read(tmp_path):
         req = forced(rig, 1, [4])
         assert req.kinds == [LaneKind.HIT_CPU] and req.slots == [slot]
         assert rig.host.counters()["rows_read"] == rows
-        assert rig.host.test_kernel_calls()[-1]["slots"] == [slot]
+        assert rig.host.fake_kernel_calls()[-1]["slots"] == [slot]
     finally:
         rig.host.stop()
 

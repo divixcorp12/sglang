@@ -43,13 +43,15 @@ class Chain:
         self, tmp_path, *, capacity=CAPACITY, staging=STAGING, mirror_weights=None, timeout_ms=2000, lease_pdl=False,
         copy_engine=False, sm_small_copies=False, copy_wait_ms=2000, start=True, variant="instr", hit_copy="ce",
         cpu_misses=False, gpu_hot=False, lanes=8, experts=EXPERTS, top_k=TOP_K, dst_rows=DST_ROWS, miss_cut=0,
-        miss_cut_max=3, layers=LAYERS, spec_share=0, drip_slots=0, drip_chunk_bytes=1 << 20,
+        miss_cut_max=3, layers=LAYERS, spec_share=0, drip_slots=0, drip_chunk_bytes=1 << 20, build=EXL3_BUILD,
     ):
-        """``lanes`` is the build's lane count; ``top_k`` is each row's plan width and ``dst_rows`` its destination
+        """``build`` is the host and device build key (FAKE_BUILD for a test that runs the fake CPU kernel);
+        ``lanes`` is the build's lane count; ``top_k`` is each row's plan width and ``dst_rows`` its destination
         rows (both at least the widest plan the test posts); ``layers`` is the number of streamed rows;
         ``spec_share`` the speculative pool's entries per row and group (0: no pool); ``drip_slots`` the GPU drip's
         scratch slots (0: off; needs ``copy_engine``), fed by ``host.drip_offer``."""
         self.lanes, self.experts, self.top_k, self.dst_rows = lanes, experts, top_k, dst_rows
+        self.build = build
         self.layers = layers
         wire = wire_layout(lanes)
         write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts, hidden=ROW_IMAGE_DIM,
@@ -71,7 +73,7 @@ class Chain:
             self.host = ExpertStreamHost(
                 self.tables, page=self.page,
                 slot_map=torch.full((layers, experts), -1, dtype=torch.int32).pin_memory(), variant=variant,
-                hot_page=self.hot_page, lanes=lanes,
+                hot_page=self.hot_page, lanes=lanes, layout=build,
             )
             self.host.reserve_staging(staging)
             if spec_share:
@@ -107,7 +109,7 @@ class Chain:
                 timeout_ms=timeout_ms, piece_runs=self.host.piece_runs(),
                 row_capacities=[int(c) for c in self.tables.capacity], lease_pdl=lease_pdl,
                 hit_copy=hit_copy, cpu_misses=cpu_misses, hot_page=self.hot_page, lanes=lanes,
-                miss_cut=miss_cut, miss_cut_max=miss_cut_max,
+                miss_cut=miss_cut, miss_cut_max=miss_cut_max, layout=build,
             )
             if copy_engine:
                 for row in range(layers):

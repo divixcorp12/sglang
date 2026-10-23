@@ -51,22 +51,17 @@ def arm(args):
     import sglang
     import exl3_cpu_forward_ab as fixture
     from sglang.kernels.ops.moe import expert_stream_transport as es
-    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     torch.set_num_threads(1)
     fixture.CAP = CAPACITY
     print(f"sglang {sglang.__file__}", flush=True)
-    if args.library:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(args.library.stem, args.library)
-        ext = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(ext)
-    else:
-        ext = exl3_ext()
-    if not ext.exl3_moe_cpu_has_avx512_bw():
+    # The kernel is compiled into the host module (SGLANG_JIT_HOST_MARCH above picks its tier); there is no prebuilt
+    # extension to load, so --library is ignored.
+    options = es.cpu_kernel_options(variant="instr")
+    if options.cpu_kernel_isa() not in ("bw", "vnni", "vbmi"):
         raise RuntimeError("expected BW optimized CPU tier")
     slabs = fixture.random_slabs(torch, HIDDEN, 2304, seed=719)
-    handle, trait = fixture.register_slabs(ext, slabs, 10.0)
+    handle, trait = fixture.register_slabs(slabs, 10.0)
     # Keep both owning objects alive throughout all forwards.
     assert trait is not None
     weight_bytes = sum(t.numel() * t.element_size() for t in slabs.values())
@@ -80,9 +75,8 @@ def arm(args):
         "trace_prefix": json.loads(os.environ.get("SGLANG_EXPERT_STREAM_TRACE") or "{}").get("cpu_worker", {}).get("prefix"),
         "tid": __import__("threading").get_native_id(),
         "case_order_seed": 619,
-        "library": ext.__file__,
-        "library_sha256": hashlib.sha256(Path(ext.__file__).read_bytes()).hexdigest(),
-        "chunk_m": torch.ops.sglang_exl3_cpu.chunk_m(),
+        "isa": options.cpu_kernel_isa(),
+        "chunk_m": options.cpu_kernel_chunk_m(),
     }
     jobs = []
     outputs = {}
@@ -140,7 +134,7 @@ def arm(args):
     summary = [{"case": key[0], "reuse": key[1], "gap_s": key[2], "n": len(values),
                 "p50_ms": statistics.median(values), "p95_ms": quantile(values, .95),
                 "max_ms": max(values)} for key, values in sorted(bycase.items())]
-    metadata["plan_calls"] = list(torch.ops.sglang_exl3_cpu.plan_calls())
+    metadata["plan_calls"] = options.cpu_kernel_plan_calls()
     args.output.write_text(json.dumps({"metadata": metadata, "summary": summary, "output_hashes": outputs,
                                       "jobs": jobs}, indent=2) + "\n")
     print(json.dumps({"output": str(args.output), "jobs": len(jobs), "summary": summary}), flush=True)
@@ -211,7 +205,7 @@ def main():
     a.add_argument("--reps", type=int, default=30)
     a.add_argument("--warmups", type=int, default=5)
     a.add_argument("--output", type=Path, required=True)
-    a.add_argument("--library", type=Path, help="load an explicitly identified prebuilt extension without JIT")
+    a.add_argument("--library", type=Path, help="ignored: the kernel is compiled into the host module, not a prebuilt extension")
     a.add_argument("--ready-file", type=Path)
     a.add_argument("--start-file", type=Path)
     m = sub.add_parser("matrix")

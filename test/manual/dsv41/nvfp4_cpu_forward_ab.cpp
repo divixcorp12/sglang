@@ -1,5 +1,5 @@
 // A/B harness for the NVFP4 CPU expert kernel; run_nvfp4_cpu_forward_checks.sh builds and runs it.
-// It calls only the kernel interface (nvfp4_cpu_kernel(), kernel.h). Every one-row output and status (status_of) is
+// It calls only the kernel type (Nvfp4CpuKernel, kernel.h). Every one-row output and status (status_of) is
 // written to OUT in a fixed order: two revisions agree when nvfp4_cpu_dump_compare.py finds their files within its
 // tolerance (the kernel is built -Ofast, so they need not be byte-identical), each built with its own revision of
 // this harness. Batched rows must match their one-row calls within one Q8_0 quantum (check_batch).
@@ -93,7 +93,8 @@ Slabs make_slabs(const Config& c, std::mt19937& rng) {
 }
 
 std::vector<int> g_cores;  // the cores main was given, carried by every forward
-using Layer = ::sglang::cpu_experts::ExpertLayer;
+using Kernel = ::sglang::nvfp4_cpu::Nvfp4CpuKernel;
+using Layer = Kernel::Layer;
 
 // The C ABI's status for what a kernel call threw: 0 none, 2 std::invalid_argument, 1 any other exception.
 template <class F>
@@ -115,9 +116,8 @@ int forward(const Layer& layer, const void* x, const int32_t* slots, const float
     call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate != 0;
     call.cores = g_cores;
     return status_of([&] {
-        const auto& kernel = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel();
-        kernel.check(layer, call);
-        kernel.forward(layer, call);
+        Kernel::check(layer, call);
+        ::sglang::cpu_experts::forward_alone<Kernel>(layer, call);
     });
 }
 
@@ -194,9 +194,8 @@ int main(int argc, char** argv) {
     int cases = 0, unexpected = 0, batch_mismatches = 0;
     for (const Config& c : kConfigs) {
         Slabs s = make_slabs(c, rng);
-        SglangNvfp4CpuParams params{};
-        params.w13_layout = c.layout; params.inv_input_scale13 = c.inv13; params.inv_input_scale2 = c.inv2;
-        ::sglang::cpu_experts::ExpertLayer d;
+        Layer d;
+        d.params.w13_layout = c.layout; d.params.inv_input_scale13 = c.inv13; d.params.inv_input_scale2 = c.inv2;
         d.capacity = kCapacity; d.hidden = c.hidden;
         d.intermediate = c.intermediate; d.activation = 0; d.act_limit = c.limit; d.slab_count = 7;
         for (int i = 0; i < 7; ++i) {
@@ -204,10 +203,7 @@ int main(int argc, char** argv) {
             d.slot_bytes[i] = s.stride[i];
         }
         Layer layer;
-        if (status_of([&] {
-                layer = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(
-                    d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
-            }) != 0) {
+        if (status_of([&] { layer = Kernel::make_layer(d); }) != 0) {
             std::fprintf(stderr, "%s: registration refused\n", c.name); return 1;
         }
         const Layer& handle = layer;

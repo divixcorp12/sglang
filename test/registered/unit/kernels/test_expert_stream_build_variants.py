@@ -143,10 +143,10 @@ RAW_EXPORTS = {
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
-    "test_kernel_address": lambda m, h: m.expert_stream_test_kernel_address(0, 0, 0),
-    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 9 + 2 * 8), dtype=torch.float64)),
-    "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
-    "test_kernel_max_rows": lambda m, h: m.expert_stream_test_kernel_max_rows(1 << 16),
+    "fake_kernel_reset": lambda m, h: m.expert_stream_fake_kernel_reset(0, 0, 0),
+    "fake_kernel_calls": lambda m, h: m.expert_stream_fake_kernel_calls(torch.zeros((0, 9 + 2 * 8), dtype=torch.float64)),
+    "fake_kernel_hold": lambda m, h: m.expert_stream_fake_kernel_hold(0, 0),
+    "fake_kernel_max_rows": lambda m, h: m.expert_stream_fake_kernel_max_rows(1 << 16),
     "draft_test_post": lambda m, h: m.expert_stream_draft_test_post(0, 0, 1, 1, 1, 0),
     "draft_test_tear": lambda m, h: m.expert_stream_draft_test_tear(0, 1),
     "draft_test_finish_close": lambda m, h: m.expert_stream_draft_test_finish_close(0, 1, 0),
@@ -167,7 +167,7 @@ def test_every_test_only_export_is_listed_and_exported_by_both_builds():
         set(ops.TEST_ONLY_EXPORTS) - {"read_rows_faulted", "read_rows_sqes", "read_rows_idle", "read_rows_two_span"}
     )
     for variant in ops.VARIANTS:
-        module = ops._host_module(ops.EXL3_BUILD, variant)
+        module = ops._host_module(ops.FAKE_BUILD, variant)  # the fake_kernel_* exports are the fake format's
         for name in ops.TEST_ONLY_EXPORTS:
             assert hasattr(module, f"expert_stream_{name}"), (variant, name)
 
@@ -176,7 +176,7 @@ def test_every_test_only_export_is_listed_and_exported_by_both_builds():
 def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
     host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
-                            variant="prod")
+                            variant="prod", layout=ops.FAKE_BUILD)
     try:
         with pytest.raises(RuntimeError, match=f"{name} is test-only: it exists in the instrumented host build"):
             RAW_EXPORTS[name](host._module, host.handle)
@@ -213,28 +213,30 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
 
 def test_the_draft_kernel_exports_run_on_prod(tmp_path):
     """The DSpark draft computes its CPU experts through kernel_layer/kernel_forward (cpu_experts/draft.py), so the
-    production build serves them: one row through the instr build's fake kernel, out[j] = j + sum(w * (s + 1)). The
-    fake computes one row (the host only calls it so); test_cpu_expert_engines_exl3.py pins m rows on the real kernel."""
+    production build serves them: one row through the fake kernel of the FAKE_BUILD prod host, out[j] = j + sum(w * (s
+    + 1)). The fake computes one row (the host only calls it so); test_cpu_expert_engines_exl3.py pins m rows on the
+    real kernel."""
     from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
 
     s = ram_miss_setup(tmp_path, capacity=2)
     instr = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
-                             variant="instr")
+                             variant="instr", layout=ops.FAKE_BUILD)
     try:
         assert not {"kernel_layer", "kernel_forward", "kernel_error", "kernel_drop"} & set(ops.TEST_ONLY_EXPORTS)
-        layer = ops.kernel_layer(instr.test_kernel_address(), fake_cpu_layer(hidden=4), variant="prod")
+        layer = ops.kernel_layer(fake_cpu_layer(hidden=4), layout=ops.FAKE_BUILD, variant="prod")
         slots = torch.tensor([[0, 2]], dtype=torch.int32)
         weights = torch.tensor([[0.5, 0.25]])
         out = torch.full((1, 4), float("nan"))
         status, why = ops.kernel_forward(
-            layer, torch.zeros((1, 4), dtype=torch.float16), slots, weights, out, threads=1, variant="prod"
+            layer, torch.zeros((1, 4), dtype=torch.float16), slots, weights, out, threads=1, layout=ops.FAKE_BUILD,
+            variant="prod",
         )
         assert (status, why) == (0, "")
         assert torch.equal(out, (torch.arange(4, dtype=torch.float32) + 0.5 * 1 + 0.25 * 3).unsqueeze(0))
-        ops.kernel_drop(layer, variant="prod")
+        ops.kernel_drop(layer, layout=ops.FAKE_BUILD, variant="prod")
         with pytest.raises(RuntimeError, match="no layer"):
             ops.kernel_forward(layer, torch.zeros((1, 4), dtype=torch.float16), slots, weights, out, threads=1,
-                               variant="prod")
+                               layout=ops.FAKE_BUILD, variant="prod")
     finally:
         instr.stop()
 

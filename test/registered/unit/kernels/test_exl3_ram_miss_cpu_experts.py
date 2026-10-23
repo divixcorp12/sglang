@@ -7,7 +7,7 @@ The service hands the CPU hits to the CPU expert thread as part 0 before the cop
 the copy-engine hits; the service sends each CPU miss into part 1 once its row landed, adding into the part after the
 record's first miss job.
 CopyDone covers every host lane of the record once all of them are done.
-The kernel here is the instr build's fake CpuExpertKernel (ExpertStreamHost.test_kernel_address), which records its
+The kernel here is the FAKE_BUILD host's fake kernel (ExpertStreamHost.fake_kernel_reset), which records its
 calls and writes a known partial sum.
 
 The fake runs natively on the CPU expert thread, so no wait for the CPU lanes depends on the GIL;
@@ -64,7 +64,7 @@ def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0, enable=True):
     # Seven slots, three staging: four mappable rows.
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False, wire=wire_layout(8))
-    host = attached_host(s, page, k=3)
+    host = attached_host(s, page, k=3, layout=es.FAKE_BUILD)
     dst = None
     if copy_engine:
         host.enable_copy_engine(-1)
@@ -78,13 +78,14 @@ def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0, enable=True):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN) if parts == 2 else (ROWS, HIDDEN), dtype=torch.float32)
     if copy_engine and enable:
-        host.enable_cpu_experts(host.test_kernel_address(fail=fail), split, _cores(), x_rows, out_rows, threads=2)
+        host.fake_kernel_reset(fail=fail)
+        host.enable_cpu_experts(split, _cores(), x_rows, out_rows, threads=2)
     return s, page, host, ChainSim(host, page, s.slabs), dst, out_rows
 
 
 def _calls(host):
     """The fake kernel's calls as (slots, weights, threads)."""
-    return [(c["slots"], c["weights"], c["threads"]) for c in host.test_kernel_calls()]
+    return [(c["slots"], c["weights"], c["threads"]) for c in host.fake_kernel_calls()]
 
 
 def _load(sim, host, experts):
@@ -126,7 +127,7 @@ def test_split_n_hit_lanes_go_to_the_cpu_and_copydone_waits_for_both(tmp_path):
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.MISS_GPU, LaneKind.HIT_CPU]
         assert host.pump() == 1
 
-        assert _wait(lambda: len(host.test_kernel_calls()) == 1)
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 1)
         assert _calls(host)[0] == ([slot2], [0.125], 2)
         assert torch.equal(out_rows[ROW, 0], torch.arange(HIDDEN, dtype=torch.float32) + 0.125 * (slot2 + 1))
         assert not out_rows[ROW, 1].any() and not out_rows[1 - ROW].any()
@@ -155,9 +156,9 @@ def test_the_groups_cores_reach_every_cpu_forward(tmp_path):
         req = _post(sim, [2])
         assert req.kinds == [LaneKind.HIT_CPU]
         assert host.pump() == 1
-        assert _wait(lambda: len(host.test_kernel_calls()) == 1)
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 1)
         assert sim.copy_wait(req)
-        assert [c["core"] for c in host.test_kernel_calls()] == [_cores()[0]]
+        assert [c["core"] for c in host.fake_kernel_calls()] == [_cores()[0]]
     finally:
         host.stop()
 
@@ -196,12 +197,12 @@ def test_a_test_kernel_layer_keeps_its_slabs_until_it_is_dropped(tmp_path):
         slab = torch.zeros(64)
         alive = weakref.ref(slab)
         layer = es.kernel_layer(
-            host.test_kernel_address(), dataclasses.replace(fake_cpu_layer(HIDDEN), keep=(slab,)), variant="instr"
+            dataclasses.replace(fake_cpu_layer(HIDDEN), keep=(slab,)), layout=es.FAKE_BUILD, variant="instr"
         )
         del slab
         gc.collect()
         assert alive() is not None
-        es.kernel_drop(layer, variant="instr")
+        es.kernel_drop(layer, layout=es.FAKE_BUILD, variant="instr")
         gc.collect()
         assert alive() is None
     finally:
@@ -219,7 +220,8 @@ def test_a_bad_core_list_is_refused_when_the_cpu_experts_are_enabled(tmp_path, c
     try:
         x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
         with pytest.raises(Exception, match=why):
-            host.enable_cpu_experts(host.test_kernel_address(), NO_SPLIT, cores, x_rows, out_rows, threads=threads)
+            host.fake_kernel_reset()
+            host.enable_cpu_experts(NO_SPLIT, cores, x_rows, out_rows, threads=threads)
     finally:
         host.stop()
 
@@ -235,7 +237,7 @@ def test_a_job_of_cpu_lanes_only_completes_without_any_copy(tmp_path):
         assert host.pump() == 1
         assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert _calls(host) == [([_slot_of(host, 3), _slot_of(host, 1)], [1.0, 2.0], 2)]
-        assert [c["affinity"] for c in host.test_kernel_calls()] == [_cores()[0]]
+        assert [c["affinity"] for c in host.fake_kernel_calls()] == [_cores()[0]]
         assert host.copy_engine_marked() == 0
         assert host.copy_engine_idle(5.0)
         assert all(not dst[n].view(torch.uint8).any() for n in dst)
@@ -258,7 +260,7 @@ def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
         assert host.pump() == 1
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0)
-        assert host.test_kernel_calls() == [] and host.counters()["cpu_lanes"] == 0
+        assert host.fake_kernel_calls() == [] and host.counters()["cpu_lanes"] == 0
     finally:
         host.stop()
 
@@ -273,7 +275,7 @@ def test_the_cpu_takes_the_last_hit_lanes_past_a_miss_lane(tmp_path):
         req = _post(sim, [3, 1, 5, 2], dst=[0, 1, 2, 3], weights=[1.0, 2.0, 3.0, 4.0])
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.HIT_CPU, LaneKind.MISS_GPU, LaneKind.HIT_CPU]
         assert host.pump() == 1
-        assert _wait(lambda: len(host.test_kernel_calls()) == 1)
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 1)
         assert sorted(_calls(host)[0][0]) == sorted([_slot_of(host, 1), _slot_of(host, 2)])
         host.copy_engine_release(-1)
         assert _wait(lambda: sim.copy_done(req) == req.gen)
@@ -297,7 +299,7 @@ def test_a_cpu_miss_runs_as_part_one_after_its_row_lands_and_copydone_waits_for_
         staging = req.slots[1]
         assert host.pump() == 1
         assert _wait(lambda: sim.copy_done(req) == req.gen)
-        assert len(host.test_kernel_calls()) == 2, "CopyDone before the CPU miss's job ran"
+        assert len(host.fake_kernel_calls()) == 2, "CopyDone before the CPU miss's job ran"
         calls = _calls(host)
         assert calls[0] == ([_slot_of(host, 3)], [0.5], 2)
         assert calls[1] == ([staging], [0.25], 2)
@@ -335,8 +337,8 @@ def test_each_cpu_miss_runs_as_its_row_lands_and_later_jobs_add_into_part_one(tm
     host, sim, req, out_rows = _two_cpu_misses(tmp_path, pack_delay_ns=SLOW_PACK_NS)
     try:
         assert host.pump() == 1
-        assert _wait(lambda: len(host.test_kernel_calls()) == 2)
-        assert [c["accumulate"] for c in host.test_kernel_calls()] == [False, True]
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 2)
+        assert [c["accumulate"] for c in host.fake_kernel_calls()] == [False, True]
         first, second = _calls(host)
         assert len(first[0]) == 1 and len(second[0]) == 1, "the misses were batched, not sent as each landed"
         assert sorted(first[0] + second[0]) == sorted(req.slots)
@@ -361,7 +363,7 @@ def test_cpu_misses_landing_together_or_apart_sum_once_each_into_part_one(tmp_pa
     try:
         assert host.pump() == 1
         assert _wait(lambda: sim.copy_done(req) == req.gen)
-        calls = host.test_kernel_calls()
+        calls = host.fake_kernel_calls()
         assert sorted(slot for call in calls for slot in call["slots"]) == sorted(req.slots)
         assert [c["accumulate"] for c in calls] == [False] + [True] * (len(calls) - 1)
         expected = torch.arange(HIDDEN, dtype=torch.float32) + _sum(req.slots, [0.5, 0.25])
@@ -406,7 +408,8 @@ _SCRIPT_HOST = """
         host.arm_copy_engine()
         x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
         out_rows = torch.zeros(({out_shape}), dtype=torch.float32)
-        host.enable_cpu_experts(host.test_kernel_address(fail={result}), _split(n1=1, n2=2), _cores(), x_rows, out_rows, threads=2)
+        host.fake_kernel_reset(fail={result})
+        host.enable_cpu_experts(_split(n1=1, n2=2), _cores(), x_rows, out_rows, threads=2)
         req = sim.post(ROW, [3])
         assert host.pump() == 1
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
@@ -417,7 +420,8 @@ def _script(tmp_path, body, *, result=0, parts=2):
     here = os.path.dirname(os.path.abspath(__file__))
     shape = "ROWS, 2, HIDDEN" if parts == 2 else "ROWS, HIDDEN"
     return run_host_script(
-        tmp_path, _SCRIPT_HOST.format(here=here, result=result, out_shape=shape) + body, capacity=4, staging=2
+        tmp_path, _SCRIPT_HOST.format(here=here, result=result, out_shape=shape) + body, capacity=4, staging=2,
+        layout=es.FAKE_BUILD,
     )
 
 
@@ -440,7 +444,7 @@ def test_a_cpu_miss_read_failure_aborts_before_copy_done(tmp_path):
         req = sim.post(ROW, [5], dst=[1], captured=True, cpu_on=True, cpu_misses=True, weights=[1.0])
         assert req.kinds == [LaneKind.MISS_CPU]
         host.pump()
-        print("reached", sim.copy_done(req) == req.gen, len(host.test_kernel_calls()))
+        print("reached", sim.copy_done(req) == req.gen, len(host.fake_kernel_calls()))
     """)
     assert_aborted(result, "a test fault failed the read")
 
@@ -459,8 +463,9 @@ def test_cpu_experts_need_the_copy_engine(tmp_path):
     s, page, host, sim, dst, out_rows = _host(tmp_path, split=NO_SPLIT, copy_engine=False)
     try:
         with pytest.raises(Exception, match="need the copy engine"):
+            host.fake_kernel_reset()
             host.enable_cpu_experts(
-                host.test_kernel_address(), NO_SPLIT, _cores(), torch.zeros((ROWS, 16), dtype=torch.uint8),
+                NO_SPLIT, _cores(), torch.zeros((ROWS, 16), dtype=torch.uint8),
                 torch.zeros((ROWS, HIDDEN)), threads=1,
             )
     finally:

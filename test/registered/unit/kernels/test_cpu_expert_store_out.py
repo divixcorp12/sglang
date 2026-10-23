@@ -1,7 +1,7 @@
 """SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT on the CPU expert engine (cpu_experts.h run_job): a verify's per-token job leaves
 its overwrite to the kernel instead of zeroing its token rows and then accumulating.
 
-The kernel is the instr build's fake CpuExpertKernel (ExpertStreamHost.test_kernel_address), driven by the split
+The kernel is the FAKE_BUILD host's fake kernel (ExpertStreamHost.fake_kernel_reset), driven by the split
 calibration's per-token jobs (every job an overwrite of part 0, each lane routed by about 1.25 of the tokens, so one
 token routes none). The fake marks an overwrite: it writes j + sum to column j of every row, where an accumulate adds
 sum to what the row held. So the rows tell which the engine did: with the flag off, zeros plus sum (the engine zeroed
@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD, ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, ram_miss_setup
 
@@ -31,6 +31,7 @@ def _host(tmp_path, *, nodes, tokens, store_out):
     host = ExpertStreamHost(
         s.tables, page=new_page(pin=False, wire=lease.wire_layout(8, nodes)),
         slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr", node_ranges=node_ranges,
+        layout=FAKE_BUILD,
     )
     host.reserve_staging(2)
     host.enable_copy_engine(-1)
@@ -50,10 +51,10 @@ def _host(tmp_path, *, nodes, tokens, store_out):
     cores = sorted(os.sched_getaffinity(0))
     if len(cores) < 2 * nodes:
         pytest.skip(f"needs {2 * nodes} cores in the affinity mask")
-    kernel = host.test_kernel_address(1000)  # the fake's spin keeps the blocking calibration from deadlocking
+    host.fake_kernel_reset(1000)  # the fake's spin keeps the blocking calibration from deadlocking
     for group in range(nodes):
         host.enable_cpu_experts(
-            kernel, [0] * (host.wire.lanes + 1), cores[2 * group : 2 * group + 2], x_rows, out_rows, threads=2,
+            [0] * (host.wire.lanes + 1), cores[2 * group : 2 * group + 2], x_rows, out_rows, threads=2,
             group=group, store_out=store_out,
         )
     host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
@@ -62,9 +63,9 @@ def _host(tmp_path, *, nodes, tokens, store_out):
 
 def _calibrate(host, group, tokens):
     scratch = torch.zeros(LANES * host.copy_expert_bytes(ROW), dtype=torch.uint8)
-    before = len(host.test_kernel_calls())
+    before = len(host.fake_kernel_calls())
     host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch, group=group, lanes=LANES, tokens=tokens)
-    return host.test_kernel_calls()[before:]
+    return host.fake_kernel_calls()[before:]
 
 
 @pytest.mark.parametrize("nodes", [1, 2])

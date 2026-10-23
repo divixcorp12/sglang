@@ -127,17 +127,28 @@ def test_production_has_no_timing_resource_or_file_symbols(probes, tmp_path):
     assert not any(s in symbols for s in ("clock_gettime", "getrusage", "fopen", "getenv", "syscall"))
 
 
-def test_build_flag_requires_job_attribution(monkeypatch):
-    from sglang.srt.layers.quantization.exl3.ext import worker_trace_defines
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS", "1")
-    monkeypatch.delenv("SGLANG_EXPERT_STREAM_TRACE", raising=False)
-    assert worker_trace_defines() == []
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"cpu_worker": {"prefix": "/diagnostic/phases"}}))
+def test_build_flag_requires_job_attribution():
+    from sglang.kernels.ops.moe.cpu_kernel_build import worker_trace_defines
+    from sglang.srt.layers.moe.expert_engine.config import (
+        CpuExpertsConfig,
+        CpuWorkerTraceConfig,
+        ExpertStreamConfig,
+        JobTraceConfig,
+        TraceConfig,
+    )
+
+    def config(*, worker="", job=""):
+        return ExpertStreamConfig(
+            cpu_experts=CpuExpertsConfig(enabled=True),
+            trace=TraceConfig(cpu_worker=CpuWorkerTraceConfig(prefix=worker), job=JobTraceConfig(prefix=job)),
+        )
+
+    assert worker_trace_defines(config()) == []
     with pytest.raises(ValueError, match="attribution"):
-        worker_trace_defines()
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps(
-        {"cpu_worker": {"prefix": "/diagnostic/phases"}, "job": {"prefix": "/diagnostic/events"}}))
-    assert worker_trace_defines() == ["-DEXL3_MOE_CPU_WORKER_TRACE=1"]
+        worker_trace_defines(config(worker="/diagnostic/phases"))
+    assert worker_trace_defines(config(worker="/diagnostic/phases", job="/diagnostic/events")) == [
+        "-DEXL3_MOE_CPU_WORKER_TRACE=1"
+    ]
 
 
 def test_scratch_growth_is_attributed_before_team_entry(probes, tmp_path):

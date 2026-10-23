@@ -360,12 +360,18 @@ _URING_OPS = "sglang.kernels.ops.io.uring_file_reader"
 
 
 def warm_host_module_set(variants: Sequence[str], lanes: Sequence[int], nodes: Sequence[int]) -> None:
-    """Load every exl3 host build in ``variants`` x ``lanes`` x ``nodes``, plus the uring reader, cold ones built side
-    by side: for a suite runner to call once before ``pytest -n 8``, so no worker waits on another's compile."""
+    """Load every exl3 and fake host build in ``variants`` x ``lanes`` x ``nodes``, plus the uring reader, cold ones
+    built side by side: for a suite runner to call once before ``pytest -n 8``, so no worker waits on another's compile."""
     from sglang.kernels.jit.utils.compile.warm import load_in_parallel
 
     load_in_parallel(
-        [(_HOST_OPS, "_host_module", (_EXL3_BUILD, v, l, n)) for v in variants for l in lanes for n in nodes]
+        [
+            (_HOST_OPS, "_host_module", (layout, v, l, n))
+            for layout in (_EXL3_BUILD, _FAKE_BUILD)
+            for v in variants
+            for l in lanes
+            for n in nodes
+        ]
         + [(_URING_OPS, "_uring_file_reader_type", ())]
     )
 

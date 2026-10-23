@@ -515,14 +515,14 @@ def _compile_flags(text: str) -> dict:
 
 
 def test_source_cflags_replace_the_module_flags_for_that_file_only():
-    """A C file gets `-x c -std=c11` and none of the module's `-std=c++20 -O3`; the other file and the toolchain's
-    own flags are untouched."""
+    """A C file gets `-x c -std=c11` and none of the module's `-O3`; the other file and the toolchain's own flags are
+    untouched."""
     spec = _two_sources(source_cflags=(("/src/nvfp4.c", ("-x", "c", "-std=c11", "-Ofast")),))
     flags = _compile_flags(ninja.generate(spec))
     host, c_file = flags["host_0.o"].split(), flags["nvfp4_1.o"].split()
-    assert "-std=c++20" in host and "-x" not in host
+    assert "-O3" in host and "-x" not in host
     assert c_file[c_file.index("-x") : c_file.index("-x") + 4] == ["-x", "c", "-std=c11", "-Ofast"]
-    assert "-std=c++20" not in c_file and "-O3" not in c_file
+    assert "-O3" not in c_file
     assert "-fPIC" in c_file
 
 

@@ -17,6 +17,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 from lease_chain_rig import EXPERTS, LAYERS, Chain  # noqa: E402
 
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, paused  # noqa: E402
 from sglang.test.dsv41_ram_prefetch_fixtures import HIDDEN, enable, x_token_bytes  # noqa: E402
@@ -37,13 +38,13 @@ def test_a_landed_pool_row_is_typed_a_hit_after_the_previous_rows_next_record(tm
     it with 7 mapped, and row 1's post types 7 a hit with no row read. Off: 7 is a GPU miss read from NVMe again.
     Mutations: promote at publish skips the landed entry (7 is MISS_GPU); the entry is mapped but the delta is
     published before row 0's record is claimed (the post sees the unpromoted map)."""
-    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2)
+    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2, build=FAKE_BUILD)
     try:
         x_rows = torch.zeros((LAYERS, x_token_bytes()), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (c.lanes + 1), cores, x_rows, out_rows,
-                                  threads=2)
+        c.host.fake_kernel_reset(zero=True)
+        c.host.enable_cpu_experts([0] * (c.lanes + 1), cores, x_rows, out_rows, threads=2)
         for row in range(LAYERS):
             c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
         enable(SimpleNamespace(host=c.host, x_rows=x_rows), [[30.0] * EXPERTS], promote=promote)
@@ -82,13 +83,13 @@ def test_a_gpu_miss_on_a_landed_pool_row_streams_the_rows_bytes_with_or_without_
     lane 0's PieceSource word and the real stream kernel copies both rows' exact bytes (7 from the pool slot, 3 from
     its staging slot) with one row read, 7 then mapped at the pool slot. Off, both are read. Mutation: S ignoring the
     source word -- red on 7's bytes (nothing writes its staging slot)."""
-    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2)
+    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2, build=FAKE_BUILD)
     try:
         x_rows = torch.zeros((LAYERS, x_token_bytes()), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (c.lanes + 1), cores, x_rows, out_rows,
-                                  threads=2)
+        c.host.fake_kernel_reset(zero=True)
+        c.host.enable_cpu_experts([0] * (c.lanes + 1), cores, x_rows, out_rows, threads=2)
         for row in range(LAYERS):
             c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
         enable(SimpleNamespace(host=c.host, x_rows=x_rows), [[30.0] * EXPERTS], pool_serve=pool_serve)
@@ -122,13 +123,13 @@ def test_a_pool_served_lanes_source_word_does_not_redirect_its_ring_index_s_next
     """Record G streams 7 from its pool slot on lane 0; 15 hit records later, record G + 16 reuses the ring index and
     reads 5 from NVMe on lane 0. Its PieceSource word still holds G's, which must name nothing for G + 16. Mutation:
     S's piece_source_slot ignoring the generation -- 5's lane streams 7's slot, red on the bytes."""
-    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2)
+    c = Chain(tmp_path, copy_engine=True, start=False, spec_share=2, build=FAKE_BUILD)
     try:
         x_rows = torch.zeros((LAYERS, x_token_bytes()), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (c.lanes + 1), cores, x_rows, out_rows,
-                                  threads=2)
+        c.host.fake_kernel_reset(zero=True)
+        c.host.enable_cpu_experts([0] * (c.lanes + 1), cores, x_rows, out_rows, threads=2)
         for row in range(LAYERS):
             c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
         enable(SimpleNamespace(host=c.host, x_rows=x_rows), [[30.0] * EXPERTS], pool_serve=True)

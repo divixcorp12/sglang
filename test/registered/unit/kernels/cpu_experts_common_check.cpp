@@ -1,4 +1,4 @@
-// Standalone harness for host/cpu_experts: a toy quant through ExpertForward, as a CpuExpertKernel. Built by
+// Standalone harness for host/cpu_experts: a toy quant through ExpertForward, as a kernel type (binding.hpp). Built by
 // test_cpu_experts_common.py.
 #include "cpu_experts_common_toy.hpp"
 #include <pthread.h>
@@ -25,19 +25,11 @@
         }                                                                                   \
     } while (0)
 
-namespace toy {
-const sglang::cpu_experts::CpuExpertKernel& toy_kernel()
-{
-    static const sglang::cpu_experts::ExpertForward<ToyQuant> kernel{};
-    return kernel;
-}
-}  // namespace toy
-
 namespace {
-using sglang::cpu_experts::CpuExpertKernel;
-using sglang::cpu_experts::ExpertLayer;
 using sglang::cpu_experts::ForwardCall;
 using sglang::cpu_experts::Isa;
+using toy::Toy;
+using Layer = toy::ToyLayer;
 
 constexpr int kCapacity = 3;
 constexpr int kHidden = 16;
@@ -72,26 +64,25 @@ struct Fixture {
             for (int h = 0; h < kHidden; ++h) slab[size_t(s) * kHidden + h] = float(s + h);
     }
 
-    ExpertLayer layer() const
+    Layer layer() const
     {
-        ExpertLayer d;
+        Layer d;
         d.capacity = kCapacity;
         d.hidden = kHidden;
         d.intermediate = kHidden;
         d.slab_count = 1;
         d.slabs[0] = slab.data();
         d.slot_bytes[0] = uint64_t(kHidden) * 4;
+        d.params = params;
         return d;
     }
-
-    std::span<const std::byte> params_bytes() const { return std::as_bytes(std::span<const toy::ToyParams>(&params, 1)); }
 };
 
-ExpertLayer make_toy(const Fixture& f) { return toy::toy_kernel().make_layer(f.layer(), f.params_bytes()); }
+Layer make_toy(const Fixture& f) { return Toy::make_layer(f.layer()); }
 
 // One forward's buffers; out starts at 7 so a refused call is seen to leave it untouched.
 struct Call {
-    const ExpertLayer* layer;
+    const Layer* layer;
     std::vector<uint16_t> x;
     std::vector<int32_t> slots;
     std::vector<float> weights;
@@ -99,7 +90,7 @@ struct Call {
     std::vector<int> cores;
     ForwardCall c;
 
-    Call(const ExpertLayer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
+    Call(const Layer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
          std::vector<int> on = {})
         : layer(&l), x(size_t(rows) * kHidden), slots(std::move(s)), weights(std::move(w)),
           out(size_t(rows) * kHidden, 7.0f), cores(std::move(on))
@@ -116,11 +107,11 @@ struct Call {
     Call(const Call&) = delete;
     Call& operator=(const Call&) = delete;
 
-    int run(const CpuExpertKernel& kernel = toy::toy_kernel())
+    int run()
     {
         return status_of([&] {
-            kernel.check(*layer, c);
-            kernel.forward(*layer, c);
+            Toy::check(*layer, c);
+            sglang::cpu_experts::forward_alone<Toy>(*layer, c);
         });
     }
     bool untouched() const
@@ -149,15 +140,13 @@ void ok(const char* name) { std::printf("ok %s\n", name); std::fflush(stdout); }
 int main()
 {
     Fixture f;
-    const CpuExpertKernel& kernel = toy::toy_kernel();
-    CHECK(std::string(kernel.name()) == "toy");
+    CHECK(std::string(Toy::name()) == "toy");
     const std::vector<int> allowed = allowed_cores();
     const int team = allowed.size() >= 2 ? 2 : 1;
     const std::vector<int> cores(allowed.begin(), allowed.begin() + team);
 
     {
         const auto layer = make_toy(f);
-        CHECK(layer.kernel == &kernel);
         // Token 0: slots 0 and 2; token 1: slot 1 and a skipped -1.
         Call call(layer, 2, 2, {0, 2, 1, -1}, {0.5f, 0.25f, 2.0f, 1.0f}, team, cores);
         for (int accumulate = 0; accumulate < 2; ++accumulate) {
@@ -176,40 +165,28 @@ int main()
     }
 
     {
-        const ExpertLayer good = f.layer();
-        auto refused = [&](const ExpertLayer& d, std::span<const std::byte> p) {
-            return status_of([&] { kernel.make_layer(d, p); }) == 2;
-        };
-        ExpertLayer d = good;
+        const Layer good = f.layer();
+        auto refused = [&](const Layer& d) { return status_of([&] { Toy::make_layer(d); }) == 2; };
+        Layer d = good;
         d.slot_bytes[0] = uint64_t(kHidden) * 4 - 4;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.slabs[0] = nullptr;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.slab_count = 2;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.activation = 1;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.capacity = 0;
-        CHECK(refused(d, f.params_bytes()));
-        CHECK(refused(good, {}));  // the toy needs its params
-        const std::byte wide[8]{};
-        CHECK(refused(good, wide));  // not sizeof(ToyParams)
+        CHECK(refused(d));
+        d = good;
+        d.params.scale = std::numeric_limits<float>::quiet_NaN();  // the quant validates its params
+        CHECK(refused(d));
+        CHECK(!refused(good));
         ok("params_and_slabs_are_validated");
-    }
-
-    {
-        // A second kernel object of the same quant (another library's, in production) refuses this one's layer.
-        const sglang::cpu_experts::ExpertForward<toy::ToyQuant> other{};
-        const auto layer = make_toy(f);
-        Call call(layer, 1, 1, {0}, {1.0f});
-        CHECK(call.run(other) == 2);
-        CHECK(call.untouched());
-        CHECK(call.run() == 0);
-        ok("a_layer_of_another_kernel_is_refused");
     }
 
     {
@@ -363,7 +340,7 @@ int main()
     {
         uint32_t word = 5;
         auto warm = [&](const uint32_t* w, uint32_t seen, int64_t deadline) {
-            return status_of([&] { kernel.warm(w, seen, deadline); });
+            return status_of([&] { Toy::warm(w, seen, deadline); });
         };
         // The register work returns when the word moves, inside its deadline.
         {
@@ -411,7 +388,7 @@ int main()
     {
         // A team's barrier orders its phases: what every worker wrote before it, every worker reads after it, job
         // after job on the one team.
-        sglang::cpu_experts::Team t(cores, team, &kernel, 0);
+        sglang::cpu_experts::Team t(cores, team, &Toy::warm, 0);
         std::vector<int> seen(size_t(team), -1), sum(size_t(team), 0);
         for (int rep = 0; rep < 1000; ++rep) {
             t.run([&](int w, int n) {

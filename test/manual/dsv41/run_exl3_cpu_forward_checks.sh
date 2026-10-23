@@ -8,7 +8,7 @@
 #       (3) the full-stack bench's 48; (4) the CPU expert engine and service tests. (2) and (3) run twice: built for
 #       the host's tier and at -march=skylake-avx512 (bw). The dumps' tiers are builds at -march too (exl3_cpu_forward_ab.py).
 #
-# Builds into OUT: a private copy of the extension's build directory (~670 MB) and the bench. Exits nonzero when any
+# Builds into OUT: the bench (the CPU kernel is compiled into the host module, which has its own JIT cache). Exits nonzero when any
 # step fails; each step's log is OUT/<step>.log. CPU jobs run under taskset -c 0-51,56-107 (the bench's 22-43 sit
 # inside it); the interpreter is /data/models/slang/.venv-upstream, so PYTHONPATH must be the worktree's (it is).
 set -uo pipefail
@@ -39,14 +39,6 @@ export SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 SGLANG_EXL3_CPU_CXX=$GXX CUDA_H
 export CXX=$GXX  # the host module's JIT build (kernel_layer/kernel_forward from Task 6): the kernels' GCC 15
 export PYTHONPATH=$wt/python OMP_NUM_THREADS=8 SGLANG_EXL3_MOE_CPU_PIN=0
 export CUDA_VISIBLE_DEVICES=9  # CPU-only: no device 9, so no CUDA context (an empty value crashes sglang.test.test_utils)
-# The default build is resid_b128_m16_cpu_v1 (SGLANG_EXL3_CPU_MAX_M=16; m8 before it); resid_b128_cpu_v1 is MAX_M=0's.
-# Seed whichever the user cache holds, so a run does not rebuild them.
-for flavor in resid_b128_m16_cpu_v1 resid_b128_m8_cpu_v1 resid_b128_cpu_v1; do
-  if [[ ! -d $SGLANG_EXL3_BUILD_DIR/$flavor && -d ~/.cache/sglang/exl3_ext/$flavor ]]; then
-    mkdir -p "$SGLANG_EXL3_BUILD_DIR"
-    cp -a ~/.cache/sglang/exl3_ext/$flavor "$SGLANG_EXL3_BUILD_DIR/"
-  fi
-done
 cd "$wt"
 echo "worktree $wt at $(git rev-parse --short HEAD)"
 

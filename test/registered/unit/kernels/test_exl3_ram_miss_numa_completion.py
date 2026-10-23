@@ -2,8 +2,8 @@
 "Errors"; Testing 3): each group's CPU lanes run on its own cores into its own output parts, the copy thread stores
 CopyDone only when every group with a host lane is done, and a stalled group is named by the copy-wait abort.
 
-The kernel is the instr build's fake CpuExpertKernel (ExpertStreamHost.test_kernel_address): one per tier, so a call's
-group is told by the first core it was given, and test_kernel_hold stalls one group's forward."""
+The kernel is the FAKE_BUILD host's fake kernel (ExpertStreamHost.fake_kernel_reset): one per tier, so a call's
+group is told by the first core it was given, and fake_kernel_hold stalls one group's forward."""
 
 import os
 import textwrap
@@ -12,7 +12,7 @@ import time
 import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD, ExpertStreamHost, new_page
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
@@ -49,7 +49,7 @@ def _host(tmp_path, *, split, arm=True, ns_per_expert=0):
     page = new_page(pin=False, wire=wire_layout(8, 2))
     host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr",
-        node_ranges=HALVES,
+        node_ranges=HALVES, layout=FAKE_BUILD,
     )
     host.reserve_staging(2)
     host.enable_copy_engine(-1)
@@ -65,10 +65,10 @@ def _host(tmp_path, *, split, arm=True, ns_per_expert=0):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 4, HIDDEN), dtype=torch.float32)
     cores = _cores()
-    kernel = host.test_kernel_address(ns_per_expert)  # one kernel serves both groups
+    host.fake_kernel_reset(ns_per_expert)  # one kernel serves both groups
     for group in range(2):
         host.enable_cpu_experts(
-            kernel, split[group], cores[2 * group : 2 * group + 2], x_rows, out_rows, threads=2,
+            split[group], cores[2 * group : 2 * group + 2], x_rows, out_rows, threads=2,
             group=group,
         )
     host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
@@ -90,11 +90,11 @@ def test_each_groups_cpu_lanes_go_to_its_own_cores_and_part(tmp_path):
         req = _cpu_post(sim)
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.HIT_COPY, LaneKind.HIT_CPU, LaneKind.HIT_CPU]
         assert host.pump() == 1
-        assert _wait(lambda: len(host.test_kernel_calls()) == 2)
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 2)
         assert sim.copy_wait(req)
         slot2, slot3 = host.mapping(ROW)[2], host.mapping(ROW)[3]
         assert 0 <= slot2 < 10 <= slot3 < 20
-        calls = host.test_kernel_calls()
+        calls = host.fake_kernel_calls()
         assert sorted((c["core"], c["slots"]) for c in calls) == [(cores[0], [slot2]), (cores[2], [slot3])]
         assert out_rows[ROW, 0].tolist() == [j + slot2 + 1 for j in range(HIDDEN)], "group 0's hits: part 0"
         assert out_rows[ROW, 2].tolist() == [j + slot3 + 1 for j in range(HIDDEN)], "group 1's hits: part 2"
@@ -108,16 +108,16 @@ def test_copydone_waits_for_every_groups_cpu_engine(tmp_path):
     cores = _cores()
     s, host, sim, out_rows = _host(tmp_path, split=[ONE_OF_TWO, ONE_OF_TWO])
     try:
-        host.test_kernel_hold(cores[2])
+        host.fake_kernel_hold(cores[2])
         req = _cpu_post(sim)
         assert host.pump() == 1
-        assert _wait(lambda: len(host.test_kernel_calls()) == 1)
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 1)
         time.sleep(0.05)
         assert sim.copy_done(req) != req.gen, "CopyDone before group 1's CPU job finished"
-        host.test_kernel_hold(cores[2], False)
+        host.fake_kernel_hold(cores[2], False)
         assert sim.copy_wait(req)
     finally:
-        host.test_kernel_hold(cores[2], False)
+        host.fake_kernel_hold(cores[2], False)
         host.stop()
 
 
@@ -125,14 +125,14 @@ def test_a_zero_split_keeps_a_node_off_the_cpu_and_copydone_off_its_engine(tmp_p
     cores = _cores()
     s, host, sim, out_rows = _host(tmp_path, split=[ONE_OF_TWO, NONE])
     try:
-        host.test_kernel_hold(cores[2])
+        host.fake_kernel_hold(cores[2])
         req = _cpu_post(sim)
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.HIT_COPY, LaneKind.HIT_CPU, LaneKind.HIT_COPY]
         assert host.pump() == 1
         assert sim.copy_wait(req), "group 1 has no CPU lane: CopyDone must not wait on its engine"
-        assert [c["core"] for c in host.test_kernel_calls()] == [cores[0]], "group 1 ran no CPU job"
+        assert [c["core"] for c in host.fake_kernel_calls()] == [cores[0]], "group 1 ran no CPU job"
     finally:
-        host.test_kernel_hold(cores[2], False)
+        host.fake_kernel_hold(cores[2], False)
         host.stop()
 
 
@@ -143,22 +143,22 @@ def test_a_groups_only_host_lane_being_a_cpu_miss_is_waited_for_and_completes_on
     cores = _cores()
     s, host, sim, out_rows = _host(tmp_path, split=[NONE, [0, 1] + [0] * 7])
     try:
-        host.test_kernel_hold(cores[2])
+        host.fake_kernel_hold(cores[2])
         req = sim.post(ROW, [0, 5], captured=True, cpu_on=True, cpu_misses=True, dst=[0, 1], weights=[1.0, 0.5])
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.MISS_CPU]
         assert host.pump() == 1
         assert _wait(lambda: host.counters()["copy_jobs"] == 2)  # one part per group
         time.sleep(0.05)
         assert sim.copy_done(req) != req.gen, "CopyDone before group 1's CPU miss finished"
-        host.test_kernel_hold(cores[2], False)
+        host.fake_kernel_hold(cores[2], False)
         assert sim.copy_wait(req)
-        assert _wait(lambda: len(host.test_kernel_calls()) == 1)
-        assert [c["core"] for c in host.test_kernel_calls()] == [cores[2]]
+        assert _wait(lambda: len(host.fake_kernel_calls()) == 1)
+        assert [c["core"] for c in host.fake_kernel_calls()] == [cores[2]]
         time.sleep(0.05)
         assert sim.copy_done(req) == req.gen
         assert host.counters()["cpu_jobs"] == 1
     finally:
-        host.test_kernel_hold(cores[2], False)
+        host.fake_kernel_hold(cores[2], False)
         host.stop()
 
 
@@ -186,13 +186,14 @@ def test_calibration_runs_on_its_groups_engine(tmp_path):
 _SCRIPT = """
 import os, pathlib, sys, time, torch
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD, ExpertStreamHost, new_page
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, ram_miss_setup
 ROW = 1
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=20, experts=8, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
 page = new_page(pin=False, wire=wire_layout(8, 2))
 host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 8), -1, dtype=torch.int32), variant="instr",
+                        layout=FAKE_BUILD,
                         node_ranges=[[(0, 10)] * 2, [(10, 20)] * 2])
 host.reserve_staging(2)
 host.enable_copy_engine(-1, wait_timeout_ms=200)
@@ -204,9 +205,9 @@ host.arm_copy_engine()
 x_rows, out_rows = torch.zeros((2, 16), dtype=torch.uint8), torch.zeros((2, 4, 8), dtype=torch.float32)
 cores = sorted(os.sched_getaffinity(0))
 split = [0, 0, 1] + [0] * 6
-kernel = host.test_kernel_address(0)
-host.enable_cpu_experts(kernel, split, cores[0:2], x_rows, out_rows, threads=2, group=0)
-host.enable_cpu_experts(kernel, split, cores[2:4], x_rows, out_rows, threads=2, group=1)
+host.fake_kernel_reset(0)
+host.enable_cpu_experts(split, cores[0:2], x_rows, out_rows, threads=2, group=0)
+host.enable_cpu_experts(split, cores[2:4], x_rows, out_rows, threads=2, group=1)
 host.set_cpu_layer(ROW, fake_cpu_layer(8))
 sim = ChainSim(host, page, s.slabs)
 req = sim.post(ROW, [0, 1, 2, 3])
@@ -223,7 +224,8 @@ def test_the_child_script_builds_what_the_parent_warms():
 
 def _run(tmp_path, body):
     return spawn_child(
-        textwrap.dedent(_SCRIPT) + textwrap.dedent(body), tmp_path, timeout_s=120, variant=CHILD_VARIANT, nodes=CHILD_NODES
+        textwrap.dedent(_SCRIPT) + textwrap.dedent(body), tmp_path, timeout_s=120, variant=CHILD_VARIANT, nodes=CHILD_NODES,
+        layout=("fake", "sqrt_softplus"),
     )
 
 
@@ -231,7 +233,7 @@ def test_a_group_whose_cpu_job_stalls_is_named_by_the_copy_wait_abort(tmp_path):
     """Review Focus 2: group 0's CPU lane completes, group 1's forward is held and never returns. CopyDone is never stored, and
     the 200 ms copy-wait abort names group 1, not group 0."""
     result = _run(tmp_path, """
-        host.test_kernel_hold(cores[2])
+        host.fake_kernel_hold(cores[2])
         req = sim.post(ROW, [0, 1, 2, 3], captured=True, cpu_on=True, dst=[0, 1, 2, 3])
         assert host.pump() == 1
         host.start_thread(fatal_wait_s=60.0)
@@ -247,7 +249,7 @@ def test_the_copy_wait_abort_says_the_stalled_cpu_job_was_submitted_and_is_runni
     """The abort that named a group's CPU job could not say why it was not done (DSV41_REFERENCE 33.19's warm-up abort,
     "group 1: its CPU job 7360 is not done"): here the job was submitted and its forward runs, held."""
     result = _run(tmp_path, """
-        host.test_kernel_hold(cores[2])
+        host.fake_kernel_hold(cores[2])
         req = sim.post(ROW, [0, 1, 2, 3], captured=True, cpu_on=True, dst=[0, 1, 2, 3])
         assert host.pump() == 1
         host.start_thread(fatal_wait_s=60.0)

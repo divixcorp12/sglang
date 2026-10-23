@@ -1,8 +1,8 @@
-"""The NVFP4 CPU expert library builds from Python and passes its native harnesses (Linux, GCC with OpenMP).
+"""The NVFP4 CPU expert kernel builds into native harness executables and passes them (Linux, GCC with OpenMP).
 
-``quantization/nvfp4/build.py`` compiles the kernel into a shared library or, with a harness ``main``, into an
-executable; ``nvfp4_cpu_ext.nvfp4_cpu_library_path`` builds the library once per content hash (``nvfp4_cpu_module``
-loads it). The two native harnesses are the ones the removed CMake build ran under CTest.
+``quantization/nvfp4/build.py`` compiles the kernel and a harness ``main`` into an executable (the server builds the
+same sources into the expert-stream host module, ``kernels/ops/moe/cpu_kernel_build.py``). The two native harnesses are
+the ones the removed CMake build ran under CTest.
 """
 
 import importlib.util
@@ -34,57 +34,6 @@ def _build_module():
     return module
 
 
-def test_build_py_makes_a_library_exporting_no_c_abi(tmp_path):
-    library = _build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)
-    symbols = subprocess.run(
-        ["nm", "-D", "--defined-only", str(library)], capture_output=True, text=True, check=True
-    ).stdout
-    assert "sglang_nvfp4_cpu_experts_" not in symbols
-    assert "__tvm_ffi_nvfp4_cpu_kernel_address" in symbols  # tvm-ffi's TVM_FFI_DLL_EXPORT_TYPED_FUNC prefix
-    assert "__tvm_ffi_nvfp4_cpu_params" in symbols
-
-
-def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
-    from sglang.srt.layers.quantization.nvfp4 import ext as nvfp4_cpu_ext
-
-    nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
-    path = nvfp4_cpu_ext.nvfp4_cpu_library_path(str(tmp_path))
-    built = list(tmp_path.glob("*.so"))
-    assert len(built) == 1 and Path(path) == built[0]
-    stamp = built[0].stat().st_mtime_ns
-    nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
-    nvfp4_cpu_ext.nvfp4_cpu_library_path(str(tmp_path))
-    assert [p.stat().st_mtime_ns for p in tmp_path.glob("*.so")] == [stamp]
-
-
-def test_the_library_hands_out_its_kernel_address(tmp_path):
-    from tvm_ffi import load_module
-
-    module = load_module(str(_build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)))
-    address = int(module.nvfp4_cpu_kernel_address())
-    assert address != 0 and int(module.nvfp4_cpu_kernel_address()) == address
-
-
-def test_the_library_packs_the_params_make_layer_reads(tmp_path):
-    """nvfp4_cpu_params is SglangNvfp4CpuParams {int32 w13_layout, float inv_input_scale13, float inv_input_scale2}."""
-    import struct
-
-    from tvm_ffi import load_module
-
-    module = load_module(str(_build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)))
-    assert bytes(module.nvfp4_cpu_params(2, 0.5, 1.0)) == struct.pack("<iff", 2, 0.5, 1.0)
-
-
-def test_the_module_is_loaded_once_and_kept(tmp_path):
-    """Review Focus 1: the host holds the kernel's address, so the module that owns it must outlive every host: the
-    loader is cached for the process and hands out one module."""
-    from sglang.srt.layers.quantization.nvfp4 import ext as nvfp4_cpu_ext
-
-    nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
-    first = nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path))
-    assert nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path)) is first
-
-
 def test_the_march_picks_the_tier(tmp_path):
     """A build at x86-64 holds the scalar tier and one at x86-64-v3 the AVX2 tier: the AVX2 tier's FMA accumulation
     rounds differently from the scalar loop, so the two builds' forwards dump different bytes."""
@@ -108,19 +57,20 @@ def _host_has_avx2() -> bool:
     return {"avx2", "fma", "f16c", "bmi1", "bmi2", "abm", "movbe"} <= set(flags)
 
 
-def _disassembly(library: Path) -> str:
+def _disassembly(binary: Path) -> str:
     return subprocess.run(
-        ["objdump", "-d", "-C", "--no-show-raw-insn", str(library)], capture_output=True, text=True, check=True
+        ["objdump", "-d", "-C", "--no-show-raw-insn", str(binary)], capture_output=True, text=True, check=True
     ).stdout
 
 
-def test_the_library_holds_only_its_march_tier(tmp_path):
+def test_the_executable_holds_only_its_march_tier(tmp_path):
     # The tier is compile-time: a build at x86-64 must run on a host without AVX, so it holds no vector register at
     # all; a build at x86-64-v3 holds the AVX2 tier and no AVX-512 register (NVFP4 has no AVX-512 tier).
-    scalar = _disassembly(_build_module().build(tmp_path / "libscalar.so", cxx=CXX, march="x86-64"))
+    harness = REPO / "test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp"
+    scalar = _disassembly(_build_module().build(tmp_path / "scalar", cxx=CXX, main=harness, march="x86-64"))
     assert "%ymm" not in scalar and "%zmm" not in scalar
-    avx2 = _disassembly(_build_module().build(tmp_path / "libavx2.so", cxx=CXX, march="x86-64-v3"))
-    assert "%ymm" in avx2, "the AVX2 tier is missing from the x86-64-v3 library"
+    avx2 = _disassembly(_build_module().build(tmp_path / "avx2", cxx=CXX, main=harness, march="x86-64-v3"))
+    assert "%ymm" in avx2, "the AVX2 tier is missing from the x86-64-v3 build"
     assert "%zmm" not in avx2
 
 
