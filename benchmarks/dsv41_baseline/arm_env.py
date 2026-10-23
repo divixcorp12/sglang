@@ -43,9 +43,13 @@ import msgspec
 NVFP4_WORK = "/data/models/slang/nvfp4-work"
 CC = f"{NVFP4_WORK}/cc-expert-prediction"
 
-MODEL_PATH = f"{CC}/dsv41-full40"
-ENGRAM_TABLE_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash"
-EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
+# DeepSeek-V4.1-Flash-1017 (EXL3 1.6.2, avg 2.9 bpw, mixed K) since 2026-10-23 (owner; the 3.0 bpw export was deleted).
+# MODEL_PATH is the target only: the export's config with num_nextn_predict_layers 0 and its index without mtp.*,
+# symlinking the shards; the draft's mtp.* layers are DSPARK_DRAFT. Row images: the mirrors' exl3_row_images, built
+# from EXPERT_DIR (their manifest fingerprints it), DSV41_1017_MIXED_K_PLAN.md.
+MODEL_PATH = f"{CC}/dsv41-1017-target"
+ENGRAM_TABLE_DIR = "/mnt/nvme0/dsv41-1071/engram"
+EXPERT_DIR = "/mnt/nvme0/dsv41-1071/dsv41-1017"
 # Expert-row mirrors, on by default since 2026-09-22. Mirroring is a property of the
 # box's storage, not of any one arm, so an arm that forgets it measures a drive layout
 # nobody runs. Override to the empty string to measure the unmirrored drive.
@@ -187,7 +191,7 @@ PROD_HOST = "0.0.0.0"
 # On since 2026-10-07, on the owner's go ("Merge + flip prod to DSpark") after DSV41_REFERENCE.md §33.11: all six
 # bars pass; the median decode is 7.6% above the non-DSpark recipe (95.05 vs 88.30 ms/token, the addendum's A/B).
 PROD_DSPARK = True
-DSPARK_DRAFT = f"{CC}/dsv41-dspark-draft"
+DSPARK_DRAFT = f"{CC}/dsv41-1017-dspark-draft"
 # Each stage's top-32 draft experts stay on the GPU, the other 96 on the CPU (§33.4).
 DSPARK_RESIDENT = f"{CC}/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"
 # gamma = 5 draft tokens, a 6-token verify (speculative_hook.py).
@@ -334,14 +338,16 @@ PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
 # 384 / 2 = 192 homed experts, the slots its table holds back and 2 seam slots (expert_stream.full_layer_group_rows).
 # With every streamed layer full the model is fully pinned (expert_stream.model_fully_pinned): no expert can miss, so the
 # table holds back nothing, neither staging (it was min(victim lanes 8, MAX_LANES)) nor a RAM prefetch pool (it was the
-# spec share 2): 194 rows a group, 388 a layer, 15,520 in all (it was 204, 408, 16,320 and 207,244 MiB). A row is
-# 13,315,584 B, the pinned host row (the six streamed tensors; the 2026-10-17 startup log: 8,782 rows =
-# 116,937,458,688 B; the 13,315,596 used until 2026-10-22 was the on-disk row, three mul1 scalars more). So a node holds
-# 40 x 194 x 13,315,584 = 103,328,931,840 B, rounded up to 98,543 MiB, and the tier 197,086 MiB. No served A/B yet.
+# spec share 2): 194 rows a group, 388 a layer, 15,520 in all (it was 204, 408, 16,320 and 207,244 MiB). A pinned host
+# row is the six streamed tensors (the on-disk row less its three mul1 scalars), and its size is the layer's: the 1017
+# checkpoint's K3 layers hold 13,315,584 B, its K2 layers (18-22) 8,891,904 B. So a node holds
+# 194 x (35 x 13,315,584 + 5 x 8,891,904) = 99,037,962,240 B, rounded up to 94,450 MiB, and the tier 188,900 MiB (the
+# all-K3 3.0 bpw export took 98,543 and 197,086). test_both_cpu_ab checks the row sizes against the checkpoint's headers
+# where it exists. No served A/B yet.
 PROD_PINNED_LAYERS = 40
-PROD_PINNED_ROW_BYTES = 13_315_584
+PROD_PINNED_ROW_BYTES_BY_LAYER = tuple(8_891_904 if 18 <= layer <= 22 else 13_315_584 for layer in range(PROD_PINNED_LAYERS))
 PROD_PINNED_ROWS_PER_NODE_PER_LAYER = 384 // 2 + 2
-PROD_DSPARK_PINNED_NODE_MB = -(-PROD_PINNED_LAYERS * PROD_PINNED_ROWS_PER_NODE_PER_LAYER * PROD_PINNED_ROW_BYTES // 2**20)
+PROD_DSPARK_PINNED_NODE_MB = -(-PROD_PINNED_ROWS_PER_NODE_PER_LAYER * sum(PROD_PINNED_ROW_BYTES_BY_LAYER) // 2**20)
 PROD_DSPARK_PINNED_HOST_MB = str(2 * PROD_DSPARK_PINNED_NODE_MB)
 PROD_DSPARK_PINNED_HOST_NUMA_MB = f"0:{PROD_DSPARK_PINNED_NODE_MB},1:{PROD_DSPARK_PINNED_NODE_MB}"
 PROD_DSPARK_PINNED_FULL_LAYERS = ",".join(str(layer) for layer in range(PROD_PINNED_LAYERS))
@@ -351,9 +357,9 @@ PROD_DSPARK_PINNED_FULL_LAYERS = ",".join(str(layer) for layer in range(PROD_PIN
 # prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production), plus the pinned tier's node-1 share
 # beyond arm A's. Arm A's rest was measured with its tier, 48 GiB on node 1 (PINNED_HOST_NUMA_MB "1:49152"), so that is
 # the baseline; the 51,874 MiB production ran until 2026-10-22 was never counted (2.66 GiB). Node 1 then wants
-# 69.91 + (98,543 - 49,152 MiB = 48.23) = 118.14 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more,
+# 69.91 + (94,450 - 49,152 MiB = 44.24) = 114.15 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more,
 # against production's old 59,656 MiB node-0 share; below the warn level the start only warns, and the level rises with
-# the node-0 share (+37.98 GiB: 112.98). The wait is bounded so a refusal comes in minutes.
+# the node-0 share (+33.98 GiB: 108.98). The wait is bounded so a refusal comes in minutes.
 PROD_NODE1_HICACHE_GIB = 12.67
 PROD_NODE1_MARGIN_GIB = 1.0
 ARM_A_NODE1_PINNED_MB = 49152

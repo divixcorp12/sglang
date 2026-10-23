@@ -23,6 +23,25 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     assert env["SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS"] == "1"  # the recipe's, kept
 
 
+def test_the_pinned_row_sizes_are_the_served_checkpoints():
+    """arm_env records each layer's pinned row so the launch floor is known before the server starts; the server sizes
+    its slabs from the checkpoint itself. A new export (other bit widths) must update the record, or the floor misjudges
+    the tier. Runs where the checkpoint is (divix01)."""
+    import os
+
+    import pytest
+
+    if not os.path.isdir(arm_env.EXPERT_DIR):
+        pytest.skip(f"{arm_env.EXPERT_DIR} is not on this machine")
+    from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+    from sglang.srt.layers.moe.exl3_row_image import row_image_layouts
+
+    layout = build_exl3_expert_layout(arm_env.EXPERT_DIR)
+    images = row_image_layouts(layout, range(layout.num_layers))
+    assert layout.num_layers == arm_env.PROD_PINNED_LAYERS
+    assert tuple(images[layer].image_bytes for layer in range(layout.num_layers)) == arm_env.PROD_PINNED_ROW_BYTES_BY_LAYER
+
+
 def test_prod_serves_the_dspark_mode_with_its_own_settings():
     assert arm_env.PROD_DSPARK is True
     assert arm_env.prod_env() == arm_env.arm_env({**arm_env.dspark_env(), **arm_env.prod_dspark_env()})
@@ -33,8 +52,9 @@ def test_prod_serves_the_dspark_mode_with_its_own_settings():
 # MERGE_PLAN_1016.md: production is the best served arm, RAM prefetch included, with both startup calibrations on.
 PROD_DSPARK_SETTINGS = {
     "SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS": ",".join(str(layer) for layer in range(40)),
-    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "197086",
-    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:98543,1:98543",
+    # The 1017 checkpoint (2026-10-23): K2 layers 18-22 hold smaller rows (arm_env.PROD_PINNED_ROW_BYTES_BY_LAYER).
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "188900",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:94450,1:94450",
     # Master, 2026-10-22: the DIRECT insert score without eager routes, decay 0.999, newcomer probation.
     "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS": "0",
     "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY": "0.999",
