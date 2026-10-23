@@ -22,6 +22,7 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import functools
 import threading
 import warnings
 from contextvars import ContextVar
@@ -171,7 +172,9 @@ def _weak_ref_if_tensor(x):
     if torch.is_tensor(x):
         if x.numel() == 0 or x.device.type == "cpu":
             return x
-        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+        from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
+            weak_ref_tensors,
+        )
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
@@ -221,11 +224,27 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
-    def decorator(inner: Callable):
-        if not enable:
-            return inner
+def eager_on_graph(
+    fn: Optional[Callable] = None,
+    capture_stub: Optional[Callable] = None,
+    *,
+    enable: Optional[bool] = None,
+):
+    """Record an eager call between captured segments.
 
+    Arguments retain their capture-time identity. Tensors must use the static
+    buffers owned by the graph runner; request-specific state must be read
+    inside the eager function at execution time.
+    """
+
+    # Transitional support while model callers migrate to the bare decorator.
+    if isinstance(fn, bool):
+        enable, fn = fn, None
+    if enable is False:
+        return lambda inner: inner
+
+    def decorator(inner: Callable):
+        @functools.wraps(inner)
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
             if capture is None or _in_break_var.get():
@@ -278,7 +297,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
         return wrapper
 
-    return decorator
+    return decorator(fn) if fn is not None else decorator
 
 
 class BreakableCUDAGraph:
@@ -460,11 +479,10 @@ class BreakableCUDAGraphCapture:
         self._current_graph_needs_instantiate = False
 
 
-@eager_on_graph(True)
+@eager_on_graph
 def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
-    pass
 
 
 def is_breakable_graph_capturing() -> bool:

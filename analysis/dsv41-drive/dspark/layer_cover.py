@@ -1,6 +1,6 @@
 """How completely the RAM prefetch covers each layer's forced misses, and what a covered read is worth.
 
-Reads a served run's InstrBuild job trace (``SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX``). A record is one (row, gen), as in
+Reads a served run's InstrBuild job trace (the ``job.prefix`` of ``SGLANG_EXPERT_STREAM_TRACE``). A record is one (row, gen), as in
 ``layer_misses.py``: ``copy_submit.b`` summed over both groups is its forced CPU misses, each ``spec_use`` one miss
 the pool covered, and the wait is the first submit to ``gate_open``. A used read is *late* (promoted: its demand
 waited for the landing) when its ``spec_land`` is less than ``--late-us`` before its ``spec_use``; ``spec_use`` is

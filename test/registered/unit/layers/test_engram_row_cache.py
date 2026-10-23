@@ -190,7 +190,7 @@ def test_stats_sink_records_cumulative_engram_counters(tmp_path):
     saved = (row_cache_module._SINK, row_cache_module._SINK_PATH)
     row_cache_module._SINK, row_cache_module._SINK_PATH = None, ""
     try:
-        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(trace):
+        with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"expert_path": trace})):
             cache = EngramRowCache(capacity_rows=16, row_bytes=4)
             cache._sink._interval_s = 0.0
             cache.lookup(np.array([1, 2]), _fetcher(table, []))

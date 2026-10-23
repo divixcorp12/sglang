@@ -17,8 +17,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-PREFIX = "SGLANG_EXPERT_STREAM_URING_"
-
 _SOURCE = r'''
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -107,6 +105,11 @@ int main(int argc, char** argv) {
     require(argc == 3, "usage: harness <dir> unconsumed|mixed|published|refused|refused_fail|refused_close");
     const std::string scenario = argv[2];
     Fixture fx(argv[1]);
+    // The host reads no environment: install the options Python would (SGLANG_EXPERT_STREAM_URING's members).
+    const char* read_mode = std::getenv("RINGRESET_READ_MODE");
+    sglang::expert_stream::set_uring_options(sglang::expert_stream::UringOptions::parse(
+        "default", 0, std::getenv("RINGRESET_FIXED_FILES") != nullptr, read_mode ? read_mode : "normal", "block", 10000,
+        false, "auto"));
     UringReader reader;
     require(reader.init(kDepth), "ring setup failed");
     if (reader.fixed_reads()) reader.set_fixed_chunk_cap(4 * kRow);  // 16 chunks: a real table, not one entry
@@ -193,9 +196,9 @@ def harness(tmp_path_factory):
 
 
 def _run(harness, tmp_path, scenario, read_mode):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(PREFIX)}
-    env[PREFIX + "FIXED_FILES"] = "1"  # the rewrite must also clear IOSQE_FIXED_FILE
-    env[PREFIX + "READ_MODE"] = read_mode
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RINGRESET_")}
+    env["RINGRESET_FIXED_FILES"] = "1"  # the rewrite must also clear IOSQE_FIXED_FILE
+    env["RINGRESET_READ_MODE"] = read_mode
     run = subprocess.run([str(harness), str(tmp_path), scenario], env=env, capture_output=True, text=True,
                          timeout=120, check=False)
     output = run.stdout + run.stderr

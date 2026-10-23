@@ -17,10 +17,10 @@ def fused_plan(request, monkeypatch):
     """Run every test under both planners: the fused kernel writes the plan's expert ids itself.
 
     The spec-only format serves only the default row source, so an ambient
-    SGLANG_MOE_EXPERT_ROW_SOURCE (e.g. ``shards`` from a model env file) is cleared.
+    SGLANG_EXPERT_STREAM_ROW_SOURCE (e.g. ``shards`` from a model env file) is cleared.
     """
-    monkeypatch.delenv("SGLANG_MOE_EXPERT_ROW_SOURCE", raising=False)
-    monkeypatch.setenv("SGLANG_MOE_EXPERT_FUSED_PLAN", "1" if request.param else "0")
+    monkeypatch.delenv("SGLANG_EXPERT_STREAM_ROW_SOURCE", raising=False)
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN", "1" if request.param else "0")
     return request.param
 
 

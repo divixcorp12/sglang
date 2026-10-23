@@ -17,6 +17,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,9 @@ _SINK_PATH = ""
 
 
 def cache_stats_sink() -> Optional[CacheStatsSink]:
-    """The process-wide sink when SGLANG_DSV41_EXPERT_TRACE_PATH is set, else None."""
+    """The process-wide sink when ``trace.expert_path`` is set, else None."""
     global _SINK, _SINK_PATH
-    trace_path = envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get()
+    trace_path = stream_config().trace.expert_path
     if not trace_path:
         return None
     path = trace_path + ".cache-stats"

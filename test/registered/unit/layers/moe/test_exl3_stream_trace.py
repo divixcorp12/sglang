@@ -59,15 +59,37 @@ def test_trace_lines_carry_route_counts_and_background_reads(tmp_path):
     lines = [json.loads(line) for line in path.read_text().splitlines()]
     stamps = [line.pop("t") for line in lines]
     assert stamps == sorted(stamps)
+    no_fill = {"fill_rows": 0, "residency_hits": 0}
     assert lines == [
         {"forward": 1, "layer": 0, "tokens": 2, "experts": [1, 3], "counts": [3, 1],
-         "vram_miss": 2, "ram_miss": 1, "read_ms": 2.0, "split_ms": 0.5, "background_rows": 5},
+         "vram_miss": 2, "ram_miss": 1, **no_fill, "read_ms": 2.0, "split_ms": 0.5, "background_rows": 5},
         {"forward": 1, "layer": 1, "tokens": 1, "experts": [2], "counts": [2],
-         "vram_miss": 1, "ram_miss": 0, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 0},
+         "vram_miss": 1, "ram_miss": 0, **no_fill, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 0},
         {"forward": 2, "layer": 0, "tokens": 1, "experts": [0, 1], "counts": [1, 1],
-         "vram_miss": 0, "ram_miss": 0, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 2},
+         "vram_miss": 0, "ram_miss": 0, **no_fill, "read_ms": 0.0, "split_ms": 0.0, "background_rows": 2},
     ]
     assert trace.stats()["background_read_rows"] == 7
+
+
+def test_trace_lines_carry_fill_rows_and_residency_hits(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    trace = Exl3StreamTrace(str(path))
+    stats = SimpleNamespace(miss_rows=1, host_read_rows=0, host_read_ns=0, host_split_ns=0, host_fill_rows=3,
+                            residency_hit_rows=5)
+    trace.record(0, torch.tensor([[1, 2]]), stats, 0)
+    trace.close()
+    line = json.loads(path.read_text())
+    assert (line["fill_rows"], line["residency_hits"]) == (3, 5)
+    assert "sources" not in line
+
+
+def test_trace_lines_carry_the_prefill_sources_when_given(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    trace = Exl3StreamTrace(str(path))
+    sources = {"hot": [1], "resident": [], "nvme": [2]}
+    trace.record(0, torch.tensor([[1, 2]]), _stats(1, 1), 0, sources=sources)
+    trace.close()
+    assert json.loads(path.read_text())["sources"] == sources
 
 
 def test_logs_every_n_forwards_and_at_close(caplog):
@@ -648,13 +670,15 @@ def _assert_residency_record(loaded, record, step, row):
 
 def _residency_log(tmp_path, *, layer_ids, depth=8, margin=2, router=False):
     from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
     from sglang.srt.layers.moe.residency_capture import residency_rows
 
     log = module.GraphRouteLog(layers=len(layer_ids), width=8, device="cpu", depth=depth, margin=margin)
     if router:
         log.enable_router(str(tmp_path / "router"))
     gates = {layer_ids[0]: SimpleNamespace(bias=torch.zeros(4)), layer_ids[1]: SimpleNamespace(bias=None)}
-    log.enable_residency(str(tmp_path / "router.res"), rows=residency_rows(layer_ids, gates=gates))
+    log.enable_residency(str(tmp_path / "router.res"), rows=residency_rows(layer_ids, gates=gates, strata=get_profile_by_name("dsv41").strata)
+    )
     for row, layer in enumerate(layer_ids):
         log.bind(row, layer, 28)
     return log

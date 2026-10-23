@@ -2,10 +2,10 @@
 exl3_moe_loop on the GPU, at the target's 3 and the draft's 4 bits; a captured call replays what eager computes; an eager
 call reads nothing from the device.
 
-Run on divix01 with the GPU lock, EXL3_MOE_CPU_PIN=0, SGLANG_EXL3_CPU_ACT_RESIDUAL=1, SGLANG_EXL3_CPU_ACT_BLOCK=128 and
-SGLANG_EXL3_SRC set (the optimized CPU kernel's build). Not SGLANG_DSV41_CPU_EXPERTS=1: that puts the draft on the
+Run on divix01 with the GPU lock, SGLANG_EXL3_MOE_CPU_PIN=0, SGLANG_EXL3_CPU_ACT_RESIDUAL=1, SGLANG_EXL3_CPU_ACT_BLOCK=128 and
+SGLANG_EXL3_SRC set (the optimized CPU kernel's build). Not SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1: that puts the draft on the
 RAM-miss service's team, and this is the draft-only shape:
-  flock .../cc-gpu.lock taskset -c 6-17,32-63 python -m pytest test/manual/dsv41/test_dspark_hybrid_draft_gpu.py -s
+  flock .../cc-gpu.lock taskset -c 0-27,56-83 python -m pytest test/manual/dsv41/test_dspark_hybrid_draft_gpu.py -s
 """
 
 import os
@@ -59,7 +59,7 @@ def _layer(bits, resident, monkeypatch, registry, tmp_path):
             for name, tensor in tensors.items():
                 param = getattr(layer, f"{prefix}_{name}")
                 param.weight_loader(param, tensor, f"experts.{prefix}_{name}", shard_id=shard, expert_id=expert)
-    with envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.override(str(path)):
         method.process_weights_after_loading(layer)
     return layer, method
 
@@ -89,10 +89,10 @@ def _prepared(bits, resident, monkeypatch, tmp_path):
     from sglang.srt.layers.moe.cpu_experts.draft import DraftCpuExpertsRegistry
     from sglang.srt.layers.quantization.exl3.draft_moe import prepare_dspark_draft_graph
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     registry = DraftCpuExpertsRegistry()
     layer, method = _layer(bits, resident, monkeypatch, registry, tmp_path)
-    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(",".join(map(str, _cores()))):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override(",".join(map(str, _cores()))):
         assert prepare_dspark_draft_graph(_Model(layer)) == 1
     return layer, method, registry
 

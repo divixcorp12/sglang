@@ -91,10 +91,10 @@ def build_setup(root: Path, experts: int, mirror_roots: tuple[Path, Path] | None
     different drives to measure with the mirrors split the way production splits them (the registered
     O_DIRECT run put both under the same ``--work-dir`` instead; see PACK_WORKERS.md). ``None`` disables
     mirroring."""
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-    from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3_tables import exl3_ram_miss_tables
     from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 

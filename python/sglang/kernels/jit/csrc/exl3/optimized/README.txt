@@ -8,12 +8,16 @@ There is no persistent weight repacking or increase in expert weight storage.
 Selection
 ---------
 For a call whose chunks each hold 1..CHUNK_M tokens (CHUNK_M = MAX_M / 2; MAX_M is
-EXL3_MOE_CPU_MAX_M: 4 in the source, 8 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304, residual activation rows,
+EXL3_MOE_CPU_MAX_M: 4 in the source, 16 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304, residual activation rows,
 128-element quantization blocks, 3-bit unswizzled matrices and AVX512BW:
   one expert, one token: range3_unroll (range-aware neighboring-band traversal);
   other one-token chunks: unroll_small (one-band traversal);
   chunks of M > 1 tokens: register_tiles<M>, all M tokens sharing each decoded tile,
-  kRegisterBudget[M - 1].pairs tile pairs per call.
+  kRegisterBudget[M - 1].pairs tile pairs per call; M = 5..8 through register_band_halves,
+  which runs each 128-input block once per output half to hold half the accumulators.
+On a VNNI host one-token chunks accumulate the decoded product bytes with vpdpbusd (no byte sum)
+and larger chunks with vpdpwssd; on AVX-512BW alone, vpmaddwd + vpaddd. The generic plan splits
+calls into chunks of at most 4 tokens (GENERIC_CHUNK_M) whatever MAX_M.
 kRegisterBudget (math_avx512.hpp) holds one entry per M and a static_assert keeps each
 within 32 zmm; raising MAX_M needs an entry per new M. The measured multiple-expert
 counts are 3 and 5; counts 2, 4 and above 5 use the same default but have no
@@ -61,7 +65,7 @@ refused call throws std::invalid_argument and a failed one another std::exceptio
 SGLang integration
 ------------------
 quantization/exl3/ext.py selects this source for residual=1, block=128 and links OpenMP.
-With SGLANG_DSV41_CPU_EXPERTS=1 it always does: the accuracy flags can be left
+With SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 it always does: the accuracy flags can be left
 unset, and a flag set to any other value is refused. The extension flavor
 resid_b128_cpu_v1 prevents reuse of an old CPU kernel cache. Registration and
 the kernel's address op (torch_ops.cpp) are compiled into one extension; the CPU
@@ -69,7 +73,7 @@ service takes the kernel's address from it. Before starting SGLang, set:
 
   export SGLANG_EXL3_CPU_CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++
   export CUDA_HOME=/usr/local/cuda-13.4
-  export EXL3_MOE_CPU_PIN=0
+  export SGLANG_EXL3_MOE_CPU_PIN=0
   export OMP_NUM_THREADS=16 OMP_THREAD_LIMIT=16 OMP_DYNAMIC=FALSE
   export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
 
@@ -91,10 +95,15 @@ math.hpp holds the arithmetic every tier shares (state decode, Hadamard, activat
 math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; forward_plan.hpp holds the tier
 dispatch, the forward driver and the plans; kernel.cpp holds the public API. Registration, validation, the ISA
 tier, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp).
-The tier is min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier query; EXL3_MOE_CPU_REPORT_ISA=1 prints
-"exl3 isa <tier>" to stderr then. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
+The tier is min(host, SGLANG_EXPERT_STREAM_CPU_MAX_ISA), fixed at the first forward or tier query;
+SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1 prints "exl3 isa <tier>" to stderr then. Python passes both through the torch op
+sglang_exl3_cpu::configure before it takes the kernel's address; a native harness calls exl3_cpu_configure (kernel.h). A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
 picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
-an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
+an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. On a VNNI host (tier Vnni or Vbmi) the same
+plan runs with its Vnni flag set: its register kernels (register_kernels.hpp, included once as reg_bw and once as
+reg_vnni by math_avx512.hpp) accumulate with vpdpwssd instead of vpmaddwd + vpaddd, bit-identically (the 16-bit byte sums
+and activation pairs are unchanged; both forms wrap mod 2^32). SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw runs the reg_bw copy, as before
+the VNNI copy existed. PlanTraits<Dsv41Shape, Isa::Bw> is the one
 specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and wide single-expert quantization (one token).
 MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile tables (kTiles) and the
 register dispatch (register_tiles_for) are generated from it. A plan reads every layer fact

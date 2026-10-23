@@ -54,9 +54,9 @@ def test_cpu_act_options_map_to_defines_and_flavor():
 
 
 def _cpu_experts_defines(**flags):
-    """cpu_act_defines with SGLANG_DSV41_CPU_EXPERTS on and only the given SGLANG_EXL3_CPU_ACT_* flags set."""
+    """cpu_act_defines with SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS on and only the given SGLANG_EXL3_CPU_ACT_* flags set."""
     with contextlib.ExitStack() as stack:
-        stack.enter_context(exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True))
+        stack.enter_context(exl3_ext.envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True))
         for name in ("SGLANG_EXL3_CPU_ACT_RESIDUAL", "SGLANG_EXL3_CPU_ACT_BLOCK", "SGLANG_EXL3_CPU_MAX_M"):
             field = getattr(exl3_ext.envs, name)
             if name in flags:
@@ -73,32 +73,32 @@ def _cpu_experts_defines(**flags):
 )
 def test_cpu_experts_always_build_the_optimized_kernel(flags):
     defines = _cpu_experts_defines(**flags)
-    assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-DEXL3_MOE_CPU_MAX_M=8"]
-    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_m8_cpu_v1"
+    assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-DEXL3_MOE_CPU_MAX_M=16"]
+    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_m16_cpu_v1"
 
 
-def test_cpu_max_m_defaults_to_8_and_0_keeps_the_kernels_own():
-    """Default 8 (4 tokens per chunk, DSV41_REFERENCE.md 33.20); 0 builds the kernel source's default (MAX_M 4)."""
-    assert exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.default == 8
+def test_cpu_max_m_defaults_to_16_and_0_keeps_the_kernels_own():
+    """Default 16 (8 tokens per chunk, register_band_halves); 0 builds the kernel source's default (MAX_M 4)."""
+    assert exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.default == 16
     defines = _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=0)
     assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]
     assert exl3_ext.build_flavor(defines) == "_resid_b128_cpu_v1"
 
 
 def test_the_max_m_default_does_not_refuse_a_launch_without_cpu_experts():
-    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(False), contextlib.ExitStack() as stack:
+    with exl3_ext.envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(False), contextlib.ExitStack() as stack:
         field = exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M
         if field.is_set():
             stack.callback(os.environ.__setitem__, "SGLANG_EXL3_CPU_MAX_M", os.environ["SGLANG_EXL3_CPU_MAX_M"])
             field.clear()
-        assert "-DEXL3_MOE_CPU_MAX_M=8" not in exl3_ext.cpu_act_defines()
+        assert "-DEXL3_MOE_CPU_MAX_M=16" not in exl3_ext.cpu_act_defines()
 
 
 @pytest.mark.parametrize(
     "flags", [{"SGLANG_EXL3_CPU_ACT_RESIDUAL": False}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 64}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 0}]
 )
 def test_cpu_experts_refuse_another_accuracy_flavor(flags):
-    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_EXPERTS"):
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"):
         _cpu_experts_defines(**flags)
 
 
@@ -108,15 +108,21 @@ def test_cpu_max_m_maps_to_a_define_and_its_own_flavor():
     assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_m8_cpu_v1"
 
 
-@pytest.mark.parametrize("max_m", [1, 3, 10, -2])
-def test_cpu_max_m_must_be_even_in_2_to_8(max_m):
+def test_cpu_max_m_16_maps_to_its_own_flavor():
+    defines = _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=16)
+    assert defines[-1] == "-DEXL3_MOE_CPU_MAX_M=16"
+    assert exl3_ext.build_flavor(defines) == "_resid_b128_m16_cpu_v1"
+
+
+@pytest.mark.parametrize("max_m", [1, 3, 17, 18, -2])
+def test_cpu_max_m_must_be_even_in_2_to_16(max_m):
     with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_MAX_M"):
         _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=max_m)
 
 
 def test_cpu_max_m_needs_the_optimized_kernel():
     """The vendored kernel (moe_mul1.cpp) keeps its own MAX_M: setting the variable without CPU experts is refused."""
-    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(False), exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.override(8):
+    with exl3_ext.envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(False), exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.override(8):
         with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_MAX_M"):
             exl3_ext.cpu_act_defines()
 
@@ -198,13 +204,13 @@ if __name__ == "__main__":
 
 
 def test_cpu_experts_build_the_optimized_extension(tmp_path, monkeypatch):
-    """With CPU experts on, the build is the optimized flavor (MAX_M 8 by default) even with every flag left unset."""
+    """With CPU experts on, the build is the optimized flavor (MAX_M 16 by default) even with every flag left unset."""
     monkeypatch.delenv("SGLANG_EXL3_CPU_ACT_RESIDUAL", raising=False)
     monkeypatch.delenv("SGLANG_EXL3_CPU_ACT_BLOCK", raising=False)
     monkeypatch.delenv("SGLANG_EXL3_CPU_MAX_M", raising=False)
-    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+    with exl3_ext.envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True):
         kw, _ = _load_args(tmp_path, monkeypatch, None, None)
-    assert kw["name"] == "sglang_exl3_ext_resid_b128_m8_cpu_v1"
+    assert kw["name"] == "sglang_exl3_ext_resid_b128_m16_cpu_v1"
     assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL, exl3_ext.OPTIMIZED_TORCH_OPS]
 
 

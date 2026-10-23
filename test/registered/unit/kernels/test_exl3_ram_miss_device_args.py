@@ -243,12 +243,12 @@ def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
         _device(layers=1, experts=384, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
 
 
-# Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
+# Lease-chain PDL (SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
 # the Python method that launches each. C1 and CC are plain launches.
 PDL_KERNELS = {
-    "exl3_ram_miss_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
-    "exl3_ram_miss_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
-    "exl3_ram_miss_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
+    "expert_stream_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
+    "expert_stream_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
+    "expert_stream_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
 }
 
 
@@ -295,9 +295,9 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     node ends)."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
     launcher = text[text.index("static void lease_copy_wait("):]
-    arm = launcher.index("exl3_ram_miss_lease_copy_wait_kernel<true>")
+    arm = launcher.index("expert_stream_lease_copy_wait_kernel<true>")
     wait = launcher.index("enqueue_gate_wait(")
-    commit = launcher.index("(exl3_ram_miss_lease_copy_commit_kernel, commit)")
+    commit = launcher.index("(expert_stream_lease_copy_commit_kernel, commit)")
     assert arm < wait < commit
     call = launcher[wait:launcher.index(";", wait)]
     assert "kLeaseCopyGate" in call, call
@@ -307,8 +307,8 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     enqueue = enqueue[: enqueue.index("\n}\n")]
     assert "channel::kGateOpen" in enqueue and "kStreamWaitValueGeq" in enqueue, enqueue
     assert "kStreamWaitValueGeq = 0;" in stream_wait and '"cuStreamWaitValue32_v2"' in stream_wait
-    assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(exl3_ram_miss_lease_copy_commit_kernel", launcher)
-    body = text[text.index("void exl3_ram_miss_lease_copy_commit_kernel("):]
+    assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(expert_stream_lease_copy_commit_kernel", launcher)
+    body = text[text.index("void expert_stream_lease_copy_commit_kernel("):]
     body = body[: body.index("\n}\n")]
     assert "PDL" not in body and "while" not in body and "__nanosleep" not in body, "the commit kernel must not wait"
     assert "channel::commit_or_trap<TargetChannel>(" in body
@@ -318,7 +318,7 @@ def test_cw_closes_the_gate_after_its_sm_reads_and_fences_before_the_copydone_lo
     """CW's SM reads of the kHitCopy lanes come before the gate close (behind the block barrier), and the Dekker fence
     separates the close from the CopyDone load. No Done word is left: nothing on the host waits for one."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
-    body = text[text.index("void exl3_ram_miss_lease_copy_wait_kernel("):]
+    body = text[text.index("void expert_stream_lease_copy_wait_kernel("):]
     body = body[: body.index("\n}\n")]
     reads = body.index("copy_wait_read(")
     barrier = body.index("__syncthreads();", reads)
@@ -390,7 +390,7 @@ def test_the_device_side_passes_each_rows_capacity_to_the_post_launch():
 
 @pytest.mark.parametrize("kwargs, want", [({}, (0, 3)), ({"miss_cut": 1, "miss_cut_max": 2}, (1, 2))])
 def test_the_device_side_passes_the_split_miss_cut_after_cpu_misses(kwargs, want):
-    """SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX reach the post as the two arguments after cpu_misses (index 25); off,
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT miss_cut / miss_cut_max reach the post as the two arguments after cpu_misses (index 25); off,
     the cut is 0 and the post types lanes as before it existed."""
     dev = _device(**kwargs)
     recorder = _Recorder()
@@ -401,7 +401,7 @@ def test_the_device_side_passes_the_split_miss_cut_after_cpu_misses(kwargs, want
 
 
 def test_a_row_split_reaches_the_post_of_its_row_only():
-    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: the post's row_split bank (before use_pdl) holds the table on every node
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables: the post's row_split bank (before use_pdl) holds the table on every node
     of the row it was set for, and -1 first (the lease's tables) for every other row; a table the build cannot read is
     refused. Mutations: set_row_split writing one node or every row -- red."""
     dev = _device(lanes=8, nodes=2)
@@ -415,10 +415,81 @@ def test_a_row_split_reaches_the_post_of_its_row_only():
     dev._kernels = lambda: recorder
     for row in (0, 1):
         _post(dev, _args(), row=row)
-    banks = [args[-2] for _, args in recorder.calls]
+    banks = [args[-3] for _, args in recorder.calls]
     assert banks[0] is banks[1] is dev.row_split
     assert dev.row_split[0, 0] == -1
     assert dev.row_split[1].tolist() == table * 2
+
+
+def test_the_split_model_reaches_the_post_before_use_pdl_with_room_for_its_counters():
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT model: off, the post's split_model argument (after row_split) is empty; on, it
+    holds the cost words and zeroed counters (records, then per node to_cpu and to_copy), which split_model_stats
+    reads back; a word count the build cannot read is refused. Mutation: the counters not appended -- red."""
+    for nodes in (1, 2):
+        off = _device(nodes=nodes)
+        recorder = _Recorder()
+        off._kernels = lambda: recorder
+        _post(off, _args())
+        assert recorder.calls[0][1][-2].numel() == 0 and off.split_model_stats() is None
+        words = list(range(1, 5 * nodes + 7))
+        with pytest.raises(ValueError, match="cost words"):
+            _device(nodes=nodes, split_model=words[:-1])
+        on = _device(nodes=nodes, split_model=words)
+        recorder = _Recorder()
+        on._kernels = lambda: recorder
+        _post(on, _args())
+        bank = recorder.calls[0][1][-2]
+        assert bank is on.split_model and bank.dtype == torch.int64
+        assert bank.tolist() == words + [0] * (1 + 2 * nodes)
+        bank[len(words):] = torch.arange(1, 2 + 2 * nodes)
+        assert on.split_model_stats() == {
+            "records": 1, "to_cpu": list(range(2, 2 + 2 * nodes, 2)), "to_copy": list(range(3, 3 + 2 * nodes, 2))}
+
+
+def test_set_split_model_costs_replaces_the_cost_words_and_keeps_the_counters():
+    """The calibration's and the refinement's publish path: the post's split_model bank (the same tensor the captured
+    post reads) takes the new cost words in place, its counters untouched; a word count the build cannot read, or a
+    device with the model off, is refused. Mutation: the copy writing the counters too -- red."""
+    from sglang.srt.layers.moe.ram_slot_map import split_model_off_words
+
+    for nodes in (1, 2):
+        dev = _device(nodes=nodes, split_model=split_model_off_words(nodes))
+        bank = dev.split_model
+        assert dev.split_model_costs() == split_model_off_words(nodes)
+        bank[5 * nodes + 6 :] = 7
+        words = list(range(100, 100 + 5 * nodes + 6))
+        dev.set_split_model_costs(words)
+        assert dev.split_model is bank and bank.tolist() == words + [7] * (1 + 2 * nodes)
+        assert dev.split_model_costs() == words
+        with pytest.raises(ValueError, match="cost words"):
+            dev.set_split_model_costs(words[:-1])
+    with pytest.raises(ValueError, match="off"):
+        _device().set_split_model_costs([0] * 11)
+
+
+def test_the_service_builds_its_device_side_with_the_split_model_words():
+    """exl3_ram_miss passes _split_model_words(): with SGLANG_EXPERT_STREAM_CPU_SPLIT model on and CPU experts running,
+    words that hold the model off until the calibration publishes its costs (whatever the env's costs say), else
+    None."""
+    import sglang.srt.layers.moe.expert_engine.service as service
+
+    tree = ast.parse(Path(service.__file__).read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]
+    for call in calls:
+        assert {k.arg: ast.unparse(k.value) for k in call.keywords}["split_model"] == "self._split_model_words()"
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
+
+    words = service.ExpertEngineService._split_model_words
+    wire = SimpleNamespace(nodes=2)
+    # A service resolves its config once, when it is built: a stand-in made inside an override has it.
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": false}'):
+        assert words(SimpleNamespace(cpu_experts=object(), wire=wire, config=resolved_config())) is None
+    with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"model": true, "model_costs": "copy_lane=2"}'):
+        stub = SimpleNamespace(cpu_experts=object(), wire=wire, config=resolved_config())
+        got = words(stub)
+        assert len(got) == 16 and got[10] < 0 and not any(got[:10] + got[11:])
+        assert words(SimpleNamespace(cpu_experts=None, wire=wire, config=stub.config)) is None
 
 
 @pytest.mark.parametrize("name", ["miss_cut", "miss_cut_max"])
@@ -429,7 +500,7 @@ def test_a_negative_split_miss_cut_is_refused(name):
 
 def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
     """exl3_ram_miss passes the two env vars, the cut zeroed without CPU experts (split_miss_cut)."""
-    import sglang.srt.layers.moe.exl3_ram_miss as service
+    import sglang.srt.layers.moe.expert_engine.service as service
 
     tree = ast.parse(Path(service.__file__).read_text())
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]
@@ -439,10 +510,10 @@ def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
         assert kw["miss_cut"] == "miss_cut"
         assert kw["miss_cut_max"] == "miss_cut_max"
     text = Path(service.__file__).read_text()
-    assert (
-        "miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(), "
-        "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(), cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get())"
-    ) in " ".join(text.split())
+    # The cut and its cap come from the CPU-split config group, the CPU-experts switch from its own env or config.
+    assert re.search(
+        r"miss_cut, miss_cut_max = split_miss_cut\([^)]*miss_cut[^)]*miss_cut_max[^)]*cpu_experts=", " ".join(text.split())
+    )
 
 
 def test_the_chain_has_no_hit_wait_and_the_post_fills_c1s_compaction():
@@ -462,16 +533,15 @@ def test_the_device_map_starts_empty_with_chain_one():
     assert bank["ce_ok"].tolist() == [0, 0] and bank["cpu_ok"].tolist() == [0, 0]
 
 
-@pytest.mark.parametrize("name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"])
-def test_the_exl3_host_file_is_only_bindings(name):
+def test_the_engine_host_file_is_only_bindings():
     """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
-    ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
-    back into one of them."""
-    path = CSRC / "exl3" / name
+    ffi_test_exports.h); the engine's one host file (both builds) only names its format, router, reader and build. Red
+    when a body grows back into it."""
+    path = CSRC / "expert_stream" / "engine_host.cpp"
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
     assert not bodies, f"{path.name} defines functions: {bodies}"
-    assert len(lines) < 40, f"{path.name} has {len(lines)} lines; it should hold only bindings"
+    assert len(lines) < 70, f"{path.name} has {len(lines)} lines; it should hold only bindings"
 
 
 if __name__ == "__main__":
@@ -550,3 +620,28 @@ def test_the_gpu_scorer_sizes_its_scratch_by_the_rows_tokens():
 def test_scoring_before_the_gpu_scorer_is_enabled_is_refused():
     with pytest.raises(RuntimeError, match="enable_spec_scorer"):
         _device().spec_score(SimpleNamespace(target=0), None)
+
+
+@pytest.mark.parametrize("with_weights", [True, False])
+def test_the_gpu_scorer_hands_the_posts_routes_to_the_select_kernel(with_weights):
+    """The select kernel ranks only a verify's live rows, which it finds in the post's routes (a dead row's are -1), so
+    the scoring passes them with the post's routes per token: the weights' count over the tokens, as the post kernel
+    derives it. Without the weights it passes none and ranks every row. Mutant: drop the routes -- red."""
+    dev = _device()
+    dev.cpu_tokens_max = 3  # a verify's rows, as enable_cpu_experts sets it
+    dev.enable_spec_scorer(ram_miss.new_candidate_page(pin=False), top_k=2, per_token=1, top_k_only=False)
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    entry = SimpleNamespace(
+        target=1, weight=torch.zeros(4, 8), bias=torch.zeros(4), hot_slots=torch.full((1,), -1), hot_capacity=0
+    )
+    routes = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1], dtype=torch.int64)
+    weights = torch.ones(3, 2) if with_weights else None
+    dev.spec_score(entry, torch.zeros(3, 8, dtype=torch.bfloat16), routes=routes, route_weights=weights)
+    assert [name for name, _ in recorder.calls] == ["expert_stream_spec_score", "expert_stream_spec_select"]
+    _, args = recorder.calls[1]
+    assert args[1] == 3
+    if with_weights:
+        assert args[-2] is routes and args[-1] == 2
+    else:
+        assert (args[-2], args[-1]) == (None, 0)

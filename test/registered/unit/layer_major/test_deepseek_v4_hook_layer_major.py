@@ -51,6 +51,13 @@ def _cfg(**overrides):
         enable_dp_attention=False,
         attn_cp_size=1,
         max_running_requests=1,
+        # Upstream's prefill-CP and DP-attention reads (attn_dp_enabled_of), at their defaults: no CP, tp 1.
+        enable_prefill_cp=False,
+        cp_strategy=None,
+        tp_size=1,
+        attn_dp_size=1,
+        dcp_size=1,
+        ep_join_mode=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -83,6 +90,33 @@ class TestValidateDeepseekV41FeaturesLayerMajorGate(unittest.TestCase):
         with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64):
             with self.assertRaisesRegex(ValueError, "--enable-decoder-swa-bounded-replay"):
                 _run(_cfg(enable_decoder_swa_bounded_replay=False))
+
+    def test_lending_is_on_by_default_and_inert_without_residency_rows(self):
+        self.assertTrue(envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get())
+        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), envs.SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS.override(4):
+            _run(_cfg())  # ROWS is 0: the default lend does not refuse the launch
+
+    def test_lending_refuses_prefetch_pull_mode_and_gpu_drip(self):
+        lend = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.override(True)
+        rows = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.override(360)
+        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), lend, rows:
+            _run(_cfg())
+            with envs.SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS.override(4):
+                with self.assertRaisesRegex(ValueError, "GPU_DRIP_SLOTS"):
+                    _run(_cfg())
+            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"predictor": "llapor", "pull_mode": "always"}'):
+                # A pull mode needs a predictor, so the group names one; the gate names the group's pull_mode.
+                with self.assertRaisesRegex(ValueError, "SHADOW_PREFETCH's pull_mode"):
+                    _run(_cfg())
+
+    def test_drip_and_pull_mode_are_fine_without_lending(self):
+        rows = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.override(360)
+        no_lend = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.override(False)
+        with envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.override(64), rows, no_lend:
+            with envs.SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS.override(4):
+                _run(_cfg())
+            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always"}'):
+                _run(_cfg())
 
     # The encoder-replay refusal (dsv41_layer_major_refusal's other branch) is not exercised
     # through the full hook here: setting cfg.enable_encoder_swa_bounded_replay=True also

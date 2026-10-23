@@ -1,12 +1,9 @@
 // The x86 vector tiers a CPU expert quant may implement, and the tier one runs at: min(hardware, the quant's top
-// tier, the quant's cap environment variable). A quant's report variable prints the tier it settled on.
-// Env convention: kIsaCapEnv / kIsaReportEnv per quant; new quants use <QUANT>_CPU_MAX_ISA / <QUANT>_CPU_REPORT_ISA,
-// EXL3 keeps its legacy EXL3_MOE_CPU_* prefix.
+// tier, the configured cap). The cap and the report are SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA, which Python
+// passes to each quant library's configure export (ExpertForward::configure_isa); nothing here reads the environment.
 #pragma once
 #include <cctype>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
 
 #if !defined(__GNUC__) || !defined(__linux__) || !defined(__x86_64__)
@@ -27,9 +24,9 @@ namespace {
 enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
 template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I == Isa::Vbmi;
 
-// cap_env (may be null) names a variable holding scalar|avx2|bw|avx512bw|vnni|avx512|vbmi, case-insensitive, that
-// caps the tier for testing; it never raises the tier, and an unrecognized value is ignored.
-inline Isa detect_isa(Isa top, const char* cap_env)
+// cap (empty: none) is scalar|avx2|bw|avx512bw|vnni|avx512|vbmi, case-insensitive, and caps the tier for testing; it
+// never raises the tier, and an unrecognized value is ignored.
+inline Isa detect_isa(Isa top, const std::string& cap)
 {
     __builtin_cpu_init();
     // Each tier needs every feature its SGLANG_TARGET_* attribute compiles for (fma and f16c included).
@@ -47,8 +44,8 @@ inline Isa detect_isa(Isa top, const char* cap_env)
         hw = Isa::Scalar;
     if (top < hw) hw = top;
 
-    if (const char* e = cap_env ? std::getenv(cap_env) : nullptr) {
-        std::string s(e);
+    if (!cap.empty()) {
+        std::string s(cap);
         for (char& c : s) c = (char) std::tolower((unsigned char) c);
         Isa cap;
         if (s == "scalar") cap = Isa::Scalar;
@@ -75,11 +72,10 @@ inline const char* isa_name(Isa isa)
     return "unknown";
 }
 
-// report_env (may be null) names a variable that, when it is "1", makes this print "<name> isa <tier>" to stderr.
-inline void report_isa(const char* name, Isa isa, const char* report_env)
+// When report is set, prints "<name> isa <tier>" to stderr.
+inline void report_isa(const char* name, Isa isa, bool report)
 {
-    const char* e = report_env ? std::getenv(report_env) : nullptr;
-    if (e && std::strcmp(e, "1") == 0) std::fprintf(stderr, "%s isa %s\n", name, isa_name(isa));
+    if (report) std::fprintf(stderr, "%s isa %s\n", name, isa_name(isa));
 }
 
 }  // namespace

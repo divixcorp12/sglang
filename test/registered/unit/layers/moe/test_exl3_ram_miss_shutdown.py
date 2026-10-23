@@ -19,14 +19,14 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe import expert_host_tier
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+from sglang.srt.layers.moe.expert_engine import service as module
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, dsv41_exl3_pairing, service_row_images
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -46,10 +46,11 @@ def world(tmp_path, monkeypatch):
     images need. The env stays set until teardown."""
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
+    module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     streamers, caches = {}, {}
     with service_row_images(tmp_path):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
@@ -58,12 +59,12 @@ def world(tmp_path, monkeypatch):
                 layer._nvfp4_expert_streamer = streamer
                 caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
-        service = module.Exl3RamMissService.get()
+        service = module.ExpertEngineService.get()
         service.plan_gather_width(1)
         service.ensure_started()
         order = []
         # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.
-        monkeypatch.setattr(module.Exl3RamMissService, "_cuda_active", lambda self: True)
+        monkeypatch.setattr(module.ExpertEngineService, "_cuda_active", lambda self: True)
         close_admission, stop = service.host.close_admission, service.host.stop
         monkeypatch.setattr(service.host, "close_admission", lambda: (order.append("close_admission"), close_admission()))
         monkeypatch.setattr(service.host, "stop", lambda: (order.append("stop"), stop()))
@@ -72,7 +73,7 @@ def world(tmp_path, monkeypatch):
             monkeypatch.setattr(cache, "close", lambda close=close, i=layer_id: (order.append(f"free{i}"), close()))
             monkeypatch.setattr(cache, "quarantine", lambda q=quarantine, i=layer_id: (order.append(f"quarantine{i}"), q()))
         yield service, caches, order
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
 
 
 def _barrier(service, monkeypatch, order, behaviour):
@@ -155,7 +156,7 @@ def test_quarantined_slabs_survive_the_tier_and_the_service_going_away(world, mo
     service.shutdown()
     caches.clear()
     monkeypatch.undo()
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
     del service
     gc.collect()
     expert_host_tier._QUARANTINED.clear()
@@ -370,7 +371,7 @@ def test_the_graceful_scheduler_shutdown_shuts_the_service_down_after_every_chea
     """Mutations: the block is omitted; it runs before hisparse, before the tree cache or
     before the last cheap release. The whole order is asserted, so the failing line is the `==` below."""
     order = []
-    monkeypatch.setattr(module, "shutdown_exl3_ram_miss_service", lambda: order.append("ram_miss"))
+    monkeypatch.setattr(module, "shutdown_expert_engine_service", lambda: order.append("ram_miss"))
     _release_scheduler_host_resources(order)
     assert order == CHEAP + ["ram_miss"]
 
@@ -384,7 +385,7 @@ def test_a_failing_service_shutdown_does_not_escape_the_scheduler_release(monkey
         order.append("ram_miss")
         raise RuntimeError("the service could not shut down")
 
-    monkeypatch.setattr(module, "shutdown_exl3_ram_miss_service", fail)
+    monkeypatch.setattr(module, "shutdown_expert_engine_service", fail)
     escaped = None
     try:
         _release_scheduler_host_resources(order)
@@ -438,15 +439,15 @@ def test_a_second_orderly_shutdown_does_nothing(world, monkeypatch):
 
 
 def test_shutting_down_without_a_service_does_not_construct_one():
-    """Mutation: the function calls Exl3RamMissService.get() (a run without EXL3 would create a service at shutdown)."""
-    module.Exl3RamMissService._instance = None
-    module.shutdown_exl3_ram_miss_service()
-    assert module.Exl3RamMissService._instance is None
+    """Mutation: the function calls ExpertEngineService.get() (a run without EXL3 would create a service at shutdown)."""
+    module.ExpertEngineService._instance = None
+    module.shutdown_expert_engine_service()
+    assert module.ExpertEngineService._instance is None
 
 
 def test_the_scheduler_release_imports_nothing_when_the_module_was_never_loaded(monkeypatch):
     """F4. Mutation: the block imports the module unconditionally (every non-EXL3 run would load the MoE stack)."""
-    key = "sglang.srt.layers.moe.exl3_ram_miss"
+    key = "sglang.srt.layers.moe.expert_engine.service"
     monkeypatch.delitem(sys.modules, key)
     order = []
     _release_scheduler_host_resources(order)
@@ -480,4 +481,21 @@ def test_shutdown_reads_the_shared_draft_hosts_counters_before_closing_the_host(
     assert order == ["synchronize", "close_admission", "draft_stats", "stop", "free0", "free1"]
     assert [r.getMessage() for r in caplog.records if "DSpark CPU experts" in r.getMessage()] == [
         f"DSpark CPU experts: {counters}"
+    ]
+
+
+def test_shutdown_logs_the_module_loads_that_drained_the_device_once(world, monkeypatch, caplog):
+    """The served check for the startup warm-up reads this line: a Triton or tvm-ffi module loaded after the copy
+    engine armed drained the device first (_copy_engine_module_load_guard). Logged once, with the armed state, and
+    without any device work of its own (the order is unchanged)."""
+    service, caches, order = world
+    service.copy_engine_module_loads = 3
+    service._copy_armed = True
+    _barrier(service, monkeypatch, order, lambda: None)
+    with caplog.at_level("INFO", logger=module.logger.name):
+        service.shutdown()
+        service.shutdown()
+    assert order == ["synchronize", "close_admission", "stop", "free0", "free1"]
+    assert [r.getMessage() for r in caplog.records if "copy_engine_module_loads" in r.getMessage()] == [
+        "exl3 RAM miss: copy_engine_module_loads=3 (module loads after the copy engine armed; armed: True)"
     ]

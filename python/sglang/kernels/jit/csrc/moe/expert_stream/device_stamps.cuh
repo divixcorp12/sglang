@@ -1,4 +1,4 @@
-// Device stamps (EXL3_RAM_MISS_DEVICE_STAMPS, the traced device module only): %globaltimer at fixed points of each
+// Device stamps (EXPERT_STREAM_DEVICE_STAMPS, the traced device module only): %globaltimer at fixed points of each
 // record's chain, written into a pinned host ring the service dumps at shutdown. Without the define every stamp
 // compiles to nothing and the module exports no setter.
 #pragma once
@@ -23,7 +23,7 @@ enum StampPoint : int {
 // Rows in the ring, by seq; arbitrary, sized for a capture's few thousand records with room to spare.
 constexpr uint32_t kStampRing = 65536;
 
-#ifdef EXL3_RAM_MISS_DEVICE_STAMPS
+#ifdef EXPERT_STREAM_DEVICE_STAMPS
 // The ring, set once by set_device_stamps before any captured chain runs; null leaves every stamp a no-op.
 static __device__ uint64_t* g_stamp_ring = nullptr;
 

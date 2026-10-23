@@ -8,8 +8,9 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import exl3_ram_miss as module
+from sglang.srt.layers.moe import ram_prefetch
 from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
+from sglang.srt.layers.moe.expert_engine import service as module
 from sglang.kernels.ops.moe.expert_stream_transport import CAND_PAGE_BYTES, new_candidate_page
 from sglang.srt.layers.moe.ram_prefetch import (
     MARGIN_FLOORS,
@@ -27,6 +28,7 @@ from sglang.srt.layers.moe.ram_prefetch import (
     spec_score_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_ram_miss_fixtures import dsv41_exl3_pairing
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -123,7 +125,7 @@ def test_a_layer_registered_again_with_another_gate_is_refused():
 
 
 def test_the_service_enables_the_host_with_the_registered_gates_options_and_spare_cores(monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH_SCORER", "cpu")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER", "cpu")
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
     calls = []
@@ -132,29 +134,29 @@ def test_the_service_enables_the_host_with_the_registered_gates_options_and_spar
         nodes=1, plans=[NodePlan(group=0, node=0, ram=17, cpu=(8, 9), sq=None, busy_poll=True, spec=(0, 1))]
     )
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
-    with envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.override(2):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER.override(2):
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], numa, cpu)
     (targets, gates, bias), kw = calls[0]
     assert targets.tolist() == [[1, 0], [-1, -1]] and torch.equal(gates[0], gate.weight)
     assert kw == dict(
         top_k=6, per_token=1, per_layer=2, cores=[[0, 1]], top_k_only=False, idle_drive=False, idle_deadline_s=0.004,
         idle_spread=False, idle_pieces=1, promote=False,
     )
-    with envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.override(True):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY.override(True):
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], numa, cpu)
     assert calls[1][1]["top_k_only"] is True
-    with envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.override(True), \
-            envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.override(2500):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE.override(True), \
+            envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US.override(2500):
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], numa, cpu)
     assert (calls[2][1]["idle_drive"], calls[2][1]["idle_deadline_s"]) == (True, 0.0025)
-    with envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.override(True), \
-            envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.override(True), \
-            envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.override(2), caplog.at_level(logging.INFO):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, cpu)
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE.override(True), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD.override(True), \
+            envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES.override(2), caplog.at_level(logging.INFO):
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], numa, cpu)
     assert (calls[3][1]["idle_spread"], calls[3][1]["idle_pieces"]) == (True, 2)
     assert "idle-drive reads (own reader per group, deadline 4 ms, spread ties, 2 pieces in flight)" in caplog.text
-    with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_CPU_EXPERTS"):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], numa, None)
+    with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"):
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], numa, None)
 
 
 def _numa():
@@ -169,8 +171,8 @@ def test_the_gpu_scorer_enables_the_host_with_a_candidate_page_and_no_host_gate_
     calls = []
     host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
-    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("gpu"), envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""):
-        scorer = module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.override("gpu"), envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""):
+        scorer = module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
     (targets, gates, bias), kw = calls[0]
     assert targets.tolist() == [[1, 0], [-1, -1]] and gates is None and bias is None
     page = kw.pop("candidates")
@@ -188,11 +190,11 @@ def test_the_cpu_scorer_returns_no_gpu_scorer_and_an_unknown_one_is_refused():
     register_router_gate(1, gate.weight, gate.bias, 6)
     host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: None)
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
-    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("cpu"):
-        assert module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu) is None
-    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("tpu"):
-        with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER"):
-            module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.override("cpu"):
+        assert module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], _numa(), cpu) is None
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.override("tpu"):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"):
+            module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
 
 
 def test_the_service_builds_both_scorers_tables_at_the_configured_horizon(caplog):
@@ -208,10 +210,10 @@ def test_the_service_builds_both_scorers_tables_at_the_configured_horizon(caplog
         calls = []
         host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
         caplog.clear()
-        with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override(scorer), \
+        with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.override(scorer), \
                 envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""), \
-                envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.override(horizon), caplog.at_level(logging.INFO):
-            result = module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1, 2], _numa(), cpu)
+                envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON.override(horizon), caplog.at_level(logging.INFO):
+            result = module.ExpertEngineService._enable_ram_prefetch(host, [0, 1, 2], _numa(), cpu)
         (args, kw) = calls[0]
         kw.pop("candidates", None)
         return result, args, kw, caplog.text
@@ -262,7 +264,7 @@ def test_a_gate_the_kernels_cannot_read_is_refused_when_the_table_is_built(weigh
 def test_the_service_binds_each_row_as_its_target_attaches_and_flags_rows_with_a_target():
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
-    svc = module.Exl3RamMissService()
+    svc = module.ExpertEngineService(**dsv41_exl3_pairing())
     picked = prefetch_targets([0, 1], registered_gates(), hidden=8)
     svc._spec_gpu = GpuScorer(picked, new_candidate_page(pin=False), per_token=1, top_k_only=False)
     hot0, hot1 = (torch.full((3,), -1, dtype=torch.int64) for _ in range(2))
@@ -279,7 +281,7 @@ def test_the_candidate_page_and_the_score_scratch_are_quarantined(monkeypatch):
     """The select kernel writes the page through UVA: a shutdown that cannot establish the GPU stopped keeps it."""
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
-    svc = module.Exl3RamMissService()
+    svc = module.ExpertEngineService(**dsv41_exl3_pairing())
     page = new_candidate_page(pin=False)
     svc._spec_gpu = GpuScorer(prefetch_targets([0, 1], registered_gates(), hidden=8), page, 1, False)
     owned = []
@@ -315,20 +317,20 @@ def test_the_gpu_scorer_passes_the_margin_floors_file_to_the_host(tmp_path):
     host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
     path = _floors_file(tmp_path, {"1": 0.5})
-    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("gpu"), envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.override("gpu"), envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(
         path
     ):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
     assert calls[0][1]["min_margin"].tolist() == [float("-inf"), 0.5]
 
 
 def test_the_prefetch_alone_runs_the_gpu_scorer_with_the_packaged_margin_floors(caplog):
-    """DSV41_REFERENCE.md 33.14-33.18's best arm is the default: SGLANG_DSV41_RAM_PREFETCH=1 needs nothing else."""
+    """DSV41_REFERENCE.md 33.14-33.18's best arm is the default: SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1 needs nothing else."""
     import os
 
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get() == "gpu"
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.get() == "gpu"
     assert not envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.is_set()
-    assert os.path.dirname(MARGIN_FLOORS) == os.path.dirname(module.__file__) and os.path.isfile(MARGIN_FLOORS)
+    assert os.path.dirname(MARGIN_FLOORS) == os.path.dirname(ram_prefetch.__file__) and os.path.isfile(MARGIN_FLOORS)
     gate = _gate()
     register_router_gate(1, gate.weight, gate.bias, 6)
     calls = []
@@ -336,7 +338,7 @@ def test_the_prefetch_alone_runs_the_gpu_scorer_with_the_packaged_margin_floors(
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
     rows = max(read_margin_floors(MARGIN_FLOORS)) + 1
     with caplog.at_level("INFO", logger=module.logger.name):
-        scorer = module.Exl3RamMissService._enable_ram_prefetch(host, list(range(rows)), _numa(), cpu)
+        scorer = module.ExpertEngineService._enable_ram_prefetch(host, list(range(rows)), _numa(), cpu)
     assert isinstance(scorer, GpuScorer)
     assert torch.equal(calls[0][1]["min_margin"], load_margin_floors(MARGIN_FLOORS, rows))
     assert "GPU scorer" in caplog.text and f"margin floors {MARGIN_FLOORS}" in caplog.text
@@ -350,10 +352,10 @@ def test_empty_margin_floors_read_every_candidate_and_the_cpu_scorer_has_none(ca
     cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
     with envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(""):
         assert margin_floors_path("gpu") is None
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
     assert calls[0][1]["min_margin"] is None
     assert margin_floors_path("gpu") == MARGIN_FLOORS and margin_floors_path("cpu") is None
-    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("cpu"), caplog.at_level("INFO", logger=module.logger.name):
-        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    with envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.override("cpu"), caplog.at_level("INFO", logger=module.logger.name):
+        module.ExpertEngineService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
     assert "min_margin" not in calls[1][1]
     assert "CPU scorer" in caplog.text and "margin floors none" in caplog.text

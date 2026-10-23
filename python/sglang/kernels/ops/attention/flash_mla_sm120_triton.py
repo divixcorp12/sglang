@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 LOG2E = tl.constexpr(1.4426950408889634)
@@ -289,15 +291,35 @@ def _merge_partial_attn(
 
     out: [B, 1, H, D] bf16,  lse: [B, 1, H] float32
     """
+    w1, w2, total, merged_lse = _merge_weights(lse1, lse2)
+    return _merge_outputs(out1, out2, w1, w2, total), merged_lse
+
+
+def _merge_weights(
+    lse1: torch.Tensor, lse2: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The merge's per-(token, head) weights, total and merged LSE: [B, 1, H] each."""
     max_lse = torch.maximum(lse1, lse2)
     w1 = torch.where(lse1 > -1e20, torch.exp(lse1 - max_lse), torch.zeros_like(lse1))
     w2 = torch.where(lse2 > -1e20, torch.exp(lse2 - max_lse), torch.zeros_like(lse2))
     total = (w1 + w2).clamp(min=1e-20)
+    merged_lse = max_lse + torch.log(total)
+    return w1, w2, total, merged_lse
+
+
+def _merge_outputs(
+    out1: torch.Tensor,
+    out2: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    total: torch.Tensor,
+) -> torch.Tensor:
+    """The merged bf16 output; elementwise, so any token slice gives the same values.
+    Holds at most 3 fp32 copies of the slice at once."""
     merged = (
         w1.unsqueeze(-1) * out1.float() + w2.unsqueeze(-1) * out2.float()
     ) / total.unsqueeze(-1)
-    merged_lse = max_lse + torch.log(total)
-    return merged.to(torch.bfloat16), merged_lse
+    return merged.to(torch.bfloat16)
 
 
 def _apply_attn_sink(
@@ -312,6 +334,14 @@ def _apply_attn_sink(
 
     out: [B, 1, H, D] bf16,  lse: [B, 1, H] f32,  attn_sink: [H] f32
     """
+    w, combined_lse = _sink_weights(lse, attn_sink)
+    return _sink_outputs(out, w), combined_lse
+
+
+def _sink_weights(
+    lse: torch.Tensor, attn_sink: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The sink's per-(token, head) output scale and combined LSE: [B, 1, H] each."""
     sink_lse = attn_sink.view(1, 1, -1).expand_as(lse)
     combined_lse = torch.logaddexp(lse, sink_lse)
     w = torch.where(
@@ -319,7 +349,98 @@ def _apply_attn_sink(
         torch.exp(lse - combined_lse),
         torch.zeros_like(lse),
     )
-    return (out.float() * w.unsqueeze(-1)).to(torch.bfloat16), combined_lse
+    return w, combined_lse
+
+
+def _sink_outputs(out: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """The sink-scaled bf16 output; elementwise, holds at most 2 fp32 copies."""
+    return (out.float() * w.unsqueeze(-1)).to(torch.bfloat16)
+
+
+# fp32 copies of a token's [H, D] output that the merge holds at once (_merge_outputs).
+_MERGE_FP32_COPIES = 3
+
+
+def merge_chunk_tokens(num_heads: int, head_dim_v: int, budget_mb: int) -> int:
+    """Tokens per merge chunk whose fp32 temporaries fit in budget_mb MiB (>= 1)."""
+    per_token = _MERGE_FP32_COPIES * num_heads * head_dim_v * 4
+    return max(1, (budget_mb << 20) // per_token)
+
+
+# Per token of a kernel chunk: the SWA and extra partial outputs (bf16, 2 bytes each) plus the merge's fp32 copies.
+_KERNEL_CHUNK_BYTES_PER_ELEMENT = 2 + 2 + 4 * _MERGE_FP32_COPIES
+
+
+def kernel_chunk_tokens(num_heads: int, head_dim: int, budget_mb: int) -> int:
+    """Tokens per kernel chunk whose partial outputs and merge temporaries fit in budget_mb MiB (>= 1)."""
+    per_token = _KERNEL_CHUNK_BYTES_PER_ELEMENT * num_heads * head_dim
+    return max(1, (budget_mb << 20) // per_token)
+
+
+def _sparse_decode_chunked(
+    q, k_cache, indices, topk_length, attn_sink, softmax_scale,
+    extra_k_cache, extra_indices, extra_topk_length, chunk_tokens,
+):
+    """flash_mla_sparse_decode_triton over token chunks: per chunk the SWA and extra kernels, the merge and the sink,
+    written into one [B, 1, H, D] output. Every kernel program is one (token, head) and every merge op is elementwise
+    per token, and the autotune key is the top-k, not the token count, so each chunk computes exactly what the whole
+    call would for its tokens."""
+    B, _, H, D = q.shape
+    out = torch.empty(B, 1, H, D, dtype=torch.bfloat16, device=q.device)
+    lse = torch.empty(B, 1, H, dtype=torch.float32, device=q.device)
+    has_extra = extra_k_cache is not None and extra_indices is not None
+    for start in range(0, B, chunk_tokens):
+        end = min(start + chunk_tokens, B)
+        part = slice(start, end)
+        o, l = _run_triton_sparse_decode(
+            q[part], k_cache, indices[part],
+            topk_length[part] if topk_length is not None else None, softmax_scale,
+        )
+        if has_extra:
+            o_extra, l_extra = _run_triton_sparse_decode(
+                q[part], extra_k_cache, extra_indices[part],
+                extra_topk_length[part] if extra_topk_length is not None else None, softmax_scale,
+            )
+            o, l = _merge_partial_attn(o, l, o_extra, l_extra)
+            del o_extra, l_extra
+        if attn_sink is not None:
+            o, l = _apply_attn_sink(o, l, attn_sink)
+        out[part].copy_(o)
+        lse[part].copy_(l)
+    return out, lse.permute(0, 2, 1)
+
+
+def _merge_and_sink_chunked(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    out_extra: Optional[torch.Tensor],
+    lse_extra: Optional[torch.Tensor],
+    attn_sink: Optional[torch.Tensor],
+    chunk_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """_merge_partial_attn then _apply_attn_sink, chunk_tokens tokens at a time, written
+    into ``out`` in place. The [B, 1, H] weights are computed once by the same helpers
+    and every [.., D] op is elementwise per token, so the result is bitwise the one-pass
+    path's, without its full-size fp32 temporaries."""
+    if out_extra is not None:
+        w1, w2, total, lse = _merge_weights(lse, lse_extra)
+    if attn_sink is not None:
+        w, lse = _sink_weights(lse, attn_sink)
+    for start in range(0, out.shape[0], chunk_tokens):
+        end = min(start + chunk_tokens, out.shape[0])
+        chunk = out[start:end]
+        if out_extra is not None:
+            chunk = _merge_outputs(
+                chunk,
+                out_extra[start:end],
+                w1[start:end],
+                w2[start:end],
+                total[start:end],
+            )
+        if attn_sink is not None:
+            chunk = _sink_outputs(chunk, w[start:end])
+        out[start:end].copy_(chunk)
+    return out, lse
 
 
 def flash_mla_sparse_decode_triton(
@@ -342,6 +463,17 @@ def flash_mla_sparse_decode_triton(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
+    # A prefill chunk holds both partial outputs at full size before the merge; with the kernel chunking flag and
+    # a budget, run the kernels, merge and sink per token chunk into one output instead (bitwise the same).
+    budget_mb = envs.SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB.get()
+    if budget_mb > 0 and envs.SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS.get():
+        chunk_tokens = kernel_chunk_tokens(q.shape[2], q.shape[3], budget_mb)
+        if q.shape[0] > chunk_tokens:
+            return _sparse_decode_chunked(
+                q, k_cache, indices, topk_length, attn_sink, softmax_scale,
+                extra_k_cache, extra_indices, extra_topk_length, chunk_tokens,
+            )
+
     # Process main cache (SWA)
     out, lse = _run_triton_sparse_decode(
         q,
@@ -352,6 +484,7 @@ def flash_mla_sparse_decode_triton(
     )
 
     # Process extra cache (c4 / c128) if present
+    out_extra = lse_extra = None
     if extra_k_cache is not None and extra_indices is not None:
         out_extra, lse_extra = _run_triton_sparse_decode(
             q,
@@ -360,6 +493,19 @@ def flash_mla_sparse_decode_triton(
             extra_topk_length,
             softmax_scale,
         )
+
+    # A prefill chunk's one-pass merge holds 3 fp32 copies of the output; under a
+    # budget, merge and sink in token chunks instead (bitwise the same output).
+    budget_mb = envs.SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB.get()
+    if budget_mb > 0 and (out_extra is not None or attn_sink is not None):
+        chunk_tokens = merge_chunk_tokens(out.shape[2], out.shape[3], budget_mb)
+        if out.shape[0] > chunk_tokens:
+            out, lse = _merge_and_sink_chunked(
+                out, lse, out_extra, lse_extra, attn_sink, chunk_tokens
+            )
+            return out, lse.permute(0, 2, 1)
+
+    if out_extra is not None:
         out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
 
     # Apply attention sink

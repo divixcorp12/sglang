@@ -20,13 +20,15 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
+_ROUTE_TRACE = "SGLANG_EXPERT_STREAM_TRACE"
 
 
 def validate_moe_route_trace(cfg: Any) -> None:
@@ -36,64 +38,66 @@ def validate_moe_route_trace(cfg: Any) -> None:
     run eagerly: a captured graph replays without calling the hooks, and the
     sync-free graph gather exists only to serve captured decode.
     """
-    if not envs.SGLANG_MOE_ROUTE_TRACE_DIR.get():
+    stream = stream_config()
+    route = stream.trace.route
+    if not route.dir:
         return
-    if envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get() < 1:
-        raise ValueError("SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS must be positive")
-    if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+    if route.max_tokens < 1:
+        raise ValueError(f"{_ROUTE_TRACE}'s route.max_tokens must be positive")
+    if stream.copy.graph_gather:
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_DIR is incompatible with "
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER; set SGLANG_MOE_EXPERT_GRAPH_GATHER=0"
+            f"{_ROUTE_TRACE}'s route.dir is incompatible with "
+            "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER; set SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0"
         )
     graph_config = cfg.cuda_graph_config
     if graph_config is not None and graph_config.decode.backend != Backend.DISABLED:
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_DIR traces eager decode only; use "
+            f"{_ROUTE_TRACE}'s route.dir traces eager decode only; use "
             "--cuda-graph-backend-decode disabled"
         )
     if getattr(cfg, "enable_torch_compile", False):
-        raise ValueError("SGLANG_MOE_ROUTE_TRACE_DIR does not support torch.compile")
+        raise ValueError(f"{_ROUTE_TRACE}'s route.dir does not support torch.compile")
     if any(getattr(cfg, name, 1) != 1 for name in ("tp_size", "pp_size", "dp_size")):
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_DIR requires --tp 1, --pp-size 1 and --dp 1: "
+            f"{_ROUTE_TRACE}'s route.dir requires --tp 1, --pp-size 1 and --dp 1: "
             "one scheduler writes the trace directory"
         )
     if getattr(cfg, "enable_mixed_chunk", False):
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_DIR does not support --enable-mixed-chunk: "
+            f"{_ROUTE_TRACE}'s route.dir does not support --enable-mixed-chunk: "
             "decode tokens inside mixed batches would be skipped"
         )
     if getattr(cfg, "moe_runner_backend", None) != "flashinfer_cutlass":
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_DIR requires --moe-runner-backend "
+            f"{_ROUTE_TRACE}'s route.dir requires --moe-runner-backend "
             "flashinfer_cutlass, whose TopK output carries topk_ids and topk_weights"
         )
     speculative_algorithm = getattr(cfg, "speculative_algorithm", None)
-    if not envs.SGLANG_MOE_ROUTE_TRACE_SPECULATIVE.get():
+    if not route.speculative:
         if speculative_algorithm is not None:
             raise ValueError(
-                "SGLANG_MOE_ROUTE_TRACE_DIR does not support speculative decoding "
-                "unless SGLANG_MOE_ROUTE_TRACE_SPECULATIVE=1 (NEXTN only)"
+                f"{_ROUTE_TRACE}'s route.dir does not support speculative decoding "
+                "unless route.speculative is true (NEXTN only)"
             )
         return
     if speculative_algorithm is None or str(speculative_algorithm).upper() != "NEXTN":
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE requires --speculative-algorithm NEXTN"
+            f"{_ROUTE_TRACE}'s route.speculative requires --speculative-algorithm NEXTN"
         )
     if getattr(cfg, "speculative_eagle_topk", None) != 1:
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE requires --speculative-eagle-topk 1: "
+            f"{_ROUTE_TRACE}'s route.speculative requires --speculative-eagle-topk 1: "
             "verify rows must be one draft chain per request"
         )
     if not getattr(cfg, "disable_flashinfer_autotune", False):
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE requires --disable-flashinfer-autotune: "
+            f"{_ROUTE_TRACE}'s route.speculative requires --disable-flashinfer-autotune: "
             "autotune warms the target up with a TARGET_VERIFY dummy forward the "
             "trace would record"
         )
     if graph_config is not None and graph_config.prefill.backend != Backend.DISABLED:
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE needs an eager draft model; use "
+            f"{_ROUTE_TRACE}'s route.speculative needs an eager draft model; use "
             "--cuda-graph-backend-prefill disabled (a breakable prefill backend "
             "captures draft graphs)"
         )
@@ -103,7 +107,8 @@ def handle_offload_compatibility(server_args: Any) -> None:
     """Validate generic, selected-expert, and PLE offload combinations."""
     cfg = resolving_view(server_args)
     validate_moe_route_trace(cfg)
-    streaming = envs.SGLANG_MOE_EXPERT_STREAM.get()
+    stream = stream_config()
+    streaming = stream.enabled
     if cfg.ple_offload_embedding and cfg.offload_group_size > 0:
         raise ValueError(
             "--ple-offload-embedding cannot be combined with "
@@ -113,7 +118,7 @@ def handle_offload_compatibility(server_args: Any) -> None:
     if cfg.ple_offload_embedding and cfg.cpu_offload_gb > 0 and not streaming:
         raise ValueError(
             "--ple-offload-embedding cannot be combined with --cpu-offload-gb "
-            "unless SGLANG_MOE_EXPERT_STREAM=1 limits offload to ModelOpt "
+            "unless SGLANG_EXPERT_STREAM_ENABLE=1 limits offload to ModelOpt "
             "NVFP4 routed experts."
         )
     if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
@@ -121,60 +126,57 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "--ple-offload-backend file requires --ple-offload-embedding: "
             "the file-backed table is the offloaded table."
         )
-    hot_budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
-    pinned_budget_mb = envs.SGLANG_MOE_PINNED_HOST_MB.get()
-    prefetch_candidates = envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
-    copy_backend = envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get()
-    if copy_backend not in ("gpu", "dma"):
-        raise ValueError("SGLANG_MOE_EXPERT_COPY_BACKEND must be gpu or dma")
-    graph_gather = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
-    graph_gather_scratch_rows = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get()
+    hot_budget_mb = stream.hot_cache.gpu_mb
+    pinned_budget_mb = stream.tiers.pinned_host_mb
+    prefetch_candidates = stream.prefetch.legacy_max_candidates
+    graph_gather = stream.copy.graph_gather
+    graph_gather_scratch_rows = stream.copy.graph_gather_scratch_rows
     if graph_gather_scratch_rows < 0:
         raise ValueError(
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS must be nonnegative"
+            "SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS must be nonnegative"
         )
     if graph_gather_scratch_rows and not graph_gather:
         raise ValueError(
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS requires "
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER=1"
+            "SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS requires "
+            "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1"
         )
     if graph_gather_scratch_rows and getattr(cfg, "speculative_algorithm", None) is None:
         raise ValueError(
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS caps speculative verify "
+            "SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS caps speculative verify "
             "scratch and requires speculative decoding; non-speculative decode "
             "reserves decode max_bs x top_k rows"
         )
-    if envs.SGLANG_MOE_EXPERT_HOST_ARENA.get() and pinned_budget_mb:
+    if stream.tiers.host_arena and pinned_budget_mb:
         raise ValueError(
-            "SGLANG_MOE_EXPERT_HOST_ARENA replaces the pinned expert cache; "
-            "set SGLANG_MOE_PINNED_HOST_MB=0"
+            "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA replaces the pinned expert cache; "
+            "set SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0"
         )
     if graph_gather:
         if not hot_budget_mb:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
+                "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER requires SGLANG_EXPERT_STREAM_HOT_GPU_MB"
             )
         host_source = expert_stream_requirements_for(
             server_args, cfg
         ).graph_gather_host_source
-        if host_source == "arena" and not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
+        if host_source == "arena" and not stream.tiers.host_arena:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
+                "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER requires SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA=1"
             )
         if host_source == "pinned_tier" and not pinned_budget_mb:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER over the pinned host tier requires "
-                "SGLANG_MOE_PINNED_HOST_MB"
+                "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER over the pinned host tier requires "
+                "SGLANG_EXPERT_STREAM_PINNED_HOST_MB"
             )
         if prefetch_candidates:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER cannot run with expert prefetch"
+                "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER cannot run with expert prefetch"
             )
         graph_config = cfg.cuda_graph_config
         if graph_config is not None:
             if graph_config.decode.backend == Backend.DISABLED:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires decode CUDA graphs"
+                    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER requires decode CUDA graphs"
                 )
             if (
                 graph_config.decode.backend == Backend.FULL
@@ -214,15 +216,15 @@ def handle_offload_compatibility(server_args: Any) -> None:
                 "replays; disable prefill CUDA graph capture"
             )
     if prefetch_candidates < 0:
-        raise ValueError("SGLANG_MOE_PREFETCH_MAX_CANDIDATES must be nonnegative")
+        raise ValueError("SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES must be nonnegative")
     if prefetch_candidates and (not hot_budget_mb or not pinned_budget_mb):
         raise ValueError("NVFP4 expert prefetch requires nonzero hot GPU and pinned host caches")
     if prefetch_candidates and cfg.expert_distribution_recorder_mode != "stat":
         raise ValueError("NVFP4 expert prefetch requires --expert-distribution-recorder-mode stat")
     if pinned_budget_mb < 0:
-        raise ValueError("SGLANG_MOE_PINNED_HOST_MB must be nonnegative")
+        raise ValueError("SGLANG_EXPERT_STREAM_PINNED_HOST_MB must be nonnegative")
     if hot_budget_mb == 0 and pinned_budget_mb == 0 and prefetch_candidates == 0:
-        if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
+        if stream.draft.cpu_experts:
             # The draft's CPU experts need no expert cache; their launch rules hold all the same.
             from sglang.srt.arg_groups.expert_stream_requirements_exl3 import (
                 check_dspark_cpu_experts,
@@ -231,7 +233,7 @@ def handle_offload_compatibility(server_args: Any) -> None:
             check_dspark_cpu_experts(cfg)
         return
     if hot_budget_mb < 0:
-        raise ValueError("SGLANG_MOE_HOT_GPU_MB must be nonnegative")
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_GPU_MB must be nonnegative")
     # Each expert format declares its own launch requirements; a launch whose
     # quantization method is not known yet keeps the NVFP4 requirements.
     expert_stream_requirements_for(server_args, cfg).check(
@@ -280,6 +282,7 @@ def handle_gpu_memory_settings(server_args: Any):
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
     decode_cuda_graph_config = cuda_graph_config.decode
     prefill_cuda_graph_config = cuda_graph_config.prefill
+    decode_max_bs_is_default = decode_cuda_graph_config.max_bs is None
 
     # ------------------------------------------------------------------
     # GPU-dependent capacity defaults
@@ -377,6 +380,14 @@ def handle_gpu_memory_settings(server_args: Any):
             )
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
+
+    if (
+        decode_max_bs_is_default
+        and cfg.max_running_requests is not None
+        and decode_cuda_graph_config.max_bs is not None
+        and decode_cuda_graph_config.max_bs > cfg.max_running_requests
+    ):
+        decode_cuda_graph_config.max_bs = cfg.max_running_requests
 
     from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
         expand_multimodal_decode_graph_to_running_limit,
@@ -561,14 +572,14 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         reserved_mem += decode_cuda_graph_config.max_bs * 2
 
     if (
-        resolved_view(server_args).enable_dp_attention
+        attn_dp_enabled_of(resolved_view(server_args))
         and cfg.disaggregation_mode != "prefill"
     ):
         # DP attention needs more padding for some operations, and much more for large
         # cuda graph max bs (torch allocator / implementation inefficiencies).
-        reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 3
+        reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 3
         if decode_cuda_graph_config.max_bs > 300:
-            reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 1.5
+            reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 1.5
 
     if (
         cfg.disaggregation_mode != "decode"

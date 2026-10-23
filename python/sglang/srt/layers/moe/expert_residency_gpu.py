@@ -24,6 +24,11 @@ import torch
 
 from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import (
+    ExpertStreamConfig,
+    PullMode,
+    stream_config,
+)
 from sglang.srt.layers.moe.expert_residency import (
     decide_residency_on_device,
     residency_rank_keys,
@@ -39,13 +44,16 @@ _READY = 3
 # Index into the [2, layers] promotion and eviction counters.
 _DECODE_PHASE = 0
 _PREFILL_PHASE = 1
-# SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE values.
+# residency.insert_on_miss_stage values.
 _STAGE_OFF = 0
 _STAGE_SCRATCH = 1
 _STAGE_DIRECT = 2
 # Above every residency_rank_keys key of a nonnegative score: sign-bit-0 float32 bits
 # shifted left by 16 stay below 2**47. Adding it ranks a routed expert after all others.
 _ROUTED_RANK_OFFSET = 1 << 48
+# Above every key, routed or not (< 2**49). Probation adds it to the residents off probation, so a slot on probation
+# ranks before all of them and after the free slots' negative keys.
+_SETTLED_RANK_OFFSET = 1 << 50
 
 
 class GpuResidencyUpdater:
@@ -81,7 +89,9 @@ class GpuResidencyUpdater:
     * Stage 2 (DIRECT): the boundary only ranks a victim shortlist. The next
       forward's gather sends its miss copies straight into the shortlisted slots and
       commits residency in the same graph (:meth:`_init_insert_direct` states the
-      capacity guarantee).
+      capacity guarantee). With ``insert_probation`` a slot a gather inserted into
+      stays on probation, ranked ahead of every other resident for eviction, until a
+      later window routes it again (:meth:`_update_probation`).
 
     Device-to-device row copies were measured on the RTX 5090 over a 4.9 GiB working
     set, which is the size the production loop runs in (48 layers x 6 tensors per
@@ -100,7 +110,11 @@ class GpuResidencyUpdater:
         insert_on_miss: bool | int = False,
         insert_on_miss_decay: float = 0.98,
         fused_insert: bool = False,
+        insert_eager_counts: bool = True,
+        insert_probation: bool = False,
+        config: ExpertStreamConfig | None = None,
     ) -> None:
+        self.stream_config = stream_config() if config is None else config
         layer_ids = [
             layer_id
             for layer_id in manager._layer_ids
@@ -145,7 +159,9 @@ class GpuResidencyUpdater:
         self.promotion_margin = policies[0].promotion_margin
         self.promotion_sigmas = policies[0].promotion_sigmas
         capacities = [cache.capacity for cache in caches]
-        self.max_capacity = max(capacities)
+        # Banks span each cache's upper bound, so startup calibration can grow a layer in place
+        # (hot_cache_retire.set_hot_capacity); without it upper_capacity equals capacity.
+        self.max_capacity = max(getattr(cache, "upper_capacity", cache.capacity) for cache in caches)
         self.max_promotions = max(
             1, min(index(max_promotions), max(self.max_capacity, 1))
         )
@@ -230,11 +246,33 @@ class GpuResidencyUpdater:
         self.insert_direct = self.insert_stage == _STAGE_DIRECT
         self.insert_on_miss_decay = float(insert_on_miss_decay)
         self.fused_insert = bool(fused_insert)
+        self.insert_eager_counts = bool(insert_eager_counts)
+        if not self.insert_eager_counts and not self.insert_on_miss:
+            raise ValueError(
+                "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS=0 shapes the insert-on-miss score; "
+                "it needs SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE"
+            )
+        self.insert_probation = bool(insert_probation)
+        if self.insert_probation and not self.insert_direct:
+            raise ValueError(
+                "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION ranks DIRECT's victims; "
+                f"it needs SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE={_STAGE_DIRECT}"
+            )
+        # residency.insert_eager_counts False: the eager (record_routes) share of route_counts since each layer's
+        # last boundary, which the insert score leaves out.
+        self.eager_counts = None
+        # residency.insert_probation: per slot, whether it is on probation, and the slot_to_expert the last
+        # boundary saw, whose difference names the slots this window's gathers inserted into.
+        self.probation = None
+        self.boundary_slot_expert = None
         self.insert_scores = None
         self.insert_tensors = None
         self.insert_active = None
         self.victims = None
         self.miss_keys = None
+        # A lane_head.LaneHead when SGLANG_OPT_LANE_HEAD_PATH is set (expert_hot_cache.from_model installs it). Its
+        # per-request state restarts at every prefill and after capture.
+        self.lane_head = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -263,7 +301,7 @@ class GpuResidencyUpdater:
                 return values
         raise ValueError(
             "GPU residency update cannot tabulate this decay exactly; "
-            "lower SGLANG_MOE_HOT_DECAY_TOKENS"
+            "lower SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS"
         )
 
     def _init_insert_on_miss(self) -> None:
@@ -288,11 +326,16 @@ class GpuResidencyUpdater:
             self.miss_rows, dtype=torch.long, device=device
         )
         self.insert_scores = self.scores.clone()
+        if not self.insert_eager_counts:
+            self.eager_counts = torch.zeros_like(self.route_counts)
+            for row, policy in enumerate(self.policies):
+                policy._eager_counts = self.eager_counts[row]
+        # 1 << 18 tokens reaches a float32 zero for any decay up to about 0.9996 (0.999 needs ~103k).
         values = (
             [1.0, 1.0]
             if self.insert_on_miss_decay == 1.0
             else self._tabulate_decay(
-                lambda tokens: self.insert_on_miss_decay**tokens, 1 << 16
+                lambda tokens: self.insert_on_miss_decay**tokens, 1 << 18
             )
         )
         self.insert_decay_table_tokens = len(values) - 1
@@ -368,21 +411,21 @@ class GpuResidencyUpdater:
         ``victim_lanes`` shortlist columns are victims, so the floor is ``2 * victim_lanes``.
         """
         width = self.miss_rows
-        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
-        if victims and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        victims = self.stream_config.copy.graph_gather_victim_lanes
+        if victims and not self.stream_config.cpu_experts.enabled:
             raise ValueError(
-                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} needs SGLANG_DSV41_CPU_EXPERTS=1: only the "
-                "CPU serves the lanes that take no victim"
+                f"SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES={victims} needs "
+                "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1: only the CPU serves the lanes that take no victim"
             )
         if victims and not 1 <= victims < width:
             raise ValueError(
-                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {width} miss lanes"
+                f"SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {width} miss lanes"
             )
         if victims and any(s.graph_miss_width != s.graph_gather_rows for s in self.streamers):
             # A lane per route: a verify's distinct misses never outnumber its lanes, so nothing is clamped.
             raise ValueError(
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"
+                "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
+                "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES"
             )
         # Lanes that may take a victim; the rest are the CPU's (the post's spill).
         self.victim_lanes = victims or width
@@ -394,18 +437,18 @@ class GpuResidencyUpdater:
             # per-expert scalars (8 B/row in production) are on that kernel otherwise.
             if (
                 not streamer._graph_host_pair_count
-                and getattr(streamer.format, "key", None) != "exl3"
+                and not streamer.format.engine_served
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
                     f"layer {layer_id} keeps every streamed tensor on the device"
                 )
         for layer_id, cache in zip(self.layer_ids, self.caches):
             if cache.capacity < 2 * self.victim_lanes:
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
                     f"twice its graph-gather victim lanes; layer {layer_id} has {cache.capacity} "
-                    f"slots for {self.victim_lanes} lanes. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
+                    f"slots for {self.victim_lanes} lanes. Raise SGLANG_EXPERT_STREAM_HOT_GPU_MB or use stage 1."
                 )
         device, layers = self.device, self.num_layers
         # Shortlisted slots per layer, and which of those columns name a real slot.
@@ -414,6 +457,9 @@ class GpuResidencyUpdater:
             (layers, width), dtype=torch.bool, device=device
         )
         self.victims_fresh = False
+        if self.insert_probation:
+            self.probation = torch.zeros_like(self.slot_to_expert, dtype=torch.bool)
+            self.boundary_slot_expert = self.slot_to_expert.clone()
         self.gather_lanes = torch.arange(width, dtype=torch.long, device=device)
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.gather_evictions = torch.zeros(layers, dtype=torch.long, device=device)
@@ -446,7 +492,7 @@ class GpuResidencyUpdater:
             for dtype in (torch.int32, torch.int64)
         }
 
-    def check_miss_plans(self) -> None:
+    def check_miss_plans(self, config: ExpertStreamConfig | None = None) -> None:
         """Refuse every backend that could write a cache row this mode does not control.
 
         The refusals are one guard because together they are the whole safety
@@ -462,28 +508,29 @@ class GpuResidencyUpdater:
           overwrite a slot the mapping has already committed.
         * A prefetch pull owns a dedicated row, covers routes that then never enter
           residency, and reads cache rows from a side stream.
+
+        ``config`` defaults to the process's ``stream_config()``.
         """
+        config = stream_config() if config is None else config
         if self.insert_direct:
-            exl3 = [getattr(s.format, "key", None) == "exl3" for s in self.streamers]
-            if any(exl3) and not all(exl3):
+            engine_served = [s.format.engine_served for s in self.streamers]
+            if any(engine_served) and not all(engine_served):
                 raise ValueError(
                     "EXL3 DIRECT requires every GPU-updated layer to use EXL3"
                 )
 
         if (
             self.insert_direct
-            and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
+            and config.prefetch.shadow.pull_mode is not PullMode.OFF
         ):
             raise ValueError(
-                "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs "
-                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE=off: a side-stream pull reads and writes "
+                "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 needs "
+                "SGLANG_EXPERT_STREAM_SHADOW_PREFETCH pull_mode=off: a side-stream pull reads and writes "
                 "cache rows this mode commits residency for"
             )
         for streamer in self.streamers:
-            if self.insert_direct and getattr(streamer.format, "key", None) == "exl3":
-                from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
-
-                if not isinstance(streamer.row_backend, Exl3RamMissRowBackend):
+            if self.insert_direct and streamer.format.engine_served:
+                if not streamer.row_backend.leased:
                     raise ValueError(
                         "EXL3 DIRECT requires the native EXL3 RAM-miss backend"
                     )
@@ -493,16 +540,16 @@ class GpuResidencyUpdater:
                 or plan.count.data_ptr() != streamer._graph_miss_count.data_ptr()
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan, "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan, "
                     "not plan buffers posted by another backend"
                 )
             if (
                 self.insert_direct
                 and streamer.pinned_host_cache is not None
-                and getattr(streamer.format, "key", None) != "exl3"
+                and not streamer.format.engine_served
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
                     "pinned host cache"
                 )
 
@@ -523,6 +570,8 @@ class GpuResidencyUpdater:
         Called at the first streamed layer's graph gather. Without decode boundaries
         the forward is only counted.
         """
+        if getattr(self.manager, "prefill_lend_active", False):
+            raise RuntimeError("a graph gather ran while a layer-major pass has hot-cache slots lent")
         if self.update_decode_forwards > 0:
             self._apply(
                 self.boundary_pending & self.enabled, self.max_promotions, _DECODE_PHASE
@@ -553,6 +602,9 @@ class GpuResidencyUpdater:
         """
         if kind is ForwardKind.DRAFT:
             return
+        if kind is ForwardKind.PREFILL and self.lane_head is not None:
+            # A request starts: the head's score and age features count its verifies only, as in training.
+            self.lane_head.reset()
         if graph_served:
             self.host_pending = False
             if kind is not ForwardKind.DECODE and kind is not ForwardKind.VERIFY:
@@ -576,6 +628,9 @@ class GpuResidencyUpdater:
         self.boundary_pending.fill_(False)
         self.host_pending = False
         self.enabled.fill_(True)
+        if self.lane_head is not None:
+            # Warm-up and capture gathers ran the head on dummy routes.
+            self.lane_head.reset()
         if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(False)
         if self.insert_direct:
@@ -587,6 +642,12 @@ class GpuResidencyUpdater:
             # measures serving, not the warm-up.
             self.gather_insertions.zero_()
             self.gather_evictions.zero_()
+            if self.eager_counts is not None:
+                self.eager_counts.zero_()
+            if self.probation is not None:
+                # The capture's dummy inserts are not newcomers demand chose.
+                self.probation.zero_()
+                self.boundary_slot_expert.copy_(self.slot_to_expert)
             # Rank a shortlist eagerly: the first replay reads it before any boundary
             # runs, and a capture-time shortlist would name pre-warm-up slots.
             self._rank_victims(self.route_counts > 0)
@@ -601,6 +662,8 @@ class GpuResidencyUpdater:
         }
         for name, counter in self.insertion_counters().items():
             snapshot[name] = counter.cpu().tolist()
+        if self.lane_head is not None:
+            snapshot["lane_head_gathers"] = self.lane_head.gather_ct.cpu().tolist()
         return snapshot
 
     def insertion_counters(self) -> dict[str, torch.Tensor]:
@@ -645,7 +708,15 @@ class GpuResidencyUpdater:
 
     def _apply(self, gate: torch.Tensor, width: int, phase: int) -> None:
         """Run one masked boundary: every tensor keeps its value where ``gate`` is false."""
+        if getattr(self.manager, "prefill_lend_active", False):
+            raise RuntimeError("a residency boundary ran while a layer-major pass has hot-cache slots lent")
         inserting = self.insert_on_miss and phase == _DECODE_PHASE
+        insert_counts = self.route_counts
+        if self.eager_counts is not None:
+            # Eager routes are recorded before an eager forward's first gather flushes the pending boundary, so they
+            # can sit in any boundary's window; whichever window holds them, the insert score skips them.
+            insert_counts = self.route_counts - self.eager_counts
+            self.eager_counts.masked_fill_(gate, 0.0)
         if self.insert_on_miss:
             insert_decay = self.insert_decay_table.index_select(
                 0, self.tokens.clamp(max=self.insert_decay_table_tokens)
@@ -653,11 +724,13 @@ class GpuResidencyUpdater:
             self.insert_scores.copy_(
                 torch.where(
                     gate,
-                    self.insert_scores * insert_decay + self.route_counts,
+                    self.insert_scores * insert_decay + insert_counts,
                     self.insert_scores,
                 )
             )
-        routed = self.route_counts > 0 if self.insert_on_miss else None
+        routed = insert_counts > 0 if self.insert_on_miss else None
+        if self.probation is not None:
+            self._update_probation(gate, routed, inserting)
         decay = self.decay_table.index_select(
             0, self.tokens.clamp(max=self.decay_table_tokens)
         )
@@ -682,8 +755,7 @@ class GpuResidencyUpdater:
                 self.insert_direct
                 and phase == _PREFILL_PHASE
                 and any(
-                    getattr(streamer.format, "key", None) == "exl3"
-                    for streamer in self.streamers
+                    streamer.format.engine_served for streamer in self.streamers
                 )
             ):
                 self._promote(eligible, width, phase)
@@ -861,11 +933,28 @@ class GpuResidencyUpdater:
         )
         self.plans_fresh.masked_fill_(gate, False)
 
+    def _update_probation(self, gate: torch.Tensor, routed: torch.Tensor, inserting: bool) -> None:
+        """Put the slots this window's gathers inserted into on probation; release those routed again.
+
+        A slot whose expert changed since the last boundary was inserted into during this window. Its own miss
+        routed it, so that route does not release it: a later window's route does. Only a decode boundary's
+        gathers insert; a slot another boundary rewrote (a prefill promotion) leaves probation.
+        """
+        slot_experts = self.slot_to_expert
+        changed = slot_experts != self.boundary_slot_expert
+        slot_routed = routed.gather(1, slot_experts.clamp(min=0)) & (slot_experts >= 0)
+        kept = self.probation & ~slot_routed & ~changed
+        if inserting:
+            kept = kept | (changed & (slot_experts >= 0))
+        self.probation.copy_(torch.where(gate, kept, self.probation))
+        self.boundary_slot_expert.copy_(torch.where(gate, slot_experts, self.boundary_slot_expert))
+
     def _rank_victims(self, routed: torch.Tensor) -> None:
         """Propose each layer's next ``miss_rows`` victim slots.
 
         Free slots come first, then the lowest-scored residents, those this window did
-        not route ahead of those it did.
+        not route ahead of those it did. With probation, the residents on probation
+        come before all others, in the same order among themselves.
 
         This is only a proposal. It is ranked before the next forward's routing is
         known, so it may name a slot that forward reads; the gather that commits
@@ -882,6 +971,8 @@ class GpuResidencyUpdater:
         )
         expert_keys = self._expert_rank_keys(routed)
         rank = expert_keys.gather(1, slot_experts)
+        if self.probation is not None:
+            rank = torch.where(self.probation, rank, rank + _SETTLED_RANK_OFFSET)
         never = torch.iinfo(torch.int64).max
         keys = torch.full(
             (self.num_layers, self.victim_columns),
@@ -1069,11 +1160,11 @@ class GpuResidencyUpdater:
         if self.layer_fusion:
             self._fused_commit_gather(row, streamer, destinations, live)
             return
-        if getattr(backend, "name", None) == "exl3_ram_miss" and backend.cpu_experts:
+        if backend.leased and backend.cpu_experts:
             raise RuntimeError(
                 "CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its commit leaves CPU lanes out"
             )
-        if getattr(backend, "name", None) == "exl3_ram_miss":
+        if backend.leased:
             delivered = backend.delivered_count.long()
             live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
         self._commit_gather(row, streamer, destinations, live)
@@ -1110,7 +1201,7 @@ class GpuResidencyUpdater:
         self.gather_insertions[row].add_(live.sum())
         self.gather_evictions[row].add_(evicted.sum())
         backend = streamer.row_backend
-        if getattr(backend, "name", None) == "exl3_ram_miss":
+        if backend.leased:
             delivered = backend.delivered_count.long()
             good = backend.keep[0] > 0
             self.insertion_truncated[row].add_(
@@ -1130,7 +1221,7 @@ class GpuResidencyUpdater:
         )
 
         backend = streamer.row_backend
-        leased = getattr(backend, "name", None) == "exl3_ram_miss"
+        leased = backend.leased
         direct_commit_gather(
             destinations,
             live,

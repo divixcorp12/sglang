@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import functools
 import glob
 import logging
 import mmap
@@ -29,10 +30,15 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_EXTEND,
     MODE_VERIFY,
     engram_commit_history,
+    engram_hash_extend_and_commit,
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+    find_loaded_library,
+)
+from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
@@ -54,7 +60,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
     retain_for_current_graph,
 )
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -149,15 +155,36 @@ def _graphable_lookup_shape(indices: torch.Tensor, mode) -> bool:
     )
 
 
-def _device_wait_lookup(embed: EngramEmbedding, indices: torch.Tensor) -> torch.Tensor:
+def _device_wait_lookup(
+    embed: EngramEmbedding, indices: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
     lookup = embed._posted_lookup
     embed._posted_lookup = None
     if lookup is None:
         # No early post (a caller outside DeepseekV4Model's layer loop): post here.
         lookup = _EngramDeviceWaitLookup(embed.file_table, indices)
-        lookup.post(indices)
+        lookup.post(mask_dead_lookup_rows(indices, embed.verify_dead_rows, forward_batch))
     retain_for_current_graph(lookup)
     return lookup.wait(embed.file_table, indices)
+
+
+# A dead verify row's hash id (layers/moe/verify_dead_rows.py). The native Store serves it a zero row and counts
+# no access; it must match kDeadRowId in engram_host_node.cpp.
+DEAD_ROW_ID = -1
+
+
+def mask_dead_lookup_rows(
+    indices: torch.Tensor, dead: Optional[torch.Tensor], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """[T, n_hash_cols] ``indices`` with every dead row's ids set to DEAD_ROW_ID; the identity outside a target
+    verify of at most ``dead.shape[0]`` tokens, so decode, prefill and bs > 1 verifies are untouched."""
+    if (
+        dead is None
+        or not forward_batch.forward_mode.is_target_verify()
+        or indices.shape[0] > dead.shape[0]
+    ):
+        return indices
+    return torch.where(dead[: indices.shape[0]], DEAD_ROW_ID, indices)
 
 
 def post_engram_device_lookups(
@@ -174,7 +201,9 @@ def post_engram_device_lookups(
             embed, indices, forward_batch
         ):
             embed._posted_lookup = _EngramDeviceWaitLookup(embed.file_table, indices)
-            embed._posted_lookup.post(indices)
+            embed._posted_lookup.post(
+                mask_dead_lookup_rows(indices, embed.verify_dead_rows, forward_batch)
+            )
 
 
 # Arbitrary: far above the host node's 33.8 ms worst case, short enough that a lost
@@ -291,10 +320,13 @@ def _engram_file_table_lookup(file_table, indices):
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
+_is_hip = is_hip()
+
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
-    """True where the Triton kernels apply; ROCm and CPU take the torch paths."""
-    return t.is_cuda and is_cuda()
+    """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
+    take the torch paths."""
+    return t.is_cuda and (is_cuda() or is_gfx95_supported())
 
 
 def _is_prime(n: int) -> bool:
@@ -475,6 +507,11 @@ class EngramHasher(nn.Module):
         self.image_token_id: Optional[int] = None
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        # typing only
+        self.token_map: torch.Tensor
+        self.multipliers: torch.Tensor
+        self.primes: torch.Tensor
+        self.offsets: torch.Tensor
 
     def init_history(self, num_req_slots: int, device) -> None:
         """Allocate oldest-first history with a spare row for graph padding."""
@@ -521,6 +558,33 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if (
+            mode.is_extend()
+            and not mode.is_target_verify()
+            and envs.SGLANG_OPT_ENGRAM_EXTEND_HASH.get()
+            and _cuda_kernels(input_ids)
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            history = forward_batch.engram_history
+            return engram_hash_extend_and_commit(
+                input_ids,
+                forward_batch.positions,
+                history=self.history if history is None else history,
+                commit_history=self.history,
+                req_slots=forward_batch.req_pool_indices,
+                starts=forward_batch.extend_start_loc,
+                lengths=forward_batch.extend_seq_lens,
+                num_real=sum(forward_batch.extend_seq_lens_cpu),
+                history_via_slots=history is None,
+                out_cache_loc=forward_batch.out_cache_loc,
+                token_map=self.token_map,
+                multipliers=self.multipliers,
+                primes=self.primes,
+                offsets=self.offsets,
+                pad_id=self.pad_id,
+                image_token_id=self.image_token_id,
+                mm_pad_shift=MM_PAD_SHIFT_VALUE,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
@@ -545,7 +609,13 @@ class EngramHasher(nn.Module):
             )
             lens = forward_batch.extend_seq_lens.to(torch.int64)
             starts = forward_batch.extend_start_loc.to(torch.int64)
-            row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
+            lens_cpu = forward_batch.extend_seq_lens_cpu
+            row = torch.repeat_interleave(
+                torch.arange(bs, device=device),
+                lens,
+                # The host total skips the device sum's sync.
+                output_size=sum(lens_cpu) if lens_cpu is not None else None,
+            )
             num_real = row.shape[0]
             kmode = MODE_EXTEND
             if forward_batch.engram_history is not None:
@@ -780,6 +850,39 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+@functools.cache
+def _hip_runtime() -> ctypes.CDLL:
+    """
+    torch.cuda.cudart() does not expose hipHostGetDevicePointer, so call it
+    through ctypes to map a registered host address to its device address.
+    """
+    path = find_loaded_library("libamdhip64")
+    if path is None:
+        raise RuntimeError("libamdhip64 is not loaded in the current process")
+    lib = ctypes.CDLL(path)
+    lib.hipHostGetDevicePointer.restype = ctypes.c_int
+    lib.hipHostGetDevicePointer.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    ]
+    return lib
+
+
+def _registered_device_ptr(host_ptr: int) -> int:
+    """
+    Address kernels must use for registered host memory.
+    UVA makes it the host address on CUDA; HIP may map it elsewhere.
+    """
+    if not _is_hip:
+        return host_ptr
+    device_ptr = ctypes.c_void_p()
+    err = _hip_runtime().hipHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
+    if err != 0 or not device_ptr.value:
+        raise RuntimeError(f"hipHostGetDevicePointer failed: {err}")
+    return device_ptr.value
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -828,6 +931,7 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -921,6 +1025,8 @@ class EngramEmbedding(nn.Module):
         self.host_table: Optional[_HostTable] = None
         self.file_table: Optional[EngramFileTable] = None
         self._posted_lookup: Optional[_EngramDeviceWaitLookup] = None
+        # [max_rows, 1] bool: a speculative verify's dead rows (attach_verify_dead_rows), or None.
+        self.verify_dead_rows: Optional[torch.Tensor] = None
         table_dir = envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get()
         if table_dir:
             if self.tp_size != 1:
@@ -959,10 +1065,17 @@ class EngramEmbedding(nn.Module):
         scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
+        device_ptr = self.host_table.device_ptr
+        self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
 
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
+
+    def _table_ptrs(self) -> tuple[int, int]:
+        if self.host_table is None:
+            return self.weight.data_ptr(), self.scale.data_ptr()
+        return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
@@ -990,7 +1103,7 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             if _captures_native_lookup(self, indices, forward_batch):
                 if envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get():
-                    return _device_wait_lookup(self, indices)
+                    return _device_wait_lookup(self, indices, forward_batch)
                 return _capture_engram_file_lookup(self.file_table, indices)
             return _engram_file_table_lookup(self.file_table, indices)
         if self._shared:
@@ -998,8 +1111,7 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             out = self._empty(indices)
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                *self._table_ptrs(),
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
@@ -1028,8 +1140,17 @@ class EngramEmbedding(nn.Module):
             return self._empty(indices)
         values = self._owned_rows(indices)
         if self.tp_size > 1:
-            values = tensor_model_parallel_all_reduce(values)
+            values = self._reduce_owned_rows(values)
         return values
+
+    def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
+        if _is_hip and values.is_cuda:
+            # Integer addition preserves all BF16 bits because exactly one shard owns each row.
+            inplace_all_reduce(
+                values.view(torch.int32), group_name=get_parallel().tp_group.unique_name
+            )
+            return values
+        return tensor_model_parallel_all_reduce(values)
 
     def _empty(self, indices: torch.Tensor) -> torch.Tensor:
         return torch.empty(
@@ -1049,8 +1170,7 @@ class EngramEmbedding(nn.Module):
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            *self._table_ptrs(),
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
@@ -1086,9 +1206,14 @@ class EngramEmbedding(nn.Module):
             and self.tp_size == get_parallel().attn_dp_size
             and rows == self.tp_size * local.shape[0]
         ) or is_dp_gatherv_active():
-            dp_reduce_scatter_tensor(local, values)
+            if _is_hip and values.is_cuda:
+                dp_reduce_scatter_tensor(
+                    local.view(torch.int32), values.view(torch.int32)
+                )
+            else:
+                dp_reduce_scatter_tensor(local, values)
         else:
-            dp_scatter(local, tensor_model_parallel_all_reduce(values), forward_batch)
+            dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
         return local.view(*indices.shape, self.dim)
 
 

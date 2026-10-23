@@ -25,7 +25,9 @@ TASK1_VERDICT_PATH = (
     "/data/models/slang/nvfp4-work/cc-expert-prediction"
     "/analysis/dsv41-drive/task1_arm_verdict.py"
 )
-TASK1_VERDICT_SHA256 = "0bcd9a26282c5c24b3e35bbe3374e49467165dcbc04bf346a32de9b2d72fb770"
+# Re-pinned by F145 P3-H2c (66f7812601): the file now reads an arm json's environment under both the old env names and
+# the new group envs (read again before re-pinning; the verdict logic is unchanged). Was 0bcd9a26282c5c24...
+TASK1_VERDICT_SHA256 = "27ed75c9b42321035841c38ad4250be9afc95cb96ea7f9020aa99617b50c59b3"
 
 
 class Task1VerdictHashMismatchError(RuntimeError):

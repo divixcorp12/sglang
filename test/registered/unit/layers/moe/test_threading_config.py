@@ -25,9 +25,16 @@ DIVIX01 = {0: "0-17,36-53", 1: "18-35,54-71"}
 SERVER = frozenset(parse_cpu_list("0-7,16,36-52"))
 
 
+LEGACY_RESERVED = frozenset(range(64, 72))
+REAL_RESERVED = frozenset(range(52, 56)) | frozenset(range(108, 112))
+
+
 @pytest.fixture(autouse=True)
-def fresh_shared_spec_core_warnings():
+def fresh_shared_spec_core_warnings(monkeypatch):
+    """The rule tests below run on a synthetic 72-CPU machine (the 18-core CPUs divix01 had until 2026-10-21), so they
+    reserve that machine's 64-71. The real box's layout is pinned by the 8280 tests at the end."""
     tc._warned_shared_spec_cores.clear()
+    monkeypatch.setattr(tc, "RESERVED_CORES", LEGACY_RESERVED)
 
 
 def fake_sysfs(root, nodes, pairs):
@@ -89,7 +96,7 @@ def test_sqpoll_takes_the_next_usable_core_below_the_ram_core(divix01):
 
 
 def test_two_nodes_without_cpu_experts_pin_only_the_ram_threads(divix01):
-    config = resolve(divix01, spin_core=17)
+    config = resolve(divix01, numa_cores="0:ram=17")
     assert [(p.ram, p.cpu, p.busy_poll) for p in config.plans] == [(17, (), True), (35, (), True)]
 
 
@@ -98,13 +105,13 @@ def test_one_node_without_numa_or_cpu_experts_is_todays_runtime(divix01):
     config = resolve(divix01, nodes=(0,), affinity=everything)
     assert config.plans == (NodePlan(group=0, node=0, ram=None, cpu=(), sq=None, busy_poll=False),)
     assert config.copy_cpus == ()
-    pinned = resolve(divix01, nodes=(0,), affinity=everything, spin_core=17, sq_thread_cpu=15, sqpoll=True)
+    pinned = resolve(divix01, nodes=(0,), affinity=everything, numa_cores="0:ram=17,sq=15", sqpoll=True)
     assert pinned.plans[0] == NodePlan(group=0, node=0, ram=17, cpu=(), sq=15, busy_poll=True)
 
 
 def test_a_reserved_sq_core_is_refused_without_the_derivation(divix01):
     with pytest.raises(ValueError, match="64-71"):
-        resolve(divix01, nodes=(0,), affinity=frozenset(range(72)), sqpoll=True, sq_thread_cpu=70)
+        resolve(divix01, nodes=(0,), affinity=frozenset(range(72)), sqpoll=True, numa_cores="0:sq=70")
 
 
 def test_the_override_replaces_the_plans_of_the_nodes_it_names(divix01):
@@ -116,7 +123,7 @@ def test_the_override_replaces_the_plans_of_the_nodes_it_names(divix01):
 
 
 def test_cpu_experts_cores_is_the_cpu_override_of_its_node(divix01):
-    config = resolve(divix01, cpu_experts=True, cores="20-23")
+    config = resolve(divix01, cpu_experts=True, numa_cores="1:cpu=20-23")
     assert config.plans[1].cpu == (20, 21, 22, 23) and config.plans[1].ram == 35
 
 
@@ -136,20 +143,11 @@ def test_a_server_affinity_covering_a_node_is_refused(divix01):
         ({"numa_cores": "1:ram=17,cpu=18-33"}, "core 17 is on node 0"),
         ({"numa_cores": "1:ram=35,cpu=18-33,54"}, "cores 18 and 54 share a physical core"),
         ({"numa_cores": "2:ram=35,cpu=18-33"}, "node 2 is not one of the tier's nodes"),
-        ({"numa_cores": "1:ram=35,cpu=18-33", "cores": "20-23"}, "both"),
-        ({"cores": "10-11,20-21"}, "two nodes"),
-        ({"cores": "18-29", "nodes": (0,)}, "core 18 is on node 1"),
-        ({"spin_core": 8}, "core 8 shares a physical core with the server's affinity"),
+        ({"numa_cores": "0:cpu=10-11,20-21"}, "core 20 is on node 1"),
+        ({"numa_cores": "0:cpu=18-29", "nodes": (0,)}, "core 18 is on node 1"),
+        ({"numa_cores": "0:ram=8"}, "core 8 shares a physical core with the server's affinity"),
         ({"affinity": SERVER | frozenset(range(8, 18))}, "node 0 has no core .* for the copy thread"),
         ({"numa_cores": "1:ram=35,cpu=18-33,sq=34"}, "node 1 sets an SQPOLL core, but .* is not sqpoll"),
-        (
-            {"numa_cores": "1:ram=34,cpu=18-33", "spin_core": 35},
-            "node 1's RAM core is set both by SGLANG_DSV41_RAM_MISS_SPIN_CORE and SGLANG_EXPERT_NUMA_CORES",
-        ),
-        (
-            {"numa_cores": "0:sq=15,cpu=8-14", "nodes": (0,), "sq_thread_cpu": 14},
-            "node 0's SQPOLL core is set both by SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU and SGLANG_EXPERT_NUMA_CORES",
-        ),
     ],
 )
 def test_each_refusal(divix01, settings, match):
@@ -179,7 +177,7 @@ def test_an_engine_core_refusal_names_the_node(divix01):
 )
 def test_a_malformed_core_list_names_the_variable_and_the_entry(spec, entry):
     """Mutation: parse_cpu_list's bare `invalid literal for int()` escapes."""
-    with pytest.raises(ValueError, match=r"SGLANG_EXPERT_NUMA_CORES") as caught:
+    with pytest.raises(ValueError, match=r"SGLANG_EXPERT_STREAM_NUMA_CORES") as caught:
         parse_numa_cores(spec)
     assert entry in str(caught.value) and "invalid literal" not in str(caught.value)
 
@@ -188,6 +186,8 @@ def test_a_malformed_core_list_names_the_variable_and_the_entry(spec, entry):
     "spec, match",
     [
         ("1:ram=35;1:ram=34", "twice"),
+        ("1:ram=34,cpu=18-33,ram=35", "node 1 sets ram twice"),
+        ("1:ram=34,sq=15,sq=16", "node 1 sets sq twice"),
         ("x:ram=1", "node"),
         ("1:foo=3", "unknown key"),
         ("1:ram=34-35", "one core"),
@@ -236,17 +236,15 @@ def test_from_env_reads_every_core_setting(monkeypatch):
     monkeypatch.setattr(Topology, "from_sysfs", classmethod(lambda cls, root=tc.SYSFS: "topology"))
     monkeypatch.setattr(tc, "_affinity", lambda: frozenset({0, 1}))
     monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
-    with envs.SGLANG_DSV41_CPU_EXPERTS_CORES.override("18-29"), \
-            envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.override(4), \
-            envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.override(17), \
-            envs.SGLANG_EXPERT_STREAM_URING_MODE.override("sqpoll_iopoll"), \
-            envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.override(15), \
-            envs.SGLANG_EXPERT_NUMA_CORES.override("1:ram=35,cpu=18-33"), \
-            envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"), \
-            envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.override(True), \
-            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override("6-11"), \
-            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.override(3), \
-            envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
+    with envs.SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS.override(4), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT.override(True), \
+            envs.SGLANG_EXPERT_STREAM_URING.override('{"mode": "sqpoll_iopoll"}'), \
+            envs.SGLANG_EXPERT_STREAM_NUMA_CORES.override("1:ram=35,cpu=18-29,sq=15"), \
+            envs.SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS.override(True), \
+            envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override("6-11"), \
+            envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS.override(3), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True):
         assert ThreadingConfig.from_env(cpu_experts=True, device=None) == "resolved"
     assert seen == {
         "nodes": [1, 0],
@@ -254,10 +252,30 @@ def test_from_env_reads_every_core_setting(monkeypatch):
         "affinity": frozenset({0, 1}),
         "topology": "topology",
         "settings": CoreSettings(
-            cpu_experts=True, cores="18-29", threads=4, spin_core=17, sqpoll=True, sq_thread_cpu=15,
-            numa_cores="1:ram=35,cpu=18-33", draft=True, draft_cores="6-11", draft_threads=3, ram_prefetch=True,
+            cpu_experts=True, threads=4, smt=True, sqpoll=True,
+            numa_cores="1:ram=35,cpu=18-29,sq=15", draft=True, draft_cores="6-11", draft_threads=3, ram_prefetch=True,
         ),
     }
+
+
+def test_from_env_gives_the_ram_prefetch_no_cores_when_every_streamed_layer_is_full(monkeypatch):
+    """Every expert mapped in RAM leaves the prefetch nothing to read, so its speculative threads get no cores."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import expert_stream
+
+    seen = {}
+    monkeypatch.setattr(ThreadingConfig, "resolve", staticmethod(lambda **kw: seen.update(kw) or "resolved"))
+    monkeypatch.setattr(Topology, "from_sysfs", classmethod(lambda cls, root=tc.SYSFS: "topology"))
+    monkeypatch.setattr(tc, "_affinity", lambda: frozenset({0, 1}))
+    monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0"):
+            ThreadingConfig.from_env(cpu_experts=True, device=None)
+            assert seen["settings"].ram_prefetch is True
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
+            ThreadingConfig.from_env(cpu_experts=True, device=None)
+            assert seen["settings"].ram_prefetch is False
 
 
 # The recipe's server cores (benchmarks/dsv41_baseline/arm_env.py SERVER_CORES): node 0's 6-17 and their siblings free.
@@ -287,7 +305,7 @@ def test_a_one_node_tier_with_the_draft_on_is_derived(divix01):
 
 
 def test_without_the_draft_there_are_no_draft_cores(divix01):
-    assert resolve(divix01, affinity=RECIPE_SERVER, spin_core=17).draft_cpus == ()
+    assert resolve(divix01, affinity=RECIPE_SERVER, numa_cores="0:ram=17").draft_cpus == ()
 
 
 def test_named_draft_cores_are_left_out_of_every_derived_role(divix01):
@@ -301,8 +319,8 @@ def test_named_draft_cores_are_left_out_of_every_derived_role(divix01):
 @pytest.mark.parametrize(
     "settings, match",
     [
-        ({"spin_core": 17}, "core 17 is named both for the DSpark draft"),
-        ({"spin_core": 17, "draft_cores": "6-16,53"}, "core 17 is named both for the DSpark draft"),
+        ({"numa_cores": "0:ram=17"}, "core 17 is named both for the DSpark draft"),
+        ({"numa_cores": "0:ram=17", "draft_cores": "6-16,53"}, "core 17 is named both for the DSpark draft"),
         ({"numa_cores": "0:ram=12"}, "core 12 is named both for the DSpark draft"),
     ],
 )
@@ -320,7 +338,7 @@ def test_too_few_cores_left_for_the_draft_is_refused(divix01):
 def test_under_cpu_experts_the_draft_has_no_cores_of_its_own(divix01):
     """One team per node: with the target's CPU experts on, the draft is a job source on node 0's team, so the plan
     derives no draft role and node 0's team keeps every free core (the recipe's 6-15)."""
-    config = resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True)
+    config = resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, numa_cores="0:ram=17", draft=True)
     assert config.draft_cpus == ()
     assert [(p.ram, p.cpu) for p in config.plans] == [(17, tuple(range(6, 16))), (35, tuple(range(18, 28)))]
     assert config.copy_cpus == (16,)
@@ -329,7 +347,7 @@ def test_under_cpu_experts_the_draft_has_no_cores_of_its_own(divix01):
 @pytest.mark.parametrize("settings", [{"draft_cores": "12-15"}, {"draft_threads": 4}])
 def test_under_cpu_experts_named_draft_cores_are_refused(divix01, settings):
     with pytest.raises(ValueError, match="shares the GPU node's CPU expert team"):
-        resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True, **settings)
+        resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, numa_cores="0:ram=17", draft=True, **settings)
 
 
 def test_a_draft_only_launch_still_derives_the_draft_cores(divix01):
@@ -339,14 +357,24 @@ def test_a_draft_only_launch_still_derives_the_draft_cores(divix01):
 
 def test_ram_prefetch_takes_each_nodes_spare_affinity_cores_or_its_ram_core(divix01):
     """Spare: the server's affinity on the node less every assigned core and its SMT sibling (CPU experts 8-14 take
-    44-50 with them, the copy core 15 takes 51). Node 1 has no affinity core, so its thread shares the RAM core."""
+    44-50 with them, the copy core 15 takes 51). Node 1 has no affinity core, so its thread takes the node's highest
+    unassigned physical core, 34, not the RAM core 35."""
     config = resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
     assert config.plans[0].spec == (*range(0, 8), 16, *range(36, 44), 52)
-    assert config.plans[1].spec == (35,)
+    assert config.plans[1].spec == (34,)
     assert config.log_lines()[:2] == [
         "numa node0: ram=17 cpu=8-14 (7) sq=- spec=0-7,16,36-43,52",
-        "numa node1: ram=35 cpu=18-33 (16) sq=- spec=35",
+        "numa node1: ram=35 cpu=18-33 (16) sq=- spec=34",
     ]
+
+
+def test_a_node_outside_the_servers_affinity_gives_its_spec_thread_its_own_core(divix01, caplog):
+    """The production layout: 10 CPU experts a node leave node 1's 28-34 free, and the thread takes 34, not RAM core 35."""
+    with caplog.at_level(logging.WARNING, logger=tc.__name__):
+        config = resolve(divix01, cpu_experts=True, threads=10, ram_prefetch=True)
+    assert config.plans[1].spec == (34,)
+    assert config.plans[1].ram not in config.plans[1].spec
+    assert [r for r in caplog.records if r.name == tc.__name__] == []
 
 
 def test_without_ram_prefetch_no_plan_names_spec_cores(divix01):
@@ -356,9 +384,10 @@ def test_without_ram_prefetch_no_plan_names_spec_cores(divix01):
 
 
 def test_a_spec_thread_sharing_the_ram_core_is_warned_naming_the_node_and_core(divix01, caplog):
-    """Node 1 has no spare core, so its speculative thread time-slices the busy-polling RAM core 35; node 0 has spares."""
+    """Node 1's CPU experts (18-34) take every core, so its speculative thread time-slices the busy-polling RAM core
+    35; node 0 has spares."""
     with caplog.at_level(logging.WARNING, logger=tc.__name__):
-        resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+        resolve(divix01, cpu_experts=True, threads=17, ram_prefetch=True)
     warnings = [r.getMessage() for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "node1" in warnings[0] and "core 35" in warnings[0] and "node0" not in warnings[0]
@@ -367,7 +396,7 @@ def test_a_spec_thread_sharing_the_ram_core_is_warned_naming_the_node_and_core(d
 def test_a_shared_spec_core_is_warned_once_per_node_and_core_across_resolves(divix01, caplog):
     with caplog.at_level(logging.WARNING, logger=tc.__name__):
         for _ in range(3):
-            resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+            resolve(divix01, cpu_experts=True, threads=17, ram_prefetch=True)
     warnings = [r for r in caplog.records if r.name == tc.__name__ and r.levelno == logging.WARNING]
     assert len(warnings) == 1
 
@@ -380,7 +409,103 @@ def test_ram_prefetch_without_a_shared_core_warns_nothing(divix01, caplog):
 
 
 def test_ram_prefetch_spec_cores_leave_out_the_reserved_cores(divix01):
-    """An affinity spanning 64-71: node 1's only spare would be a reserved core, so its thread shares the RAM core."""
-    config = resolve(divix01, affinity=SERVER | set(range(64, 72)), cpu_experts=True, threads=16, ram_prefetch=True)
+    """An affinity spanning 64-71: node 1's only spare would be a reserved core, so with its CPU experts on 18-34 its
+    thread shares the RAM core."""
+    config = resolve(divix01, affinity=SERVER | set(range(64, 72)), cpu_experts=True, threads=17, ram_prefetch=True)
     assert config.plans[1].spec == (config.plans[1].ram,)
     assert not set(config.plans[0].spec) & tc.RESERVED_CORES
+
+
+# --- divix01 on its 2x Xeon Platinum 8280 (2026-10-21): 112 CPUs, node 0 0-27,56-83, node 1 28-55,84-111, sibling N + 56 ---
+
+SYS_8280 = {0: "0-27,56-83", 1: "28-55,84-111"}
+SERVER_8280 = frozenset(parse_cpu_list("0-5,56-61"))  # benchmarks/dsv41_baseline/arm_env.SERVER_CORES
+
+
+@pytest.fixture
+def xeon8280(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc, "RESERVED_CORES", REAL_RESERVED)
+    return fake_sysfs(tmp_path, SYS_8280, 56)
+
+
+def test_the_8280_reserved_cores_are_node_1s_top_four_physical_cores_and_their_siblings(xeon8280):
+    assert REAL_RESERVED == frozenset(parse_cpu_list("52-55,108-111"))
+    assert {xeon8280.node_of(c) for c in REAL_RESERVED} == {1}
+    assert {s for c in range(52, 56) for s in xeon8280.siblings[c]} == REAL_RESERVED
+    for core in (51, 56, 64, 71, 107):
+        check_not_reserved(core)  # 64-71 are ordinary cores now
+    for core in REAL_RESERVED:
+        with pytest.raises(ValueError, match=r"52-55,108-111"):
+            check_not_reserved(core)
+
+
+def test_the_8280_recipe_plan_is_the_old_roles_on_the_new_numbers(xeon8280):
+    """The recipe (arm_env: SERVER 0-5,56-61, SPIN_CORE 26, 10 CPU expert threads). Node 0: copy 27, RAM 26, experts 6-15;
+    node 1: RAM 51, experts 28-37, nothing on 52-55,108-111. Mutant: RESERVED_CORES back at 64-71 -- red (node 1's RAM
+    thread lands on 55, a reserved core)."""
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, numa_cores="0:ram=26", ram_prefetch=True)
+    assert config.log_lines() == [
+        "numa node0: ram=26 cpu=6-15 (10) sq=- spec=0-5,56-61",
+        "numa node1: ram=51 cpu=28-37 (10) sq=- spec=50",
+        "numa copy thread: node0 cpus=27",
+    ]
+    used = {c for p in config.plans for c in p.cores() + list(p.spec)} | set(config.copy_cpus)
+    assert not used & REAL_RESERVED
+    assert all(xeon8280.node_of(c) == p.node for p in config.plans for c in p.cores())
+    assert xeon8280.node_of(config.copy_cpus[0]) == 0
+
+
+def test_the_8280_ram_threads_have_their_physical_cores_alone(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, numa_cores="0:ram=26")
+    busy = [c for p in config.plans for c in p.cores()] + list(config.copy_cpus)
+    physical = [c % 56 for c in busy]
+    assert len(set(physical)) == len(physical), "two expert-stream threads share a physical core"
+    assert not {c % 56 for c in SERVER_8280} & set(physical)
+
+
+def test_without_the_spin_core_the_8280_derives_the_same_ram_cores(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10)
+    assert [p.ram for p in config.plans] == [26, 51] and config.copy_cpus == (27,)
+
+
+# --- SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT: each pool core's SMT sibling joins the pool, after the cores ---
+
+
+def test_smt_adds_each_pool_cores_sibling_after_the_cores(xeon8280):
+    """The recipe with SMT on: each node's 10 cores, then their siblings; the RAM, copy and spec threads keep their
+    physical cores alone and nothing lands on a reserved core. Mutant: _derive ignoring settings.smt -- red."""
+    config = resolve(
+        xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, smt=True, numa_cores="0:ram=26", ram_prefetch=True
+    )
+    assert config.log_lines() == [
+        "numa node0: ram=26 cpu=6-15,62-71 (20) sq=- spec=0-5,56-61",
+        "numa node1: ram=51 cpu=28-37,84-93 (20) sq=- spec=50",
+        "numa copy thread: node0 cpus=27",
+    ]
+    used = {c for p in config.plans for c in p.cores() + list(p.spec)} | set(config.copy_cpus)
+    assert not used & REAL_RESERVED
+    others = [c for p in config.plans for c in [p.ram, *p.spec] if c not in SERVER_8280] + list(config.copy_cpus)
+    pool = {c % 56 for p in config.plans for c in p.cpu}
+    assert not {c % 56 for c in others} & pool, "a pool sibling shares a physical core with another role"
+
+
+def test_smt_off_leaves_the_plan_unchanged(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, threads=10, numa_cores="0:ram=26")
+    assert [p.cpu for p in config.plans] == [tuple(range(6, 16)), tuple(range(28, 38))]
+
+
+def test_smt_applies_to_named_cpu_cores(xeon8280):
+    config = resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, smt=True, numa_cores="0:ram=26;1:cpu=28-31")
+    assert config.plans[1].cpu == (28, 29, 30, 31, 84, 85, 86, 87)
+
+
+def test_smt_refuses_a_sibling_in_the_servers_affinity(xeon8280):
+    """The server's affinity reaching 62 and 63, the siblings of cores 6 and 7. The copy thread takes 7 (it prefers a
+    core whose sibling is the server's), so pool core 6 brings 62, which the pool cannot take."""
+    with pytest.raises(ValueError, match=r"node 0: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT adds core 6's SMT sibling 62"):
+        resolve(xeon8280, affinity=SERVER_8280 | {62, 63}, cpu_experts=True, threads=10, smt=True, numa_cores="0:ram=26")
+
+
+def test_without_smt_pool_cores_on_one_physical_core_are_still_refused(xeon8280):
+    with pytest.raises(ValueError, match=r"cores 28 and 84 share a physical core"):
+        resolve(xeon8280, affinity=SERVER_8280, cpu_experts=True, numa_cores="0:ram=26;1:cpu=28,84")

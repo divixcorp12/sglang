@@ -17,6 +17,7 @@ struct Chunk
     int m;
     int token[MAX_M];
     float weight[MAX_M];
+    unsigned first = 0;  // bit r: row r is token[r]'s first write of the call (ForwardCtx::store_first)
 };
 
 struct GenericShape
@@ -41,12 +42,18 @@ struct Dsv41Shape
     // kRegisterBudget).
     static bool accepts(const ExpertLayer& l, const Exl3Quant::Params& p, const std::vector<Chunk>& chunks)
     {
-        if (ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128) return false;
-        if (l.hidden != kHidden || l.intermediate != kIntermediate || l.act_limit != kActLimit) return false;
-        if (p.bits != kBits || p.swizzled) return false;
+        if (!accepts_layer(l, p)) return false;
         for (const auto& ch : chunks)
             if (ch.m < 1 || ch.m > CHUNK_M) return false;
         return true;
+    }
+
+    // accepts' build and layer facts alone: Exl3Quant::dispatch sizes the call's chunks by it.
+    static bool accepts_layer(const ExpertLayer& l, const Exl3Quant::Params& p)
+    {
+        if (ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128) return false;
+        if (l.hidden != kHidden || l.intermediate != kIntermediate || l.act_limit != kActLimit) return false;
+        return p.bits == kBits && !p.swizzled;
     }
 };
 

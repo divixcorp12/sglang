@@ -1,12 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
+    handle_speculative_decoding,
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -100,9 +99,8 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
-        server_args.dp_size = 2
+        server_args.attn_dp_size = 2
         server_args.tp_size = 2
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
@@ -122,36 +120,63 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
                 _handle_dspark(server_args)
 
 
-class TestDsparkFoldedSamplingDefault(CustomTestCase):
-    def test_sharded_greedy_default_and_sampling_override(self):
-        from sglang.srt.environ import DsparkFoldedSampling, envs
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            _resolve_folded_sampling,
-        )
+class TestDsparkConfidenceCutRefusals(CustomTestCase):
+    """SGLANG_DSPARK_CONFIDENCE_CUT's launch contract: one cut source, calibrated, static, DSpark only."""
 
-        model = SimpleNamespace(
-            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
-            markov_head=SimpleNamespace(supports_sharded_greedy=True),
+    def _cut_server_args(self) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        args = dict(
-            model=model,
-            gamma=5,
-            max_bs=64,
-            device="cpu",
-            tp_rank=0,
-            available_memory_gb=16,
+        server_args.speculative_dspark_confidence_sts_path = "/fitted/sts.json"
+        return server_args
+
+    def test_flag_off_checks_nothing(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
         )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.AUTO.value
-        ):
-            self.assertFalse(_resolve_folded_sampling(**args))
-            model.markov_head.supports_sharded_greedy = False
-            self.assertTrue(_resolve_folded_sampling(**args))
-        model.markov_head.supports_sharded_greedy = True
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.FORCE.value
-        ):
-            self.assertTrue(_resolve_folded_sampling(**args))
+        server_args.speculative_algorithm = None
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(False):
+            handle_speculative_decoding(server_args)
+
+    def test_a_served_launch_is_admitted(self):
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+            True
+        ), envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            handle_speculative_decoding(self._cut_server_args())
+
+    def test_collect_mode_needs_no_sts_file(self):
+        """Collecting STS data builds the head with no table; the cut stays off, so the launch is admitted."""
+        server_args = self._cut_server_args()
+        server_args.speculative_dspark_confidence_sts_path = None
+        with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+            True
+        ), envs.SGLANG_RAGGED_VERIFY_MODE.override(
+            "static"
+        ), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/captures/sts.jsonl"):
+            handle_speculative_decoding(server_args)
+
+    def test_each_refusal_names_its_fix(self):
+        refusals = {
+            "speculative-algorithm DSPARK": dict(speculative_algorithm=None),
+            "SGLANG_DSPARK_TOP_PROB_GATE=0": dict(top_prob_gate=0.4),
+            "confidence-sts-path": dict(sts_path=None),
+            "SGLANG_RAGGED_VERIFY_MODE=static": dict(mode="compact"),
+        }
+        for fix, change in refusals.items():
+            server_args = self._cut_server_args()
+            if "speculative_algorithm" in change:
+                server_args.speculative_algorithm = change["speculative_algorithm"]
+            if "sts_path" in change:
+                server_args.speculative_dspark_confidence_sts_path = change["sts_path"]
+            with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
+                True
+            ), envs.SGLANG_DSPARK_TOP_PROB_GATE.override(
+                change.get("top_prob_gate", 0.0)
+            ), envs.SGLANG_RAGGED_VERIFY_MODE.override(
+                change.get("mode", "static")
+            ):
+                with self.subTest(fix=fix), self.assertRaisesRegex(ValueError, fix):
+                    handle_speculative_decoding(server_args)
 
 
 if __name__ == "__main__":

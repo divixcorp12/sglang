@@ -15,10 +15,11 @@ with less than 1 GiB of free device memory. Set
 instead — for CI recipes that assert full startup warmup coverage. The hooks
 only run for compilation and first-use loads, so steady-state cost is zero.
 
-Note: request-driven warmup (``--warmups``, the server warmup request) runs
-*after* ``mark_serving_started()`` and is subject to the same diagnostics;
-crash mode is only meant for deployments whose kernels are fully pre-loaded at
-engine init.
+The scheduler calls ``mark_serving_started()`` when the HTTP startup warm-ups
+(``--warmups``, then the server warmup request) have ended, so their loads are
+not reported; the Rust server and a server that skips the warm-ups mark at
+event-loop start or at once. Crash mode is meant for deployments whose kernels
+are fully pre-loaded by engine init and the warm-ups.
 """
 
 from __future__ import annotations
@@ -64,6 +65,12 @@ def mark_serving_started() -> None:
     """Arm diagnostics for subsequent Triton compilations and device-loads."""
     global _serving_started
     _serving_started = True
+
+
+def serving_started() -> bool:
+    """Whether this process's scheduler is serving: engine init (CUDA graph capture included) and the startup warm-ups
+    are done."""
+    return _serving_started
 
 
 def _on_compilation(*, src, metadata, metadata_group, times, cache_hit) -> None:

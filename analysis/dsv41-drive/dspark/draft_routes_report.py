@@ -1,4 +1,4 @@
-"""The DSpark draft's real routing, from SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH, priced at the CPU kernel's cost.
+"""The DSpark draft's real routing, from the draft_routes_path of SGLANG_EXPERT_STREAM_TRACE, priced at the CPU kernel's cost.
 
 Plan 2026-10-02-dsv41-dspark-cpu-draft, Task 1 follow-up: draft_bench.py brackets a CPU draft step between 14.5 ms
 (all 6 rows share 3 experts) and 26.5 ms (independent rows); this reports where the real routes fall.

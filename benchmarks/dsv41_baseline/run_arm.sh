@@ -34,7 +34,7 @@
 # Env: NSYS_TRACE=1 captures the timed set with Nsight Systems (report under
 # NSYS_OUT_DIR, default /mnt/nvme1/dsv41-nsys; anything off /mnt/nvme1 is refused).
 # NSYS_CUDA_GRAPH_TRACE=graph|node (default graph) picks --cuda-graph-trace; graph is
-# refused when the arm's env turns on SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.
+# refused when the arm's env sets SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine.
 # NSYS_GPU_METRICS=1 (default) also samples GPU metrics, including PCIe RX/TX throughput,
 # in a second root session (sudo -n /usr/local/sbin/nsys-profile; the driver keeps the
 # counters admin-only) written to <report>-pcie.nsys-rep over the same window. The arm
@@ -54,9 +54,9 @@ overrides=("$@")
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 worktree=${DSV41_WORKTREE:-$(cd "$here/../.." && pwd)}
-py=/data/models/slang/.venv/bin/python
+py=/data/models/slang/.venv-upstream/bin/python  # arm_env.PYTHON, as in launch_prod.sh
 # Read the server's core list from arm_env rather than repeating it: this line and
-# arm_env.SERVER_CORES were two copies of "32-63" that could drift, and a taskset
+# arm_env.SERVER_CORES were two copies of a core list ("32-63" at the time) that could drift, and a taskset
 # spanning both NUMA nodes is exactly the startup hang of 2026-09-22. The command
 # substitution finishes long before the launch below, so it does not break the
 # "nothing may fork between the shell and python" rule that keeps $! the server.
@@ -722,10 +722,10 @@ import verdict
 report = json.load(open('$report_path'))
 task1_module = task1_verdict.load_task1_verdict()
 # Truthy, not merely present: mirroring is on by default in arm_env, and an arm turns it
-# off by overriding the var to the empty string (exl3_expert_format.exl3_mirror_config
-# reads an empty value as off). Testing for the key would then judge an unmirrored arm
-# against the mirrored baseline.
-mirror = bool(json.load(open('$expected_env_path')).get('SGLANG_MOE_EXPERT_MIRROR_DIRS'))
+# off by overriding SGLANG_EXPERT_STREAM_MIRROR so its dirs key is empty (or the env to the
+# empty string; an empty dirs reads as off). Testing for the key would then judge an unmirrored
+# arm against the mirrored baseline.
+mirror = bool(json.loads(json.load(open('$expected_env_path')).get('SGLANG_EXPERT_STREAM_MIRROR') or '{}').get('dirs'))
 result = verdict.judge(
     report, root='$worktree', head='$commit', mirror=mirror, traced=False, task1_module=task1_module,
 )

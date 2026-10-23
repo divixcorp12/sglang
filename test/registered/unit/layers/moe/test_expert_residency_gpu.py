@@ -252,7 +252,7 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
 
     def test_gathers_match_the_pre_doorbell_path_across_residency_updates(self):
         """Gathers, then residency updates, then more gathers, with the host (Python) update
-        and with SGLANG_MOE_GPU_RESIDENCY_UPDATE. Each step's gathered rows,
+        and with SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE. Each step's gathered rows,
         per-layer hit and miss counters and residency state must equal a twin manager whose
         streamers run 7de955329a's ``_gather_graph``, and the rows must equal the source rows.
         The GPU update rebinds each cache's ``expert_to_slot`` to its own table, so a gather
@@ -262,7 +262,7 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
                 self._run_mode(gpu)
 
     def test_gathers_match_the_pre_doorbell_path_across_insert_on_miss_updates(self):
-        """The same cross-residency check with SGLANG_MOE_HOT_INSERT_ON_MISS: every forward's
+        """The same cross-residency check with SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE: every forward's
         misses are copied from scratch rows into slots before the next forward's gathers, so a
         planner or remap that read a stale mapping or stale scratch row would
         return rows that differ from the reference path or from the source rows."""
@@ -559,8 +559,11 @@ class _InsertOnMissReference:
     Then the forward's routes gather against the resulting mapping.
     """
 
-    def __init__(self, manager, decay=IOM_DECAY):
+    def __init__(self, manager, decay=IOM_DECAY, eager_counts=True):
         self.decay = decay
+        # False (SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS=0): the eager routes stay in route counts but
+        # the insert score and the routed mask leave them out.
+        self.eager_counts = eager_counts
         self.caches = [cache for _, cache in sorted(manager.caches.items())]
         self.mapping = [cache.expert_to_slot.tolist() for cache in self.caches]
         self.slots = []
@@ -575,6 +578,7 @@ class _InsertOnMissReference:
             [manager.residency_policies[layer_id]._scores.detach().cpu() for layer_id in sorted(manager.caches)]
         ).to(torch.float32)
         self.pending = torch.zeros_like(self.scores)
+        self.eager = torch.zeros_like(self.scores)
         self.tokens = 0
         self.plans = None
         self.insertions = [0] * LAYERS
@@ -585,9 +589,11 @@ class _InsertOnMissReference:
 
     def boundary(self):
         factor = torch.tensor(self.decay**self.tokens, dtype=torch.float32)
-        self.scores = self.scores * factor + self.pending
-        routed = self.pending > 0
+        counts = self.pending if self.eager_counts else self.pending - self.eager
+        self.scores = self.scores * factor + counts
+        routed = counts > 0
         self.pending = torch.zeros_like(self.pending)
+        self.eager = torch.zeros_like(self.eager)
         self.tokens = 0
         plans, self.plans = self.plans, None
         if plans is None:
@@ -629,15 +635,23 @@ class _InsertOnMissReference:
             self.plans.append(plan)
         self.tokens += 1
 
-    def eager_prefill(self, routes, tokens):
-        """A prefill below the prefill boundary: flush a pending boundary, then only count."""
+    def eager_prefill(self, routes, tokens, record_first=False):
+        """A prefill below the prefill boundary: flush a pending boundary, then only count. ``record_first`` records
+        its routes before the flush, as the EXL3 path does (exl3.py records before its first chunk's gather)."""
+        if record_first:
+            self._count_eager(routes)
         if self.plans is not None:
             self.boundary()
+        if not record_first:
+            self._count_eager(routes)
+        self.tokens += tokens
+
+    def _count_eager(self, routes):
         for row, layer_routes in enumerate(routes):
             for token in layer_routes:
                 for expert in token:
                     self.pending[row, expert] += 1
-        self.tokens += tokens
+                    self.eager[row, expert] += 1
 
     def assert_matches(self, test, manager, context):
         updater = manager.gpu_residency
@@ -677,7 +691,7 @@ def _verify_routes(generator, tokens):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestInsertOnMiss(unittest.TestCase):
-    """SGLANG_MOE_HOT_INSERT_ON_MISS: a decode forward's missed experts move from scratch rows into slots."""
+    """SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE: a decode forward's missed experts move from scratch rows into slots."""
 
     def setUp(self):
         self.model = _model()
@@ -730,27 +744,24 @@ class TestInsertOnMiss(unittest.TestCase):
                 self.assertNotIn("insertions", updater.snapshot())
                 self.assertFalse(any("insertion" in name for name in manager._trace_sources()))
                 self.assertNotIn("insertions", manager.snapshot_counters()["decode"]["0"])
-        stage = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE
-        with stage.override(1), envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.override(0.99):
+        stage = envs.SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE
+        with stage.override(1), envs.SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY.override(0.99):
             manager = _manager(_model(), gpu=True, update_decode_forwards=1)
             self.assertTrue(manager.gpu_residency.insert_on_miss)
             self.assertFalse(manager.gpu_residency.insert_direct)
             self.assertAlmostEqual(manager.gpu_residency.insert_on_miss_decay, 0.99)
 
-    def test_the_retired_boolean_still_selects_stage_one(self):
-        """`combined-iom`'s measured arms set SGLANG_MOE_HOT_INSERT_ON_MISS=1. The stage enum keeps
-        that value, so those arms keep running stage 1 -- with a DeprecationWarning, not silently
-        falling back to off and simply looking slower."""
-        from sglang.srt.environ import InsertOnMissStage, envs
+    def test_the_retired_boolean_is_refused_naming_the_stage_env(self):
+        """`combined-iom`'s measured arms set SGLANG_MOE_HOT_INSERT_ON_MISS=1. The name is removed
+        (no alias): startup refuses it and names SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE, whose
+        value 1 keeps the stage enum's meaning."""
+        from sglang.srt.environ import InsertOnMissStage
+        from sglang.srt.layers.moe.expert_engine.removed_env import RemovedEnvError, check_removed_env
 
         self.assertEqual(int(InsertOnMissStage.OFF), 0)
         self.assertEqual(int(InsertOnMissStage.SCRATCH), 1)
-        with unittest.mock.patch.dict(os.environ, {"SGLANG_MOE_HOT_INSERT_ON_MISS": "1"}):
-            envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.clear()
-            with self.assertWarns(DeprecationWarning):
-                resolved = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
-            self.assertEqual(resolved, InsertOnMissStage.SCRATCH)
-        envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.clear()
+        with self.assertRaisesRegex(RemovedEnvError, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE"):
+            check_removed_env({"SGLANG_MOE_HOT_INSERT_ON_MISS": "1"})
 
     def test_the_miss_order_needs_direct(self):
         manager = _manager(self.model, gpu=True, **IOM)
@@ -758,13 +769,13 @@ class TestInsertOnMiss(unittest.TestCase):
             manager.gpu_residency.enable_miss_order()
 
     def test_an_unknown_stage_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE"):
             _manager(_model(), gpu=True, update_decode_forwards=1, insert_on_miss=3)
 
     def test_mode_requires_the_gpu_update_and_a_boundary_every_decode_forward(self):
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"):
             _manager(_model(), gpu=False, **IOM)
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS=1"):
             _manager(_model(), gpu=True, **dict(IOM, update_decode_forwards=4))
         with self.assertRaisesRegex(ValueError, "decay"):
             _manager(_model(), gpu=True, **dict(IOM, insert_on_miss_decay=1.5))
@@ -895,6 +906,56 @@ class TestInsertOnMiss(unittest.TestCase):
         self.assertGreater(sum(updater.snapshot()["insertions"]), inserted)
         self.assertEqual(sum(updater.snapshot()["promotions"][0]), 0)
 
+    def test_eager_counts_off_leaves_prefill_routes_out_of_the_insert_score(self):
+        """SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS=0: a prefill's routes stay in the route counts (and the
+        promotion scores) but not in the insert score or the routed mask, whether recorded after the pending boundary's
+        flush (the NVFP4 gather) or before it (EXL3), and decode insertions stay exact. Mutation: subtract nothing --
+        "short prefill"/"recorded first" scores red."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS.override(False):
+            manager = _manager(self.model, gpu=True, **IOM)
+        updater = manager.gpu_residency
+        self.assertIsNotNone(updater.eager_counts)
+        reference = _InsertOnMissReference(manager, eager_counts=False)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(7)
+
+        def prefill(tokens, record_first):
+            routes = [[generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)] for _ in range(LAYERS)]
+            streamers = sorted(manager.streamers.items())
+            ids = {layer: torch.tensor(routes[layer], dtype=torch.int32, device="cuda") for layer, _ in streamers}
+            if record_first:
+                # Every layer's routes in the window the flush closes (EXL3 puts its first layer's there).
+                for layer, streamer in streamers:
+                    streamer.record_routes(ids[layer])
+                updater.flush()
+                for layer, streamer in streamers:
+                    streamer.gather_experts(torch.unique(ids[layer].reshape(-1)))
+            else:
+                for layer, streamer in streamers:
+                    streamer.gather(ids[layer])
+            manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
+            torch.cuda.synchronize()
+            return routes
+
+        for record_first in (False, True):
+            context = "recorded first" if record_first else "short prefill"
+            for step in range(4):
+                self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"{context} {step}")
+            self.assertTrue(updater.host_pending)
+            reference.eager_prefill(prefill(6, record_first), 6, record_first=record_first)
+            reference.assert_matches(self, manager, context)
+            for step in range(4, 8):
+                self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"{context} {step}")
+        self.assertGreater(sum(reference.insertions), 0)
+        self.assertEqual(updater.eager_counts.abs().sum().item(), 0.0)
+
+    def test_a_decay_near_one_tabulates(self):
+        """0.999 (production since 2026-10-22) reaches a float32 zero only after ~103k tokens."""
+        manager = _manager(self.model, gpu=True, **dict(IOM, insert_on_miss_decay=0.999))
+        self.assertGreater(manager.gpu_residency.insert_decay_table_tokens, 1 << 16)
+
     def test_decode_forward_hook_is_sync_free(self):
         manager = _manager(self.model, gpu=True, **IOM)
         graph, static, _ = self.capture(manager)
@@ -920,7 +981,7 @@ class TestInsertOnMiss(unittest.TestCase):
         from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
         from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
 
-        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always", "predictor": "llapor"}'):
             manager = _manager(self.model, gpu=True, **IOM)
         cache, streamer = manager.caches[0], manager.streamers[0]
         self.assertTrue(cache.reserves_prefetch_pull_row)
@@ -979,7 +1040,7 @@ FUSED = dict(IOM, fused_insert=True)
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestFusedInsert(unittest.TestCase):
-    """SGLANG_MOE_HOT_FUSED_INSERT: the same boundary copy in one masked pass instead of two.
+    """SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT: the same boundary copy in one masked pass instead of two.
 
     The claim being defended is that this is a cost change and nothing else, so
     the tests compare it byte for byte against the ``index_copy_`` path it
@@ -1083,7 +1144,7 @@ class TestFusedInsert(unittest.TestCase):
         run, so both are refused rather than accepted."""
         for stage in (0, 2):
             with self.subTest(stage=stage):
-                with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_FUSED_INSERT"):
+                with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT"):
                     _manager(
                         _model(),
                         gpu=True,
@@ -1098,7 +1159,7 @@ class TestFusedInsert(unittest.TestCase):
         manager = _manager(_model(), gpu=True, **IOM)
         self.assertFalse(manager.gpu_residency.fused_insert)
         self.assertIsNone(manager.gpu_residency.insert_active)
-        with envs.SGLANG_MOE_HOT_FUSED_INSERT.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT.override(True):
             manager = _manager(_model(), gpu=True, **IOM)
         self.assertTrue(manager.gpu_residency.fused_insert)
         self.assertEqual(
@@ -1272,7 +1333,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         budget = dict(budget_bytes=56 * LAYERS * 8, graph_gather_batch_size=2)
         wide = _manager(_model(), gpu=True, **budget, **DIRECT)
         capped = _manager(_model(), gpu=True, graph_gather_miss_lanes=99, **budget, **DIRECT)
-        with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.override(3):
+        with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES.override(3):
             narrow = _manager(_model(), gpu=True, **budget, **DIRECT)
         for manager, lanes, width in ((wide, 0, 4), (capped, 0, 4), (narrow, 3, 3)):
             for streamer in manager.streamers.values():
@@ -1280,7 +1341,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
             self.assertEqual(manager.gpu_residency.miss_rows, width)
 
     def test_a_narrow_miss_width_needs_direct(self):
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2"):
             _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **IOM)
 
     def test_the_fused_remap_rows_hold_the_routes(self):
@@ -1322,7 +1383,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def _narrow(self, model, lanes, fused):
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused):
             # Zero seed scores fill every layer evenly (8 slots each) whatever its floor, so the narrow and the wide
             # twin hold the same capacities.
             manager = _manager(
@@ -1492,7 +1553,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as trace:
             from sglang.srt.environ import envs
 
-            with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(False):
+            with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(False):
                 manager = _manager(
                     self.model, gpu=True, seed_scale=(0, 0, 0), graph_gather_batch_size=2, graph_gather_miss_lanes=2,
                     budget_bytes=56 * LAYERS * 8, metrics_path=trace.name, log_interval=1, **DIRECT,
@@ -1518,8 +1579,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
 
-        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
-            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE=off"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always", "predictor": "llapor"}'):
+            with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_SHADOW_PREFETCH pull_mode=off"):
                 _manager(_model(), gpu=True, **DIRECT)
 
         # A plan whose buffers are not the gather's own: a backend that posts its own plan buffers
@@ -1562,7 +1623,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         delivered = torch.tensor([1], dtype=torch.int32, device="cuda")
         keep = torch.tensor([0.0], dtype=torch.float32, device="cuda")
         streamer.row_backend = SimpleNamespace(
-            name="exl3_ram_miss", delivered_count=delivered, keep=keep, cpu_experts=False,
+            leased=True, delivered_count=delivered, keep=keep, cpu_experts=False,
         )
         destinations = torch.zeros(updater.miss_rows, dtype=torch.long, device="cuda")
         live = torch.zeros(updater.miss_rows, dtype=torch.bool, device="cuda")
@@ -1586,7 +1647,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         manager = _manager(_model(), gpu=True, **DIRECT)
         updater = manager.gpu_residency
         for streamer in updater.streamers:
-            streamer.format = SimpleNamespace(key="exl3")
+            streamer.format = SimpleNamespace(key="exl3", engine_served=True)
         updater.enabled.fill_(True)
         updater.route_counts[:, 3].fill_(4.0)
         before = updater.scores[:, 3].clone()
@@ -1715,15 +1776,70 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertEqual(int(cache.expert_to_slot[second]), -1)
         assert_slot_rows(self, manager, self.model, "routed victim")
 
+    def test_probation_evicts_an_unrerouted_newcomer_before_any_settled_resident(self):
+        """SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION: the miss a forward inserted is the next victim unless a
+        later forward routes it again, however its score compares. Without probation its own miss route protects it for
+        one forward and the lowest-scored settled resident goes. Routing it again releases it. Mutant: rank probation slots like
+        any other (drop the offset), and the first case evicts the low resident."""
+        from sglang.srt.environ import envs
+
+        for probation in (False, True):
+            self.model = _model()
+            with envs.SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION.override(probation):
+                manager = _manager(self.model, gpu=True, **DIRECT)
+            updater = manager.gpu_residency
+            graph, static, outputs = self.capture(manager)
+            cache = manager.caches[0]
+            others = [[[0, 1]] for _ in range(LAYERS - 1)]
+            mapping = cache.expert_to_slot.tolist()
+            residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
+            outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+            self.assertEqual(len(residents), cache.capacity, "a free slot would take the miss first")
+            self.assertGreaterEqual(len(outsiders), 2)
+            keep, newcomer, second = residents[2], outsiders[0], outsiders[1]
+            self.step(manager, graph, static, outputs, [[[keep, residents[3]]]] + others, "warm")
+            self.step(manager, graph, static, outputs, [[[newcomer, keep]]] + others, "insert")
+            newcomer_slot = int(cache.expert_to_slot[newcomer])
+            self.assertGreaterEqual(newcomer_slot, 0)
+            settled = [e for e, s in enumerate(cache.expert_to_slot.tolist()) if s >= 0 and e not in (newcomer, keep)]
+            low = settled[0]
+            low_slot = int(cache.expert_to_slot[low])
+            scores = torch.full((EXPERTS,), 100.0)
+            scores[low], scores[newcomer] = 1.0, 1000.0
+            updater.insert_scores[0].copy_(scores)
+            torch.cuda.synchronize()
+            self.step(manager, graph, static, outputs, [[[keep, second]]] + others, f"probation={probation}")
+            if probation:
+                self.assertEqual(int(cache.expert_to_slot[second]), newcomer_slot, "the newcomer is the victim")
+                self.assertEqual(int(cache.expert_to_slot[newcomer]), -1)
+                self.assertTrue(bool(updater.probation[0, newcomer_slot]), "the next newcomer is on probation")
+                # The newcomer routed again by the forward after its insert leaves probation at the next boundary.
+                self.step(manager, graph, static, outputs, [[[second, keep]]] + others, "rerouted")
+                self.step(manager, graph, static, outputs, [[[keep, residents[3]]]] + others, "released")
+                self.assertFalse(bool(updater.probation[0, newcomer_slot]), "a rerouted newcomer leaves probation")
+                self.assertEqual(int(cache.expert_to_slot[second]), newcomer_slot)
+            else:
+                self.assertIsNone(updater.probation)
+                self.assertEqual(int(cache.expert_to_slot[second]), low_slot, "the low settled resident is the victim")
+                self.assertEqual(int(cache.expert_to_slot[newcomer]), newcomer_slot)
+            assert_slot_rows(self, manager, self.model, f"probation={probation}")
+
+    def test_probation_needs_direct(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION"):
+                _manager(_model(), gpu=True, **IOM)
+
     def test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one(self):
         """`gather_destinations` takes a miss lane's rank from ``remap - scratch_base``, its expert
         from ``_graph_source_rows[rank]`` and its liveness from ``_graph_miss_count``. Under
-        SGLANG_MOE_EXPERT_FUSED_PLAN one kernel writes all three, so a drift in that layout would
+        SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN one kernel writes all three, so a drift in that layout would
         copy misses into the wrong slots. Twins, one per planner, must stay identical."""
         from sglang.srt.environ import envs
 
         generic = _manager(self.model, gpu=True, **DIRECT)
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"):
             fused = _manager(_model(), gpu=True, **DIRECT)
         for streamer in fused.streamers.values():
             streamer.row_planner.route_plan = unittest.mock.Mock(
@@ -1753,7 +1869,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         from sglang.srt.environ import envs
 
         generic = _manager(self.model, gpu=True, **DIRECT)
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
             fused = _manager(_model(), gpu=True, **DIRECT)
         self.assertTrue(fused.gpu_residency.layer_fusion)
         self.assertIsNone(fused.gpu_residency.miss_keys)
@@ -1774,7 +1890,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def _miss_order_manager(self, model):
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"):
             manager = _manager(model, gpu=True, **DIRECT)
         updater = manager.gpu_residency
         updater.enable_miss_order()
@@ -1880,7 +1996,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         tokens = 2
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"):
             manager = _manager(
                 self.model, gpu=True, graph_gather_batch_size=tokens,
                 budget_bytes=56 * LAYERS * (EXPERTS - 2), **DIRECT,
@@ -2062,12 +2178,12 @@ class TestInsertOnMissDirect(unittest.TestCase):
         for streamer in manager.streamers.values():
             self.assertNotEqual(streamer._graph_device_pairs, ())
 
-    # ----- spill: victims for the first V lanes of a lane-per-route gather (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) -----
+    # ----- spill: victims for the first V lanes of a lane-per-route gather (SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES) -----
 
     def _spill(self, fused, lanes=0, victims=1):
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True), envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(
             victims
         ):
             return self._narrow(_model(), lanes, fused)
@@ -2075,8 +2191,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def test_victim_lanes_need_cpu_experts_and_a_value_below_the_lanes(self):
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(1), self.assertRaisesRegex(
-            ValueError, "VICTIM_LANES=1 needs SGLANG_DSV41_CPU_EXPERTS=1"
+        with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(1), self.assertRaisesRegex(
+            ValueError, "VICTIM_LANES=1 needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1"
         ):
             self._narrow(_model(), 0, False)
         with self.assertRaisesRegex(ValueError, "below the 4 miss lanes"):
@@ -2084,7 +2200,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
 
     def test_spill_needs_a_lane_per_route(self):
         """Review Focus 5 by construction: a narrowed MISS_LANES could leave more misses than lanes, so spill refuses it."""
-        with self.assertRaisesRegex(ValueError, "unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"):
+        with self.assertRaisesRegex(ValueError, "unset SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES"):
             self._spill(False, lanes=2)
 
     def test_victim_lanes_cap_the_shortlist_and_the_floor(self):

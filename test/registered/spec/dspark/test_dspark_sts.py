@@ -9,7 +9,7 @@ from sglang.benchmark.dspark_sts_fit import (
     expected_calibration_error,
     fit_sts_temperatures,
 )
-from sglang.srt.models.dspark import DSparkConfidenceHead
+from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     DSparkStsCalibration,
     StsDataRecorder,
@@ -40,11 +40,38 @@ class TestApplySts(CustomTestCase):
             for got, want in zip(row, expected_row):
                 self.assertAlmostEqual(got, want, places=6)
 
-    def test_apply_sts_stashes_raw_logit(self):
+
+class TestConfidencePredict(CustomTestCase):
+    def test_predict_applies_sts_to_the_raw_logit(self):
+        torch.manual_seed(0)
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
-        confidence_raw = torch.randn(2, 5)
-        head.apply_sts(confidence_raw)
-        self.assertIs(head._last_confidence_raw, confidence_raw)
+        head.sts_temperatures = torch.tensor([0.5, 1.0, 2.0])
+        confidence, confidence_raw = head.predict(
+            torch.randn(2 * 3, 8),
+            anchor_tokens=torch.tensor([1, 2]),
+            draft_tokens=torch.tensor([[3, 4, 5], [6, 7, 8]]),
+            markov_head=None,
+        )
+        self.assertEqual(confidence_raw.shape, (2, 3))
+        self.assertTrue(torch.equal(confidence, head.apply_sts(confidence_raw)))
+
+    def test_markov_features_are_the_previous_tokens(self):
+        # Step i reads the embedding of the token before it: the anchor, then drafts.
+        torch.manual_seed(0)
+        head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=True)
+        markov_head = VanillaMarkov(vocab_size=16, markov_rank=4)
+        features = torch.randn(2, 3, 8)
+        anchor_tokens = torch.tensor([1, 2])
+        draft_tokens = torch.tensor([[3, 4, 5], [6, 7, 8]])
+        _, confidence_raw = head.predict(
+            features.view(6, 8),
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=markov_head,
+        )
+        prev_tokens = torch.tensor([[1, 3, 4], [2, 6, 7]])
+        expected = head(features, markov_head.get_prev_embeddings(prev_tokens))
+        self.assertTrue(torch.equal(confidence_raw, expected))
 
 
 class TestDSparkStsCalibration(CustomTestCase):
@@ -136,6 +163,126 @@ class TestStsDataRecorder(CustomTestCase):
             shard = torch.load(f"{stem}.0.pt")
         self.assertTrue(torch.equal(shard["prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.equal(shard["logits"], confidence_raw.to(torch.float32)))
+        # A caller with no sampled labels: the accept's outcome is the argmax one, rates and temperatures unknown.
+        self.assertTrue(torch.equal(shard["sampled_prefix_mask"], expected_prefix_mask))
+        self.assertTrue(torch.isnan(shard["accept_rates"]).all())
+        self.assertTrue(torch.isnan(shard["temperatures"]).all())
+        # Each row carries the CLOCK_MONOTONIC time it was recorded at.
+        self.assertEqual(shard["record_ns"].shape, (4,))
+        self.assertEqual(shard["record_ns"].dtype, torch.int64)
+        self.assertGreater(int(shard["record_ns"][0]), 0)
+
+    def test_records_the_sampled_accepts_outcome_rates_and_temperatures(self):
+        gamma = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=gamma, flush_every=10)
+            recorder.record(
+                confidence_raw=torch.zeros(2, gamma),
+                num_correct_drafts=torch.tensor([0, 3]),
+                sampled_num_correct_drafts=torch.tensor([2, 1]),
+                accept_rates=torch.tensor([[0.9, 0.5, 0.1], [1.0, 0.2, 0.0]]),
+                temperatures=torch.tensor([0.6, 0.6]),
+            )
+            recorder.flush()
+            shard = torch.load(f"{stem}.0.pt")
+            self.assertTrue(torch.equal(shard["prefix_mask"], torch.tensor([[0.0, 0, 0], [1, 1, 1]])))
+            self.assertTrue(torch.equal(shard["sampled_prefix_mask"], torch.tensor([[1.0, 1, 0], [1, 0, 0]])))
+            self.assertTrue(torch.equal(shard["temperatures"], torch.tensor([0.6, 0.6])))
+
+            from sglang.benchmark.dspark_sts_fit import load_collected_labels
+
+            glob = f"{stem}.*.pt"
+            _, argmax = load_collected_labels(data_glob=glob, label="argmax")
+            _, sampled = load_collected_labels(data_glob=glob, label="sampled")
+            _, soft = load_collected_labels(data_glob=glob, label="soft")
+            self.assertTrue(torch.equal(argmax, shard["prefix_mask"].double()))
+            self.assertTrue(torch.equal(sampled, shard["sampled_prefix_mask"].double()))
+            self.assertTrue(torch.allclose(soft, torch.tensor([[0.9, 0.45, 0.045], [1.0, 0.2, 0.0]]).double()))
+            with self.assertRaises(ValueError):
+                load_collected_labels(data_glob=glob, label="soft", temperature=1.0)
+            logits, _ = load_collected_labels(data_glob=glob, label="soft", temperature=0.6)
+            self.assertEqual(logits.shape[0], 2)
+
+    @staticmethod
+    def _record(recorder, bs, gamma=3):
+        recorder.record(
+            confidence_raw=torch.randn(bs, gamma),
+            num_correct_drafts=torch.ones(bs, dtype=torch.int64),
+            temperatures=torch.full((bs,), 0.6),
+            draft_features={k: torch.rand(bs, gamma) for k in StsDataRecorder.DRAFT_FEATURES},
+        )
+
+    def test_close_writes_the_partial_tail_as_a_last_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=2)
+            for _ in range(3):
+                self._record(recorder, bs=1)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt"])
+            recorder.close()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt", "shard.1.pt"])
+            tail = torch.load(f"{stem}.1.pt")
+            self.assertEqual(tail["logits"].shape, (1, 3))
+            self.assertEqual(set(tail), set(torch.load(f"{stem}.0.pt")))
+
+    def test_close_with_nothing_pending_writes_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            StsDataRecorder(path_stem=stem, gamma=3, flush_every=2).close()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=2)
+            for _ in range(2):
+                self._record(recorder, bs=1)
+            recorder.close()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt"])
+
+    def test_close_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=10)
+            self._record(recorder, bs=2)
+            recorder.close()
+            recorder.close()
+            recorder.flush()
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["shard.0.pt"])
+            self.assertEqual(torch.load(f"{stem}.0.pt")["logits"].shape[0], 2)
+
+    def test_a_short_tail_shard_loads_in_the_fit_and_the_cv_script(self):
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[4]
+        spec = importlib.util.spec_from_file_location(
+            "sts_sampled_cv", root / "analysis" / "dsv41-drive" / "dspark" / "sts_sampled_cv.py"
+        )
+        cv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cv)
+        from sglang.benchmark.dspark_sts_fit import load_collected_labels
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(path_stem=stem, gamma=3, flush_every=2)
+            for _ in range(3):
+                self._record(recorder, bs=1)
+            recorder.close()
+            logits, target = load_collected_labels(data_glob=f"{stem}.*.pt", label="argmax")
+            self.assertEqual(logits.shape[0], 3)
+            self.assertEqual(target.shape, (3, 3))
+            rows = cv.load_rows(f"{stem}.*.pt")
+            self.assertEqual((rows["raw"].shape[0], rows["dropped_nan"]), (3, 0))
+            self.assertEqual(rows["ns"].shape, (3,))
+
+    def test_a_shard_without_sampled_labels_refuses_a_sampled_fit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.0.pt"
+            torch.save({"logits": torch.zeros(1, 2), "prefix_mask": torch.ones(1, 2)}, path)
+            from sglang.benchmark.dspark_sts_fit import load_collected_labels
+
+            _, argmax = load_collected_labels(data_glob=str(Path(tmp) / "old.*.pt"), label="argmax")
+            self.assertEqual(argmax.tolist(), [[1.0, 1.0]])
+            for label in ("sampled", "soft"):
+                with self.assertRaises(ValueError):
+                    load_collected_labels(data_glob=str(Path(tmp) / "old.*.pt"), label=label)
 
 
 if __name__ == "__main__":

@@ -68,16 +68,23 @@ struct Counters {
 class Store {
  public:
   static constexpr size_t kBounceBytes = 16 << 20;
+  // A dead verify row's id (engram.py DEAD_ROW_ID): a zero row, no access, no read, no insert. Other negatives fail.
+  static constexpr int64_t kDeadRowId = -1;
+  // A budget of 0 is no cache: every lookup misses and reads its rows through io_uring, and nothing is kept.
   Store(size_t budget, int64_t row_bytes) : row_bytes_(row_bytes) {
-    if (row_bytes <= 0 || budget < static_cast<size_t>(row_bytes)) throw std::invalid_argument("invalid Engram cache size");
-    ways_=8;
+    if (row_bytes <= 0 || (budget != 0 && budget < static_cast<size_t>(row_bytes)))
+      throw std::invalid_argument("invalid Engram cache size");
+    ways_=budget ? 8 : 0;
     size_t capacity=budget/static_cast<size_t>(row_bytes);
-    nsets_=std::max<size_t>(1,capacity/ways_);
+    nsets_=std::max<size_t>(1,ways_ ? capacity/ways_ : 1);
     tags_.assign(nsets_*ways_,-1); ages_.assign(nsets_*ways_,0);
-    data_=static_cast<uint8_t*>(mmap(nullptr,nsets_*ways_*row_bytes_,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0));
-    if(data_==MAP_FAILED) { data_=nullptr; throw std::runtime_error("Engram cache mmap failed"); }
+    if(ways_) {
+      data_=static_cast<uint8_t*>(mmap(nullptr,nsets_*ways_*row_bytes_,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0));
+      if(data_==MAP_FAILED) { data_=nullptr; throw std::runtime_error("Engram cache mmap failed"); }
+    }
     if(posix_memalign(reinterpret_cast<void**>(&bounce_),4096,kBounceBytes)!=0) {
-      munmap(data_,nsets_*ways_*row_bytes_); data_=nullptr;
+      if(data_) munmap(data_,nsets_*ways_*row_bytes_);
+      data_=nullptr;
       throw std::runtime_error("Engram aligned bounce allocation failed");
     }
     q_.reserve(8);
@@ -196,9 +203,12 @@ class Store {
     const size_t rb=row_bytes_; if(q.status) *q.status=1;
     std::vector<int64_t> misses; std::vector<std::vector<size_t>> miss_positions;
     std::unordered_map<int64_t,size_t> miss_index;
-    ++clock_; stats_.accesses+=q.n;
+    ++clock_;
     for(int64_t i=0;i<q.n;i++) {
-      int64_t id=q.ids[i]; if(id<0||id>=t.rows) { if(q.status)*q.status=2; return -EINVAL; }
+      int64_t id=q.ids[i];
+      if(id==kDeadRowId) { std::memset(q.out+i*rb,0,rb); continue; }
+      if(id<0||id>=t.rows) { if(q.status)*q.status=2; return -EINVAL; }
+      stats_.accesses++;
       int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_, base=set*ways_, way=ways_;
       for(size_t w=0;w<ways_;w++) if(tags_[base+w]==key){way=w;break;}
       if(way<ways_) { std::memcpy(q.out+i*rb,data_+(base+way)*rb,rb); ages_[base+way]=clock_; stats_.hits++; }
@@ -328,11 +338,13 @@ class Store {
             return true;
           };
           if(!scatter(wo,t.dim,dst)||!scatter(so,t.scale_dim,dst+t.dim))return -EIO;
-          int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_,base=set*ways_,way=ways_;
-          for(size_t w=0;w<ways_;w++)if(tags_[base+w]==key){way=w;break;}
-          if(way==ways_) way=std::min_element(ages_.begin()+base,ages_.begin()+base+ways_)-(ages_.begin()+base);
-          if(tags_[base+way]<0)stats_.filled_rows++;else stats_.evictions++;
-          tags_[base+way]=key; ages_[base+way]=clock_; memcpy(data_+(base+way)*rb,dst,rb);
+          if(ways_) {
+            int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_,base=set*ways_,way=ways_;
+            for(size_t w=0;w<ways_;w++)if(tags_[base+w]==key){way=w;break;}
+            if(way==ways_) way=std::min_element(ages_.begin()+base,ages_.begin()+base+ways_)-(ages_.begin()+base);
+            if(tags_[base+way]<0)stats_.filled_rows++;else stats_.evictions++;
+            tags_[base+way]=key; ages_[base+way]=clock_; memcpy(data_+(base+way)*rb,dst,rb);
+          }
           for(size_t k=1;k<miss_positions[j].size();k++) memcpy(q.out+miss_positions[j][k]*rb,dst,rb);
         }
         chunk_begin=chunk_end;

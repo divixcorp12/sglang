@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, List
 
 import numpy as np
 import tqdm
 
+from sglang.srt.constants import WARMUP_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -15,6 +17,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__file__)
 
 _warmup_registry = {}
+
+
+def warmup_rid() -> str:
+    """A warm-up request's rid: the scheduler tells it from a serving request by its prefix."""
+    return f"{WARMUP_RID_PREFIX}_{uuid.uuid4().hex}"
 
 
 def warmup(name: str):
@@ -79,6 +86,7 @@ async def whisper_autodetect(
             variant_name,
         )
         req = GenerateReqInput(
+            rid=warmup_rid(),
             text="",
             audio_data=audio_data_uri,
             sampling_params={
@@ -112,6 +120,7 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
     for i in tqdm.trange(1, 512):
         size = i * 4
         generate_req_input = GenerateReqInput(
+            rid=warmup_rid(),
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 30,
@@ -148,6 +157,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
         generate_req_input = GenerateReqInput(
+            rid=warmup_rid(),
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 1,
@@ -165,7 +175,9 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 # Triton's own M == 1 / M % 16 == 0 / other specialization, crossed with the M
 # thresholds the launchers branch on (8 and 48 in hc_combine_norm, 64-384 and
 # 2048 in mhc's hc_mix_stats), plus a full 4096-token prefill chunk.
-_DSV41_PREFILL_WARMUP_SIZES = (1, 5, 8, 16, 33, 64, 257, 400, 2048, 2049, 4096)
+# The startup hot-cache calibration replays the same sequence (hot_cache_calibration.calibration_shapes), so its
+# allocator history matches this warm-up's.
+DSV41_PREFILL_WARMUP_SIZES = (1, 5, 8, 16, 33, 64, 257, 400, 2048, 2049, 4096)
 
 
 @warmup("dsv41_prefill_shapes")
@@ -180,8 +192,9 @@ async def dsv41_prefill_shapes(
     streams its routed experts and costs seconds.
     """
     rng = np.random.default_rng(0)
-    for size in tqdm.tqdm(_DSV41_PREFILL_WARMUP_SIZES, desc="Warmup DSV4.1 prefill"):
+    for size in tqdm.tqdm(DSV41_PREFILL_WARMUP_SIZES, desc="Warmup DSV4.1 prefill"):
         req = GenerateReqInput(
+            rid=warmup_rid(),
             input_ids=rng.integers(2**16, size=size).tolist(),
             sampling_params={"max_new_tokens": 1, "temperature": 0.0},
         )
@@ -192,6 +205,7 @@ async def dsv41_prefill_shapes(
             pass
     # A grammar request loads xgrammar's bitmask kernel and runs the sampler's grammar token sync.
     req = GenerateReqInput(
+        rid=warmup_rid(),
         input_ids=rng.integers(2**16, size=16).tolist(),
         sampling_params={"max_new_tokens": 2, "temperature": 0.0, "regex": "(yes|no)"},
     )
@@ -200,3 +214,50 @@ async def dsv41_prefill_shapes(
         req.bootstrap_host = FAKE_BOOTSTRAP_HOST
     async for _ in tokenizer_manager.generate_request(req, None):
         pass
+
+
+# (prompt tokens, sampling params) of the decode warm-up, in order. The greedy prompt takes two prefill chunks at
+# production's 4096; the second is short because a chunk costs about the experts it routes to (64 tokens ~5 s, 4096
+# ~20 s). The sampled prompts are short too: their kernels do not depend on the prompt.
+DSV41_DECODE_WARMUP_REQUESTS = (
+    (4096 + 64, {"temperature": 0.0}),
+    (16, {"temperature": 0.6}),
+    (16, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
+)
+DSV41_DECODE_WARMUP_NEW_TOKENS = 16
+
+
+@warmup("dsv41_decode_paths")
+async def dsv41_decode_paths(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Load the Triton kernels that only decoding and SWA eviction reach, which dsv41_prefill_shapes never runs.
+
+    Run it after dsv41_prefill_shapes. That warm-up leaves its prompts' SWA KV cached in the radix tree (8,704 tokens
+    of the 11,264-token SWA pool), so the long prompt's first chunk has to evict it. Tree values are int64, unlike
+    the int32 request rows every earlier free passed, so the eviction loads the int64 variant of
+    get_and_clear_swa_pages_kernel. The sampled requests take DSpark's sampling draft (_online_partial_kernel,
+    _online_combine_kernel, _build_step_local_kernel) and its rejection-sampling accept
+    (speculative_sampling_classic_kernel, _gather_two_level_bonus_kernel); a greedy batch reaches none of them.
+    ignore_eos keeps every request decoding for its full length.
+
+    hot_cache_calibration.calibration_shapes does not replay these: no extend here exceeds the 4096-token chunk
+    dsv41_prefill_shapes already ran, and the calibration is compared with that warm-up's first 4096 prefill, which
+    comes before this one.
+    """
+    rng = np.random.default_rng(1)
+    for size, params in tqdm.tqdm(DSV41_DECODE_WARMUP_REQUESTS, desc="Warmup DSV4.1 decode"):
+        req = GenerateReqInput(
+            input_ids=rng.integers(2**16, size=size).tolist(),
+            sampling_params={
+                **params,
+                "max_new_tokens": DSV41_DECODE_WARMUP_NEW_TOKENS,
+                "ignore_eos": True,
+            },
+            rid=warmup_rid(),
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass

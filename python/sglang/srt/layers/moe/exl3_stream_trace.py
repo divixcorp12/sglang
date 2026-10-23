@@ -15,7 +15,7 @@ the shards (DSV41_REFERENCE.md section 9.4). This file holds:
   Python never runs, into a device ring for the trace.
 * :class:`RouterCapture`, the binary side files of the router's input.
 
-The trace is enabled by ``SGLANG_DSV41_EXPERT_TRACE_PATH``.
+The trace is enabled by ``trace.expert_path`` (``SGLANG_EXPERT_STREAM_TRACE``).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 from sglang.srt.layers.moe.residency_capture import (
     ResidencyCapture,
     ResidencyRings,
@@ -194,7 +194,7 @@ class GraphRouteLog:
 
     For the stage trace only. A replayed decode graph runs no Python, so its routes
     never reach ``Exl3StreamTrace.record``. ``record`` is instead called from each
-    layer's in-graph gather (``Exl3RamMissRowBackend.post``) and is captured with it:
+    layer's in-graph gather (``ExpertEngineRowBackend.post``) and is captured with it:
     the first streamed layer (row 0) takes the next ring slot and bumps ``seq``, then
     every layer copies its routes and its plan's miss count into that slot. Each
     forward thus writes its own entry, numbered by ``seq`` (the graph forwards that
@@ -208,7 +208,7 @@ class GraphRouteLog:
     from a token count.
 
     ``poll`` runs at the per-batch check. It reads the ring back through pinned
-    buffers without waiting, one batch behind (like ``Exl3RamMissService._graph_rows``),
+    buffers without waiting, one batch behind (like ``ExpertEngineService._graph_rows``),
     and writes the entries finished since the last read. The copy is on the host's
     current stream, which need not be the stream the graph replays on, so an entry is
     trusted only when the ``seq`` read before the ring shows a later forward has
@@ -608,12 +608,15 @@ class Exl3StreamTrace:
         topk_ids: torch.Tensor,
         stats: Optional[Any],
         background_read_rows: int,
+        sources: Optional[dict] = None,
     ) -> None:
         """Count one streamed MoE call and, if tracing, write its line.
 
         ``stats`` is its gather's stats, or None when the call gathered nothing.
         ``background_read_rows`` is the layer's cumulative count of rows read outside
-        gathers (promotions, seeding). Ignored during graph capture.
+        gathers (promotions, seeding). ``sources``, when the call ran prefill fills,
+        splits its experts into hot, resident and NVMe-read lists (the rest came from
+        the pinned tier); the line carries it as ``sources``. Ignored during graph capture.
         """
         if capturing_graphs():
             return
@@ -655,11 +658,16 @@ class Exl3StreamTrace:
                 "counts": counts.tolist(),
                 "vram_miss": vram_miss,
                 "ram_miss": ram_miss,
+                # Rows prefill_fills read before the gather (not in ram_miss), and layer-major residency hits.
+                "fill_rows": int(getattr(stats, "host_fill_rows", 0)),
+                "residency_hits": int(getattr(stats, "residency_hit_rows", 0)),
                 "read_ms": round(read_ms, 4),
                 "split_ms": round(split_ms, 4),
                 "background_rows": background,
                 "t": round(time.monotonic(), 6),
             }
+            if sources is not None:
+                line["sources"] = sources
             if self._graph_seq is not None:
                 line["graph_seq"] = self._graph_seq
             if self._meta is not None:
@@ -673,7 +681,7 @@ class Exl3StreamTrace:
 
     @property
     def enabled(self) -> bool:
-        """A trace file is open (SGLANG_DSV41_EXPERT_TRACE_PATH was set)."""
+        """A trace file is open (trace.expert_path was set)."""
         return self._file is not None
 
     def record_graph_step(
@@ -935,11 +943,13 @@ _TRACE: Optional[Exl3StreamTrace] = None
 _TRACE_LOCK = threading.Lock()
 
 
-def get_exl3_stream_trace() -> Exl3StreamTrace:
-    """The process-wide trace, writing to SGLANG_DSV41_EXPERT_TRACE_PATH when set."""
+def get_exl3_stream_trace(*, config: Optional[ExpertStreamConfig] = None) -> Exl3StreamTrace:
+    """The process-wide trace, writing to ``trace.expert_path`` when set; ``config`` (default: the process's
+    ``stream_config()``) is read only by the first call, which opens it."""
     global _TRACE
     with _TRACE_LOCK:
         if _TRACE is None:
-            _TRACE = Exl3StreamTrace(envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get())
+            config = stream_config() if config is None else config
+            _TRACE = Exl3StreamTrace(config.trace.expert_path)
             atexit.register(_TRACE.close)
         return _TRACE

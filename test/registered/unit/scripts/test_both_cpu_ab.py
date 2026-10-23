@@ -11,7 +11,92 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-METRICS = "SGLANG_MOE_HOT_METRICS_FILE"
+TRACE = "SGLANG_EXPERT_STREAM_TRACE"
+MIRROR = "SGLANG_EXPERT_STREAM_MIRROR"
+CPU_SPLIT = "SGLANG_EXPERT_STREAM_CPU_SPLIT"
+CPU_TWO_STAGE = "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE"
+GROUP_ENVS = (TRACE, MIRROR, CPU_SPLIT, CPU_TWO_STAGE, "SGLANG_EXPERT_STREAM_URING",
+              "SGLANG_EXPERT_STREAM_SHADOW_PREFETCH")
+# A group member is (group env, key): the group env holds one JSON object with the member under its key.
+METRICS = (TRACE, "hot_metrics_file")
+
+
+def _group(env, name):
+    raw = env.get(name)
+    return json.loads(raw) if raw else {}
+
+
+def _get(env, member):
+    """A plain env's value, or a group member's value (None when the group does not set it)."""
+    if isinstance(member, str):
+        return env[member]
+    value = _group(env, member[0])
+    for part in member[1].split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def _flat(env):
+    """The env with each group env expanded into (group, dotted key) members, for comparing two whole envs."""
+    out = {}
+    for name, value in env.items():
+        if name not in GROUP_ENVS:
+            out[name] = value
+            continue
+
+        def walk(node, prefix):
+            for key, item in node.items():
+                if isinstance(item, dict):
+                    walk(item, f"{prefix}{key}.")
+                else:
+                    out[(name, f"{prefix}{key}")] = item
+
+        walk(_group(env, name), "")
+    return out
+
+
+def _strip(env, *members):
+    """The env without these plain keys and group members (a group left empty is dropped)."""
+    out = dict(env)
+    for member in members:
+        if isinstance(member, str):
+            out.pop(member, None)
+            continue
+        group = _group(out, member[0])
+        node, *path = group, *member[1].split(".")
+        for part in path[:-1]:
+            node = node.get(part, {})
+        node.pop(path[-1], None)
+        if group:
+            out[member[0]] = json.dumps(group)
+        else:
+            out.pop(member[0], None)
+    return out
+
+
+def _setenv(monkeypatch, *pairs):
+    """monkeypatch.setenv for group members: the members of one group are merged into that group's JSON object."""
+    groups = {}
+    for member, value in pairs:
+        node = groups.setdefault(member[0], {})
+        *path, last = member[1].split(".")
+        for part in path:
+            node = node.setdefault(part, {})
+        node[last] = value
+    for name, value in groups.items():
+        monkeypatch.setenv(name, json.dumps(value))
+STS_COLLECT = "SGLANG_DSPARK_STS_COLLECT_PATH"
+CONFIDENCE_CUT = "SGLANG_DSPARK_CONFIDENCE_CUT"
+STS_PATH_FLAG = "--speculative-dspark-confidence-sts-path"
+BLOCK_FLAG = "--speculative-use-block-verification"
+SAMPLED_KNOBS = (
+    "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST",
+    "SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL",
+    "SGLANG_DSPARK_USE_GREEDY_DRAFT",
+)
 
 
 def _ab():
@@ -23,14 +108,22 @@ def _ab():
     return module
 
 
+def _arm(ab, name):
+    """An arm's overrides as the launch sees them: ARMS holds `GROUP.key` members, collapse() builds the group JSON."""
+    return ab.collapse(ab.ARMS[name][0])
+
+
 def test_the_probe_server_writes_its_own_metrics_file_and_keeps_the_arms_env():
     ab = _ab()
     for arm in ab.ARMS:
         timed = ab._overrides(arm, "/out")
         probe = ab._probe_overrides(arm, "/out")
         # summarize() reads the timed server's last record; an appending probe server would overwrite it.
-        assert probe[METRICS] != timed[METRICS]
-        assert {k: v for k, v in probe.items() if k != METRICS} == {k: v for k, v in timed.items() if k != METRICS}
+        assert _get(probe, METRICS) != _get(timed, METRICS)
+        # A collecting probe server's recorder would overwrite the timed server's shards from shard 0.
+        assert (probe[STS_COLLECT] != timed[STS_COLLECT]) == (arm == STS_COLLECT_ARM), arm
+        own = (METRICS, STS_COLLECT)
+        assert _strip(probe, *own) == _strip(timed, *own)
 
 
 def test_a_dspark_arm_gets_a_health_budget_past_its_measured_startup_and_run_arm_honours_it(monkeypatch):
@@ -65,46 +158,46 @@ def test_the_timed_dspark_arms_take_the_recipes_mem_fraction_and_prod_does_not(m
 def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_it_off(monkeypatch):
     ab = _ab()
     options = {
-        "SGLANG_DSV41_RAM_PREFETCH": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
-        "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
-        "SGLANG_DSV41_RAM_PREFETCH_SCORER": "cpu",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE": "2",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY": "0",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "cpu",
     }
     a, b = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-prefetch"][0]
-    assert a["SGLANG_DSV41_RAM_PREFETCH"] == "0"
+    assert a["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == "0"
     assert {k: b[k] for k in options} == options
-    assert {k: v for k, v in a.items() if k != "SGLANG_DSV41_RAM_PREFETCH"} == {
+    assert {k: v for k, v in a.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"} == {
         k: v for k, v in b.items() if k not in options
     }
     assert ab.ARMS["dspark-both-prefetch"][1] is True
     for k in options:
         monkeypatch.setenv(k, "9")
     assert {k: ab._overrides("dspark-both-prefetch", "/out")[k] for k in options} == options
-    assert ab._overrides("dspark-both", "/out")["SGLANG_DSV41_RAM_PREFETCH"] == "0"
+    assert ab._overrides("dspark-both", "/out")["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == "0"
 
 
 def test_the_top_k_only_arm_differs_from_the_prefetch_arm_in_that_option_alone(monkeypatch):
     ab = _ab()
     b, c = ab.ARMS["dspark-both-prefetch"][0], ab.ARMS["dspark-both-prefetch-topk"][0]
-    assert c["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] == "1"
-    assert {k: v for k, v in c.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"} == {
-        k: v for k, v in b.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"
+    assert c["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"] == "1"
+    assert {k: v for k, v in c.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"} == {
+        k: v for k, v in b.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"
     }
     assert ab.ARMS["dspark-both-prefetch-topk"][1] is True
     assert ab.REFERENCE["dspark-both-prefetch-topk"] == "dspark-both"
-    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY", "0")
-    assert ab._overrides("dspark-both-prefetch-topk", "/out")["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] == "1"
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY", "0")
+    assert ab._overrides("dspark-both-prefetch-topk", "/out")["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"] == "1"
 
 
 def test_every_arm_but_the_prefetch_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
-    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH", "1")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH", "1")
     for arm in ab.ARMS:
         expected = "1" if arm.startswith("dspark-both-prefetch") else "0"
-        assert ab._overrides(arm, "/out")["SGLANG_DSV41_RAM_PREFETCH"] == expected, arm
-        assert ab._probe_overrides(arm, "/out")["SGLANG_DSV41_RAM_PREFETCH"] == expected, arm
+        assert ab._overrides(arm, "/out")["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == expected, arm
+        assert ab._probe_overrides(arm, "/out")["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == expected, arm
 
 
 def test_the_private_build_caches_reach_every_arms_server(monkeypatch):
@@ -197,18 +290,18 @@ def test_a_missing_reference_probe_is_recorded(tmp_path):
 def test_the_gpu_arm_differs_from_the_prefetch_arm_in_the_scorer_alone(monkeypatch):
     ab = _ab()
     b, g = ab.ARMS["dspark-both-prefetch"][0], ab.ARMS["dspark-both-prefetch-gpu"][0]
-    assert (b["SGLANG_DSV41_RAM_PREFETCH_SCORER"], g["SGLANG_DSV41_RAM_PREFETCH_SCORER"]) == ("cpu", "gpu")
-    assert {k: v for k, v in g.items() if k != "SGLANG_DSV41_RAM_PREFETCH_SCORER"} == {
-        k: v for k, v in b.items() if k != "SGLANG_DSV41_RAM_PREFETCH_SCORER"
+    assert (b["SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"], g["SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"]) == ("cpu", "gpu")
+    assert {k: v for k, v in g.items() if k != "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"} == {
+        k: v for k, v in b.items() if k != "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"
     }
     assert ab.ARMS["dspark-both-prefetch-gpu"][1] is True and ab.REFERENCE["dspark-both-prefetch-gpu"] == "dspark-both"
     t = ab.ARMS["dspark-both-prefetch-gpu-topk"][0]
-    assert {k: v for k, v in t.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"} == {
-        k: v for k, v in g.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"
+    assert {k: v for k, v in t.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"} == {
+        k: v for k, v in g.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"
     }
-    assert t["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] == "1"
-    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH_SCORER", "cpu")
-    assert ab._overrides("dspark-both-prefetch-gpu", "/out")["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu"
+    assert t["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"] == "1"
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER", "cpu")
+    assert ab._overrides("dspark-both-prefetch-gpu", "/out")["SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"] == "gpu"
 
 
 def test_the_floors_arm_differs_from_the_gpu_arm_in_the_committed_margin_floors_alone(monkeypatch):
@@ -234,7 +327,7 @@ def test_every_prefetch_arm_pins_its_scorer_and_floors_against_the_defaults_and_
 
     ab = _ab()
     assert ab.MARGIN_FLOORS == MARGIN_FLOORS
-    scorer, floors = "SGLANG_DSV41_RAM_PREFETCH_SCORER", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"
+    scorer, floors = "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"
     monkeypatch.setenv(scorer, "tpu")
     monkeypatch.setenv(floors, "/elsewhere.json")
     for arm in ab.ARMS:
@@ -244,7 +337,7 @@ def test_every_prefetch_arm_pins_its_scorer_and_floors_against_the_defaults_and_
             assert env[floors] == (MARGIN_FLOORS if arm.endswith("-floors") else ""), arm
         else:
             # Prefetch off: the scorer is unused, and the gate refuses a leaked explicit gpu rather than ignore it.
-            assert env["SGLANG_DSV41_RAM_PREFETCH"] == "0" and env[floors] == "", arm
+            assert env["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == "0" and env[floors] == "", arm
 
 
 def test_the_driver_runs_the_arms_in_the_order_given(monkeypatch, tmp_path):
@@ -339,32 +432,31 @@ def test_a_baseline_cannot_be_both_imported_and_rerun(monkeypatch, tmp_path):
         ab.main()
 
 
-MISS_CUT = {"SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
+MISS_CUT = {(CPU_SPLIT, "miss_cut"): 1, (CPU_SPLIT, "miss_cut_max"): 3}
 
 
 def test_the_miss_cut_arm_is_dspark_both_with_the_cut_on_against_dspark_both():
     ab = _ab()
-    a, c = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-misscut"][0]
-    assert {k: c[k] for k in MISS_CUT} == MISS_CUT
-    assert {k: v for k, v in c.items() if k not in MISS_CUT} == {k: v for k, v in a.items() if k not in MISS_CUT}
+    a, c = _arm(ab, "dspark-both"), _arm(ab, "dspark-both-misscut")
+    assert {k: _get(c, k) for k in MISS_CUT} == MISS_CUT
+    assert _strip(c, *MISS_CUT) == _strip(a, *MISS_CUT)
     assert ab.ARMS["dspark-both-misscut"][1] is True
     assert ab.REFERENCE["dspark-both-misscut"] == "dspark-both"
 
 
 def test_the_prefetch_miss_cut_arm_is_the_gpu_prefetch_arm_with_the_cut_on():
     ab = _ab()
-    a, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut"][0]
-    assert {k: c[k] for k in MISS_CUT} == MISS_CUT
-    assert {k: v for k, v in c.items() if k not in MISS_CUT} == {k: v for k, v in a.items() if k not in MISS_CUT}
+    a, c = _arm(ab, "dspark-both-prefetch-gpu"), _arm(ab, "dspark-both-prefetch-gpu-misscut")
+    assert {k: _get(c, k) for k in MISS_CUT} == MISS_CUT
+    assert _strip(c, *MISS_CUT) == _strip(a, *MISS_CUT)
     assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut"] == "dspark-both"
 
 
 def test_the_weights_arm_is_the_miss_cut_arm_with_the_mirror_weighted_by_drive_speed():
     ab = _ab()
-    a, w = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-weights-misscut"][0]
-    assert w["SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"] == "16:10:16"  # nvme0 : nvme4 (SPCC) : nvme2, by fio rate
-    assert {k: v for k, v in w.items() if k != "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"} == {
-        k: v for k, v in a.items() if k != "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"}
+    a, w = _arm(ab, "dspark-both-misscut"), _arm(ab, "dspark-both-weights-misscut")
+    assert _get(w, (MIRROR, "weights")) == "16:10:16"  # nvme0 : nvme4 (SPCC) : nvme2, by fio rate
+    assert _strip(w, (MIRROR, "weights")) == _strip(a, (MIRROR, "weights"))
     assert ab.ARMS["dspark-both-weights-misscut"][1] is True
     assert ab.REFERENCE["dspark-both-weights-misscut"] == "dspark-both-misscut"
 
@@ -379,19 +471,46 @@ def test_the_max_m8_arm_is_the_miss_cut_arm_with_four_tokens_per_cpu_chunk():
     assert ab.REFERENCE["dspark-both-misscut-maxm8"] == "dspark-both-misscut"
 
 
-PROMOTE = "SGLANG_DSV41_RAM_PREFETCH_PROMOTE"
+PROMOTE = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE"
 PROMOTE_ON = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote"
 PROMOTE_OFF = f"{PROMOTE_ON}-off"
-POOL_SERVE = "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE"
+POOL_SERVE = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE"
 POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-poolserve"
 PROMOTE_POOL_SERVE_ARM = f"{PROMOTE_ON}-poolserve"
-GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
+GPU_DRIP = "SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS"
 GPU_DRIP_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-gpudrip"
 GPU_DRIP_LEAN_ARM = f"{GPU_DRIP_ARM}-c64p2"
 PIN01_ARM = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit-pin01"
 PIN01_GPU01_ARM = f"{PIN01_ARM}-gpu01"
-FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
-SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
+PIN01_SPLIT_MODEL_ARM = f"{PIN01_ARM}-splitmodel"
+PIN01_MEM_ARM = f"{PIN01_ARM}-mem"
+PIN01_SPLIT_MODEL_MEM_ARM = f"{PIN01_SPLIT_MODEL_ARM}-mem"
+# Production's arm (-expseg with production's additions) and the confidence cut's two arms built on it.
+PROD_ARM = f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-prod"
+STS_COLLECT_ARM, CONFIDENCE_CUT_ARM = f"{PROD_ARM}-stscollect", f"{PROD_ARM}-confcut"
+SAMPLED_CUT_ARM = f"{CONFIDENCE_CUT_ARM}-sampled"
+SAMPLED_CUT_BLOCK_ARM = f"{SAMPLED_CUT_ARM}-block"
+LAYER_MAJOR_ARM = f"{PROD_ARM}-layermajor"
+LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM = f"{LAYER_MAJOR_ARM}-smallhot", f"{LAYER_MAJOR_ARM}-res"
+LAYER_MAJOR_ARMS = (LAYER_MAJOR_ARM, LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
+LAYER_MAJOR_LEND_ARM = f"{LAYER_MAJOR_ARM}-lend"
+CHUNKED_ARM = f"{PROD_ARM}-chunked"
+PROD_ARMS = (PROD_ARM, STS_COLLECT_ARM, CONFIDENCE_CUT_ARM, SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM, *LAYER_MAJOR_ARMS,
+             LAYER_MAJOR_LEND_ARM, CHUNKED_ARM)
+PIN01_HICACHE_ARMS = (f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-engram0",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-decay995", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-tiebreak",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-mergechunk-expseg-calib",
+                      f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-fixedcosts", f"{PIN01_SPLIT_MODEL_MEM_ARM}-hicache1-refine",
+                      *PROD_ARMS)
+PIN01_SPLIT_MODEL_FIXED_COSTS_ARM, PIN01_SPLIT_MODEL_REFINE_ARM = PIN01_HICACHE_ARMS[7:9]
+MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
+SPLIT_MODEL = (CPU_SPLIT, "model")
+SPLIT_MODEL_COSTS = (CPU_SPLIT, "model_costs")
+SPLIT_MODEL_REFINE = (CPU_SPLIT, "model_refine_batches")
+FULL_LAYERS = "SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS"
+SPLIT_LAYERS = (CPU_SPLIT, "layer_tables")
 PROMOTE_PAIR_ARMS = (
     PROMOTE_ON, PROMOTE_OFF, f"{PROMOTE_ON}-fixedsplit", f"{PROMOTE_OFF}-fixedsplit", POOL_SERVE_ARM,
     f"{POOL_SERVE_ARM}-fixedsplit", PROMOTE_POOL_SERVE_ARM, f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit",
@@ -401,11 +520,15 @@ PROMOTE_PAIR_ARMS = (
     GPU_DRIP_LEAN_ARM,
     PIN01_ARM,
     PIN01_GPU01_ARM,
+    PIN01_SPLIT_MODEL_ARM,
+    PIN01_MEM_ARM,
+    PIN01_SPLIT_MODEL_MEM_ARM,
+    *PIN01_HICACHE_ARMS,
 )
-SPLIT = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
-CALIBRATION = "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION"
-IDLE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE"
-IDLE_DEADLINE = "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US"
+SPLIT = (CPU_SPLIT, "table")
+CALIBRATION = (CPU_SPLIT, "calibration")
+IDLE = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE"
+IDLE_DEADLINE = "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US"
 
 
 def test_the_idle_drive_arm_is_the_prefetch_miss_cut_arm_with_idle_drive_reads_against_the_miss_cut_arm():
@@ -419,8 +542,8 @@ def test_the_idle_drive_arm_is_the_prefetch_miss_cut_arm_with_idle_drive_reads_a
     assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut-idle"] == "dspark-both-misscut"
 
 
-IDLE_SPREAD = "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD"
-IDLE_PIECES = "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES"
+IDLE_SPREAD = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD"
+IDLE_PIECES = "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES"
 IDLE2_ARMS = (
     "dspark-both-prefetch-gpu-misscut-idle2",
     "dspark-both-prefetch-gpu-misscut-idle2-floors",
@@ -469,15 +592,15 @@ def test_every_other_arm_pins_idle_drive_reads_off_against_an_exported_shell(mon
             assert (overrides[IDLE_SPREAD], overrides[IDLE_PIECES]) == knobs, arm
 
 
-HORIZON = "SGLANG_DSV41_RAM_PREFETCH_HORIZON"
+HORIZON = "SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON"
 L2_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2"
 T3_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3"
 L2_CAP2_ARM = f"{L2_ARM}-cap2"
 T3_CAP2_ARM = f"{T3_ARM}-cap2"
 T3_CAP3_ARM = f"{T3_ARM}-cap3"
 LEARNED_HEAD = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
-PER_LAYER = "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER"
-SPEC_SHARE = "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE"
+PER_LAYER = "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER"
+SPEC_SHARE = "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE"
 
 
 def test_the_t3_cap3_arm_is_the_t3_arm_with_three_rows_per_layer_and_three_pool_slots_alone():
@@ -548,6 +671,8 @@ def test_the_t3_arm_is_the_l2_arm_with_the_head_file_alone_and_every_other_arm_p
     assert ab.REFERENCE[T3_ARM] == "dspark-both-misscut"
     for arm in ab.ARMS:
         want = ab.T3_HEAD if arm in (T3_ARM, T3_CAP2_ARM, T3_CAP3_ARM, *PROMOTE_PAIR_ARMS) else ""
+        if arm in PROD_ARMS:
+            want = ab.arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD  # production's checksummed copy of the same head
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[LEARNED_HEAD] == want, arm
 
@@ -593,18 +718,16 @@ def test_the_promote_pair_differs_in_the_flag_alone_and_the_on_arm_is_compared_w
 def test_the_fixed_split_option_adds_the_table_and_calibration_off_to_both_arms_of_the_pair(monkeypatch, tmp_path):
     """Mutant: the option reaches one arm only, leaves calibration on, or drops the table -- red."""
     ab = _ab()
-    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    _setenv(monkeypatch, (SPLIT, "0:3,1:5"))
     for arm in (PROMOTE_ON, PROMOTE_OFF):
         plain, fixed = ab._overrides(arm, "/out"), ab._overrides(f"{arm}-fixedsplit", "/out")
-        assert SPLIT not in plain and CALIBRATION not in plain
-        assert (fixed[SPLIT], fixed[CALIBRATION]) == ("0:3,1:5", "0")
-        assert {k: v for k, v in fixed.items() if k not in (SPLIT, CALIBRATION, METRICS)} == {
-            k: v for k, v in plain.items() if k != METRICS
-        }
-        assert ab._probe_overrides(f"{arm}-fixedsplit", "/out")[SPLIT] == "0:3,1:5"
-    monkeypatch.delenv(SPLIT)
+        assert _get(plain, SPLIT) is None and _get(plain, CALIBRATION) is None
+        assert (_get(fixed, SPLIT), _get(fixed, CALIBRATION)) == ("0:3,1:5", False)
+        assert _strip(fixed, SPLIT, CALIBRATION, METRICS) == _strip(plain, METRICS)
+        assert _get(ab._probe_overrides(f"{arm}-fixedsplit", "/out"), SPLIT) == "0:3,1:5"
+    monkeypatch.delenv(CPU_SPLIT)
     monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), f"{PROMOTE_ON}-fixedsplit"])
-    with pytest.raises(SystemExit, match=SPLIT):
+    with pytest.raises(SystemExit, match=CPU_SPLIT):
         ab.main()
 
 
@@ -613,16 +736,17 @@ def test_the_cores13_arm_differs_from_its_base_in_node_1s_cpu_expert_cores_alone
     ab = _ab()
     base = ab.ARMS[f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"][0]
     cores = ab.ARMS[f"{PROMOTE_POOL_SERVE_ARM}-cores13-fixedsplit"][0]
-    knobs = ("SGLANG_DSV41_CPU_EXPERTS_THREADS", "SGLANG_EXPERT_NUMA_CORES")
+    knobs = ("SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS", "SGLANG_EXPERT_STREAM_NUMA_CORES")
     assert {k: v for k, v in cores.items() if k not in knobs} == {k: v for k, v in base.items() if k not in knobs}
     from sglang.srt.layers.moe.cpu_experts.threading_config import parse_numa_cores
 
-    plan = parse_numa_cores(cores["SGLANG_EXPERT_NUMA_CORES"])
+    plan = parse_numa_cores(cores["SGLANG_EXPERT_STREAM_NUMA_CORES"])
     assert plan[0]["cpu"] == list(range(6, 16))
-    assert len(plan[1]["cpu"]) == int(cores["SGLANG_DSV41_CPU_EXPERTS_THREADS"]) == 13
-    assert not set(plan[1]["cpu"]) & set(range(28, 32)) and 35 not in plan[1]["cpu"]
-    # The launch refuses node 0's RAM core named both here and by the spin core the recipe sets.
-    assert "ram" not in plan[0] and ab.arm_env.arm_env(cores)["SGLANG_DSV41_RAM_MISS_SPIN_CORE"]
+    assert len(plan[1]["cpu"]) == int(cores["SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS"]) == 13
+    # Node 1's RAM core is 51 and its spec thread's 50; its FREE cores 52-55 are never named.
+    assert set(plan[1]["cpu"]) <= set(range(28, 50)) and plan[1]["ram"] == [51]
+    # The spin core is node 0's "ram" entry of this one NUMA_CORES value (it was a separate env); no CPU worker holds it.
+    assert plan[0]["ram"] == [ab.arm_env.SPIN_CORE] and ab.arm_env.SPIN_CORE not in plan[0]["cpu"]
 
 
 def test_the_gate_arm_is_its_fixed_split_reference_with_the_gate_alone_and_every_other_arm_pins_it_off(monkeypatch):
@@ -633,13 +757,13 @@ def test_the_gate_arm_is_its_fixed_split_reference_with_the_gate_alone_and_every
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
     assert arm == "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-poolserve-fixedsplit-confgate"
     monkeypatch.setenv(gate, "0.9")
-    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    _setenv(monkeypatch, (SPLIT, "0:3,1:5"))
     for name in ab.ARMS:
         assert ab._overrides(name, "/out")[gate] == ("0.4" if name == arm else "0"), name
     on, off = ab.ARMS[arm][0], ab.ARMS[reference][0]
     assert {k: v for k, v in on.items() if k != gate} == {k: v for k, v in off.items() if k != gate}
     assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == reference
-    assert ab._overrides(arm, "/out")[SPLIT] == "0:3,1:5"
+    assert _get(ab._overrides(arm, "/out"), SPLIT) == "0:3,1:5"
 
 
 def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_drip_alone(monkeypatch):
@@ -648,26 +772,26 @@ def test_the_gpu_drip_arm_is_the_promote_pool_serve_fixed_split_arm_with_the_dri
     drip arm changes another knob or is compared with the wrong arm, or it loses the split table -- red."""
     ab = _ab()
     monkeypatch.setenv(GPU_DRIP, "7")
-    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    _setenv(monkeypatch, (SPLIT, "0:3,1:5"))
     for arm in ab.ARMS:
         want = "24" if arm in (GPU_DRIP_ARM, GPU_DRIP_LEAN_ARM) else "0"
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert overrides[GPU_DRIP] == want, arm
     base = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
     drip, plain = ab.ARMS[GPU_DRIP_ARM][0], ab.ARMS[base][0]
-    knobs = {GPU_DRIP: "24", "SGLANG_DSV41_GPU_DRIP_PICKS": "4", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "256"}
+    knobs = {GPU_DRIP: "24", "SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS": "4", "SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB": "256"}
     assert {k: drip[k] for k in knobs} == knobs and plain[GPU_DRIP] == "0"
     assert {k: v for k, v in drip.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
     assert ab.ARMS[GPU_DRIP_ARM][1] is True and ab.REFERENCE[GPU_DRIP_ARM] == base
-    assert ab._overrides(GPU_DRIP_ARM, "/out")[SPLIT] == "0:3,1:5"
+    assert _get(ab._overrides(GPU_DRIP_ARM, "/out"), SPLIT) == "0:3,1:5"
     assert {"drip_issued", "drip_landed", "drip_used", "drip_abandoned"} <= set(ab.RAM_KEYS)
     lean = ab.ARMS[GPU_DRIP_LEAN_ARM][0]
-    lean_knobs = {"SGLANG_DSV41_GPU_DRIP_PICKS": "2", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "64"}
+    lean_knobs = {"SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS": "2", "SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB": "64"}
     assert {k: lean[k] for k in lean_knobs} == lean_knobs
     assert {k: v for k, v in lean.items() if k not in lean_knobs} == {
         k: v for k, v in drip.items() if k not in lean_knobs
     }
-    assert ab.REFERENCE[GPU_DRIP_LEAN_ARM] == base and ab._overrides(GPU_DRIP_LEAN_ARM, "/out")[SPLIT] == "0:3,1:5"
+    assert ab.REFERENCE[GPU_DRIP_LEAN_ARM] == base and _get(ab._overrides(GPU_DRIP_LEAN_ARM, "/out"), SPLIT) == "0:3,1:5"
 
 
 def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(monkeypatch):
@@ -678,32 +802,245 @@ def test_the_pin_arms_add_their_knobs_alone_and_every_other_arm_pins_them_empty(
     fixed split -- red."""
     ab = _ab()
     monkeypatch.setenv(FULL_LAYERS, "5")
-    monkeypatch.setenv(SPLIT_LAYERS, "5:0")
-    monkeypatch.setenv(SPLIT, "0:3,1:5")
+    _setenv(monkeypatch, (SPLIT_LAYERS, "5:0"), (SPLIT, "0:3,1:5"))
+    # Production pins every layer whole since 2026-10-22 (owner): the arms built on it carry its list.
+    prod_full = ab.arm_env.prod_env()[FULL_LAYERS]
     for arm in ab.ARMS:
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[FULL_LAYERS] == ("0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM) else ""), arm
-            assert overrides[SPLIT_LAYERS] == (ab.ARMS[arm][0][SPLIT_LAYERS] if arm == PIN01_GPU01_ARM else ""), arm
+            assert overrides[FULL_LAYERS] == (prod_full if arm in PROD_ARMS
+                                              else "0,1" if arm in (PIN01_ARM, PIN01_GPU01_ARM, PIN01_SPLIT_MODEL_ARM,
+                                                                    PIN01_MEM_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                                    *PIN01_HICACHE_ARMS)
+                                              else ""), arm
+            assert (_get(overrides, SPLIT_LAYERS) or "") == (
+                _get(_arm(ab, arm), SPLIT_LAYERS) if arm == PIN01_GPU01_ARM else ""), arm
     reference = f"{PROMOTE_POOL_SERVE_ARM}-fixedsplit"
-    pin, plain, gpu = ab.ARMS[PIN01_ARM][0], ab.ARMS[reference][0], ab.ARMS[PIN01_GPU01_ARM][0]
-    budget = {"SGLANG_MOE_PINNED_HOST_MB", "SGLANG_MOE_PINNED_HOST_NUMA_MB"}
+    pin, plain, gpu = _arm(ab, PIN01_ARM), _arm(ab, reference), _arm(ab, PIN01_GPU01_ARM)
+    budget = {"SGLANG_EXPERT_STREAM_PINNED_HOST_MB", "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB"}
     knobs = budget | {FULL_LAYERS}
     assert {k: v for k, v in pin.items() if k not in knobs} == {k: v for k, v in plain.items() if k not in knobs}
-    assert {k: v for k, v in gpu.items() if k != SPLIT_LAYERS} == {k: v for k, v in pin.items() if k != SPLIT_LAYERS}
+    assert _strip(gpu, SPLIT_LAYERS) == _strip(pin, SPLIT_LAYERS)
     assert ab.REFERENCE[PIN01_ARM] == reference and ab.REFERENCE[PIN01_GPU01_ARM] == PIN01_ARM
     for arm in (PIN01_ARM, PIN01_GPU01_ARM):
-        assert ab.ARMS[arm][1] is True and ab._overrides(arm, "/out")[SPLIT] == "0:3,1:5"
-    nodes = [(int(n), int(mib) << 20) for n, mib in (e.split(":") for e in pin["SGLANG_MOE_PINNED_HOST_NUMA_MB"].split(","))]
-    assert sum(b for _, b in nodes) == int(pin["SGLANG_MOE_PINNED_HOST_MB"]) << 20
+        assert ab.ARMS[arm][1] is True and _get(ab._overrides(arm, "/out"), SPLIT) == "0:3,1:5"
+    nodes = [(int(n), int(mib) << 20) for n, mib in (e.split(":") for e in pin["SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB"].split(","))]
+    assert sum(b for _, b in nodes) == int(pin["SGLANG_EXPERT_STREAM_PINNED_HOST_MB"]) << 20
     row = 13_315_584  # one DSV4.1 EXL3 expert row (2026-10-14 startup log: 111664487424 bytes / 8386 rows)
     rest = [b - 2 * 204 * row for _, b in nodes]
     assert sum(rest) // row >= 24 * 210 + 14 * 209 and abs(rest[0] / rest[1] - 57344 / 49152) < 1e-3
-    for spec in gpu[SPLIT_LAYERS].split(";"):
+    for spec in _get(gpu, SPLIT_LAYERS).split(";"):
         _, table = spec.split(":")
         split = [int(v) for v in table.split(",")]
         fixed = [0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 13, 14, 15, 15, 16, 17, 17, 18, 19, 19,
                  20, 21, 21, 22, 23, 23, 24, 24, 25, 26, 26]
         assert len(split) == len(fixed) and all(a <= b for a, b in zip(split, fixed))  # only lanes to the link
+
+
+def test_the_split_model_arm_is_pin01_with_the_model_on_and_every_other_arm_pins_it_off(monkeypatch):
+    """-splitmodel is pin01 with SGLANG_EXPERT_STREAM_CPU_SPLIT '{"model": true}' at the default costs, compared with pin01; every
+    other arm states the model off and its costs empty against a shell's. The fixed split stays: the model replaces it
+    on the device only where the copy engine can take hits. Mutant: the arm changes another knob, an arm inherits the
+    shell's flag or costs, or the arm is compared with the wrong one -- red."""
+    ab = _ab()
+    _setenv(monkeypatch, (SPLIT_MODEL, True), (SPLIT_MODEL_COSTS, "copy_lane=9"), (SPLIT_MODEL_REFINE, 7))
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert bool(_get(overrides, SPLIT_MODEL)) == (arm in (PIN01_SPLIT_MODEL_ARM, PIN01_SPLIT_MODEL_MEM_ARM,
+                                                                  *PIN01_HICACHE_ARMS)), arm
+            assert (_get(overrides, SPLIT_MODEL_COSTS) or "") == (
+                ab.SPLIT_MODEL_FIXED_COSTS if arm == PIN01_SPLIT_MODEL_FIXED_COSTS_ARM else ""), arm
+            assert (_get(overrides, SPLIT_MODEL_REFINE) or 0) == (50 if arm == PIN01_SPLIT_MODEL_REFINE_ARM else 0), arm
+    model, pin = _arm(ab, PIN01_SPLIT_MODEL_ARM), _arm(ab, PIN01_ARM)
+    assert _strip(model, SPLIT_MODEL) == _strip(pin, SPLIT_MODEL)
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_ARM] == PIN01_ARM and ab.ARMS[PIN01_SPLIT_MODEL_ARM][1] is True
+
+
+def test_the_fixed_cost_and_refine_arms_are_hicache1_with_one_knob_each():
+    """-fixedcosts names every cost (the offline fits), so it skips the calibration; -refine is the calibrated model with
+    the live refinement, compared with -fixedcosts. Both keep -hicache1's -mem server flag. Mutant: the fixed costs
+    miss a key or differ from the fixtures, or -refine is compared with the calibrated arm -- red."""
+    from sglang.srt.layers.moe.ram_slot_map import (
+        SPLIT_MODEL_FIXTURE_MS,
+        split_model_overrides_complete,
+        split_model_words,
+    )
+
+    ab = _ab()
+    base = _arm(ab, PIN01_HICACHE_ARMS[0])
+    for arm, key in ((PIN01_SPLIT_MODEL_FIXED_COSTS_ARM, SPLIT_MODEL_COSTS), (PIN01_SPLIT_MODEL_REFINE_ARM,
+                                                                            SPLIT_MODEL_REFINE)):
+        other = _arm(ab, arm)
+        assert _strip(other, key) == _strip(base, key), arm
+        assert ab.server_flags(arm) == ("--weight-loader-drop-cache-after-load",) and ab.ARMS[arm][1] is True
+    assert split_model_overrides_complete(ab.SPLIT_MODEL_FIXED_COSTS, 2)
+    assert split_model_words(2, ab.SPLIT_MODEL_FIXED_COSTS) == split_model_words(2, base=SPLIT_MODEL_FIXTURE_MS)
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_REFINE_ARM] == PIN01_SPLIT_MODEL_FIXED_COSTS_ARM
+    assert ab.REFERENCE[PIN01_SPLIT_MODEL_FIXED_COSTS_ARM] == PIN01_HICACHE_ARMS[0]
+
+
+def test_the_mem_arms_add_the_mlock_and_the_cache_drop_alone(monkeypatch):
+    """-mem is its arm with the scheduler's mlockall and --weight-loader-drop-cache-after-load, nothing else; every
+    other arm pins the mlock off against a shell's and adds no server flag; the capture and the timed run both append
+    the arm's flags. The ON -mem arm is compared with the OFF -mem arm. Mutant: a -mem arm changes another knob, the
+    flag is not appended, or an arm inherits the shell's mlock -- red."""
+    ab = _ab()
+    monkeypatch.setenv(MLOCK, "1")
+    for arm in ab.ARMS:
+        mem = "-mem-" in arm + "-"
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[MLOCK] == ("1" if mem else "0"), arm
+        drop = ("--weight-loader-drop-cache-after-load",) if mem else ()
+        assert ab.server_flags(arm) == drop + ab.ARM_MEMORY_FLAGS.get(arm, ()) + ab.ARM_SPEC_FLAGS.get(arm, ()), arm
+    for base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
+        mem, plain = ab.ARMS[base + "-mem"][0], ab.ARMS[base][0]
+        assert {k: v for k, v in mem.items() if k != MLOCK} == {k: v for k, v in plain.items() if k != MLOCK}
+        assert ab.ARMS[base + "-mem"][1] is True
+    assert ab.REFERENCE[PIN01_MEM_ARM] == PIN01_ARM and ab.REFERENCE[PIN01_SPLIT_MODEL_MEM_ARM] == PIN01_MEM_ARM
+    capture = open(os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "spec_margin_capture.py")).read()
+    # long-prompt-mode moved the argv into spec_margin_capture.server_argv(arm).
+    assert "*both_cpu_ab.server_flags(arm)]" in capture
+    seen = {}
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, env, cwd: seen.update(env) or type("R", (), {"returncode": 0}))
+    ab.run_timed(PIN01_MEM_ARM, "/out")
+    assert seen["DSV41_EXTRA_SERVER_ARGS"].endswith("--weight-loader-drop-cache-after-load")
+
+
+def test_the_hicache_and_engram_arms_add_their_knob_alone(monkeypatch):
+    """-hicache1 is the ON -mem arm with the HiCache host pools on node 1, -engram0 that with the native Engram cache
+    at 0; every other arm states the Engram cache at its default 5 against a shell's, and no other arm names the node.
+    Both keep the -mem server flag. Mutant: an arm changes another knob or loses the cache drop -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB", "0")
+    hicache, engram0 = PIN01_SPLIT_MODEL_MEM_ARM + "-hicache1", PIN01_SPLIT_MODEL_MEM_ARM + "-hicache1-engram0"
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        assert overrides["SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"] == ("0" if arm == engram0 else "5"), arm
+        assert ("SGLANG_HICACHE_HOST_NUMA_NODE" in ab.ARMS[arm][0]) == (arm in PIN01_HICACHE_ARMS), arm
+    base, h, e = (ab.ARMS[a][0] for a in (PIN01_SPLIT_MODEL_MEM_ARM, hicache, engram0))
+    assert {k: v for k, v in h.items() if k != "SGLANG_HICACHE_HOST_NUMA_NODE"} == base
+    assert h["SGLANG_HICACHE_HOST_NUMA_NODE"] == "1"
+    assert {k: v for k, v in e.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"} == \
+        {k: v for k, v in h.items() if k != "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"}
+    assert ab.server_flags(hicache) == ab.server_flags(engram0) == ("--weight-loader-drop-cache-after-load",)
+    assert ab.REFERENCE[hicache] == PIN01_SPLIT_MODEL_MEM_ARM and ab.REFERENCE[engram0] == hicache
+
+
+def test_the_decay_arm_is_arm_a_with_the_hot_decay_alone(monkeypatch):
+    """-decay995 is -hicache1 with SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY=0.995; the arms on production's env
+    state its 0.999 (2026-10-22), every other arm 0.98, against a shell's. Mutant: another arm inherits the shell's
+    decay, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY", "0.9")
+    decay, arm_a = PIN01_HICACHE_ARMS[2], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        expected = "0.995" if arm == decay else "0.999" if arm in PROD_ARMS else "0.98"
+        assert ab._overrides(arm, "/out")["SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY"] == expected, arm
+    d, a = ab.ARMS[decay][0], ab.ARMS[arm_a][0]
+    assert {k: v for k, v in d.items() if k != "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY"} == \
+        {k: v for k, v in a.items() if k != "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY"}
+    assert ab.REFERENCE[decay] == arm_a and ab.server_flags(decay) == ("--weight-loader-drop-cache-after-load",)
+
+
+def test_the_tiebreak_arm_is_arm_a_with_the_tiebreak_alone(monkeypatch):
+    """-tiebreak is -hicache1 with SGLANG_EXPERT_STREAM_CPU_SPLIT '{"model_residency_tiebreak": true}'; every other arm
+    states false against a shell's. Mutant: another arm inherits the shell's flag, or the arm changes another knob -- red."""
+    ab = _ab()
+    key = (CPU_SPLIT, "model_residency_tiebreak")
+    _setenv(monkeypatch, (key, True))
+    tiebreak, arm_a = PIN01_HICACHE_ARMS[3], PIN01_HICACHE_ARMS[0]
+    for arm in ab.ARMS:
+        assert bool(_get(ab._overrides(arm, "/out"), key)) == (arm == tiebreak), arm
+    t, a = _arm(ab, tiebreak), _arm(ab, arm_a)
+    assert _strip(t, key) == _strip(a, key)
+    assert ab.REFERENCE[tiebreak] == arm_a and ab.server_flags(tiebreak) == ("--weight-loader-drop-cache-after-load",)
+
+
+def test_the_mergechunk_arm_is_arm_a_with_the_merge_budget_and_its_hot_cache_alone(monkeypatch):
+    """-mergechunk is -hicache1 with the triton merge budget and a hot cache sized by hot_mb_for_margin, launched with
+    its own fraction and the KV pool pinned; every other arm states the budget 0 against a shell's and adds no memory
+    flag. Mutant: another arm inherits the shell's budget, the arm changes another knob, or the pin is dropped -- red."""
+    ab = _ab()
+    budget = "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB"
+    monkeypatch.setenv(budget, "64")
+    merge, arm_a = PIN01_HICACHE_ARMS[4], PIN01_HICACHE_ARMS[0]
+    merges = (merge, PIN01_HICACHE_ARMS[5], *PROD_ARMS)  # -mergechunk, -mergechunk-expseg and those built on it
+    calib = PIN01_HICACHE_ARMS[6]  # -mergechunk-expseg-calib: its own budget (A3)
+    for arm in ab.ARMS:
+        want = str(ab.MERGE_CHUNK_MB) if arm in merges else "32" if arm == calib else "0"
+        assert ab._overrides(arm, "/out")[budget] == want, arm
+        assert (arm in ab.ARM_MEMORY_FLAGS) == (arm in merges + (calib,)), arm
+    m, a = ab.ARMS[merge][0], ab.ARMS[arm_a][0]
+    knobs = (budget, "SGLANG_EXPERT_STREAM_HOT_GPU_MB")
+    assert {k: v for k, v in m.items() if k not in knobs} == {k: v for k, v in a.items() if k not in knobs}
+    assert m["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] == str(ab.hot_mb_for_margin())
+    flags = ab.server_flags(merge)
+    assert flags[0] == "--weight-loader-drop-cache-after-load"
+    assert flags[flags.index("--max-total-tokens") + 1] == str(ab.MERGE_KV_TOKENS)
+    fraction = flags[flags.index("--mem-fraction-static") + 1]
+    assert fraction == ab.fraction_keeping_kv(ab.hot_mb_for_margin(), ab.MERGE_KV_TOKENS)
+    assert ab.REFERENCE[merge] == arm_a
+
+
+def test_the_expseg_arm_is_mergechunk_on_expandable_segments_with_its_hot_cache_alone(monkeypatch):
+    """-expseg is -mergechunk with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and a hot cache sized from its smoke
+    (923 slots, 2,040 MiB free, 29.39 GiB) less 3 held-back slots: 1035 slots, KV still pinned; every other arm states the
+    allocator config empty against a shell's. Mutant: another arm inherits the shell's config, or the size moves -- red."""
+    ab = _ab()
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.5")
+    expseg, merge = PIN01_HICACHE_ARMS[5], PIN01_HICACHE_ARMS[4]
+    on_expseg = (expseg, PIN01_HICACHE_ARMS[6], *PROD_ARMS)  # -expseg and the arms built on it
+    for arm in ab.ARMS:
+        assert ab._overrides(arm, "/out")["PYTORCH_CUDA_ALLOC_CONF"] == (
+            "expandable_segments:True" if arm in on_expseg else ""), arm
+    e, m = ab.ARMS[expseg][0], ab.ARMS[merge][0]
+    knobs = ("PYTORCH_CUDA_ALLOC_CONF", "SGLANG_EXPERT_STREAM_HOT_GPU_MB")
+    assert {k: v for k, v in e.items() if k not in knobs} == {k: v for k, v in m.items() if k not in knobs}
+    assert int(e["SGLANG_EXPERT_STREAM_HOT_GPU_MB"]) * 2**20 // ab.HOT_SLOT_BYTES == 1035
+    flags = ab.server_flags(expseg)
+    assert flags[flags.index("--max-total-tokens") + 1] == "381184"
+    assert flags[flags.index("--mem-fraction-static") + 1] == ab.fraction_keeping_kv(ab.EXPSEG_HOT_GPU_MB, 381184)
+    assert ab.REFERENCE[expseg] == merge
+
+
+def test_the_calib_arm_is_expseg_with_the_calibration_and_the_prefill_cuts_alone(monkeypatch):
+    """-expseg-calib is -expseg with the startup hot-cache calibration and A1/A2/A3 (indexer budget 32, chunk kernels,
+    merge budget 32), at -expseg's fraction and KV pin; every other arm states the calibration and the chunk kernels off
+    against a shell's. Mutant: another arm inherits the shell's flag, or the arm changes another knob -- red."""
+    ab = _ab()
+    monkeypatch.setenv(ab.CALIBRATE, "1")
+    monkeypatch.setenv(ab.CHUNK_KERNELS, "1")
+    calib, expseg = PIN01_HICACHE_ARMS[6], PIN01_HICACHE_ARMS[5]
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        # Production's arms calibrate the hot cache without the per-chunk kernels, as production does; the residency
+        # pair's fixed smaller hot cache does not (test_the_residency_pair_...).
+        residency_pair = (LAYER_MAJOR_SMALL_HOT_ARM, LAYER_MAJOR_RESIDENCY_ARM)
+        want = (
+            ("1", "1") if arm == calib
+            else ("0", "0") if arm in residency_pair
+            else ("1", "0") if arm in PROD_ARMS
+            else ("0", "0")
+        )
+        assert (overrides[ab.CALIBRATE], overrides[ab.CHUNK_KERNELS]) == want, arm
+    c, e = ab.ARMS[calib][0], ab.ARMS[expseg][0]
+    knobs = {ab.CALIBRATE: "1", ab.CHUNK_KERNELS: "1", ab.MERGE_BUDGET: "32", ab.INDEXER_BUDGET: "32"}
+    assert {k: v for k, v in c.items() if k not in knobs} == {k: v for k, v in e.items() if k not in knobs}
+    assert {k: c[k] for k in knobs} == knobs
+    assert ab.server_flags(calib) == ab.server_flags(expseg) and ab.REFERENCE[calib] == expseg
+
+
+def test_hot_mb_for_margin_buys_whole_slots_of_the_measured_spare():
+    """At the probe's own free memory and margin the arm keeps the probe's slots; each slot of extra margin costs one
+    slot, and the MiB it returns floors back to that slot count."""
+    ab = _ab()
+    slot = ab.HOT_SLOT_BYTES
+    for margin in (0, 93, 94, 200, 508):
+        mb = ab.hot_mb_for_margin(margin)
+        slots = mb * 2**20 // slot
+        assert -(-slots * slot // 2**20) == mb
+        worst = ab.PROBE_FREE_AT_PEAK_MIB * 2**20 - (ab.PROBE_PRE_LOAD_GIB - ab.MIN_PRE_LOAD_GIB) * 2**30
+        assert slots == ab.PROBE_HOT_SLOTS + int((worst - margin * 2**20) // slot)
+        assert worst - (slots - ab.PROBE_HOT_SLOTS) * slot >= margin * 2**20
 
 
 def test_the_sessions_flag_reaches_the_timed_run_and_defaults_to_the_eight_corpus_sessions(monkeypatch, tmp_path):
@@ -728,13 +1065,11 @@ def test_the_summary_keeps_the_idle_drive_counters():
 
 def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
-    monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
-    monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX", "5")
+    _setenv(monkeypatch, ((CPU_SPLIT, "miss_cut"), 2), ((CPU_SPLIT, "miss_cut_max"), 5))
     for arm in ab.ARMS:
-        want = MISS_CUT if "-misscut" in arm else {
-            "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
+        want = MISS_CUT if "-misscut" in arm else {(CPU_SPLIT, "miss_cut"): 0, (CPU_SPLIT, "miss_cut_max"): 3}
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert {k: overrides[k] for k in want} == want, arm
+            assert {k: _get(overrides, k) for k in want} == want, arm
 
 
 def _drive_rows(busy_ms_by_session):
@@ -805,79 +1140,346 @@ def test_run_arm_brackets_the_warm_up_and_every_timed_session_with_drive_counter
     assert script.index("drive_sample 'warmup_end'") < script.index("label': 'server_ready'")
 
 
-DYNAMIC = "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC"
-CAPS = "SGLANG_MOE_EXPERT_MIRROR_CAPS"
+DYNAMIC = (MIRROR, "dynamic")
+CAPS = (MIRROR, "caps")
 
 
 def test_the_cap_arm_is_the_gpu_arm_with_the_per_drive_in_flight_cap(monkeypatch):
     """Design 2026-10-09-dsv41-drive-aware-reads change (3): roots nvme0, nvme4 (the SPCC), nvme2 capped at 4, 2, 4
     sub-reads in flight; compared with dspark-both like the other prefetch arms."""
     ab = _ab()
-    g, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-cap"][0]
-    assert (c[DYNAMIC], c[CAPS]) == ("1", "4,2,4")
-    assert {k: v for k, v in c.items() if k not in (DYNAMIC, CAPS)} == {
-        k: v for k, v in g.items() if k not in (DYNAMIC, CAPS)
-    }
+    g, c = _arm(ab, "dspark-both-prefetch-gpu"), _arm(ab, "dspark-both-prefetch-gpu-cap")
+    assert (_get(c, DYNAMIC), _get(c, CAPS)) == (True, "4,2,4")
+    assert _strip(c, DYNAMIC, CAPS) == _strip(g, DYNAMIC, CAPS)
     # The caps follow the roots' order in the recipe the arms run on.
     assert ab.arm_env.EXPERT_MIRROR_DIRS.split(":") == [
         "/mnt/nvme0/dsv41_flash", "/mnt/nvme4/dsv41_flash", "/mnt/nvme2/dsv41_flash"]
     assert ab.ARMS["dspark-both-prefetch-gpu-cap"][1] is True
     assert ab.REFERENCE["dspark-both-prefetch-gpu-cap"] == "dspark-both"
-    monkeypatch.setenv(DYNAMIC, "0")
-    monkeypatch.setenv(CAPS, "9,9,9")
-    assert (ab._overrides("dspark-both-prefetch-gpu-cap", "/out")[DYNAMIC],
-            ab._overrides("dspark-both-prefetch-gpu-cap", "/out")[CAPS]) == ("1", "4,2,4")
+    _setenv(monkeypatch, (DYNAMIC, False), (CAPS, "9,9,9"))
+    assert (_get(ab._overrides("dspark-both-prefetch-gpu-cap", "/out"), DYNAMIC),
+            _get(ab._overrides("dspark-both-prefetch-gpu-cap", "/out"), CAPS)) == (True, "4,2,4")
 
 
 def test_every_other_arm_pins_the_dynamic_root_choice_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
-    monkeypatch.setenv(DYNAMIC, "1")
-    monkeypatch.setenv(CAPS, "4,2,4")
+    _setenv(monkeypatch, (DYNAMIC, True), (CAPS, "4,2,4"))
     for arm in ab.ARMS:
         if arm == "dspark-both-prefetch-gpu-cap":
             continue
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert (overrides[DYNAMIC], overrides[CAPS]) == ("0", ""), arm
+            assert (bool(_get(overrides, DYNAMIC)), _get(overrides, CAPS) or "") == (False, ""), arm
 
 
-TWO_STAGE = "SGLANG_DSV41_CPU_TWO_STAGE"
+TWO_STAGE = (CPU_TWO_STAGE, "enabled")
 
 
 def test_the_two_stage_arm_is_the_miss_cut_arm_with_the_two_stage_cpu_miss_on():
     ab = _ab()
-    a, t = ab.ARMS["dspark-both-misscut"][0], ab.ARMS["dspark-both-misscut-twostage"][0]
-    assert t[TWO_STAGE] == "1"
-    assert {k: v for k, v in t.items() if k != TWO_STAGE} == {k: v for k, v in a.items() if k != TWO_STAGE}
+    a, t = _arm(ab, "dspark-both-misscut"), _arm(ab, "dspark-both-misscut-twostage")
+    assert _get(t, TWO_STAGE) is True
+    assert _strip(t, TWO_STAGE) == _strip(a, TWO_STAGE)
     assert ab.ARMS["dspark-both-misscut-twostage"][1] is True
     assert ab.REFERENCE["dspark-both-misscut-twostage"] == "dspark-both-misscut"
 
 
 def test_every_arm_but_the_two_stage_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
-    monkeypatch.setenv(TWO_STAGE, "1")
+    _setenv(monkeypatch, (TWO_STAGE, True))
     for arm in ab.ARMS:
-        want = "1" if arm.startswith("dspark-both-misscut-twostage") else "0"
+        want = arm.startswith("dspark-both-misscut-twostage")
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert overrides[TWO_STAGE] == want, arm
+            assert bool(_get(overrides, TWO_STAGE)) == want, arm
 
 
-SPAN = ("SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS")
+SPAN = ((CPU_TWO_STAGE, "w13_weights"), (CPU_TWO_STAGE, "w2_weights"))
 
 
 def test_the_spcc13_arm_is_the_two_stage_arm_with_the_spcc_on_w13_only():
     ab = _ab()
-    t, c = ab.ARMS["dspark-both-misscut-twostage"][0], ab.ARMS["dspark-both-misscut-twostage-spcc13"][0]
-    assert (c[SPAN[0]], c[SPAN[1]]) == ("6:10:6", "1:0:1")  # nvme0 : nvme4 (SPCC) : nvme2
-    assert {k: v for k, v in c.items() if k not in SPAN} == {k: v for k, v in t.items() if k not in SPAN}
+    t, c = _arm(ab, "dspark-both-misscut-twostage"), _arm(ab, "dspark-both-misscut-twostage-spcc13")
+    assert (_get(c, SPAN[0]), _get(c, SPAN[1])) == ("6:10:6", "1:0:1")  # nvme0 : nvme4 (SPCC) : nvme2
+    assert _strip(c, *SPAN) == _strip(t, *SPAN)
     assert ab.ARMS["dspark-both-misscut-twostage-spcc13"][1] is True
     assert ab.REFERENCE["dspark-both-misscut-twostage-spcc13"] == "dspark-both-misscut"
 
 
 def test_every_arm_but_spcc13_pins_the_span_weights_unset_against_an_exported_shell(monkeypatch):
     ab = _ab()
-    for name in SPAN:
-        monkeypatch.setenv(name, "1:1:1")
+    _setenv(monkeypatch, *((name, "1:1:1") for name in SPAN))
     for arm in ab.ARMS:
         want = ("6:10:6", "1:0:1") if arm == "dspark-both-misscut-twostage-spcc13" else ("", "")
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
-            assert (overrides[SPAN[0]], overrides[SPAN[1]]) == want, arm
+            assert (_get(overrides, SPAN[0]) or "", _get(overrides, SPAN[1]) or "") == want, arm
+
+
+def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_checksummed_head():
+    # MERGE_PLAN_1016.md: production = -mergechunk-expseg (the best served arm, prefetch on: owner, 2026-10-16) with the
+    # table and hot-cache calibrations on (owner rule) and the prefetch head's production copy; every other key the arm
+    # states is at its library default.
+    ab = _ab()
+    arm_env = ab.arm_env
+    arm = ab.MERGE_CHUNK_EXPSEG_ARM
+    best, prod = _flat(arm_env.arm_env(ab.collapse(ab.ARMS[arm][0]))), _flat(arm_env.prod_env())
+    differs = {k: (best.get(k), prod.get(k)) for k in set(best) | set(prod) if best.get(k) != prod.get(k)}
+    head = "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD"
+    assert differs.pop(head) == (ab.T3_HEAD, arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD)
+    prefetch = set()
+    stated_defaults = {
+        "SGLANG_DSPARK_TOP_PROB_GATE": "0",
+        STS_COLLECT: "",
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT": "0",
+        SPLIT_LAYERS: "",
+        (CPU_SPLIT, "model_residency_tiebreak"): False,
+        "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB": "5",
+        "SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS": "0",
+        CAPS: "",
+        DYNAMIC: False,
+    }
+    # Owner, 2026-10-22, no served A/B: the DIRECT insert score without eager (prefill) routes, at decay 0.999 (offline
+    # replay +15.6 hits a verify, hot-cache-replay-1022), and DIRECT newcomer probation.
+    hot_insert = {"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY": ("0.98", "0.999"),
+                  "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS": (None, "0"),
+                  "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION": (None, "1")}
+    calibrations = {CALIBRATION: (False, True),
+                    "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
+    # Layer-major prefill under DSpark: production since 2026-10-17 (owner), never served on the best arm.
+    layer_major = {"SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": ("0", "8192"),
+                   "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK": (None, "1"),
+                   # Lent residency rows: production since 2026-10-18 (owner), after the served lend validation.
+                   "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS": (None, "360")}
+    # The sampled confidence cut: production since 2026-10-18 (owner), after the served sampled A/B (DO 3.12). The refit
+    # interval 0 is the library default, stated by the arms.
+    cut = {k: ("0", "1") for k in ("SGLANG_DSPARK_CONFIDENCE_CUT", "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED",
+                                   "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST")}
+    # The live T(w) refit every 32 timed cut verifies: production since 2026-10-20 (owner); the non-prod arms leave it unset.
+    cut["SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL"] = (None, "32")
+    # Owner, 2026-10-22, no served A/B: the pinned tier holds every routed expert row (all 40 layers whole), and the hot
+    # cache starts 41 slots smaller, because driver 615.71.10 and the 8280 build missed the KV pin at -expseg's size.
+    pinned = {k: (best.get(k), prod.get(k)) for k in ("SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS", "SGLANG_EXPERT_STREAM_PINNED_HOST_MB",
+                                                       "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB", "SGLANG_EXPERT_STREAM_HOT_GPU_MB")}
+    assert pinned["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] == (str(ab.EXPSEG_HOT_GPU_MB), arm_env.PROD_DSPARK_HOT_GPU_MB)
+    rest ={k: v for k, v in differs.items() if k not in prefetch}
+    assert rest == {**{k: (v, None) for k, v in stated_defaults.items()}, **calibrations, **layer_major, **cut, **pinned,
+                    **hot_insert}
+    # Its server flags are production's: the page-cache drop, its fraction and the KV pin.
+    argv = arm_env.ServerArgs.prod().argv()
+    flags = ab.server_flags(arm)
+    assert flags == ("--weight-loader-drop-cache-after-load", "--mem-fraction-static",
+                     arm_env.PROD_DSPARK_MEM_FRACTION_STATIC, "--max-total-tokens",
+                     str(arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS))
+    # Production starts its hot cache below -expseg's (2026-10-22) and keeps -expseg's fraction, so the freed memory
+    # goes to the KV pool and the startup calibration grows the cache back into what remains.
+    assert int(arm_env.PROD_DSPARK_HOT_GPU_MB) < ab.EXPSEG_HOT_GPU_MB
+    assert all(flag in argv for flag in flags)
+
+
+def test_the_prod_arm_is_production_with_the_arms_stated_defaults_and_takes_no_fixed_split(monkeypatch, tmp_path):
+    """-prod is production's env and flags, plus the off-states every arm pins, and runs without a driver split table
+    (production calibrates it). Mutant: the arm drops a production setting, keeps -expseg's head or calibration off, or
+    takes the shell's split -- red."""
+    ab = _ab()
+    arm_env = ab.arm_env
+    assert ab.PROD_ARM == PROD_ARM and ab.PROD_ARMS == PROD_ARMS
+    env, prod = _flat(arm_env.arm_env(ab.collapse(ab.ARMS[PROD_ARM][0]))), _flat(arm_env.prod_env())
+    assert {k: v for k, v in env.items() if k in prod} == prod
+    extra = {k: v for k, v in env.items() if k not in prod}
+    assert all(v in ("", "0", "5", "0.98", False) for v in extra.values()), extra  # stated off or at the library default
+    assert extra[SPLIT] == "" and extra[STS_COLLECT] == ""
+    # The sampled cut is production's (arm_env.PROD_DSPARK_CUT_ENV) and runs on the fitted STS file.
+    assert {k: env[k] for k in ab.arm_env.PROD_DSPARK_CUT_ENV} == ab.arm_env.PROD_DSPARK_CUT_ENV
+    assert env[CONFIDENCE_CUT] == "1" and env["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0"
+    assert ab.ARMS[PROD_ARM][1] is True and ab.REFERENCE[PROD_ARM] == PIN01_HICACHE_ARMS[5]
+    assert ab.server_flags(PROD_ARM) == ab.server_flags(PIN01_HICACHE_ARMS[5]) + (STS_PATH_FLAG, arm_env.PROD_DSPARK_STS_PATH)
+    assert all(flag in arm_env.ServerArgs.prod().argv() for flag in ab.server_flags(PROD_ARM))
+    _setenv(monkeypatch, (SPLIT, "0:3,1:5"))
+    for arm in PROD_ARMS:
+        assert (_get(ab._overrides(arm, "/out"), SPLIT) or "") == "", arm
+    monkeypatch.delenv(CPU_SPLIT)
+    ran = []
+    monkeypatch.setattr(ab, "run_timed", lambda arm, out, **_: ran.append(arm) or 0)
+    monkeypatch.setattr(ab, "run_probe", lambda arm, out: 0)
+    monkeypatch.setattr(ab, "summarize", lambda out: {})
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), *PROD_ARMS])
+    ab.main()
+    assert ran == list(PROD_ARMS)
+
+
+def test_the_cut_arms_are_prod_or_its_greedy_cut_and_every_other_arm_pins_the_cut_and_the_collection_off(monkeypatch):
+    """Production runs the sampled cut (arm_env.PROD_DSPARK_CUT_ENV) on the fitted STS file, so every production arm
+    carries the cut and the STS flag, except the collect arm, which has no STS file (collect mode: the head built, the cut
+    off). -confcut and -stscollect state the greedy-only cut they ran as (the sampled path and the draft's cost off). Every
+    other arm states the flag 0 and the collect path empty against a shell's. Mutant: an arm inherits the shell's flag or
+    path, the collect arm passes the STS file, a production arm drops it, or a greedy cut arm takes the sampled path -- red."""
+    ab = _ab()
+    monkeypatch.setenv(CONFIDENCE_CUT, "1")
+    monkeypatch.setenv(STS_COLLECT, "/shell/sts")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides[CONFIDENCE_CUT] == ("1" if arm in PROD_ARMS else "0"), arm
+            assert (overrides[STS_COLLECT] != "") == (arm == STS_COLLECT_ARM), arm
+        assert (STS_PATH_FLAG in ab.server_flags(arm)) == (arm in PROD_ARMS and arm != STS_COLLECT_ARM), arm
+    prod = ab.ARMS[PROD_ARM][0]
+    greedy = {CONFIDENCE_CUT: "1", "SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED": "0", "SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST": "0"}
+    for arm in (STS_COLLECT_ARM, CONFIDENCE_CUT_ARM):
+        cut = ab.ARMS[arm][0]
+        assert {k: v for k, v in cut.items() if k in greedy} == greedy, arm
+        assert {k: v for k, v in cut.items() if k not in greedy} == {k: v for k, v in prod.items() if k not in greedy}, arm
+        assert ab.ARMS[arm][1] is True and ab.REFERENCE[arm] == PROD_ARM
+    flags = ab.server_flags(CONFIDENCE_CUT_ARM)
+    assert flags == ab.server_flags(PROD_ARM)
+    assert flags[-2:] == (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+    assert ab.server_flags(STS_COLLECT_ARM) == ab.server_flags(PIN01_HICACHE_ARMS[5])
+
+
+def test_the_sampled_cut_arm_is_prod_and_the_block_arm_adds_block_verification_alone(monkeypatch):
+    """-confcut-sampled ran the sampled A/B (2026-10-18) as -prod plus the cut; the cut shipped, so the arm now equals
+    -prod and states arm_env.PROD_DSPARK_CUT_ENV. -confcut-sampled-block is -prod plus --speculative-use-block-verification
+    alone. The draft stays sampled: SGLANG_DSPARK_USE_GREEDY_DRAFT is 0 in every arm, whatever the shell exports. Every
+    non-production arm pins the sampled knobs off. Mutant: an arm drops a knob, turns the greedy draft on, the block arm
+    changes env, or block verification reaches another arm -- red."""
+    ab = _ab()
+    for key in SAMPLED_KNOBS:
+        monkeypatch.setenv(key, "1")
+    for arm in ab.ARMS:
+        for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
+            assert overrides["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0", arm
+            if arm not in PROD_ARMS:
+                assert all(overrides[k] == "0" for k in SAMPLED_KNOBS), arm
+        assert (BLOCK_FLAG in ab.server_flags(arm)) == (arm == SAMPLED_CUT_BLOCK_ARM), arm
+    prod = ab.ARMS[PROD_ARM][0]
+    assert {k: prod[k] for k in ab.arm_env.PROD_DSPARK_CUT_ENV} == ab.arm_env.PROD_DSPARK_CUT_ENV
+    assert prod["SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL"] == "0" and prod["SGLANG_DSPARK_USE_GREEDY_DRAFT"] == "0"
+    for arm in (SAMPLED_CUT_ARM, SAMPLED_CUT_BLOCK_ARM):
+        assert ab.ARMS[arm] == ab.ARMS[PROD_ARM], arm
+        assert arm in ab.PROD_ARMS
+    assert ab.REFERENCE[SAMPLED_CUT_ARM] == PROD_ARM and ab.REFERENCE[SAMPLED_CUT_BLOCK_ARM] == SAMPLED_CUT_ARM
+    sts = (STS_PATH_FLAG, ab.arm_env.PROD_DSPARK_STS_PATH)
+    assert ab.ARM_SPEC_FLAGS[SAMPLED_CUT_ARM] == ab.ARM_SPEC_FLAGS[PROD_ARM] == sts
+    assert ab.ARM_SPEC_FLAGS[SAMPLED_CUT_BLOCK_ARM] == (*sts, BLOCK_FLAG)
+    assert ab.server_flags(SAMPLED_CUT_ARM) == ab.server_flags(PROD_ARM)
+    assert ab.server_flags(SAMPLED_CUT_BLOCK_ARM) == ab.server_flags(PROD_ARM) + (BLOCK_FLAG,)
+
+
+def test_the_production_arms_prefill_layer_major_and_every_other_arm_keeps_it_off():
+    """Production prefills layer-major under DSpark since 2026-10-17 (arm_env.prod_dspark_env), so -prod and every arm
+    built on it carry the 8192-token threshold and the DSpark switch, and -prod-layermajor now equals -prod. No other
+    arm sets either (dspark_env() keeps the threshold 0 beneath them). Mutant: another arm turns it on, or production
+    drops it -- red."""
+    ab = _ab()
+    threshold, switch = "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS", "SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK"
+    for arm, (overrides, _) in ab.ARMS.items():
+        if arm == CHUNKED_ARM:
+            # The parity reference: production with layer-major prefill off, and the switch unstated.
+            assert overrides[threshold] == "0" and switch not in overrides
+            rows = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"  # residency rows need layer-major prefill: off too
+            assert overrides[rows] == "0"
+            assert {k: v for k, v in ab.ARMS[PROD_ARM][0].items() if k not in (threshold, switch, rows)} == {
+                k: v for k, v in overrides.items() if k not in (threshold, rows)
+            }
+        elif arm in PROD_ARMS:
+            assert (overrides[threshold], overrides[switch]) == ("8192", "1"), arm
+        else:
+            assert overrides.get(threshold, "0") == "0" and switch not in overrides, arm
+    assert ab.arm_env.dspark_env()[threshold] == "0"
+    assert ab.ARMS[LAYER_MAJOR_ARM][0] == ab.ARMS[PROD_ARM][0]
+    assert ab.ARMS[LAYER_MAJOR_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_ARM] == PROD_ARM
+    assert ab.server_flags(LAYER_MAJOR_ARM) == ab.server_flags(PROD_ARM)
+
+
+def test_the_residency_pair_differs_only_in_the_residency_rows_and_both_give_up_that_much_hot_cache():
+    """-smallhot is -layermajor with the hot cache RESIDENCY_ROWS slots smaller and the startup calibration off (it
+    would grow back into the buffer's memory) and the rows off; -res adds the rows with the lend off (stage 0's allocated
+    buffer). Production has the rows (and the lend, by default) since 2026-10-18, so only the arms built on non-production
+    recipes leave the rows unset. Mutant: the pair differs in another knob, or the hot cache keeps the memory the buffer
+    needs -- red."""
+    ab = _ab()
+    residency, hot = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS", "SGLANG_EXPERT_STREAM_HOT_GPU_MB"
+    lend = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
+    for arm, (overrides, _) in ab.ARMS.items():
+        assert (residency in overrides) == (arm in PROD_ARMS), arm
+        want = "0" if arm in (LAYER_MAJOR_SMALL_HOT_ARM, CHUNKED_ARM) else str(ab.RESIDENCY_ROWS)
+        assert overrides.get(residency, want) == want, arm
+    lm, small, res = (ab.ARMS[a][0] for a in LAYER_MAJOR_ARMS)
+    assert {k: v for k, v in res.items() if k not in (residency, lend)} == {
+        k: v for k, v in small.items() if k != residency
+    }
+    assert res[residency] == str(ab.RESIDENCY_ROWS) and res[lend] == "0" and small[residency] == "0"
+    assert {k: v for k, v in small.items() if k not in (hot, ab.CALIBRATE, residency)} == {
+        k: v for k, v in lm.items() if k not in (hot, ab.CALIBRATE, residency)
+    }
+    assert small[ab.CALIBRATE] == "0"
+    given_up = (int(lm[hot]) - int(small[hot])) * 2**20
+    assert ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES <= given_up < ab.RESIDENCY_ROWS * ab.HOT_SLOT_BYTES + 2**20
+    assert ab.REFERENCE[LAYER_MAJOR_RESIDENCY_ARM] == LAYER_MAJOR_SMALL_HOT_ARM
+    assert all(ab.server_flags(a) == ab.server_flags(PROD_ARM) for a in LAYER_MAJOR_ARMS)
+
+
+def test_the_lend_arm_is_production_with_the_lend_stated():
+    """-lend keeps production's full hot cache and calibration (the decode bar is the full hot cache) and equals -prod,
+    which has the rows (and the lend by default) since 2026-10-18, with the lend stated 1; only it and -res (lend 0) state
+    the lend. Mutant: the arm shrinks the hot cache, drops the lend, or another arm sets it -- red."""
+    ab = _ab()
+    lend = "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND"
+    for arm, (overrides, _) in ab.ARMS.items():
+        assert (lend in overrides) == (arm in (LAYER_MAJOR_LEND_ARM, LAYER_MAJOR_RESIDENCY_ARM)), arm
+    prod, arm = ab.ARMS[PROD_ARM][0], ab.ARMS[LAYER_MAJOR_LEND_ARM][0]
+    assert arm[lend] == "1" and arm["SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS"] == str(ab.RESIDENCY_ROWS)
+    assert {k: v for k, v in arm.items() if k != lend} == prod
+    assert ab.ARMS[LAYER_MAJOR_LEND_ARM][1] is True and ab.REFERENCE[LAYER_MAJOR_LEND_ARM] == PROD_ARM
+    assert ab.server_flags(LAYER_MAJOR_LEND_ARM) == ab.server_flags(PROD_ARM)
+    assert LAYER_MAJOR_LEND_ARM in ab.PROD_ARMS
+
+
+def test_the_collect_arm_writes_its_shards_under_out_and_the_probe_server_its_own(monkeypatch):
+    """The timed server, the probe server and a capture each collect into their own directory, at the stem the fit's
+    --data-glob '<stem>.*.pt' names. Mutant: the probe shares the timed stem (its shard 0 overwrites the timed one) or
+    the capture leaves the path empty -- red."""
+    ab = _ab()
+    timed = ab._overrides(STS_COLLECT_ARM, "/out")[STS_COLLECT]
+    probe = ab._probe_overrides(STS_COLLECT_ARM, "/out")[STS_COLLECT]
+    assert timed == f"/out/{STS_COLLECT_ARM}/sts/confidence"
+    assert probe == f"/out/{STS_COLLECT_ARM}.probe/sts/confidence"
+    spec = importlib.util.spec_from_file_location(
+        "spec_margin_capture", os.path.join(ROOT, "analysis", "dsv41-drive", "dspark", "spec_margin_capture.py")
+    )
+    cap = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cap)
+    assert cap.server_env("/cap", False, arm=STS_COLLECT_ARM)[STS_COLLECT] == "/cap/sts/confidence"
+    assert cap.server_env("/cap", False, arm=CONFIDENCE_CUT_ARM)[STS_COLLECT] == ""
+    assert STS_PATH_FLAG in cap.server_argv(CONFIDENCE_CUT_ARM)
+    assert STS_PATH_FLAG not in cap.server_argv(STS_COLLECT_ARM)
+    # The production arms run production's warm-ups; the others keep the prefill-only one.
+    for arm in ab.ARMS:
+        argv = cap.server_argv(arm)
+        want = "dsv41_prefill_shapes,dsv41_decode_paths" if arm in PROD_ARMS else "dsv41_prefill_shapes"
+        assert argv[argv.index("--warmups") + 1] == want, arm
+
+
+def test_the_cut_arms_probe_server_gets_the_sts_file_and_no_other_arms_does(monkeypatch, tmp_path):
+    """The probe server launches the arm too, so it needs the cut's STS file; without it the launch refuses the cut.
+    Mutant: run_probe builds its argv without the arm's speculative flags -- red."""
+    import contextlib
+
+    ab = _ab()
+    argvs = []
+
+    class Server:
+        pid = 1
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(ab.subprocess, "Popen", lambda cmd, **_: argvs.append(cmd) or Server())
+    monkeypatch.setattr(ab, "_healthy", lambda port, deadline: False)  # no client: run_probe returns 1
+    monkeypatch.setattr(ab.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(ab.run_locks, "take", lambda path: contextlib.nullcontext())
+    for arm in PROD_ARMS:
+        assert ab.run_probe(arm, str(tmp_path)) == 1
+    prod, collect, cut, sampled, block, *layer_major = argvs
+    for argv in (prod, cut, sampled, block):
+        assert argv[argv.index(STS_PATH_FLAG) + 1] == ab.arm_env.PROD_DSPARK_STS_PATH
+    assert BLOCK_FLAG in block and BLOCK_FLAG not in sampled and BLOCK_FLAG not in cut and BLOCK_FLAG not in prod
+    assert all(a[a.index("--warmups") + 1] == "dsv41_prefill_shapes,dsv41_decode_paths" for a in argvs)
+    assert STS_PATH_FLAG not in collect
+    assert len(layer_major) == len(LAYER_MAJOR_ARMS) + 2 and all(STS_PATH_FLAG in a for a in layer_major)

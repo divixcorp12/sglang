@@ -48,7 +48,7 @@ rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 e = arm_env.arm_env($OVR)
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+e['SGLANG_EXPERT_STREAM_TRACE'] = '{\"expert_path\": \"$OUT/stages.jsonl\"}'
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')

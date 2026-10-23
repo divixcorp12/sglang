@@ -62,8 +62,8 @@ class BasicUringReader {
   static_assert(BuildPolicy<Build>);
 
  public:
-  // set_sq_thread_cpu's "keep the env's value".
-  static constexpr int kEnvSqThreadCpu = -2;
+  // set_sq_thread_cpu's "keep the options' value" (unpinned).
+  static constexpr int kOptionsSqThreadCpu = -2;
 
   BasicUringReader() = default;
   BasicUringReader(const BasicUringReader&) = delete;
@@ -72,28 +72,30 @@ class BasicUringReader {
     close();
   }
 
-  // Replaces SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU for this ring: the RAM tier's groups get their cores from
-  // ThreadingConfig. -1 leaves the SQPOLL thread unpinned; kEnvSqThreadCpu keeps the env's value. Before init().
+  // This ring's SQPOLL core: the RAM tier's groups get theirs from ThreadingConfig's plan
+  // (SGLANG_EXPERT_STREAM_NUMA_CORES' sq=). -1 leaves the SQPOLL thread unpinned; kOptionsSqThreadCpu keeps the
+  // options' value. Before init().
   void set_sq_thread_cpu(int cpu) {
     sq_override_ = cpu;
   }
 
-  // Creates the ring with room for `depth` reads, from the SGLANG_EXPERT_STREAM_URING_* options. Returns false if
-  // the kernel refuses a plain ring. Throws for an invalid depth, an unsupported explicit option, or when a ring
-  // with registered resources cannot be created.
+  // Creates the ring with room for `depth` reads, from the module's installed uring options (uring_options.h).
+  // Returns false if the kernel refuses a plain ring. Throws for an invalid depth, an unsupported explicit option, or
+  // when a ring with registered resources cannot be created.
   bool init(unsigned depth) {
     close();
-    options_ = UringOptions::from_env();
-    if (sq_override_ != kEnvSqThreadCpu) {
+    options_ = installed_uring_options();
+    if (sq_override_ != kOptionsSqThreadCpu) {
       if (sq_override_ >= 0 && !options_.sqpoll())
-        throw std::invalid_argument("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU: requires a sqpoll mode");
+        throw std::invalid_argument("an SQPOLL core (SGLANG_EXPERT_STREAM_NUMA_CORES sq=) requires a sqpoll " +
+                                    UringOptions::key("mode"));
       options_.sq_thread_cpu = sq_override_;
     }
     depth_ = depth;
     if (depth == 0 || depth > 32768) throw std::invalid_argument("io_uring depth must be in [1, 32768]");
 #if !SGLANG_URING_HAS_READV_FIXED
     if (options_.read_mode == UringReadMode::ReadvFixed)
-      throw std::runtime_error("SGLANG_EXPERT_STREAM_URING_READ_MODE=readv_fixed requires liburing 2.10+ headers");
+      throw std::runtime_error(UringOptions::key("read_mode") + "=readv_fixed requires liburing 2.10+ headers");
 #endif
     return create_ring();
   }
@@ -109,7 +111,7 @@ class BasicUringReader {
     if (!ready_ || configured_ || outstanding_ != 0)
       throw std::logic_error("io_uring resources must be configured once on a ready, idle reader");
     if (options_.iopoll() && !direct)
-      throw std::invalid_argument("SGLANG_EXPERT_STREAM_URING_MODE with iopoll requires O_DIRECT files");
+      throw std::invalid_argument(UringOptions::key("mode") + " with iopoll requires O_DIRECT files");
     if (options_.fixed_files) {
       if (fds.empty()) throw std::invalid_argument("fixed files requested with an empty file table");
       for (int fd : fds)
@@ -671,7 +673,7 @@ class BasicUringReader {
   io_uring ring_{};
   io_uring_params params_{};
   UringOptions options_{};
-  int sq_override_ = kEnvSqThreadCpu;  // set_sq_thread_cpu
+  int sq_override_ = kOptionsSqThreadCpu;  // set_sq_thread_cpu
   unsigned depth_ = 0;
   unsigned requested_flags_ = 0;
   unsigned outstanding_ = 0;

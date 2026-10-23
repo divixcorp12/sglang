@@ -1,4 +1,4 @@
-"""Speculative reads only to an idle drive (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE; design
+"""Speculative reads only to an idle drive (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE; design
 2026-10-09-dsv41-drive-aware-reads, change (2), section 5): each group's speculative thread reads its pool rows through a
 reader of its own (IdleRoots), one piece at a time, from a mirror root no demand sub-read is on in any group; it waits
 for one without a ring wait, abandons on a deadline, a settled stale target, a hold or a stop, and a forced miss that
@@ -11,7 +11,7 @@ Mutants (divix01, reverted): gate_root keeps the row's root without rechecking i
 (test_each_piece_reads_a_root_no_demand_reads_and_moves_when_demand_arrives); boost ignored -- red
 (test_a_boosted_read_reads_its_table_roots_despite_demand, test_a_forced_miss_boosts_the_read_it_waits_on); one
 piece limit dropped -- red (the two one-root tests); ReaderCore::drain keeps the read's drive-load share -- red (the
-in-flight submit faults). Spread and pieces (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD, _IDLE_PIECES): the spread rotation
+in-flight submit faults). Spread and pieces (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD, _IDLE_PIECES): the spread rotation
 removed -- red (test_spread_sends_consecutive_rows_first_pieces_to_every_root); max_inflight ignored (back to 1) -- red
 (the two-pieces tests); a second piece in flight reusing the row's root without the demand check -- red
 (test_two_pieces_go_in_flight_at_once_never_on_a_root_demand_reads)."""
@@ -130,7 +130,7 @@ def test_a_faulted_idle_drive_read_fails_without_abandoning_and_leaves_the_load_
     assert got["share_after"] == 0 and idle(got["load"])
 
 
-# ---- Spread ties (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) and pieces in flight (..._IDLE_PIECES) ----
+# ---- Spread ties (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD) and pieces in flight (..._IDLE_PIECES) ----
 
 
 def _per_read(got, reads):

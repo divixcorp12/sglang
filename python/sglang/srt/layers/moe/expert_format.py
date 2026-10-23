@@ -7,11 +7,11 @@ tensors one expert row holds (:class:`ExpertTensorSpec`), where each tensor's de
 This file holds:
 
 * :class:`ExpertTensorSpec`, one streamed tensor's per-expert row.
-* :class:`ExpertFormat`, the protocol a format implements.
 * :class:`DenseLayerFormat`, the NVFP4 format: every tensor is a layer attribute.
-  (The EXL3 format lives in ``exl3_expert_format.py``.)
+  (The ``ExpertFormat`` protocol and the EXL3 format live in
+  ``expert_engine/formats``.)
 * Helpers that find a layer's streamer, resolve the row source kind
-  (``SGLANG_MOE_EXPERT_ROW_SOURCE``) and check graph-gather and pinned-tier support.
+  (``SGLANG_EXPERT_STREAM_ROW_SOURCE``) and check graph-gather and pinned-tier support.
 """
 
 from __future__ import annotations
@@ -27,13 +27,13 @@ from typing import (
     Literal,
     Mapping,
     Optional,
-    Protocol,
     Sequence,
 )
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
+from sglang.srt.layers.moe.expert_transfer import NVFP4_TRANSFER_TENSOR_COUNT
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_row_source import ExpertRowSource
@@ -91,70 +91,24 @@ class ExpertTensorSpec:
         return math.prod(self.row_shape) * self.dtype.itemsize
 
 
-class ExpertFormat(Protocol):
-    """What an expert streamer needs to know about one layer's expert tensors.
-
-    ``tensor_specs`` returns one spec per streamed tensor, in streamer order.
-    ``source`` returns the dense ``[experts, ...]`` tensor of a name at call time
-    (the host arena rebinds layer tensors after startup), or None when the format
-    has no dense source and only its row source can read rows.
-    ``default_row_source`` builds the row source for a knob kind (see
-    ``SGLANG_MOE_EXPERT_ROW_SOURCE``) and raises for kinds it does not know.
-    ``file_source_bytes_per_expert`` returns the file bytes one expert row reads, or
-    None; None keeps eager gathers out of the pinned host tier and reports file
-    counters as unknown.
-
-    Attributes:
-        key: Format name, used in error messages.
-        supports_graph_gather: Whether dense host sources can serve graph gathers.
-        supports_host_arena: Whether ``SGLANG_MOE_EXPERT_HOST_ARENA`` applies.
-        max_gather_rows: Cap on rows one eager gather stages, or None.
-        inclusive_pinned_tier: True when the format's ``is_pinned`` protects its
-            hot-cache experts, so the pinned tier holds every hot row (see
-            :func:`inclusive_hot_slot_limit`).
-    """
-
-    key: str
-    supports_graph_gather: bool
-    supports_host_arena: bool
-    max_gather_rows: Optional[int]
-    inclusive_pinned_tier: bool
-
-    def tensor_specs(self, layer: torch.nn.Module) -> tuple[ExpertTensorSpec, ...]: ...
-
-    def num_experts(self, layer: torch.nn.Module) -> int: ...
-
-    def source(self, layer: torch.nn.Module, name: str) -> Optional[torch.Tensor]: ...
-
-    def default_row_source(
-        self,
-        layer: torch.nn.Module,
-        specs: Sequence[ExpertTensorSpec],
-        kind: str,
-    ) -> Optional[ExpertRowSource]: ...
-
-    def file_source_bytes_per_expert(
-        self, layer: torch.nn.Module, row_source: Optional[ExpertRowSource]
-    ) -> Optional[int]: ...
-
-    def pinned_tier_options(self, layer: torch.nn.Module) -> Mapping[str, Any]:
-        """Keyword arguments for this layer's ``ExpertPinnedHostCache``, e.g.
-        ``is_pinned``."""
-        ...
-
-
 class DenseLayerFormat:
     """Every streamed tensor is a dense ``[experts, ...]`` attribute of the layer.
 
     This is the NVFP4 format and the behaviour of every streamer created without a
     format: the dense tensors may live on CPU or CUDA, and the pinned host tier
     gets no extra options. The tensors must be contiguous, non-empty and agree on
-    the expert count; ``num_experts`` checks this.
+    the expert count; ``num_experts`` checks this. The native engine does not serve it
+    yet, so it has no transport build, no CPU kernel and no draft.
     """
 
     key = "dense"
+    transport_build: Optional[str] = None
+    engine_served = False
     supports_graph_gather = True
     supports_host_arena = True
+    supports_cpu_experts = False
+    supports_draft = False
+    supports_dead_rows = False
     max_gather_rows: Optional[int] = None
     inclusive_pinned_tier = False
 
@@ -162,6 +116,33 @@ class DenseLayerFormat:
         self.tensor_names = tuple(tensor_names)
         if not self.tensor_names:
             raise ValueError("expert streamer requires at least one tensor")
+        # The transfer executor submits one expert's rows as a fixed bundle of NVFP4_TRANSFER_TENSOR_COUNT copies.
+        self.supports_transfer_executor = (
+            len(self.tensor_names) == NVFP4_TRANSFER_TENSOR_COUNT
+        )
+
+    def layer_dims(self, layer: torch.nn.Module) -> tuple[int, int]:
+        raise NotImplementedError(
+            "a dense format is attached by its quantization method, not by the expert engine"
+        )
+
+    def build_streamer(self, layer: torch.nn.Module) -> Any:
+        raise NotImplementedError(
+            "a dense format is attached by its quantization method, not by the expert engine"
+        )
+
+    def cpu_trait(self, *, source: str, ext: Any = None) -> None:
+        return None
+
+    def prepare_host_rows(
+        self, layer: torch.nn.Module, name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        return tensor
+
+    def moe_apply(self, layer, x, slot_ids, weights, slot_tensors) -> torch.Tensor:
+        raise NotImplementedError(
+            "a dense format applies its experts through its quantization method, not over slot buffers"
+        )
 
     @staticmethod
     def _dense(layer: torch.nn.Module, name: str) -> torch.Tensor:
@@ -230,11 +211,11 @@ class DenseLayerFormat:
         if kind == "auto":
             return ExpertFileRowReader.from_layer(layer, names)
         if kind == "files":
-            mode = validate_file_reader_mode(envs.SGLANG_MOE_EXPERT_FILE_READER.get())
+            mode = validate_file_reader_mode(stream_config().tiers.file_reader)
             if mode == "mmap":
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_ROW_SOURCE=files needs "
-                    "SGLANG_MOE_EXPERT_FILE_READER=uring or uring_direct"
+                    "SGLANG_EXPERT_STREAM_ROW_SOURCE=files needs "
+                    "SGLANG_EXPERT_STREAM_FILE_READER=uring or uring_direct"
                 )
             return ExpertFileRowReader.from_layer(layer, names, mode=mode)
         if kind == "tensor":
@@ -271,14 +252,15 @@ def iter_expert_streamers(model: torch.nn.Module) -> Iterator[ExpertStreamer]:
             yield streamer
 
 
-def resolve_row_source_kind() -> str:
-    """The row source kind ``SGLANG_MOE_EXPERT_ROW_SOURCE`` selects (default ``auto``).
+def resolve_row_source_kind(config: Optional[ExpertStreamConfig] = None) -> str:
+    """The row source kind ``SGLANG_EXPERT_STREAM_ROW_SOURCE`` selects (default ``auto``); ``config`` defaults to
+    ``stream_config()``.
 
     Raises if the variable is blank.
     """
-    kind = envs.SGLANG_MOE_EXPERT_ROW_SOURCE.get().strip()
+    kind = (stream_config() if config is None else config).tiers.row_source.strip()
     if not kind:
-        raise ValueError("SGLANG_MOE_EXPERT_ROW_SOURCE must name a row source kind")
+        raise ValueError("SGLANG_EXPERT_STREAM_ROW_SOURCE must name a row source kind")
     return kind
 
 
@@ -293,7 +275,7 @@ def graph_source_kind_of(expert_format: Any) -> str:
 
 
 def graph_gather_needs_host_arena(model: torch.nn.Module) -> bool:
-    """Whether ``model``'s graph gathers need ``SGLANG_MOE_EXPERT_HOST_ARENA``.
+    """Whether ``model``'s graph gathers need ``SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA``.
 
     True unless every attached streamer's format serves them from its pinned host
     tier.
@@ -308,7 +290,7 @@ def require_graph_gather_support(
     streamers: Iterable[ExpertStreamer],
     *,
     pinned_tier_ok: bool = False,
-    exl3_direct_ok: bool = False,
+    engine_direct_ok: bool = False,
 ) -> None:
     """Raise unless every streamer's format can serve sync-free graph gathers.
 
@@ -316,18 +298,18 @@ def require_graph_gather_support(
     spec-only tensors lack. A ``pinned_tier`` format serves graph gathers from its
     pinned host tier instead; only the plain graph gather supports that
     (``pinned_tier_ok``), not the GPU residency update, whose copies index host rows
-    by expert id. ``exl3_direct_ok`` admits an ``exl3`` format on the same terms.
+    by expert id. ``engine_direct_ok`` admits an ``engine_served`` format on the same terms.
     """
     for streamer in streamers:
         expert_format = streamer.format
         key = expert_format.key
         if (
-            pinned_tier_ok or (exl3_direct_ok and key == "exl3")
+            pinned_tier_ok or (engine_direct_ok and expert_format.engine_served)
         ) and graph_source_kind_of(expert_format) == "pinned_tier":
             if streamer.pinned_host_cache is None:
                 raise ValueError(
                     f"expert format {key!r} of layer {streamer.layer_id} serves graph "
-                    "gathers from its pinned host tier; set SGLANG_MOE_PINNED_HOST_MB"
+                    "gathers from its pinned host tier; set SGLANG_EXPERT_STREAM_PINNED_HOST_MB"
                 )
             continue
         unsupported = (
@@ -336,8 +318,8 @@ def require_graph_gather_support(
         if unsupported:
             raise ValueError(
                 f"expert format {key!r} of layer {streamer.layer_id} does not support "
-                "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER and "
-                "SGLANG_MOE_GPU_RESIDENCY_UPDATE"
+                "graph gather; unset SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER and "
+                "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"
             )
 
 

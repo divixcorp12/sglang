@@ -24,8 +24,8 @@ say() { echo "$(date +%T) $*"; }
 PYTHONPATH=$WT/python $PY -c "import sglang; print('sglang from', sglang.__file__)" || exit 1
 mfs=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.MEM_FRACTION_STATIC)")
 [ "$mfs" = "${EXPECT_MFS:-0.885}" ] || { say "arm_env.MEM_FRACTION_STATIC is $mfs, not ${EXPECT_MFS:-0.885}"; exit 1; }
-HOT=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.base_env()['SGLANG_MOE_HOT_GPU_MB'])")
-say "recipe: MEM_FRACTION_STATIC=$mfs SGLANG_MOE_HOT_GPU_MB=$HOT"
+HOT=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.base_env()['SGLANG_EXPERT_STREAM_HOT_GPU_MB'])")
+say "recipe: MEM_FRACTION_STATIC=$mfs SGLANG_EXPERT_STREAM_HOT_GPU_MB=$HOT"
 [ -z "${DSV41_MEM_FRACTION_STATIC:-}" ] || { say "DSV41_MEM_FRACTION_STATIC is set; this check runs the constant"; exit 1; }
 
 node_avail() {

@@ -1,6 +1,6 @@
-"""Two-stage CPU misses on the EXL3 kernel (SGLANG_DSV41_CPU_TWO_STAGE): the forward a staged job runs, its stage-two
+"""Two-stage CPU misses on the EXL3 kernel (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE '{"enabled": true}'): the forward a staged job runs, its stage-two
 wait between GateUp and Middle, gives the one-stage forward's output bit for bit. Needs the optimized ext build
-(SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1) and 4 cores in the affinity mask.
+(SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1) and 4 cores in the affinity mask.
 
 Each case holds the routed slots' w2 back: their w2 slabs are poisoned, and kernel_forward_two_stage's helper thread
 restores them 200 ms into the call, then opens the gate. The forward starts at once, runs PrepareGateUp and GateUp on
@@ -43,7 +43,7 @@ def test_a_staged_forward_matches_the_one_stage_forward_bit_for_bit(monkeypatch,
     never -- red on the call count and the output."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     slabs = _random_slabs(20261010, HIDDEN, INTER)
     layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(slabs, CAP), variant="instr")
@@ -87,7 +87,7 @@ def test_the_poison_reaches_a_forward_that_reads_w2_without_waiting(monkeypatch)
     forward that read w2 before its wait."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     slabs = _random_slabs(20261010, HIDDEN, INTER)
     layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(slabs, CAP), variant="instr")

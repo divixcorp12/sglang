@@ -15,6 +15,7 @@
 #include <cstring>
 #include <span>
 #include <fstream>
+#include <iostream>
 #include <omp.h>
 #include <stdexcept>
 #include <string>
@@ -193,18 +194,20 @@ void StackFixture::preload_slots(int64_t row) const {
   }
 }
 
-void configure_cpu_kernel_runtime() {
-  // The kernel detects its ISA tier at the first query, here, after EXL3_MOE_CPU_MAX_ISA was set at launch.
-  if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
-    throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
+const char* kernel_isa_tier() {
+  if (exl3_moe_cpu_has_avx512_vbmi()) return "vbmi";
+  return exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
+}
+
+void configure_cpu_kernel_runtime(const std::string& max_isa) {
+  // The kernel detects its ISA tier at the first query, here, under the cap configured just before it.
+  ::sglang::exl3_cpu::exl3_cpu_configure({.max_isa = max_isa});
+  if (!exl3_moe_cpu_has_avx512_bw())
+    throw std::runtime_error("This study requires AVX512BW");
+  std::cerr << "isa tier " << kernel_isa_tier() << '\n';
   at::set_num_threads(1);
   at::set_num_interop_threads(1);
   omp_set_dynamic(0);
-}
-
-void release_kernel_team() {
-  if (omp_pause_resource_all(omp_pause_soft) != 0)
-    throw std::runtime_error("Cannot release the bare caller's OpenMP team");
 }
 
 void check_reference(const fs::path& path, const std::vector<float>& actual) {

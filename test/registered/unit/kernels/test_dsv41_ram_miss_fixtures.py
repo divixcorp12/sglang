@@ -14,6 +14,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+EXL3 = ops.EXL3_BUILD  # the (format, router) key the fixtures warm
+
 
 def _record(monkeypatch):
     events = []
@@ -33,7 +35,7 @@ def _loads(events):
 
 
 def _host_loads(events):
-    return {args for args in _loads(events) if args[0] == "exl3"}
+    return {args for args in _loads(events) if args[0] == EXL3}
 
 
 def test_run_host_script_loads_the_childs_host_module_before_spawning_it(monkeypatch, tmp_path):
@@ -41,7 +43,7 @@ def test_run_host_script_loads_the_childs_host_module_before_spawning_it(monkeyp
     fixtures.run_host_script(tmp_path, "print('reached')")
     assert [event[0] for event in events].count("spawn") == 1
     assert events[-1][0] == "spawn", events  # every load precedes the timed child
-    assert ("exl3", fixtures.HOST_SCRIPT_VARIANT, fixtures.HOST_SCRIPT_LANES, 1) in _loads(events)
+    assert (EXL3, fixtures.HOST_SCRIPT_VARIANT, fixtures.HOST_SCRIPT_LANES, 1) in _loads(events)
 
 
 def test_the_child_script_builds_the_host_the_parent_warmed():
@@ -55,14 +57,14 @@ def test_a_child_also_loads_the_default_build_through_host_layout(monkeypatch):
     names: that module is as cold as the named one."""
     events = _record(monkeypatch)
     fixtures.warm_host_modules("instr", lanes=8, nodes=2)
-    assert _host_loads(events) == {("exl3", "instr", 8, 2), ("exl3", "prod", 8, 1)}
+    assert _host_loads(events) == {(EXL3, "instr", 8, 2), (EXL3, "prod", 8, 1)}
 
 
 def test_warming_ignores_the_parents_conftest_default_variant(monkeypatch):
     events = _record(monkeypatch)
     monkeypatch.setattr(ops, "_DEFAULT_VARIANT", "instr")  # the conftest's autouse fixture
     fixtures.warm_host_modules()
-    assert _host_loads(events) == {("exl3", "prod", 8, 1)}
+    assert _host_loads(events) == {(EXL3, "prod", 8, 1)}
     assert ops._DEFAULT_VARIANT == "instr"  # restored
 
 
@@ -99,7 +101,7 @@ def test_spawn_child_warms_then_spawns_a_child_with_core_dumps_off(monkeypatch, 
     """The one place every child goes through: warm first, no core file, the arguments after the script."""
     events = _record(monkeypatch)
     fixtures.spawn_child("print(1)", tmp_path, 7, timeout_s=33, variant="instr", nodes=2)
-    assert events[-1][0] == "spawn" and ("exl3", "instr", 8, 2) in _loads(events)
+    assert events[-1][0] == "spawn" and (EXL3, "instr", 8, 2) in _loads(events)
     argv = events[-1][1][0]
     assert argv[1:3] == ["-c", fixtures.NO_CORE_DUMP + "print(1)"] and argv[3:] == [str(tmp_path), "7"]
 
@@ -112,7 +114,7 @@ def test_the_hotpath_shim_child_is_warmed_and_core_dump_free_with_the_shim_prelo
     monkeypatch.delenv("LD_PRELOAD", raising=False)
     hotpath_shim.run_child(tmp_path / "shim.so", variant="instr", tmp=tmp_path)
     kind, args, kwargs = events[-1]
-    assert kind == "spawn" and ("exl3", "instr", 8, 1) in _loads(events)
+    assert kind == "spawn" and (EXL3, "instr", 8, 1) in _loads(events)
     assert args[0][2].startswith(fixtures.NO_CORE_DUMP)
     assert kwargs["env"]["LD_PRELOAD"] == str(tmp_path / "shim.so")
     assert "LD_PRELOAD" not in os.environ

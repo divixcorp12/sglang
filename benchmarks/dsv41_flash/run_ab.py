@@ -6,7 +6,7 @@
 One repetition is two processes, the minimum (the lease switch is read once at service start). A second pair is
 decided after reading the first pair's table, not planned: rerun with --rep-start 1 into the same --out-dir; the
 pair's order flips on odd reps, so the order effect cancels. Each process holds cc-gpu.lock via gpu-run.sh for its whole life. --dry-run prints the commands
-and runs bench_arm.py --dry-run under taskset -c 0-63: no lock, no GPU, no Engine.
+and runs bench_arm.py --dry-run under taskset -c 0-51,56-107: no lock, no GPU, no Engine.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import arm_config as ac  # noqa: E402
 import compare  # noqa: E402
 
-VENV_PYTHON = "/data/models/slang/.venv/bin/python"
+VENV_PYTHON = "/data/models/slang/.venv-upstream/bin/python"
 BENCH_ARM = str(Path(__file__).resolve().parent / "bench_arm.py")
 
 
@@ -129,7 +129,7 @@ def main(argv=None) -> int:
         cmd = [
             "taskset",
             "-c",
-            "0-63",
+            "0-51,56-107",
             args.python,
             BENCH_ARM,
             "--arm",

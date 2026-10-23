@@ -1,16 +1,26 @@
 // The EXL3 CPU expert kernel's torch ops: sglang_exl3_cpu::kernel_address, how Python hands the kernel to the
 // expert-stream host (enable_cpu_experts) and to the host's test exports, and sglang_exl3_cpu::params, a layer's
 // params as make_layer reads them (uint8 bytes of SglangExl3CpuParams), sglang_exl3_cpu::plan_calls, the forwards each
-// plan took ([dsv41, generic]), and sglang_exl3_cpu::chunk_m, the build's CHUNK_M. Built into the optimized extension only
-// (quantization/exl3/ext.py), not into benches or the standalone build.
+// plan took ([dsv41, generic]), sglang_exl3_cpu::chunk_m, the build's CHUNK_M, and sglang_exl3_cpu::configure, the
+// kernel's options (kernel.h's Exl3CpuOptions), which Python calls before kernel_address. Built into the optimized
+// extension only (quantization/exl3/ext.py), not into benches or the standalone build.
 #include "kernel.h"
 #include <ATen/ATen.h>
 #include <cstring>
+#include <string>
 #include <torch/library.h>
 #include <vector>
 
 namespace {
 int64_t kernel_address() { return reinterpret_cast<int64_t>(&::sglang::exl3_cpu::exl3_cpu_kernel()); }
+
+void configure(std::string max_isa, bool report_isa, std::string worker_trace_prefix, int64_t worker_trace_capacity,
+               int64_t worker_trace_min_us, std::string scratch_trace_prefix, std::string trace_gate_path)
+{
+    ::sglang::exl3_cpu::exl3_cpu_configure({std::move(max_isa), report_isa, std::move(worker_trace_prefix),
+                                            worker_trace_capacity, worker_trace_min_us,
+                                            std::move(scratch_trace_prefix), std::move(trace_gate_path)});
+}
 
 at::Tensor params(int64_t bits, int64_t swizzled, int64_t row_weighted)
 {
@@ -36,4 +46,7 @@ TORCH_LIBRARY(sglang_exl3_cpu, m)
     m.def("params(int bits, int swizzled, int row_weighted) -> Tensor", &params);
     m.def("plan_calls() -> int[]", &plan_calls);
     m.def("chunk_m() -> int", &chunk_m);
+    m.def("configure(str max_isa, bool report_isa, str worker_trace_prefix, int worker_trace_capacity, "
+          "int worker_trace_min_us, str scratch_trace_prefix, str trace_gate_path) -> ()",
+          &configure);
 }

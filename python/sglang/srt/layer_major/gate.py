@@ -37,8 +37,14 @@ def launch_refusal(
     # One blocking pass per request; nothing may run between its chunks.
     if max_running_requests != 1:
         return "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS requires --max-running-requests 1"
+    # The scheduler passes str(SpeculativeAlgorithm.DSPARK), the launch hook the raw "DSPARK".
+    dspark_allowed = (
+        speculative_algorithm is not None
+        and str(speculative_algorithm).rsplit(".", 1)[-1].upper() == "DSPARK"
+        and envs.SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK.get()
+    )
     for feature, enabled in (
-        ("speculative decoding", speculative_algorithm is not None),
+        ("speculative decoding", speculative_algorithm is not None and not dspark_allowed),
         ("DP attention", enable_dp_attention),
         ("context parallelism", attn_cp_size > 1),
         ("two-batch overlap", enable_two_batch_overlap),

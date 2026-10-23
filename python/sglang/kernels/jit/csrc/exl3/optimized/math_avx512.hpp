@@ -1,6 +1,7 @@
 // The AVX-512 tiers' GEMV tiles: the Bw, Vnni and Vbmi bands (bw_tiles, vnni_tiles, vbmi_tiles) and the K3
 // block-128 residual kernels (bw3_blocked_*, register_tiles<M> (M tokens per chunk, kRegisterBudget) and the
-// one-token traversal). Each function carries its tier's target attribute (M1_TARGET_*, math.hpp).
+// one-token traversal; the last two in register_kernels.hpp, included once per integer accumulate: reg_bw, reg_vnni).
+// Each function carries its tier's target attribute (M1_TARGET_*, math.hpp).
 // Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
 // see ../LICENSE.exllamav3.
 #pragma once
@@ -100,7 +101,7 @@ M1_TARGET_VNNI
 inline void vnni_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (dword_pair_wins<bits>())
@@ -164,7 +165,7 @@ void vnni_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -299,7 +300,7 @@ M1_TARGET_BW
 M1_ALWAYS_INLINE void bw_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat_dup, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (dword_pair_wins<bits>())
@@ -393,7 +394,7 @@ constexpr std::array<uint16_t, 32> bw3_word_shifts()
 template <int rows, int band, int P>
 M1_TARGET_BW
 M1_ALWAYS_INLINE void bw3_band_rows(__m512i p0, __m512i p1, int b,
-    const int32_t* splat_dup, int k, __m512i (&acc)[band][MAX_M], const char* future_weight)
+    const int32_t* splat_dup, int k, __m512i (&acc)[band][GENERIC_MAX_M], const char* future_weight)
 {
     if constexpr (P < 8)
     {
@@ -456,7 +457,7 @@ void bw_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -658,7 +659,7 @@ M1_TARGET_VBMI
 inline void vbmi_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][GENERIC_MAX_M]
 )
 {
     if constexpr (P < 8)
@@ -708,7 +709,7 @@ void vbmi_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][GENERIC_MAX_M];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -814,7 +815,7 @@ void bw3_blocked_band(const Exl3Projection& mat, const PreparedIn& in, float* to
     __m512 sums[band][rows];
     for (int kb = 0; kb < mat.k / B; ++kb)
     {
-        __m512i acc[band][MAX_M];
+        __m512i acc[band][GENERIC_MAX_M];
         for (int b = 0; b < band; ++b)
             for (int i = 0; i < rows; ++i)
                 acc[b][i] = _mm512_setzero_si512();
@@ -914,291 +915,70 @@ M1_TARGET_BW M1_ALWAYS_INLINE __m512i register_word(__m512i p0,__m512i p1,__m512
 
 // The compact register kernels' register budget, one entry per tokens-per-chunk M = 1..CHUNK_M (register_tiles<M>):
 // pairs, the tile pairs one register_band call holds; traversal, whether whole 128-output groups take the grouped
-// traversal (its IntegerAccum holds one token's rows). Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
+// traversal (its IntegerAccum holds one token's rows); halves, whether each 128-input block runs once per output half
+// (register_band_halves), holding half the accumulators. Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
 // compile below until an entry is added.
 struct RegisterBudget
 {
     int pairs;
     bool traversal;
+    bool halves = false;
 };
 constexpr RegisterBudget kRegisterBudget[] = {
     {4, true},   // M = 1: today's kernels (register_band<1..4>, traversal_kblock's four bands)
     {2, false},  // M = 2
     {1, false},  // M = 3
     {1, false},  // M = 4
+    {1, false, true},  // M = 5..8: 4 * M accumulators per tile pair exceed the registers; 2 * M per half fit
+    {1, false, true},
+    {1, false, true},
+    {1, false, true},
 };
 // zmm registers register_rows keeps live besides the integer accumulators: prev, a, b, c, the state, its byte sum, two
 // products, the multiplier halves, the ones vector and the broadcast activation pair.
 constexpr int kRegisterDecodeZmm = 12;
 
+// Integer accumulators one register_band call holds for M tokens: two output halves of 2 * M rows per tile pair, or
+// one half at a time.
+constexpr int register_accumulators(int m, const RegisterBudget& b) { return (b.halves ? 2 : 4) * m * b.pairs; }
+
 constexpr bool register_budget_fits()
 {
     for (int m = 1; m <= int(std::size(kRegisterBudget)); ++m)
-        if (kRegisterBudget[m - 1].pairs < 1 || 4 * m * kRegisterBudget[m - 1].pairs + kRegisterDecodeZmm > 32)
+        if (kRegisterBudget[m - 1].pairs < 1
+            || register_accumulators(m, kRegisterBudget[m - 1]) + kRegisterDecodeZmm > 32)
             return false;
     return true;
 }
 static_assert(register_budget_fits(), "kRegisterBudget (math_avx512.hpp): an entry's integer accumulators "
-                                      "(4 * M * pairs) plus kRegisterDecodeZmm exceed the 32 zmm registers");
+                                      "(register_accumulators) plus kRegisterDecodeZmm exceed the 32 zmm registers");
 static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(std::size(kRegisterBudget)),
               "kRegisterBudget (math_avx512.hpp) has no entry for this CHUNK_M: add one before raising "
               "EXL3_MOE_CPU_MAX_M");
 
-template<int J,int Pairs,bool Compact=false,int M=1>
-M1_TARGET_BW M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i b,__m512i c,
-    const std::conditional_t<Compact,int16_t,int32_t>* splat,__m512i (&acc)[Pairs][2][2*M],int band) {
-    if constexpr(J<16) {
-        constexpr int offset=19+6*J,q=offset/32,s=offset%32;
-        __m512i lo,hi;
-        if constexpr(q==0){lo=prev;hi=a;}
-        else if constexpr(q==1){lo=a;hi=b;}
-        else if constexpr(q==2){lo=b;hi=c;}
-        else {lo=c;hi=_mm512_setzero_si512();}
-        __m512i state;
-    if constexpr(s<=13) {
-        // Only v[31:13] survives the halfword selection. hi contributes to
-        // v[s-1:0], so it is irrelevant in these seven row positions.
-        state=_mm512_mask_blend_epi16(0xaaaaaaaaU,
-            _mm512_srli_epi32(lo,16-s),_mm512_slli_epi32(lo,s+3));
-    } else if constexpr(s==15) {
-        state=_mm512_mask_blend_epi16(0xaaaaaaaaU,_mm512_srli_epi32(lo,1),
-            _mm512_or_si512(_mm512_slli_epi32(lo,18),_mm512_srli_epi32(hi,14)));
-    } else if constexpr(s==29) {
-        state=_mm512_mask_blend_epi16(0xaaaaaaaaU,
-            _mm512_or_si512(_mm512_slli_epi32(lo,13),_mm512_srli_epi32(hi,19)),hi);
-    } else if constexpr(s==31) {
-        state=_mm512_mask_blend_epi16(0xaaaaaaaaU,
-            _mm512_or_si512(_mm512_slli_epi32(lo,15),_mm512_srli_epi32(hi,17)),_mm512_slli_epi32(hi,2));
-    } else {
-        const __m512i v=_mm512_or_si512(_mm512_slli_epi32(lo,s),_mm512_srli_epi32(hi,32-s));
-        state=_mm512_mask_blend_epi16(0xaaaaaaaaU,_mm512_srli_epi32(v,16),_mm512_slli_epi32(v,3));
-    }
-        const __m512i sum=register_bytesum(state);
-        constexpr int row=(J/4)*2+(J%2)*8,half=(J/2)%2;
-        // 2 * M quantized rows, 128 apart: M token rows, then their M residual rows (compact_quantize_block).
-        for(int i=0;i<2*M;++i) {
-            uint32_t pair;std::memcpy(&pair,reinterpret_cast<const char*>(splat+i*128+row)+(Compact?0:2),4);
-            acc[band][half][i]=_mm512_add_epi32(acc[band][half][i],_mm512_madd_epi16(sum,_mm512_set1_epi32(int32_t(pair))));
-        }
-        register_rows<J+1,Pairs,Compact,M>(prev,a,b,c,splat,acc,band);
-    }
-}
+// The register kernels, once per integer accumulate (register_kernels.hpp). reg_bw is today's code, for every
+// AVX-512BW host. reg_vnni accumulates with vpdpwssd and runs on VNNI hosts (the plan's tier is >= Isa::Vnni); its
+// one-token compact chunks drop the byte sum for vpdpbusd on the product bytes (M1_REG_BYTES), one fewer vector
+// operation per decoded state, the same int32 sums.
+namespace reg_bw {
+#define M1_REG_TARGET M1_TARGET_BW
+#define M1_REG_ACC(acc, sum, pair) _mm512_add_epi32((acc), _mm512_madd_epi16((sum), (pair)))
+#define M1_REG_BYTES 0
+#include "register_kernels.hpp"
+#undef M1_REG_BYTES
+#undef M1_REG_ACC
+#undef M1_REG_TARGET
+}  // namespace reg_bw
 
-// M token rows (the tokens of one chunk) share each decoded tile. Per output: the int32 sum of each (k-block,
-// quantized row), one FMA scale each, fp32 sums in increasing k-block order, then token + residual once: the generic
-// path's rounding (bw3_blocked_band).
-template<int Pairs,int FixedK=0,int FixedN=0,bool Compact=false,int M=1>
-M1_TARGET_BW void register_band(const Exl3Projection& mat,const PreparedIn& in,float* tout,int n0) {
-    constexpr int R=2*M;  // quantized rows: M token rows, then their M residual rows
-    const int k=FixedK?FixedK:mat.k,n=FixedN?FixedN:mat.n;
-    const bool swz=FixedK?false:mat.swz;
-    const int tiles_k=k/16,tiles_n=n/16;
-    const size_t step=size_t(swz?8:tiles_n)*96;
-    __m512 sums[Pairs][2][R];
-    alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
-    for(int kb=0;kb<k/128;++kb) {
-        __m512i acc[Pairs][2][R];
-        for(int b=0;b<Pairs;++b)for(int h=0;h<2;++h)for(int i=0;i<R;++i)acc[b][h][i]=_mm512_setzero_si512();
-        for(int kt=0;kt<8;++kt) {
-            const auto* splat=[&]() {
-                    if constexpr(Compact) return in.compact+size_t(kb)*R*128+kt*16;
-                    else return in.splat_dup+size_t(kb)*R*128+kt*16;
-                }();
-            for(int band=0;band<Pairs;++band) {
-                const int nt=n0+2*band,tile_k=kb*8+kt;
-                const size_t tile=swz?size_t(nt/8)*tiles_k*8+size_t(tile_k)*8+nt%8:size_t(tile_k)*tiles_n+nt;
-                const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+tile*48);
-                const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+step*2;
-                #pragma GCC unroll 3
-                for(int line=0;line<3;++line)_mm_prefetch(reinterpret_cast<const char*>(future+line*64),_MM_HINT_T0);
-                const __m512i p0=_mm512_loadu_si512(packed),p1=_mm512_loadu_si512(packed+16),p2=_mm512_loadu_si512(packed+32);
-                const __m512i a=register_word<0>(p0,p1,p2),b=register_word<1>(p0,p1,p2),c=register_word<2>(p0,p1,p2);
-                const __m512i prev=_mm512_permutexvar_epi32(_mm512_load_si512(previous),c);
-                register_rows<0,Pairs,Compact,M>(prev,a,b,c,splat,acc,band);
-            }
-        }
-        __m512 scales[R],corrections[R];
-        for(int i=0;i<R;++i) {
-            const float scale=0x1.bb8p-8f*in.bq[kb*MAX_M+i];
-            scales[i]=_mm512_set1_ps(scale);
-            corrections[i]=_mm512_set1_ps(-510.0f*float(in.bsum[kb*MAX_M+i])*scale);
-        }
-        for(int b=0;b<Pairs;++b)for(int h=0;h<2;++h)for(int i=0;i<R;++i) {
-            const __m512 v=_mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][h][i]),scales[i],corrections[i]);
-            if(kb==0)sums[b][h][i]=v;else sums[b][h][i]=_mm512_add_ps(sums[b][h][i],v);
-        }
-    }
-    // Token row t at tout + t * n gets token + residual; its residual row stays at tout + (M + t) * n, as the generic
-    // path leaves it.
-    for(int b=0;b<Pairs;++b)for(int t=0;t<M;++t) {
-        float* row=tout+size_t(t)*n;
-        float* res=tout+size_t(M+t)*n;
-        const __m512 lo=_mm512_add_ps(sums[b][0][t],sums[b][0][M+t]);
-        const __m512 hi=_mm512_add_ps(sums[b][1][t],sums[b][1][M+t]);
-        _mm512_storeu_ps(row+(n0+2*b)*16,_mm512_shuffle_f32x4(lo,hi,0x44));
-        _mm512_storeu_ps(row+(n0+2*b+1)*16,_mm512_shuffle_f32x4(lo,hi,0xee));
-        _mm512_storeu_ps(res+(n0+2*b)*16,_mm512_shuffle_f32x4(sums[b][0][M+t],sums[b][1][M+t],0x44));
-        _mm512_storeu_ps(res+(n0+2*b+1)*16,_mm512_shuffle_f32x4(sums[b][0][M+t],sums[b][1][M+t],0xee));
-    }
-}
-
-// register_band<P, 0, 0, true, M> for a runtime P in 1..sizeof...(P): one direct call per P.
-template<int M,int... P>
-M1_TARGET_BW M1_ALWAYS_INLINE void register_band_for(std::integer_sequence<int,P...>,const Exl3Projection& mat,
-                                                     const PreparedIn& in,float* tout,int n0,int pairs) {
-    (void)((pairs==P+1 && (register_band<P+1,0,0,true,M>(mat,in,tout,n0),true)) || ...);
-}
-
-// Visit neighboring 128-output bands before advancing to the next 128-input block.
-// Original packed weights and each output's increasing-kb FP32 addition order stay
-// unchanged. One integer band is live at a time; FP32 partials reside in private
-// aligned scratch. The one-band variant controls for this factoring/scratch cost.
-
-struct IntegerAccum { __m512i lanes[4][2][2]; };
-M1_TARGET_BW inline void integer_acc_zero(IntegerAccum& a) {
-    for(int b=0;b<4;++b)for(int h=0;h<2;++h)for(int i=0;i<2;++i)a.lanes[b][h][i]=_mm512_setzero_si512();
-}
-
-M1_TARGET_BW __attribute__((noinline))
-void traversal_kblock(const Exl3Projection& mat, const PreparedIn& in,
-                      __m512 (&sums)[4][2][2], int n0, int kb) {
-    const int tiles_k=mat.k/16, tiles_n=mat.n/16;
-    const bool swz=mat.swz;
-    const size_t step=size_t(swz?8:tiles_n)*96;
-    alignas(64) static constexpr int previous[16]={7,0,1,2,3,4,5,6,15,8,9,10,11,12,13,14};
-    IntegerAccum first;integer_acc_zero(first);
-    for(int kt=0;kt<8;++kt) {
-        auto& acc=first.lanes;
-        const int16_t* splat=in.compact+size_t(kb)*256+kt*16;
-        #pragma omp unroll full
-        for(int band=0;band<4;++band) {
-            const int nt=n0+2*band, tile_k=kb*8+kt;
-            const size_t tile=swz?size_t(nt/8)*tiles_k*8+size_t(tile_k)*8+nt%8
-                                 :size_t(tile_k)*tiles_n+nt;
-            const uint32_t* packed=reinterpret_cast<const uint32_t*>(mat.trellis+tile*48);
-            const uintptr_t future=reinterpret_cast<uintptr_t>(packed)+step*2;
-            #pragma GCC unroll 3
-            for(int line=0;line<3;++line)
-                _mm_prefetch(reinterpret_cast<const char*>(future+line*64),_MM_HINT_T0);
-            const __m512i p0=_mm512_loadu_si512(packed);
-            const __m512i p1=_mm512_loadu_si512(packed+16);
-            const __m512i p2=_mm512_loadu_si512(packed+32);
-            const __m512i a=register_word<0>(p0,p1,p2);
-            const __m512i b=register_word<1>(p0,p1,p2);
-            const __m512i c=register_word<2>(p0,p1,p2);
-            const __m512i prev=_mm512_permutexvar_epi32(_mm512_load_si512(previous),c);
-            register_rows<0,4,true>(prev,a,b,c,splat,acc,band);
-        }
-    }
-    auto& acc=first.lanes;
-    __m512 scales[2],corrections[2];
-    for(int i=0;i<2;++i) {
-        const float scale=0x1.bb8p-8f*in.bq[kb*MAX_M+i];
-        scales[i]=_mm512_set1_ps(scale);
-        corrections[i]=_mm512_set1_ps(-510.0f*float(in.bsum[kb*MAX_M+i])*scale);
-    }
-    for(int b=0;b<4;++b) for(int h=0;h<2;++h) for(int i=0;i<2;++i) {
-        const __m512 v=_mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][h][i]),scales[i],corrections[i]);
-        if(kb==0) sums[b][h][i]=v;
-        else sums[b][h][i]=_mm512_add_ps(sums[b][h][i],v);
-    }
-}
-
-template<int Groups>
-M1_TARGET_BW void traversal_group(const Exl3Projection& mat, const PreparedIn& in,
-                                 float* tout, int n0) {
-    static_assert(Groups>=1 && Groups<=4);
-    // Each group has 16 ZMM partial sums: 1024 bytes per 128 outputs.
-    alignas(64) __m512 sums[Groups][4][2][2];
-    for(int kb=0;kb<mat.k/128;++kb)
-        for(int group=0;group<Groups;++group)
-            traversal_kblock(mat,in,sums[group],n0+group*8,kb);
-    for(int group=0;group<Groups;++group) for(int b=0;b<4;++b) {
-        const int tile=n0+group*8+2*b;
-        const __m512 lo=_mm512_add_ps(sums[group][b][0][0],sums[group][b][0][1]);
-        const __m512 hi=_mm512_add_ps(sums[group][b][1][0],sums[group][b][1][1]);
-        _mm512_storeu_ps(tout+tile*16,_mm512_shuffle_f32x4(lo,hi,0x44));
-        _mm512_storeu_ps(tout+(tile+1)*16,_mm512_shuffle_f32x4(lo,hi,0xee));
-        _mm512_storeu_ps(tout+mat.n+tile*16,
-            _mm512_shuffle_f32x4(sums[group][b][0][1],sums[group][b][1][1],0x44));
-        _mm512_storeu_ps(tout+mat.n+(tile+1)*16,
-            _mm512_shuffle_f32x4(sums[group][b][0][1],sums[group][b][1][1],0xee));
-    }
-}
-
-M1_TARGET_BW void traversal_tiles(const Exl3Projection& mat,const PreparedIn& in,
-                                 float* tout,int t0,int t1,bool grouped) {
-    for(int t=t0;t<t1;) {
-        const int remaining=(t1-t)/8;
-        // Range-aware: preserve three-band E1 ranges, 9=3+3+3 and 10=3+3+4.
-        const int cap=grouped ? (remaining>4 ? 3 : 4) : 1;
-        const int groups=std::min(cap,remaining);
-        switch(groups) {
-            case 4: traversal_group<4>(mat,in,tout,t);break;
-            case 3: traversal_group<3>(mat,in,tout,t);break;
-            case 2: traversal_group<2>(mat,in,tout,t);break;
-            default: traversal_group<1>(mat,in,tout,t);break;
-        }
-        t+=groups*8;
-    }
-}
-
-// Compact tile pairs [t0, t1) inside one 128-output group, t1 - t0 in {0, 2, 4, 6}: the same per-output arithmetic as
-// traversal_kblock, which takes whole groups.
-M1_TARGET_BW void compact_pairs(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1) {
-    switch((t1-t0)/2) {
-        case 1:register_band<1,0,0,true>(mat,in,tout,t0);break;
-        case 2:register_band<2,0,0,true>(mat,in,tout,t0);break;
-        case 3:register_band<3,0,0,true>(mat,in,tout,t0);break;
-        default:break;
-    }
-}
-
-// The tokens of one chunk, M = 1..CHUNK_M. M = 1 is the one-token kernel either plan calls (compact or not, swizzled
-// or not; the grouped traversal: kRegisterBudget[0]). M > 1 is the DSV4.1 plan's compact, unswizzled input, in runs of
-// up to kRegisterBudget[M - 1].pairs tile pairs.
-template<int M>
-M1_TARGET_BW void register_tiles(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1,
-                                 [[maybe_unused]] bool grouped) {
-    [[maybe_unused]] constexpr RegisterBudget budget=kRegisterBudget[M-1];
-    if constexpr (M==1) {
-        if(in.compact) {
-            if(mat.swz) {
-                // The swizzled layout stores a 128-output group's eight tiles together.
-                TORCH_CHECK(t0%8==0 && t1%8==0,"compact swizzled input requires whole output blocks");
-                for(int t=t0;t<t1;t+=8)register_band<4,0,0,true>(mat,in,tout,t);
-                return;
-            }
-            // Unswizzled: whole groups through the traversal, a partial group at either end as tile pairs.
-            TORCH_CHECK(t0%2==0 && t1%2==0,"compact input requires whole tile pairs");
-            const int a0=std::min(t1,(t0+7)/8*8), a1=std::max(a0,t1/8*8);
-            compact_pairs(mat,in,tout,t0,a0);
-            if(a1>a0)traversal_tiles(mat,in,tout,a0,a1,grouped);
-            compact_pairs(mat,in,tout,a1,t1);
-            return;
-        }
-        for(int n0=t0;n0<t1;) {
-            if((n0%2)||t1-n0<2){bw3_blocked_band<1>(mat,in,tout,n0++);continue;}
-            const int pairs=std::min({4,(t1-n0)/2,(8-n0%8)/2});
-            switch(pairs) {
-                case 1:register_band<1>(mat,in,tout,n0);break;
-                case 2:register_band<2>(mat,in,tout,n0);break;
-                case 3:register_band<3>(mat,in,tout,n0);break;
-                case 4:register_band<4>(mat,in,tout,n0);break;
-            }
-            n0+=pairs*2;
-        }
-    } else {
-        static_assert(!budget.traversal,"the grouped traversal holds one token's rows (IntegerAccum)");
-        TORCH_CHECK(in.compact && !mat.swz && t0%2==0 && t1%2==0,
-                    "a chunk of several tokens needs compact, unswizzled tile pairs");
-        for(int n0=t0;n0<t1;) {
-            const int pairs=std::min(budget.pairs,(t1-n0)/2);
-            register_band_for<M>(std::make_integer_sequence<int,budget.pairs>{},mat,in,tout,n0,pairs);
-            n0+=pairs*2;
-        }
-    }
-}
+namespace reg_vnni {
+#define M1_REG_TARGET M1_TARGET_VNNI
+#define M1_REG_ACC(acc, sum, pair) _mm512_dpwssd_epi32((acc), (sum), (pair))
+#define M1_REG_BYTES 1
+#include "register_kernels.hpp"
+#undef M1_REG_BYTES
+#undef M1_REG_ACC
+#undef M1_REG_TARGET
+}  // namespace reg_vnni
 
 }  // namespace
 }  // namespace sglang::exl3_cpu

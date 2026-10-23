@@ -251,7 +251,7 @@ def _cut_post(forced, *, unforced=(0, 2, 4, 6), miss_cut=1, miss_cut_max=3, ram_
 
 @pytest.mark.parametrize("forced, take", [((), 3), ((8,), 2), ((8, 10), 2), ((8, 10, 12), 2), ((8, 10, 12, 14), 3)])
 def test_the_miss_cut_takes_one_cpu_lane_off_a_node_with_one_to_three_forced_misses(forced, take):
-    """Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, _MAX=3): a forced CPU miss queues behind the record's CPU-hit
+    """Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT '{"miss_cut": 1, "miss_cut_max": 3}'): a forced CPU miss queues behind the record's CPU-hit
     job, so a node with 1..3 of them gives one of its split's lanes back to the GPU; 0 or 4 keep the split."""
     assert _cut_post(forced) == take
 

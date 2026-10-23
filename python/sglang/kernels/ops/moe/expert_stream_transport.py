@@ -1,4 +1,9 @@
-"""Python wrappers for the RAM-miss expert-stream transport of EXL3 streamed experts.
+"""Python wrappers for the RAM-miss expert-stream transport of streamed experts.
+
+The transport is built per (format, router) pair (``LAYOUTS``: the engine's template
+translation units, ``csrc/moe/expert_stream/engine_{host.cpp,device.cuh}``, instantiated
+for ``csrc/moe/formats/<format>`` and the router of ``csrc/moe/expert_stream/router.h``);
+every entry point takes its pair as ``layout``.
 
 Streamed experts live in files and in pinned host RAM; the device kernels fetch the
 ones a layer needs through a request/response protocol with a C++ service thread.
@@ -24,7 +29,6 @@ from __future__ import annotations
 import atexit
 import functools
 import json
-import os
 import struct
 import sys
 import weakref
@@ -37,6 +41,7 @@ from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
 from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKENS_MAX, cpu_row_bytes
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 
 # Rows per io_uring batch and per bounce bank. The C++ reader has kBanks = 2 banks of
 # kBounceRows = 8 row slots each; a bank is reused only after every row read into it
@@ -48,31 +53,54 @@ if TYPE_CHECKING:
 
 
 class TransportBuild(msgspec.Struct, frozen=True):
-    """One instantiation of the transport for a row format.
+    """One instantiation of the transport for a (format, router) pair.
 
     ``host_sources`` maps each build variant (``VARIANTS``) to the host translation
     unit that binds the format's C++ layout and file reader. ``device_source`` is the
-    translation unit ``RowCopyKernel`` is compiled in, and ``device_layout`` the
-    layout type it is instantiated with.
+    translation unit ``RowCopyKernel`` is compiled in, ``device_layout`` the layout
+    type it is instantiated with and ``spec_score_kernel`` the GPU scorer launcher
+    (``spec_score.cuh``) the scorer exports bind. ``defines`` are the ``-D`` flags
+    both translation units take; the engine's pick the format and router.
     """
 
     host_sources: dict[str, str]
     device_source: str
     device_layout: str
+    spec_score_kernel: str = "SpecScoreKernel"
+    defines: tuple[str, ...] = ()
 
 
-# One entry per format the transport is built for. Adding a format adds an entry, its
-# instantiation files (``host_sources``, ``device_source``) and the layout type they
-# define.
-LAYOUTS = {
-    "exl3": TransportBuild(
-        host_sources={
-            "prod": "moe/exl3/exl3_ram_miss_host.cpp",
-            "instr": "moe/exl3/exl3_ram_miss_host_instr.cpp",
-        },
-        device_source="moe/exl3/exl3_ram_miss.cuh",
-        device_layout="sglang::exl3::Exl3RowLayout",
+# A transport build is named by its (format, router) pair, in this order.
+BuildKey = tuple[str, str]
+EXL3_BUILD: BuildKey = ("exl3", "sqrt_softplus")
+NVFP4_BUILD: BuildKey = ("nvfp4", "sqrt_softplus")
+MXFP4_BUILD: BuildKey = ("mxfp4", "sigmoid")
+# MiMo V2.6 Pro once converted to NVFP4: the NVFP4 rows with MiMo's sigmoid router. The same host and device sources,
+# so only the -D macros (and so the JIT keys) differ from NVFP4_BUILD.
+NVFP4_MIMO_BUILD: BuildKey = ("nvfp4", "sigmoid")
+
+_ENGINE_HOST = "moe/expert_stream/engine_host.cpp"
+_ENGINE_DEVICE = "moe/expert_stream/engine_device.cuh"
+
+
+def _engine_build(key: BuildKey) -> TransportBuild:
+    """The engine's template translation units for ``key``: one host file for both variants (the instrumented one adds
+    ``-DSGLANG_EXPERT_STREAM_INSTR``) and one device file, with the format and router chosen by macro."""
+    fmt, router = key
+    return TransportBuild(
+        host_sources={"prod": _ENGINE_HOST, "instr": _ENGINE_HOST},
+        device_source=_ENGINE_DEVICE,
+        device_layout="sglang::expert_stream::EngineLayout",
+        spec_score_kernel="SpecScoreKernelFor<sglang::expert_stream::EngineRouter>",
+        defines=(f"-DSGLANG_EXPERT_FORMAT={fmt}", f"-DSGLANG_EXPERT_ROUTER={router}"),
     )
+
+
+# One entry per (format, router) the transport is built for. A pair the engine does not
+# build is absent: ``_build_for`` raises with the JIT key it looked for. Adding a format
+# adds a ``csrc/moe/formats/<format>/format.h`` and an entry here.
+LAYOUTS: dict[BuildKey, TransportBuild] = {
+    key: _engine_build(key) for key in (EXL3_BUILD, NVFP4_BUILD, NVFP4_MIMO_BUILD, MXFP4_BUILD)
 }
 
 # The two host builds: production (ProdBuild) and instrumented (InstrBuild), selected
@@ -86,21 +114,19 @@ VARIANTS = ("prod", "instr")
 _DEFAULT_VARIANT: Optional[str] = None
 
 
-def host_variant() -> str:
+def host_variant(config: Optional[ExpertStreamConfig] = None) -> str:
     """Return the host build a new service loads.
 
     The instrumented build when this process writes a stream trace
-    (``SGLANG_DSV41_EXPERT_TRACE_PATH`` or ``SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX``)
+    (``SGLANG_EXPERT_STREAM_TRACE``'s ``expert_path`` or ``job.prefix``)
     or injects a RAM-miss fault
-    (``SGLANG_TEST_DSV41_RAM_MISS_FAULT``); production otherwise.
+    (``SGLANG_TEST_DSV41_RAM_MISS_FAULT``); production otherwise. ``config``
+    defaults to the process's (``stream_config()``).
     """
     if _DEFAULT_VARIANT is not None:
         return _DEFAULT_VARIANT
-    if (
-        envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get()
-        or os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
-        or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get()
-    ):
+    trace = (config or stream_config()).trace
+    if trace.expert_path or trace.job.prefix or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get():
         return "instr"
     return "prod"
 
@@ -161,51 +187,130 @@ def _refuse_test_only(name: str, variant: Optional[str]) -> None:
         )
 
 
-# cache_once keys f(), f("exl3") and f(layout="exl3") apart, so each cached loader
-# below is called only positionally, through a wrapper: a layout and variant then have
-# exactly one module whatever the call form.
+# cache_once keys f(), f(EXL3_BUILD) and f(layout=EXL3_BUILD) apart, so each cached loader
+# below is called only positionally, through a wrapper: a (format, router) key and
+# variant then have exactly one module whatever the call form.
 def _suffix(lanes: int, nodes: int) -> str:
     """A build's module-name suffix: one node keeps the Phase 1 names, so its modules and caches are unchanged."""
     return f"_l{lanes}" if nodes == 1 else f"_l{lanes}_n{nodes}"
 
 
 def _host_module(
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     lanes: int = 8,
     nodes: int = 1,
+    config: Optional[ExpertStreamConfig] = None,
 ) -> Module:
-    """Return the cached host module for ``layout``, ``variant`` (default build), ``lanes`` and ``nodes``."""
-    variant = host_variant() if variant is None else variant
+    """Return the cached host module for ``layout``, ``variant`` (default build), ``lanes`` and ``nodes``, with the
+    options of ``config`` (default ``stream_config()``) installed: the C++ host reads no env, and each object it
+    builds copies the options installed when it is built."""
+    config = config or stream_config()
+    variant = host_variant(config) if variant is None else variant
     wire = expert_lease_block.wire_layout(lanes, nodes)
     lanes, nodes = wire.lanes, wire.nodes
     if variant == "instr_tsan" and _ALLOW_TSAN:
-        return _host_module_tsan(layout, lanes, nodes)
+        return _install_host_options(_host_module_tsan(layout, lanes, nodes), config)
     if variant not in VARIANTS:
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
         )
-    if variant not in LAYOUTS[layout].host_sources:
-        raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
-    trigger_only = os.environ.get("SGLANG_DRAFT_DELAY_TRIGGER_ONLY", "0") == "1"
+    trigger_only = config.trace.draft_trigger.trigger_only
+    if variant not in _build_for(layout, host_jit_key(layout, variant, lanes, nodes, trigger_only)).host_sources:
+        raise ValueError(f"build {layout!r} has no {variant!r} host build variant")
     if trigger_only and variant != "prod":
-        raise ValueError("SGLANG_DRAFT_DELAY_TRIGGER_ONLY requires the production host build")
-    return _host_module_cached(layout, variant, lanes, nodes, trigger_only)
+        raise ValueError("SGLANG_EXPERT_STREAM_TRACE draft_trigger.trigger_only requires the production host build")
+    return _install_host_options(_host_module_cached(layout, variant, lanes, nodes, trigger_only), config)
+
+
+# The options last installed in each loaded host module, by id(module): a module is cached for the process, so an
+# unchanged config costs no FFI call.
+_INSTALLED_OPTIONS: dict[int, tuple] = {}
+
+
+def _install_host_options(module: Module, config: ExpertStreamConfig) -> Module:
+    """Install ``config``'s C++ options in ``module`` (trace_options.h, uring_options.h); returns the module."""
+    trace, uring = config.trace, config.tiers.uring
+    trace_args = (
+        trace.job.prefix,
+        int(trace.job.capacity),
+        bool(trace.job.resources),
+        int(trace.draft_trigger.arrival_us),
+        int(trace.draft_trigger.pending_us),
+        int(trace.draft_trigger.forward_us),
+        trace.draft_trigger.report_prefix,
+        trace.gate_path,
+    )
+    uring_args = (
+        uring.mode,
+        int(uring.queue_depth),
+        bool(uring.fixed_files),
+        uring.read_mode,
+        uring.wait_mode,
+        int(uring.sq_thread_idle_ms),
+        bool(uring.diagnostics),
+        uring.read_cuts,
+    )
+    if _INSTALLED_OPTIONS.get(id(module)) != (trace_args, uring_args):
+        module.expert_stream_set_trace_options(*trace_args)
+        module.expert_stream_set_uring_options(*uring_args)
+        _INSTALLED_OPTIONS[id(module)] = (trace_args, uring_args)
+    return module
+
+
+def _check_key(layout) -> BuildKey:
+    """``layout`` as a (format, router) key, or ValueError: a bare format name is refused so every caller states its router."""
+    if not (isinstance(layout, tuple) and len(layout) == 2 and all(isinstance(part, str) for part in layout)):
+        raise ValueError(
+            f"an expert-stream build is a (format, router) key such as {EXL3_BUILD}, got {layout!r}; "
+            f"registered: {sorted(LAYOUTS)}"
+        )
+    return layout
+
+
+def host_jit_key(layout: BuildKey, variant: str, lanes: int = 8, nodes: int = 1, trigger_only: bool = False) -> str:
+    """The JIT module name of the host build ``layout`` x ``variant`` x ``lanes`` x ``nodes``: it names both the format
+    and the router, so two pairs never share a module."""
+    fmt, router = _check_key(layout)
+    return f"expert_stream_host_{fmt}_{router}_{variant}{'_trigger' if trigger_only else ''}{_suffix(lanes, nodes)}"
+
+
+def device_jit_key(layout: BuildKey, lanes: int = 8, nodes: int = 1) -> str:
+    """The JIT module name of the device build of ``layout`` for ``lanes`` and ``nodes`` (test and stamped builds add a
+    marker after it)."""
+    fmt, router = _check_key(layout)
+    return f"expert_stream_{fmt}_{router}{_suffix(lanes, nodes)}"
+
+
+def _build_for(layout: BuildKey, jit_key: str) -> TransportBuild:
+    """The registered ``TransportBuild`` of ``layout``; ValueError naming ``jit_key``, the module it looked for, when the
+    (format, router) pair is not one of ``LAYOUTS``."""
+    try:
+        return LAYOUTS[_check_key(layout)]
+    except KeyError:
+        raise ValueError(
+            f"no expert-stream transport is registered for (format, router) {layout!r}: JIT key {jit_key!r} has no "
+            f"build; registered: {sorted(LAYOUTS)}"
+        ) from None
 
 
 @cache_once
-def _host_module_cached(layout: str, variant: str, lanes: int, nodes: int, trigger_only: bool = False) -> Module:
+def _host_module_cached(layout: BuildKey, variant: str, lanes: int, nodes: int, trigger_only: bool = False) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
+    key = host_jit_key(layout, variant, lanes, nodes, trigger_only)
+    build = _build_for(layout, key)
     return load_jit(
-        f"expert_stream_host_{layout}_{variant}{'_trigger' if trigger_only else ''}{_suffix(lanes, nodes)}",
-        cpp_files=[LAYOUTS[layout].host_sources[variant]],
+        key,
+        cpp_files=[build.host_sources[variant]],
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
+            *build.defines,
+            *(["-DSGLANG_EXPERT_STREAM_INSTR=1"] if variant == "instr" else []),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
-            *(["-DSGLANG_DRAFT_DELAY_TRIGGER_ONLY=1"] if trigger_only else []),
+            *(["-DSGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY=1"] if trigger_only else []),
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
@@ -221,13 +326,16 @@ _ALLOW_TSAN = False
 
 
 @cache_once
-def _host_module_tsan(layout: str, lanes: int, nodes: int) -> Module:
+def _host_module_tsan(layout: BuildKey, lanes: int, nodes: int) -> Module:
+    key = host_jit_key(layout, "instr_tsan", lanes, nodes)
     return load_jit(
-        f"expert_stream_host_{layout}_instr_tsan{_suffix(lanes, nodes)}",
-        cpp_files=[LAYOUTS[layout].host_sources["instr"]],
+        key,
+        cpp_files=[_build_for(layout, key).host_sources["instr"]],
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
+            *_build_for(layout, key).defines,
+            "-DSGLANG_EXPERT_STREAM_INSTR=1",
             "-fsanitize=thread",
             "-O1",
             "-g",
@@ -239,7 +347,7 @@ def _host_module_tsan(layout: str, lanes: int, nodes: int) -> Module:
     )
 
 
-def host_layout(layout: str = "exl3", lanes: int = 8) -> tuple[tuple[str, ...], int]:
+def host_layout(layout: BuildKey = EXL3_BUILD, lanes: int = 8) -> tuple[tuple[str, ...], int]:
     """Return the host module's row layout.
 
     That is its tensor names in copy-table order and a bit mask of the ones the SMs
@@ -250,7 +358,7 @@ def host_layout(layout: str = "exl3", lanes: int = 8) -> tuple[tuple[str, ...], 
 
 
 @cache_once
-def _host_layout_cached(layout: str, lanes: int) -> tuple[tuple[str, ...], int]:
+def _host_layout_cached(layout: BuildKey, lanes: int) -> tuple[tuple[str, ...], int]:
     # The default variant is enough: every variant of a layout has the same layout.
     module = _host_module(layout, lanes=lanes)
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(
@@ -351,7 +459,7 @@ def read_rows_once(
     slots,
     *,
     step: int = BOUNCE_ROWS,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++.
@@ -411,7 +519,7 @@ def _fault_tensor(
     documented at ``read_rows_with_fault``; ``root`` narrows the per-extent faults to
     the drive a sub-read reads (``file % parts``), and ``mirror_caps`` (one cap per
     mirror root, at most 4 roots and 255 each; empty: off) turns the dynamic root
-    choice of ``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC`` on in the entry points that take it
+    choice of ``SGLANG_EXPERT_STREAM_MIRROR`` dynamic on in the entry points that take it
     (``read_rows_sqes``, ``read_rows_drive_load``).
     """
     caps = [int(c) for c in mirror_caps]
@@ -468,7 +576,7 @@ def read_rows_traced(
     *,
     step: int = BOUNCE_ROWS,
     owner_core: int = -1,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict]:
@@ -517,7 +625,10 @@ def read_rows_traced(
 # instantaneous; ``*_bytes`` landed and ``*_busy_ns`` accumulate over the load's life.
 # ``overlap_ns`` is the time a root had demand and speculative reads in flight at once;
 # ``moved_from``/``moved_to`` count the sub-reads the dynamic root choice
-# (``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``) sent away from and to the root.
+# (``SGLANG_EXPERT_STREAM_MIRROR`` dynamic) sent away from and to the root.
+# ``DRIVE_TAIL_FIELDS`` follow every root's ``DRIVE_FIELDS``, field-major, and decode
+# into the same per-root dict: ``fill_bytes`` are the bytes of the tier's fills (prefill
+# fills, hot-cache promotions, full layers), already counted in ``demand_bytes``.
 DRIVE_SLOTS = 4  # kMaxDrives
 DRIVE_FIELDS = (
     "demand_reads",
@@ -532,12 +643,14 @@ DRIVE_FIELDS = (
     "moved_from",
     "moved_to",
 )
-DRIVE_LOAD_WORDS = 3 + DRIVE_SLOTS * len(DRIVE_FIELDS)
+DRIVE_TAIL_FIELDS = ("fill_bytes",)
+DRIVE_TAIL_START = 3 + DRIVE_SLOTS * len(DRIVE_FIELDS)  # kDriveTailStart
+DRIVE_LOAD_WORDS = DRIVE_TAIL_START + DRIVE_SLOTS * len(DRIVE_TAIL_FIELDS)
 
 
 def decode_drive_load(words) -> dict:
     """Decode ``DRIVE_LOAD_WORDS`` int64 words into ``{"elapsed_ns", "clock_reads",
-    "roots": [one dict of DRIVE_FIELDS per root]}``."""
+    "roots": [one dict of DRIVE_FIELDS then DRIVE_TAIL_FIELDS per root]}``."""
     words = [int(w) for w in words]
     roots = words[2]
     fields = len(DRIVE_FIELDS)
@@ -545,7 +658,13 @@ def decode_drive_load(words) -> dict:
         "elapsed_ns": words[0],
         "clock_reads": words[1],
         "roots": [
-            dict(zip(DRIVE_FIELDS, words[3 + q * fields : 3 + (q + 1) * fields]))
+            {
+                **dict(zip(DRIVE_FIELDS, words[3 + q * fields : 3 + (q + 1) * fields])),
+                **{
+                    name: words[DRIVE_TAIL_START + k * DRIVE_SLOTS + q]
+                    for k, name in enumerate(DRIVE_TAIL_FIELDS)
+                },
+            }
             for q in range(roots)
         ],
     }
@@ -564,7 +683,7 @@ def read_rows_drive_load(
     nested: bool = False,
     step: int = BOUNCE_ROWS,
     preload: Sequence[tuple[int, int]] = (),
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> dict:
@@ -637,18 +756,19 @@ def read_rows_idle(
     spread: bool = False,
     pieces: int = 1,
     reads: int = 1,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> dict:
     """Test only: one speculative C++ read of ``experts`` into ``slots`` under the idle-drive root policy
-    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, ``IdleRoots``), with the fault keywords of ``read_rows_with_fault`` (piece
+    (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE, ``IdleRoots``), with the fault keywords of ``read_rows_with_fault`` (piece
     streaming always on).
 
     ``preload`` (demand reads per root) stands for other readers' demand in flight for the whole read. ``follow``: a
     demand read arrives on the first piece's root once it is in flight, and stays. ``boost`` boosts the read from its
     start. ``give_up_after`` > 0 gives up once that many pieces were issued. ``deadline_s``: the longest wait for an
-    idle root. ``spread`` and ``pieces``: SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD and _IDLE_PIECES. ``reads`` repeats the
+    idle root. ``spread`` and ``pieces``: SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD and
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES. ``reads`` repeats the
     read on the one reader, as its speculative reader reads row after row (stopping at the first that does not return
     1); the counts and SQEs add up over them.
 
@@ -712,7 +832,7 @@ def read_rows_with_fault(
     *,
     cqes: Optional[list[int]] = None,
     stats: Optional[dict] = None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, int]:
@@ -777,7 +897,7 @@ def read_rows_with_fault(
       ``READ_CUTS`` says (see ``analysis/dsv41-drive/iopoll-cuts/results.md``);
       ``leg`` then narrows the faults to a cut leg as well.
 
-    Two spans (``SGLANG_DSV41_CPU_TWO_STAGE``, piece streaming only):
+    Two spans (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``, piece streaming only):
 
     - ``two_span_rows`` (a bit per row ordinal) reads those rows in two spans, the
       layout's first stage over every root before its second (``piece_geometry``'s
@@ -826,7 +946,7 @@ def read_rows_sqes(
     step: int = BOUNCE_ROWS,
     max_sqes: int = 4096,
     span_weights=None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
@@ -896,7 +1016,7 @@ def publish_piece(
     generation: int,
     bit: int,
     *,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[bool, int]:
     """Test only: the reader owner's publish primitive on one readiness word.
@@ -944,7 +1064,7 @@ def read_rows_pieces(
     reference: Optional[torch.Tensor] = None,
     ref_slots=None,
     step: int = BOUNCE_ROWS,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict, torch.Tensor, dict]:
@@ -1007,7 +1127,7 @@ def piece_geometry(
     *,
     two_span: bool = False,
     span_weights=None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> Optional[tuple[list[dict], list[dict]]]:
     """Test only: how the C++ reader cuts one expert under piece streaming.
@@ -1018,7 +1138,7 @@ def piece_geometry(
     ``{deps, runs}``: ``deps`` is the bitmask of sub-reads the piece depends on and
     ``runs`` holds one ``(dst_lo, dst_hi)`` per segment, in segment destination
     coordinates. ``two_span`` cuts it as a two-stage CPU miss
-    (``SGLANG_DSV41_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
+    (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
     second's ``k`` 1, each span divided by ``span_weights`` (w13's, w2's) when given.
     """
     segments = int(tables.segments.shape[0])
@@ -1055,7 +1175,7 @@ def read_rows_two_span(
     ref_slots,
     step: int = BOUNCE_ROWS,
     span_weights=None,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     **faults,
 ) -> dict:
@@ -1121,6 +1241,13 @@ def calibration_shape(lanes: int = 8) -> tuple[int, int]:
     """The calibration grid (kCalibRows, kCalibCols)."""
     n = expert_lease_block.wire_layout(lanes).lanes
     return (n + 2, n + 1)
+
+
+# The split model calibration's cell kinds (split_calibration.h kSplitCell*): a CPU hit job, a CPU miss job, a DMA, an
+# NVMe read.
+SPLIT_CELL_HIT, SPLIT_CELL_MISS, SPLIT_CELL_COPY, SPLIT_CELL_LANDING = 1, 2, 3, 4
+# The CPU engine's fit moments per output part (cpu_experts.h kCpuFitMoments), in order.
+CPU_FIT_MOMENTS = ("n", "k", "p", "kk", "kp", "pp", "y", "ky", "py")
 
 
 # The C++ ``kPieces``: pieces per row, and the most sub-reads a row issues under piece
@@ -1218,7 +1345,7 @@ STAGE_ORDER = (
 
 
 def _stage_words(
-    layout: str = "exl3", variant: Optional[str] = None, lanes: int = 8
+    layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None, lanes: int = 8
 ) -> int:
     """Return the C++ ``StageRecord`` word count of a ``lanes``-lane build, checked against ``stage_fields``."""
     words = int(_host_module(layout, variant, lanes).expert_stream_trace_words())
@@ -1357,7 +1484,7 @@ def hot_record_bytes(experts: int) -> int:
     """Return the size of one hot-bitmap record: header plus one bit per expert."""
     if experts <= 0 or experts > 65535:
         raise ValueError(
-            f"EXL3 hot bitmap expert count {experts} is outside [1, 65535]"
+            f"expert-stream hot bitmap expert count {experts} is outside [1, 65535]"
         )
     return (
         (HOT_HEADER_BYTES + (experts + 7) // 8 + HOT_ALIGNMENT - 1) // HOT_ALIGNMENT
@@ -1490,6 +1617,8 @@ COUNTERS = (
     "drip_paused",
     "drip_skipped_bytes",
     "drip_late",
+    # Eager admissions' evictions, also counted in "evictions".
+    "eager_evictions",
 )
 
 # The counters a production host keeps: the shutdown line's served, rows and errors,
@@ -1540,6 +1669,7 @@ CORE_COUNTERS = (
     "drip_paused",
     "drip_skipped_bytes",
     "drip_late",
+    "eager_evictions",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -1554,7 +1684,7 @@ DRIP_STATES = ("free", "filling", "published", "retiring", "publishing", "cleari
 def seqlock_stress(
     seconds: float,
     *,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     lanes: int = 8,
 ) -> tuple[int, int]:
@@ -1580,7 +1710,7 @@ def read_record_fields(
     record: torch.Tensor,
     expected: int,
     *,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
     lanes: int = 8,
 ) -> dict:
@@ -1623,7 +1753,7 @@ def read_record_fields(
 _kernel_layer_keep: dict[int, tuple] = {}
 
 
-def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
+def kernel_layer(kernel: int, spec, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> int:
     """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
 
     ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: the DSpark draft's CPU experts
@@ -1656,11 +1786,12 @@ def kernel_forward(
     threads: int,
     cores: Sequence[int] = (),
     accumulate: bool = False,
-    layout: str = "exl3",
+    store_first: bool = False,
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[int, str]:
     """One forward of :func:`kernel_layer`'s ``layer`` over ``rows`` token rows (x ``[rows, H]``, slots and weights
-    ``[rows, k]``).
+    ``[rows, k]``). ``store_first`` is ForwardCall::store_first: an overwrite stores each token's first sum.
 
     Returns (0, "") or the kernel's refusal: (2, why) for a bad call, (1, why) for a failure; ``out`` is untouched
     then. Pins the calling thread to ``cores[0]``. Both builds.
@@ -1676,6 +1807,7 @@ def kernel_forward(
             int(threads),
             torch.tensor(list(cores), dtype=torch.int64),
             int(bool(accumulate)),
+            int(bool(store_first)),
         )
     )
     # The message is this thread's (a thread-local in the module), read on the same thread.
@@ -1694,10 +1826,10 @@ def kernel_forward_two_stage(
     delay_s: float,
     cores: Sequence[int] = (),
     accumulate: bool = False,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> tuple[int, str, dict]:
-    """Test only: :func:`kernel_forward` as a two-stage CPU miss runs it (``SGLANG_DSV41_CPU_TWO_STAGE``).
+    """Test only: :func:`kernel_forward` as a two-stage CPU miss runs it (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``).
 
     The forward's stage-two wait holds until a helper thread, ``delay_s`` after the call, has copied each ``restore``
     row ``(dst, src, bytes)`` (the second-stage bytes the caller held back) and opened the gate. Returns the status, the
@@ -1725,13 +1857,13 @@ def kernel_forward_two_stage(
     return status, (str(module.expert_stream_kernel_error()) if status else ""), {"calls": calls, "waited_ns": waited}
 
 
-def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
+def kernel_drop(layer: int, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> None:
     """Release :func:`kernel_layer`'s ``layer``. Both builds."""
     _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
     _kernel_layer_keep.pop(int(layer), None)
 
 
-def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
+def pause_ns(*, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> float:
     """Test only: ns per ``_mm_pause`` on this core.
 
     That is the RAM-miss service's idle-poll quantum. Instrumented build only.
@@ -1751,7 +1883,7 @@ def score_gate(
     per_layer: int,
     top_k_only: bool = False,
     return_meta: bool = False,
-    layout: str = "exl3",
+    layout: BuildKey = EXL3_BUILD,
     variant: Optional[str] = None,
 ) -> list:
     """The RAM prefetch's gate scorer (``host/gate_scorer.h``): ``x`` fp16 ``[tokens, >= hidden]`` (columns past
@@ -1781,6 +1913,30 @@ def score_gate(
     return out[:n].tolist()
 
 
+ROUTERS = {"sqrt_softplus": 0, "sigmoid": 1}  # router.h kName -> router_score's router index
+
+
+def router_score(
+    router: str,
+    dots: torch.Tensor,
+    biases: torch.Tensor,
+    *,
+    layout: BuildKey = EXL3_BUILD,
+    variant: Optional[str] = None,
+) -> torch.Tensor:
+    """The host score of router ``router`` (``ROUTERS``, ``csrc/moe/expert_stream/router.h``) for fp32 ``dots`` and
+    ``biases`` of one shape ``[n]``. Both builds."""
+    if router not in ROUTERS:
+        raise ValueError(f"router_score: router is one of {sorted(ROUTERS)}")
+    if dots.dtype != torch.float32 or biases.dtype != torch.float32 or dots.shape != biases.shape or dots.dim() != 1:
+        raise ValueError("router_score takes fp32 dots and biases of one 1-D shape")
+    out = torch.zeros_like(dots)
+    _host_module(layout, variant).expert_stream_router_score(
+        ROUTERS[router], dots.contiguous(), biases.contiguous(), out
+    )
+    return out
+
+
 def new_page(*, pin: bool, wire: expert_lease_block.WireLayout) -> torch.Tensor:
     """A zeroed request page of ``wire``; pinned (device-readable through UVA) for a real device."""
     return torch.zeros(wire.page_bytes, dtype=torch.uint8, pin_memory=pin)
@@ -1802,7 +1958,7 @@ def _stop_live() -> None:
         try:
             host.stop()
         except Exception as error:  # noqa: BLE001 - keep stopping the other hosts
-            sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
+            sys.stderr.write(f"{host.format_name} RAM miss: stopping a host failed: {error!r}\n")
 
 
 def _spin_ns(spin_us: int) -> int:
@@ -1847,14 +2003,16 @@ class ExpertStreamHost:
         slot_map: torch.Tensor,
         lease_block: Optional[torch.Tensor] = None,
         hot_page: Optional[torch.Tensor] = None,
-        layout: str = "exl3",
+        layout: BuildKey = EXL3_BUILD,
         variant: Optional[str] = None,
         lanes: int = 8,
         node_ranges: Optional[Sequence[Sequence[tuple[int, int]]]] = None,
         sq_thread_cpus: Optional[Sequence[int]] = None,
+        config: Optional[ExpertStreamConfig] = None,
     ) -> None:
         # NUMA groups: node_ranges[g][row] = (lo, hi), group g's slots of the row; one group owning every slot by
-        # default. sq_thread_cpus: each group's SQPOLL core (-1 unpinned); None keeps the uring env's.
+        # default. sq_thread_cpus: each group's SQPOLL core (-1 unpinned); None keeps the uring options' (unpinned).
+        # config: the engine config whose C++ options (uring, trace) the module takes; None is stream_config().
         capacity = [int(c) for c in tables.capacity.tolist()]
         if node_ranges is None:
             node_ranges = [[(0, c) for c in capacity]]
@@ -1895,9 +2053,10 @@ class ExpertStreamHost:
                 "slot_map must start filled with -1 (the C++ tiers start empty)"
             )
         self._layout = layout
+        self.config = config or stream_config()
         # The host build is chosen once here: every later call goes to this module.
-        self.variant = host_variant() if variant is None else variant
-        self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes)
+        self.variant = host_variant(self.config) if variant is None else variant
+        self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes, self.config)
         self.threaded = False
         # set_cpu_layer's specs' tensors, kept alive while the host's layers read them.
         self._cpu_layer_keep: dict[int, tuple] = {}
@@ -1965,7 +2124,7 @@ class ExpertStreamHost:
         )
         if self.handle < 0:
             raise RuntimeError(
-                "exl3 RAM miss service failed to open (files, io_uring or bounce)"
+                f"{self.format_name} RAM miss service failed to open (files, io_uring or bounce)"
             )
         self.layout_names, self.small_mask = host_layout(self._layout)
         self._close = weakref.finalize(
@@ -1999,10 +2158,10 @@ class ExpertStreamHost:
         """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
         ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
-        affinity. Cores 64-71 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
+        affinity. Cores 52-55,108-111 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
         or with ``busy_poll`` with no PAUSE (which the C++ side refuses unless each physical core is its service's
         alone), for ``spin_us``, then sleeps 50 us between polls; parked, it sleeps 20 us between checks. -1 never
-        sleeps (``SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`` in a server).
+        sleeps (``SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US`` in a server).
         """
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
@@ -2035,11 +2194,11 @@ class ExpertStreamHost:
         )
         if outcome == 2:
             raise RuntimeError(
-                "exl3 RAM miss: not paused, the copy thread still has a job (unsynchronized stream)"
+                f"{self.format_name} RAM miss: not paused, the copy thread still has a job (unsynchronized stream)"
             )
         if outcome != 1:
             raise RuntimeError(
-                f"exl3 RAM miss thread did not pause within {timeout_s} s"
+                f"{self.format_name} RAM miss thread did not pause within {timeout_s} s"
             )
 
     def resume(self) -> None:
@@ -2143,11 +2302,11 @@ class ExpertStreamHost:
         )
         if outcome == 0:
             raise RuntimeError(
-                f"exl3 RAM miss: a prefill fill failed before its first {rows} rows landed"
+                f"{self.format_name} RAM miss: a prefill fill failed before its first {rows} rows landed"
             )
         if outcome != 1:
             raise RuntimeError(
-                f"exl3 RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s"
+                f"{self.format_name} RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s"
             )
 
     def fill_landed(self) -> int:
@@ -2185,7 +2344,7 @@ class ExpertStreamHost:
         self._module.expert_stream_reserve_staging(self.handle, int(k))
 
     def reserve_spec_pool(self, share: int) -> None:
-        """Reserve every row's speculative pool (SGLANG_DSV41_RAM_PREFETCH): ``share`` slots per row and NUMA group
+        """Reserve every row's speculative pool (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH): ``share`` slots per row and NUMA group
         after its staging slots, never mapped, never a victim, never released. Once, after ``reserve_staging``, before
         any slot fills and before the thread starts."""
         self._module.expert_stream_reserve_spec_pool(self.handle, int(share))
@@ -2229,17 +2388,17 @@ class ExpertStreamHost:
         GPU scorer: ``candidates`` (``new_candidate_page``), which the select kernel writes, and no gates; optional
         ``min_margin`` fp32 ``[layers]``, per target row the least margin a candidate needs to be read.
 
-        ``idle_drive`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE): each group reads its pool rows through a reader of its
+        ``idle_drive`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE): each group reads its pool rows through a reader of its
         own, one piece at a time from a drive no demand reads, abandoning a read that waited ``idle_deadline_s`` for
         one; off, the speculative reads take turns with the demand reads on the group's reader. With it,
-        ``idle_spread`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
-        rotating from row to row, and ``idle_pieces`` (SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
+        ``idle_spread`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD) spreads each row's pieces over the idle drives, ties
+        rotating from row to row, and ``idle_pieces`` (SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES, 1 to 4) is how many of a
         row's pieces may be in flight at once.
 
-        ``promote`` (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
+        ``promote`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE) maps rows that landed before their target layer's record into
         that layer's map delta, so the device types them as RAM hits.
 
-        ``pool_serve`` (SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE) serves a GPU miss whose row landed in the pool by naming
+        ``pool_serve`` (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE) serves a GPU miss whose row landed in the pool by naming
         the pool slot in the lane's PieceSource word, so the stream kernel copies from it, instead of reading it from
         NVMe."""
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
@@ -2401,9 +2560,9 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The idle copy thread polls for
+        (``SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS`` in a server). The idle copy thread polls for
         ``spin_us``, then sleeps on its doorbell until the next submit; -1 never sleeps
-        (``SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US`` in a server). ``cpus`` is its core
+        (``SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US`` in a server). ``cpus`` is its core
         (``ThreadingConfig.copy_cpus``); empty inherits the caller's affinity.
         """
         self._module.expert_stream_enable_copy_engine(
@@ -2519,6 +2678,7 @@ class ExpertStreamHost:
         keep_warm_us: int = 0,
         two_stage: bool = False,
         two_stage_weights=None,
+        store_out: bool = False,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
@@ -2535,10 +2695,12 @@ class ExpertStreamHost:
         register work for ``keep_warm_us`` after each job and PAUSE after that, until the
         next submit. With ``[rows, 2 * nodes, tokens, hidden]`` rows a record's CPU job runs
         one forward of its tokens from the row's token table. ``two_stage``
-        (``SGLANG_DSV41_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
+        (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``) reads each CPU miss's w13 before its w2 and starts
         its job once w13 has landed: the gate/up GEMVs run while w2 is still being read.
         ``two_stage_weights`` (w13's, w2's, each one weight per mirror root or None for the
-        mirror's shares) divides those two spans over the roots.
+        mirror's shares) divides those two spans over the roots. ``store_out``
+        (``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT``) leaves a job's overwrite of its token rows to
+        the kernel, which stores each token's first sum, instead of zeroing the rows first.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -2582,6 +2744,7 @@ class ExpertStreamHost:
             int(threads),
             int(keep_warm_us * 1e3),
             int(bool(two_stage)),
+            int(bool(store_out)),
             *(
                 torch.tensor(list(w) if w is not None else [], dtype=torch.float64)
                 for w in (two_stage_weights or (None, None))
@@ -2679,6 +2842,45 @@ class ExpertStreamHost:
             out,
         )
         return out
+
+    def cpu_fit_moments(self, group: int = 0) -> list[list[int]]:
+        """Group ``group``'s CPU fit moments since start (cpu_experts.h fit_moments), hit jobs then miss jobs, each
+        ``CPU_FIT_MOMENTS`` sums over its unstaged target jobs: jobs, k, pairs, k*k, k*pairs, pairs*pairs, ns, k*ns,
+        pairs*ns."""
+        out = torch.zeros((2, len(CPU_FIT_MOMENTS)), dtype=torch.int64)
+        self._module.expert_stream_cpu_fit_moments(self.handle, int(group), out)
+        return out.tolist()
+
+    def calibrate_split_model(
+        self,
+        rows: Sequence[int],
+        cells: Sequence[Sequence[int]],
+        *,
+        device: int,
+        reps: int,
+        scratch: Optional[torch.Tensor],
+        timeout_s: float = 1.0,
+        group: int = 0,
+    ) -> list[float]:
+        """Run the split model's startup cells on group ``group`` (split_calibration.h): each cell ``(kind, a, b)`` of
+        ``SPLIT_CELL_*``, mean ms over ``reps`` runs after a warm-up, rotating over ``rows`` (registered CPU rows) and
+        the group's slots. ``scratch`` holds the widest copy cell's experts on ``device`` (-1: the test backend), or is
+        None without copy cells. The caller owns the tier and has not armed the copy engine. Raises RuntimeError on
+        failure."""
+        out = torch.zeros(len(cells), dtype=torch.float64)
+        self._module.expert_stream_calibrate_split_model(
+            self.handle,
+            int(group),
+            torch.tensor(list(rows), dtype=torch.int64),
+            torch.tensor([list(c) for c in cells], dtype=torch.int64).reshape(-1, 3),
+            int(device),
+            int(reps),
+            0 if scratch is None else scratch.data_ptr(),
+            0 if scratch is None else scratch.numel() * scratch.element_size(),
+            int(timeout_s * 1e9),
+            out,
+        )
+        return out.tolist()
 
     def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
         """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset.
@@ -2848,6 +3050,11 @@ class ExpertStreamHost:
         _refuse_test_only("hold_row", self.variant)
         self._module.expert_stream_hold_row(self.handle, int(row), int(group), int(hold))
 
+    @property
+    def format_name(self) -> str:
+        """The row format's name, the prefix of this host's messages (``<format> RAM miss: ``)."""
+        return self._layout[0]
+
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.
 
@@ -2867,7 +3074,7 @@ class ExpertStreamHost:
             # A refused row's runs are empty: the stream kernel would admit a READY hit
             # of it, copy nothing and commit.
             raise RuntimeError(
-                f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces"
+                f"{self.format_name} RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces"
             )
         return runs
 
@@ -2943,7 +3150,7 @@ class ExpertStreamHost:
         return dict(zip(COUNTERS, out.tolist()))
 
     def set_mirror_caps(self, caps: Sequence[int]) -> None:
-        """``SGLANG_MOE_EXPERT_MIRROR_DYNAMIC``: every NUMA group's reader picks each sub-read's mirror root, skipping
+        """``SGLANG_EXPERT_STREAM_MIRROR`` dynamic: every NUMA group's reader picks each sub-read's mirror root, skipping
         roots with ``caps[q]`` sub-reads in flight (demand and speculative, every group) and preferring the fewest bytes
         in flight; with every root at its cap a sub-read keeps its own root. One positive cap per mirror root; empty
         turns it off. Refused when the tables' files are not a full mirror set. Paused, or before the thread starts."""
@@ -2976,22 +3183,24 @@ class ExpertStreamHost:
                     self.threaded = False
                 # One line per window; benchmark arms grep it, so keep its shape.
                 sys.stderr.write(
-                    "exl3 RAM miss thread counters "
+                    f"{self.format_name} RAM miss thread counters "
                     + json.dumps(self.counters())
                     + "\n"
                 )
                 if self.nodes > 1:
                     for group in range(self.nodes):
                         sys.stderr.write(
-                            f"exl3 RAM miss group {group} counters " + json.dumps(self.group_counters(group)) + "\n"
+                            f"{self.format_name} RAM miss group {group} counters "
+                            + json.dumps(self.group_counters(group))
+                            + "\n"
                         )
                 # Per root: reads in flight (0 here), bytes landed and busy/overlap time by kind
                 # (analysis/dsv41-drive/dspark/drive_busy.py drive-load reads it).
-                sys.stderr.write("exl3 RAM miss drive load " + json.dumps(self.drive_load()) + "\n")
+                sys.stderr.write(f"{self.format_name} RAM miss drive load " + json.dumps(self.drive_load()) + "\n")
                 if getattr(self, "cpu_rows", None) is not None:
                     # Per group, the CPU expert thread's jobs, with the two-stage misses' waits for w2.
                     stats = [self.cpu_stats(group) for group in range(self.nodes)]
-                    sys.stderr.write("exl3 RAM miss cpu stats " + json.dumps(stats) + "\n")
+                    sys.stderr.write(f"{self.format_name} RAM miss cpu stats " + json.dumps(stats) + "\n")
             finally:
                 close()
 
@@ -3016,6 +3225,7 @@ _LEASE_METHODS = {
 _ROW_COPY_METHODS = {
     "expert_stream_lease_stream": "lease_stream",
     "expert_stream_lease_copy_wait": "lease_copy_wait",
+    "expert_stream_calibration_pull": "calibration_pull",
 }
 _SPEC_METHODS = {
     "expert_stream_spec_score": "score",
@@ -3031,9 +3241,10 @@ SPEC_DEPTH = 12
 SPEC_SELECT_MAX_EXPERTS = 1024
 
 
-def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
+def _device_wrappers(layout: BuildKey = EXL3_BUILD) -> list[tuple[str, str]]:
     """Return the (FFI name, C++ symbol) pairs the device module exports."""
-    device_layout = LAYOUTS[layout].device_layout
+    build = _build_for(layout, device_jit_key(layout))
+    device_layout = build.device_layout
     return [
         (name, f"LeaseProtocolKernel::{method}")
         for name, method in _LEASE_METHODS.items()
@@ -3041,7 +3252,7 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
         (name, f"RowCopyKernel<{device_layout}>::{method}")
         for name, method in _ROW_COPY_METHODS.items()
     ] + [
-        (name, f"SpecScoreKernel::{method}")
+        (name, f"{build.spec_score_kernel}::{method}")
         for name, method in _SPEC_METHODS.items()
     ] + [
         (name, f"ResidencySnapshotKernel::{method}")
@@ -3049,10 +3260,10 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ]
 
 
-def device_stamps_enabled() -> bool:
-    """Whether this process loads the stamped device module (device_stamps.cuh): with a job trace, as host_variant
-    picks the instrumented host build."""
-    return bool(os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"))
+def device_stamps_enabled(config: Optional[ExpertStreamConfig] = None) -> bool:
+    """Whether this process loads the stamped device module (device_stamps.cuh): with a job trace
+    (``SGLANG_EXPERT_STREAM_TRACE``'s ``job.prefix``), as host_variant picks the instrumented host build."""
+    return bool((config or stream_config()).trace.job.prefix)
 
 
 # device_stamps.cuh's ring: kStampRing rows of kStampWords int64, the seq then one %globaltimer ns per point.
@@ -3061,27 +3272,32 @@ DEVICE_STAMP_WORDS = 8
 DEVICE_STAMP_POINTS = ("post_start", "post_end", "stream_start", "stream_end", "wait_start", "wait_end")
 
 
-def _device_module(layout: str = "exl3", lanes: int = 8, nodes: int = 1) -> Module:
-    """Return the cached device module for ``layout``, ``lanes`` and ``nodes``."""
+def _device_module(
+    layout: BuildKey = EXL3_BUILD, lanes: int = 8, nodes: int = 1, config: Optional[ExpertStreamConfig] = None
+) -> Module:
+    """Return the cached device module for ``layout``, ``lanes`` and ``nodes``; ``config`` (default
+    ``stream_config()``) says whether it is the stamped build."""
     wire = expert_lease_block.wire_layout(lanes, nodes)
-    return _device_module_cached(layout, wire.lanes, wire.nodes, device_stamps_enabled())
+    return _device_module_cached(layout, wire.lanes, wire.nodes, device_stamps_enabled(config))
 
 
 @cache_once
-def _device_module_cached(layout: str, lanes: int, nodes: int, stamps: bool) -> Module:
+def _device_module_cached(layout: BuildKey, lanes: int, nodes: int, stamps: bool) -> Module:
+    key = device_jit_key(layout, lanes, nodes)
+    build = _build_for(layout, key)
     wrappers = _device_wrappers(layout)
     if stamps:
-        device_layout = LAYOUTS[layout].device_layout
         wrappers = wrappers + [
-            ("expert_stream_set_device_stamps", f"RowCopyKernel<{device_layout}>::set_device_stamps")
+            ("expert_stream_set_device_stamps", f"RowCopyKernel<{build.device_layout}>::set_device_stamps")
         ]
     return load_jit(
-        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
+        key,
         *(["stamps"] if stamps else []),
-        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_files=[build.device_source],
         cuda_wrappers=wrappers,
         extra_cuda_cflags=[
-            *(["-DEXL3_RAM_MISS_DEVICE_STAMPS"] if stamps else []),
+            *build.defines,
+            *(["-DEXPERT_STREAM_DEVICE_STAMPS"] if stamps else []),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
@@ -3089,23 +3305,26 @@ def _device_module_cached(layout: str, lanes: int, nodes: int, stamps: bool) -> 
 
 
 def device_module_with_hooks(
-    defines: Sequence[str], layout: str = "exl3", lanes: int = 8, nodes: int = 1
+    defines: Sequence[str], layout: BuildKey = EXL3_BUILD, lanes: int = 8, nodes: int = 1
 ) -> Module:
-    """Test only: build the device kernels with the ``EXL3_RAM_MISS_TEST_*`` hooks on.
+    """Test only: build the device kernels with the ``EXPERT_STREAM_TEST_*`` hooks on.
 
     ``defines`` are ``NAME`` or ``NAME=value`` entries. The result is a module of its
     own; production builds with none, so its kernels carry no test knob.
     """
-    if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
-        raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
+    if not defines or not all(d.startswith("EXPERT_STREAM_TEST_") for d in defines):
+        raise ValueError(f"not a set of EXPERT_STREAM_TEST_* hooks: {defines}")
     wire = expert_lease_block.wire_layout(lanes, nodes)
     lanes, nodes = wire.lanes, wire.nodes
+    key = device_jit_key(layout, lanes, nodes)
+    build = _build_for(layout, key)
     return load_jit(
-        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
+        key,
         "test",
-        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_files=[build.device_source],
         cuda_wrappers=_device_wrappers(layout),
         extra_cuda_cflags=[
+            *build.defines,
             *(f"-D{d}" for d in defines),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
@@ -3123,11 +3342,13 @@ def run_spec_score(x, w, bias, scores, *, module=None) -> None:
 
 def run_spec_select(
     scores, tokens, *, top_k, per_token, top_k_only, hot_slots, hot_capacity, ram_slot, target, state, candidates,
-    module=None,
+    routes=None, route_top_k=0, module=None,
 ) -> None:
     """The GPU scorer's select kernel: ranks ``scores``' first ``tokens`` rows past ``hot_slots[:hot_capacity]`` and
     the experts ``ram_slot[target]`` maps, and publishes up to CAND_MAX candidates to the slot of ``state``'s posted
-    seq in the pinned ``candidates`` page; count 0 when ``tokens`` is outside 1..scores' rows."""
+    seq in the pinned ``candidates`` page; count 0 when ``tokens`` is outside 1..scores' rows. With ``routes`` (int64
+    flat, ``route_top_k`` per token) it ranks only the rows through the last with a route >= 0: a verify's dead rows
+    (layers/moe/verify_dead_rows.py) take no picks."""
     (module or _device_module()).expert_stream_spec_select(
         scores,
         int(tokens),
@@ -3140,6 +3361,8 @@ def run_spec_select(
         int(target),
         state,
         int(candidates.data_ptr()),
+        routes,
+        int(route_top_k),
     )
 
 
@@ -3301,10 +3524,11 @@ class ExpertStreamDevice:
     ``host.piece_runs()``; ``row_capacities`` is each row's pinned slot count
     (``tables.capacity``), which the post and S bound every host slot by.
     ``timeout_ms`` is the post's delta wait and S's deadline. ``hit_copy`` ("ce" or
-    "sm") and ``cpu_misses`` carry ``SGLANG_DSV41_RAM_HIT_COPY`` and
-    ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
-    ``SGLANG_DSV41_CPU_SPLIT_MISS_CUT``/``_MAX`` (ram_slot_map.type_lanes); ``lease_pdl``
-    (``SGLANG_DSV41_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
+    "sm") and ``cpu_misses`` carry ``SGLANG_EXPERT_STREAM_RAM_HIT_COPY`` and
+    ``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
+    ``SGLANG_EXPERT_STREAM_CPU_SPLIT``'s miss_cut/miss_cut_max (ram_slot_map.type_lanes); ``split_model`` carries the
+    experiment ``SGLANG_EXPERT_STREAM_CPU_SPLIT`` model's cost words (ram_slot_map.split_model_words); ``lease_pdl``
+    (``SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
     PDL.
 
     ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
@@ -3330,7 +3554,7 @@ class ExpertStreamDevice:
         piece_runs: torch.Tensor,
         row_capacities: Sequence[int],
         hot_page=None,
-        layout: str = "exl3",
+        layout: BuildKey = EXL3_BUILD,
         lease_pdl: bool = False,
         hit_copy: str = "ce",
         cpu_misses: bool = False,
@@ -3338,8 +3562,12 @@ class ExpertStreamDevice:
         miss_cut_max: int = 3,
         lanes: int = 8,
         nodes: int = 1,
+        split_model: Optional[Sequence[int]] = None,
+        config: Optional[ExpertStreamConfig] = None,
     ) -> None:
         self.wire = expert_lease_block.wire_layout(lanes, nodes)
+        # Whether the device module is the stamped build (device_stamps_enabled); None is stream_config().
+        self._config = config
         if (
             page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
@@ -3397,6 +3625,14 @@ class ExpertStreamDevice:
             if value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
         self.miss_cut, self.miss_cut_max = int(miss_cut), int(miss_cut_max)
+        # The split model's cost words (ram_slot_map.split_model_words) and its counters, or empty: the split and the
+        # miss cut.
+        costs = 5 * self.wire.nodes + 6
+        if split_model is not None and len(split_model) != costs:
+            raise ValueError(f"the split model has {costs} cost words for {self.wire.nodes} nodes, got {len(split_model)}")
+        # The counters (ram_slot_map.split_model_stats_words): records, then per node to_cpu and to_copy.
+        words = [] if split_model is None else list(split_model) + [0] * (1 + 2 * self.wire.nodes)
+        self.split_model = torch.tensor(words, dtype=torch.int64, device=device)
         state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
         # Continue from the page's head: the thread serves demand_head + 1 next, so a
         # device restarting at 1 over a used page would never be served.
@@ -3506,15 +3742,17 @@ class ExpertStreamDevice:
         """Return the device module, loading it on first use."""
         if self._module is None:
             self._module = _device_module(
-                self._layout, self.wire.lanes, self.wire.nodes
+                self._layout, self.wire.lanes, self.wire.nodes, self._config
             )
         return self._module
 
     def enable_device_stamps(self) -> None:
         """Point the stamped module's chain kernels at a pinned ring (device_stamps.cuh). Needs
         ``device_stamps_enabled()``; the ring lives as long as this object."""
-        if not device_stamps_enabled():
-            raise RuntimeError("device stamps need SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX (the stamped device module)")
+        if not device_stamps_enabled(self._config):
+            raise RuntimeError(
+                "device stamps need SGLANG_EXPERT_STREAM_TRACE's job.prefix (the stamped device module)"
+            )
         ring = torch.zeros(DEVICE_STAMP_RING * DEVICE_STAMP_WORDS, dtype=torch.int64).pin_memory()
         self._kernels().expert_stream_set_device_stamps(ring)
         self._stamp_ring = ring
@@ -3616,7 +3854,7 @@ class ExpertStreamDevice:
         self.map_bank["cpu_ok"][row] = 1
 
     def enable_spec_scorer(self, candidates: torch.Tensor, *, top_k: int, per_token: int, top_k_only: bool) -> None:
-        """The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu): ``candidates`` is the host's candidate page
+        """The GPU scorer (SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu): ``candidates`` is the host's candidate page
         (``new_candidate_page``); scores go to an fp32 [cpu_tokens_max, experts] scratch allocated here, so this runs
         after ``enable_cpu_experts`` and before any graph captures ``spec_score``."""
         if self._spec is not None:
@@ -3743,8 +3981,9 @@ class ExpertStreamDevice:
                 scores = self.spec_head.workspace.block_scores.view(1, -1)
                 self._spec_drip_launch(entry, scores, 1 if in_range else 0, module)
             return
-        self._spec_select_launch(entry, x, tokens, module)
+        self._spec_select_launch(entry, x, tokens, module, routes=routes, route_weights=route_weights)
         if self.drip_picks:
+            # A dead row's scores are the anchor's (its input is), so the rows' max is the live rows'.
             rows = tokens if 1 <= tokens <= self.cpu_tokens_max else 0
             self._spec_drip_launch(entry, self.spec_scores, rows, module)
 
@@ -3762,10 +4001,14 @@ class ExpertStreamDevice:
             module=module,
         )
 
-    def _spec_select_launch(self, entry, x, tokens: int, module) -> None:
+    def _spec_select_launch(self, entry, x, tokens: int, module, *, routes=None, route_weights=None) -> None:
         top_k, per_token, top_k_only = self._spec
         if 1 <= tokens <= self.cpu_tokens_max:
             run_spec_score(x.reshape(tokens, -1), entry.weight, entry.bias, self.spec_scores, module=module)
+        # The post's routes per token, as the post kernel derives them (cpu_weights_count / cpu_tokens).
+        route_top_k = (
+            route_weights.numel() // tokens if routes is not None and route_weights is not None and tokens else 0
+        )
         run_spec_select(
             self.spec_scores,
             tokens,
@@ -3778,6 +4021,8 @@ class ExpertStreamDevice:
             target=entry.target,
             state=self.state,
             candidates=self.spec_candidates,
+            routes=routes if route_top_k else None,
+            route_top_k=route_top_k,
             module=module,
         )
 
@@ -3865,7 +4110,7 @@ class ExpertStreamDevice:
         a lane is the CPU's, and the weights in the record.
 
         ``spill`` is DIRECT's ``(overflow_flag int32 [1], gather_overflow int64 [1])`` for this row, given when lanes
-        may have no VRAM victim (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES): a lane whose ``dst_slots`` entry is -1
+        may have no VRAM victim (SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES): a lane whose ``dst_slots`` entry is -1
         becomes a CPU lane, or, when one cannot, the post serves the live prefix, lowers ``count`` and flags both words.
         """
         self._check_row(row)
@@ -3879,7 +4124,7 @@ class ExpertStreamDevice:
             self._check_buffers(hot_slots=(hot_slots, torch.int64))
             if self._hot_address == 0 or not 0 < hot_capacity <= hot_slots.numel():
                 raise ValueError(
-                    "EXL3 DIRECT needs a hot sidecar and a valid slot capacity"
+                    "expert-stream DIRECT needs a hot sidecar and a valid slot capacity"
                 )
         cpu_x, cpu_weights, cpu_x_dst = self._no_cpu, self._no_cpu, 0
         if cpu_input is not None:
@@ -3959,6 +4204,7 @@ class ExpertStreamDevice:
             self.scratch_dst_1,
             self.scratch_go_1,
             self.row_split,
+            self.split_model,
             int(self.lease_pdl),
         )
 
@@ -4045,6 +4291,45 @@ class ExpertStreamDevice:
             self.cpu_lanes if self.cpu_x_rows is not None else self._no_cpu,
             int(self.lease_pdl),
         )
+
+    def calibration_pull(self, table: torch.Tensor) -> None:
+        """The split model calibration's stand-in for S's host pulls (expert_stream_calibration_pull_kernel), on the
+        current stream: ``table`` is int64 ``[n, 3]`` {source, destination, bytes} on this device, each source a pinned
+        host address."""
+        self._kernels().expert_stream_calibration_pull(table)
+
+    def set_split_model_costs(self, words: Sequence[int]) -> None:
+        """Replace the split model's cost words (ram_slot_map.split_model_words, or split_model_off_words) in place,
+        leaving its counters. The copy is queued on the current stream from pinned memory, so a captured post reads
+        the new words from its next replay on; the host does not wait for it."""
+        costs = 5 * self.wire.nodes + 6  # the costs and the flags word
+        if self.split_model.numel() == 0:
+            raise ValueError("the split model is off: the post has no cost words to replace")
+        if len(words) != costs:
+            raise ValueError(f"the split model has {costs} cost words for {self.wire.nodes} nodes, got {len(words)}")
+        src = torch.tensor(list(words), dtype=torch.int64)
+        if self.split_model.is_cuda:
+            # The caching host allocator keeps the pinned block until the copy that reads it has run.
+            src = src.pin_memory()
+        self.split_model[:costs].copy_(src, non_blocking=True)
+
+    def split_model_costs(self) -> Optional[list[int]]:
+        """The split model's cost words as the device holds them (a device-to-host copy), or None when it is off."""
+        if self.split_model.numel() == 0:
+            return None
+        return self.split_model[: 5 * self.wire.nodes + 6].cpu().tolist()
+
+    def split_model_stats(self) -> Optional[dict]:
+        """The split model's counters (a device-to-host copy), or None when it is off: records it typed, and per node
+        the lanes it put on the CPU that the table would not (``to_cpu``) and took off the CPU (``to_copy``)."""
+        if self.split_model.numel() == 0:
+            return None
+        words = self.split_model[5 * self.wire.nodes + 6 :].cpu().tolist()
+        return {
+            "records": words[0],
+            "to_cpu": words[1::2],
+            "to_copy": words[2::2],
+        }
 
     def stats(self) -> dict[str, int]:
         """Return the device words ``STATE_WORDS`` (a device-to-host copy)."""

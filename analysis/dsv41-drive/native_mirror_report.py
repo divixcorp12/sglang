@@ -74,7 +74,7 @@ def summarize(name, path, names):
     reqs = read_requests(path)
     print(f"--- {name}: {len(reqs)} RAM-miss requests")
     if not reqs:
-        print("    no ram_miss_request lines; was SGLANG_DSV41_EXPERT_TRACE_PATH set?")
+        print("    no ram_miss_request lines; was the expert_path of SGLANG_EXPERT_STREAM_TRACE set?")
         return None
 
     per_drive_bytes = defaultdict(int)

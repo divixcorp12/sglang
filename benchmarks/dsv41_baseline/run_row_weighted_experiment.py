@@ -47,7 +47,7 @@ def main():
         parser.error("At least two rounds and sixteen iterations are required")
     args.output.mkdir(parents=True, exist_ok=False)
     references = args.output / "routed-references"
-    env = dict(os.environ, OMP_NUM_THREADS="10", OMP_DYNAMIC="FALSE", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", EXL3_MOE_CPU_MAX_ISA="bw")
+    env = dict(os.environ, OMP_NUM_THREADS="10", OMP_DYNAMIC="FALSE", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", SGLANG_EXPERT_STREAM_CPU_MAX_ISA="bw")
     for key in list(env):
         if "TRACE" in key and (key.startswith("EXL3_") or key.startswith("SGLANG_")):
             del env[key]
@@ -67,14 +67,14 @@ def main():
     }
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2))
     results = []
-    for node, cpus in [(0, "6-15"), (1, "18-27")]:
+    for node, cpus in [(0, "6-15"), (1, "28-37")]:
         for round_id in range(args.rounds):
             # AB BA AB BA controls slow order drift; each process has fresh OpenMP state.
             order = [("a", args.a), ("b", args.b)] if round_id % 2 == 0 else [("b", args.b), ("a", args.a)]
             for arm, binary in order:
                 label = f"node{node}-round{round_id}-{arm}"
                 target = args.output / f"{label}.json"
-                command = ["taskset", "-c", "0-63", "numactl", f"--membind={node}", str(binary.resolve()),
+                command = ["taskset", "-c", "0-51,56-107", "numactl", f"--membind={node}", str(binary.resolve()),
                            f"--fixture={args.fixture}", f"--reference-dir={args.reference_dir}",
                            f"--cpus={cpus}", "--workers=10", f"--numa-node={node}",
                            "--warmup-forwards=64", "--routed-layers=8", "--routed-slots=12",

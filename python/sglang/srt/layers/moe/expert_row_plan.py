@@ -281,6 +281,8 @@ class InGraphRowBackend:
     """Serves a plan with the in-graph copy kernel at ``post``; everything is delivered."""
 
     name = BACKEND_IN_GRAPH
+    # Whether a lease chain stands behind the gather (the native engine's backend); the residency updater asks.
+    leased = False
 
     def __init__(self, segments: Mapping[int, ExpertRowSegments]) -> None:
         self.segments = dict(segments)
@@ -310,6 +312,7 @@ class PinnedTierRowBackend:
     """
 
     name = BACKEND_PINNED_TIER
+    leased = False
 
     def __init__(
         self,

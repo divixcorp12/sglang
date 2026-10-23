@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKEN_TABLE_LIVE, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamHost,
     candidate_offset,
@@ -173,9 +173,10 @@ def enable(
     )
 
 
-def write_x(rig: PrefetchRig, row: int, tokens: int) -> None:
+def write_x(rig: PrefetchRig, row: int, tokens: int, live: int | None = None) -> None:
     """Stages `row`'s input as the post kernel does: token t is the unit vector e_t (fp16); a multi-token row's table
-    counts the live tokens."""
+    counts the record's tokens and, `live` of them (default all) live, as a verify with dead rows posts it."""
+    live = tokens if live is None else live
     stride = x_token_bytes()
     for t in range(tokens):
         x = torch.zeros(HIDDEN, dtype=torch.float16)
@@ -184,14 +185,16 @@ def write_x(rig: PrefetchRig, row: int, tokens: int) -> None:
     if rig.tokens > 1:
         table = rig.tokens * stride
         rig.x_rows[row, table : table + 4] = torch.tensor([tokens], dtype=torch.int32).view(torch.uint8)
+        at = table + CPU_TOKEN_TABLE_LIVE
+        rig.x_rows[row, at : at + 4] = torch.tensor([live], dtype=torch.int32).view(torch.uint8)
 
 
-def trigger(rig: PrefetchRig, *, tokens: int = 1, resident: int = 5) -> SimRequest:
+def trigger(rig: PrefetchRig, *, tokens: int = 1, live: int | None = None, resident: int = 5) -> SimRequest:
     """A captured post of row 0 with one CPU hit (`resident`, loaded first if absent), after staging row 0's input:
     the service hands it to every group's speculative thread."""
     if rig.host.mapping(0)[resident] < 0:
         load(rig, 0, [resident])
-    write_x(rig, 0, tokens)
+    write_x(rig, 0, tokens, live)
     req = rig.sim.post(0, [resident], captured=True, cpu_on=True)
     _served(rig, req)
     return req

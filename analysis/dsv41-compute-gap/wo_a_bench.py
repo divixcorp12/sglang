@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.wo_a import wo_a_bf16_gemv
+from sglang.kernels.ops.gemm.dsv4_wo_a import wo_a_bf16_gemv
 
 LAYERS, G, R, D = 40, 8, 1024, 4096
 

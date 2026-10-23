@@ -39,17 +39,36 @@ def test_decode_admission_excludes_prefill_and_requires_all_burnin_bounds(monkey
         assert gate.observe(first + i * 100_000_000, (i + 1) * 4, True) is None
     assert gate.observe(first + 31_000_000_000, 404, True) is not None
 
+def clean_env(**extra):
+    """The host reads no SGLANG_EXPERT_STREAM_TRACE: the probes take their options from argv."""
+    return {**{k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_TRACE"}, **extra}
+
+
+def arrival_args(prefix, pending=0, forward=0, arrival=0):
+    """The arrival probe's argv: trace.job.prefix and the draft_trigger pending_us / forward_us / arrival_us."""
+    return [str(prefix), str(pending), str(forward), str(arrival)]
+
+
 @pytest.fixture(scope="module")
 def trigger_only_probe(tmp_path_factory):
     work = tmp_path_factory.mktemp("trigger-only")
     source = work / "probe.cpp"
     source.write_text(r'''
 #include "job_trace.h"
+#include <cstdlib>
 using namespace sglang::expert_stream;
 static_assert(!ProdBuild::kMetrics);
 static_assert(std::is_empty_v<JobTrace<false>>);
 static_assert(std::is_empty_v<Stats<false, 8>>);
-int main() {
+// The host reads no environment: the probe installs the trace options as the module's expert_stream_set_trace_options
+// export does, from argv: gate path, draft_trigger forward_us, draft_trigger report prefix.
+int main(int argc, char** argv) {
+  if (argc != 4) return 4;
+  TraceOptions options;
+  options.gate_path = argv[1];
+  options.forward_us = std::strtoll(argv[2], nullptr, 10);
+  options.trigger_report_prefix = argv[3];
+  set_trace_options(options);
   DraftDelayTrigger<kDraftDelayTriggerOnly> trigger("engine");
   trigger.finished(1, 6000000); // gate closed: must not consume the one-shot
   puts("ready"); fflush(stdout); getchar();
@@ -62,7 +81,7 @@ int main() {
     for enabled in (False, True):
         binary = work / str(enabled)
         subprocess.run(["g++", "-std=c++20", "-O3", "-rdynamic",
-                        f"-DSGLANG_DRAFT_DELAY_TRIGGER_ONLY={int(enabled)}", "-I",
+                        f"-DSGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY={int(enabled)}", "-I",
                         str(ROOT / "python/sglang/kernels/jit/csrc/moe/expert_stream/host"),
                         str(source), "-o", str(binary)], check=True, capture_output=True)
         binaries.append(binary)
@@ -76,10 +95,8 @@ def test_independent_trigger_retained_without_metrics_and_gate(trigger_only_prob
     gate.write_bytes(bytes(4))
     with gate.open("r+b") as file, mmap.mmap(file.fileno(), 4) as flag:
         binary = trigger_only_probe[int(enabled)]
-        process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            env={**os.environ, "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
-                 "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(threshold),
-                 "SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX": str(tmp_path / "trigger")})
+        process = subprocess.Popen([str(binary), str(gate), str(threshold), str(tmp_path / "trigger")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=clean_env())
         try:
             assert process.stdout.readline().strip() == "ready"
             flag[:] = (1).to_bytes(4, "little")
@@ -111,6 +128,7 @@ int run() {
 #ifdef PROD
   JobTrace<false> trace("prod"); trace.emit("forbidden",0,0,0,0);
 #else
+  // Installed by main() from argv, as expert_stream_set_trace_options does; JobTrace copies them here.
   JobTrace<true> trace("arrival");
   // Ready handshake also makes this probe usable for a real magic-trace attach.
   puts("ready"); fflush(stdout); getchar();
@@ -127,7 +145,15 @@ int run() {
 #endif
   return 0;
 }
-int main() {
+// The host reads no environment: argv is job prefix, pending_us, forward_us, arrival_us.
+int main(int argc, char** argv) {
+  if (argc != 5) return 4;
+  TraceOptions options;
+  options.job_prefix = argv[1];
+  options.pending_us = std::strtoll(argv[2], nullptr, 10);
+  options.forward_us = std::strtoll(argv[3], nullptr, 10);
+  options.arrival_us = std::strtoll(argv[4], nullptr, 10);
+  set_trace_options(options);
   if (getenv("WORKER_PROBE")) { std::thread worker(run); worker.join(); return 0; }
   return run();
 }
@@ -145,10 +171,9 @@ int main() {
 
 @pytest.mark.parametrize("pending,forward,reason", [(1000,0,0), (0,1000,1), (0,0,2), (10000,10000,None)])
 def test_first_observation_and_threshold(arrival_probe, tmp_path, pending, forward, reason):
-    subprocess.run([str(arrival_probe[0])], input="x", text=True, check=True, env={**os.environ,
-        "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-        "SGLANG_DRAFT_PENDING_TRIGGER_US": str(pending), "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(forward),
-        "SGLANG_DRAFT_ARRIVAL_TRIGGER_US": "1000" if reason == 2 else "0"})
+    subprocess.run([str(arrival_probe[0]), *arrival_args(tmp_path / "events", pending, forward,
+                                                         1000 if reason == 2 else 0)],
+                   input="x", text=True, check=True, env=clean_env())
     records = [json.loads(l) for l in next(tmp_path.glob("events.*")).read_text().splitlines()]
     events = records[1:-1]
     assert records[-1] == {"dropped": 0}
@@ -179,10 +204,9 @@ def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path, worker):
     tool = os.environ.get("SGLANG_TEST_MAGIC_TRACE")
     if not tool:
         pytest.skip("set SGLANG_TEST_MAGIC_TRACE for a live Intel PT smoke capture")
-    probe = subprocess.Popen([str(arrival_probe[0])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True, env={**os.environ, **({"WORKER_PROBE":"1"} if worker else {}),
-                       "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path/"events"),
-                       "SGLANG_DRAFT_PENDING_TRIGGER_US":"1000"})
+    probe = subprocess.Popen([str(arrival_probe[0]), *arrival_args(tmp_path/"events", pending=1000)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=clean_env(**({"WORKER_PROBE":"1"} if worker else {})))
     trace = None
     try:
         assert probe.stdout.readline().strip() == "ready"

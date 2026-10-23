@@ -3,6 +3,7 @@ read_cuts.h alone; the FFI part (Tasks 4-5) reads through the reader with a test
 leg_cut_cap). Why the cuts exist: analysis/dsv41-drive/iopoll/diagnosis.md."""
 
 import errno
+import json
 import os
 import shutil
 import subprocess
@@ -171,7 +172,7 @@ def test_read_cuts_planner_and_limits(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert "PASS read_cuts" in done.stdout
 
-PREFIX = "SGLANG_EXPERT_STREAM_URING_"
+URING_ENV = "SGLANG_EXPERT_STREAM_URING"
 EXPERTS = [10, 3, 7, 0, 11, 5, 1, 8, 2, 9, 4]
 SLOTS = [7, 0, 11, 3, 9, 1, 5, 10, 2, 8, 4]
 CUT = 8192
@@ -179,13 +180,13 @@ CUT = 8192
 
 @pytest.fixture
 def uring_env(monkeypatch):
-    for key in list(os.environ):
-        if key.startswith(PREFIX):
-            monkeypatch.delenv(key)
+    monkeypatch.delenv(URING_ENV, raising=False)
+    group = {}
 
     def set_(**values):
-        for key, value in values.items():
-            monkeypatch.setenv(PREFIX + key, str(value))
+        # The io_uring options are one JSON env; keys are UringConfig field names, in any case.
+        group.update({key.lower(): value for key, value in values.items()})
+        monkeypatch.setenv(URING_ENV, json.dumps(group))
 
     return set_
 
@@ -238,7 +239,7 @@ def test_credit_scales_with_the_leg_bound(tmp_path, uring_env):
 def test_explicit_depth_below_the_leg_bound_is_refused(tmp_path, uring_env):
     s = _setup(tmp_path, (1.0, 1.0, 1.0))
     uring_env(QUEUE_DEPTH=2)
-    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=2"):
+    with pytest.raises(RuntimeError, match="(?i)queue_depth=2"):
         _read(s, leg_cut_cap=CUT)
 
 
@@ -277,7 +278,7 @@ def test_cuts_are_off_by_default_outside_iopoll(tmp_path, uring_env):
 def test_read_cuts_on_uses_the_files_device_limits(tmp_path, uring_env):
     s = _setup(tmp_path, (1.0, 1.0, 1.0))
     _, _, _, _, base_bytes = _read(s)
-    uring_env(READ_CUTS=1)
+    uring_env(READ_CUTS="1")
     result, log, info, _, cut_bytes = _read(s)
     assert result == 1 and _equal(cut_bytes, base_bytes)
     assert info["min_cut_bytes"] >= 4096 and all(length <= info["min_cut_bytes"] for _, _, length, _ in log)

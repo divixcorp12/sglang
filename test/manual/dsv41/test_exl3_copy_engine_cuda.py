@@ -101,7 +101,7 @@ def test_device_stamps_record_each_armed_chain_in_chain_order(tmp_path, monkeypa
     the order; drop the post's clearing of a lapped row -- red on the seq check."""
     import json
 
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     c = Chain(tmp_path, copy_engine=True)
     try:
         c.dev.enable_device_stamps()

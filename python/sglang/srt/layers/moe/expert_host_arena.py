@@ -3,7 +3,7 @@
 ``ExpertHostArena`` copies each streamed layer's host expert tensors into
 page-aligned, CUDA-registered memory once at load, so captured graphs and copy
 kernels can read host rows in place. It replaces the pinned LRU tier
-(``SGLANG_MOE_EXPERT_HOST_ARENA``, with ``SGLANG_MOE_PINNED_HOST_MB=0``).
+(``SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA``, with ``SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0``).
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ class ExpertHostArena:
                 raise ValueError(
                     f"expert format {streamer.format.key!r} of layer "
                     f"{streamer.layer_id} does not support the host arena; unset "
-                    "SGLANG_MOE_EXPERT_HOST_ARENA"
+                    "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA"
                 )
         arena = cls()
         try:

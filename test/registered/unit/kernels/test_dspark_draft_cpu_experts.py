@@ -84,9 +84,9 @@ def test_prepare_builds_the_runtime_once(monkeypatch):
     from sglang.srt.environ import envs
 
     registry = DraftCpuExpertsRegistry()
-    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0)
-    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=1)
-    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(",".join(map(str, _cores()))):
+    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0, format_key="exl3")
+    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=1, format_key="exl3")
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override(",".join(map(str, _cores()))):
         try:
             registry.prepare()
             registry.prepare()
@@ -106,12 +106,12 @@ def test_the_registry_builds_once_from_the_envs_and_refuses_mixed_limits(monkeyp
     built = []
     monkeypatch.setattr(draft, "draft_kernel_for", lambda key, act_limit: built.append((key, act_limit)) or _Kernel())
     registry = DraftCpuExpertsRegistry()
-    assert registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0) == 0
-    assert registry.register(_slabs(), _on_cpu(), 10.0, layer_id=1) == 1
+    assert registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0, format_key="exl3") == 0
+    assert registry.register(_slabs(), _on_cpu(), 10.0, layer_id=1, format_key="exl3") == 1
     with pytest.raises(ValueError, match="activation limit"):
-        registry.register(_slabs(), _on_cpu(), 7.0, layer_id=2)
+        registry.register(_slabs(), _on_cpu(), 7.0, layer_id=2, format_key="exl3")
     cores = ",".join(str(c) for c in _cores())
-    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(cores):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override(cores):
         try:
             runtime = registry.runtime()
             assert registry.runtime() is runtime and built == [("exl3", 10.0)]
@@ -121,7 +121,7 @@ def test_the_registry_builds_once_from_the_envs_and_refuses_mixed_limits(monkeyp
 
 
 def test_without_named_cores_the_registry_runs_on_the_threading_plans_draft_cores(monkeypatch):
-    """Unset SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES: the draft runs on the cores ThreadingConfig derived for it, the plan
+    """Unset SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES: the draft runs on the cores ThreadingConfig derived for it, the plan
     the RAM-miss service resolves too, so neither lands on the other. Mutant: parse the empty env list -- red (refused
     for fewer than 2 cores)."""
     from types import SimpleNamespace
@@ -136,7 +136,7 @@ def test_without_named_cores_the_registry_runs_on_the_threading_plans_draft_core
         classmethod(lambda cls, **kw: asked.append(kw) or SimpleNamespace(draft_cpus=cores)),
     )
     registry = DraftCpuExpertsRegistry()
-    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0)
+    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0, format_key="exl3")
     try:
         runtime = registry.runtime()
         assert (tuple(runtime.cores), runtime.threads) == (cores, len(cores))
@@ -149,9 +149,9 @@ def test_the_registry_refuses_more_threads_than_cores(monkeypatch):
     from sglang.srt.environ import envs
 
     registry = DraftCpuExpertsRegistry()
-    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0)
+    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0, format_key="exl3")
     cores = ",".join(str(c) for c in _cores())
-    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(cores), envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.override(3):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override(cores), envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS.override(3):
         try:
             with pytest.raises(ValueError, match="threads"):
                 registry.runtime()
@@ -166,9 +166,9 @@ def test_the_registry_refuses_a_resident_file_with_a_stage_the_draft_lacks(monke
     path = tmp_path / "resident.json"
     write_resident_set(str(path), {0: [1], 1: [5]}, n=1, source="")
     registry = DraftCpuExpertsRegistry()
-    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0)
+    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0, format_key="exl3")
     cores = ",".join(str(c) for c in _cores())
-    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(cores), envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES.override(cores), envs.SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.override(str(path)):
         try:
             with pytest.raises(ValueError, match=r"stages \[1\]"):
                 registry.runtime()
@@ -196,7 +196,7 @@ def test_with_target_cpu_experts_the_draft_attaches_to_the_services_gpu_group(mo
 
     monkeypatch.setattr(draft, "_ram_miss_service", lambda: Service())
     monkeypatch.setattr(draft, "_new_host", lambda *a, **k: pytest.fail("built a draft-only engine"))
-    with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True):
         runtime = draft.DraftCpuExperts(
             _Kernel(), {0: draft.DraftLayer(_slabs(), _on_cpu(), 10.0)}, cores=[], threads=0, device=None
         )

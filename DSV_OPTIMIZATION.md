@@ -1477,6 +1477,268 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
 - divix01 has ccache 4.11.3 system-wide (`/etc/profile.d/ccache.sh`), `~/.config/ccache/ccache.conf` max_size 50G.
   Build-time measurements must set `CCACHE_DISABLE=1`.
 
+### 3.12 DSpark confidence-head verify cut — MERGED; the sampled cut is on in production (owner, 2026-10-18)
+
+- **Shipped 2026-10-18 (owner): the cut for sampled requests, without block verification.** Production's env
+  (`arm_env.PROD_DSPARK_CUT_ENV`) sets `SGLANG_DSPARK_CONFIDENCE_CUT=1`, `..._CUT_SAMPLED=1`, `..._CUT_DRAFT_COST=1`
+  (draft time priced into T(w)) and `..._CUT_REFIT_INTERVAL=0` (one sample cannot judge an online refit);
+  `ServerArgs.prod()` passes `--speculative-dspark-confidence-sts-path` with the greedy STS file below. The draft stays
+  sampled (`SGLANG_DSPARK_USE_GREEDY_DRAFT` off). `check_prod_assets` now also checks that file's sha256, so production
+  refuses to start without the fitted file. The A/B's `-prod-confcut-sampled` arm is now identical to `-prod`.
+  - **Served sampled A/B** (2026-10-18, sampled at temperature 0.6 / top-p 0.95, long prompt, 420 s decode, KV 381,184,
+    `/mnt/nvme1/sampled-finish-20261018`, `report.txt`, `report-cutretry.txt`; `wt-sf-ab` @ `08d7acdbe1` plus the driver
+    fixes). Block verification and the accept kernels logged no late device loads:
+
+    | 60-360 s | -prod | cut | cut, second run | cut + block |
+    |---|---:|---:|---:|---:|
+    | ms/token | 73.14 | 61.60 | 66.27 | 62.02 (60-358 s) |
+    | decode tok/s | 13.7 | 16.2 | 15.1 | 16.1 |
+    | ms per verify | 186.2 | 130.4 | 138.2 | 139.4 |
+    | tokens per verify | 2.55 | 2.12 | 2.09 | 2.25 |
+    | accept length (decode log) | 2.66 | 2.22 | 2.15 | 2.27 |
+    | TTFT | 14.39 s | 14.47 s | 14.22 s | 14.17 s |
+
+    - The cut is 9.4-15.8% faster on ms/token and 25.8-30.0% on ms per verify, depending on which cut run is read.
+    - **Run-to-run noise is about 7%**: the two cut runs differ by 61.6 vs 66.3 ms/token (6,752 vs 6,299 tokens in 420 s).
+      Each arm has one or two samples, so a 5% bar is inside the noise for ms/token; the ms per verify gain is the more
+      robust number.
+    - **Tokens per verify and accept length fall by design**: the cut verifies fewer rows (verify-weighted w* about 2.6 of
+      6). Read literally, the ship rule's "accept not lower" cannot pass for any cut; the owner shipped on the speed result.
+    - **Block verification is not shipped.** Block over cut-only was -0.7% ms/token and -6.9% ms per verify against the
+      first cut run, and +6.4% and -0.9% against the second: inconclusive, below the 5% bar. The block run also ended
+      itself at 358 s (finish "stop"), so its 60-360 s window is 60-358 s. The block arm stays in `both_cpu_ab`
+      (`-prod-confcut-sampled-block`).
+    - **T(w) calibration** (post-warm-up, 96 verifies, 16 per width): a=131.9 ms, b=51.8 ms/row, r2=0.55 (first cut run);
+      a=154.6, b=54.8, r2=0.43 (second); a=149.3, b=60.1, r2=0.50 (block). The fit is still noisy (r2 about 0.5).
+    - **Trace overflow and warn-only.** The cut runs overflowed the copy-engine job-trace buffer (1,048,576 events a
+      file; 181,212 and 135,317 dropped) because they verify more per second, and `spec_margin.py` refused the run
+      (rc=1) although the decode was complete. That drop affects only the diagnostic trace, not decode or the verify
+      count. `spec_margin_capture.py --analysis-warn-only` (set by `run_sampled_finish_ab.sh`) now logs it as a WARNING
+      with the dropped count and does not fail the arm; the server env is unchanged. The report flags truncation only
+      when the verify or device-stamp files drop events.
+  - Tools: `analysis/dsv41-drive/dspark/run_sampled_finish_ab.sh` (three arms; `--only` adds arms to a finished
+    directory) and `sampled_finish_report.py`.
+
+- (history) The cut began as branch `confidence-cut` (`60852853fd`), off by default.
+
+- **What it does.** At batch size 1 with greedy sampling, each verify keeps the w* rows that maximise
+  (1 + sum_{k<w} S_k) / T(w). S_k is the STS-calibrated cumulative product of the draft's trained Markov confidence
+  head (DSpark paper eq. 7). T(w) is verify ms with w live rows, measured at startup from 48 interleaved forced-width
+  verifies. Cut rows go through the existing static-graph dead-row mask (no experts routed) and the accept cap.
+  Switch: `SGLANG_DSPARK_CONFIDENCE_CUT=1` plus `--speculative-dspark-confidence-sts-path`. Spec:
+  `docs/hx/compact-verify-exl3.draft.md`. Real `compact` mode was dropped: at bs 1 its tier grid is [6], and its
+  padding rows still route experts.
+- **STS.** Fitted from `/mnt/nvme1/sts-collect-20261016` (one long prompt, 2,048 verifies). Temperatures
+  0.89/0.79/1.26/0.89/0.63, ECE 2.9-3.8% -> 2.1-3.0%. Installed read-only at
+  `/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json`, sha256 `a0f2fc7c...bcd5`.
+- **Smoke** (`/mnt/nvme1/confcut-smoke-20261016`, instr build, long prompt, 300 s):
+  - T(w) = [126, 187, 187, 187, 207, 257] ms.
+  - w* 3.7-4.0; E(w*) 2.37-2.59 against accept 2.38-2.58, so the calibration holds.
+  - Greedy text matched the all-rows run for 57 tokens, then split at a near-tie wording choice (ordinary on this stack).
+  - Not an A/B: in the windows clean in both runs (60-180 s), 64-66 vs 75-79 ms/token, wait per verify 80 vs 90-119 ms.
+- **Follow-ups merged into `confidence-cut` (owner, 2026-10-16; test run pending):**
+  - T(w) is an affine least-squares fit over every calibration sample instead of per-width medians.
+  - Prefetch scorers rank only live rows. The post kernel writes a device-side live count into spare bytes of the
+    token-table header (offset 4), and the GPU select kernel reads the routes. Picks were already unchanged, because a
+    dead row duplicates row 0; this saves ranking work and CPU-scorer dot products. The learned head still uses the
+    token count fixed when the graph is captured.
+  - Dead routes no longer add to the hot-cache route counts. They still count in the graph, unique and outcome counters,
+    the GPU residency updater's decay clock still counts all 6 rows, and the eager streamed path still records them as
+    row 0's experts. Production uses the static graph, so the eager path is moot.
+  - Dead rows' Engram lookups post -1, which the native store serves as a zero row: no access, read or insert. Any other
+    negative id is still fatal. This covers the in-graph device wait (the default) only.
+- **Served pair, -prod vs -prod-confcut** (2026-10-16 21:55-22:29, `confidence-cut` @ `5158aa38d3` incl. the dead-row
+  follow-ups and the V4.1 parsers; long prompt, 420 s decode each, one sample each, prod first, instr build in both;
+  `/mnt/nvme1/confcut-ab-20261017`, `long_compare.txt`):
+
+  | | -prod | -prod-confcut | delta |
+  |---|---:|---:|---:|
+  | tokens in 420 s | 6,309 | 6,725 | +6.6% |
+  | ms/token, whole decode | 66.6 | 62.5 | -6.2% |
+  | ms/token, 60-360 s | 70.8 | 60.8 | -14% |
+  | ms per verify, 60-360 s | 180.4 | 158.4 | -12% |
+  | tokens per verify, 60-360 s | 2.55 | 2.61 | +2% |
+  | wait per verify, 120-300 s | 107-123 | 53-84 | |
+  | TTFT | 16.44 s | 17.07 s | +0.63 s |
+
+  - The verify is cheaper and accept did not fall. Texts diverged at token 41, so tokens/verify is content-dependent;
+    ms per verify is the cleaner number.
+  - Cold GPU lanes per verify rose by about 3 (1.9-2.3 -> 3.2-5.2), and stream per verify rose 5.8 -> 9.8-13.4. Not
+    explained yet.
+  - Noise: the cut arm's 0-30 s and 300-360 s windows had swap-in spikes (CPUSLOW), and 360-420 s was a disk stall
+    (x10.8) and is truncated (the copy engine's job trace overflowed at 414.8 s, which is why the capture reported
+    rc=1). All excluded from the 60-360 s rows.
+- **The startup T(w) fit is noise-dominated** (found 2026-10-16 in the two cut arms below and above). The affine fit
+  over the 48 calibration verifies gave a = 226.6, b = 16.8 ms/row (r^2 = 0.015) in the confcut arm, and a = 271.0,
+  b = 4.7 ms/row (r^2 = 0.0009) in the engramscales arm. With the shallower slope the cut is much weaker: w* 4.4-5.3
+  and about 50 cut rows per 40 verifies, against w* 3.4-4.1 and about 90. So how hard the cut bites is set by
+  calibration noise at each launch. Needs a decision (owner) before the cut ships.
+- **Engram scales in node-1 RAM, served** (`engram-scales-ram` @ `e9fb5bbd2d`, `-prod-confcut` +
+  `SGLANG_DSV41_ENGRAM_SCALES_RAM_NODE=1`; owner skipped the off arm; compared with the confcut arm above;
+  `/mnt/nvme1/engramscales-20261017`):
+  - Works: 2 x 2.861 GiB loaded in 1.9 s each, 0 pages off node 1. Engram NVMe reads per unique miss fell from 2 to
+    1.0 (for example 48,370 reads for 48,370 misses in one 60 s window).
+  - Node 1 free in decode 14.35 -> 8.21 GiB (median); node 0 and swap unchanged.
+  - Throughput is not comparable: the T(w) fit above made this arm cut far less, so it verified more rows (about 226
+    Engram accesses per verify against 174) and waited longer. 60-360 s: 166.2 vs 158.4 ms per verify, 65.9 vs 60.8
+    ms/token. A clean read needs a fixed-width base (for example `-prod` vs `-prod` + scales).
+- **Dead-row audit** (2026-10-16, read-only; confcut smoke server.log Engram stats against verify.jsonl, prefill-free
+  60 s windows only):
+  - **Engram lookups are the only disk/host work a dead row still causes.** Both runs do 288 accesses per verify
+    (6 rows x 24 hash columns x layers 1 and 14), so the cut saves none today. At cap len 3.90, 2.1 of 6 rows are dead,
+    about 101 accesses and 65 unique misses per verify, which is about 130 4 KiB O_DIRECT reads (0.5 MiB) on nvme2n1.
+    nvme2n1 is also an expert mirror root, and it served 2.4x nvme0n1's read count for the same MiB. Estimated
+    0.3-1 ms per verify; not measured, because ring wait stats are not logged. Fix in progress: a -1 sentinel that the
+    native Store skips (zero row, no access counted), applied in graph from `VerifyDeadRows.dead`. Expected effect:
+    about 288 x live/6 accesses per verify in the "engram native cache" log line, instead of 288.
+  - **Everything else a dead row runs is GPU work at about 0 marginal cost at 6 rows**: indexer scoring and top-k (under
+    0.05 ms at 3K context, growing with context), the sparse MLA gather (about 0.02 ms), KV and compressor-state writes
+    (position-keyed, every ring has margin, never read back), shared expert, projections and lm_head. A static graph
+    cannot shrink M, so none of it is worth skipping now. The indexer is the one to revisit at long context.
+  - **No functional consumer reads a dead row**: accept, bonus (correct_len is capped at L-1), KV/state, the draft
+    hidden inject and the Engram/n-gram history all key off commit_lens. Three metrics do read dead rows, and are
+    already counterfactual because those rows route no experts:
+    - `cap_trim_lens` reads the uncapped correct_len and feeds `block_accept_lens`;
+    - the debug confidence metrics and `block_accept_recorder` read every row's logits;
+    - dead routes count toward row 0's experts in the planner route counts.
+    Outputs are unaffected. Fix them if any of those metrics gets used for a decision.
+- **Sampled STS recalibration (owner, 2026-10-18): not shipped; production keeps the greedy STS file.**
+  - Data: 6,758 verifies over 32 prompts (24 from `hot-cache-policy/prompts_varied.json`, 8 short answers in
+    `dspark/prompts_short_answer.json`) at T=0.6, top-p 0.95, thinking on, 768 new tokens each, collected at
+    `4a2e4e9602` (`-prod-stscollect`, KV 381,184). Rows map to prompts through the shards' `record_ns` and
+    `probe.json`'s CLOCK_MONOTONIC spans. 116 rows with NaN draft features were dropped. The recorder lost its partial
+    last shard, so short answers 6 and 7 have no rows and the short-answer category has only 214.
+  - Result (4-fold CV holding out whole prompts, stratified by category; `sts_cut_replay` ms/token at the served cost
+    a=131.9, b=51.8, draft 5.8 ms): (a) greedy STS 99.25; (b) per-position temperature fitted to the sampled label
+    +0.2%; (c) per-position temperature plus additive logit bias, fitted to the replayed ms/token, -0.9%; (d) logistic
+    regression over head logit, q(d_k), top-1 probability and entropy, -2.0% (offline only). Constant w=2 112.8,
+    every row 147.9, realized oracle 83.8. SAMPLE_PROMPT_DIVIX01 as an extra test set: (a) 117.85, (d) 116.25. No
+    candidate reaches the bar of 3% overall with no category losing more than 3%.
+  - Why: the T=10 pin of 2026-10-17 was a single-prompt artifact. On 32 prompts the sampled temperatures are 1.0, 0.89,
+    1.12, 1.0, 1.26, close to the greedy file's. The head's signal for sampled acceptance is weak: AUC at position 1 is
+    about 0.62 (draft q, top-1 and entropy are no better there), which caps what recalibrating it can do.
+  - Next lever, if one is wanted: a retrained confidence head (`head_hidden` and the draft/target features are in
+    the shards). (c) would need an optional `biases` list in the STS JSON and its loader; (d) needs the draft features
+    at cut time.
+  - Caveat: the ms/token figures rest on a fixed affine T(w) and an assumed 5.8 ms draft cost. The startup T(w) fit
+    is noisy (see above), and a live A/B could differ.
+  - Results: `divix01:/mnt/nvme1/sts-collect-varied-20261018/cv-draft5.8.json` and `cv-draft0.json` (shards in
+    `collect/sts/`); script `analysis/dsv41-drive/dspark/sts_sampled_cv.py` at `fd3a312795`.
+- **Live T(w) refit on in production (owner, 2026-10-20), benefit unproven.** `PROD_DSPARK_CUT_ENV` sets
+  `SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL=32` (branch `tw-calib-fix`, merged): T(w) is refit by least squares
+  over the last 192 timed cut verifies every 32, so the table follows the server out of the slow first ~35 s of a run.
+  This overrides the owner rule "values calculated at startup" for this one table, at the owner's request. The served
+  pair (`/mnt/nvme1/tw-calib-fix-20261018/`) showed 32 refits with no error and no regression. It did not show a
+  benefit: the live arm never hit the nvme3n1 slow phase the refit exists to follow. `..._REFIT_INTERVAL` stays 0; it
+  refits the per-position acceptance calibration (`OnlineRefit`), a separate object that does not touch T(w).
+- **F141 merged (owner, 2026-10-20).** Branch `f141-residency-clock`: `forward_verify_with_reverify` re-runs a verify
+  whose narrowed gather overflowed (common on the cold warm-up cache). Both forwards were observed as verifies but the
+  worker commits once per step, so each re-run left an uncommitted provisional, and the `dsv41_decode_paths` warm-up
+  overflowed the 16-deep queue and logged a false "commits are not reaching the hot cache manager". The overflowed
+  forward now takes its provisional back (`discard_overflowed_verify`); the warning counts the drops. Its temporary diagnostic commit (`04e1d36f6f`) is not in the
+  merged tree.
+- **TODO (owner, 2026-10-16):**
+  - ~~Broaden the STS calibration data~~ Done 2026-10-18: see "Sampled STS recalibration" above.
+  - Drive-pressure-aware cost: scale T(w)'s slope by a live NVMe pressure signal (e.g. recent NVMe wait per row), so
+    the cut is harder while the SPCC stalls. Check it against the owner's startup-calibration rule first.
+  - A per-row cost conditioned on predicted misses: price each extra row by the likelihood that its experts miss
+    VRAM/RAM. Needs a per-row miss predictor; the parked lane head (4a) is the foundation.
+  - Use the calibrated S_k beyond the cut: weight RAM prefetch candidates toward likely-accepted positions, and feed the
+    split model's CPU/GPU decisions.
+
+### 3.13 SM120 FlashMLA backend: FlashInfer everywhere (owner, 2026-10-20)
+
+- **Decision (owner, 2026-10-20): full FlashInfer, in every arm and in production.** `arm_env.dspark_env()` sets
+  `SGLANG_SM120_FLASHMLA_BACKEND=flashinfer` (it was `triton`: every DSpark text result before this date ran triton
+  attention). The new `flashinfer_prefill` value (FlashInfer for calls of more than 64 tokens, triton for decode and the
+  DSpark verify) is kept as an option, not used.
+- **Served pair, 32k prompt** (`/mnt/nvme1/fi-prefill/serve-20261019-0300` and `-control`): TTFT 63.8 s vs triton
+  81.4 / 80.5 s; accept len 2.36 vs 2.34; median step 150 vs 151 ms; KV 381,184, no OOM.
+- **Exactness:** FlashInfer's decode is less exact than triton's at 64 tokens or fewer (relL2 3e-3..1.2e-2 vs <= 2.6e-3
+  on realistic keys, `parity.json`). The greedy split (token 19) is within triton's own run-to-run split (token 27).
+- `SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB=128` and `..._CHUNK_KERNELS=0` stay in `prod_dspark_env()`; they only act
+  when the backend is triton or on `flashinfer_prefill`'s triton path.
+- **Open, owner to decide:** the parity test `test_flash_mla_backends.py:473` silently skips on flashinfer 0.7.2. Its
+  guard looks for `flashinfer.sparse_mla_sm120`; the module is `flashinfer.mla._sparse_mla_sm120`. Left unchanged.
+- **Known failure, not called by production:** the 8 `test_dsa_indexer.py::test_dsv4_flashinfer_compact_topk_cuda_graph`
+  subtests fail because FlashInfer 0.7.2 refuses graph-safe top-k on SM120 (128 KiB shared memory). The indexer uses the
+  sgl-kernel top-k.
+- Stale comment, left as is: `DSPARK_MEM_FRACTION_STATIC`'s block in `arm_env.py` describes the triton fp32 prefill merge's
+  peak and says flashinfer "refuses the 5-token draft capture"; the served pair above ran DSpark on flashinfer.
+
+### 3.14 divix01's 8280 core layout, the bench at the host tier, the full-stack census fix (owner, 2026-10-22)
+
+- **Core layout** (`core-layout-8280`, merged): divix01 is 2x Xeon Platinum 8280 (28 cores per socket, SMT 2; node 0 =
+  0-27,56-83, node 1 = 28-55,84-111; AVX-512 VNNI, no VBMI). Every hard-coded core was remapped: server 0-5,56-61, RAM
+  thread 26, copy thread 27, CPU experts 6-15 and 28-37, node-1 RAM thread 51, benchmark client 18-21, free 52-55,108-111;
+  CPU jobs `0-51,56-107`, GPU jobs `0-27,56-83` (`.claude/rules/divix01-run-protocol.md`).
+- **Expert-stream bench** (`python/sglang/kernels/jit/csrc/moe/expert_stream/bench/`):
+  - `run.sh`, `ab.sh` and `run_full_stack.sh` no longer pin `EXL3_MOE_CPU_MAX_ISA=bw`, so they measure the host's tier
+    (vnni). A caller's `EXL3_MOE_CPU_MAX_ISA` passes through; an empty one is unset (the kernels ignore it anyway). Every
+    process prints `isa tier <tier>`, puts `isa_tier` in its JSON context, and each results directory has an `isa.txt`.
+    Before this the bench could only ever time the old bw path.
+  - Defaults: bare bench `--cpus=28-43 --numa-node=1`; full stack writer 22, service 26, copy 27, workers 28-43 (the
+    production roles' cores), and the `exl3bench` partition source files now say 22-43,78-99 (the installed unit keeps
+    16-33,52-69 until the root reinstall).
+  - **Census root cause.** The full-stack bench failed its bare-phase thread census (`threads are pinned to {}, expected
+    {29..43}`) at master. Its bare forwards called `CpuExpertKernel::forward(layer, call)`, which builds a `Team` for the
+    call and joins it on return (`team.hpp`), so no helper was alive when the census ran; the census and the class
+    comments still assumed the OpenMP team the kernel had before the persistent-Team change (`9085b3be4e`), and
+    `release_kernel_team` paused an OpenMP pool that no longer exists. The bench now holds one `Team` per group for the
+    bare phase (as `cpu_forward.cpp` already did), counts its live helpers, and joins it on entering the stack phase.
+    Side effect: `BM_bare` no longer includes a thread create and join per call, so its numbers drop against earlier
+    full-stack results (the stack-minus-bare overhead counter grows by the same amount).
+- **VNNI tier** (`exl3-vnni`, `/mnt/nvme1/exl3-vnni/stageC`, 10 rounds, medians of p50): the DSV4.1 plan at the vnni tier is
+  4-11% faster than bw (experts 1/3/5: 255 / 755 / 1256 us vs 275 / 800 / 1316 us; routed rows 2-8: 2977-12459 us vs
+  3105-13964 us) and 15-38% faster than master's generic vnni path (411 / 975 / 1606 us at experts 1/3/5). Arm labels are
+  read from the data, not recorded in the directory.
+
+### 3.15 EXL3 CPU experts on the 8280: chunks of 8, VNNI byte accumulate, claimed groups, 16 threads, SMT opt-in (2026-10-22)
+
+Branch `exl3-8280-kernels` (not merged). All bit-exact: master-build references (24 frozen layer outputs, 13 routed
+workloads incl. shared5-8 and counts8-7-6-5-4-3-2-1) at 10 and 16 workers, with and without SMT, vnni and bw; A/B dumps
+72/72 at vnni, bw, avx2, scalar; bare and full-stack validates at the host tier and bw, also with `--smt`.
+
+- **What changed.**
+  - #6: on a VNNI host one-token chunks drop `register_bytesum` and accumulate the product bytes with 4 `vpdpbusd` per
+    decoded state against byte-duplicated activations (12.5 vs 13.5 vector ops per state); bw and M >= 2 unchanged
+    (disassembly identical to master's).
+  - #5: `SGLANG_EXL3_CPU_MAX_M` 8 -> 16, chunks of up to 8 tokens; M = 5..8 through `register_band_halves` (one output
+    half per pass, 2M accumulators). The generic plan keeps chunks of at most 4 (`GENERIC_CHUNK_M`), so its build does not
+    grow (555 s for a full 16-row table vs 478 s).
+  - #1: a call whose chunks differ in token count claims 8-tile groups from an atomic counter (gate/up, down); uniform
+    calls keep the static split. It covers every call row weighting would change, so
+    `SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT` (#1b) now only reaches the generic plan and stays off.
+  - #2: `arm_env.CPU_EXPERTS_THREADS` 10 -> 16 (experts 6-21 and 28-43); driver 18-21 -> 22-25, capture helpers
+    22-25 -> 78-81 (`HELPER_CORES`).
+  - #11: `SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT` (off) adds each expert core's SMT sibling to its pool; benches take `--smt`.
+- **Bare bench, node 1, membind 1, vnni, 5 rotated rounds, p50 us medians** (`/mnt/nvme1/exl3-8280/tprod`; per-feature
+  conditions in `t10`, `t16`; range across rounds <= 6% except single outlier rounds):
+
+  | workload | master @10 (prod today) | branch @10 | branch @16 (shipped) | branch @16 + SMT | master @16 |
+  |---|---|---|---|---|---|
+  | experts 1 / 3 / 5 | 315 / 954 / 1585 | 298 / 906 / 1478 | 252 / 759 / 1255 | 232 / 820 / 1312 | 268 / 797 / 1290 |
+  | rows 2 / 3 / 4 / 8 random | 3801 / 5733 / 8673 / 13742 | 3569 / 4914 / 6744 / 11607 | 3008 / 4078 / 5701 / 9320 | 3283 / 3992 / 5706 / 9013 | 3155 / 4990 / 7416 / 12830 |
+  | shared 5 / 6 / 7 / 8 | 6373 / 6569 / 6677 / 6895 | 4285 / 4648 / 5198 / 5546 | 3073 / 3357 / 3774 / 4064 | 2568 / 2828 / 3183 / 3520 | 5033 / 4983 / 4976 / 4983 |
+
+  Shipped vs production today: one-token calls -20%, mixed rows -21..-34%, shared5-8 -41..-52%.
+- **Per feature** (vs master at the same worker count, 10 / 16 workers): #6 experts 1-5 -5..-6% / -2..-4%; #5 shared5-8
+  -32..-19% / -38..-18%; #1 rows 3/4/8 -11/-17/-13% / -17/-22/-26%; #1b -3.5/-12/-5% / -13/-18/-12%; #11 at 10 workers
+  -3..-15%, at 16 workers +2..+9% on memory-bound one-token calls (experts 3, 5, rows 2), -7..-15% on several tokens.
+- **SMT under the engine's idle policy** (full stack, keep-warm 2000 us, 1 ms gaps, `/mnt/nvme1/exl3-8280/kw`): 10 cores
+  300 / 908 / 1503 us -> with siblings 291 / 892 / 1438; 16 cores 269 / 757 / 1256 -> 236 / 819 / 1332. The same pattern as
+  the bare bench: SMT stays off, an owner A/B question once the GPU is back.
+- **Open:** a served A/B of the shipped settings (16 threads; the kernel changes ship with the extension) before
+  production restarts.
+
+### 3.16 Production's pinned tier holds every routed expert row (owner, 2026-10-22)
+
+- After the 128 GB RAM upgrade the owner asked for +90 GiB of pinned host memory. The useful maximum is every expert row:
+  all 40 layers full layers (408 slots each: 192 homed experts a node, 10 held back, 2 seam), `207244` MiB, `0:103622,1:103622`
+  (93.5 GiB over the old 111,530 MiB; derivation in `arm_env.py`). Pre-launch floor: node 1 123.10 GiB (the pinned share
+  beyond arm A's 48 GiB is `--pinned-extra-gib`), node-0 warn 117.94 GiB. `_size_prefill_share` returns 0 when no layer
+  admits (it raised, which would have refused the start). No served A/B yet; startup now reads every row from NVMe.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.
@@ -1484,6 +1746,14 @@ The safe graded+ variant gains ~0.5-1 ms/token. Not prioritised.
   NUMA move unless arm A leaves node 0 short.
 - In-server interleaved A/B harness for noise (offered; owner chose other work).
 - RAM prefetch `promote_landed`: ~42 rows land and ~20 are used per verify; a RAM-tier precision concern.
+- **TODO (owner, 2026-10-17): FP4 C4 indexer arm** (`--enable-deepseek-v4-fp4-indexer`, off in prod).
+  - What it changes: the C4 indexer K cache is stored in FP4 (per-32 UE8M0) instead of FP8 (`set_index_k_fp4`), the
+    query is quantized to FP4, and scoring uses DeepGEMM `fp8_fp4` kernels. So it changes which compressed tokens
+    attention selects; it is an accuracy change, not a pure speed knob. sglang labels it experimental.
+  - Platform: the launch gate (`serving_hook.py`) admits SM100/SM120/gfx95, so it starts on the 5090.
+  - Open: whether production's torch prefill indexer (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`) reads FP4 K pages.
+  - Plan: an arm `-prod-confcut-fp4idx` (`-prod-confcut` + the flag), long prompt against `-prod-confcut`. Compare
+    ms/token, accept length (the first sign of worse attention), where the text diverges, and VRAM freed.
 
 ## 4a. Consolidation review (2026-10-16, before the merge to master)
 

@@ -1,8 +1,8 @@
 // DriveLoad: the RAM tier's per-drive in-flight accounting, shared by every reader of the tier (design
 // docs/superpowers/specs/2026-10-09-dsv41-drive-aware-reads-design.md, section 2). With
-// SGLANG_MOE_EXPERT_MIRROR_DYNAMIC a reader also decides with it: each sub-read picks its root by the roots' reads and
+// SGLANG_EXPERT_STREAM_MIRROR dynamic a reader also decides with it: each sub-read picks its root by the roots' reads and
 // bytes in flight (ReaderCore::choose_root, change (3)), and the load counts those redirects. With
-// SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE a speculative read issues each piece only to a root with no demand sub-read in
+// SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE a speculative read issues each piece only to a root with no demand sub-read in
 // flight (ReaderCore::gate_root, change (2)).
 //
 //   DriveSlot    one mirror root's counts, one cache line: both NUMA groups' threads write it
@@ -24,6 +24,11 @@
 // indicator is up is the time it was up. The sum is exact once every reader is idle (the shutdown line); a live read
 // can land between a change and its sum update and is clamped. Only a change of an indicator reads the clock, at
 // most once per refill() or reap() turn (the caller's `now`, 0 until read).
+//
+// Fills. A read the tier makes for an eager caller (a prefill fill, a hot-cache promotion's or a full layer's
+// admission: RamTier::run_fill) is a demand read in every count above, so the root choice and the idle-drive gate treat
+// it as one. Its landed bytes are also counted apart (fill_landed), so the shutdown line separates them from the
+// service's demand misses: a root's demand bytes minus its fill bytes are the service's.
 //
 // Relaxed atomics only: no syscall but the vDSO clock read, no allocation, no lock.
 #pragma once
@@ -47,11 +52,15 @@ struct alignas(64) DriveSlot {
 static_assert(sizeof(DriveSlot) == 64, "a drive slot is one cache line");
 
 // The words of DriveLoad::snapshot: a header, then kDriveFields per root for kMaxDrives roots (roots past `roots` are
-// zero). Python's decode_drive_load (expert_stream_transport.py) reads the same layout.
+// zero), then kDriveTailFields more per root, field-major (field k of root q at kDriveTailStart + k * kMaxDrives + q).
+// The tail comes after every root so the words before it keep their places. Python's decode_drive_load
+// (expert_stream_transport.py) reads the same layout.
 constexpr int kDriveHeader = 3;  // elapsed ns since the origin, clock reads, roots
 constexpr int kDriveFields = 11;  // demand reads, spec reads, demand/spec bytes in flight, demand/spec bytes landed,
                                   // demand/spec/overlap busy ns, sub-reads redirected away from / to the root
-constexpr int kDriveLoadWords = kDriveHeader + kMaxDrives * kDriveFields;
+constexpr int kDriveTailStart = kDriveHeader + kMaxDrives * kDriveFields;
+constexpr int kDriveTailFields = 1;  // fill bytes landed (a part of the demand bytes landed)
+constexpr int kDriveLoadWords = kDriveTailStart + kMaxDrives * kDriveTailFields;
 
 class DriveLoad {
  public:
@@ -90,6 +99,11 @@ class DriveLoad {
     if (bytes > 0) slots_[root].done[kind].fetch_add(bytes, std::memory_order_relaxed);
   }
 
+  // `bytes` of a fill landed on root `root`, counted as demand by landed() too.
+  void fill_landed(int root, int64_t bytes) {
+    if (bytes > 0) fill_done_[root].fetch_add(bytes, std::memory_order_relaxed);
+  }
+
   // Root `root`'s sub-reads in flight, demand and speculative, its demand sub-reads alone, and its bytes in flight
   // (relaxed: another reader may change them as they are read; a stale value costs one choice, not correctness).
   int64_t reads_in_flight(int root) const {
@@ -110,8 +124,8 @@ class DriveLoad {
     moved_[to][1].fetch_add(1, std::memory_order_relaxed);
   }
 
-  // Writes kDriveLoadWords words: the header, then each of the first `roots` roots' fields (relaxed reads; exact once
-  // every reader is idle).
+  // Writes kDriveLoadWords words: the header, then each of the first `roots` roots' fields, then their tail fields
+  // (relaxed reads; exact once every reader is idle).
   void snapshot(int64_t* out, int64_t roots) const {
     std::fill(out, out + kDriveLoadWords, 0);
     roots = std::clamp<int64_t>(roots, 0, kMaxDrives);
@@ -135,6 +149,7 @@ class DriveLoad {
         f[6 + k] = std::clamp<int64_t>(s.busy[k].load(std::memory_order_relaxed) + (up[k] ? now : 0), 0, now);
       f[9] = moved_[q][0].load(std::memory_order_relaxed);
       f[10] = moved_[q][1].load(std::memory_order_relaxed);
+      out[kDriveTailStart + q] = fill_done_[q].load(std::memory_order_relaxed);
     }
   }
 
@@ -151,6 +166,7 @@ class DriveLoad {
 
   DriveSlot slots_[kMaxDrives];
   alignas(64) std::atomic<int64_t> moved_[kMaxDrives][2]{};  // per root: sub-reads redirected away from it, to it
+  alignas(64) std::atomic<int64_t> fill_done_[kMaxDrives]{};  // per root: fill bytes landed (fill_landed)
   const int64_t origin_;
   alignas(64) std::atomic<int64_t> clock_reads_{0};
 };

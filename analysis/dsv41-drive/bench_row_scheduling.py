@@ -59,7 +59,7 @@ import drive_conditions as dc  # noqa: E402
 
 import torch  # noqa: E402
 
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat  # noqa: E402
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat  # noqa: E402
 from sglang.srt.layers.moe.exl3_expert_layout import (  # noqa: E402
     Exl3ExpertLayout,
     build_exl3_expert_layout,

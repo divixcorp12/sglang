@@ -1,7 +1,7 @@
 """The DSpark draft's non-resident routed experts on the CPU, in the decode graph.
 
-With ``SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS`` each draft stage's ``FusedMoE`` loads its experts into host RAM and
-keeps only its resident set (``draft_resident.py``) and any fused shared expert on the GPU (``DraftResidentMoe``). The
+With ``SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS`` each draft stage's ``FusedMoE`` loads its experts into host
+RAM and keeps only its resident set (``draft_resident.py``) and any fused shared expert on the GPU (``DraftResidentMoe``). The
 rest run on the GPU node's CPU expert engine (host/cpu_experts.h with host/draft_experts.h, one team per node), or, with the
 target's CPU experts off,
 on a draft-only engine, over the draft channel (``dspark_draft_cpu.py``): the
@@ -18,7 +18,6 @@ from typing import Mapping, Optional, Sequence
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
 from sglang.srt.layers.moe.cpu_experts.service import cpu_trait_for
 from sglang.srt.layers.moe.cpu_experts.threading_config import (
@@ -27,6 +26,7 @@ from sglang.srt.layers.moe.cpu_experts.threading_config import (
     check_not_reserved,
     parse_cpu_list,
 )
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +71,9 @@ def cpu_slots(on_cpu: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
 
 
 def _ram_miss_service():
-    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
-    return Exl3RamMissService.get()
+    return ExpertEngineService.get()
 
 
 def _new_host(areas, **kw):
@@ -89,7 +89,10 @@ def _new_device(areas, on_cpu: torch.Tensor, device):
 
 
 class DraftCpuExperts:
-    """The draft stages' CPU share: the draft channel's pinned areas, its device half and the draft CPU thread."""
+    """The draft stages' CPU share: the draft channel's pinned areas, its device half and the draft CPU thread.
+
+    ``config`` is the engine config; None resolves the process's.
+    """
 
     def __init__(
         self,
@@ -99,10 +102,12 @@ class DraftCpuExperts:
         cores: Sequence[int],
         threads: int,
         device=None,
+        config: Optional[ExpertStreamConfig] = None,
     ):
         from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
-        from sglang.srt.layers.moe.exl3_ram_miss import watchdog_wait_s
 
+        if config is None:
+            config = stream_config()
         self.kernel = kernel
         self.cores = list(cores)
         self.threads = threads
@@ -118,8 +123,8 @@ class DraftCpuExperts:
         if device is None and torch.cuda.is_available():
             device = torch.device("cuda", torch.cuda.current_device())
         self.areas = DraftCpuAreas(len(keys), hidden.pop(), pin=torch.cuda.is_available())
-        fatal_wait_s = watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get())
-        if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        fatal_wait_s = config.copy.watchdog_wait_s()
+        if config.cpu_experts.enabled:
             # One team per node: the GPU node's CPU expert engine serves the draft channel too.
             self.host = _ram_miss_service().draft_host(self.areas, fatal_wait_s=fatal_wait_s)
         else:
@@ -127,7 +132,7 @@ class DraftCpuExperts:
                 self.areas,
                 cores=self.cores,
                 threads=threads,
-                keep_warm_us=envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get(),
+                keep_warm_us=config.cpu_experts.keep_warm_us,
                 fatal_wait_s=fatal_wait_s,
             )
         try:
@@ -164,6 +169,7 @@ class DraftCpuExpertsRegistry:
     def __init__(self):
         self._layers: dict[int, DraftLayer] = {}
         self._stages: set[int] = set()
+        self._format_key: Optional[str] = None
         self._runtime: Optional[DraftCpuExperts] = None
         self._lock = threading.Lock()
 
@@ -174,8 +180,12 @@ class DraftCpuExpertsRegistry:
         act_limit: Optional[float],
         *,
         layer_id: int,
+        format_key: str,
     ) -> int:
-        """Add one stage; returns its key. Every stage must share one activation limit (one kernel trait)."""
+        """Add one stage of expert format ``format_key``; returns its key.
+
+        Every stage must share one activation limit and one format (one kernel trait).
+        """
         with self._lock:
             if self._runtime is not None:
                 raise RuntimeError("a DSpark draft stage registered after the CPU experts started")
@@ -184,6 +194,11 @@ class DraftCpuExpertsRegistry:
                 raise ValueError(
                     f"DSpark draft stages disagree on the activation limit: {sorted(limits)} and {act_limit}"
                 )
+            if self._format_key is not None and format_key != self._format_key:
+                raise ValueError(
+                    f"DSpark draft stages disagree on the expert format: {self._format_key!r} and {format_key!r}"
+                )
+            self._format_key = format_key
             key = len(self._layers)
             self._stages.add(layer_id)
             self._layers[key] = DraftLayer(slabs, on_cpu, act_limit)
@@ -201,35 +216,37 @@ class DraftCpuExpertsRegistry:
                     raise RuntimeError("prepare the DSpark draft before capture (DRAFT_CPU_EXPERTS.prepare())")
                 if not self._layers:
                     raise RuntimeError("no DSpark draft stage registered for CPU experts")
-                path = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
+                config = stream_config()
+                path = config.draft.resident_path
                 extra = sorted(set(load_resident_set(path)) - self._stages) if path else []
                 if extra:
                     raise ValueError(
                         f"DSpark draft resident set {path} lists stages {extra} that this draft does not have "
                         f"(it has {sorted(self._stages)}); recalibrate it from this draft's routes"
                     )
-                if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+                if config.cpu_experts.enabled:
                     # Node 0's CPU expert team runs the draft: no cores of its own (the gate refuses named ones).
                     cores, threads = [], 0
                 else:
-                    named = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get()
+                    named = config.draft.cores
                     if named:
                         cores = parse_cpu_list(named)
                         for core in cores:
                             check_not_reserved(core)
-                        threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get() or len(cores)
+                        threads = config.draft.threads or len(cores)
                     else:
                         # The plan the RAM-miss service resolves too, so the draft and its threads never share a core.
                         cores = list(
                             ThreadingConfig.from_env(
-                                cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
+                                cpu_experts=config.cpu_experts.enabled,
                                 device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+                                config=config,
                             ).draft_cpus
                         )
                         threads = len(cores)
                     check_engine_cores(cores, threads)
-                kernel = draft_kernel_for("exl3", next(iter(self._layers.values())).act_limit)
-                self._runtime = DraftCpuExperts(kernel, self._layers, cores=cores, threads=threads)
+                kernel = draft_kernel_for(self._format_key, next(iter(self._layers.values())).act_limit)
+                self._runtime = DraftCpuExperts(kernel, self._layers, cores=cores, threads=threads, config=config)
                 atexit.register(self.close)
                 logger.info(
                     "DSpark CPU experts: %d draft stages on %s; %s experts on the CPU",

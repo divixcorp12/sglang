@@ -1,6 +1,7 @@
 // Output-tile ownership only: changing the owner never changes a tile's arithmetic.
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 #ifndef EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT
@@ -62,6 +63,20 @@ inline void assign_row_weighted_gemvs(int worker, int num_workers, int total, in
         if (t0 < t1) gemv(j, t0, t1);
         prefix += int64_t(groups) * m;
     }
+}
+
+// Dynamic claiming for a call whose chunks differ in token count, where no static split balances the workers (a
+// chunk's cost is neither its tile count nor its rows): each worker takes the next unclaimed 8-tile group of any of
+// the `total` GEMVs from `next` until none is left. Every group has one owner, and a tile's arithmetic does not
+// depend on it. `next` starts at 0 for the phase (ForwardPlan::prepare_scratch).
+template <typename Gemv>
+inline void claim_groups(int& next, int total, int tiles_n, Gemv gemv)
+{
+    std::atomic_ref<int> counter(next);
+    const int groups = tiles_n / 8;
+    for (int u = counter.fetch_add(1, std::memory_order_relaxed); u < total * groups;
+         u = counter.fetch_add(1, std::memory_order_relaxed))
+        gemv(u / groups, u % groups * 8, u % groups * 8 + 8);
 }
 
 // `weighted` is the layer's choice (SglangExl3CpuParams::row_weighted): one kernel serves the target's and the

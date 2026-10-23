@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.layer_major.state_store import FieldSpec, StateStore
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -149,7 +150,11 @@ class DeepseekV4LayerMajorAdapter:
             positions = torch.arange(prefix_len, seq_len, device=full.device)
             self.allocator.map_ring_positions(full, positions, ring)
             for span in spans:
-                fb = self._chunk_forward_batch(schedule_batch, req, slot, span, last=span is spans[-1])
+                # A tail span runs the late layers, where DSpark's aux hiddens are captured (FULL from its worker).
+                fb = self._chunk_forward_batch(
+                    schedule_batch, req, slot, span, last=span is spans[-1],
+                    capture_hidden_mode=forward_batch.capture_hidden_mode if span.index in tail_indices else None,
+                )
                 # Mapping before init_forward_metadata: the tail's swa_out_cache_loc is translated through the
                 # mapping when metadata is built.
                 self.backend.init_forward_metadata(fb)
@@ -171,7 +176,7 @@ class DeepseekV4LayerMajorAdapter:
             raise
         return handle
 
-    def _chunk_forward_batch(self, batch, req, slot, span, *, last):
+    def _chunk_forward_batch(self, batch, req, slot, span, *, last, capture_hidden_mode=None):
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 
         device = self.runner.device
@@ -198,7 +203,9 @@ class DeepseekV4LayerMajorAdapter:
             n = self.model.engram_hasher.max_ngram_size - 1
             sub.engram_history = torch.tensor([engram_history(req.full_untruncated_fill_ids, span.start, n)],
                                               dtype=torch.int32, device=device)
-        return ForwardBatch.init_new(sub, self.runner, capture_hidden_mode=CaptureHiddenMode.NULL,
+        if capture_hidden_mode is None:
+            capture_hidden_mode = CaptureHiddenMode.NULL
+        return ForwardBatch.init_new(sub, self.runner, capture_hidden_mode=capture_hidden_mode,
                                      return_hidden_states_before_norm=False)
 
     # --- the strategy's loop ----------------------------------------------------------------------------------------
@@ -210,8 +217,6 @@ class DeepseekV4LayerMajorAdapter:
         return len(handle.spans)
 
     def run_layer(self, handle: _Pass, layer_id: int, chunk: int, store: StateStore) -> None:
-        from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-
         span = handle.spans[chunk]
         fb = handle.forward_batches[chunk]
         offset = span.start - int(handle.schedule_batch.prefix_lens[0])
@@ -228,24 +233,12 @@ class DeepseekV4LayerMajorAdapter:
         # can then publish tail-only masks; other chunks have none and rely on layer_major_skip_candidates.
         tail_metadata = handle.tail_by_span.get(span.index)
         self.backend.install_forward_metadata(meta, tail_metadata=tail_metadata)
-        layer = self.model.layers[layer_id]
-        if layer.engram is not None:
-            before_engram = hidden
-            hidden = layer.engram(hidden, handle.hash_ids[chunk][:, layer.engram.layer_hash_index], fb,
-                                  cp_all_tokens=False)
-            if self.model.config.model_type == "deepseek_v41" and self.model.config.vision_n_layers > 0:
-                hidden = torch.where(
-                    (fb.input_ids == self.model.config.image_token_id)[:, None, None],
-                    before_engram,
-                    hidden,
-                )
-        with get_global_expert_distribution_recorder().with_current_layer(layer_id):
-            # The chunked path's own arguments under bounded replay: its tail makes next_combined None (4549).
-            hidden, prev_pre = layer.forward_hc_pre_from_prev(
-                positions=fb.positions, hidden_states=hidden, input_ids=fb.input_ids, forward_batch=fb,
-                input_ids_global=fb.input_ids, prev_pre=prev_pre, precomputed_attn=None, next_norm=None,
-                next_input=[], combined_attn=None, normalized_attn=None, next_combined=None,
-            )
+        # The model's own layer loop over one early layer: it applies engram, records the expert distribution and
+        # drives the CUDA residual boundary. The range never reaches late_layer_start, so no tail is entered.
+        hidden, prev_pre, _ = self.model._forward_layers_hc_pre_from_prev(
+            fb.positions, hidden, fb, fb.input_ids, fb.input_ids, False, [],
+            layer_ids=range(layer_id, layer_id + 1), prev_pre_in=prev_pre, hash_ids_in=handle.hash_ids[chunk],
+        )
         store.write_from("hidden", offset, hidden, stream=None)
         store.write_from("prev_pre", offset, prev_pre, stream=None)
         # Top-k written in place by index-source layers travels with the chunk's metadata.
@@ -254,10 +247,15 @@ class DeepseekV4LayerMajorAdapter:
     def finish_pass(self, handle: _Pass, store: StateStore) -> Any:
         prefix_len = int(handle.schedule_batch.prefix_lens[0])
         tail_spans = tail_run_spans(handle.spans, window=DSV4_WINDOW, prefix_len=prefix_len)
-        # C1: run every needed span's own tail, oldest first; only the true final span's output returns.
-        for span in tail_spans[:-1]:
-            self._run_late_layers(handle, store, span)
-        output = self._run_late_layers(handle, store, tail_spans[-1])
+        # C1: run every needed span's own tail, oldest first; only the true final span's logits return.
+        outputs = [self._run_late_layers(handle, store, span) for span in tail_spans]
+        output = outputs[-1]
+        # Tail row indices are per span; the extend's consumer (DSpark's KV injection) indexes the whole suffix.
+        indices = [out.hidden_states_token_indices + (span.start - prefix_len) for out, span in zip(outputs, tail_spans)]
+        output.hidden_states_token_indices = torch.cat(indices)
+        if output.hidden_states is not None:
+            # Every span a chunked prefill would have run its own tail for: the draft's window needs all of them.
+            output.hidden_states = torch.cat([out.hidden_states for out in outputs])
         self._finalize_ring(handle)
         return output
 
@@ -288,7 +286,7 @@ class DeepseekV4LayerMajorAdapter:
             req.swa_branching_seqlen = None
         self.allocator.finalize_ring(handle.extend_full_locs, extend_start=prefix_len, keep_from=keep_from,
                                      ring=handle.ring)
-        req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, keep_from)
+        req.kv.set_evicted_seqlen(ComponentType.SWA, max(req.kv.get_evicted_seqlen(ComponentType.SWA), keep_from))
         handle.finalized = True
 
     def _insert_keep_from(self, req: Req, handle: _Pass, *, prefix_len: int, seq_len: int) -> tuple[int, bool]:

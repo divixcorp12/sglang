@@ -6,12 +6,12 @@
 # Env: HOT_GPU_MB (default 14336), CAPTURE=1 to record expert prediction training data,
 # OVERLAP_SCHEDULE=1 to run the overlap scheduler (default 0 passes --disable-overlap-schedule).
 # HOT_INSERT_ON_MISS=1 selects insert-on-miss residency (decode boundary every forward), HOT_INSERT_ON_MISS_DECAY its decay.
-# HOT_INSERT_ON_MISS_STAGE=0|1|2 selects the stage instead (2 = miss copies land directly in victim slots) and
-# exports SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE; without it the retired boolean is exported unchanged.
+# HOT_INSERT_ON_MISS_STAGE=0|1|2 selects the stage instead (2 = miss copies land directly in victim slots). Either way
+# the script exports SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE (the old boolean 1 is stage 1).
 # HOT_FUSED_INSERT=1 runs stage 1's boundary insert copies through the fused masked kernel; it exports
-# SGLANG_MOE_HOT_FUSED_INSERT only when set, so an existing arm's exact-match environment check is unchanged.
+# SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT only when set, so an existing arm's exact-match environment check is unchanged.
 # FUSED_PLAN=1 runs graph-gather route planning through the fused kernel; it exports
-# SGLANG_MOE_EXPERT_FUSED_PLAN only when set, on the same terms. Unset, arms run the generic planner.
+# SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN only when set, on the same terms. Unset, arms run the generic planner.
 # NEXTN=1 adds NEXTN speculative decoding with top-k 1 and NEXTN_DRAFT_TOKENS (default 4) draft tokens,
 # one fewer draft step; the manifest records the draft tokens, 0 when off.
 # CHUNKED_PREFILL sets --chunked-prefill-size and --max-prefill-tokens (default 4096).
@@ -43,9 +43,6 @@ model_shapes=${MODEL_SHAPES:-unknown}
 model_top_k=${MODEL_TOP_K:-10}
 provenance_only=${PREFETCH_PROVENANCE_ONLY:-0}
 insert_on_miss=${HOT_INSERT_ON_MISS_STAGE:-${HOT_INSERT_ON_MISS:-0}}
-# Stage 2 exports the stage variable; stage 0/1 keep exporting the retired boolean verbatim, so an
-# existing matrix's exact-match environment check still sees the environment it recorded.
-insert_on_miss_var=$([ -n "${HOT_INSERT_ON_MISS_STAGE:-}" ] && echo SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE || echo SGLANG_MOE_HOT_INSERT_ON_MISS)
 insert_on_miss_decay=${HOT_INSERT_ON_MISS_DECAY:-0.98}
 case "${insert_on_miss,,}" in
     2) insert_on_miss=2 ;;
@@ -66,14 +63,14 @@ overlap_schedule=${OVERLAP_SCHEDULE:-0}
 # environment it recorded; only an arm that asks for the fused kernel carries the variable.
 fused_insert=${HOT_FUSED_INSERT:-0}
 case "${fused_insert,,}" in
-    1|true|yes|y) fused_insert=1; fused_insert_env=(SGLANG_MOE_HOT_FUSED_INSERT=1) ;;
+    1|true|yes|y) fused_insert=1; fused_insert_env=(SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT=1) ;;
     0|false|no|n) fused_insert=0; fused_insert_env=() ;;
     *) echo "HOT_FUSED_INSERT must be a boolean" >&2; exit 2 ;;
 esac
 # Manifests before this flag existed record fused_plan=1 as a literal; those arms ran the generic planner.
 fused_plan=${FUSED_PLAN:-0}
 case "${fused_plan,,}" in
-    1|true|yes|y) fused_plan=1; fused_plan_env=(SGLANG_MOE_EXPERT_FUSED_PLAN=1) ;;
+    1|true|yes|y) fused_plan=1; fused_plan_env=(SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN=1) ;;
     0|false|no|n) fused_plan=0; fused_plan_env=() ;;
     *) echo "FUSED_PLAN must be a boolean" >&2; exit 2 ;;
 esac
@@ -228,52 +225,69 @@ cd "$worktree"
 commit=$(git rev-parse HEAD)
 write_provenance
 
+# The shadow-prefetch and trace settings are group envs: one JSON object each (removed_env.py names the keys).
+shadow_prefetch_json=$(
+    SP_PREDICTOR="$predictor" SP_MODEL_DIR="$prefetch_model_dir" SP_CANDIDATES="$prefetch_candidates" \
+    SP_BUDGET="$prefetch_budget" SP_PULL_MODE="$prefetch_pull_mode" SP_RECALL="$shadow_recall" \
+    SP_CALIBRATION="$calibration" SP_CALIBRATION_FILE="$run_dir/pull-calibration.json" \
+    SP_CALIBRATION_PROVENANCE="$calibration_provenance" SP_PREDICTORS="$predictors" \
+    python3 -c '
+import json, os
+e = os.environ
+print(json.dumps({
+    "predictor": e["SP_PREDICTOR"], "model_dir": e["SP_MODEL_DIR"], "candidates": int(e["SP_CANDIDATES"]),
+    "budget": int(e["SP_BUDGET"]), "pull_mode": e["SP_PULL_MODE"], "shadow_recall": e["SP_RECALL"] == "1",
+    "calibration": e["SP_CALIBRATION"] == "1", "calibration_file": e["SP_CALIBRATION_FILE"],
+    "calibration_provenance": e["SP_CALIBRATION_PROVENANCE"],
+    "predictors": [p for p in e["SP_PREDICTORS"].split(",") if p],
+}))'
+)
+trace_json=$(
+    TR_HOT_METRICS="$run_dir/hot-cache.metrics.jsonl" TR_PREDICTOR_METRICS="$run_dir/expert-prediction.metrics.jsonl" \
+    TR_CAPTURE_DIR="$capture_dir" \
+    python3 -c '
+import json, os
+e = os.environ
+print(json.dumps({
+    "hot_metrics_file": e["TR_HOT_METRICS"], "predictor_log_interval": 100,
+    "predictor_metrics_file": e["TR_PREDICTOR_METRICS"], "predictor_capture": {"dir": e["TR_CAPTURE_DIR"]},
+}))'
+)
+
 exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock "${launch_env[@]}" \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \
     PYTHONUNBUFFERED=1 \
     TMPDIR="$work/runtime-tmp" \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1 \
-    SGLANG_MOE_EXPERT_STREAM=1 \
-    SGLANG_MOE_EXPERT_FILE_DIR="$expert_cache" \
-    SGLANG_MOE_EXPERT_FILE_READER=uring_direct \
+    SGLANG_EXPERT_STREAM_ENABLE=1 \
+    SGLANG_EXPERT_STREAM_FILE_CACHE_DIR="$expert_cache" \
+    SGLANG_EXPERT_STREAM_FILE_READER=uring_direct \
     SGLANG_QWEN4_PLE_FILE_READER=uring \
     SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY=1 \
     SGLANG_FILE_CACHE_MODEL_PATH="$cache_model_path" \
-    SGLANG_MOE_HOT_GPU_MB="$hot_gpu_mb" \
-    SGLANG_MOE_PINNED_HOST_MB=0 \
-    SGLANG_MOE_EXPERT_HOST_ARENA=1 \
-    SGLANG_MOE_EXPERT_GRAPH_GATHER=1 \
-    SGLANG_MOE_HOT_SEED="$expert_seed" \
-    SGLANG_MOE_HOT_DYNAMIC=1 \
-    SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS="$hot_update_decode_forwards" \
-    "$insert_on_miss_var"="$insert_on_miss" \
+    SGLANG_EXPERT_STREAM_HOT_GPU_MB="$hot_gpu_mb" \
+    SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0 \
+    SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA=1 \
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1 \
+    SGLANG_EXPERT_STREAM_HOT_SEED="$expert_seed" \
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC=1 \
+    SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS="$hot_update_decode_forwards" \
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE="$insert_on_miss" \
     ${fused_insert_env[@]+"${fused_insert_env[@]}"} \
     ${fused_plan_env[@]+"${fused_plan_env[@]}"} \
-    SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY="$insert_on_miss_decay" \
-    SGLANG_MOE_HOT_DECAY_TOKENS=1 \
-    SGLANG_MOE_HOT_PROMOTION_SIGMAS=0 \
-    SGLANG_MOE_HOT_BENEFIT_RATIO=2 \
-    SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS=0 \
-    SGLANG_MOE_HOT_LOG_INTERVAL=100 \
-    SGLANG_MOE_HOT_METRICS_FILE="$run_dir/hot-cache.metrics.jsonl" \
-    SGLANG_MOE_GPU_RESIDENCY_UPDATE=1 \
-    SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS=64 \
-    SGLANG_MOE_PREFETCH_MAX_CANDIDATES=0 \
-    SGLANG_MOE_EXPERT_COPY_BACKEND=dma \
-    SGLANG_MOE_EXPERT_PREDICTOR="$predictors" \
-    SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL=100 \
-    SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE="$run_dir/expert-prediction.metrics.jsonl" \
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR="$capture_dir" \
-    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR="$predictor" \
-    SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR="$prefetch_model_dir" \
-    SGLANG_MOE_EXPERT_PREFETCH_BUDGET="$prefetch_budget" \
-    SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES="$prefetch_candidates" \
-    SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE="$prefetch_pull_mode" \
-    SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL="$shadow_recall" \
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION="$calibration" \
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE="$run_dir/pull-calibration.json" \
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE="$calibration_provenance" \
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY="$insert_on_miss_decay" \
+    SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS=1 \
+    SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS=0 \
+    SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO=2 \
+    SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS=0 \
+    SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL=100 \
+    SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1 \
+    SGLANG_EXPERT_STREAM_GPU_RESIDENCY_MAX_PROMOTIONS=64 \
+    SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES=0 \
+    SGLANG_EXPERT_STREAM_COPY_MODE=dma \
+    SGLANG_EXPERT_STREAM_SHADOW_PREFETCH="$shadow_prefetch_json" \
+    SGLANG_EXPERT_STREAM_TRACE="$trace_json" \
     SGLANG_TORCH_PROFILER_DIR="$run_dir/profiles" \
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$run_dir/profiles/expert-distribution" \
     "${trace_env[@]}" \

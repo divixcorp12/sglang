@@ -132,8 +132,12 @@ struct CpuExpertConfig {
   int64_t keep_warm_ns = 0;  // how long after each job the idle team runs register work instead of PAUSE
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
-  bool two_stage = false;    // SGLANG_DSV41_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job (CpuJob::staged)
-  // SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS: a weight per mirror root for each span of a two-span row
+  bool two_stage = false;    // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job
+                             // (CpuJob::staged)
+  // SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (ForwardCall::store_first), not a zeroing of
+  // the job's token rows on this thread followed by an accumulating forward.
+  bool store_out = false;
+  // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights: a weight per mirror root for each span of a two-span row
   // (empty: the mirror's shares). The tier hands them to its readers (RamTier::enable_cpu_experts).
   std::vector<double> span_weights[2];
 };
@@ -159,6 +163,9 @@ struct CpuExpertConfig {
 /// With a DSpark draft source (attach_draft, draft_experts.h) the thread serves the draft channel too, one job at a
 /// time with the target's, the target's ring first. A draft-only engine (CpuExpertConfig::draft_only) has only that
 /// source.
+// The int64 moments per output part of the engine's live fit (BasicCpuExpertEngine::fit_moments).
+constexpr int kCpuFitMoments = 9;
+
 template <BuildPolicy Build>
 class BasicCpuExpertEngine {
  public:
@@ -225,18 +232,34 @@ class BasicCpuExpertEngine {
   /// inputs are left as they are: the timing does not depend on them. The tables are the pinned rows the Python
   /// service owns and the post kernel writes (cpu_token_table.h); the const is only the engine's own read-only view of
   /// them.
-  void write_calibration_table(int64_t row, int64_t tokens) const {
+  ///
+  /// `per_lane` above 0 routes each lane by that many consecutive tokens from token lane % tokens instead (the split
+  /// model's calibration, split_calibration.h kSplitCellHit): a job of k lanes then runs k * per_lane (token, expert)
+  /// pairs.
+  void write_calibration_table(int64_t row, int64_t tokens, int64_t per_lane = 0) const {
     constexpr int64_t kLanes = wire::Wire::kLanes;
     if (tokens < 1 || tokens > config_.tokens)
       throw std::runtime_error(
           prefix_ + "calibration tokens " + std::to_string(tokens) + " is not within the rows' 1.." +
           std::to_string(config_.tokens));
+    if (per_lane < 0 || per_lane > tokens)
+      throw std::runtime_error(
+          prefix_ + "calibration tokens per lane " + std::to_string(per_lane) + " is not within 0.." +
+          std::to_string(tokens));
     if (tokens == 1) return;
     uint8_t* table = const_cast<uint8_t*>(config_.x_base) + row * config_.x_stride + config_.tokens * config_.x_token_bytes;
     const auto store = [](uint8_t* at, uint32_t v) { std::memcpy(at, &v, sizeof v); };
+    const auto mask = [&](int64_t lane) {
+      if (per_lane == 0) return calibration_lane_mask(lane, tokens);
+      uint32_t bits = 0;
+      for (int64_t t = 0; t < per_lane; ++t)
+        bits |= 1u << ((lane + t) % tokens);
+      return bits;
+    };
     store(table, static_cast<uint32_t>(tokens));
+    store(table + CpuTokenTable::kLiveTokens, static_cast<uint32_t>(tokens));
     for (int64_t lane = 0; lane < kLanes; ++lane)
-      store(table + CpuTokenTable::kHeaderBytes + 4 * lane, calibration_lane_mask(lane, tokens));
+      store(table + CpuTokenTable::kHeaderBytes + 4 * lane, mask(lane));
     for (int64_t t = 0; t < tokens; ++t)
       for (int64_t lane = 0; lane < kLanes; ++lane)
         store(table + CpuTokenTable::kHeaderBytes + 4 * kLanes + 4 * (t * kLanes + lane), std::bit_cast<uint32_t>(1.0f));
@@ -312,6 +335,26 @@ class BasicCpuExpertEngine {
   }
   int64_t stage_two_wait_ns() const {
     return stage_two_wait_ns_.load(std::memory_order_relaxed);
+  }
+
+  /// The split model's live fit (split_model_calibration.py, SplitModelRefiner): per output part (0 hit jobs, 1 miss
+  /// jobs), the least-squares moments of every unstaged target job since start, kFitMoments int64 each: jobs, then the
+  /// sums of k, pairs, k*k, k*pairs, pairs*pairs, ns, k*ns and pairs*ns, where k is the job's lanes, pairs its (token,
+  /// expert) pairs and ns its forward time. Any thread: a consistent snapshot (a seqlock against the engine's update).
+  static constexpr int kFitMoments = kCpuFitMoments;
+  void fit_moments(int64_t* out) const {
+    for (;;) {
+      const uint32_t before = fit_version_.load(std::memory_order_acquire);
+      if (before & 1u) {
+        _mm_pause();
+        continue;
+      }
+      for (int part = 0; part < 2; ++part)
+        for (int i = 0; i < kFitMoments; ++i)
+          out[part * kFitMoments + i] = fit_[part][i].load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (fit_version_.load(std::memory_order_relaxed) == before) return;
+    }
   }
 
   static constexpr const char* kDraftPrefix = DraftExperts<Build>::kPrefix;
@@ -446,20 +489,28 @@ class BasicCpuExpertEngine {
         reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
     call.accumulate = job.accumulate;
     call.cores = config_.cores;
+    call.store_first = config_.store_out;
     if (job.staged) {
       call.stage_two = &BasicCpuExpertEngine::stage_two;
       call.stage_two_ctx = this;
       stage_job_ = &job;
       stage_called_ = false;
     }
+    int64_t pairs = job.k;  // the job's (token, expert) pairs, for the split model's fit: one a lane on a one-token row
     if (job.per_token && config_.tokens > 1) {
       call.rows = static_cast<int32_t>(expand_tokens(job, static_cast<const uint8_t*>(call.x)));
       call.slots = token_slots_.data();
       call.weights = token_weights_.data();
+      pairs = 0;
+      for (int i = 0; i < call.rows * call.k; ++i)
+        pairs += call.slots[i] >= 0;
       // A token that routes none of the lanes must read 0, whatever an earlier record left: zero the rows here rather
-      // than trust the kernel's overwrite, then accumulate.
-      if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
-      call.accumulate = true;
+      // than trust the kernel's overwrite, then accumulate. With store_out the kernel's overwrite does it (a store per
+      // token's first sum, zeros for the rest): the same bits, without this thread zeroing every row first.
+      if (!config_.store_out) {
+        if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
+        call.accumulate = true;
+      }
     }
     if constexpr (Build::kMetrics) {
       if (trace_.enabled()) {
@@ -479,11 +530,13 @@ class BasicCpuExpertEngine {
     // A kernel built before ForwardCall::stage_two would run Down on rows still landing: refuse its output.
     if (job.staged && !stage_called_)
       fail_stop(prefix_ + "kernel " + config_.kernel->name() + " never waited for row " + std::to_string(job.row) +
-                "'s second stage (rebuild it with SGLANG_DSV41_CPU_TWO_STAGE's ForwardCall)");
+                "'s second stage (rebuild it with SGLANG_EXPERT_STREAM_CPU_TWO_STAGE's ForwardCall)");
     const int64_t end = now_ns();
     add(compute_ns_, end - start);
     add(jobs_done_, 1);
     add(lanes_done_, job.k);
+    // A staged job's time includes its wait for the second stage's read: not a forward's cost.
+    if (!job.staged) record_fit(job.part == 0 ? 0 : 1, job.k, pairs, end - start);
     if constexpr (Build::kMetrics) trace_.resources("cpu_faults_end", "cpu_switches_end", job.row, 0, job.seq);
     if constexpr (Build::kMetrics) trace_.emit("cpu_end", job.row, 0, job.seq, -1, job.part, job.k);
     done_.store(job.seq, std::memory_order_release);
@@ -592,6 +645,17 @@ class BasicCpuExpertEngine {
     counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
   }
 
+  /// Adds one job to part's fit moments (fit_moments), inside the seqlock's odd version.
+  void record_fit(int part, int64_t k, int64_t pairs, int64_t ns) {
+    const uint32_t version = fit_version_.load(std::memory_order_relaxed);
+    fit_version_.store(version + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const int64_t terms[kFitMoments] = {1, k, pairs, k * k, k * pairs, pairs * pairs, ns, k * ns, pairs * ns};
+    for (int i = 0; i < kFitMoments; ++i)
+      add(fit_[part][i], terms[i]);
+    fit_version_.store(version + 2, std::memory_order_release);
+  }
+
   CpuExpertConfig config_;
   std::string prefix_;
   std::string thread_name_;
@@ -609,6 +673,9 @@ class BasicCpuExpertEngine {
   std::atomic<int64_t> lanes_done_{0};
   std::atomic<int64_t> compute_ns_{0};
   std::atomic<int64_t> staged_jobs_{0}, stage_two_waits_{0}, stage_two_wait_ns_{0};
+  // The split model's fit moments per part (fit_moments) and their seqlock version, odd while the thread updates them.
+  std::array<std::array<std::atomic<int64_t>, kFitMoments>, 2> fit_{};
+  std::atomic<uint32_t> fit_version_{0};
   // Staged jobs: each one's gate, at its sequence modulo the ring (the tier owner stores, the thread reads), and the job
   // the thread runs now with whether its kernel called stage_two (this thread only).
   std::array<std::atomic<uint32_t>, kRing> stage_gates_{};

@@ -1,6 +1,6 @@
 """Which DSpark draft experts stay on the GPU: a calibration file made from a routes probe.
 
-The probe (``SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH``) logs each draft MoE call's topk ids per stage (``layer_id``);
+The probe (``SGLANG_EXPERT_STREAM_TRACE``'s ``draft_routes_path``) logs each draft MoE call's topk ids per stage (``layer_id``);
 ``top_n_resident_set`` keeps each stage's N most-routed experts. Every other routed expert of the stage runs on the
 CPU (``cpu_experts/draft.py``).
 """
@@ -8,9 +8,9 @@ CPU (``cpu_experts/draft.py``).
 import collections
 import json
 import threading
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import DraftConfig, stream_config
 
 VERSION = 1
 
@@ -64,8 +64,11 @@ def load_resident_set(path: str) -> dict[int, frozenset[int]]:
     return stages
 
 
-def resident_for(layer_id: int) -> frozenset[int]:
-    path = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
+def resident_for(layer_id: int, *, config: Optional[DraftConfig] = None) -> frozenset[int]:
+    """Stage ``layer_id``'s resident experts from ``draft.resident_path``; ``config`` None resolves the process's."""
+    if config is None:
+        config = stream_config().draft
+    path = config.resident_path
     if not path:
         return frozenset()
     with _lock:

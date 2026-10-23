@@ -16,7 +16,7 @@ arm() {  # arm NAME OVERRIDES
         wait_gpu; say "traced arm $name overrides=[$ov]"
         DSV41_SESSION_INDICES=${TRACE_SESSION:-4} NSYS_TMPDIR=/mnt/nvme1/nsys-tmp NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node NSYS_GPU_METRICS=0 \
             EXPECT_SHA=$SHA bash benchmarks/dsv41_baseline/run_arm.sh $name 30032 $ov \
-            SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:45056 > $OUT/arm-$name.log 2>&1
+            SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:57344,1:45056 > $OUT/arm-$name.log 2>&1
         rc=$?
         grep -q "cc-gpu.lock is held by another GPU job" $OUT/arm-$name.log || break
         say "$name lost the GPU lock race; retrying"; sleep 60

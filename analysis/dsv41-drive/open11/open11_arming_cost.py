@@ -41,7 +41,7 @@ class Rig:
     """The Service harness of test_exl3_lease_kernels_cuda.py, parameterised by lease on/off."""
 
     def __init__(self, tmp, lease: bool, timeout_ms=2000):
-        from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+        from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3

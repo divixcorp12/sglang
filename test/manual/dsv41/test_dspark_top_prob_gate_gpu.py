@@ -3,6 +3,7 @@ static epilogue's capped accept, and a captured 6-token verify whose cut rows ro
 chain.
 """
 
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -20,8 +21,22 @@ TOP_K, TOKENS, LANES, EXPERTS = 6, 6, 8, 48
 SINGLE_RANK = SimpleNamespace(world_size=1)
 
 
-def test_the_sharded_greedy_step_reduces_the_softmax_top_probability_with_its_argmax():
-    from sglang.kernels.ops.speculative.dspark.sharded_greedy import sharded_greedy_step
+def test_the_markov_step_logits_give_the_softmax_top_probability_with_the_argmax():
+    from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+    from sglang.srt.speculative.dspark_components.dspark_top_prob_gate import step_top_prob
+
+    def markov_step(base, bias, logits_out):
+        return MarkovSampleStep.execute(
+            base_logits=base,
+            bias=bias,
+            temperatures=torch.zeros(base.shape[0], device="cuda"),
+            key=0,
+            offset=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            step=0,
+            step_dtype=torch.float32,
+            logits_out=logits_out,
+            has_sampled_rows=False,
+        )
 
     generator = torch.Generator(device="cuda").manual_seed(3)
     rows, vocab = 4, 129_280  # the V4.1 vocabulary: 32 blocks, the last one partial
@@ -33,17 +48,20 @@ def test_the_sharded_greedy_step_reduces_the_softmax_top_probability_with_its_ar
     want_tokens = torch.argmax(base + bias.float(), dim=-1)
     want_probs = torch.softmax(base + bias.float(), dim=-1).amax(dim=-1)
 
-    plain = sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0)
-    # A column of a [rows, gamma] buffer, as the draft sampler passes it.
+    plain = markov_step(base, bias, None)
+    # A column of a [rows, gamma] buffer, as the draft block passes it.
     probs = torch.full((rows, 5), -1.0, device="cuda")
-    tokens = sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0, top_prob_out=probs[:, 2])
+    kept = torch.empty((rows, vocab), device="cuda")
+    tokens = markov_step(base, bias, kept)
+    probs[:, 2].copy_(step_top_prob(kept))
     assert torch.equal(tokens, plain) and torch.equal(tokens, want_tokens)
     assert torch.allclose(probs[:, 2], want_probs, rtol=1e-4, atol=1e-7)
     assert bool((probs[:, [0, 1, 3, 4]] == -1.0).all())
     assert float(probs[1, 2]) > 0.999
 
     base[3, 17] = float("nan")
-    sharded_greedy_step(bias, base, group=SINGLE_RANK, vocab_start=0, top_prob_out=probs[:, 2])
+    markov_step(base, bias, kept)
+    probs[:, 2].copy_(step_top_prob(kept))
     assert torch.isnan(probs[3, 2]) and not bool(torch.isnan(probs[:3, 2]).any())
 
 
@@ -104,31 +122,75 @@ def test_the_one_kernel_dead_row_masking_matches_its_torch_definition(id_dtype):
         assert torch.equal(got_routes.cpu(), want_routes), live
 
 
+@pytest.mark.parametrize("live", [1, 2, TOKENS])
+def test_the_dedup_plan_leaves_dead_rows_out_of_the_route_counts_and_nothing_else(live):
+    """A verify's masked routes (dead rows repeat row 0's experts) through the dedup plan with the dead mask: the
+    residency route counts are the live rows' alone, and the remap, the scratch rows and every graph and outcome
+    counter equal the plan without the mask. With no row dead the mask is the identity. Mutant: count a dead route
+    -- red for live < 6."""
+    from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes_fused
+    from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows, mask_dead_routes
+
+    generator = torch.Generator(device="cpu").manual_seed(9)
+    raw = torch.stack([torch.randperm(EXPERTS, generator=generator)[:TOP_K] for _ in range(TOKENS)])
+    dead_rows = VerifyDeadRows(max_rows=TOKENS, device="cuda")
+    dead_rows.set_live_rows(torch.tensor([live], device="cuda"))
+    ids, _ = mask_dead_routes(
+        topk_ids=raw.cuda(), topk_weights=torch.ones(raw.shape, device="cuda"), dead=dead_rows.dead
+    )
+    expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.int64, device="cuda")
+    expert_to_slot[::3] = torch.arange(EXPERTS // 3, device="cuda")  # a third of the experts hot
+    routes = TOKENS * TOP_K
+
+    def plan(dead):
+        out = dict(
+            source_rows_out=torch.full((routes,), -1, dtype=torch.int64, device="cuda"),
+            slots_out=torch.full((routes,), -1, dtype=torch.int32, device="cuda"),
+            count_out=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            graph_counters=torch.zeros(2, dtype=torch.int64, device="cuda"),
+            graph_unique_counters=torch.zeros(2, dtype=torch.int64, device="cuda"),
+            route_counts=torch.zeros(EXPERTS, dtype=torch.float32, device="cuda"),
+        )
+        out["remap"] = plan_graph_routes_fused(
+            ids.reshape(-1), expert_to_slot, 100, torch.int64, dedup=True, dead_rows=dead, row_top_k=TOP_K, **out
+        )
+        return out
+
+    masked, plain = plan(dead_rows.dead), plan(None)
+    for name, tensor in plain.items():
+        if name != "route_counts":
+            assert torch.equal(masked[name], tensor), name
+    want = torch.bincount(raw[:live].reshape(-1), minlength=EXPERTS).float()
+    assert torch.equal(masked["route_counts"].cpu(), want)
+    if live == TOKENS:
+        assert torch.equal(masked["route_counts"], plain["route_counts"])
+
+
 @pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
 def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import exl3_ram_miss as service_module
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine import service as service_module
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.moe.verify_dead_rows import VerifyDeadRows
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import dsv41_exl3_pairing, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
-    service_module.Exl3RamMissService._instance = None
-    service = service_module.Exl3RamMissService.get()
+    service_module.ExpertEngineService._instance = None
+    service = service_module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     service.plan_gather_width(LANES)
     try:
         with (
             service_row_images(tmp_path),
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
-            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
+            envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "off"})),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused),
             envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused),
         ):
             model = torch.nn.Module()
@@ -175,10 +237,16 @@ def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
             ids.copy_(torch.tensor(routes, device="cuda", dtype=torch.int32))
 
             updater.overflow_flag.zero_()
+            updater.route_counts.zero_()
             dead_rows.set_live_rows(torch.tensor([2], device="cuda"))
             graph.replay()
             torch.cuda.synchronize()
             service.fail_stop_check()
+            if fused:
+                # The fused plan's residency route counts: the two live rows' routes only, none of the cut rows'
+                # (which repeat row 0's experts).
+                counts = updater.route_counts[0, :EXPERTS].cpu().tolist()
+                assert counts == [2.0 if e in live else 0.0 for e in range(EXPERTS)]
             assert streamer.row_backend.keep.item() == 1.0
             assert int(updater.overflow_flag.item()) == 0, "a cut row took a miss lane"
             now = mapping()

@@ -2,6 +2,8 @@
 trace or fault state on the request path, and instrumented. A service loads the instrumented one exactly when this
 process writes a stream trace or injects a RAM-miss fault."""
 
+import json
+
 import pytest
 import torch
 
@@ -24,12 +26,12 @@ def no_override(monkeypatch):
 
 
 def test_the_production_build_is_the_default(no_override):
-    with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(""), envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.override(""):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(""), envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.override(""):
         assert ops.host_variant() == "prod"
 
 
 def test_a_stream_trace_selects_the_instrumented_build(no_override, tmp_path):
-    with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(str(tmp_path / "t")):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"expert_path": str(tmp_path / "t")})):
         assert ops.host_variant() == "instr"
 
 
@@ -40,7 +42,7 @@ def test_a_ram_miss_fault_selects_the_instrumented_build(no_override):
 
 @pytest.mark.parametrize("variant", ops.VARIANTS)
 def test_each_module_names_its_build_and_a_host_keeps_the_one_it_loaded(variant, tmp_path):
-    assert str(ops._host_module("exl3", variant).expert_stream_build_name()) == variant
+    assert str(ops._host_module(ops.EXL3_BUILD, variant).expert_stream_build_name()) == variant
     s = ram_miss_setup(tmp_path, capacity=2)
     host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant=variant)
@@ -52,7 +54,7 @@ def test_each_module_names_its_build_and_a_host_keeps_the_one_it_loaded(variant,
 
 def test_an_unknown_variant_is_refused():
     with pytest.raises(ValueError, match="variant"):
-        ops._host_module("exl3", "fast")
+        ops._host_module(ops.EXL3_BUILD, "fast")
 
 
 def test_a_production_host_reports_only_the_core_counters(tmp_path):
@@ -92,7 +94,7 @@ def test_every_instrumented_variant_reports_every_counter(variant):
 
 
 def test_the_python_core_counters_are_the_hosts():
-    mask = int(ops._host_module("exl3", "prod").expert_stream_core_counter_mask())
+    mask = int(ops._host_module(ops.EXL3_BUILD, "prod").expert_stream_core_counter_mask())
     assert {name for i, name in enumerate(ops.COUNTERS) if mask >> i & 1} == set(ops.CORE_COUNTERS)
 
 
@@ -165,7 +167,7 @@ def test_every_test_only_export_is_listed_and_exported_by_both_builds():
         set(ops.TEST_ONLY_EXPORTS) - {"read_rows_faulted", "read_rows_sqes", "read_rows_idle", "read_rows_two_span"}
     )
     for variant in ops.VARIANTS:
-        module = ops._host_module("exl3", variant)
+        module = ops._host_module(ops.EXL3_BUILD, variant)
         for name in ops.TEST_ONLY_EXPORTS:
             assert hasattr(module, f"expert_stream_{name}"), (variant, name)
 
@@ -238,7 +240,7 @@ def test_the_draft_kernel_exports_run_on_prod(tmp_path):
 
 
 def test_a_traced_read_on_prod_reads_exact_bytes_with_an_empty_record_and_refuses_a_fault(tmp_path):
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
     from sglang.test.dsv41_ram_miss_fixtures import same_bytes
 
     s = ram_miss_setup(tmp_path)
@@ -255,13 +257,13 @@ def test_a_traced_read_on_prod_reads_exact_bytes_with_an_empty_record_and_refuse
 
 @pytest.mark.parametrize("nodes", [1, 2])
 def test_each_host_build_is_compiled_for_its_node_count(nodes):
-    module = ops._host_module("exl3", "instr", 8, nodes)
+    module = ops._host_module(ops.EXL3_BUILD, "instr", 8, nodes)
     assert (int(module.expert_stream_wire_lanes()), int(module.expert_stream_wire_nodes())) == (8, nodes)
 
 
 def test_one_node_and_two_nodes_are_separate_modules():
-    assert ops._host_module("exl3", "instr", 8, 1) is ops._host_module("exl3", "instr", 8)
-    assert ops._host_module("exl3", "instr", 8, 2) is not ops._host_module("exl3", "instr", 8, 1)
+    assert ops._host_module(ops.EXL3_BUILD, "instr", 8, 1) is ops._host_module(ops.EXL3_BUILD, "instr", 8)
+    assert ops._host_module(ops.EXL3_BUILD, "instr", 8, 2) is not ops._host_module(ops.EXL3_BUILD, "instr", 8, 1)
 
 
 if __name__ == "__main__":

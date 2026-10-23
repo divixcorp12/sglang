@@ -13,7 +13,7 @@ B1_HEAD="${4:-${B1_HEAD:?B1_HEAD is required}}"
 MODEL_PATH="${5:-${MODEL_PATH:?MODEL_PATH is required}}"
 OUT="${6:-${OUT:-/mnt/nvme1/nvfp4-work/f109-l2-cap1-$(date +%Y%m%d)}}"
 DEVICE="${DEVICE:-cuda}"
-PYTHON="${PYTHON:-/data/models/slang/.venv/bin/python}"
+PYTHON="${PYTHON:-/data/models/slang/.venv-upstream/bin/python}"
 LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 
 PWD_REAL="$(pwd -P)"

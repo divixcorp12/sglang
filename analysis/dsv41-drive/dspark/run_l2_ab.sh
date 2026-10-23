@@ -34,7 +34,7 @@ if [[ -z "${L2_AB_LOCKED:-}" ]]; then
     exec flock "$DISK_LOCK" bash "$0" "$@"
 fi
 
-PY=/data/models/slang/.venv/bin/python
+PY=/data/models/slang/.venv-upstream/bin/python
 DSPARK=analysis/dsv41-drive/dspark
 MISSCUT=dspark-both-misscut
 FLOORS=dspark-both-prefetch-gpu-misscut-idle2-floors
@@ -42,7 +42,7 @@ IDLE2=dspark-both-prefetch-gpu-misscut-idle2
 L2=dspark-both-prefetch-gpu-misscut-idle2-l2
 
 run() {
-    taskset -c 0-63 "$PY" "$@"
+    taskset -c 0-51,56-107 "$PY" "$@"
 }
 
 record_commit() {

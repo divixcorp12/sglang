@@ -16,6 +16,14 @@
 
 namespace sglang::expert_stream {
 
+// The cores kept clear for NVMe completion interrupts on divix01 (2x Xeon Platinum 8280, 112 CPUs): node 1's top four
+// physical cores, 52-55, and their SMT siblings, 108-111. Mirrors RESERVED_CORES in
+// sglang/srt/layers/moe/cpu_experts/threading_config.py; change both together.
+inline constexpr bool is_reserved_core(long long core) {
+  return (core >= 52 && core <= 55) || (core >= 108 && core <= 111);
+}
+inline constexpr const char* kReservedCoresText = "52-55,108-111";
+
 // The SMT siblings of `core`, the core included, read from sysfs ("17,53" or "16-17"). Throws if the list cannot be
 // read or parsed.
 inline std::vector<int> core_siblings(int core) {
@@ -60,7 +68,7 @@ inline void check_dedicated_core(int core, const std::vector<int>& cpu_expert_co
     if (listed(cpu_expert_cores, sibling)) {
       throw std::runtime_error(
           prefix + "busy_poll: core " + std::to_string(sibling) + " shares the physical core of cpu_core " +
-          std::to_string(core) + " and is a CPU expert core (SGLANG_DSV41_CPU_EXPERTS_CORES)");
+          std::to_string(core) + " and is a CPU expert core (SGLANG_EXPERT_STREAM_NUMA_CORES cpu=)");
     }
   }
 }

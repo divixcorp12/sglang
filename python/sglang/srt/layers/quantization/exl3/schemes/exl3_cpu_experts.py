@@ -1,18 +1,18 @@
 """EXL3 binding of the CPU expert kernel, as a ``CpuExpertQuantTrait``.
 
 The kernel is the optimized build of exllamav3's CPU MoE kernel, ``csrc/exl3/optimized/kernel.cpp`` (built by
-SGLANG_DSV41_CPU_EXPERTS=1). ``Exl3CpuQuantTrait`` describes each streamed layer's pinned slabs for the kernel's
-``make_layer`` (``layer_spec``) and hands out the kernel's address (the extension's torch op
-``sglang_exl3_cpu::kernel_address``).
+SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1). ``Exl3CpuQuantTrait`` describes each streamed layer's pinned slabs for the
+kernel's ``make_layer`` (``layer_spec``) and hands out the kernel's address (the extension's torch op
+``sglang_exl3_cpu::kernel_address``), after passing it its options (``sglang_exl3_cpu::configure``).
 """
 
-import os
 from typing import Any, Mapping, Optional
 
 import torch
 
 from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.config import ResolvedConfig, resolved_config
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
 
 class Exl3CpuQuantTrait:
@@ -22,7 +22,8 @@ class Exl3CpuQuantTrait:
     run with; the RAM-miss service fills it in at the first registration when it is
     ``None``. ``swizzled`` selects the band-contiguous weight layout, which is
     bit-identical to the native one. ``row_weighted`` splits the layers' output tiles among the workers by chunk row
-    count (tile_assignment.hpp), bit-identical too.
+    count (tile_assignment.hpp), bit-identical too. ``config`` is the process's resolved config (default
+    ``resolved_config()`` when first needed): its CPU ISA cap and report and its worker trace go to the kernel.
     """
 
     name = "exl3"
@@ -31,17 +32,30 @@ class Exl3CpuQuantTrait:
     weights_dtype = torch.float16
     out_dtype = torch.float32
 
-    def __init__(self, ext: Any, act_limit: Optional[float], swizzled: bool = False, row_weighted: bool = False):
+    def __init__(
+        self,
+        ext: Any,
+        act_limit: Optional[float],
+        swizzled: bool = False,
+        row_weighted: bool = False,
+        config: Optional[ResolvedConfig] = None,
+    ):
         self.ext = ext
         self.act_limit = act_limit
         self.swizzled = swizzled
         self.row_weighted = row_weighted
+        self._config = config
+
+    def _resolved(self) -> ResolvedConfig:
+        if self._config is None:
+            self._config = resolved_config()
+        return self._config
 
     def check_environment(self) -> None:
-        """Require ``EXL3_MOE_CPU_PIN=0``; else the kernel pins to the first cores."""
-        if os.environ.get("EXL3_MOE_CPU_PIN") != "0":
+        """Require ``SGLANG_EXL3_MOE_CPU_PIN=0``; else the kernel pins to the first cores."""
+        if self._resolved().exl3.cpu.pin != "0":
             raise ValueError(
-                "EXL3_MOE_CPU_PIN=0 must be set: the kernel would otherwise pin its workers to the first cores"
+                "SGLANG_EXL3_MOE_CPU_PIN=0 must be set: the kernel would otherwise pin its workers to the first cores"
             )
 
     def hidden_size(self, slabs: Mapping[str, torch.Tensor]) -> int:
@@ -91,11 +105,23 @@ class Exl3CpuQuantTrait:
         except (AttributeError, RuntimeError) as error:
             raise RuntimeError(
                 f"the EXL3 extension {self.ext.__file__} has no sglang_exl3_cpu::{name}: CPU experts need the "
-                "optimized CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds (csrc/exl3/optimized)"
+                "optimized CPU kernel, which SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 builds (csrc/exl3/optimized)"
             ) from error
 
     def kernel_address(self) -> int:
-        """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``)."""
+        """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``),
+        once the kernel has its options (``sglang_exl3_cpu::configure``, before its first forward fixes the tier)."""
+        stream = self._resolved().stream
+        worker = stream.trace.cpu_worker
+        self._op("configure")(
+            stream.cpu_experts.max_isa,
+            bool(stream.cpu_experts.report_isa),
+            worker.prefix,
+            int(worker.capacity),
+            int(worker.min_us),
+            worker.scratch_prefix,
+            stream.trace.gate_path,
+        )
         return int(self._op("kernel_address")())
 
     def _params(self, bits: int) -> bytes:

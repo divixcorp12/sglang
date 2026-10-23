@@ -2,7 +2,7 @@
 
 ``Chain`` builds what the service's ``attach`` builds for each layer -- a host over row images read with O_DIRECT
 into registered pinned slabs, every row attached with ``staging`` staging slots, one ``ExpertStreamDevice`` and one
-production ``Exl3RamMissRowBackend`` per row -- and drives a gather with ``backend.post``: post -> C1 -> S -> CW ->
+production ``ExpertEngineRowBackend`` per row -- and drives a gather with ``backend.post``: post -> C1 -> S -> CW ->
 stream wait -> CC, in one stream.
 """
 
@@ -16,14 +16,15 @@ from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
+    EXL3_BUILD,
     ExpertStreamHost,
     new_hot_page,
     new_page,
     stream_segment_map,
 )
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend, sm_copy_mask, sm_copy_table
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.row_backend import ExpertEngineRowBackend, sm_copy_mask, sm_copy_table
 from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab, release_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
@@ -84,7 +85,7 @@ class Chain:
                 row: expert_row_segments([(self.slabs[row][n], self.dest[row][n]) for n in self.names])
                 for row in range(layers)
             }
-            sm_mask = sm_copy_mask(self.names) if sm_small_copies else 0
+            sm_mask = sm_copy_mask(self.names, build=EXL3_BUILD) if sm_small_copies else 0
             self.scratch = None
             if copy_engine:
                 self.host.enable_copy_engine(torch.cuda.current_device(), wait_timeout_ms=copy_wait_ms)
@@ -115,7 +116,7 @@ class Chain:
                 self.dev.enable_gpu_drip(drip_slots, table=self.drip_table)
             host_row_map = torch.full((experts,), -1, dtype=torch.int32, device="cuda")
             self.backends = {
-                row: Exl3RamMissRowBackend(
+                row: ExpertEngineRowBackend(
                     {0: self.segments[row]}, host_row_map, self.dev, row, top_k,
                     {0: stream_segment_map(self.segments[row], self.tables, row)},
                     copy_engine=copy_engine,

@@ -156,7 +156,9 @@ def _cpu_draft_moe(monkeypatch, tmp_path, resident, fused_shared=0):
     from sglang.srt.layers.moe.cpu_experts import draft, draft_resident
 
     registered = []
-    registry = SimpleNamespace(register=lambda slabs, on_cpu, limit, *, layer_id: registered.append((slabs, on_cpu, limit)) or 0)
+    registry = SimpleNamespace(
+        register=lambda slabs, on_cpu, limit, *, layer_id, format_key: registered.append((slabs, on_cpu, limit)) or 0
+    )
     monkeypatch.setattr(draft, "DRAFT_CPU_EXPERTS", registry)
     path = tmp_path / "resident.json"
     draft_resident.write_resident_set(str(path), {0: resident}, n=len(resident), source="")
@@ -170,7 +172,7 @@ def _cpu_draft_moe(monkeypatch, tmp_path, resident, fused_shared=0):
     method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False, draft=True, cpu_draft=True)
     method.create_weights(layer, E, HIDDEN, INTER, torch.bfloat16)
     _load_all(layer)
-    with envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.override(str(path)):
         method.process_weights_after_loading(layer)
     return layer, method, registered
 

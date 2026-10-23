@@ -139,10 +139,10 @@ class TestRequirementsLookup(_GateTest):
                 )
 
     def test_an_unknown_method_with_budgets_is_rejected(self):
-        os.environ.update(SGLANG_MOE_EXPERT_STREAM="1", SGLANG_MOE_HOT_GPU_MB="1")
+        os.environ.update(SGLANG_EXPERT_STREAM_ENABLE="1", SGLANG_EXPERT_STREAM_HOT_GPU_MB="1")
         with self.assertRaisesRegex(ValueError, "does not support quantization method 'awq'"):
             memory_hook.handle_offload_compatibility(_launch(quantization="awq"))
-        os.environ.update(SGLANG_MOE_HOT_GPU_MB="0", SGLANG_MOE_PINNED_HOST_MB="1")
+        os.environ.update(SGLANG_EXPERT_STREAM_HOT_GPU_MB="0", SGLANG_EXPERT_STREAM_PINNED_HOST_MB="1")
         with self.assertRaisesRegex(ValueError, "does not support quantization method 'awq'"):
             memory_hook.handle_offload_compatibility(_launch(quantization="awq"))
 
@@ -199,9 +199,9 @@ class TestPinnedTierGraphGatherRequirements(_GateTest):
             ("arena_test",), ExpertStreamRequirements("ARENA", lambda cfg, budgets: None)
         )
         os.environ.update(
-            SGLANG_MOE_HOT_GPU_MB="1",
-            SGLANG_MOE_PINNED_HOST_MB="1",
-            SGLANG_MOE_EXPERT_GRAPH_GATHER="1",
+            SGLANG_EXPERT_STREAM_HOT_GPU_MB="1",
+            SGLANG_EXPERT_STREAM_PINNED_HOST_MB="1",
+            SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="1",
         )
 
     def _args(self, quantization):
@@ -213,12 +213,12 @@ class TestPinnedTierGraphGatherRequirements(_GateTest):
         memory_hook.handle_offload_compatibility(self._args("pinned_tier_test"))
 
     def test_an_arena_format_still_needs_the_host_arena(self):
-        with self.assertRaisesRegex(ValueError, "requires SGLANG_MOE_EXPERT_HOST_ARENA=1"):
+        with self.assertRaisesRegex(ValueError, "requires SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA=1"):
             memory_hook.handle_offload_compatibility(self._args("arena_test"))
 
     def test_a_missing_pinned_budget_is_refused_before_model_load(self):
-        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "0"
-        with self.assertRaisesRegex(ValueError, "requires SGLANG_MOE_PINNED_HOST_MB"):
+        os.environ["SGLANG_EXPERT_STREAM_PINNED_HOST_MB"] = "0"
+        with self.assertRaisesRegex(ValueError, "requires SGLANG_EXPERT_STREAM_PINNED_HOST_MB"):
             memory_hook.handle_offload_compatibility(self._args("pinned_tier_test"))
 
 
@@ -237,15 +237,15 @@ class TestEagerFormatRequirements(_GateTest):
             ),
         )
         os.environ.update(
-            SGLANG_MOE_HOT_GPU_MB="1",
-            SGLANG_MOE_PINNED_HOST_MB="1",
-            SGLANG_MOE_HOT_DYNAMIC="1",
+            SGLANG_EXPERT_STREAM_HOT_GPU_MB="1",
+            SGLANG_EXPERT_STREAM_PINNED_HOST_MB="1",
+            SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC="1",
         )
 
     def test_it_needs_none_of_the_nvfp4_only_settings(self):
-        # No SGLANG_MOE_EXPERT_STREAM, overlap on, 4 running requests, auto backend.
+        # No SGLANG_EXPERT_STREAM_ENABLE, overlap on, 4 running requests, auto backend.
         memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
-        os.environ["SGLANG_MOE_HOT_DYNAMIC"] = "0"
+        os.environ["SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC"] = "0"
         memory_hook.handle_offload_compatibility(
             _launch(quantization="eager_test", expert_distribution_recorder_mode=None)
         )
@@ -271,30 +271,30 @@ class TestEagerFormatRequirements(_GateTest):
     def test_graph_gather_and_the_host_arena_are_refused(self):
         # Satisfy the generic graph-gather checks so the format's own refusal is reached.
         os.environ.update(
-            SGLANG_MOE_PINNED_HOST_MB="0",
-            SGLANG_MOE_EXPERT_GRAPH_GATHER="1",
-            SGLANG_MOE_EXPERT_HOST_ARENA="1",
+            SGLANG_EXPERT_STREAM_PINNED_HOST_MB="0",
+            SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="1",
+            SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA="1",
         )
         args = _launch(quantization="eager_test")
         args.cuda_graph_config.decode.backend = "breakable"
-        with self.assertRaisesRegex(ValueError, "does not support SGLANG_MOE_EXPERT_GRAPH_GATHER"):
+        with self.assertRaisesRegex(ValueError, "does not support SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"):
             memory_hook.handle_offload_compatibility(args)
-        os.environ["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = "0"
-        with self.assertRaisesRegex(ValueError, "does not support SGLANG_MOE_EXPERT_HOST_ARENA"):
+        os.environ["SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"] = "0"
+        with self.assertRaisesRegex(ValueError, "does not support SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA"):
             memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
     def test_the_policy_knobs_are_checked_for_it_too(self):
-        os.environ["SGLANG_MOE_HOT_LOG_INTERVAL"] = "0"
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_LOG_INTERVAL"):
+        os.environ["SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL"] = "0"
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL"):
             memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
     def test_expert_prefetch_is_refused(self):
         # Satisfy memory_hook's own generic prefetch preconditions (nonzero
         # budgets, the stat recorder) so the eager format's own refusal, not
         # that earlier generic one, is what raises here.
-        os.environ["SGLANG_MOE_PREFETCH_MAX_CANDIDATES"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES"] = "1"
         with self.assertRaisesRegex(
-            ValueError, "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
+            ValueError, "set SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES to 0"
         ):
             memory_hook.handle_offload_compatibility(
                 _launch(
@@ -304,9 +304,9 @@ class TestEagerFormatRequirements(_GateTest):
             )
 
     def test_gpu_residency_update_is_refused(self):
-        os.environ["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"] = "1"
         with self.assertRaisesRegex(
-            ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"
+            ValueError, "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE; set it to 0"
         ):
             memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
@@ -317,8 +317,8 @@ class TestEagerFormatRequirements(_GateTest):
 
     def test_it_accepts_a_launch_with_both_settings_off(self):
         os.environ.update(
-            SGLANG_MOE_PREFETCH_MAX_CANDIDATES="0",
-            SGLANG_MOE_GPU_RESIDENCY_UPDATE="0",
+            SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES="0",
+            SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE="0",
         )
         memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 

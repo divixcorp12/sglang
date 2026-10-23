@@ -58,13 +58,13 @@ constexpr std::array<TilesFn, sizeof...(R)> tiles_rows(std::integer_sequence<int
 }
 
 template <Isa I, int... B>
-constexpr std::array<std::array<TilesFn, MAX_M>, sizeof...(B)> tiles_table(std::integer_sequence<int, B...>)
+constexpr std::array<std::array<TilesFn, GENERIC_MAX_M>, sizeof...(B)> tiles_table(std::integer_sequence<int, B...>)
 {
-    return {tiles_rows<I, B + 1>(std::make_integer_sequence<int, MAX_M>{})...};
+    return {tiles_rows<I, B + 1>(std::make_integer_sequence<int, GENERIC_MAX_M>{})...};
 }
 
-// [bits - 1][rows - 1] for bits 1..8 and rows 1..MAX_M, generated from MAX_M: a larger MAX_M instantiates its rows
-// here with no hand-written case.
+// [bits - 1][rows - 1] for bits 1..8 and rows 1..GENERIC_MAX_M (the generic plan's chunks), generated from it: a
+// larger GENERIC_MAX_M instantiates its rows here with no hand-written case.
 template <Isa I>
 constexpr auto kTiles = tiles_table<I>(std::make_integer_sequence<int, 8>{});
 
@@ -106,18 +106,22 @@ void run_tiles_raw(const Exl3Projection& mat, const PreparedIn& in, float* tout,
     }
 }
 
-// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M.
-template <int... Ms>
+// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M. Vnni picks the vpdpwssd copy of
+// the register kernels (reg_vnni), else today's (reg_bw).
+template <bool Vnni, int... Ms>
 M1_ALWAYS_INLINE void register_tiles_for(std::integer_sequence<int, Ms...>, const Exl3Projection& mat,
                                          const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped)
 {
-    (void)((m == Ms + 1 && (register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
+    if constexpr (Vnni)
+        (void)((m == Ms + 1 && (reg_vnni::register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
+    else
+        (void)((m == Ms + 1 && (reg_bw::register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
 }
 
 // m token rows through the quantized kernels under the accuracy options (quantize_act's layout): per
 // k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
 // worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
-template <Isa I>
+template <Isa I, bool Vnni = false>
 void run_tiles(
     const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped = false)
 {
@@ -127,7 +131,7 @@ void run_tiles(
         // One token from either plan; several only as the DSV4.1 plan's compact input (PlanTraits::kCompactScratch).
         if ((m == 1 || in.compact) && mat.bits == 3 && act_blocked(mat.k))
         {
-            register_tiles_for(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
+            register_tiles_for<Vnni>(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
             return;
         }
     }
@@ -198,6 +202,11 @@ struct ForwardCtx
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
+    // Overwrite by store (ForwardCall::store_first): no zeroing up front; Accumulate stores each token's first sum
+    // (Chunk::first) and zeroes the `unrouted` tokens' rows, each worker its own columns.
+    bool store_first;
+    const int* unrouted;
+    int n_unrouted;
     void (*stage_two)(void*);  // ForwardCall::stage_two: worker 0 calls it between GateUp and Middle (null: never)
     void* stage_two_ctx;
     std::vector<Chunk> chunks;
@@ -211,6 +220,9 @@ struct ForwardCtx
     // Down tiles finished per (chunk, 128-output block), when a plan splits the down GEMVs finer than a block: the
     // worker that finishes a block's eighth tile applies its output transform.
     int* down_tiles_done;
+    // PlanTraits::kClaimMixedChunks on a call of differing chunk sizes: the next unclaimed group of gate/up ([0]) and
+    // of down ([16], its own cache line); null: the static split.
+    int* claims = nullptr;
 };
 
 template <Isa I>
@@ -383,7 +395,10 @@ struct ForwardArena
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
     std::vector<int> down_tiles_done;
+    std::vector<int> claims;  // ForwardCtx::claims
     std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
+    std::vector<uint8_t> written;                      // store_first: per token, whether a chunk row writes it
+    std::vector<int> unrouted;                         // store_first: the tokens no chunk row writes
     // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
     std::vector<Chunk> chunks;
 
@@ -402,6 +417,7 @@ struct PlanTraits
     static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed (one-token chunks: kRegisterBudget[0])
     static constexpr bool kWideSingleExpert = false;  // 512-wide quantization for one token through one expert
     static constexpr int kSplitTiles = 8;             // GEMV split unit in tiles (assign_gemvs)
+    static constexpr bool kClaimMixedChunks = false;  // chunks of differing token counts claim groups (claim_groups)
 };
 
 // DeepSeek V4.1 on AVX-512BW: the validated fast path.
@@ -412,11 +428,15 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
     static constexpr bool kGroupedTraversal = true;
     static constexpr bool kWideSingleExpert = true;
     static constexpr int kSplitTiles = 2;  // compact unswizzled kernels take any tile pair (register_tiles)
+    // A call whose chunks differ in token count claims 8-tile groups instead of a static split, which neither evenly
+    // nor by rows matches a chunk's cost (memory-bound at one token, compute-bound at several): rows 3/4/8 random
+    // -14/-21/-26% at 16 workers. Uniform calls keep the static split, its grouped traversal included.
+    static constexpr bool kClaimMixedChunks = true;
 };
 
 // Profile: time each phase (its barrier included) on worker 0 and print "moe_cpu phases(us)" after the forward. Off,
 // the plan holds no timing code at all.
-template <class Shape, Isa I, bool Profile = false, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0>
+template <class Shape, Isa I, bool Profile = false, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0, bool Vnni = false>
 struct ForwardPlan
 {
     using Traits = PlanTraits<Shape, I>;
@@ -495,6 +515,18 @@ private:
             std::fill_n(ar.down_tiles_done.data(), blocks, 0);
             ctx.down_tiles_done = ar.down_tiles_done.data();
         }
+        ctx.claims = nullptr;
+        if constexpr (Traits::kClaimMixedChunks)
+        {
+            const bool mixed = std::any_of(ctx.chunks.begin(), ctx.chunks.end(),
+                                           [&](const Chunk& ch) { return ch.m != ctx.chunks.front().m; });
+            if (mixed)
+            {
+                grow(ar.claims, 32, "ar.claims");
+                std::fill_n(ar.claims.data(), 32, 0);
+                ctx.claims = ar.claims.data();
+            }
+        }
         if (EXL3_MOE_CPU_ACT_BLOCK)
         {
             // Sized for one block per 16 inputs, the smallest B allows; only k / B entries are used
@@ -517,7 +549,7 @@ private:
         [[maybe_unused]] double phase_us[6]{};
         team.run([&](int worker, int n) {
             trace.worker_start(worker);
-            if (ctx.zero_out && worker == 0)
+            if (ctx.zero_out && !ctx.store_first && worker == 0)
                 std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
@@ -584,10 +616,9 @@ private:
         }
         else if constexpr (P == Phase::GateUp)
         {
-            // Gate + up GEMVs (see assign_gemvs)
+            // Gate + up GEMVs (see assign_gemvs; claim_groups for a call of differing chunk sizes)
             const int gu = 2;
-            assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16,
-                [&](int j) { return c.chunks[j / gu].m; }, [&](int j, int t0, int t1)
+            const auto gemv = [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = j % gu;
@@ -595,8 +626,11 @@ private:
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
-                run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);
-            }, E.params.row_weighted != 0);
+                run_tiles<I, Vnni>(mat, p, tout, ch.m, t0, t1, grouped);
+            };
+            if (c.claims) claim_groups(c.claims[0], nc * gu, I_ / 16, gemv);
+            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16,
+                [&](int j) { return c.chunks[j / gu].m; }, gemv, E.params.row_weighted != 0);
         }
         else if constexpr (P == Phase::Middle)
         {
@@ -618,14 +652,13 @@ private:
         }
         else if constexpr (P == Phase::Down)
         {
-            // Down GEMVs
-            assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
-                [&](int j) { return c.chunks[j].m; }, [&](int j, int t0, int t1)
+            // Down GEMVs (claimed as gate/up's are)
+            const auto gemv = [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
-                run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
+                run_tiles<I, Vnni>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
                 if constexpr (Traits::kSplitTiles == 8) {
                     transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
                 } else {
@@ -638,7 +671,10 @@ private:
                             transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,b*8,b*8+8);
                     }
                 }
-            }, E.params.row_weighted != 0);
+            };
+            if (c.claims) claim_groups(c.claims[16], nc, H / 16, gemv);
+            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
+                [&](int j) { return c.chunks[j].m; }, gemv, E.params.row_weighted != 0);
         }
         else
         {
@@ -652,10 +688,23 @@ private:
                     float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
                     const float* src = d + static_cast<size_t>(r) * H;
                     const float w = ch.weight[r];
-                    for (int col = c0; col < c1; ++col)
-                        dst[col] += w * src[col];
+                    if (c.store_first && (ch.first >> r & 1u)) {
+                        // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler
+                        // cannot see keeps the add (and its contraction) under -Ofast, so the bits match.
+                        float zero = 0.0f;
+                        asm("" : "+x"(zero));
+                        for (int col = c0; col < c1; ++col)
+                            dst[col] = w * src[col] + zero;
+                    } else {
+                        for (int col = c0; col < c1; ++col)
+                            dst[col] += w * src[col];
+                    }
                 }
             }
+            if (c.store_first)
+                for (int i = 0; i < c.n_unrouted; ++i)
+                    std::fill(c.out + static_cast<size_t>(c.unrouted[i]) * H + c0,
+                              c.out + static_cast<size_t>(c.unrouted[i]) * H + c1, 0.0f);
         }
     }
 };
@@ -668,9 +717,12 @@ std::atomic<int64_t> g_plan_calls[2];
 void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team, Isa isa)
 {
     const ExpertLayer& l = *ctx.layer;
-    if (isa == Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
+    if (isa >= Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
         g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
-        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, Experts<Dsv41Shape>{&l, p}, ar, team);
+        // The plan is written for AVX-512BW. A VNNI host (Vnni, Vbmi) runs it with the vpdpwssd register kernels.
+        const Experts<Dsv41Shape> E{&l, p};
+        if (isa == Isa::Bw) ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, team);
+        else ForwardPlan<Dsv41Shape, Isa::Bw, false, EXL3_MOE_CPU_WORKER_TRACE != 0, true>::run(ctx, E, ar, team);
         return;
     }
     g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
@@ -684,7 +736,8 @@ void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Tea
     }
 }
 
-// The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M rows. This grouping, not the
+// The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M tokens (GENERIC_CHUNK_M for the
+// generic plan). This grouping, not the
 // framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then token, then route), so it reads the
 // call's slots as given and runs zero-weight routes. Each weight is rounded to FP16, the registered kernel's
 // convention. ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range).
@@ -715,17 +768,38 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     for (int i = 0; i < n; ++i)
         if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
     std::sort(routes.begin(), routes.end());
+    // The DSV4.1 plan takes chunks of up to CHUNK_M tokens, the generic plan up to GENERIC_CHUNK_M (math.hpp).
+    const int chunk_m = isa >= Isa::Bw && Dsv41Shape::accepts_layer(l, p) ? CHUNK_M : GENERIC_CHUNK_M;
     for (size_t i = 0; i < routes.size();)
     {
         Chunk ch;
         ch.expert = routes[i].first;
         ch.m = 0;
-        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < CHUNK_M; ++i, ++ch.m)
+        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < chunk_m; ++i, ++ch.m)
         {
             ch.token[ch.m] = routes[i].second / c.k;
             ch.weight[ch.m] = half_to_float(at::Half(c.weights[routes[i].second]));
         }
         ctx.chunks.push_back(ch);
+    }
+    // A token's first write is the first of its rows in Accumulate's order (chunk, then row); the rest add to it.
+    ctx.store_first = ctx.zero_out && c.store_first;
+    ctx.unrouted = nullptr;
+    ctx.n_unrouted = 0;
+    if (ctx.store_first) {
+        auto& written = ar.written;
+        written.assign(static_cast<size_t>(c.rows), 0);
+        for (Chunk& ch : ctx.chunks)
+            for (int r = 0; r < ch.m; ++r)
+                if (!written[ch.token[r]]) {
+                    written[ch.token[r]] = 1;
+                    ch.first |= 1u << r;
+                }
+        ar.unrouted.clear();
+        for (int t = 0; t < c.rows; ++t)
+            if (!written[t]) ar.unrouted.push_back(t);
+        ctx.unrouted = ar.unrouted.data();
+        ctx.n_unrouted = static_cast<int>(ar.unrouted.size());
     }
     if (ctx.chunks.empty()) {
         if (ctx.stage_two) ctx.stage_two(ctx.stage_two_ctx);

@@ -14,7 +14,7 @@ import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup, run_host_script, same_bytes
@@ -208,7 +208,7 @@ def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
         host.stop()
 
 
-@pytest.mark.parametrize("core, error, match", [(71, ValueError, "64-71"), (1000, RuntimeError, "pin")])
+@pytest.mark.parametrize("core, error, match", [(111, ValueError, "52-55,108-111"), (1000, RuntimeError, "pin")])
 def test_a_reserved_or_unusable_core_is_refused(tmp_path, core, error, match):
     s = ram_miss_setup(tmp_path)
     host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32))

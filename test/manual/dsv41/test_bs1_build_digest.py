@@ -66,5 +66,5 @@ def test_the_acknowledge_env_turns_a_toolchain_change_into_a_skip():
 
 @pytest.mark.parametrize("acknowledged", [False, True])
 def test_a_real_digest_difference_always_fails(acknowledged):
-    assert digest_outcome(1, "device exl3_ram_miss_post_kernel::x", acknowledged)[0] == "fail"
+    assert digest_outcome(1, "device expert_stream_post_kernel::x", acknowledged)[0] == "fail"
     assert digest_outcome(0, "BS1 build unchanged", acknowledged)[0] == "pass"

@@ -74,9 +74,9 @@ def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tm
         assert elapsed >= 0.5, "shutdown waited for the GPU"
         assert done.query()
     finally:
-        import sglang.srt.layers.moe.exl3_ram_miss as service_module
+        import sglang.srt.layers.moe.expert_engine.service as service_module
 
-        service_module.Exl3RamMissService._instance = None
+        service_module.ExpertEngineService._instance = None
 
 
 CHILD = """

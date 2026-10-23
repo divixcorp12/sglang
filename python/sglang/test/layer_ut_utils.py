@@ -9,6 +9,8 @@ from typing import Optional
 
 import torch
 
+from sglang.test.test_utils import publish_build_topology
+
 
 def _free_port() -> int:
     with socket.socket() as probe:
@@ -45,12 +47,8 @@ def init_single_process_dist(master_port: Optional[int] = None, backend: str = "
     if not model_parallel_is_initialized():
         # kwargs only: a positional backend would land in the
         # attention_data_parallel_size slot and explode on int // str.
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend=backend,
-        )
+        publish_build_topology(tp_size=1, ep_size=1, pp_size=1)
+        initialize_model_parallel(backend=backend)
 
 
 def make_tp1_column_parallel_linear(
@@ -65,8 +63,7 @@ def make_tp1_column_parallel_linear(
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
         prefix=prefix,
-        tp_rank=0,
-        tp_size=1,
+        parallel_group="replicated",
         **kwargs,
     ).cuda()
 

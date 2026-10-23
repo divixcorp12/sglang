@@ -36,8 +36,10 @@ SUITES = [
     "test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py",
 ]
 PREFIX = "sgl_kernel_jit_"  # the JIT cache's module names
-DEVICE = re.compile(r"^(expert_stream_exl3_l8(_n2)?|expert_residency_direct_.*|(dsv41_)?exl3_moe_route_tables.*)$")
-HOST = re.compile(r"^expert_stream_host_exl3_(prod|instr)_l8(_n2)?$")
+DEVICE = re.compile(
+    r"^(expert_stream_exl3(_sqrt_softplus)?_l8(_n2)?|expert_residency_direct_.*|(dsv41_)?exl3_moe_route_tables.*)$"
+)
+HOST = re.compile(r"^expert_stream_host_exl3(_sqrt_softplus)?_(prod|instr)_l8(_n2)?$")
 # The wide template arguments this plan adds to shared kernels; their narrow instantiation is the old kernel.
 RENAMES = [
     # a function template demangles with its return type; the plain kernel it replaces has none
@@ -87,10 +89,10 @@ def _cpu_kernel() -> dict[str, str]:
     """The optimized EXL3 CPU kernel library's one-word keep-warm loops and forward entry point: objdump per function,
     addresses, raw bytes, rip-relative displacements and nop padding stripped, operand addresses reduced to the
     symbols they name. Needs SGLANG_EXL3_SRC and a GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel
-    (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
+    (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1, set here)."""
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
-    os.environ["SGLANG_DSV41_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
+    os.environ["SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
     so = exl3_ext().__file__
     text = subprocess.run(["objdump", "-d", "-C", "--no-show-raw-insn", so], capture_output=True, text=True,
                           check=True).stdout
@@ -122,7 +124,7 @@ def collect(keep_cache: str | None = None, reuse_cache: str | None = None) -> di
     if not reuse_cache:
         shutil.rmtree(cache, ignore_errors=True)
         # The BS1 suites build the 8-lane one-token modules; the CPU-experts switch would put the copy engine under them.
-        env = {k: v for k, v in os.environ.items() if k != "SGLANG_DSV41_CPU_EXPERTS"}
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"}
         env |= {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
         rc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *SUITES], env=env,
                             cwd=REPO).returncode
@@ -184,7 +186,7 @@ def main():
         raise SystemExit(2)
     kinds = ("device", "cpu") if args.permanent else ("device", "host", "cpu")
     diffs = [f"{kind} {key}" for kind in kinds for key, digest in golden.get(kind, {}).items()
-             if now.get(kind, {}).get(key) != digest and not (args.permanent and "exl3_ram_miss_post_kernel" in key)]
+             if now.get(kind, {}).get(key) != digest and not (args.permanent and ("expert_stream_post_kernel" in key or "exl3_ram_miss_post_kernel" in key))]
     print("\n".join(diffs) or "BS1 build unchanged")
     raise SystemExit(1 if diffs else 0)
 

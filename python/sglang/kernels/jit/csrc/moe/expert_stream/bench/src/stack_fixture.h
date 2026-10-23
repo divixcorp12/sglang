@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace fullstack {
@@ -63,14 +64,12 @@ class StackFixture {
   std::unique_ptr<Impl> impl_;
 };
 
-// Configures cpu_forward.cpp's kernel runtime: AVX512BW exactly (EXL3_MOE_CPU_MAX_ISA=bw set at launch),
-// single-threaded ATen, no dynamic OpenMP. Throws if the kernel picked another ISA.
-void configure_cpu_kernel_runtime();
+// The tier the kernel settled on (min(host, the --max-isa cap)): "bw", "vnni" or "vbmi". Needs AVX512BW.
+const char* kernel_isa_tier();
 
-// Frees the calling thread's OpenMP team. The kernel forks one team per calling thread (libgomp keeps a helper pool
-// per master), and with GOMP_SPINCOUNT=INFINITE an idle team spins forever on its cores, so the bare caller's helpers
-// would compete with the CPU expert thread's. Throws if the team cannot be released.
-void release_kernel_team();
+// Configures cpu_forward.cpp's kernel runtime: an AVX-512 tier (the host's, or `max_isa`'s cap; empty for none),
+// single-threaded ATen, no dynamic OpenMP. Prints "isa tier <tier>" to stderr. Throws if the host has no AVX512BW.
+void configure_cpu_kernel_runtime(const std::string& max_isa);
 
 // Bit-exact comparison against a reference file (fixture.h's compare_reference); throws naming the file.
 void check_reference(const std::filesystem::path& path, const std::vector<float>& actual);

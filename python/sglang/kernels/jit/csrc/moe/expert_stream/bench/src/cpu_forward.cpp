@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include "moe_mul1.h"
 #include "../../moe/expert_stream/host/cpu_experts/team.hpp"
+#include "../../moe/expert_stream/host/core_topology.h"
 #include "tile_assignment.hpp"
 #include <algorithm>
 #include <chrono>
@@ -66,8 +67,13 @@ bool benchmark_failed = false;
 struct Options {
   fs::path fixture = "/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin";
   fs::path references = "/data/models/exl3_exp/threading";
-  std::string cpus = "18-33";
+  std::string cpus = "28-43";  // node 1's first 16 physical cores; their SMT siblings 84-99 stay idle
   int workers = EXL3_BENCH_DEFAULT_WORKERS;
+  // --smt: the workers' SMT siblings join the team after them (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT)
+  bool smt = false;
+  // --max-isa=TIER: the optimized kernel's ISA cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA in a server); empty, the host's.
+  // The baseline reads its own EXL3_MOE_CPU_MAX_ISA at load instead.
+  std::string max_isa;
   int node = 1;
   int warmup = 128;
   int gap_us = 0;
@@ -121,6 +127,10 @@ Options parse_options(int& argc, char** argv) {
       opt.cpus = value("--cpus=");
     else if (arg.starts_with("--workers="))
       opt.workers = number(value("--workers="));
+    else if (arg == "--smt")
+      opt.smt = true;
+    else if (arg.starts_with("--max-isa="))
+      opt.max_isa = value("--max-isa=");
     else if (arg.starts_with("--numa-node="))
       opt.node = number(value("--numa-node="));
     else if (arg.starts_with("--warmup-forwards="))
@@ -144,7 +154,10 @@ Options parse_options(int& argc, char** argv) {
     else if (arg == "--help") {
       std::cout << "Native DSV4.1 full-forward benchmark (" EXL3_BENCH_BACKEND
                    ")\n"
-                   "--fixture=FILE --reference-dir=DIR --cpus=18-33 --workers=N\n"
+                   "--fixture=FILE --reference-dir=DIR --cpus=28-43 --workers=N\n"
+                   "--smt adds each of the N workers' SMT siblings to the team, after them (2N workers)\n"
+                   "--max-isa=scalar|avx2|bw|vnni|vbmi caps the optimized kernel's tier (the baseline reads\n"
+                   "  EXL3_MOE_CPU_MAX_ISA at load)\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
                    "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
@@ -530,12 +543,19 @@ void full_forward(benchmark::State& state, W& workload) {
 
 int main(int argc, char** argv) {
   try {
-    const auto options = parse_options(argc, argv);
+    auto options = parse_options(argc, argv);
     benchmark::Initialize(&argc, argv);
     if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
     auto cores = parse_cpus(options.cpus);
     if (options.workers > int(cores.size())) throw std::runtime_error("Not enough configured CPUs");
     cores.resize(options.workers);
+    if (options.smt) {
+      const size_t physical = cores.size();
+      for (size_t i = 0; i < physical; ++i)
+        for (int sibling : ::sglang::expert_stream::core_siblings(cores[i]))
+          if (std::find(cores.begin(), cores.end(), sibling) == cores.end()) cores.push_back(sibling);
+      options.workers = static_cast<int>(cores.size());  // every call and the team run the siblings too
+    }
     cpu_set_t allowed;
     if (sched_getaffinity(0, sizeof(allowed), &allowed)) throw std::runtime_error("Cannot read caller affinity");
     for (int cpu : cores) {
@@ -544,11 +564,22 @@ int main(int argc, char** argv) {
       if (!fs::exists("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/node" + std::to_string(options.node)))
         throw std::runtime_error("Requested CPU is not on the expected NUMA node: " + std::to_string(cpu));
     }
+#ifdef EXL3_BENCH_BASELINE
+    // The vendored baseline reads its own variables (moe_mul1.cpp): these two at its first forward, and
+    // EXL3_MOE_CPU_MAX_ISA at load, so the scripts export that one.
+    if (!options.max_isa.empty())
+      throw std::runtime_error("--max-isa caps the optimized kernel; the baseline reads EXL3_MOE_CPU_MAX_ISA at load");
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
-    // The tier is fixed from EXL3_MOE_CPU_MAX_ISA as set at launch: at load (baseline) or at this first query.
-    if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
-      throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
+#else
+    ::sglang::exl3_cpu::exl3_cpu_configure({.max_isa = options.max_isa});
+#endif
+    // The tier is fixed at load (baseline) or at this first query (optimized, from --max-isa).
+    // Any AVX-512 tier runs the DSV4.1 plan; no cap runs the host's, which is what the scripts do.
+    if (!exl3_moe_cpu_has_avx512_bw())
+      throw std::runtime_error("This study requires AVX512BW");
+    const char* isa_tier = exl3_moe_cpu_has_avx512_vbmi() ? "vbmi" : exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
+    std::cerr << "isa tier " << isa_tier << '\n';
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
@@ -594,6 +625,7 @@ int main(int argc, char** argv) {
     std::cerr << "(NUMA " << options.node << "; memory policy inherited)\n";
     if (!options.validate_only) {
       benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
+      benchmark::AddCustomContext("isa_tier", isa_tier);
       benchmark::AddCustomContext("fixture", options.fixture.string());
       std::string assigned_cpus;
       for (int cpu : cores)

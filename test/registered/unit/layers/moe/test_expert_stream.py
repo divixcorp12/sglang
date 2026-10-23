@@ -339,7 +339,7 @@ class TestExpertStreamer(unittest.TestCase):
                 ):
                     with (
                         self.subTest(mode=mode, capacity=capacity),
-                        patch.dict(os.environ, {"SGLANG_MOE_EXPERT_FILE_READER": mode}),
+                        patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_FILE_READER": mode}),
                     ):
                         streamer = ExpertStreamer(layer, ("host_rows",))
                         reader = streamer.file_row_reader

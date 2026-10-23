@@ -96,7 +96,7 @@ def test_apply_graph_refuses_a_plain_pinned_tier_backend():
 def test_apply_graph_accepts_an_option_c_backend():
     from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 
-    class OptionCBackend(PinnedTierRowBackend):  # stands in for Task 14's Exl3RamMissRowBackend
+    class OptionCBackend(PinnedTierRowBackend):  # stands in for Task 14's ExpertEngineRowBackend
         pass
 
     backend = OptionCBackend({0: None}, torch.full((6,), -1, dtype=torch.int64), 6)
@@ -130,7 +130,7 @@ def test_direct_fused_moe_covers_resident_slots_with_zero_scratch(monkeypatch):
     monkeypatch.setattr(module, "Exl3FusedMoE", lambda tensors, slots, **kw: calls.append(slots) or object())
     layer = torch.nn.Module()
     layer.top_k = 6
-    backend = SimpleNamespace(name="exl3_ram_miss")
+    backend = SimpleNamespace(leased=True)
     streamer = _stub_streamer(backend, scratch_rows=0)
     streamer.hot_cache.capacity = 6
     streamer.hot_cache.device_residency = SimpleNamespace(insert_on_miss=True, insert_direct=True)
@@ -147,7 +147,7 @@ def test_direct_fused_moe_covers_resident_slots_with_zero_scratch(monkeypatch):
     with pytest.raises(ValueError, match="DIRECT needs at least top_k"):
         module.exl3_fused_moe_for(layer, streamer)
     streamer.hot_cache.capacity = 6
-    streamer.row_backend = SimpleNamespace(name="other")
+    streamer.row_backend = SimpleNamespace(leased=False)
     with pytest.raises(ValueError, match="scratch"):
         module.exl3_fused_moe_for(layer, streamer)
 
@@ -163,7 +163,7 @@ def test_direct_fused_moe_for_a_verify_needs_one_token_of_resident_slots_not_eve
     monkeypatch.setattr(module, "Exl3FusedMoE", lambda tensors, slots, **kw: calls.append((slots, kw)) or object())
     layer = torch.nn.Module()
     layer.top_k = 6
-    streamer = _stub_streamer(SimpleNamespace(name="exl3_ram_miss"), graph_gather_rows=36, scratch_rows=0)
+    streamer = _stub_streamer(SimpleNamespace(leased=True), graph_gather_rows=36, scratch_rows=0)
     streamer.hot_cache.capacity = 16
     streamer.hot_cache.device_residency = SimpleNamespace(insert_on_miss=True, insert_direct=True)
     streamer.hot_cache.device = torch.device("cpu")
@@ -259,7 +259,7 @@ def test_fused_moe_for_sizes_tokens_from_the_gather_rows(monkeypatch):
     monkeypatch.setattr(module, "Exl3FusedMoE", lambda tensors, slots, **kw: calls.append(kw) or object())
     layer = torch.nn.Module()
     layer.top_k = 6
-    streamer = _stub_streamer(SimpleNamespace(name="other"), graph_gather_rows=36, scratch_rows=36)
+    streamer = _stub_streamer(SimpleNamespace(leased=False), graph_gather_rows=36, scratch_rows=36)
     streamer.hot_cache.device = torch.device("cpu")
     streamer.hot_cache.tensors = {"w13_suh": torch.zeros((39, 2, 8)), "w2_suh": torch.zeros((39, 1, 8))}
     module.exl3_fused_moe_for(layer, streamer)

@@ -9,13 +9,21 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import exl3_ram_miss as module
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+from sglang.srt.layers.moe.expert_engine import row_backend
+from sglang.srt.layers.moe.expert_engine.config import resolved_config
+from sglang.srt.layers.moe.expert_engine import service as module
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, DirectUpdaterStandIn, paused, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import (
+    ROW_IMAGE_DIM,
+    DirectUpdaterStandIn,
+    dsv41_exl3_pairing,
+    paused,
+    service_row_images,
+)
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -40,10 +48,11 @@ def _built_tiers(tmp_path, monkeypatch, capacities):
     monkeypatch.setattr(module, "stream_segment_map", lambda segments, tables, row: None)
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
+    module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     streamers = {}
     with service_row_images(tmp_path):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
@@ -52,11 +61,11 @@ def _built_tiers(tmp_path, monkeypatch, capacities):
                 layer._nvfp4_expert_streamer = streamer
                 ExpertPinnedHostCache(streamer, capacities[layer_id], device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
-        service = module.Exl3RamMissService.get()
+        service = module.ExpertEngineService.get()
         service.plan_gather_width(1)
         yield service, streamers
         service.shutdown()
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
 
 
 def _manager(updater=None):
@@ -156,12 +165,12 @@ def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
 def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_all(
     tmp_path, monkeypatch, extra, refused
 ):
-    """SGLANG_MOE_PINNED_HOST_FULL_LAYERS: the host keeps a row's staging slot out of assign, so a tier of exactly
+    """SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS: the host keeps a row's staging slot out of assign, so a tier of exactly
     the expert count cannot map them all and start refuses it; one slot more maps every expert at attach, and a layer
     not listed is not filled. Mutations: the check ignoring staging, or attach skipping the fill -- red."""
     # The device side's map apply is a CUDA kernel; the host's map is what is under test.
     monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, entries: None)
-    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0"):
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0"):
         for service, streamers in _built_tiers(tmp_path, monkeypatch, [EXPERTS + extra, CAPACITY]):
             if refused:
                 with pytest.raises(ValueError, match=r"short of every expert"):
@@ -174,13 +183,35 @@ def test_a_full_layer_needs_its_staging_past_every_expert_and_attach_maps_them_a
                 assert all(slot < 0 for slot in service.host.mapping(1))
 
 
+def test_a_fully_pinned_model_starts_without_staging_and_maps_every_expert_in_exactly_its_count(
+    tmp_path, monkeypatch, caplog
+):
+    """Every streamed layer full (model_fully_pinned): the start reserves no staging slot and says so, so a tier of
+    exactly the expert count maps every expert and no slot is kStaging. Mutation: staging_width keeps the planned width
+    (start refuses the layers as short of every expert)."""
+    from sglang.srt.layers.moe import expert_stream
+
+    monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, entries: None)
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset(range(LAYERS)))
+    caplog.set_level("INFO", logger=module.logger.name)
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
+        for service, streamers in _built_tiers(tmp_path, monkeypatch, [EXPERTS] * LAYERS):
+            for streamer in streamers.values():
+                _attach(service, streamer, 1)
+            with paused(service.host):
+                for row in range(LAYERS):
+                    assert sorted(service.host.mapping(row)) == list(range(EXPERTS))
+                    assert all(state != 3 for state, _, _ in service.host.slot_info(row))
+    assert "staging is off (0 staging slots a row)" in caplog.text
+
+
 def test_full_layer_room_is_every_homed_expert_past_staging_and_pool():
     """Each group keeps min(width, slots - 1) staging and the pool share, and must still hold the experts homed on it
     (expert % groups): 384 experts on 2 groups need 192 + 8 + 2 slots each."""
     ranges = [(0, 202), (202, 404)]
-    assert module.full_layer_shortfall(ranges, staging_width=8, share=2, experts=384) == []
-    assert module.full_layer_shortfall([(0, 201), (201, 403)], staging_width=8, share=2, experts=384) == [(0, 191, 192)]
-    assert module.full_layer_shortfall([(0, 6)], staging_width=1, share=0, experts=6) == [(0, 5, 6)]
+    assert row_backend.full_layer_shortfall(ranges, staging_width=8, share=2, experts=384) == []
+    assert row_backend.full_layer_shortfall([(0, 201), (201, 403)], staging_width=8, share=2, experts=384) == [(0, 191, 192)]
+    assert row_backend.full_layer_shortfall([(0, 6)], staging_width=1, share=0, experts=6) == [(0, 5, 6)]
 
 
 def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):
@@ -218,10 +249,14 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
 
 def test_cpu_experts_refuse_the_generic_route_plan():
     """Only the fused plan sorts the miss lanes; refused before the host is touched."""
-    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
-        with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
-            module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False, None)
+    cfg = SimpleNamespace(enable_layer_fusion=True)
+    with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'), \
+            envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False):
+        with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"):
+            module.ExpertEngineService._start_cpu_experts(
+                cfg, None, None, {}, False, None, stream=resolved_config().stream
+            )
 
 
 def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(tiers, monkeypatch):
@@ -234,7 +269,7 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
     service.ensure_started()
     built = []
     monkeypatch.setattr(
-        module, "Exl3RamMissRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
+        module, "ExpertEngineRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
     )
     service.cpu_experts = SimpleNamespace(
         x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
@@ -263,11 +298,54 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
     assert all(kwargs["cpu_experts"] for kwargs in built)
 
 
-@pytest.mark.parametrize("lanes, capacity, width", [(8, 3, 8), (16, 5, 16), (16, 40, 40), (32, 12, 32)])
+def test_with_a_lane_head_each_layer_plans_by_the_heads_keys_and_runs_its_hook(tiers, monkeypatch):
+    """SGLANG_OPT_LANE_HEAD_PATH: the fused plan reads the head's row of keys (a view the hook writes in the graph)
+    instead of the residency ranking's, and the gather calls the layer's hook. Mutation: keeping updater.miss_keys."""
+    from sglang.srt.layers.moe.lane_head import LaneHeadGather
+
+    service, streamers = tiers
+    service.ensure_started()
+    monkeypatch.setattr(module, "ExpertEngineRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    service.cpu_experts = SimpleNamespace(
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
+        attach_device=lambda device_side: None,
+    )
+    updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
+    head = SimpleNamespace(keys=torch.zeros((LAYERS, EXPERTS), dtype=torch.int64), meta=SimpleNamespace(experts=EXPERTS))
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater, lane_head=head)
+    try:
+        for layer_id, streamer in streamers.items():
+            streamer._graph_pinned_tier = True
+            streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
+            streamer.graph_gather_rows = 1
+            streamer.residency_row = LAYERS - 1 - layer_id
+            streamer.row_backend = SimpleNamespace(
+                segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64)
+            )
+            service.attach(manager, streamer)
+    finally:
+        service.cpu_experts = None
+    for streamer in streamers.values():
+        assert streamer._plan_miss_keys.data_ptr() == head.keys[streamer.residency_row].data_ptr()
+        hook = streamer.lane_head_hook
+        assert isinstance(hook, LaneHeadGather) and hook.row == streamer.residency_row and hook.head is head
+
+
+def test_a_lane_head_without_cpu_experts_is_refused(tiers):
+    """The head orders the CPU experts' miss lanes; with none it would load and do nothing, so the launch stops."""
+    service, streamers = tiers
+    service.ensure_started()
+    manager = _manager()
+    manager.lane_head = SimpleNamespace()
+    with pytest.raises(ValueError, match="SGLANG_OPT_LANE_HEAD_PATH orders the CPU experts"):
+        _attach(service, streamers[0], 1, manager)
+
+
+@pytest.mark.parametrize("lanes, capacity, width",[(8, 3, 8), (16, 5, 16), (16, 40, 40), (32, 12, 32)])
 def test_the_backend_pads_its_plan_to_the_build_lanes(lanes, capacity, width):
     """The production backend (not only the service's helper) pads ``planned`` to max(capacity, lanes): an eager post
     of 9-16 lanes at 16 must fit the tensor. Mutation: padded_plan_width returns the capacity."""
-    backend = module.Exl3RamMissRowBackend(
+    backend = row_backend.ExpertEngineRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(lanes)),
         0, capacity, {0: None},
     )
@@ -298,13 +376,13 @@ class _Side:
 
 def _captured_backend(monkeypatch, streamer_of):
     side = _Side()
-    backend = module.Exl3RamMissRowBackend(
+    backend = row_backend.ExpertEngineRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), side, 0, 1, {0: None},
         copy_engine=True, cpu_experts=True, streamer_of=streamer_of,
     )
     backend.cpu_input = (torch.zeros(1, 16), torch.ones(1, 1))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *args: side.calls.append(("copy", {})))
+    monkeypatch.setattr(row_backend, "copy_expert_row_segments_gpu", lambda *args: side.calls.append(("copy", {})))
     return backend, side
 
 
@@ -336,7 +414,7 @@ def test_a_captured_cpu_expert_gather_whose_streamer_is_gone_is_refused(monkeypa
 
 def test_cpu_experts_backend_needs_its_streamer():
     with pytest.raises(ValueError, match="pass streamer_of"):
-        module.Exl3RamMissRowBackend(
+        row_backend.ExpertEngineRowBackend(
             {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(8)), 0, 1,
             {0: None}, copy_engine=True, cpu_experts=True,
         )
@@ -346,7 +424,8 @@ def test_victim_lanes_stage_their_width_not_the_lanes(tiers):
     """Spill: the post types up to 36 lanes, but only the V victim lanes stage (a forced miss never does), so a row
     reserves V staging slots (Exl3ExpertFormat.plan_graph_gather plans it)."""
     service, streamers = tiers
-    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(2):
+    with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(2):
+        service.config = resolved_config()  # the service resolves its config once, when it is built
         streamers[0].format.plan_graph_gather(streamers[0], 36)
     assert service.resolved_lanes() == 40
     assert service.staging_width() == 2
@@ -390,7 +469,7 @@ def test_cpu_experts_attach_a_verify_gather_and_wire_its_spill_words(tiers, monk
     service, streamers = tiers
     service.plan_gather_width(36)
     service.ensure_started()
-    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(module, "ExpertEngineRowBackend", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(service, "_check_spill_room", lambda row, streamer, width: None)
     service.cpu_experts = _cpu_stand_in()
     updater = _spill_updater()
@@ -410,7 +489,7 @@ def test_spill_refuses_a_tier_without_a_victim_for_every_forced_miss(tiers, monk
     service, streamers = tiers
     service.plan_gather_width(36)
     service.ensure_started()
-    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(module, "ExpertEngineRowBackend", lambda *args, **kwargs: SimpleNamespace())
     service.cpu_experts = _cpu_stand_in()
     try:
         with pytest.raises(ValueError, match="reads every forced CPU miss into a RAM victim"):
@@ -428,7 +507,7 @@ def test_spill_refuses_a_tier_without_a_victim_for_every_forced_miss(tiers, monk
     ],
 )
 def test_spill_room_is_staging_plus_lanes_plus_hot_per_node(ranges, short):
-    assert module.spill_room_shortfall(ranges, staging=8, lanes=36, hot=24) == short
+    assert row_backend.spill_room_shortfall(ranges, staging=8, lanes=36, hot=24) == short
 
 
 def test_a_captured_cpu_expert_gather_posts_its_spill_words(monkeypatch):
@@ -460,15 +539,65 @@ def test_cpu_rows_hold_the_verify_tokens():
 
 def test_the_speculative_pool_adds_its_share_to_the_spill_room():
     """The pool's kSpec slots are never victims, so a forced miss's room needs them on top (RAM prefetch)."""
-    assert module.spill_room_shortfall([(0, 69), (69, 139)], staging=8, lanes=36, hot=24, pool=2) == [(0, 69, 70)]
-    assert module.spill_room_shortfall([(0, 80), (80, 161)], staging=8, lanes=36, hot=24, pool=2) == []
+    assert row_backend.spill_room_shortfall([(0, 69), (69, 139)], staging=8, lanes=36, hot=24, pool=2) == [(0, 69, 70)]
+    assert row_backend.spill_room_shortfall([(0, 80), (80, 161)], staging=8, lanes=36, hot=24, pool=2) == []
 
 
 def test_a_rows_reserved_slots_count_the_speculative_pool():
     """The pool's share per row and group is never assigned, so the eager LRU must not count on it either."""
     service = SimpleNamespace(staging_for=lambda capacity: 8, _spec_share=2, host=SimpleNamespace(nodes=2))
-    service.pool_slots = lambda: module.Exl3RamMissService.pool_slots(service)
-    assert module.NativePinnedSlotTable.reserved_rows.fget(SimpleNamespace(service=service, capacity=40)) == 12
+    service.pool_slots = lambda: module.ExpertEngineService.pool_slots(service)
+    assert row_backend.NativePinnedSlotTable.reserved_rows.fget(SimpleNamespace(service=service, capacity=40)) == 12
+
+
+def test_held_back_slots_are_none_when_every_streamed_layer_is_full(monkeypatch):
+    """The pinned tier sizes each full layer from these slots. While any layer can miss, a row holds back its staging
+    and the prefetch pool; with every layer full (model_fully_pinned) nothing can miss, so it holds back neither and a
+    DSV4.1 full layer is 192 homed experts + 2 seam slots a group. Mutation: the fully pinned branch is gone (8)."""
+    from sglang.srt.layers.moe import expert_stream
+
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0, 1}))
+    with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(0), \
+            envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES.override(8), \
+            envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), \
+            envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(2):
+        # The table reads its service's config, resolved when the service was built: one per setting here.
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
+            config = resolved_config()
+            assert not expert_stream.model_fully_pinned(config=config.stream)
+            table = SimpleNamespace(service=SimpleNamespace(config=config))
+            assert row_backend.NativePinnedSlotTable.held_back_per_group(table) == 10
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
+            config = resolved_config()
+            assert expert_stream.model_fully_pinned(config=config.stream)
+            table = SimpleNamespace(service=SimpleNamespace(config=config))
+            held_back = row_backend.NativePinnedSlotTable.held_back_per_group(table)
+            assert held_back == 0
+            assert expert_stream.full_layer_group_rows(384, groups=2, held_back=held_back) == [194, 194]
+
+
+def test_a_fully_pinned_model_stages_nothing_and_its_checks_accept_zero(tiers, monkeypatch):
+    """staging_width is 0 once every streamed layer is full, whatever the gather planned, and every check sized from
+    it takes 0: a group then maps every slot of its range. Mutation: staging_width ignores model_fully_pinned."""
+    from sglang.srt.layers.moe import expert_stream
+
+    service, streamers = tiers
+    with envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(2):
+        service.config = resolved_config()  # the service resolves its config once, when it is built
+        streamers[0].format.plan_graph_gather(streamers[0], 36)
+    assert service.staging_width() == 2
+    monkeypatch.setattr(expert_stream, "_streamed_layer_ids", frozenset({0}))
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0"):
+        service.config = resolved_config()
+        assert service.staging_width() == 0 and service.staging_for(CAPACITY) == 0
+    ranges = [(0, 193), (194, 388)]  # 194 rows a group, one slot lost to the seam
+    assert row_backend.full_layer_shortfall(ranges, staging_width=0, share=0, experts=384) == []
+    assert row_backend.full_layer_shortfall([(0, 191), (191, 383)], staging_width=0, share=0, experts=384) == [
+        (0, 191, 192)
+    ]
+    assert row_backend.usable_rows(ranges, staging_width=0, share=0) == 193 + 194
+    assert row_backend.pool_room_shortfall(ranges, staging_width=0, share=0) == []
+    assert row_backend.spill_room_shortfall(ranges, staging=0, lanes=36, hot=100) == []
 
 
 @pytest.mark.parametrize(
@@ -485,7 +614,33 @@ def test_the_pool_room_is_checked_per_group_as_the_host_reserves_it(ranges, widt
     reserve_staging, reserve_spec_pool); the row's totals would accept every case here."""
     capacity, nodes = ranges[-1][1], len(ranges)
     assert capacity - min(width, capacity - 1) - 2 * nodes >= 2 * nodes
-    assert module.pool_room_shortfall(ranges, staging_width=width, share=2) == short
+    assert row_backend.pool_room_shortfall(ranges, staging_width=width, share=2) == short
+
+
+@pytest.mark.parametrize(
+    "ranges, width, share, usable",
+    [
+        ([(0, 113), (113, 210)], 8, 2, 103 + 87),  # two nodes split 113 / 97, staging 8 and pool 2 each
+        ([(0, 10), (10, 20)], 7, 0, 3 + 3),  # each group stages 7, not 7 for the row
+        ([(0, 3), (3, 20)], 8, 1, 0 + 8),  # a tiny group stages all but one slot and gives none to the pool's excess
+        ([(0, 210)], 8, 0, 202),  # one node
+    ],
+)
+def test_usable_rows_count_each_group_past_its_staging_and_pool(ranges, width, share, usable):
+    assert row_backend.usable_rows(ranges, staging_width=width, share=share) == usable
+
+
+def test_the_prefill_share_is_the_served_fraction_of_the_smallest_row():
+    """64/187 of the served layout's 187-188 usable rows is the 64 served; the smallest row decides (the host keeps one
+    share for every layer), and a share is at least one row. Mutations: the largest row, truncation, no floor of 1."""
+    assert row_backend.PREFILL_SHARE_FRACTION == 64 / 187
+    assert row_backend.prefill_share_rows([188, 187, 188]) == 64
+    assert row_backend.prefill_share_rows([300, 100]) == 34
+    assert row_backend.prefill_share_rows([189]) == 65  # 64.69 rounds, not truncates
+    assert row_backend.prefill_share_rows([190], fraction=0.5) == 95
+    assert row_backend.prefill_share_rows([1]) == 1
+    with pytest.raises(ValueError, match="at least one row"):
+        row_backend.prefill_share_rows([])
 
 
 def test_a_row_with_a_target_scores_right_after_its_post(monkeypatch):

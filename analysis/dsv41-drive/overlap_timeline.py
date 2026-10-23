@@ -3,7 +3,7 @@
 Task 4's gate is "timeline proves I/O and packing overlap". The claim is per row, not a sorted
 list of stages: row A packing before the last completion of row B is the expected overlap.
 
-Input is the JSONL the stream trace writes (SGLANG_DSV41_EXPERT_TRACE_PATH); only its
+Input is the JSONL the stream trace writes (the expert_path of SGLANG_EXPERT_STREAM_TRACE); only its
 ``kind == "ram_miss_request"`` lines are read. Nothing is written back.
 
 What a schema allows (Exl3StreamTrace.RAM_MISS_TRACE_SCHEMA; spans are NOT comparable across it):

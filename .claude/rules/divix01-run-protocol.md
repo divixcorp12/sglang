@@ -35,9 +35,13 @@ construction, so the failure mode does not exist.
 
 ## The interpreter trap
 
-`/data/models/slang/.venv/bin/python` imports sglang from
-`main-port-probe-7bc4eb` unless `PYTHONPATH` points at the tree under test.
-Without it a run exercises unrelated code and reports green. Print
+The serving venv is `/data/models/slang/.venv-upstream` (torch 2.14.1,
+flashinfer 0.7.2; `arm_env.PYTHON`) since the upstream merge of 2026-10-18. Its
+sglang is an editable install of `wt-upstream-merge`, so it imports that tree
+unless `PYTHONPATH` points at the tree under test. The old venv
+`/data/models/slang/.venv` (torch 2.13) imports `main-port-probe-7bc4eb` the
+same way; keep it for rollback and for re-running dated records made on it.
+Without `PYTHONPATH` a run exercises unrelated code and reports green. Print
 `sglang.__file__` and read it before trusting any result.
 
 ## A pipeline reports the last command's status, not pytest's
@@ -71,8 +75,8 @@ noise. A change to the expert-stream / RAM-miss host or device code, for example
 ## Point the registered suite at `unit/kernels`, not the whole tree
 
 ```bash
-PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
-  /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-51,56-107 \
+  /data/models/slang/.venv-upstream/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
 ```
 
 `test/registered` and `test/registered/unit` sweep in directories (`xpu/`,
@@ -118,6 +122,21 @@ A suite runner should load the modules once before `-n 8` (the session runner do
 fix on a cold cache without touching anyone's cache, set `SGLANG_JIT_HOST_MARCH` to a name not used before (for example
 `x86-64-v2`), which gives every module a new key.
 
+## Run GPU tests with `-n 8`
+
+GPU test files (`register_cuda_ci` files, `test/manual/dsv41`, `test/registered/unit/kernels`) run under
+`pytest -n 8`, like the CPU tests. Run serially, they leave the RTX 5090 almost idle: on 2026-10-22 a serial
+`unit/kernels` run took 19m48s with the GPU at ~0% utilization and ~1.8 GiB used, and the expert-engine GPU selection
+took ~2 min under `-n 8` against ~15 min serially. Tests share the card without `cc-gpu.lock` (see "CPU and cores");
+A/Bs, timed benchmarks and nsys captures still take the lock and never run with `-n`.
+
+- Warm the JIT modules first, serially, as above: a cold cache under `-n 8` queues builds behind the build lock and
+  times out child processes.
+- Compare against a base run made the same way. Load-sensitive tests (idle-spin, keep-warm, timing windows) flake under
+  `-n 8`; rerun a branch-only failure serially before calling it a regression.
+- A serving process holding most of the card's memory makes GPU tests fail with out-of-memory on both sides; that is
+  not a result. Check `nvidia-smi` before reading one.
+
 ## What this costs
 
 Running unverified code needs a commit first. That is the intended trade: the
@@ -149,17 +168,36 @@ result is only meaningful next to the restored baseline.
 
 ## CPU and cores
 
-Every CPU job runs under `taskset -c 0-63` with threads capped
-(`OMP_NUM_THREADS`). Cores 64-71 stay free: NVMe completion interrupts are
-pinned there, and the RAM-miss path reads rows from NVMe. GPU work runs under
-`cc-gpu.lock` on cores 32-63, never as a bare command. Two ways, both on
-divix01:
+divix01 has two Xeon Platinum 8280s (28 physical cores per socket, SMT 2, 112 CPUs; cpu N's SMT sibling is N + 56):
+
+| | node 0 (the GPU's) | node 1 (all four NVMe drives) |
+|---|---|---|
+| CPUs | 0-27, 56-83 | 28-55, 84-111 |
+| Production roles | server 0-5,56-61; CPU experts 6-15; RAM thread 26; copy thread 27; benchmark client 18-21; helpers 22-25 | CPU experts 28-37; RAM thread 51; RAM-prefetch thread 50 |
+| Kept free | | 52-55,108-111 (`arm_env.FREE_CORES`) |
+
+(The roles are `benchmarks/dsv41_baseline/arm_env.py`'s; the 18-core CPUs this box had before 2026-10-21 used 0-17,36-53 and
+18-35,54-71 with the same roles. Older notes and result files quote those numbers.)
+
+- **CPU-only jobs** run under `taskset -c 0-51,56-107` (everything but the free cores; `arm_env.CPU_JOB_CORES`) with
+  threads capped (`OMP_NUM_THREADS`).
+- **GPU jobs** run on node 0, `taskset -c 0-27,56-83` (`arm_env.GPU_JOB_CORES`). Several can share the card: GPU unit
+  and correctness tests, mutants and offline GPU analysis run alongside each other without `cc-gpu.lock`.
+- **Only A/B tests and performance-sensitive benchmarks take `cc-gpu.lock`**, for exclusive use of the card: served
+  A/Bs and arms (`run_arm.sh` takes it itself), timed benchmarks and anything whose numbers another GPU job would
+  distort. Owner, 2026-10-22: a 30 s test file had waited tens of minutes behind another agent's test round.
+- **52-55,108-111 stay free**: NVMe completion interrupts belong there, and the RAM-miss path reads rows from NVMe.
+  Nothing pins the interrupts yet: irqbalance spreads them over node 1 and node 0's siblings. A root step does (write the
+  cores to each nvme queue IRQ's `/proc/irq/N/smp_affinity_list`, and set `IRQBALANCE_BANNED_CPULIST=0-51,56-107`). The
+  code refuses these cores already (`RESERVED_CORES` in `threading_config.py`, `is_reserved_core` in `core_topology.h`).
+
+Two ways to take the GPU lock (A/B tests and performance-sensitive benchmarks only), both on divix01:
 
 - `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh <cmd>`
   (not in any repo). It retries the lock every 60 s and **gives up after 30 min
   with exit 75**, so it fails behind a long arm or soak; check for 75.
 - To wait as long as it takes, lock directly:
-  `flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 <cmd>`,
+  `flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 0-27,56-83 <cmd>`,
   or `exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock; flock 9` in a script
   (see the lock order below).
 
@@ -180,7 +218,7 @@ launched with `env -u` did this to another agent's capture twice (KV pool
 
 ## Lock order: `rowimg-disk.lock`, then `cc-gpu.lock`
 
-A job that needs both locks takes the disk lock first. `run_arm.sh` takes
+A job that needs both locks (an A/B or a performance-sensitive benchmark) takes the disk lock first. `run_arm.sh` takes
 `cc-gpu.lock` itself (non-blocking), so an arm driver must already hold
 `rowimg-disk.lock` and poll for the GPU; a script that held the GPU while
 waiting for the disk would deadlock against it, both waiting forever.

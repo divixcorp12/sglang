@@ -1,16 +1,19 @@
 // The RAM prefetch's GPU scorer (spec docs/superpowers/specs/2026-10-09-dsv41-ram-prefetch-gpu-scorer-design.md):
 // two kernels launched right after layer T's post, on its stream and inside its captured graph.
 //
-//   exl3_ram_prefetch_score_kernel   sqrt(softplus(w_e . x_t)) + b_e of layer T+1's gate for every live token, fp32,
+//   expert_stream_prefetch_score_kernel   R::score(w_e . x_t, b_e) (router.h) of layer T+1's gate for every live token, fp32,
 //                                    into a [tokens_max, experts] scratch
-//   exl3_ram_prefetch_select_kernel  GateScorer::choose's ranking (host/gate_scorer.h) past the experts VRAM-hot or
+//   expert_stream_prefetch_select_kernel  GateScorer::choose's ranking (host/gate_scorer.h) past the experts VRAM-hot or
 //                                    RAM-mapped in layer T+1, published to the record's candidate slot (spec_candidates.h)
 //   SpecScoreKernel                  the checked host launchers for both
 #pragma once
 
 #include <sgl_kernel/tensor.h>
 
+#include <tvm/ffi/optional.h>
+
 #include "lease_device.cuh"
+#include "router.h"
 #include "spec_candidates.h"
 #include "tensor_checks.h"
 #include <cuda_bf16.h>
@@ -83,10 +86,10 @@ struct SpecScoreParams {
 
 // The score kernel: one block per expert, its threads striding the hidden size in 16-byte gate loads (a scalar loop
 // covers the rest, or all of it when unaligned) for kScoreTokenTile tokens per pass, fp32 sums reduced over the block,
-// then sqrt(softplus(z)) + b with torch's softplus threshold of 20. The sqrt and the add are correctly rounded whatever
-// the module's math flags, so integer logits score as the host's do, bit for bit.
-template <class W>
-__global__ __launch_bounds__(device::expert_stream::kScoreThreads) void exl3_ram_prefetch_score_kernel(
+// then R::score(z, b); SqrtSoftplusBias is sqrt(softplus(z)) + b with torch's softplus threshold of 20, its sqrt and add
+// correctly rounded whatever the module's math flags, so integer logits score as the host's do, bit for bit.
+template <::sglang::expert_stream::ExpertRouter R, class W>
+__global__ __launch_bounds__(device::expert_stream::kScoreThreads) void expert_stream_prefetch_score_kernel(
     const __grid_constant__ SpecScoreParams p) {
   using namespace device::expert_stream;
   constexpr int N = 16 / sizeof(W);
@@ -133,8 +136,7 @@ __global__ __launch_bounds__(device::expert_stream::kScoreThreads) void exl3_ram
       float z = 0.0f;
 #pragma unroll
       for (int w = 0; w < kWarps; ++w) z = __fadd_rn(z, partial[w][threadIdx.x]);
-      const float softplus = z > 20.0f ? z : log1pf(expf(z));
-      const float s = __fadd_rn(__fsqrt_rn(softplus), p.bias[e]);
+      const float s = R::score(z, p.bias[e]);
       p.scores[(t0 + threadIdx.x) * p.experts + e] = isnan(s) ? neg_inf() : s;  // a NaN score ranks below every other
     }
     __syncthreads();  // the next pass rewrites partial
@@ -144,8 +146,13 @@ __global__ __launch_bounds__(device::expert_stream::kScoreThreads) void exl3_ram
 // Arguments of the select kernel, a __grid_constant__ a captured graph freezes.
 struct SpecSelectParams {
   const float* scores;  // the score kernel's [tokens_max, experts]
-  int64_t tokens;       // the record's live tokens; outside 1..tokens_max the slot gets count 0
+  int64_t tokens;       // the record's tokens; outside 1..tokens_max the slot gets count 0
   int64_t tokens_max;
+  // The record's routes, route_top_k per token (lease_kernels.cuh PostParams::routes): only tokens through the last
+  // with a route >= 0 are ranked (live_route_tokens), so a verify's dead rows spend no per_token picks. Null: all.
+  const int64_t* routes;
+  int64_t route_count;
+  int64_t route_top_k;
   int64_t experts;
   int64_t top_k;
   int64_t per_token;
@@ -161,7 +168,7 @@ struct SpecSelectParams {
 // argmax, lane l holding experts l, l + 32, .... Thread 0 then walks each token's order past the skipped experts as
 // GateScorer::choose does, merges the picks by best margin, and publishes up to kMaxCandidates to the record's slot:
 // seq 0, a release fence, the payload, then the seq with a release (the hot page's order).
-__global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3_ram_prefetch_select_kernel(
+__global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void expert_stream_prefetch_select_kernel(
     const __grid_constant__ SpecSelectParams p) {
   using namespace device::expert_stream;
   using Cand = ::sglang::expert_stream::wire::SpecCandidates;
@@ -172,6 +179,8 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
   __shared__ int16_t order[kSelectMaxTokens][kSpecDepth];
   __shared__ int16_t list[kSelectMaxTokens * kSpecDepth];
   const bool live = p.tokens >= 1 && p.tokens <= p.tokens_max;
+  const int64_t tokens =
+      live && p.routes != nullptr ? live_route_tokens(p.routes, p.route_count, p.tokens, p.route_top_k) : p.tokens;
   const int64_t depth = min(static_cast<int64_t>(kSpecDepth), p.experts);
   for (int64_t e = threadIdx.x; e < p.experts; e += blockDim.x) {
     skip[e] = p.ram_slot[e] >= 0 ? 1 : 0;
@@ -184,7 +193,7 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
   }
   if (live) {
     const int lane = threadIdx.x % 32;
-    for (int64_t t = threadIdx.x / 32; t < p.tokens; t += kSelectThreads / 32) {
+    for (int64_t t = threadIdx.x / 32; t < tokens; t += kSelectThreads / 32) {
       const float* s = p.scores + t * p.experts;
       uint32_t taken = 0;  // bit k: expert lane + 32k is already ordered
       for (int64_t i = 0; i < depth; ++i) {
@@ -216,7 +225,7 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
   int n = 0;
   if (live) {
     const int64_t walk = p.top_k_only != 0 ? p.top_k : depth;
-    for (int64_t t = 0; t < p.tokens; ++t) {
+    for (int64_t t = 0; t < tokens; ++t) {
       const float* s = p.scores + t * p.experts;
       const float kth = s[order[t][p.top_k - 1]];
       int64_t taken = 0;
@@ -257,7 +266,7 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
     st_relaxed_sys<uint32_t>(entry + Cand::kCandExpert, static_cast<uint32_t>(e) | static_cast<uint32_t>(rank[e]) << 16);
     st_relaxed_sys<uint32_t>(entry + Cand::kCandMargin, __float_as_uint(best[e]));
   }
-#ifndef EXL3_RAM_MISS_TEST_SPEC_NO_SEQ
+#ifndef EXPERT_STREAM_TEST_SPEC_NO_SEQ
   st_release_sys(slot + Cand::kCandSeq, seq);  // orders the payload before the seq
 #endif
 }
@@ -278,7 +287,7 @@ struct SpecDripParams {
 // The GPU drip's picks, one block of kSelectThreads: the `picks` best experts mapped in RAM and not VRAM-hot by their
 // best score over the rows (ties to the lower id, NaN below all), published after the candidates under their own seq:
 // seq 0, a release fence, the count and experts, then the seq with a release.
-__global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3_gpu_drip_select_kernel(
+__global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void expert_stream_drip_select_kernel(
     const __grid_constant__ SpecDripParams p) {
   using namespace device::expert_stream;
   using Cand = ::sglang::expert_stream::wire::SpecCandidates;
@@ -357,7 +366,8 @@ __global__ __launch_bounds__(device::expert_stream::kSelectThreads, 1) void exl3
 
 /// \brief Checked host launchers for the GPU scorer's kernels: score, then select, on the stream of the tensors'
 /// device and without PDL, so each starts after the post before it completed.
-struct SpecScoreKernel {
+template <::sglang::expert_stream::ExpertRouter R>
+struct SpecScoreKernelFor {
   /// Launches the GPU drip's select kernel; see SpecDripParams. `scores` fp32 [rows_max, experts] with 0 <= rows <=
   /// rows_max, `ram_slot` the device map bank's [map rows, experts] and `target` its row, `candidates_address` the
   /// pinned candidate page's address.
@@ -409,7 +419,7 @@ struct SpecScoreKernel {
         .candidates = reinterpret_cast<uint8_t*>(candidates_address),
     };
     const auto stream = LaunchKernel::resolve_device(scores.device());
-    LaunchKernel(dim3(1), dim3(kSelectThreads), stream)(exl3_gpu_drip_select_kernel, params);
+    LaunchKernel(dim3(1), dim3(kSelectThreads), stream)(expert_stream_drip_select_kernel, params);
   }
 
   /// Launches the score kernel; see SpecScoreParams. `x` bf16 [tokens, hidden], `w` bf16 or fp32 [experts, hidden],
@@ -451,11 +461,12 @@ struct SpecScoreKernel {
     };
     const auto stream = LaunchKernel::resolve_device(scores.device());
     LaunchKernel(dim3(static_cast<unsigned>(E_.unwrap())), dim3(kScoreThreads), stream)(
-        fp32 ? exl3_ram_prefetch_score_kernel<float> : exl3_ram_prefetch_score_kernel<bf16_t>, params);
+        fp32 ? expert_stream_prefetch_score_kernel<R, float> : expert_stream_prefetch_score_kernel<R, bf16_t>, params);
   }
 
   /// Launches the select kernel; see SpecSelectParams. `ram_slot` is the device map bank's [rows, experts] and
-  /// `target` its row; `candidates_address` the pinned candidate page's address.
+  /// `target` its row; `candidates_address` the pinned candidate page's address. `routes`, int64 [route_count] or
+  /// absent, holds route_top_k routes per token.
   static void select(
       tvm::ffi::TensorView scores,
       int64_t tokens,
@@ -467,7 +478,9 @@ struct SpecScoreKernel {
       tvm::ffi::TensorView ram_slot,
       int64_t target,
       tvm::ffi::TensorView state,
-      int64_t candidates_address) {
+      int64_t candidates_address,
+      tvm::ffi::Optional<tvm::ffi::TensorView> routes,
+      int64_t route_top_k) {
     using namespace host;
     using namespace device::expert_stream;
     auto device = SymbolicDevice{};
@@ -475,6 +488,12 @@ struct SpecScoreKernel {
     auto E_ = SymbolicSize{"experts"};
     auto M_ = SymbolicSize{"tokens_max"};
     auto Rows_ = SymbolicSize{"rows"};
+    auto R_ = SymbolicSize{"routes"};
+    if (routes.has_value()) {
+      expert_stream::verify_named(
+          "routes", TensorMatcher({R_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), routes.value());
+      RuntimeCheck(routes.value().is_contiguous() && route_top_k >= 1, "routes: contiguous, with route_top_k >= 1");
+    }
     expert_stream::verify_named(
         "scores", TensorMatcher({M_, E_}).with_dtype<fp32_t>().with_device<kDLCUDA>(device), scores);
     expert_stream::verify_named(
@@ -498,6 +517,9 @@ struct SpecScoreKernel {
         .scores = static_cast<const float*>(scores.data_ptr()),
         .tokens = tokens,
         .tokens_max = M_.unwrap(),
+        .routes = routes.has_value() ? static_cast<const int64_t*>(routes.value().data_ptr()) : nullptr,
+        .route_count = routes.has_value() ? R_.unwrap() : 0,
+        .route_top_k = route_top_k,
         .experts = experts,
         .top_k = top_k,
         .per_token = per_token,
@@ -509,8 +531,11 @@ struct SpecScoreKernel {
         .candidates = reinterpret_cast<uint8_t*>(candidates_address),
     };
     const auto stream = LaunchKernel::resolve_device(scores.device());
-    LaunchKernel(dim3(1), dim3(kSelectThreads), stream)(exl3_ram_prefetch_select_kernel, params);
+    LaunchKernel(dim3(1), dim3(kSelectThreads), stream)(expert_stream_prefetch_select_kernel, params);
   }
 };
+
+// The DSV4 launchers, the name expert_stream_transport.py binds (_SPEC_METHODS).
+using SpecScoreKernel = SpecScoreKernelFor<::sglang::expert_stream::SqrtSoftplusBias>;
 
 }  // namespace sglang

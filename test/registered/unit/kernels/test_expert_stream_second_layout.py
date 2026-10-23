@@ -10,7 +10,7 @@ import torch
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_stream_transport as transport
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, TransportBuild, new_page
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -27,23 +27,27 @@ TWO = TransportBuild(
 )
 
 
+TWO_KEY = ("two", "sqrt_softplus")  # the test-only build's (format, router) key
+EXL3 = transport.EXL3_BUILD
+
+
 @pytest.fixture
 def two(monkeypatch):
-    monkeypatch.setitem(transport.LAYOUTS, "two", TWO)
+    monkeypatch.setitem(transport.LAYOUTS, TWO_KEY, TWO)
 
 
 def test_the_second_layout_has_its_own_host_module(two):
     """Red when HostExports ignores its Layout (say, a body naming Exl3RowLayout again): the two-name module would
     report EXL3's six names. Red too when a cached loader is keyed by call form again: _host_module() and
-    _host_module("exl3") would be two loads of one module."""
-    assert transport.host_layout("two") == (("a", "b"), 0b10)
-    assert transport.host_layout("exl3") == (tuple(EXL3_STREAMED_NAMES), 0b110110)
+    _host_module(EXL3_BUILD) would be two loads of one module."""
+    assert transport.host_layout(TWO_KEY) == (("a", "b"), 0b10)
+    assert transport.host_layout(EXL3) == (tuple(EXL3_STREAMED_NAMES), 0b110110)
     # Read from each module itself, not through host_layout's cache: two keys naming one .so would agree here.
-    two_module, exl3_module = transport._host_module("two"), transport._host_module("exl3")
+    two_module, exl3_module = transport._host_module(TWO_KEY), transport._host_module(EXL3)
     assert str(two_module.expert_stream_layout_names()) == "a\nb"
     assert str(exl3_module.expert_stream_layout_names()) == "\n".join(EXL3_STREAMED_NAMES)
     # One module per layout whatever the call form (cache_once keys f(), f(x) and f(layout=x) apart).
-    assert transport._host_module() is transport._host_module("exl3") is transport._host_module(layout="exl3")
+    assert transport._host_module() is transport._host_module(EXL3) is transport._host_module(layout=EXL3)
 
 
 def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, monkeypatch):
@@ -67,13 +71,13 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     real = transport._host_module
     monkeypatch.setattr(
         transport, "_host_module",
-        lambda layout="exl3", variant=None, lanes=8, nodes=1: (
-            loaded.append(layout) or real(layout, variant, lanes, nodes)
+        lambda layout=EXL3, variant=None, lanes=8, nodes=1, config=None: (
+            loaded.append(layout) or real(layout, variant, lanes, nodes, config)
         ),
     )
     page = new_page(pin=False, wire=wire_layout(8))
     slot_map = torch.full(tuple(t.starts.shape), -1, dtype=torch.int32)
-    host = ExpertStreamHost(tables, page=page, slot_map=slot_map, layout="two")
+    host = ExpertStreamHost(tables, page=page, slot_map=slot_map, layout=TWO_KEY)
     try:
         assert (host.layout_names, host.small_mask) == (("a", "b"), 0b10)
         host.reserve_staging(1)
@@ -88,13 +92,13 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
             assert same_bytes(s.slabs[1][name][slot], reference[name][0]), name
     finally:
         host.stop()
-    assert loaded and set(loaded) == {"two"}, loaded
+    assert loaded and set(loaded) == {TWO_KEY}, loaded
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the device module needs CUDA")
 def test_the_second_layout_builds_its_device_module(two):
     """Red when the row-copy kernels name EXL3 or need more of a layout than its trait."""
-    assert transport._device_module("two") is not None
+    assert transport._device_module(TWO_KEY) is not None
 
 
 if __name__ == "__main__":

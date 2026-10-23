@@ -1,6 +1,6 @@
 // Slot-map protocol kernels, independent of the streamed row's format.
 //
-//   PostParams / exl3_ram_miss_post_kernel   the post: applies the row's pending map delta, types the lanes and
+//   PostParams / expert_stream_post_kernel   the post: applies the row's pending map delta, types the lanes and
 //                                            publishes the demand record
 //   BulkApplyParams / ..._map_bulk_apply_kernel  applies every row's pending delta and the eager paths' map entries
 //                                            while the service is paused
@@ -51,11 +51,11 @@ struct PostParams {
   const uint8_t* cpu_ok;
   const int32_t* dst_rows;
   uint32_t row_capacity;
-  int64_t hit_copy_ce;  // SGLANG_DSV41_RAM_HIT_COPY=ce: an armed captured hit goes to the copy engine
+  int64_t hit_copy_ce;  // SGLANG_EXPERT_STREAM_RAM_HIT_COPY=ce: an armed captured hit goes to the copy engine
   int64_t cpu_on;
   int64_t cpu_misses;
-  int64_t miss_cut;  // experiment: SGLANG_DSV41_CPU_SPLIT_MISS_CUT (LanePolicy::miss_cut)
-  int64_t miss_cut_max;  // SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX
+  int64_t miss_cut;  // experiment: SGLANG_EXPERT_STREAM_CPU_SPLIT miss_cut (LanePolicy::miss_cut)
+  int64_t miss_cut_max;  // SGLANG_EXPERT_STREAM_CPU_SPLIT miss_cut_max
   // The post's outputs for the later kernels of the chain (C1 copies SM hits, S streams misses, CW waits for the copy
   // engine): each lane's kind, source slot and home node, and C1's compacted list of SM hits.
   int32_t* lane_kind;
@@ -94,9 +94,12 @@ struct PostParams {
   int64_t* scratch_rows_1;
   int32_t* scratch_dst_1;
   int32_t* scratch_go_1;
-  // SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: [rows, Wire::kNodes * (Wire::kLanes + 1)] (device memory), a row's own
+  // SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables: [rows, Wire::kNodes * (Wire::kLanes + 1)] (device memory), a row's own
   // split per node, read in place of the lease's Wire::kSplit tables; -1 at a row's first word: the lease's.
   const int32_t* row_split;
+  // Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT model): kSplitModelWords int64 words in device memory (LanePolicy::
+  // split_model), whose counters the post advances; nullptr: the split and the miss cut type the CPU's lanes.
+  int64_t* split_model;
 };
 
 // Element dtypes of the CPU experts' staged input and routing weights (PostParams).
@@ -133,12 +136,12 @@ SGL_DEVICE void stage_cpu_input(const PostParams& p) {
 // The post kernel, one block of kBlock threads. Thread 0 applies the row's pending map delta, types the lanes from
 // the device's map and publishes the demand record; the whole block stages the CPU input when a lane is the CPU's.
 //
-// Programmatic dependent launch (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL, used by every chain kernel but C1 and CC):
+// Programmatic dependent launch (kUsePDL = SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL, used by every chain kernel but C1 and CC):
 // the wait is the kernel's first statement and the trigger its second, so every word is read and written after the
 // primary grid completed and flushed, as without PDL. The ordering is transitive down the chain
 // (analysis/dsv41-drive/LEASE_PROTOCOL.md, "PDL").
 template <bool kUsePDL>
-__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void expert_stream_post_kernel(
     const __grid_constant__ PostParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
@@ -170,7 +173,18 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .dst_rows = p.dst_rows[p.row],
           .miss_cut = static_cast<int32_t>(p.miss_cut),
           .miss_cut_max = static_cast<int32_t>(p.miss_cut_max),
+          .split_model = p.split_model,
       };
+      // The split model's token counts: the routes that name each lane's expert.
+      int32_t tokens[Wire::kLanes];
+      if (p.split_model != nullptr) {
+        for (int j = 0; j < Wire::kLanes; ++j) {
+          tokens[j] = 0;
+          if (j >= count) continue;
+          for (int64_t r = 0; r < p.route_count; ++r)
+            tokens[j] += p.routes[r] == p.planned[j] ? 1 : 0;
+        }
+      }
       // Loaded before the tag spin: the host stores split relaxed at any time, ordered by nothing (set_cpu_split in
       // host/ram_tier.h). Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes
       // never indexes it.
@@ -209,7 +223,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
                   .dst = p.dst_slots,
                   .count = count,
                   .forced_from = live,
-                  .scratch = drip ? scratch : nullptr},
+                  .scratch = drip ? scratch : nullptr,
+                  .tokens = p.split_model != nullptr ? tokens : nullptr},
               map,
               policy,
               typed)) {
@@ -226,7 +241,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
                 .dst = p.dst_slots,
                 .count = live,
                 .forced_from = live,
-                .scratch = drip ? scratch : nullptr},
+                .scratch = drip ? scratch : nullptr,
+                .tokens = p.split_model != nullptr ? tokens : nullptr},
             map,
             policy,
             typed);
@@ -246,7 +262,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
                              ? p.cpu_x_dst + p.cpu_tokens_max * p.cpu_x_token_bytes
                              : nullptr;
   const int64_t top_k = p.cpu_tokens > 0 ? p.cpu_weights_count / p.cpu_tokens : 0;
-  if (table != nullptr) st_relaxed_sys<uint32_t>(table, static_cast<uint32_t>(p.cpu_tokens));
+  if (table != nullptr) {
+    st_relaxed_sys<uint32_t>(table, static_cast<uint32_t>(p.cpu_tokens));
+    st_relaxed_sys<uint32_t>(
+        table + expert_stream::CpuTokenTable::kLiveTokens,
+        static_cast<uint32_t>(live_route_tokens(p.routes, p.route_count, p.cpu_tokens, top_k)));
+  }
   int32_t protect[Wire::kLanes];
   int protect_count = 0;
   for (int64_t i = 0; i < p.route_count && protect_count < Wire::kLanes; ++i) {
@@ -362,7 +383,7 @@ struct BulkApplyParams {
 };
 
 // The bulk map apply: see BulkApplyParams. Traps on an entry outside the map bank.
-__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_map_bulk_apply_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void expert_stream_map_bulk_apply_kernel(
     const __grid_constant__ BulkApplyParams p) {
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
@@ -453,6 +474,7 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView scratch_dst_1,
       tvm::ffi::TensorView scratch_go_1,
       tvm::ffi::TensorView row_split,
+      tvm::ffi::TensorView split_model,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -510,6 +532,11 @@ struct LeaseProtocolKernel {
         "row_split",
         TensorMatcher({Rows_, Wire::kNodes * (Wire::kLanes + 1)}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
         row_split);
+    expert_stream::verify_named(
+        "split_model", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), split_model);
+    RuntimeCheck(
+        split_model.size(0) == 0 || split_model.size(0) == device::expert_stream::kSplitModelWords,
+        "split_model: empty (off) or ", device::expert_stream::kSplitModelWords, " words");
     RuntimeCheck(row >= 0 && row < Rows_.unwrap(), "row: outside the map bank");
     for (auto [name, t] :
          {std::pair{"lane_kind", lane_kind},
@@ -643,10 +670,11 @@ struct LeaseProtocolKernel {
         .scratch_dst_1 = static_cast<int32_t*>(scratch_dst_1.data_ptr()),
         .scratch_go_1 = static_cast<int32_t*>(scratch_go_1.data_ptr()),
         .row_split = static_cast<const int32_t*>(row_split.data_ptr()),
+        .split_model = split_model.size(0) > 0 ? static_cast<int64_t*>(split_model.data_ptr()) : nullptr,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(
-            use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);
+            use_pdl != 0 ? expert_stream_post_kernel<true> : expert_stream_post_kernel<false>, params);
   }
 
   /// Launches the bulk map apply kernel; see BulkApplyParams. `lease_address` is the completion block's address.
@@ -694,7 +722,7 @@ struct LeaseProtocolKernel {
         .experts = E_.unwrap(),
         .row_capacity = static_cast<const int32_t*>(row_capacity.data_ptr()),
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_map_bulk_apply_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(expert_stream_map_bulk_apply_kernel, params);
   }
 };
 

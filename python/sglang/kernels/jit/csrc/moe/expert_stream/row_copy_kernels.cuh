@@ -153,7 +153,7 @@ struct StreamParams {
 // S: copies every kMissGpu lane's pieces, then returns. Traps at the post's deadline (see kDeadlineLo) or on a staging
 // slot outside the row.
 template <bool kUsePDL>
-__global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3_ram_miss_lease_stream_kernel(
+__global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void expert_stream_lease_stream_kernel(
     const __grid_constant__ StreamParams p) {
   // PDL as in the post kernel (lease_kernels.cuh). S's primary is C1, a plain launch, whose primary is the post.
   device::PDLWaitPrimary<kUsePDL>();
@@ -233,6 +233,18 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   }
 }
 
+// The split model's startup calibration (split_model_calibration.py): S's host pulls without its lease. Copies the
+// `count` ranges of `table` ({source, destination, bytes} int64 triples in device memory, the sources pinned host rows
+// read through UVA) with S's grid and S's copy, each block its slice of every range, so the link sees the reads S makes
+// for a landed miss. Nothing waits on a piece mask: every source is already in host memory.
+__global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void expert_stream_calibration_pull_kernel(
+    const int64_t* table, int64_t count) {
+  using namespace device::expert_stream;
+  for (int64_t i = 0; i < count; ++i)
+    stream_copy_slice(
+        reinterpret_cast<const uint8_t*>(table[3 * i]), reinterpret_cast<uint8_t*>(table[3 * i + 1]), table[3 * i + 2]);
+}
+
 // CW's SM read: copies `bytes` of the pinned slot into the destination with the whole block, four 16-byte units in
 // flight per thread. Uses ld.global.cv as S does, never .nc on host bytes.
 SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) {
@@ -292,7 +304,7 @@ static_assert(2 * device::expert_stream::Wire::kNodes <= 32, "a part mask is one
 // CW: see CopyWaitParams. Closes the gate only when a copy-engine or CPU lane exists, and opens it itself when
 // CopyDone already holds G.
 template <bool kUsePDL>
-__global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void expert_stream_lease_copy_wait_kernel(
     const __grid_constant__ CopyWaitParams p) {
   // PDL as in the post kernel (lease_kernels.cuh). CW's primary is S, so C1 and S have completed before any read.
   device::PDLWaitPrimary<kUsePDL>();
@@ -329,11 +341,11 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   }
   __syncthreads();
   if (p.sm_count > 0) {
-#ifdef EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS
+#ifdef EXPERT_STREAM_TEST_CW_SM_READ_DELAY_NS
     // Test hook (device_module_with_hooks): every warp but the first reads late, so a CopyDone ahead of any read shows.
     if (threadIdx.x >= 32) {
       const uint64_t start = global_ns();
-      while (global_ns() - start < static_cast<uint64_t>(EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS)) {
+      while (global_ns() - start < static_cast<uint64_t>(EXPERT_STREAM_TEST_CW_SM_READ_DELAY_NS)) {
       }
     }
 #endif
@@ -373,7 +385,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
 // The gate is only the wake-up; CopyDone == G is what commits. The copy thread stores it after the DMA and the CPU
 // forward complete, and the acquire here orders the CPU's partial sums, which the fused MoE reads next, after them.
 // Traps if the gate opened without CopyDone.
-__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_copy_commit_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void expert_stream_lease_copy_commit_kernel(
     const __grid_constant__ CopyCommitParams p) {
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
@@ -404,7 +416,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 /// \tparam L The streamed row's compile-time layout (`expert_stream::ExpertRowLayout`).
 template <expert_stream::ExpertRowLayout L>
 struct RowCopyKernel {
-#ifdef EXL3_RAM_MISS_DEVICE_STAMPS
+#ifdef EXPERT_STREAM_DEVICE_STAMPS
   /// Points the device stamps (device_stamps.cuh) at `ring`, int64 [kStampRing * kStampWords] pinned host memory the
   /// caller keeps alive and reads only once the device is idle. Call before any chain runs.
   static void set_device_stamps(tvm::ffi::TensorView ring) {
@@ -423,6 +435,19 @@ struct RowCopyKernel {
     RuntimeCheck(r == cudaSuccess, "set_device_stamps: cudaMemcpyToSymbol failed: ", cudaGetErrorString(r));
   }
 #endif
+
+  /// Launches the split model calibration's pull (expert_stream_calibration_pull_kernel) on the current stream:
+  /// `table` is int64 [n, 3] {source, destination, bytes} in device memory, every source a UVA-readable host address.
+  static void calibration_pull(tvm::ffi::TensorView table) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    expert_stream::verify_named(
+        "table", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device), table);
+    const auto stream = LaunchKernel::resolve_device(table.device());
+    LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream)(
+        expert_stream_calibration_pull_kernel, static_cast<const int64_t*>(table.data_ptr()), table.size(0));
+  }
 
   /// Launches S. Argument meanings follow StreamParams; `segments` is the copy table ({src, dst, row bytes} per
   /// entry), `segment_map` and `piece_runs` the reader's piece geometry (host/ffi_exports.h, piece_runs).
@@ -505,7 +530,7 @@ struct RowCopyKernel {
     };
     LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream)
         .enable_pdl(use_pdl != 0)(
-            use_pdl != 0 ? exl3_ram_miss_lease_stream_kernel<true> : exl3_ram_miss_lease_stream_kernel<false>, params);
+            use_pdl != 0 ? expert_stream_lease_stream_kernel<true> : expert_stream_lease_stream_kernel<false>, params);
   }
 
   /// Launches CW, the stream's wait on the copy gate, then CC, in that order on one stream. `sm_table_address` is the
@@ -577,7 +602,7 @@ struct RowCopyKernel {
     };
     LaunchKernel(1, threads, stream)
         .enable_pdl(use_pdl != 0)(
-            use_pdl != 0 ? exl3_ram_miss_lease_copy_wait_kernel<true> : exl3_ram_miss_lease_copy_wait_kernel<false>,
+            use_pdl != 0 ? expert_stream_lease_copy_wait_kernel<true> : expert_stream_lease_copy_wait_kernel<false>,
             params);
     // The gate is not a counter, so the cyclic GEQ never wraps: an open word (29-bit seq << 2 | 1) is in [1, 2^31)
     // and passes, a closed word has bit 31 set and blocks. Captured as a memory-op node of the graph.
@@ -588,7 +613,7 @@ struct RowCopyKernel {
         .ce_mask = static_cast<const int32_t*>(ce_mask.data_ptr()),
         .cpu_lanes = cpu_lanes.size(0) != 0 ? static_cast<int32_t*>(cpu_lanes.data_ptr()) : nullptr,
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_copy_commit_kernel, commit);
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(expert_stream_lease_copy_commit_kernel, commit);
   }
 };
 

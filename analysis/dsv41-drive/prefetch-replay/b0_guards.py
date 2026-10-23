@@ -8,7 +8,7 @@ import types
 
 CORPUS_ROOT = "/mnt/nvme1"
 ARM = "dspark-both-misscut"
-PREFETCH_ENV = "SGLANG_DSV41_RAM_PREFETCH"
+PREFETCH_ENV = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"
 # Substrings of `ps -eo cmd` lines that mean an A/B or a server is using the drives (R6).
 BUSY_MARKERS = ("launch_server", "both_cpu_ab", "run_arm.sh")
 
@@ -25,7 +25,7 @@ def refuse_output_path(*, out_dir: str) -> None:
 
 
 def refuse_prefetch(*, env: dict) -> None:
-    """Refuse a recipe whose SGLANG_DSV41_RAM_PREFETCH is not '0' (D6)."""
+    """Refuse a recipe whose SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH is not '0' (D6)."""
     value = env.get(PREFETCH_ENV)
     if value != "0":
         raise RuntimeError(

@@ -43,8 +43,8 @@ def layer_major_runtime(model_runner) -> LayerMajorRuntime | None:
     if model_runner.expert_prediction_runtime is not None:
         raise ValueError(
             "layer-major prefill cannot be combined with MoE expert-prediction shadow mode yet "
-            "(SGLANG_MOE_EXPERT_PREDICTOR, SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR or "
-            "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR is set)"
+            "(prefetch.shadow.predictors, prefetch.shadow.predictor or "
+            "trace.predictor_capture.dir is set)"
         )
     if _capture_enabled():
         raise ValueError("layer-major prefill cannot be combined with routed-experts/indexer top-k capture yet")
@@ -55,7 +55,20 @@ def layer_major_runtime(model_runner) -> LayerMajorRuntime | None:
         numa_node=envs.SGLANG_LAYER_MAJOR_STATE_NUMA_NODE.get(),
         pin=True,
     )
-    return LayerMajorRuntime(adapter=adapter, store=store, residency=NullResidency())
+    return LayerMajorRuntime(adapter=adapter, store=store, residency=_residency(model_runner))
+
+
+def _residency(model_runner):
+    rows = envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.get()
+    if rows < 0:
+        raise ValueError(f"SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS={rows} must be 0 (off) or a row count")
+    if rows == 0:
+        return NullResidency()
+    from sglang.srt.layers.moe.prefill_residency import Exl3LayerMajorResidency, Exl3LendingLayerMajorResidency
+
+    if envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get():
+        return Exl3LendingLayerMajorResidency(model_runner, rows)
+    return Exl3LayerMajorResidency(model_runner, rows)
 
 
 def layer_major_runtime_for_worker(model_runner, *, is_draft_worker: bool) -> LayerMajorRuntime | None:

@@ -5,13 +5,18 @@ position, but the verify still runs every row of its one captured graph. The row
 expert-stream MoE gives a dead row the first row's experts at weight 0, so the route planner, which dedupes an expert's
 routes onto its first, opens no lane, miss read or CPU job for it. It also writes -1 for a dead row into the RAM-miss
 backend's routes, which a CPU expert job's token mask, the protect set and the prefetch scorer read. The scorer's input
-rows of a dead row are the first row's.
+rows of a dead row are the first row's; the post derives the live tokens from the -1 routes (dead rows are a suffix),
+and both prefetch scorers rank only those (the token table's live count, the GPU select kernel's routes).
 
 The routing kernels index expert tables by id without a bounds check, so a dead route must stay a valid expert id;
 -1 only goes into ``routes``, whose readers skip it. Row 0 (the anchor) is never dead.
 
-A dead route still counts toward the first row's experts in the planner's route counts (the residency scores) and the
-graph counters, and dead rows still run attention, the shared experts and Engram lookups.
+The fused graph plan reads the mask (``ExpertStreamer.verify_dead``) and leaves dead routes out of its route counts
+(the residency scores). A dead route still counts in the graph and outcome counters, the residency updater's token
+clock counts every row, and dead rows still run attention and the shared experts.
+
+A dead row's Engram lookups post -1 ids, which the native Engram store serves as zero rows with no access, read or
+insert (layers/engram.py, mask_dead_lookup_rows).
 
 Outside a gated verify every row is live, so the masking is an identity wherever it is captured or run.
 """
@@ -147,17 +152,23 @@ def _mask_dead_rows_kernel(
 
 
 def attach_verify_dead_rows(model: torch.nn.Module, dead_rows: VerifyDeadRows) -> int:
-    """Point every expert-streamed EXL3 MoE layer of ``model`` at ``dead_rows``; returns how many it reached."""
+    """Point every expert-streamed EXL3 MoE layer and every Engram embedding of ``model`` at ``dead_rows``; returns
+    how many EXL3 layers it reached."""
+    from sglang.srt.layers.engram import EngramEmbedding
+    from sglang.srt.layers.moe.expert_engine.formats import format_for_quant_method
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.exl3.exl3 import Exl3MoEMethod
 
     attached = 0
     for module in model.modules():
-        if (
-            isinstance(module, FusedMoE)
-            and isinstance(module.quant_method, Exl3MoEMethod)
-            and not module.quant_method.draft
-        ):
-            module.quant_method.verify_dead_rows = dead_rows.dead
-            attached += 1
+        if isinstance(module, EngramEmbedding):
+            module.verify_dead_rows = dead_rows.dead
+        elif isinstance(module, FusedMoE):
+            expert_format = format_for_quant_method(module.quant_method)
+            if (
+                expert_format is not None
+                and expert_format.supports_dead_rows
+                and not module.quant_method.draft
+            ):
+                module.quant_method.verify_dead_rows = dead_rows.dead
+                attached += 1
     return attached

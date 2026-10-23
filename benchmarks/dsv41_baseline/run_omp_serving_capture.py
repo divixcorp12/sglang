@@ -142,10 +142,10 @@ def main():
         env["DSV41_STEADY_TRACE_READY_FILE"] = str(output / "steady-decode.ready.json")
         env["DSV41_STEADY_TRACE_STOP_FILE"] = str(output / "steady-decode.stop")
     # These are inherited by the server; existing capture adds its own prefixes.
-    env["SGLANG_CPU_EXPERT_TRACE_GATE"] = str(trace_gate_path)
+    trace_group = {"gate_path": str(trace_gate_path)}
     if not args.no_instrumentation:
-        env.update(SGLANG_CPU_EXPERT_TRACE_GATE=str(trace_gate_path),
-               SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX=str(output / "scratch"))
+        trace_group["cpu_worker"] = {"scratch_prefix": str(output / "scratch")}
+    env["SGLANG_EXPERT_STREAM_TRACE"] = json.dumps(trace_group)
     command = [sys.executable, str(Path(__file__).with_name("run_stall_capture.py")),
                "--reference", str(args.reference), "--output", str(output),
                "--port", str(args.port), "--no-nsys"]
@@ -163,8 +163,7 @@ def main():
                        "--output=" + str(report), "/usr/bin/sleep", str(args.seconds)]
     (output / "omp-command.json").write_text(json.dumps(dict(command=command,
         diagnostic_env={k: v for k, v in env.items() if k.startswith(("DSV41_OMP", "DSV41_STEADY")) or
-                        k in ("DSV41_TIMED_START_FILE", "SGLANG_CPU_EXPERT_TRACE_GATE",
-                              "SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX")},
+                        k in ("DSV41_TIMED_START_FILE", "SGLANG_EXPERT_STREAM_TRACE")},
         scheduler_command=profile_command), indent=2) + "\n")
     profiler = None
     master = slave = None
@@ -306,9 +305,9 @@ def main():
             info = json.loads((output / "magic-command.json").read_text())
             clock_path = output / f"events.{info['pid']}.draft-clock-end.json"
             clock_env = {**env, "PYTHONPATH": str(ROOT/"python"),
-                         "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(output/"events")}
+                         "SGLANG_EXPERT_STREAM_TRACE": json.dumps({**trace_group, "job": {"prefix": str(output/"events")}})}
             with (output/"clock-end.log").open("w") as clock_log:
-                subprocess.run(["flock", "/data/models/slang/nvfp4-work/cc-gpu.lock", "taskset", "-c", "32-63",
+                subprocess.run(["flock", "/data/models/slang/nvfp4-work/cc-gpu.lock", "taskset", "-c", "0-27,56-83",
                     sys.executable, str(ROOT/"benchmarks/dsv41_baseline/draft_clock_anchor.py"), str(clock_path)],
                     env=clock_env, stdout=clock_log, stderr=subprocess.STDOUT, check=True, timeout=180)
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,

@@ -73,9 +73,9 @@ class ShardWriter:
         idle_flush_s: float = IDLE_FLUSH_S,
     ) -> None:
         if shard_rows < 1:
-            raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS must be positive")
+            raise ValueError("trace.predictor_capture.shard_rows must be positive")
         if max_bytes < 1:
-            raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB must be positive")
+            raise ValueError("trace.predictor_capture.max_gb must be positive")
         if directory.exists() and any(directory.iterdir()):
             raise ValueError(f"capture directory {directory} is not empty")
         directory.mkdir(parents=True, exist_ok=True)

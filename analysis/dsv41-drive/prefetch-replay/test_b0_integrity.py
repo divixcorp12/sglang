@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import b0_integrity as b0  # noqa: E402
-from sglang.srt.layers.moe.dsv41_strata import stratum  # noqa: E402
+from sglang.srt.layers.moe.expert_engine.profiles.dsv41_strata import stratum  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 from sglang.srt.layers.moe.residency_capture import ResidencyCapture, ResidencyRow  # noqa: E402
 

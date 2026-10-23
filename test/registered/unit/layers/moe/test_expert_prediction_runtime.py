@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ShadowPrefetchConfig
 from sglang.srt.layers.moe.expert_prediction.contracts import RouteFeature
 from sglang.srt.layers.moe.expert_prediction.runtime import (
     ExpertPredictionRuntime,
@@ -123,25 +124,20 @@ class TestExpertPredictionRuntime(unittest.TestCase):
         self.assertTrue(runtime._closed)
 
     def test_prefetch_pull_mode_defaults_to_off_and_parses_all_modes(self):
-        field = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE
+        field = envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE", None)
-            os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_PULL", None)
-            self.assertEqual(field.get(), "off")
+            os.environ.pop("SGLANG_EXPERT_STREAM_SHADOW_PREFETCH", None)
+            self.assertEqual(ShadowPrefetchConfig.from_envs().pull_mode.value, "off")
             for value in ("off", "count_zero", "always"):
-                with field.override(value):
-                    self.assertEqual(field.get(), value)
+                with field.override(json.dumps({"predictor": "llapor", "pull_mode": value})):
+                    self.assertEqual(ShadowPrefetchConfig.from_envs().pull_mode.value, value)
 
-    def test_prefetch_pull_mode_rejects_unknown_and_contradictory_legacy_settings(self):
-        field = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE
-        legacy = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL
-        with field.override("not-a-mode"):
-            with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE"):
-                field.get()
-        with field.override("off"):
-            with legacy.override(True):
-                with self.assertRaisesRegex(ValueError, "contradict"):
-                    field.get()
+    def test_prefetch_pull_mode_rejects_unknown_settings(self):
+        # The legacy boolean SGLANG_MOE_EXPERT_PREFETCH_PULL is a removed name now (check_removed_env refuses it), so
+        # the old "contradicts PULL_MODE" case no longer exists.
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "not-a-mode"}'):
+            with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_SHADOW_PREFETCH"):
+                ShadowPrefetchConfig.from_envs()
 
     def test_prefetch_pull_mode_requires_a_prefetch_predictor(self):
         common = dict(
@@ -156,17 +152,17 @@ class TestExpertPredictionRuntime(unittest.TestCase):
             pp_size=1,
             expert_hot_cache_manager=None,
         )
-        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
-            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE.*PREFETCH_PREDICTOR"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always"}'):
+            with self.assertRaisesRegex(ValueError, "pull_mode.*predictor"):
                 ExpertPredictionRuntime.from_env(**common)
 
     def test_prefetch_predictor_startup_guard_rejects_a_non_off_pull_mode(self):
         # ModelRunner checks this field before it imports or constructs the
         # prediction runtime, so this configuration boundary must reject an
         # otherwise-silent pull mode itself.
-        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("count_zero"):
-            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE.*PREFETCH_PREDICTOR"):
-                envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "count_zero"}'):
+            with self.assertRaisesRegex(ValueError, "pull_mode.*predictor"):
+                ShadowPrefetchConfig.from_envs()
 
     def test_layer_pairs_by_offset(self):
         self.assertEqual(layer_pairs((0, 2, 5), 0), ((0, 0), (2, 2), (5, 5)))
@@ -239,10 +235,10 @@ class TestExpertPredictionRuntime(unittest.TestCase):
             pp_size=1,
             expert_hot_cache_manager=None,
         )
-        with envs.SGLANG_MOE_EXPERT_PREDICTOR.override("popularity"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"predictors": ["popularity"]}'):
             with self.assertRaisesRegex(ValueError, "single GPU"):
                 ExpertPredictionRuntime.from_env(decode_max_bs=1, tp_size=2, **common)
-            with self.assertRaisesRegex(ValueError, "MAX_ROWS"):
+            with self.assertRaisesRegex(ValueError, "(?i)max_rows"):
                 ExpertPredictionRuntime.from_env(decode_max_bs=0, tp_size=1, **common)
             with self.assertRaisesRegex(ValueError, "single GPU"):
                 ExpertPredictionRuntime.from_env(
@@ -258,7 +254,7 @@ class TestExpertPredictionRuntime(unittest.TestCase):
 
     def test_build_rejects_non_positive_score_interval(self):
         with self.assertRaisesRegex(
-            ValueError, "SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL must be positive"
+            ValueError, "(?i)score_interval.*must be positive"
         ):
             _runtime(score_interval=0)
 
@@ -286,28 +282,30 @@ class TestExpertPredictionRuntime(unittest.TestCase):
         # normally, so assertRaisesRegex (which swallows the raise) must be the
         # inner context and override the outer one -- otherwise the env var leaks
         # into the next block.
-        with envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.override("llapor"):
-            with envs.SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR.override("/tmp/does-not-matter"):
-                with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"predictor": "llapor"}'):
+            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(
+                '{"predictor": "llapor", "model_dir": "/tmp/does-not-matter"}'
+            ):
+                with self.assertRaisesRegex(ValueError, "(?i)predictor"):
                     ExpertPredictionRuntime.from_env(
                         tokens_per_request=1, expert_hot_cache_manager=None, **common
                     )
-                with envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.override("/tmp/capture"):
-                    with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR"):
+                with envs.SGLANG_EXPERT_STREAM_TRACE.override('{"predictor_capture": {"dir": "/tmp/capture"}}'):
+                    with self.assertRaisesRegex(ValueError, "(?i)capture"):
                         ExpertPredictionRuntime.from_env(
                             tokens_per_request=1,
                             expert_hot_cache_manager=SimpleNamespace(caches={}),
                             max_prefill_rows=1,
                             **common,
                         )
-                with envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.override(4):
-                    with self.assertRaisesRegex(ValueError, "SGLANG_MOE_PREFETCH_MAX_CANDIDATES"):
+                with envs.SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES.override(4):
+                    with self.assertRaisesRegex(ValueError, "(?i)max_candidates"):
                         ExpertPredictionRuntime.from_env(
                             tokens_per_request=1,
                             expert_hot_cache_manager=SimpleNamespace(caches={}),
                             **common,
                         )
-            with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR"):
+            with self.assertRaisesRegex(ValueError, "(?i)model_dir"):
                 ExpertPredictionRuntime.from_env(
                     tokens_per_request=1,
                     expert_hot_cache_manager=SimpleNamespace(caches={}),

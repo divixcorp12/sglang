@@ -62,7 +62,7 @@ enum Counter : int {
   kSpecFailed,
   kSpecDelayed,
   kSpecLate,  // GPU scorer: a record's candidate slot not ready within kCandWaitNs
-  // SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE (IdleRoots): waits for a drive no demand reads; reads abandoned (stale, past
+  // SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE (IdleRoots): waits for a drive no demand reads; reads abandoned (stale, past
   // the deadline, held or stopped: not failed); reads a forced miss boosted; pieces moved off the row's earlier root.
   kSpecDeferred,
   kSpecAbandoned,
@@ -86,7 +86,7 @@ enum Counter : int {
   kSpecPublishBackstop,
   // ... and landed entries left landed because their group's row lock was busy at the claim.
   kSpecPromoteRowBusy,
-  // SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE: GPU misses streamed from a landed pool row's slot instead of read.
+  // SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE: GPU misses streamed from a landed pool row's slot instead of read.
   kSpecPoolServed,
   // Unforced misses (a staging slot) read from NVMe while their group's pool of the row held the expert, landed or
   // reading, on a GPU miss lane or a CPU lane (metrics).
@@ -110,6 +110,9 @@ enum Counter : int {
   // ... the bytes an abandoned drip never copied, and scored picks dropped because their target had posted already.
   kDripSkippedBytes,
   kDripLate,
+  // Rows an eager admission evicted (assign and fill_begin, for prefill gathers, hot-cache promotions and full layers),
+  // counted in kEvictions too: a group's evictions minus these are its service's.
+  kEagerEvictions,
   kCounterCount,
 };
 
@@ -158,6 +161,7 @@ constexpr bool is_core_counter(int k) {
     case kDripPaused:
     case kDripSkippedBytes:
     case kDripLate:
+    case kEagerEvictions:
       return true;
     default:
       return false;

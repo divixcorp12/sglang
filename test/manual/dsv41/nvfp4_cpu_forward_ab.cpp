@@ -2,7 +2,8 @@
 // It calls only the kernel interface (nvfp4_cpu_kernel(), kernel.h). Every one-row output and status (status_of) is
 // written to OUT in a fixed order: two
 // revisions agree when their files are byte-identical, each built with its own revision of this harness.
-//   nvfp4_cpu_forward_ab OUT CORE [CORE...]     worker i runs on CORE i; the caller is worker 0
+//   nvfp4_cpu_forward_ab [--max-isa=TIER] [--report-isa] OUT CORE [CORE...]     worker i runs on CORE i; the caller is
+//   worker 0; --max-isa caps the tier and --report-isa prints it ("nvfp4 isa <tier>" on stderr) at its first query.
 #include "kernel.h"
 #include "quant.hpp"
 #include "../upstream/kernels.h"
@@ -162,14 +163,27 @@ void put(FILE* f, const std::string& name, int status, const std::vector<float>&
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s OUT CORE [CORE...]\n", argv[0]); return 2; }
+    // The kernel reads no environment: the ISA cap and report are passed to its configure call, before the first forward.
+    std::string max_isa;
+    bool report_isa = false;
+    int first = 1;
+    for (; first < argc && std::strncmp(argv[first], "--", 2) == 0; ++first) {
+        if (std::strncmp(argv[first], "--max-isa=", 10) == 0) max_isa = argv[first] + 10;
+        else if (std::strcmp(argv[first], "--report-isa") == 0) report_isa = true;
+        else { std::fprintf(stderr, "unknown option %s\n", argv[first]); return 2; }
+    }
+    if (argc - first < 2) {
+        std::fprintf(stderr, "usage: %s [--max-isa=TIER] [--report-isa] OUT CORE [CORE...]\n", argv[0]);
+        return 2;
+    }
+    ::sglang::nvfp4_cpu::nvfp4_cpu_configure(max_isa, report_isa);
     std::vector<int32_t> cores;
-    for (int i = 2; i < argc; ++i) cores.push_back(std::atoi(argv[i]));
+    for (int i = first + 1; i < argc; ++i) cores.push_back(std::atoi(argv[i]));
     g_cores.assign(cores.begin(), cores.end());
     if (status_of([&] { ::sglang::cpu_experts::check_cores(g_cores); }) != 0) {
         std::fprintf(stderr, "cores refused\n"); return 1;
     }
-    FILE* f = std::fopen(argv[1], "wb");
+    FILE* f = std::fopen(argv[first], "wb");
     if (!f) return 1;
     // Descending: the pre-OpenMP pool fixes its size at the first forward and refuses a larger later one.
     std::vector<int> teams = {int(cores.size())};

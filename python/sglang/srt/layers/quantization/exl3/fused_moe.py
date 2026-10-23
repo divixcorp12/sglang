@@ -282,7 +282,7 @@ def exl3_fused_moe_for(layer, streamer) -> Exl3FusedMoE:
         updater = getattr(cache, "device_residency", None)
         direct = (
             getattr(updater, "insert_direct", False)
-            and getattr(streamer.row_backend, "name", None) == "exl3_ram_miss"
+            and streamer.row_backend.leased
         )
         # A token's routes are distinct slots; tokens share slots, and a verify's gather flags the misses it
         # cannot place (GpuResidencyUpdater.clamp_gather_misses).

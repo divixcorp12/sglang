@@ -92,7 +92,7 @@ std::string unsupported_capability(const std::string& mode, const std::string& r
   if (mode == "sqpoll" || mode == "sqpoll_iopoll") {
     params.flags |= IORING_SETUP_SQPOLL;
     params.sq_thread_idle = 1000;
-    const int cpu = std::stoi(setting("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU", "-1"));
+    const int cpu = std::stoi(setting("URING_TEST_SQ_THREAD_CPU", "-1"));
     if (cpu >= 0) {
       params.flags |= IORING_SETUP_SQ_AFF;
       params.sq_thread_cpu = cpu;
@@ -168,11 +168,11 @@ void expect_bytes(const uint8_t* actual, const DataFile& file, size_t offset, si
 int main(int argc, char** argv) {
   try {
     require(argc == 2, "expected temporary fixture directory");
-    const std::string mode = setting("SGLANG_EXPERT_STREAM_URING_MODE", "default");
-    const std::string read_mode = setting("SGLANG_EXPERT_STREAM_URING_READ_MODE", "normal");
+    const std::string mode = setting("URING_TEST_MODE", "default");
+    const std::string read_mode = setting("URING_TEST_READ_MODE", "normal");
     const bool iopoll = mode == "iopoll" || mode == "sqpoll_iopoll";
     const bool direct = setting("URING_TEST_DIRECT", "1") == "1";
-    const unsigned configured_depth = std::stoul(setting("SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH", "0"));
+    const unsigned configured_depth = std::stoul(setting("URING_TEST_QUEUE_DEPTH", "0"));
     const unsigned depth = configured_depth == 0 ? 8 : configured_depth;
     const std::string unsupported = unsupported_capability(mode, read_mode);
     Arena arena;
@@ -182,7 +182,14 @@ int main(int argc, char** argv) {
     // destinations: READV_FIXED has one buffer index, not an index per iovec.
     const std::vector<int> fds{second.fd, first.fd};
     const std::vector<RegisteredRegion> buffers{{arena.data, kArenaBytes, kArenaBytes}};
+    // The host reads no environment: install SGLANG_EXPERT_STREAM_URING's members as Python would, and give the
+    // ring its SQPOLL core as the thread plan does (set_sq_thread_cpu).
+    sglang::expert_stream::set_uring_options(sglang::expert_stream::UringOptions::parse(
+        mode, configured_depth, setting("URING_TEST_FIXED_FILES", "0") == "1", read_mode,
+        setting("URING_TEST_WAIT_MODE", "block"), std::stoll(setting("URING_TEST_SQ_THREAD_IDLE_MS", "10000")),
+        setting("URING_TEST_DIAGNOSTICS", "0") == "1", "auto"));
     UringReader reader;
+    reader.set_sq_thread_cpu(std::stoi(setting("URING_TEST_SQ_THREAD_CPU", "-1")));
     if (!unsupported.empty()) {
       bool rejected = false;
       try {
@@ -287,8 +294,8 @@ int main(int argc, char** argv) {
     expect_bytes(arena.data, first, 5 * kPage, kPage);
     reader.close();
     std::cout << "PASS real io_uring mode=" << mode << " read_mode=" << read_mode
-              << " fixed_files=" << setting("SGLANG_EXPERT_STREAM_URING_FIXED_FILES", "0")
-              << " wait_mode=" << setting("SGLANG_EXPERT_STREAM_URING_WAIT_MODE", "block")
+              << " fixed_files=" << setting("URING_TEST_FIXED_FILES", "0")
+              << " wait_mode=" << setting("URING_TEST_WAIT_MODE", "block")
               << " direct=" << direct << " scatter/reset/drain/short-read/close/reopen verified\n";
     return 0;
   } catch (const Unsupported& error) {
@@ -328,18 +335,18 @@ def uring_native_binary(tmp_path_factory):
 
 
 def _run_native(binary, tmp_path, *, mode, read_mode, fixed_files, wait_mode="block", direct=True):
-    env = {key: value for key, value in os.environ.items() if not key.startswith("SGLANG_EXPERT_STREAM_URING_")}
+    env = {key: value for key, value in os.environ.items() if key != "SGLANG_EXPERT_STREAM_URING" and not key.startswith("URING_TEST_")}
     env.update(
-        SGLANG_EXPERT_STREAM_URING_MODE=mode,
-        SGLANG_EXPERT_STREAM_URING_READ_MODE=read_mode,
-        SGLANG_EXPERT_STREAM_URING_FIXED_FILES=str(int(fixed_files)),
-        SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH="4" if wait_mode == "spin" else "0",
-        SGLANG_EXPERT_STREAM_URING_WAIT_MODE=wait_mode,
-        SGLANG_EXPERT_STREAM_URING_SQ_THREAD_IDLE_MS="1000",
-        SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=(
+        URING_TEST_MODE=mode,
+        URING_TEST_READ_MODE=read_mode,
+        URING_TEST_FIXED_FILES=str(int(fixed_files)),
+        URING_TEST_QUEUE_DEPTH="4" if wait_mode == "spin" else "0",
+        URING_TEST_WAIT_MODE=wait_mode,
+        URING_TEST_SQ_THREAD_IDLE_MS="1000",
+        URING_TEST_SQ_THREAD_CPU=(
             str(min(os.sched_getaffinity(0))) if "sqpoll" in mode else "-1"
         ),
-        SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS="1",
+        URING_TEST_DIAGNOSTICS="1",
         URING_TEST_DIRECT=str(int(direct)),
     )
     completed = subprocess.run(

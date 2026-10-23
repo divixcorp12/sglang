@@ -152,63 +152,6 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
-class EnvPrefetchPullMode(EnvField):
-    """Resolve the prefetch-pull delivery mode and its temporary boolean alias."""
-
-    _MODES = frozenset({"off", "count_zero", "always"})
-
-    def __init__(self, legacy_name: str):
-        super().__init__("off")
-        self.legacy_name = legacy_name
-
-    def parse(self, value: str) -> str:
-        mode = value.lower()
-        if mode not in self._MODES:
-            raise ValueError(
-                f'"{value}" is not a valid pull mode; expected one of "off", "count_zero", or "always"'
-            )
-        return mode
-
-    def get(self) -> str:
-        mode_value = os.getenv(self.name)
-        legacy_value = os.getenv(self.legacy_name)
-        if mode_value is None:
-            if legacy_value is None:
-                return "off"
-            try:
-                return "always" if EnvBool(False).parse(legacy_value) else "off"
-            except ValueError as error:
-                raise ValueError(f"{self.legacy_name}: {error}") from error
-        try:
-            mode = self.parse(mode_value)
-        except ValueError as error:
-            raise ValueError(f"{self.name}: {error}") from error
-        if legacy_value is None:
-            return mode
-        try:
-            legacy_mode = "always" if EnvBool(False).parse(legacy_value) else "off"
-        except ValueError as error:
-            raise ValueError(f"{self.legacy_name}: {error}") from error
-        if mode != legacy_mode:
-            raise ValueError(
-                f"{self.name}={mode!r} contradicts {self.legacy_name}={legacy_value!r}; "
-                "set only one, or use matching off/false or always/true values"
-            )
-        return mode
-
-
-class EnvPrefetchPredictor(EnvStr):
-    """Reject a configured pull mode before ModelRunner skips prediction setup."""
-
-    def get(self) -> str:
-        predictor = super().get()
-        if not predictor and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
-            raise ValueError(
-                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"
-            )
-        return predictor
-
-
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -222,7 +165,7 @@ class _DeprecatedEnvFallback:
     check *deprecated_name* and emit DeprecationWarning before reading it.
 
     Usage:
-        SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
+        SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
     """
 
     def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
@@ -249,6 +192,10 @@ class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
 
 
 class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
+    pass
+
+
+class EnvStrWithAlias(_DeprecatedEnvFallback, EnvStr):
     pass
 
 
@@ -303,16 +250,6 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
-class DsparkFoldedSampling(IntEnum):
-    """Sampling support in the graph-folded DSpark draft proposal: OFF =
-    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
-    FORCE = always."""
-
-    OFF = 0
-    AUTO = 1
-    FORCE = 2
-
-
 class InsertOnMissStage(IntEnum):
     """How a decode boundary gives a missed expert residency.
 
@@ -324,7 +261,8 @@ class InsertOnMissStage(IntEnum):
 
     The values are ordered so that the retired boolean
     ``SGLANG_MOE_HOT_INSERT_ON_MISS`` keeps its meaning: ``0`` is OFF and ``1``
-    is SCRATCH, the behaviour that boolean selected.
+    is SCRATCH, the behaviour that boolean selected. The boolean is a removed
+    name now (``SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE`` replaces it).
     """
 
     OFF = 0
@@ -379,110 +317,6 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
-    # Stream ModelOpt NVFP4 routed experts from host memory; required for hot caching.
-    SGLANG_MOE_EXPERT_STREAM = EnvBool(False)
-    SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
-    SGLANG_MOE_PINNED_HOST_MB = EnvInt(0)
-    # Where the pinned host tier lives: "node:MiB,node:MiB" (e.g. "0:65536,1:30720"),
-    # summing to SGLANG_MOE_PINNED_HOST_MB. Every layer's rows are bound to the nodes
-    # in that proportion, and startup refuses a node without the memory. Empty keeps
-    # first-touch placement.
-    SGLANG_MOE_PINNED_HOST_NUMA_MB = EnvStr("")
-    # Layer ids whose every expert stays in the pinned host tier ("0,1"): each is bought first, per node, with the
-    # slots its tier's reader holds back on top, and filled at start; the rest of the budget is split as without.
-    # Empty: no layer is held whole.
-    SGLANG_MOE_PINNED_HOST_FULL_LAYERS = EnvTuple(tuple())
-    SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
-    SGLANG_MOE_HOT_GPU_MB = EnvInt(0)
-    SGLANG_MOE_HOT_SEED = EnvStr("")
-    SGLANG_MOE_HOT_DYNAMIC = EnvBool(False)
-    SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS = EnvInt(1024)
-    # Also update dynamic residency every this many decode forwards; 0 leaves
-    # updates to qualifying prefills only.
-    SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS = EnvInt(0)
-    SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS = EnvInt(8)
-    SGLANG_MOE_HOT_BENEFIT_RATIO = EnvFloat(1.0)
-    # Decay residency scores by 0.95 once per this many routed tokens instead
-    # of once per boundary; 0 keeps per-boundary decay.
-    SGLANG_MOE_HOT_DECAY_TOKENS = EnvInt(0)
-    # Standard deviations of routing-count noise a candidate expert must lead
-    # the expert it replaces by, on top of SGLANG_MOE_HOT_BENEFIT_RATIO.
-    SGLANG_MOE_HOT_PROMOTION_SIGMAS = EnvFloat(0.0)
-    # Return from a residency boundary once promotion copies are submitted and
-    # publish the promoted slots on a later forward after the copies complete.
-    SGLANG_MOE_HOT_ASYNC_PROMOTIONS = EnvBool(False)
-    # Copy CPU-policy scores to a pinned host buffer at residency boundaries
-    # and apply decisions only after a nonblocking CUDA event query succeeds.
-    SGLANG_MOE_ASYNC_RESIDENCY_SCORES = EnvBool(False)
-    # Run the decode residency update as device ops inside the captured decode
-    # graph; requires SGLANG_MOE_HOT_DYNAMIC and SGLANG_MOE_EXPERT_GRAPH_GATHER.
-    SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
-    # Most experts one layer promotes at a decode boundary on the GPU path.
-    SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
-    # Decode boundaries serve misses out of residency instead of promoting host
-    # rows; see InsertOnMissStage. Requires SGLANG_MOE_GPU_RESIDENCY_UPDATE and
-    # SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1. The deprecated boolean
-    # SGLANG_MOE_HOT_INSERT_ON_MISS still selects stage 1 (SCRATCH), because the
-    # enum keeps that boolean's 0/1 values.
-    SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE = EnvIntWithAlias(
-        InsertOnMissStage.OFF, deprecated_name="SGLANG_MOE_HOT_INSERT_ON_MISS"
-    )
-    # Per-token decay of the scores that pick insert-on-miss victims.
-    SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
-    # Run stage 1's boundary insert copies through the fused masked Triton
-    # kernel instead of index_select + index_copy_. Byte-identical output; one
-    # pass instead of two, and idle lanes move no bytes. Off by default until a
-    # serving arm accepts it, so the measured stage-1 config stays reproducible.
-    SGLANG_MOE_HOT_FUSED_INSERT = EnvBool(False)
-    SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
-    SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
-    SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)
-    # Shadow-score these registered MoE expert predictors against native routes
-    # (comma list, e.g. "affinity,popularity"); empty installs no hooks or buffers.
-    SGLANG_MOE_EXPERT_PREDICTOR = EnvTuple(tuple())
-    SGLANG_MOE_EXPERT_PREDICTOR_CANDIDATES = EnvInt(16)
-    # Score and update predictors on every Nth eligible forward; raise it to
-    # cut the per-step host overhead of shadow scoring.
-    SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL = EnvInt(1)
-    # Rows per tap buffer; 0 uses decode CUDA-graph max_bs x tokens per request.
-    SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS = EnvInt(0)
-    SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL = EnvInt(100)
-    SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE = EnvStr("")
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR = EnvStr("")
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB = EnvInt(500)
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS = EnvInt(4096)
-    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES = EnvInt(2)
-    # In-graph expert prefetch candidate scoring (shadow until the shared copy layer consumes it): "", "llapor" or "apex".
-    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR = EnvPrefetchPredictor("")
-    SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR = EnvStr("")
-    # Candidates per target layer kept in the device bank.
-    SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES = EnvInt(16)
-    # Rows per layer the shadow budget-recall metric credits.
-    SGLANG_MOE_EXPERT_PREFETCH_BUDGET = EnvInt(3)
-    SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU = EnvFloat(0.95)
-    # Post the candidate bank's best non-resident target-layer expert onto the
-    # captured side stream (expert_gpu_pull.py) and join it into the covered/
-    # residual remap; requires SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR and a hot
-    # cache allocated with the trailing DedicatedPrefetchSlot row. Default off:
-    # the plan forbids enabling this by default on synthetic evidence.
-    SGLANG_MOE_EXPERT_PREFETCH_PULL = EnvBool(False)
-    # Delivery-mode replacement for the legacy boolean above. ``count_zero``
-    # preserves the captured post/join graph while publishing a no-payload plan.
-    SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE = EnvPrefetchPullMode(
-        "SGLANG_MOE_EXPERT_PREFETCH_PULL"
-    )
-    # Keep BudgetRecall enabled by default for compatibility, but let matched
-    # performance arms exclude its device work independently of pull telemetry.
-    SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL = EnvBool(True)
-    # Serving-only BS1 fp32 candidate selection. When disabled (or when any
-    # recall/calibration/analysis consumer is active), use the reference
-    # stable top-W candidate bank instead.
-    SGLANG_MOE_EXPERT_PREFETCH_FUSED_TOP1 = EnvBool(True)
-    # Profiling-only graph-captured score/margin histograms. Timed throughput
-    # arms leave this false so the observer has no allocation or device work.
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION = EnvBool(False)
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE = EnvStr("")
-    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE = EnvStr("")
     # mmap | uring | uring_direct; see sglang.srt.model_loader.file_row_reader.
     SGLANG_QWEN4_PLE_FILE_READER = EnvStr("mmap")
     # Stage file-backed PLE rows before decode CUDA-graph replay instead of
@@ -491,62 +325,7 @@ class Envs:
     # Keep the Qwen4-Exp token embedding in pinned host memory and gather its
     # rows over PCIe; a speculative draft binds the same host table.
     SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING = EnvBool(False)
-    SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
-    # Where host expert rows are read from: auto | files | tensor, or a kind the
-    # expert format defines. auto keeps each format's default (dense NVFP4 layers:
-    # their expert files through io_uring, unless SGLANG_MOE_EXPERT_FILE_READER=mmap).
-    SGLANG_MOE_EXPERT_ROW_SOURCE = EnvStr("auto")
-    # Mirror roots for EXL3 expert rows, os.pathsep-separated: each holds a
-    # byte-identical copy of the checkpoint (one per drive). Non-empty selects the
-    # mirror row source, which reads every row from all roots at once; one entry
-    # reads everything from that root. Rows are read from the roots, while the
-    # layout is still built from SGLANG_DSV41_EXPERT_DIR. Check the copies with
-    # scripts/dsv41/verify_expert_mirror.py before trusting them.
-    SGLANG_MOE_EXPERT_MIRROR_DIRS = EnvStr("")
-    # Colon-separated relative read shares, one per root of
-    # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
-    SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
-    # Pick each RAM-miss sub-read's mirror root when it is issued instead of by the
-    # static split: a root whose sub-reads in flight reach its cap in
-    # SGLANG_MOE_EXPERT_MIRROR_CAPS is skipped, the fewest bytes in flight wins, and
-    # with every root capped a sub-read keeps its own root.
-    SGLANG_MOE_EXPERT_MIRROR_DYNAMIC = EnvBool(False)
-    # Comma-separated in-flight sub-read caps, one positive integer per root of
-    # SGLANG_MOE_EXPERT_MIRROR_DIRS in its order (e.g. 4,2,4); required with DYNAMIC.
-    SGLANG_MOE_EXPERT_MIRROR_CAPS = EnvStr("")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
-    # Copy all host expert rows into registered memory (replaces the pinned LRU).
-    SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
-    # Serve decode-sized expert gathers without host syncs so CUDA graphs capture
-    # them; requires SGLANG_MOE_EXPERT_HOST_ARENA and SGLANG_MOE_HOT_GPU_MB.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER = EnvBool(False)
-    # Plan a graph-gather's BS1, unique-ID, top_k<=32 routes with one fused
-    # CUDA kernel launch instead of the general tensor-op sequence; requires
-    # SGLANG_MOE_EXPERT_GRAPH_GATHER. Shapes/dtypes outside that specialization
-    # fall back to the general path unchanged.
-    SGLANG_MOE_EXPERT_FUSED_PLAN = EnvBool(False)
-    # Speculative decoding only: cap each layer's graph-gather scratch rows below
-    # one per verify route (decode max_bs x draft tokens x top_k); 0 keeps that bound.
-    # Startup rejects a cap below one request's routes: that needs phase 3's overflow path.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
-    # Speculative decoding with DIRECT residency (SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2) only: each layer's graph gather
-    # serves at most this many distinct misses (the RAM-miss lanes and the victim shortlist), below one per verify
-    # route. A gather with more serves the lanes that find a victim and sets the residency's overflow flag; its output
-    # is then not a verify result. 0 keeps one lane per route.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)
-    # Spill (SGLANG_DSV41_CPU_EXPERTS, a DSpark verify with a lane per route: MISS_LANES unset): only the first V of a
-    # gather's miss lanes in plan order take a VRAM victim and a staging slot; the post makes every later lane a CPU
-    # lane, a miss of which the host reads into a RAM victim. 0: every miss lane may take a victim. 1 <= V < the routes.
-    SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
-    # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
-    # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
-    SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")
-    SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS = EnvInt(2048)
-    # Ignored unless SGLANG_MOE_ROUTE_TRACE_DIR is set. Traces target verify forwards
-    # and MTP draft hidden states (<dir>/mtp) under eager NEXTN; startup requires
-    # --speculative-eagle-topk 1 passed explicitly, --cuda-graph-backend-prefill
-    # disabled and --disable-flashinfer-autotune.
-    SGLANG_MOE_ROUTE_TRACE_SPECULATIVE = EnvBool(False)
     # Debug only: append per-request speculative verify rows (draft, argmax, accept
     # length, committed tokens, top-2 logit gap, sampling flags) to this JSONL file,
     # suffixed .rank<N> when several ranks run; empty disables and adds no work.
@@ -587,6 +366,230 @@ class Envs:
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
     # ===================================================================
+    # Expert streaming engine: master switch and tiers
+    # ===================================================================
+    # Every name in the "Expert streaming engine" sections is read once, by sglang.srt.layers.moe.expert_engine.config
+    # (ExpertStreamConfig.from_envs); engine code takes the resolved config and never reads these. A name that is a
+    # JSON object (URING, MIRROR, TRACE, CPU_SPLIT, CPU_TWO_STAGE, SHADOW_PREFETCH) is decoded into its config
+    # sub-struct, unknown keys rejected; unset or empty keeps every default. The old names these replace are still
+    # registered below until the wiring step switches the engine over; expert_engine/removed_env.py then refuses
+    # them at startup.
+    # Stream the routed experts from host memory and disk through the expert engine.
+    SGLANG_EXPERT_STREAM_ENABLE = EnvBool(False)
+    # The format's read-only source shard directory (for EXL3 the checkpoint's shards, which may sit on another drive
+    # than the model). Required when streaming such a format.
+    SGLANG_EXPERT_STREAM_EXPERT_DIR = EnvStr("")
+    # The engine's writable file-cache directory (repacked runtime tensors, identity-keyed and reused across
+    # restarts); empty copies the experts into plain CPU tensors.
+    SGLANG_EXPERT_STREAM_FILE_CACHE_DIR = EnvStr("")
+    SGLANG_EXPERT_STREAM_PINNED_HOST_MB = EnvInt(0)
+    # Where the pinned host tier lives: "node:MiB,node:MiB" (e.g. "0:65536,1:30720"), summing to PINNED_HOST_MB.
+    # Every layer's rows are bound to the nodes in that proportion, and startup refuses a node without the memory.
+    # Empty keeps first-touch placement.
+    SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB = EnvStr("")
+    # Layer ids whose every expert stays in the pinned host tier ("0,1"): each is bought first, per node, with the
+    # slots its tier's reader holds back on top, and filled at start; the rest of the budget is split as without.
+    # Empty: no layer is held whole.
+    SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS = EnvTuple(tuple())
+    # Copy all host expert rows into registered memory (legacy streamer; replaces the pinned LRU).
+    SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA = EnvBool(False)
+    # mmap | uring | uring_direct. The EXL3 path refuses mmap, so the default cannot start it (recorded, not changed).
+    SGLANG_EXPERT_STREAM_FILE_READER = EnvStr("mmap")
+    # Where host expert rows are read from: auto | files | tensor | shards, or a kind the expert format defines.
+    SGLANG_EXPERT_STREAM_ROW_SOURCE = EnvStr("auto")
+    # Per-node thread plans replacing the derived ones, e.g. "1:ram=51,cpu=28-43,sq=50;0:ram=26": nodes separated by
+    # ";", keys ram, cpu, sq, each a taskset list. Validated like a derived plan; a refused plan stops the start.
+    # Empty derives every node's plan. Replaces the single-core spellings of the same three roles.
+    SGLANG_EXPERT_STREAM_NUMA_CORES = EnvStr("")
+    # JSON object -> TiersConfig.uring: mode, queue_depth, fixed_files, read_mode, wait_mode, sq_thread_idle_ms,
+    # diagnostics, read_cuts, slab_arena.
+    SGLANG_EXPERT_STREAM_URING = EnvStr("")
+    # JSON object -> TiersConfig.mirror: dirs (os.pathsep-separated roots, each a byte-identical checkpoint copy on
+    # its own drive), weights (colon-separated read shares), dynamic, caps (comma-separated in-flight caps).
+    SGLANG_EXPERT_STREAM_MIRROR = EnvStr("")
+
+    # ===================================================================
+    # Expert streaming engine: copy path
+    # ===================================================================
+    # What moves a RAM-resident row into its VRAM slot: sm_copy (the in-graph SM copy kernel), dma (the legacy
+    # streamer's CUDA copy engine) or copy_engine (the native engine's copy thread, armed after 16 decode forwards;
+    # needs CUDA_MODULE_LOADING=EAGER). The default reproduces COPY_BACKEND=gpu with the copy engine off.
+    SGLANG_EXPERT_STREAM_COPY_MODE = EnvStr("sm_copy")
+    # What moves a captured decode post's RAM hits once the copy engine is armed: "ce" (its DMA) or "sm" (the in-graph
+    # SM copy). CPU lanes complete through the copy thread either way.
+    SGLANG_EXPERT_STREAM_RAM_HIT_COPY = EnvStr("ce")
+    # The copy engine copies only each RAM-hit row's big tensors; the copy wait reads the layout's small ones from the
+    # pinned slot with SM loads. Needs the copy engine.
+    SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES = EnvBool(False)
+    # Lease-chain kernels launch with programmatic dependent launch (at most ~1 us per layer).
+    SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL = EnvBool(False)
+    # How long the in-graph wait for the RAM-miss thread may take per MoE layer, in ms, before the process fails
+    # stop. The thread's watchdog aborts after max(30 s, 3x this) (CopyConfig.watchdog_wait_s), so it outlasts this
+    # wait and the eager pause bound (2x this + 1 s).
+    SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # How long an idle RAM-miss service thread (one per NUMA group) polls before it sleeps. -1: never sleep.
+    SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US = EnvInt(5000)
+    # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
+    SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US = EnvInt(5000)
+    # Serve decode-sized expert gathers without host syncs so CUDA graphs capture them; requires HOT_GPU_MB.
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER = EnvBool(False)
+    # Plan a graph-gather's BS1, unique-ID, top_k<=32 routes with one fused CUDA kernel launch; requires GRAPH_GATHER.
+    SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN = EnvBool(False)
+    # Speculative decoding only: cap each layer's graph-gather scratch rows below one per verify route; 0 keeps that
+    # bound. Startup rejects a cap below one request's routes.
+    SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
+    # Speculative decoding with DIRECT residency only: each layer's graph gather serves at most this many distinct
+    # misses, below one per verify route; 0 keeps one lane per route.
+    SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES = EnvInt(0)
+    # Spill: only the first V of a gather's miss lanes in plan order take a VRAM victim and a staging slot; every later
+    # lane is a CPU lane. 0: every miss lane may take a victim. 1 <= V < the routes.
+    SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
+    # Prefill misses are read by the native reader straight into the pinned slabs; needs GRAPH_GATHER.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS = EnvBool(False)
+    # A prefill's pinned-tier admissions own at most one gather chunk of rows per layer, then evict their own LRU row.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE = EnvBool(False)
+    # With the prefill share on: a fixed share in rows per layer instead of the computed one, for A/B arms. Unset uses
+    # the computed size.
+    SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS = EnvInt(None)
+    # The eager streamed MoE reads a layer's topk_ids to the host once and takes each chunk's expert ids as host lists.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
+    # A prefill gather chunk copies its already-pinned rows before waiting for the layer's fill.
+    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
+    # GPU drip: this many VRAM scratch slots, one expert row each, which the copy engine fills from pinned RAM with
+    # the experts the GPU scorer predicts. 0 is off. Needs the RAM prefetch with the GPU scorer, and the copy engine.
+    SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS = EnvInt(0)
+    # Drips per scored record: the best-scored experts mapped in RAM and not VRAM-hot (1 to 8).
+    SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS = EnvInt(4)
+    # The most one drip copy submission carries, in KiB: a demand copy issued meanwhile waits behind at most this.
+    SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB = EnvInt(1024)
+
+    # ===================================================================
+    # Expert streaming engine: hot cache and residency
+    # ===================================================================
+    SGLANG_EXPERT_STREAM_HOT_GPU_MB = EnvInt(0)
+    # Startup residency, a {"count": [[...]]} JSON file.
+    SGLANG_EXPERT_STREAM_HOT_SEED = EnvStr("")
+    SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL = EnvInt(100)
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC = EnvBool(False)
+    SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS = EnvInt(1024)
+    # Also update dynamic residency every this many decode forwards; 0 leaves updates to qualifying prefills only.
+    SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS = EnvInt(0)
+    SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS = EnvInt(8)
+    SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO = EnvFloat(1.0)
+    # Decay residency scores by 0.95 once per this many routed tokens instead of once per boundary; 0 keeps
+    # per-boundary decay.
+    SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS = EnvInt(0)
+    # Standard deviations of routing-count noise a candidate expert must lead the expert it replaces by, on top of
+    # HOT_BENEFIT_RATIO.
+    SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS = EnvFloat(0.0)
+    # Return from a residency boundary once promotion copies are submitted and publish the promoted slots on a later
+    # forward after the copies complete.
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS = EnvBool(False)
+    # Copy CPU-policy scores to a pinned host buffer at residency boundaries and apply decisions only after a
+    # nonblocking CUDA event query succeeds.
+    SGLANG_EXPERT_STREAM_ENABLE_ASYNC_RESIDENCY_SCORES = EnvBool(False)
+    # Run the decode residency update as device ops inside the captured decode graph; requires HOT_DYNAMIC and
+    # GRAPH_GATHER.
+    SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE = EnvBool(False)
+    # Most experts one layer promotes at a decode boundary on the GPU path.
+    SGLANG_EXPERT_STREAM_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
+    # Decode boundaries serve misses out of residency instead of promoting host rows; see InsertOnMissStage. Requires
+    # GPU_RESIDENCY_UPDATE and HOT_UPDATE_DECODE_FORWARDS=1.
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE = EnvInt(InsertOnMissStage.OFF)
+    # Per-token decay of the scores that pick insert-on-miss victims.
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
+    # Count eager forwards' routes in that insert-on-miss score. False leaves them out, so the score follows the routes
+    # the graph gathers count (verifies/decodes; with the verify graphed, the eager forwards are the prefills). The
+    # decay still advances by their tokens. A prefill small enough for the graph gather is still counted. Needs
+    # HOT_INSERT_ON_MISS_STAGE.
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS = EnvBool(True)
+    # Put each slot a DIRECT gather inserted into on probation: it ranks first for eviction until a later forward
+    # routes it again. Needs HOT_INSERT_ON_MISS_STAGE=2.
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION = EnvBool(False)
+    # Run stage 1's boundary insert copies through the fused masked Triton kernel (byte-identical, one pass).
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT = EnvBool(False)
+
+    # ===================================================================
+    # Expert streaming engine: prefetch
+    # ===================================================================
+    # NVMe-to-RAM prefetch: per NUMA group a thread scores a later layer's gate and reads its pick into a pool of RAM
+    # slots the device never maps; a forced CPU miss on a pooled expert swaps it in. Needs CPU experts. Inert when the
+    # pinned full-layer list covers every streamed layer.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH = EnvBool(False)
+    # Candidates per live token, in its score order past the hot, mapped and pooled experts.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN = EnvInt(1)
+    # Speculative rows per layer over all NUMA groups.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER = EnvInt(1)
+    # Pool slots per row and NUMA group, taken out of the tier at start.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE = EnvInt(2)
+    # Pick only among each token's predicted top_k.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
+    # Where the target layer's gate is scored: "cpu" (each group's speculative thread) or "gpu" (two kernels after the
+    # layer's post inside the decode graph; needs the copy engine).
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER = EnvStr("gpu")
+    # Speculative reads only to an idle drive: a reader of its own per group, one piece at a time.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
+    # How long such a read waits for an idle drive before it is abandoned.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
+    # With idle-drive reads: spread each row's pieces over the idle drives instead of keeping a row on one drive.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD = EnvBool(False)
+    # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4).
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
+    # Defer each row's map delta to the previous row's next record and fold landed pool rows into it. Needs RAM_PREFETCH.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE = EnvBool(False)
+    # Serve a GPU miss whose row landed in the prefetch pool straight from the pool slot. Needs RAM_PREFETCH.
+    SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE = EnvBool(False)
+    # How many layers ahead the speculative scorer targets (1 to 4). Above 1 needs the profile's margin floors set,
+    # since the packaged floors were fit for 1.
+    SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON = EnvInt(1)
+    # The older GPU-side next-layer prefetch (rejected by the preset); mutually exclusive with the shadow predictor.
+    SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES = EnvInt(0)
+    # JSON object -> PrefetchConfig.shadow: predictor, model_dir, candidates, budget, apex_tau, pull_mode (off |
+    # count_zero | always; needs a predictor), shadow_recall, fused_top1, calibration, calibration_file,
+    # calibration_provenance, predictors, predictor_candidates, score_interval, max_rows.
+    SGLANG_EXPERT_STREAM_SHADOW_PREFETCH = EnvStr("")
+
+    # ===================================================================
+    # Expert streaming engine: CPU experts, draft and trace
+    # ===================================================================
+    # Decode computes a layer's RAM-tier experts on the CPU, in place over the pinned tier, instead of copying them
+    # over the link. Batch-1 decode only; startup fails where the format's CPU kernel is a stub.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS = EnvBool(False)
+    # Worker threads of the CPU expert pool per NUMA node, at most one per core. 0 takes one per core.
+    SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS = EnvInt(0)
+    # Each node's CPU expert pool also takes the SMT sibling of every one of its cores.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT = EnvBool(False)
+    # CPU-computed NVMe misses: the CPU's split tail counts every missing lane, not only RAM hits. Needs CPU experts.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES = EnvBool(False)
+    # For this many us after its last job, the idle CPU expert team runs the kernel's register-only AVX-512 loop
+    # instead of PAUSE. 0: PAUSE only. The team never sleeps either way.
+    SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
+    # A verify's CPU job leaves the overwrite of its token rows to the kernel. Needs CPU experts.
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT = EnvBool(False)
+    # Caps the CPU kernel's ISA tier: scalar | avx2 | bw | vnni | vbmi, never raising it; empty keeps the host's.
+    SGLANG_EXPERT_STREAM_CPU_MAX_ISA = EnvStr("")
+    # Print the CPU kernel's chosen ISA tier to stderr.
+    SGLANG_EXPERT_STREAM_CPU_REPORT_ISA = EnvBool(False)
+    # JSON object -> CpuExpertsConfig.split: table, layer_tables, cpu_ms, link_ms, handoff_ms, retune_batches,
+    # calibration, calibration_reps, miss_cut, miss_cut_max, model, model_costs, model_refine_batches,
+    # model_residency_tiebreak.
+    SGLANG_EXPERT_STREAM_CPU_SPLIT = EnvStr("")
+    # JSON object -> CpuExpertsConfig.two_stage: enabled, w13_weights, w2_weights.
+    SGLANG_EXPERT_STREAM_CPU_TWO_STAGE = EnvStr("")
+    # The draft's experts as a second job source of the GPU node's CPU expert team (needs a speculative draft adapter;
+    # startup fails where the profile's adapter is a stub).
+    SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS = EnvBool(False)
+    # Cores of the draft's own CPU expert kernel, as a taskset list ("6-15"); refused with CPU experts on.
+    SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the draft's own CPU expert kernel. 0 takes one per core.
+    SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS = EnvInt(0)
+    # The draft experts kept on the GPU, per stage; empty keeps none: every routed draft expert runs on the CPU.
+    SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH = EnvStr("")
+    # JSON object -> TraceConfig (diagnostics and captures, all off by default). Nested objects: predictor_capture,
+    # job, draft_trigger, cpu_worker, preforward_readiness, route.
+    SGLANG_EXPERT_STREAM_TRACE = EnvStr("")
+
+    # ===================================================================
     # HTTP server and health
     # ===================================================================
     # Decompress request bodies tagged with `x-body-compressed`.
@@ -598,6 +601,9 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    # ASGI import string that multi-worker Uvicorn and Granian processes load;
+    # point it at an app that extends `http_server.app` with extra routes.
+    SGLANG_HTTP_SERVER_APP_PATH = EnvStr("sglang.srt.entrypoints.http_server:app")
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
@@ -613,6 +619,8 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
+    SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
@@ -635,10 +643,8 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
-    # Set to true by the check-changes CI job when a PR touches nothing under
-    # rust/; default false so local and scheduled runs never skip the cargo tests.
-    SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    SGLANG_TEST_TI2I_INPUT_IMAGE = EnvStr(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -709,12 +715,8 @@ class Envs:
     # reaches this many requests (0 = first decode batch). Lets a batch-size bench
     # capture steady-state full-admission decode steps instead of the ramp-up.
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
-    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_ENABLE_NVTX"
-    )
-    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
-    )
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -749,6 +751,9 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Log the CUDA allocator's allocated and reserved bytes around each target layer, attention, MoE, logits, sampler
+    # and draft injection call of a DSpark prefill (debug_utils/prefill_peak_log.py). Off: nothing is wrapped.
+    SGLANG_DEBUG_PREFILL_PEAK_LOG = EnvBool(False)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
@@ -766,6 +771,7 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    SGLANG_ENABLE_NAN_LOGITS_CHECK = EnvBool(False)
     # Signal level for value/index validity checks (nan/inf/oob/...); see
     # invariants.py. OFF (prod default) runs only the free data layer, WARN
     # adds throttled logging, STRICT (CI default) crashes on violations.
@@ -779,6 +785,12 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # run the greedy draft/accept path and only the bonus token is temperature-sampled.
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (hip graph) instead of falling back to the eager accept + commit path.
+    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -790,15 +802,14 @@ class Envs:
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
-    # Appends each DSpark draft MoE call's topk ids as a JSON line; the routes probe the draft resident set is made from.
-    SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
-    SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
-    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    # Argmax every draft row, sampling requests included, accepted as a one-hot
+    # draft: no step logits kept, lower acceptance at high temperatures.
+    SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     # Test only: re-run every graphed DSpark verify eagerly, as an overflowed one is. Its output must equal an eager
     # verify's (D2-3's end-to-end check of the re-run path).
@@ -807,8 +818,8 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
-    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
-    # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
+    # With the TP-sharded markov_w2, run the draft's vocab all-gathers (each
+    # step's per-shard token candidates, and the step logits sampling keeps) over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
@@ -819,6 +830,26 @@ class Envs:
     # first draft where the running product of the draft's top-1 softmax probabilities falls below this, and the
     # target routes no experts for the positions past it. 0 is off. 0.4 was the offline replay's best.
     SGLANG_DSPARK_TOP_PROB_GATE = EnvFloat(0.0)
+    # The confidence-head verify cut: under static, the draft's trained confidence head (built only when this is on)
+    # picks each bs-1 verify's width, and the dead-row mask drops the rest. Needs an STS file; excludes the gate above.
+    SGLANG_DSPARK_CONFIDENCE_CUT = EnvBool(False)
+    # With the cut on, cut sampled (temperature > 0) bs-1 verifies too, not only greedy ones; their T(w) calibration
+    # admits them as well. Lossless by the stopping-rule argument in dspark_confidence_cut.py's docstring.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED = EnvBool(False)
+    # The sampled cut's own STS file (dspark_sts_fit --label soft at the serving temperature): sampled verifies re-temper
+    # the head's output from --speculative-dspark-confidence-sts-path's temperatures to these. Empty: they use the
+    # greedy file's, fitted on argmax labels.
+    SGLANG_DSPARK_CONFIDENCE_CUT_SAMPLED_STS_PATH = EnvStr("")
+    # The cut's rule maximises E(w) / (draft ms + T(w)), the draft ms timed on the T(w) calibration's verifies, not
+    # E(w) / T(w). The draft ms is timed and logged either way.
+    SGLANG_DSPARK_CONFIDENCE_CUT_DRAFT_COST = EnvBool(False)
+    # Refit the cut's per-position calibration from the server's own accepts every this many cut verifies (greedy and
+    # sampled apart; dspark_confidence_refit.py). The cut reads max(offline, refit), so it never cuts harder. 0 is off.
+    SGLANG_DSPARK_CONFIDENCE_CUT_REFIT_INTERVAL = EnvInt(0)
+    # Keep timing the cut's own verifies after the T(w) calibration and refit T(w) (least squares over the last 192)
+    # every this many of them, so the table follows the server out of the slow first ~35 s of a run instead of freezing
+    # the calibration's. 0 is off: T(w) stays as the calibration fitted it.
+    SGLANG_DSPARK_CONFIDENCE_CUT_LIVE_FIT_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -834,21 +865,42 @@ class Envs:
     # Per-call move cap on a non-urgent lazy-compaction flush, so a large
     # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
     SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    # Max pages one compaction move-kernel launch copies (eager or lazy, urgent
+    # or not); a larger move is issued as consecutive launches of this size
+    # within the same compaction call.
+    SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Lock the scheduler process's memory against swap once the scheduler is built (model loaded, graphs captured):
+    # mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT), so touched pages stay resident without faulting anything in
+    # (sglang/srt/utils/memory_lock.py). Needs RLIMIT_MEMLOCK unlimited; a failure is logged, not raised.
+    SGLANG_ENABLE_SCHEDULER_MLOCK = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
+    SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
+    # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
+    # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
+    # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and
+    # nothing else; at any other page size the view is never built and this
+    # flag does nothing whichever way it is set. Where it does apply the win
+    # grows with context (~1-2% throughput and 3-7% TTFT at 60k and above) and
+    # is flat to marginally negative at moderate ISL, so this is a per-workload
+    # switch rather than a pure kill-switch. Off falls back to the contiguous
+    # gather path. Default on.
+    SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission
     # ===================================================================
+    SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
@@ -890,11 +942,7 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
-    # For non-streaming requests, the scheduler still flushes intermediate
-    # output batches to the tokenizer manager every N decoded tokens so that
-    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
-    # an accurate TTFT for benchmarking; the upstream default of 50 trades
-    # off some TTFT-metric accuracy for less IPC overhead.
+    # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # ===================================================================
@@ -921,11 +969,14 @@ class Envs:
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Opt-in: keep receiving prefill requests while forward results are pending.
+    SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Override NVML Confidential Computing autodetection. None = autodetect.
+    SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
     # ===================================================================
     # Radix and sparse KV caches
     # ===================================================================
-    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
@@ -935,16 +986,22 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
-    # Deprecated: the unified radix tree is the default tree cache now, so the
-    # registry no longer reads this. Kept because a few model/arch call sites
-    # still assert on it; do not use in new code.
-    SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
-    # Registered TreeCore backend serving the unified radix cache.
-    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
-    # TODO(DSV4): @ispobock this has bug on main branch when retract
-    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
-    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
-    SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # The tree-core registry falls back to Python for:
+    # - Session-aware caching.
+    # - C128 or other unsupported components.
+    # - Custom component overrides.
+    # - Non-Linux platforms.
+    # - Unsupported PyTorch versions.
+    # - Devices other than CPU or CUDA.
+    # - Installs with neither the Rust extension nor its sources.
+    # - Source builds with a missing or unusable Rust toolchain.
+    # This also applies when Rust is explicitly selected.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    # Once decode passes the sliding window, drop the SWA part of the prefill's
+    # tree lock; its SWA KV becomes evictable rather than freed.
+    SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
+    )
 
     # ===================================================================
     # PD disaggregation runtime
@@ -973,8 +1030,9 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
-    # below fires. Off by default (no behavior/perf impact when disabled).
-    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
+    # below fires. Only applies to backends that ack the drain
+    # (supports_deferred_decode_kv_release).
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
@@ -1016,10 +1074,16 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # NUMA node the mmap host KV pools (mmap_allocator.alloc_mmap) are bound to before their pages are touched;
+    # unset: first touch places them, on the allocating thread's node.
+    SGLANG_HICACHE_HOST_NUMA_NODE = EnvInt(None)
     # Device bytes one page_first host pool may spend on its write-back staging buffer; fewer pages, more chunks.
     SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB = EnvInt(32)
     # Device memory reserved out of the KV budget for HiCache allocations made after the pool is sized.
     SGLANG_HICACHE_DEVICE_RESERVE_MB = EnvInt(64)
+    # HiCache host<->device transfers use the TMA staging kernel when the GPU
+    # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
+    SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -1038,6 +1102,9 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # Buffer mode: store only the SWA window ending at each node (what a
+    # prefetch ending there restores) instead of every SWA page.
+    SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -1119,11 +1186,34 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
+    # true forces EPv2; false forces EPv1.
+    SGLANG_MORI_EP_V2 = EnvBool(True)
+    SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
+    SGLANG_MORI_COMBINE_DTYPE = EnvStr("auto")
+    SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS = EnvInt(0)
+    # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
+    # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
+    SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
+    SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
     # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
+    # pinned aiter still ships the pre-PR config (see
+    # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
+    # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+    # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+    SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
+    # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+    SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
+    # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
+    # Enabled by default for supported configurations; set to 0 to disable.
+    SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
@@ -1144,6 +1234,10 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
+    # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
+    # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
+    SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1177,13 +1271,27 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
+    # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
+    SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    # Smaller MegaMoEV2 capacity for decode steps; a step with an extend on any
+    # DP rank keeps SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR. Must hold one rank's
+    # largest decode forward (checked at startup). 0 disables it; otherwise a
+    # power of two no larger than SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.
+    SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR = EnvInt(0)
+    SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
+    SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:
@@ -1196,6 +1304,16 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # Select the AITER MLA kernel for decode, "asm" or "gluon".
+    SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
+        "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
+    )
+    # Select the AITER MLA kernel for target verify, "asm" or "gluon".
+    SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
+    # Let aiter plan the KV splits for the asm persistent MLA decode.
+    SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
+    SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1246,9 +1364,7 @@ class Envs:
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
-    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
-    )
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
@@ -1267,6 +1383,9 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
+    # Disable to save the additional weight memory or allow online updates.
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1277,6 +1396,9 @@ class Envs:
     # (per-tensor activation scale 1.0); target layers are unaffected.
     SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
+    # since the block-scale MoE kernel lacks SwiGLU-OAI
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
@@ -1285,7 +1407,7 @@ class Envs:
     # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
     # default CUTLASS path. Only takes effect on a GPU with a matching
     # dtype=fp8_w8a8_channelwise config JSON under
-    # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
+    # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
     # Path to a pinned exllamav3 checkout (see exl3_ext.EXLLAMAV3_COMMIT) whose
@@ -1303,19 +1425,27 @@ class Envs:
     SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
     SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
     # Build-time: the optimized EXL3 CPU kernel's quantized activation rows per chunk (EXL3_MOE_CPU_MAX_M, even in
-    # [2, 8]; a chunk holds half as many tokens). 8 by default: an expert shared by 3-4 verify tokens decodes its
-    # weights once (DSV41_REFERENCE.md 33.20). 0 keeps the kernel source's default (4). A nonzero value builds into its
-    # own extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
-    SGLANG_EXL3_CPU_MAX_M = EnvInt(8)
+    # [2, 16]; a chunk holds half as many tokens). 16 by default: an expert shared by up to 8 verify tokens decodes its
+    # weights once (DSV41_REFERENCE.md 33.20; chunks of 5-8 tokens through register_band_halves). The generic plan
+    # keeps chunks of at most 4 tokens. 0 keeps the kernel source's default (4). A nonzero value builds into its own
+    # extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
+    SGLANG_EXL3_CPU_MAX_M = EnvInt(16)
     # Experiment-only; retire with plan 2026-10-07-dsv41-row-weighted-serving-experiment. Whose EXL3 CPU expert layers
     # split their gate/up and down output tiles by chunk row count instead of evenly
     # (csrc/exl3/optimized/tile_assignment.hpp): "draft", "target" or "both"; empty keeps the original assignment
     # everywhere. Per layer at run time, not a build flavor: the same arithmetic in another worker's hands. The launch
-    # gate requires the named source's CPU experts.
+    # gate requires the named source's CPU experts. The DSV4.1 plan claims 8-tile groups dynamically whenever a call's
+    # chunks differ in token count (PlanTraits::kClaimMixedChunks), the only calls row weighting changes, so there the
+    # setting has no effect: it still weights the generic plan's layers.
     SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT = EnvStr("")
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
     # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
+    # The vendored EXL3 CPU kernel pins its workers to the first cores unless this is "0", and the engine (which pins
+    # its own workers) refuses anything else. Unset leaves the kernel's default (the previous EXL3_MOE_CPU_PIN).
+    SGLANG_EXL3_MOE_CPU_PIN = EnvStr(None)
+    # Caps the vendored EXL3 CPU kernel's small-expert workers; 0 is no cap (the previous EXL3_MOE_CPU_SMALL_WORKERS).
+    SGLANG_EXL3_MOE_CPU_SMALL_WORKERS = EnvInt(0)
 
     # ===================================================================
     # Humming quantization
@@ -1333,16 +1463,17 @@ class Envs:
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
-    # means each call site keeps its own default.
+    # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
     # FlashInfer MegaMOE (generic moe_ep.MoEEpMegaLayer backend). Sizes the
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
-    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
-    # region and can win at large batch, but makes the output accumulation order
-    # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
+    # cutedsl mega kernels (NVFP4 W4A4 / W4A16 and MXFP8). Permits in-kernel
+    # reduction; FlashInfer's tuning profile may still select external reduction.
+    # BF16 atomic accumulation is nondeterministic -- keep off for
+    # bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
     # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
@@ -1353,7 +1484,8 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
-    # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights.
+    # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
+    # including the flashinfer_megamoe runner (BF16 combine).
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
@@ -1363,6 +1495,8 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
+    SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1374,8 +1508,27 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
-    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    # SM120 FlashMLA backend: "flashinfer" (default), "triton", or "torch". "flashinfer_prefill" runs FlashInfer's
+    # prefill for calls of more than 64 tokens and the triton kernel for decode and the DSpark verify (64 tokens or
+    # fewer); the triton merge-budget and chunk knobs below then apply to that triton path.
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Byte cap (MiB) on the fp32 temporaries of the triton backend's LSE merge and
+    # attention-sink scaling, which peak at 3 fp32 copies of the [tokens, heads,
+    # head_dim_v] output (1.5 GiB at a 4096-token prefill chunk). Tokens are merged
+    # independently, so chunking them under the cap gives bitwise the same output.
+    # 0 keeps the one-pass merge.
+    SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB = EnvInt(0)
+    # With the merge budget set, also run the triton backend's SWA and extra kernels per token chunk (sized by the
+    # same budget), so the two full-size partial outputs never exist; bitwise the same output.
+    SGLANG_SM120_TRITON_FLASHMLA_CHUNK_KERNELS = EnvBool(False)
+    # Release the CUDA caching allocator's unused segments (torch.cuda.empty_cache) before a DSpark prefill larger than
+    # any before it, so the startup warm-up's growing shapes do not strand reserve sized for the smaller ones (1.9 GB
+    # above the live peak, /mnt/nvme1/prefill-merge/peaklog). Allocator-only: no math changes.
+    SGLANG_OPT_EMPTY_CACHE_ON_LARGER_PREFILL = EnvBool(False)
+    # Size the expert hot cache at startup from a measured prefill peak: its tensors go on CUDA VMM memory
+    # (layers/moe/hot_cache_vmm.py) so slots past the calibrated capacity can be retired and their memory released
+    # before CUDA graph capture.
+    SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP = EnvBool(False)
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
@@ -1386,6 +1539,9 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)
+    SGLANG_OPT_FLUX3_PRIMS_TS_TUNING_BUCKETS = EnvTuple(tuple())
+    SGLANG_USE_SAGE_ATTENTION_IMPL = EnvStr("")
 
     # ===================================================================
     # Triton and Torch compilation
@@ -1434,7 +1590,6 @@ class Envs:
     # the batch fits the chunk budget.
     SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
-    SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # ===================================================================
@@ -1550,6 +1705,7 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
+    SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
     # by the model-specific dispatcher configuration; all other paths retain
@@ -1564,6 +1720,9 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
+    # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
+    SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -1580,6 +1739,7 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
 
     # ===================================================================
     # Top-k kernels
@@ -1616,12 +1776,8 @@ class Envs:
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
-    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
-    )
-    SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
-        2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
-    )
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
     # Compute input logprobs from logits via per-row logsumexp instead of
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
@@ -1646,6 +1802,9 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # See docs/references/environment_variables.
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
     # RoPE cache
@@ -1663,6 +1822,7 @@ class Envs:
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).
     SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
@@ -1670,6 +1830,8 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
+    SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
@@ -1679,7 +1841,7 @@ class Envs:
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
-    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
+    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
@@ -1752,6 +1914,13 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # Breakable prefill CUDA graphs capture the Triton KDA extend instead of
+    # breaking the graph at every KDA layer (layers/attention/linear/
+    # kda_prefill_graph.py); this kill-switch restores the eager break.
+    SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND = EnvBool(False)
+    # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
+    # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
+    SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
@@ -1760,6 +1929,11 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
+    SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
+    # Shorter prompts use the single-call encode; below this the gain is eaten
+    # by rayon dispatch and the id merge.
+    SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
@@ -1825,7 +1999,7 @@ class Envs:
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
-    # fp4 compressed caches) or "auto" (v41 on SM100 when FlashMLA supports it).
+    # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
     SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
@@ -1836,10 +2010,46 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    # ROCm gfx950, DeepSeek-V4 128x128 block-fp8 dense linears: run the GEMM as
+    # aiter's e8m0 mxscale bpreshuffle (flydsl) instead of the fp32-scale
+    # CK/asm/triton bpreshuffle. The weight bytes are shared; only an e8m0 copy
+    # of the (power-of-two) weight scale is added at load, and activations are
+    # quantized with power-of-two (ue8m0) scales. Restricted to the (N, K)
+    # shapes in SGLANG_DSV4_DENSE_MXSCALE_SHAPES ("N:K,N:K"; empty = built-in
+    # whitelist of shapes that win in the microbench, "all" = every shape).
+    SGLANG_DSV4_DENSE_MXSCALE = EnvBool(False)
+    SGLANG_DSV4_DENSE_MXSCALE_SHAPES = EnvStr("")
+    # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
+    # installed aiter ships it; 0 keeps the asm kernel.
+    SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)
+    # ... which copy: "auto" = aiter's when the installed aiter ships it, else
+    # sglang's in-tree copy; "aiter" = aiter's only (asm without it); "intree" =
+    # the in-tree copy only.
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    SGLANG_DSV4_FLYDSL_DECODE_SOURCE = EnvStr("auto")
+    # ... also with 128 local heads (DP attention). Off: there the asm path
+    # below (split plan + HCA persistent, ROCm/aiter#6126) measured the same
+    # DP8 DSpark decode step on MI355X without depending on FlyDSL.
+    SGLANG_DSV4_FLYDSL_DECODE_H128 = EnvBool(False)
+    # fp8 unified_kv asm decode (when FlyDSL is off or absent): pick the KV
+    # split count from aiter's v4 nm latency model (ROCm/aiter#6126; ported
+    # when aiter predates it) with a constant split_indptr, per stream kind.
+    SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL = EnvBool(True)
+    # context the HCA split plan is sized for, capped at the server context
+    # length (0: the server context length). Sizing for 1M over-splits HCA at
+    # AgentX lengths (32k-200k).
+    SGLANG_DSV4_FP8_DECODE_SPLIT_CTX = EnvInt(200_000)
+    # fp8 unified_kv asm decode: HCA layers with 128 local heads (DP attention)
+    # take aiter's persistent mla_decode_fwd_v4_nm_ps (in-kernel split + merge)
+    # for MIN_ROWS..32768 rows; needs aiter >= ROCm/aiter#6126.
+    SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
+    SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
     # anonymous mapping per rank holding only its rows, gathered with the
@@ -1861,6 +2071,9 @@ class Envs:
     # Capture layer-1 Engram lookup as a CUDA host node backed by a shared native
     # row cache and an io_uring worker. Disabled unless explicitly requested.
     SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING = EnvBool(False)
+    # Size in GiB of that native row cache (shared by every Engram layer). 0 keeps no rows: every lookup reads its
+    # rows through io_uring.
+    SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB = EnvFloat(5.0)
     # With the above, capture the decode lookup as a device post kernel and a device
     # wait kernel served by a polling thread instead of a host node; the decode graph
     # then has no host nodes, which is asserted at capture.
@@ -1870,60 +2083,12 @@ class Envs:
     # On since DSV41_REFERENCE.md 33.35: the two break gaps (~8 ms per verify) are gone.
     SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH = EnvBool(True)
 
-    # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
-    # checkpoint loader skips them and each MoE layer gathers the experts it
-    # routes to through the MoE expert streaming framework. Its knobs size the
-    # tiers: SGLANG_MOE_PINNED_HOST_MB (host RAM), SGLANG_MOE_HOT_GPU_MB (VRAM),
-    # SGLANG_MOE_HOT_SEED (startup residency, a {"count": [[...]]} JSON).
-    SGLANG_DSV41_EXPERT_STREAM = EnvBool(False)
-    # Directory whose EXL3 shards the streamed experts are read from (required
-    # when streaming; the experts may live on a different drive than the model).
-    SGLANG_DSV41_EXPERT_DIR = EnvStr("")
-    # When set, append one JSON line per streamed MoE layer call (forward, layer,
-    # tokens, experts and route counts, VRAM and RAM misses, read and split time)
-    # for offline tier simulation (scripts/dsv41/tier_sim.py).
-    SGLANG_DSV41_EXPERT_TRACE_PATH = EnvStr("")
-    # With the trace above on and EXL3 graph decode: also capture every graph forward's per-layer router
-    # input and top-k weights into binary side files at this path prefix (exl3_stream_trace.RouterCapture,
-    # ~410 KB per token). Setting it without the trace is refused.
-    SGLANG_DSV41_ROUTER_CAPTURE_PATH = EnvStr("")
-    # With the router capture above on: also record, per layer, the RAM residency of the next four layers'
-    # experts and each routed lane's demand kind into side files at the same prefix. Refused without it.
-    SGLANG_DSV41_RESIDENCY_CAPTURE = EnvBool(False)
-    # Trace runs: a path prefix for one JSON line per request per verify step (its ordinal and correct drafts,
-    # speculative/verify_accept_log.py), which joins the route log's verify forwards to split misses by verified
-    # position (analysis/dsv41-drive/dspark/verify_split.py). Empty: nothing is written.
-    SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH = EnvStr("")
+    # DeepSeek-V4.1 EXL3 routed experts are streamed from disk by the expert engine; every streaming knob is a
+    # SGLANG_EXPERT_STREAM_* name in the "Expert streaming engine" sections. The names below are the DSV4.1 profile's.
     # Trace runs: a path prefix for one JSON line per request per DSpark verify step with the draft's top-1/top-2
     # probability at each draft position (speculative/dspark_components/dspark_draft_top_prob_log.py); recomputes the
     # draft's step logits, one extra LM-head pass per verify. Empty: nothing is computed or written.
     SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH = EnvStr("")
-    # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
-    # thread may take per MoE layer, in ms, before the process fails stop. The
-    # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
-    # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
-    # With the copy engine, the copy wait gets this again, timed by that watchdog from
-    # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
-    # then take about 2x this (+20 ms).
-    SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
-    # How long an idle RAM-miss service thread (one per NUMA group) polls before it sleeps 50 us between polls; a
-    # parked thread then sleeps 20 us between checks too. -1: never sleep (spin, with PAUSE or busy-polling).
-    SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US = EnvInt(5000)
-    # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
-    SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US = EnvInt(5000)
-    # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
-    # (ThreadingConfig.resolve). Refused unless it is outside cores 64-71 and the server's affinity, on a node of the
-    # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
-    # core); also refused with SGLANG_EXPERT_NUMA_CORES naming that node's ram=. Unset: with several nodes or CPU
-    # experts each node's thread takes the node's highest free physical core; with one node and no CPU experts it
-    # inherits the server's affinity and spins with PAUSE, then sleeps. Checked once, at start.
-    SGLANG_DSV41_RAM_MISS_SPIN_CORE = EnvInt(None)
-    # io_uring options the C++ reader also reads itself (host/uring_options.h); declared here because
-    # ThreadingConfig resolves the SQPOLL thread's core from them. The service passes every ring its core explicitly.
-    SGLANG_EXPERT_STREAM_URING_MODE = EnvStr("default")
-    # The SQPOLL thread's core with one NUMA group, -1 or unset unpinned; refused above one group (use
-    # SGLANG_EXPERT_NUMA_CORES's sq=).
-    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU = EnvInt(None)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
@@ -1942,182 +2107,44 @@ class Envs:
     # kernel. Bit-identical to the unfused casts. Read once when each module is built, and per BS1 call where the
     # sublayer input is combined. Off by default.
     SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
-    # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md "Copy engine"): the RAM-miss
-    # service copies each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on
-    # its own thread) instead of the in-graph SM copy C1, and the graph waits for its completion word. Captured decode
-    # graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in flight can still
-    # deadlock it into a fail-stop. Read once at service start. Off by default.
-    SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
-    # What moves a captured decode post's RAM hits once the copy engine is armed (LEASE_PROTOCOL.md, lane kinds): "ce",
-    # the copy engine's DMA (kHitCopy), or "sm", the in-graph SM copy C1 (kHitSm), with no host thread on the hit path.
-    # CPU lanes still complete through the copy thread either way. Read once at service start. Default "ce".
-    SGLANG_DSV41_RAM_HIT_COPY = EnvStr("ce")
-    # SM small copies: the copy engine copies only each RAM-hit row's two trellis tensors; the copy wait (CW) reads the
-    # four small ones (44.5 KB a row) from the pinned slot with SM loads, and the lease is released only once both the
-    # DMA completed and CW published Done. Needs the copy engine (refused without it). Read once at service start.
-    # Off by default.
-    SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES = EnvBool(False)
-    # Lease-chain PDL (LEASE_PROTOCOL.md "PDL"): the lease-chain kernels post, W1, S and CW launch with programmatic
-    # dependent launch, each waiting on its predecessor as its first statement and letting the next one launch right
-    # after that wait, so a layer's kernels overlap their launch latency. Outputs unchanged; at most ~1 us per layer
-    # (analysis/dsv41-drive/chain-pdl/results.md). Read once at service start. Off by default.
-    SGLANG_DSV41_ENABLE_LEASE_PDL = EnvBool(False)
-    # Prefill fills (plan 2026-09-25-dsv41-prefill-fills): eager pinned-tier misses are read by the RAM-miss service's
-    # native reader straight into the pinned slabs (row images, every mirror drive at once) instead of the Python bounce
-    # read and CPU copy. A layer's misses are all issued once its routing is known, on a helper thread, and each gather
-    # chunk waits only for its own rows. Needs the native slot table (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when
-    # the service starts. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_FILLS = EnvBool(False)
-    # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
-    # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own
-    # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
-    # Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
     # Test only: test/manual/dsv41/test_bs1_build_digest.py skips, instead of failing, when nvcc or the GPU arch differs
     # from its golden's (the golden is then stale: re-record it). Off by default.
     SGLANG_TEST_BS1_DIGEST_TOOLCHAIN_ACKNOWLEDGED = EnvBool(False)
-    # Prefill route plan (plan 2026-09-25-dsv41-prefill-route-plan): the eager streamed MoE reads a layer's topk_ids
-    # to the host once, before any of its gathers, groups the routes by expert, and takes each chunk's expert ids and
-    # row_of_source as host lists, so no readback sits between a chunk's gather and its compute and the host runs
-    # ahead of the gather. Outputs are bitwise those of the per-expert torch.where loop. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
-    # Split fill gather (plan 2026-09-26-dsv41-split-fill-gather): a prefill gather chunk holding rows the layer's
-    # prefill fill is still reading copies its other rows first, then waits for the fill and copies the filled rows,
-    # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
-    # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
-    # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
-    SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
-    # Optional override of the CPU expert pool's cores, as a taskset list ("36-47,50") on one node, at least two.
-    # Unset or empty derives each node's pool from its free physical cores (ThreadingConfig.resolve).
-    SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
-    # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
-    SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
-    # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
-    # "1:ram=35,cpu=18-33,sq=34;0:ram=17": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
-    # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
-    SGLANG_EXPERT_NUMA_CORES = EnvStr("")
-    # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
-    # computes k*(n) from the three costs below (policy.split_table).
-    SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")
-    # Per-layer tables replacing the group's split on every node of the listed layers: "LAYERS:TABLE;LAYERS:TABLE",
-    # e.g. "0:0,0,0,1,...;1:0,0,1,..." or "0,1:0,0,1,...", each TABLE shaped as SGLANG_DSV41_CPU_EXPERTS_SPLIT.
-    # Calibration and the retune never change them. Empty: every layer uses its group's table.
-    SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS = EnvStr("")
-    # ms per expert on the CPU pool, per resident row over the link, and per layer handoff. Defaults are P0's native
-    # resid+b128 build at 12 node-1 threads and the measured link (plan 2026-09-29-dsv41-cpu-experts, P0 results).
-    SGLANG_DSV41_CPU_EXPERTS_CPU_MS = EnvFloat(0.52)
-    SGLANG_DSV41_CPU_EXPERTS_LINK_MS = EnvFloat(1.0)
-    SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS = EnvFloat(0.02)
-    # Batches between re-tunes of the split from the CPU's measured cost per expert; 0 keeps the startup table.
-    SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES = EnvInt(0)
-    # Measure the split once when the copy engine arms (spec 2026-10-01-cpu-split-calibration): the CPU, the link and
-    # both together on the loaded model, then keep it. Off: the three costs above, and the retune.
-    SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION = EnvBool(True)
-    # Timed runs per calibration cell, after one discarded warm-up.
-    SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS = EnvInt(10)
-    # CPU-computed NVMe misses: the CPU's split[n] tail counts every missing lane, not only RAM hits, and a miss on the
-    # CPU is computed from its staging slot once its read lands (it still enters the RAM tier, never VRAM). Needs
-    # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
-    # (slot-map plan, Task 0), so a served A/B decides.
-    SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
-    # A miss-aware split. A forced CPU miss runs on its node's CPU behind the record's CPU-hit job, so a node with
-    # 1.._MAX forced misses takes this many fewer of its split's lanes (they go to the copy engine or the GPU). 0 is
-    # off. Applies only with SGLANG_DSV41_CPU_EXPERTS; on by default after three A/Bs (DSV41_REFERENCE.md 33.17).
-    SGLANG_DSV41_CPU_SPLIT_MISS_CUT = EnvInt(1)
-    # The most forced misses on a node for which the cut applies.
-    SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX = EnvInt(3)
-    # Experiment: a two-stage CPU miss. The reader fetches a CPU-computed miss's w13 prefix across the mirror roots
-    # before its w2 suffix, and the CPU job starts once w13 has landed: it runs the gate/up GEMVs while w2 is still being
-    # read and waits for w2 before anything reads it. Needs SGLANG_DSV41_CPU_EXPERTS. Off until a served A/B decides.
-    SGLANG_DSV41_CPU_TWO_STAGE = EnvBool(False)
-    # Its row's w13 and w2 spans divided over the mirror roots by these weights, in SGLANG_MOE_EXPERT_MIRROR_WEIGHTS's
-    # format and root order, rather than both by the mirror's (empty: the mirror's). A root weighted 0 in a span reads
-    # none of it, so 1:0:1 for w2 leaves the middle root one contiguous piece of w13. Only with the flag.
-    SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS = EnvStr("")
-    SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS = EnvStr("")
-    # DSpark draft experts on the CPU (plan 2026-10-05-dsv41-dspark-port): each draft stage keeps the experts its
-    # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
-    # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.
-    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS = EnvBool(False)
-    # Cores of the draft's CPU expert kernel, as a taskset list ("18-27"). At least two, none of the reserved 64-71.
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
-    # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
     # Keeps an EXL3 DSpark draft eager (no decode graph); the draft MoE then runs the same graph-safe path eagerly.
     # For A/B only.
     SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH = EnvBool(False)
-    # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
-    # Empty keeps none: every routed draft expert runs on the CPU.
-    SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
-    # For this many us after its last job, the idle CPU expert team runs the kernel's register-only AVX-512 loop
-    # instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap costs about
-    # 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03: a 1 ms or
-    # 3 ms gap then costs nothing). 0: PAUSE only. The team never sleeps either way.
-    SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
-    # NVMe-to-RAM prefetch: per NUMA group a thread scores a later layer's gate (the next by default)
-    # and reads its pick into a pool of RAM slots the device never maps; a forced CPU miss on a pooled
-    # expert swaps it in. Needs SGLANG_DSV41_CPU_EXPERTS.
-    SGLANG_DSV41_RAM_PREFETCH = EnvBool(False)
-    # Candidates per live token, in its score order past the hot, mapped and pooled experts.
-    SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN = EnvInt(1)
-    # Speculative rows per layer over both NUMA groups: the replay's best budget (DSV41_REFERENCE.md section 33.13).
-    SGLANG_DSV41_RAM_PREFETCH_PER_LAYER = EnvInt(1)
-    # Pool slots per row and NUMA group, taken out of the tier at start.
-    SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE = EnvInt(2)
-    # Pick only among each token's predicted top_k: a layer whose predicted experts are all cached reads nothing,
-    # rather than an expert the gate ranks below top_k (the 2026-10-08 A/B's unused reads, DSV41_REFERENCE.md 33.14).
-    SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY = EnvBool(False)
-    # Where the target layer's gate is scored: "cpu", each group's speculative thread on the record's staged input, or
-    # "gpu", two kernels after the layer's post inside the decode graph (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer).
-    # gpu is the prefetch's best measured arm (DSV41_REFERENCE.md 33.14-33.18) and needs the RAM-miss copy engine.
-    SGLANG_DSV41_RAM_PREFETCH_SCORER = EnvStr("gpu")
     # The GPU scorer's margin floors: a JSON file {"min_margin": {"<target row>": floor}} from spec_margin.py's admission
     # sweep. A candidate whose margin is under its target row's floor is not read and does not count toward the layer's
     # budget; a row the file omits keeps every candidate. Unset: the GPU scorer's packaged table
     # (layers/moe/ram_prefetch_margin_floors.json), the CPU scorer none. Empty: no floors.
     SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS = EnvStr(None)
-    # Speculative reads only to an idle drive (design 2026-10-09-dsv41-drive-aware-reads, change (2)): each NUMA group
-    # reads its pool rows through a reader of its own, one piece at a time, from a mirror root no demand read is on,
-    # instead of taking turns with the demand reads on the group's reader. A forced miss waiting on a row lifts that.
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE = EnvBool(False)
-    # How long such a read waits for an idle drive before it is abandoned (its pool entry stays empty).
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US = EnvInt(4000)
-    # With idle-drive reads: spread each row's pieces over the idle drives, ties rotating from row to row, instead of
-    # keeping the row on one drive with ties to the lowest-numbered (which took 179 of 249 GB in the A/B of
-    # DSV41_REFERENCE.md 33.18).
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD = EnvBool(False)
-    # With idle-drive reads: how many of a row's pieces may be in flight at once (1 to 4), each on a drive no demand
-    # reads. One read rows too slowly in that A/B: 35% abandoned, 82% of promotions boosted.
-    SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES = EnvInt(1)
-    # Defer each row's map delta to the previous row's next record and fold landed pool rows into it, so the GPU types
-    # them as RAM hits. Needs SGLANG_DSV41_RAM_PREFETCH=1.
-    SGLANG_DSV41_RAM_PREFETCH_PROMOTE = EnvBool(False)
-    # Serve a GPU miss whose row already landed in the prefetch pool by streaming it to the GPU straight from the pool
-    # slot instead of reading it again from NVMe. Needs SGLANG_DSV41_RAM_PREFETCH=1.
-    SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE = EnvBool(False)
-    # How many layers ahead the speculative scorer targets (1 to 4): 1 scores the next layer's gate, 2 the one after.
-    # Above 1 needs SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS set, since the packaged floors were fit for 1.
-    SGLANG_DSV41_RAM_PREFETCH_HORIZON = EnvInt(1)
     # Path of a folded learned L+2 head file (analysis/dsv41-drive/prefetch-replay/l2_head_export.py) that replaces
     # the native candidate select. Unset or empty means the native select.
     SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD = EnvStr(None)
-    # GPU drip (host/gpu_drip.h): this many VRAM scratch slots, one expert row each (~13 MB at DSV4.1's EXL3 rows),
-    # which the copy engine fills from pinned RAM, while no demand copy is pending, with experts the GPU scorer
-    # predicts for its target layer; that layer's post copies a landed one from VRAM instead of computing it on the
-    # CPU or copying it on demand. 0 is off. Needs SGLANG_DSV41_RAM_PREFETCH with the GPU scorer, whose target
-    # (SGLANG_DSV41_RAM_PREFETCH_HORIZON) is the drip's, and the copy engine.
-    SGLANG_DSV41_GPU_DRIP_SLOTS = EnvInt(0)
-    # Drips per scored record: the target layer's best-scored experts that are mapped in RAM and not VRAM-hot (1 to 8).
-    SGLANG_DSV41_GPU_DRIP_PICKS = EnvInt(4)
-    # The most one drip copy submission carries, in KiB: a demand copy issued meanwhile waits behind at most this.
-    # Arbitrary; ~75 us at the slot's 13.7 GB/s.
-    SGLANG_DSV41_GPU_DRIP_CHUNK_KB = EnvInt(1024)
+    # Path of a lane-head file (analysis/dsv41-drive/dspark/export_lane_head.py): a per-layer head run at each
+    # graph gather, between the router and the fused route plan, that keys the miss lanes by how likely each routed
+    # expert is to be routed again by the next verify, so the GPU copies (and the VRAM hot cache keeps) those and the
+    # CPU computes the rest. Unset or empty keeps the residency-ranking key. Needs DIRECT residency, CPU experts and
+    # the fused plan; its device bytes (~29 MB with a bf16 PCA) come out of SGLANG_EXPERT_STREAM_HOT_GPU_MB before the
+    # cache is sized. A missing or mismatched file is a ValueError at startup.
+    SGLANG_OPT_LANE_HEAD_PATH = EnvStr(None)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
     # stream once per prompt. 0 turns it off. Model- and quant-agnostic; the model must provide an adapter.
     SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS = EnvInt(0)
+    # Lets layer-major prefill run under DSpark: the late-layer tail captures the draft's aux hiddens and the pass
+    # reports them at whole-extend row indices for the KV injection. Off: launch_refusal refuses DSpark as before.
+    SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK = EnvBool(False)
+    # Layer-major expert residency (layers/moe/prefill_residency.py): a buffer of this many expert rows keeps the experts
+    # one chunk of a layer read for the layer's later chunks, so each is read once per prompt. 0 turns it off. Stage 0:
+    # a plain allocation at the first layer-major pass, so the launch must leave it free (a smaller hot cache).
+    SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS = EnvInt(0)
+    # Stage 1 of the above: the rows are the late layers' (never run in the pass loop) VRAM hot-cache slots, lent in
+    # place for the pass and reloaded from the pinned RAM tier before the late-layer tail, so no buffer is allocated
+    # and the hot cache keeps its size. On by default (owner, 2026-10-18); only acts with ROWS > 0, and then the launch
+    # refuses prefetch pull mode and GPU drip slots. 0 gives stage 0's allocated buffer back.
+    SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND = EnvBool(True)
     # NUMA node for the layer-major host state store; node 0 is kept near full by the expert tier (DSV41_REFERENCE
     # §25.4, 27.17).
     SGLANG_LAYER_MAJOR_STATE_NUMA_NODE = EnvInt(1)
@@ -2144,8 +2171,36 @@ class Envs:
     # prefill indexer; the chunk's transient peaks at ~3x this. Rows are scored
     # independently, so any cap gives the same top-k. 0 keeps the built-in 1 GiB.
     SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB = EnvInt(0)
+    # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
+    # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
+    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
+    # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
+    SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # gfx950 MXFP8 dense GEMMs run the in-tree FlyDSL kernel mxfp8_flydsl_gfx95 at prefill
+    # sizes; decode stays on aiter.
+    SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
+    # DSpark draft block on the HIP radix backend: build the attention metadata inside the
+    # draft CUDA graph from the raw inputs instead of eagerly before every replay.
+    SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
+    # gfx950 MXFP8 dense routes (aiter group32 / native): the producer emits fp8 + ue8m0 for its
+    # consumer instead of bf16 plus a separate quant launch -- the shared expert's SwiGLU for
+    # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
+    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
+    # FP4 MQA logits kernel, a request's verify rows sharing each key load.
+    SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
+    # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
+    # its workspace built in the graph without a schedule; a request's verify rows share each
+    # key load.
+    SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP = EnvBool(False)
+    # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
+    # 64-slot page), so a candidate consumer layer scores only its published blocks.
+    SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
@@ -2234,23 +2289,21 @@ class Envs:
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
-    SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
-    )
+    SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
-    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
-        2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
-    )
-    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
-    )
+    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
+    # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
+    # Separate from the CUDA flag: that one also packs wk+weights_proj.
+    SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel
@@ -2308,6 +2361,15 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
+    # cache replicated; gathers Q and exchanges local top-k candidates.
+    SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
+    # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
+    # main attention K/V keep kv_cache_dtype.
+    SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table
@@ -2334,22 +2396,18 @@ class Envs:
     # output and the latent|shared MoE reduce; everything else falls back to
     # the regular all-reduce path. Auto-enabled on SM100/SM103 when
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
-    # either direction. See srt/layers/k3_ar_fusion.py.
+    # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
-    # CustomAllReduceV2's MNNVL push workspace. Auto-probed for the validated
-    # TP8 GB300 configuration; set 0/1 to override. See
-    # srt/layers/k3_sp_collective.py.
+    # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
+    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
+    # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
-    # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
-    # kernel computes the TP-local o_proj partial and the cross-rank sum over
-    # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
-    SGLANG_K3_GEMM_AR = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
@@ -2368,13 +2426,6 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
-    SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
-    SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
-    # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
-    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION = EnvBool(False)
-    # Distinct workspace configurations allowed in one process. Production
-    # uses one model/configuration per rank, so fail closed on accidental reuse.
-    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
 
     # ===================================================================
     # Plugin system
@@ -2520,57 +2571,45 @@ _LEASES_ALWAYS_ON_NOTE = (
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
-    # Renamed: the value is forwarded to the replacement.
-    "SGLANG_GC_LOG": _DeprecatedEnv(replacement="SGLANG_LOG_GC"),
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": _DeprecatedEnv(
-        replacement="SGLANG_MOE_NVFP4_DISPATCH"
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
+        note=(
+            "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "
+            "Without it an eligible model auto-enables the legacy mnnvl "
+            "backend rather than the CuTe DSL fusion."
+        )
     ),
-    "SGLANG_ENABLE_THINKING": _DeprecatedEnv(replacement="SGLANG_DEFAULT_THINKING"),
-    "SGLANG_REASONING_EFFORT": _DeprecatedEnv(
-        replacement="SGLANG_DSV4_REASONING_EFFORT"
-    ),
-    "SGLANG_USE_JIT_ALL_REDUCE": _DeprecatedEnv(
-        replacement="SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
-    ),
-    # The legacy DISABLE flags have the opposite polarity of their replacement.
-    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": _DeprecatedEnv(
-        replacement="SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", transform=_invert_bool
-    ),
-    # Renamed with a unit change.
-    "SGLANG_QUEUED_TIMEOUT_MS": _DeprecatedEnv(
-        replacement="SGLANG_REQ_WAITING_TIMEOUT",
-        transform=_ms_to_s,
-        note="Note the unit change: milliseconds -> seconds.",
-    ),
-    "SGLANG_FORWARD_TIMEOUT_MS": _DeprecatedEnv(
-        replacement="SGLANG_REQ_RUNNING_TIMEOUT",
-        transform=_ms_to_s,
-        note="Note the unit change: milliseconds -> seconds.",
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES": _DeprecatedEnv(
+        note="One workspace per process is now an invariant, not a limit."
     ),
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
-    "SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2": _DeprecatedEnv(),
-    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
-    "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
-    "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
-    # The unified free list is kept unsorted between flushes by design; the
-    # sort-after-merge A/B knob never left its off default and is gone.
-    "SGLANG_SORT_FREE_LIST_AFTER_MERGE": _DeprecatedEnv(),
-    "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
-    # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
-    "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
-    # DSV4 compressor V2 is always used.
-    "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
+    "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
+        note="DSpark draft sampling always uses Gumbel-max."
+    ),
+    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
+        note="A one-row step of SGLANG_DSPARK_USE_GREEDY_DRAFT on a vanilla markov "
+        "head fuses the bias GEMV."
+    ),
+    "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
+        note="A folded DSpark draft proposal samples; set "
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
+        "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
+    ),
+    "SGLANG_SKIP_RUST_TESTS": _DeprecatedEnv(
+        note="The Rust tests run in pr-test-rust-workspace.yml now."
+    ),
+    "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
         note="Buffer-mode anchor pinning is always on; set "
         "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
     ),
-    # Replaced by CLI flags.
-    "SGLANG_ENABLE_GRPC": _DeprecatedEnv(
-        note="Please use '--grpc-port' to enable the native gRPC server."
+    "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": _DeprecatedEnv(
+        note="Deterministic inference on triton no longer aligns prefill chunks."
     ),
+    # Replaced by CLI flags.
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
         note="Please use '--enable-prefill-delayer' instead."
     ),
@@ -2580,23 +2619,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
     ),
-    "SGLANG_CUTLASS_MOE": _DeprecatedEnv(
-        note="Please use '--moe-runner-backend=cutlass' and/or "
-        "'--speculative-moe-runner-backend=cutlass' instead."
-    ),
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
-        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
-    ),
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": _DeprecatedEnv(
-        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
-    ),
-    "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
-        note="DFlash now auto-enables the min-free-slots delay; unset this env. "
-        "To override the threshold, use '--min-free-slots-delay'."
-    ),
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
-        note="The unified radix tree is the default tree cache now; unset this "
-        "env. The field is still defined for legacy call sites."
+        note="The unified radix tree is the default tree cache now; unset this env."
     ),
     # The doorbell copier and all its knobs (removed 2026-09-27). Production launches
     # still pin SGLANG_MOE_EXPERT_DOORBELL=0, so a set value warns rather than refuses.

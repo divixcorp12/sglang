@@ -3,14 +3,14 @@
 # DSV41_REFERENCE section 19 "Unexplained: eager + mirrors is slower".
 #
 # Same corpus, sessions and settings as run-mirror-arms.sh e-base / e-mirror:
-# graphs OFF, SGLANG_MOE_EXPERT_GRAPH_GATHER=0, sessions 0-3, 256 prompt tokens,
-# 128 new tokens, 70 GiB pinned tier. New: SGLANG_DSV41_EXPERT_TRACE_PATH per arm,
+# graphs OFF, SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0, sessions 0-3, 256 prompt tokens,
+# 128 new tokens, 70 GiB pinned tier. New: the `expert_path` key of SGLANG_EXPERT_STREAM_TRACE per arm,
 # so the scheduler writes the per-forward trace and, beside it, the cache counters
 # (<trace>.cache-stats); the driver brackets each session with monotonic times and
 # per-drive diskstats.
 #
 # Usage: [START_IDX=n] eager-cache-arms.sh <label> <run-dir> <arm>...     arm = base | mirror
-# NO_TRACE=1 leaves SGLANG_DSV41_EXPERT_TRACE_PATH unset (the original section 19 arms had
+# NO_TRACE=1 leaves SGLANG_EXPERT_STREAM_TRACE unset (the original section 19 arms had
 # none), so neither the trace nor the cache-stats file is written; only the driver json is.
 # Arms are named <label>-<index>-<arm> so a repeated arm never overwrites its twin.
 # Every GPU run goes through gpu-run.sh (cc-gpu.lock). Never touches port 7867.
@@ -64,13 +64,13 @@ for arm in "$@"; do
   echo "=================================================================="
   idle_check
   mirror_env=()
-  [ "$arm" = "mirror" ] && mirror_env=(SGLANG_MOE_EXPERT_MIRROR_DIRS="$MIRRORS")
-  trace_env=(SGLANG_DSV41_EXPERT_TRACE_PATH="$OUTDIR/$name.trace")
+  [ "$arm" = "mirror" ] && mirror_env=(SGLANG_EXPERT_STREAM_MIRROR="{\"dirs\": \"$MIRRORS\"}")
+  trace_env=(SGLANG_EXPERT_STREAM_TRACE="{\"expert_path\": \"$OUTDIR/$name.trace\"}")
   [ -n "${NO_TRACE:-}" ] && trace_env=()
   rm -f "$OUTDIR/$name.trace" "$OUTDIR/$name.trace.cache-stats"
   t0=$(date +%s)
   $ANA/gpu-run.sh env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
-    SGLANG_MOE_EXPERT_GRAPH_GATHER=0 \
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0 \
     "${trace_env[@]}" \
     "${mirror_env[@]}" \
     "$PY" "$DRIVER" \

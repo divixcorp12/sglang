@@ -16,56 +16,8 @@ import torch
 from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_dense_weight
 
 EXL3_SUFFIXES = ("suh", "svh", "mul1", "trellis")
-ROUTED_EXPERT_WEIGHT_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.\d+\.")
 DEQUANT_PREFIX_RE = re.compile(r"^.+\.attn\.(?:compressor\.(?:wkv|wgate)|indexer\.wk)$")
 WO_A_SLICE_RE = re.compile(r"^(?P<prefix>.+\.attn\.wo_a)\.slice\.(?P<group>\d+)$")
-
-# Unlike ROUTED_EXPERT_WEIGHT_RE (raw checkpoint tensor names), this matches the
-# sglang *module* prefix Exl3Config.get_quant_method receives for a FusedMoE
-# layer: DeepseekV4ForCausalLM builds it as "model.layers.<L>.mlp.experts"
-# (deepseek_v4.py DeepseekV4Model prefix="model" -> DeepseekV4DecoderLayer
-# mlp=add_prefix("mlp", ...) -> deepseek_v2.DeepseekV2MoE
-# experts=add_prefix("experts", ...)). The DSpark draft's stages are built with
-# an empty root prefix and land under "stages.<S>.mlp.experts" instead
-# (deepseek_v4_dspark.py DeepseekV4ForCausalLMDSpark.stages
-# prefix=add_prefix(f"stages.{stage_id}", prefix)), so they never match and
-# stay resident.
-ROUTED_EXPERT_MODULE_RE = re.compile(r"^model\.layers\.\d+\.mlp\.experts$")
-
-
-def is_streamed_expert_module(prefix: str) -> bool:
-    """True for a target routed-expert FusedMoE (the draft's stages keep theirs resident)."""
-    return ROUTED_EXPERT_MODULE_RE.match(prefix) is not None
-
-
-# The DSpark draft's stage MoEs: "stages.<S>.mlp.experts" (empty root prefix) or "model.stages.<S>.mlp.experts".
-DSPARK_DRAFT_EXPERT_MODULE_RE = re.compile(r"^(?:model\.)?stages\.\d+\.mlp\.experts$")
-
-
-def is_dspark_draft_expert_module(prefix: str) -> bool:
-    """True for a DSpark draft stage's routed-expert FusedMoE."""
-    return DSPARK_DRAFT_EXPERT_MODULE_RE.match(prefix) is not None
-
-
-def is_streamed_expert_weight(name: str, quant_method: str | None, streaming: bool) -> bool:
-    """True for a routed-expert tensor that EXL3 expert streaming reads from disk itself."""
-    return (
-        streaming
-        and quant_method == "exl3"
-        and ROUTED_EXPERT_WEIGHT_RE.match(name) is not None
-    )
-
-
-def streamed_expert_skip_hook(
-    quant_method: str | None, streaming: bool
-) -> Callable[[str], bool] | None:
-    """The loader's skip predicate, or None when no tensor can be skipped.
-
-    None keeps the loader on its no-skip path (and fastsafetensors usable).
-    """
-    if not (streaming and quant_method == "exl3"):
-        return None
-    return lambda name: is_streamed_expert_weight(name, quant_method, streaming)
 
 
 def dense_on_device(t: Exl3Tensors) -> torch.Tensor:

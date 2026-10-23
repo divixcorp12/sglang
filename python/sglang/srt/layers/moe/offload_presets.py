@@ -45,8 +45,8 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
     pinned_host_mb: int | None = None
     # Copy every host expert row into registered memory once.
     expert_host_arena: bool | None = None
-    # Host-to-device misses through the CUDA copy engine.
-    expert_copy_backend: str | None = None
+    # Host-to-device misses through the CUDA copy engine ("dma", the legacy streamer's mode).
+    copy_mode: str | None = None
     # Sync-free in-graph gather of misses; both approaches are built on it.
     expert_graph_gather: bool | None = None
     # Scores decide residency at run time instead of the seed alone.
@@ -73,27 +73,27 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
 
 
 ENV_NAMES: dict[str, str] = {
-    "expert_stream": "SGLANG_MOE_EXPERT_STREAM",
-    "expert_file_reader": "SGLANG_MOE_EXPERT_FILE_READER",
+    "expert_stream": "SGLANG_EXPERT_STREAM_ENABLE",
+    "expert_file_reader": "SGLANG_EXPERT_STREAM_FILE_READER",
     "ple_file_reader": "SGLANG_QWEN4_PLE_FILE_READER",
     "ple_stage_before_replay": "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY",
     "host_token_embedding": "SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING",
-    "hot_gpu_mb": "SGLANG_MOE_HOT_GPU_MB",
-    "pinned_host_mb": "SGLANG_MOE_PINNED_HOST_MB",
-    "expert_host_arena": "SGLANG_MOE_EXPERT_HOST_ARENA",
-    "expert_copy_backend": "SGLANG_MOE_EXPERT_COPY_BACKEND",
-    "expert_graph_gather": "SGLANG_MOE_EXPERT_GRAPH_GATHER",
-    "hot_dynamic": "SGLANG_MOE_HOT_DYNAMIC",
-    "hot_decay_tokens": "SGLANG_MOE_HOT_DECAY_TOKENS",
-    "hot_promotion_sigmas": "SGLANG_MOE_HOT_PROMOTION_SIGMAS",
-    "hot_benefit_ratio": "SGLANG_MOE_HOT_BENEFIT_RATIO",
-    "hot_min_residence_forwards": "SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS",
-    "gpu_residency_update": "SGLANG_MOE_GPU_RESIDENCY_UPDATE",
-    "gpu_residency_max_promotions": "SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS",
-    "hot_update_decode_forwards": "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS",
-    "prefetch_max_candidates": "SGLANG_MOE_PREFETCH_MAX_CANDIDATES",
-    "expert_fused_plan": "SGLANG_MOE_EXPERT_FUSED_PLAN",
-    "insert_on_miss_stage": "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE",
+    "hot_gpu_mb": "SGLANG_EXPERT_STREAM_HOT_GPU_MB",
+    "pinned_host_mb": "SGLANG_EXPERT_STREAM_PINNED_HOST_MB",
+    "expert_host_arena": "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA",
+    "copy_mode": "SGLANG_EXPERT_STREAM_COPY_MODE",
+    "expert_graph_gather": "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER",
+    "hot_dynamic": "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC",
+    "hot_decay_tokens": "SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS",
+    "hot_promotion_sigmas": "SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS",
+    "hot_benefit_ratio": "SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO",
+    "hot_min_residence_forwards": "SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS",
+    "gpu_residency_update": "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE",
+    "gpu_residency_max_promotions": "SGLANG_EXPERT_STREAM_GPU_RESIDENCY_MAX_PROMOTIONS",
+    "hot_update_decode_forwards": "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS",
+    "prefetch_max_candidates": "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES",
+    "expert_fused_plan": "SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN",
+    "insert_on_miss_stage": "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE",
     "draft_moe_nvfp4_requant": "SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT",
 }
 OFFLOAD_ENV_NAMES: tuple[str, ...] = tuple(ENV_NAMES.values())
@@ -107,7 +107,7 @@ _SHARED = dict(
     hot_gpu_mb=15360,
     pinned_host_mb=0,
     expert_host_arena=True,
-    expert_copy_backend="dma",
+    copy_mode="dma",
     expert_graph_gather=True,
     hot_dynamic=True,
     hot_decay_tokens=1,
@@ -178,12 +178,12 @@ def explicit_offload_env(environ: Mapping[str, str]) -> dict[str, str]:
 
 def _insert_on_miss(values: Mapping[str, str]) -> bool:
     """Whether the insert-on-miss stage is 1 or higher."""
-    return _value(values, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE") >= 1
+    return _value(values, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE") >= 1
 
 
 def _residency_update(values: Mapping[str, str]) -> bool:
     """Whether the in-graph residency update is on."""
-    return _value(values, "SGLANG_MOE_GPU_RESIDENCY_UPDATE")
+    return _value(values, "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE")
 
 
 # (condition, variable, value, why). Ordered: a later rule reads what an earlier one
@@ -191,21 +191,21 @@ def _residency_update(values: Mapping[str, str]) -> bool:
 _DERIVATIONS = (
     (
         _insert_on_miss,
-        "SGLANG_MOE_GPU_RESIDENCY_UPDATE",
+        "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE",
         "1",
-        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE>=1",
+        "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE>=1",
     ),
     (
         _insert_on_miss,
-        "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS",
+        "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS",
         "1",
-        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE>=1",
+        "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE>=1",
     ),
     (
         _residency_update,
-        "SGLANG_MOE_HOT_DYNAMIC",
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC",
         "1",
-        "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1",
+        "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1",
     ),
 )
 
@@ -249,9 +249,9 @@ def needs_overlap_off(values: Mapping[str, str], *, nvfp4_hot_cache: bool) -> bo
     # expert_stream_requirements._check_nvfp4 enforces the same rule.
     return (
         nvfp4_hot_cache
-        and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0
+        and _value(values, "SGLANG_EXPERT_STREAM_HOT_GPU_MB") > 0
         and not (
-            _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER")
+            _value(values, "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER")
             and _residency_update(values)
         )
     )
@@ -275,16 +275,16 @@ def check_offload_config(
     """
     if (
         nvfp4_hot_cache
-        and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0
-        and not _value(values, "SGLANG_MOE_EXPERT_STREAM")
+        and _value(values, "SGLANG_EXPERT_STREAM_HOT_GPU_MB") > 0
+        and not _value(values, "SGLANG_EXPERT_STREAM_ENABLE")
     ):
-        raise ValueError("SGLANG_MOE_HOT_GPU_MB requires SGLANG_MOE_EXPERT_STREAM=1")
-    if _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER") and decode_graphs_disabled:
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_GPU_MB requires SGLANG_EXPERT_STREAM_ENABLE=1")
+    if _value(values, "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER") and decode_graphs_disabled:
         raise ValueError(
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER=1 requires decode CUDA graphs; "
+            "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1 requires decode CUDA graphs; "
             "drop --cuda-graph-backend-decode disabled"
         )
     if _residency_update(values) and (decode_max_bs or 0) > 1:
         raise ValueError(
-            "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1 requires --cuda-graph-max-bs-decode 1"
+            "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1 requires --cuda-graph-max-bs-decode 1"
         )

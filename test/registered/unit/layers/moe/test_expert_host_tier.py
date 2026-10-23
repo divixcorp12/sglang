@@ -378,14 +378,14 @@ class TestCacheStatsSink(unittest.TestCase):
             return [json.loads(line) for line in f]
 
     def test_no_trace_path_means_no_sink_and_no_file(self):
-        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(""):
+        with envs.SGLANG_EXPERT_STREAM_TRACE.override(""):
             lru = PinnedSlotLRU(2)
         self.assertIsNone(lru._sink)
         lru.assign(1)
         lru.touch(1)
 
     def test_snapshots_are_throttled_and_cumulative(self):
-        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(self.trace):
+        with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"expert_path": self.trace})):
             lru = PinnedSlotLRU(4)
             lru.assign(1)
             for _ in range(50):
@@ -405,7 +405,7 @@ class TestCacheStatsSink(unittest.TestCase):
         self.assertLessEqual(lines[0]["t"], lines[-1]["t"])
 
     def test_a_sink_writes_no_decision_of_its_own(self):
-        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(self.trace):
+        with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"expert_path": self.trace})):
             counted = PinnedSlotLRU(3)
             counted._sink._interval_s = 0.0
             plain = _UncountedLRU(3)

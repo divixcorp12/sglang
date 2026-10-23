@@ -1,4 +1,4 @@
-// The GPU drip (SGLANG_DSV41_GPU_DRIP_SLOTS): copies experts the GPU scorer predicts for a later layer from their
+// The GPU drip (SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS): copies experts the GPU scorer predicts for a later layer from their
 // pinned RAM rows into a small VRAM scratch while the link carries no demand transfer, and publishes each landed row
 // in the scratch table, a device-memory u64 per slot the copy stream writes after the row's bytes. The target layer's
 // post types a lane whose (row, expert) a published word names kKindHitScratch, and C1s copies it from the scratch

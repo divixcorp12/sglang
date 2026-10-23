@@ -302,7 +302,7 @@ MISS_CUT_CASES = [
 
 @pytest.mark.parametrize("experts, hits, forced_from", MISS_CUT_CASES)
 def test_the_split_miss_cut_types_lanes_like_the_reference(tmp_path, experts, hits, forced_from):
-    """Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, _MAX=3): the CUDA typing is ram_slot_map.type_lanes's with the
+    """Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT '{"miss_cut": 1, "miss_cut_max": 3}'): the CUDA typing is ram_slot_map.type_lanes's with the
     cut, and the cut changes the kinds exactly where the reference says. Mutations: drop the miss_cut_max bound (the
     4-miss case goes red); count forced hits as misses (the forced-hit case goes red)."""
     c = Chain(tmp_path, start=False, copy_engine=True, hit_copy="ce", cpu_misses=False, miss_cut=1, miss_cut_max=3)
@@ -362,7 +362,11 @@ def test_a_40_lane_post_makes_36_forced_misses_on_one_node_cpu_lanes(tmp_path):
         c.close()
 
 
-from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKEN_TABLE_HEADER, cpu_row_bytes  # noqa: E402
+from sglang.kernels.ops.moe.expert_lease_block import (  # noqa: E402
+    CPU_TOKEN_TABLE_HEADER,
+    CPU_TOKEN_TABLE_LIVE,
+    cpu_row_bytes,
+)
 
 
 def test_a_verify_post_stages_every_token_and_the_token_table(idle):
@@ -397,6 +401,8 @@ def test_a_verify_post_stages_every_token_and_the_token_table(idle):
         assert torch.equal(row[t * xb : (t + 1) * xb].view(torch.float16), x[t].half().cpu()), t
     table = tokens_max * xb
     assert int(row[table : table + 4].view(torch.int32)[0]) == 3
+    live = table + CPU_TOKEN_TABLE_LIVE
+    assert int(row[live : live + 4].view(torch.int32)[0]) == 3  # no dead row: every token is live
     planned = backend.planned[:3].tolist()
     for j, expert in enumerate(planned):
         at = table + CPU_TOKEN_TABLE_HEADER + 4 * j
@@ -408,6 +414,45 @@ def test_a_verify_post_stages_every_token_and_the_token_table(idle):
                 assert float(row[at : at + 4].view(torch.float32)[0]) == pytest.approx(
                     float(weights[t, routes[t].index(expert)])
                 ), (j, t)
+
+
+@pytest.mark.parametrize("live_rows", [1, 2])
+def test_a_verify_posts_dead_rows_as_record_tokens_but_not_live_ones(idle, live_rows):
+    """A verify of three tokens whose rows from `live_rows` on are dead (all -1 routes, verify_dead_rows.py): the header
+    keeps the record's 3 tokens for the CPU expert job, its live count is `live_rows` for the CPU prefetch scorer, and
+    no lane's mask has a dead token's bit. Mutation: write the record's tokens as the live count -- red."""
+    c = idle
+    hidden, tokens_max, lanes = 64, 4, W.lanes
+    xb = 2 * hidden
+    x_rows = torch.zeros((2, cpu_row_bytes(hidden, tokens_max, lanes)), dtype=torch.uint8).pin_memory()
+    out_rows = torch.zeros((2, 2, tokens_max, hidden), dtype=torch.float32).pin_memory()
+    c.dev.enable_cpu_experts(x_rows, out_rows)
+    c.dev.set_row_cpu(0)
+    _set_host_words(c, armed=True, split=ALL_CPU)
+    _write_delta(c, 0, 1, [9, 10, 11, 12, 13, 14])
+    experts = [3, 5, 7]
+    c.dev.map_bulk_apply(torch.tensor([[0, e, s] for s, e in enumerate(experts)], dtype=torch.int32))
+    c.plan(experts)
+    backend, plan = c.backends[0], c.plans[0]
+    backend._stage_planned(plan)
+    routes = [[3, 5, 8, 9, 10, 11], [7, 3, 12, 13, 14, 15], [5, 7, 8, 12, 9, 13]]
+    routes = [r if t < live_rows else [-1] * TOP_K for t, r in enumerate(routes)]
+    weights = torch.tensor(
+        [[0.0 if t >= live_rows else 0.01 * (10 * t + i + 1) for i in range(TOP_K)] for t in range(3)], device="cuda"
+    )
+    x = torch.randn(3, hidden, device="cuda")
+    route_ids = torch.tensor(sum(routes, []), dtype=torch.int64, device="cuda")
+    c.dev.post(0, backend.planned, plan.count, route_ids, plan.slots, captured=True, cpu_input=(x, weights))
+    torch.cuda.synchronize()
+    row = x_rows[0]
+    table = tokens_max * xb
+    live = table + CPU_TOKEN_TABLE_LIVE
+    assert int(row[table : table + 4].view(torch.int32)[0]) == 3
+    assert int(row[live : live + 4].view(torch.int32)[0]) == live_rows
+    for j, expert in enumerate(backend.planned[:3].tolist()):
+        at = table + CPU_TOKEN_TABLE_HEADER + 4 * j
+        mask = int(row[at : at + 4].view(torch.int32)[0])
+        assert mask >> live_rows == 0, (j, expert, mask)
 
 
 if __name__ == "__main__":

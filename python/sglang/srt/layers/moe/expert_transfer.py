@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from operator import index
 from threading import Lock
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
 import torch
@@ -19,6 +19,8 @@ from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
 from sglang.srt.layers.moe.expert_dma import ExpertDMARowRoute
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig
 
 NVFP4_TRANSFER_TENSOR_COUNT = 6
 _COPY_BACKENDS = frozenset(("gpu", "dma"))
@@ -644,9 +646,21 @@ def _actual_backend(requested_backend: str, paths: Sequence[str]) -> str:
     )
 
 
+def legacy_copy_backend(config: ExpertStreamConfig | None = None) -> str:
+    """The legacy streamer's copy backend for ``copy.mode``: "dma" for DMA, else "gpu".
+
+    The streamer never read the native engine's copy-engine switch, so COPY_ENGINE is "gpu" here as SM_COPY is.
+    ``config`` defaults to the process's ``stream_config()``.
+    """
+    from sglang.srt.layers.moe.expert_engine.config import CopyMode, stream_config
+
+    config = stream_config() if config is None else config
+    return "dma" if config.copy.mode is CopyMode.DMA else "gpu"
+
+
 def _normalize_copy_backend(backend: str) -> str:
     if backend not in _COPY_BACKENDS:
-        raise ValueError("SGLANG_MOE_EXPERT_COPY_BACKEND must be gpu or dma")
+        raise ValueError("the expert copy backend must be gpu or dma (SGLANG_EXPERT_STREAM_COPY_MODE sm_copy or dma)")
     return backend
 
 

@@ -174,6 +174,7 @@ def _promoting_hot_cache(streamer, events, table):
         begin_loading=lambda ticket: True,
         _cancel_tickets=lambda tickets: events.append(("cancel", len(tickets))),
         promotion_in_flight=None,
+        _sync_wait_nvtx=False,  # set from the config's trace.sync_wait_nvtx at construction
         wait_for_slot_publication=lambda: None,
         _transfer_executor=SimpleNamespace(
             wait=lambda ticket, stream: events.append(("wait", table.depth))

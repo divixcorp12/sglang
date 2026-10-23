@@ -16,7 +16,9 @@ from typing import Iterable, Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.formats import get_format
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
 from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
@@ -104,9 +106,11 @@ def service_row_images(source) -> contextlib.ExitStack:
     them with. Returns the entered env overrides; close the stack when the test is done.
 
     The formats must be built inside the stack with ``source_root=source`` and no ``direct`` (so
-    SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production). Row images and lease mode need no env:
-    both are unconditional (plan 2026-09-29-hotpath-zero-overhead Task 7). Modelled on
+    SGLANG_EXPERT_STREAM_FILE_READER=uring_direct decides it, as in production). Row images and lease mode need no
+    env: both are unconditional (plan 2026-09-29-hotpath-zero-overhead Task 7). Modelled on
     test_exl3_prefill_fills_service._build."""
+    import json
+
     from sglang.srt.environ import envs
 
     source = pathlib.Path(source)
@@ -119,11 +123,17 @@ def service_row_images(source) -> contextlib.ExitStack:
     require_o_direct(os.path.join(ri.row_image_dir(str(root)), ri.layer_file_name(0)))
     stack = contextlib.ExitStack()
     for env, value in (
-        (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
-        (envs.SGLANG_MOE_EXPERT_FILE_READER, "uring_direct"),
+        (envs.SGLANG_EXPERT_STREAM_MIRROR, json.dumps({"dirs": str(root)})),
+        (envs.SGLANG_EXPERT_STREAM_FILE_READER, "uring_direct"),
     ):
         stack.enter_context(env.override(value))
     return stack
+
+
+def dsv41_exl3_pairing() -> dict:
+    """The ``ExpertEngineService`` keyword arguments of the DSV4.1 EXL3 pairing: ``ExpertEngineService(**...)`` builds
+    a service, ``ExpertEngineService.bind(**...)`` binds the singleton."""
+    return dict(expert_format=get_format("exl3"), profile=get_profile_by_name("dsv41"))
 
 
 def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=None):
@@ -132,8 +142,10 @@ def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=N
     (``<source_root>_images<i>``; one root, weight 1, when ``mirror_weights`` is None), split as the weights say. The
     image files must take O_DIRECT (``require_o_direct``). Returns the tables and the roots. For harnesses that
     allocate their own slabs (the manual GPU suites); ``ram_miss_setup`` builds its tables with it too."""
-    from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+    from sglang.srt.layers.moe.expert_engine.formats.exl3_tables import (
+        exl3_ram_miss_tables,
+    )
     from sglang.srt.layers.moe.exl3_row_image import open_row_images
 
     weights = (1.0,) if mirror_weights is None else tuple(mirror_weights)
@@ -320,8 +332,9 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
         ops._DEFAULT_VARIANT = conftest_default
     load_in_parallel(
         [
-            (_HOST_OPS, "_host_module", ("exl3", child_default, 8, 1)),  # what host_layout() loads: its default lanes, one node
-            (_HOST_OPS, "_host_module", ("exl3", variant or child_default, lanes, nodes)),
+            # what host_layout() loads: its default lanes, one node
+            (_HOST_OPS, "_host_module", (_EXL3_BUILD, child_default, 8, 1)),
+            (_HOST_OPS, "_host_module", (_EXL3_BUILD, variant or child_default, lanes, nodes)),
             # A child that serves a miss reads through this module, which the host modules do not load.
             (_URING_OPS, "_uring_file_reader_type", ()),
         ]
@@ -329,6 +342,7 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
 
 
 _HOST_OPS = "sglang.kernels.ops.moe.expert_stream_transport"
+_EXL3_BUILD = ("exl3", "sqrt_softplus")  # expert_stream_transport.EXL3_BUILD, as a literal: load_in_parallel crosses processes
 _URING_OPS = "sglang.kernels.ops.io.uring_file_reader"
 
 
@@ -338,7 +352,7 @@ def warm_host_module_set(variants: Sequence[str], lanes: Sequence[int], nodes: S
     from sglang.kernels.jit.utils.compile.warm import load_in_parallel
 
     load_in_parallel(
-        [(_HOST_OPS, "_host_module", ("exl3", v, l, n)) for v in variants for l in lanes for n in nodes]
+        [(_HOST_OPS, "_host_module", (_EXL3_BUILD, v, l, n)) for v in variants for l in lanes for n in nodes]
         + [(_URING_OPS, "_uring_file_reader_type", ())]
     )
 
@@ -357,7 +371,7 @@ def spawn_child(
     as there), so the timeout measures the child; its core dumps are off (``NO_CORE_DUMP``), so a child that is meant
     to abort, or dies when its test is red, is not held up writing one. The pytest process's own limit is untouched.
 
-    ``env`` must not change what picks the child's default build (``SGLANG_DSV41_EXPERT_TRACE_PATH``,
+    ``env`` must not change what picks the child's default build (``SGLANG_EXPERT_STREAM_TRACE``'s ``expert_path``,
     ``SGLANG_TEST_DSV41_RAM_MISS_FAULT``): the warm-up reads this process's."""
     warm_host_modules(variant, lanes=lanes, nodes=nodes)
     return subprocess.run(

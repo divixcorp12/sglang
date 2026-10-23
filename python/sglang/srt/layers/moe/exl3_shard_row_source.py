@@ -19,7 +19,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
 from sglang.srt.layers.moe.expert_row_source import (

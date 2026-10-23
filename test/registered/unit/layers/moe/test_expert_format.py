@@ -180,10 +180,10 @@ class TestDenseLayerFormat(unittest.TestCase):
         layer.rows = torch.zeros(4, 3)
         dense = DenseLayerFormat(("rows",))
         specs = dense.tensor_specs(layer)
-        with envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"):
+        with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("mmap"):
             self.assertIsNone(dense.default_row_source(layer, specs, "auto"))
             self.assertIsNone(dense.default_row_source(layer, specs, "tensor"))
-            with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_FILE_READER"):
+            with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_FILE_READER"):
                 dense.default_row_source(layer, specs, "files")
         with self.assertRaisesRegex(ValueError, "no row source kind 'shards'"):
             dense.default_row_source(layer, specs, "shards")
@@ -244,44 +244,44 @@ class TestRowSourceKnob(unittest.TestCase):
 
     def test_auto_keeps_the_mmap_default_of_no_reader(self):
         with (
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("auto"),
-            envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("auto"),
+            envs.SGLANG_EXPERT_STREAM_FILE_READER.override("mmap"),
         ):
             self.assertIsNone(ExpertStreamer(self._layer(), ("rows",)).row_source)
 
     def test_auto_with_uring_needs_expert_files(self):
         # "auto" reaches ExpertFileRowReader.from_layer the same as "files"
-        # when SGLANG_MOE_EXPERT_FILE_READER selects a real reader mode.
+        # when SGLANG_EXPERT_STREAM_FILE_READER selects a real reader mode.
         with (
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("auto"),
-            envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("auto"),
+            envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"),
         ):
             with self.assertRaisesRegex(ValueError, "has no expert file"):
                 ExpertStreamer(self._layer(), ("rows",))
 
     def test_tensor_kind_builds_no_reader(self):
         with (
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("tensor"),
-            envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("tensor"),
+            envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"),
         ):
             self.assertIsNone(ExpertStreamer(self._layer(), ("rows",)).row_source)
 
     def test_files_kind_needs_an_io_uring_reader_and_expert_files(self):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("files"):
-            with envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"):
-                with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_FILE_READER"):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("files"):
+            with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("mmap"):
+                with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_FILE_READER"):
                     ExpertStreamer(self._layer(), ("rows",))
-            with envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"):
+            with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"):
                 with self.assertRaisesRegex(ValueError, "has no expert file"):
                     ExpertStreamer(self._layer(), ("rows",))
 
     def test_unknown_kind_is_refused(self):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
             with self.assertRaisesRegex(ValueError, "no row source kind 'shards'"):
                 ExpertStreamer(self._layer(), ("rows",))
 
     def test_an_explicit_row_source_ignores_the_knob(self):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
             streamer = ExpertStreamer(self._layer(), ("rows",), row_source=None)
         self.assertIsNone(streamer.row_source)
 
@@ -337,7 +337,7 @@ class TestSpecOnlyFormat(unittest.TestCase):
         self.assertFalse(ExpertStreamer(layer, ("rows",)).has_spec_only_tensors)
 
     def test_the_tensor_kind_is_refused(self):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("tensor"):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("tensor"):
             with self.assertRaisesRegex(ValueError, "no row source kind 'tensor'"):
                 self._streamer()
 

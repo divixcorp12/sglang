@@ -66,7 +66,7 @@ class FramePool:
 
     def __init__(self, frames: Sequence[CaptureFrame]) -> None:
         if not frames:
-            raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES must be positive")
+            raise ValueError("trace.predictor_capture.frames must be positive")
         self._frames = tuple(frames)
         self._free: queue.Queue[CaptureFrame] = queue.Queue(maxsize=len(frames))
         for frame in frames:

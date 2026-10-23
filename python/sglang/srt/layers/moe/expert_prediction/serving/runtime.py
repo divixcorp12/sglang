@@ -2,7 +2,7 @@
 
 Every per-token op runs from ``FeatureStore.after_write`` during eager forwards and graph
 capture, so replay executes recorded kernels only. ``bank`` rows feed the shared copy
-layer; a non-off ``SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE`` also posts and joins a
+layer; a non-off ``prefetch.shadow.pull_mode`` also posts and joins a
 captured side-stream pull of each target's top candidate through ``expert_gpu_pull.py``.
 """
 
@@ -467,7 +467,7 @@ class PrefetchScoring:
     ) -> "PrefetchScoring":
         by_layer = {spec.layer_id: spec for spec in specs}
         if width > min(spec.num_experts for spec in specs):
-            raise ValueError("SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES exceeds the expert count")
+            raise ValueError("prefetch.shadow.candidates exceeds the expert count")
         missing_caches = sorted(set(checkpoints) - set(hot_caches))
         if missing_caches:
             raise ValueError(f"expert prefetch scoring needs hot caches for layers {missing_caches}")

@@ -197,7 +197,8 @@ void census(const std::set<int>& before, const std::vector<int>& expected) {
 
 void verify_threads(const std::set<int>& before, std::vector<int> expected) {
   std::sort(expected.begin(), expected.end());
-  // A released OpenMP team's helpers exit asynchronously: give them up to 2 s to leave /proc/self/task.
+  // A joined thread's /proc/self/task entry can outlive its join by a moment: give the entries up to 2 s to settle. A
+  // census taken after the threads it counts have exited does not settle: the helpers must be alive (a Team's are).
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   for (;;) {
     try {

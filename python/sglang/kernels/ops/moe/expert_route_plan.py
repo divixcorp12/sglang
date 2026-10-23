@@ -136,6 +136,8 @@ def plan_unique_routes_cuda(
     outcome_counters: Optional[torch.Tensor] = None,
     miss_keys: Optional[torch.Tensor] = None,
     dedup: bool = False,
+    dead_rows: Optional[torch.Tensor] = None,
+    row_top_k: int = 0,
 ) -> None:
     """Write a BS1, K<=32 plan into supplied stable CUDA buffers.
 
@@ -149,8 +151,16 @@ def plan_unique_routes_cuda(
     miss_keys is an optional int64 [num_experts] key per expert: when given,
     residual rows are ordered by key, highest first, instead of by route order.
     ``dedup`` plans several tokens' routes (up to 64) with the kernel that shares a
-    scratch row between an expert's routes.
+    scratch row between an expert's routes. ``dead_rows`` (dedup only; bool, one entry per row of ``row_top_k``
+    routes) marks a verify's dead rows, whose routes add nothing to ``route_counts``. One token's row is the anchor,
+    never dead, so the one-token kernel takes none.
     """
+    if dead_rows is not None:
+        if not dedup:
+            raise ValueError("dead_rows needs the dedup planner: one token's row is never dead")
+        _validate_device_tensor("dead_rows", dead_rows, topk_ids.device)
+        if dead_rows.dtype != torch.bool or row_top_k < 1 or dead_rows.numel() * row_top_k < topk_ids.numel():
+            raise ValueError("dead_rows must be bool with one entry per row of row_top_k routes.")
     _validate_route_plan_inputs(
         topk_ids,
         expert_to_slot,
@@ -168,6 +178,7 @@ def plan_unique_routes_cuda(
         MAX_DEDUP_ROUTES if dedup else MAX_ROUTES,
     )
     module = _jit_expert_route_plan_module(topk_ids.dtype, remap_out.dtype)
+    dedup_args = (dead_rows, int(row_top_k)) if dedup else ()
     (module.plan_dedup_routes_gpu if dedup else module.plan_unique_routes_gpu)(
         topk_ids,
         expert_to_slot,
@@ -184,4 +195,5 @@ def plan_unique_routes_cuda(
         int(prefetch_slot),
         outcome_counters,
         miss_keys,
+        *dedup_args,
     )

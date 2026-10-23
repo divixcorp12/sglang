@@ -26,21 +26,21 @@ launch() {
     echo 'exl3bench.service is already active: wait for it, or stop it, first' >&2
     return 2
   fi
-  # The partition takes CPUs 16-33 and 52-69 from every other thread, a production server's included.
+  # The partition takes CPUs 22-43 and 78-99 from every other thread, a production server's included.
   if pgrep -f 'sglang.launch_server' > /dev/null; then
-    echo 'A production server (sglang.launch_server) is running: the partition would take its CPUs 16-33' >&2
+    echo 'A production server (sglang.launch_server) is running: the partition would take its CPUs 22-43' >&2
     return 2
   fi
-  site=${EXL3_SITE_PACKAGES:-/data/models/slang/.venv/lib/python3.13/site-packages}
+  site=${EXL3_SITE_PACKAGES:-/data/models/slang/.venv-upstream/lib/python3.13/site-packages}
   benchmark_src=${EXL3_BENCHMARK_SRC:-/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src}
   if [[ ! -f $build/CMakeCache.txt ]]; then
     local configure=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-15/root/usr/bin/g++
       "-DEXL3_TORCH_ROOT=$site/torch" "-DEXL3_TVM_FFI_ROOT=$site/tvm_ffi")
     # A local Google Benchmark source when there is one; otherwise CMake fetches the pinned tag.
     if [[ -d $benchmark_src ]]; then configure+=("-DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=$benchmark_src"); fi
-    taskset -c 0-63 cmake -S "$(dirname "$self")" -B "$build" "${configure[@]}"
+    taskset -c 0-51,56-107 cmake -S "$(dirname "$self")" -B "$build" "${configure[@]}"
   fi
-  taskset -c 0-63 cmake --build "$build" -j16 --target exl3_full_stack_prod exl3_full_stack_instr
+  taskset -c 0-51,56-107 cmake --build "$build" -j16 --target exl3_full_stack_prod exl3_full_stack_instr
   printf '%s\n' /bin/bash "$self" "$build" "$@" > "$home/service-command.txt"
   echo "Job written to $home/service-command.txt (remove it to return the service to run.sh):"
   sed 's/^/  /' "$home/service-command.txt"
@@ -87,7 +87,12 @@ if [[ ! $rounds =~ ^[1-9][0-9]*$ ]]; then
 fi
 export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
 export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
-export EXL3_MOE_CPU_PIN=0 EXL3_MOE_CPU_MAX_ISA=bw EXL3_MOE_CPU_SMALL_WORKERS=0
+# The ISA tier is the host's unless the caller sets EXL3_BENCH_MAX_ISA (scalar|avx2|bw|vnni|vbmi), passed to each binary
+# as --max-isa. The kernel ignores an unrecognized value and runs the host's tier. Each binary prints the tier it ran
+# ("isa tier <tier>") into its log; isa.txt gathers them.
+max_isa=${EXL3_BENCH_MAX_ISA-}
+isa_flag=()
+[[ -z $max_isa ]] || isa_flag=(--max-isa="$max_isa")
 export MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 fixture=/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin
 references=/data/models/exl3_exp/threading
@@ -111,6 +116,7 @@ fi
   printf 'Arguments:'
   printf ' %q' "$@"
   printf '\n'
+  echo "EXL3_BENCH_MAX_ISA=${max_isa:-<unset: the host tier>}"
   sha256sum "${binaries[@]}"
   sha256sum "$fixture" "$references"/reference-e{1,3,5}.bin
   echo "Images: $images"
@@ -126,12 +132,16 @@ for ((round=0; round<rounds; ++round)); do
     "$build/exl3_full_stack_$variant" \
       --benchmark_min_time=512x --benchmark_repetitions=1 \
       --benchmark_out="$results/round-$round-$variant.json" \
-      --benchmark_out_format=json "$@" \
+      --benchmark_out_format=json "${isa_flag[@]}" "$@" \
       > "$results/round-$round-$variant.log" 2>&1 || status=$?
     cat "$results/round-$round-$variant.log"
     echo "round $round $variant exit $status" | tee -a "$results/status.txt"
     if (( status != 0 )); then failed=1; fi
   done
 done
+{
+  echo "EXL3_BENCH_MAX_ISA=${max_isa:-<unset: the host tier>}"
+  grep -H '^isa tier ' "$results"/round-*.log || true
+} > "$results/isa.txt"
 echo "Results: $results"
 exit $failed

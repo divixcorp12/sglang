@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.moe import silu_and_mul_clamp
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
 from sglang.kernels.ops.layernorm.hc_combine_norm import (
     hc_combine_norm,
     hc_combine_norm_half,

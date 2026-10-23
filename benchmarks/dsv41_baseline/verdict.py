@@ -36,8 +36,8 @@ def is_acknowledged_step_latency_problem(problem: str) -> bool:
     return problem.startswith(STEP_LATENCY_PROBLEM_PREFIX) and STEP_LATENCY_PROBLEM_SUFFIX in problem
 
 
-READER_ENV = "SGLANG_MOE_EXPERT_FILE_READER"
-GATHER_ENV = "SGLANG_MOE_EXPERT_GRAPH_GATHER"
+READER_ENV = "SGLANG_EXPERT_STREAM_FILE_READER"
+GATHER_ENV = "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"
 TRUE_VALUES = ("1", "true", "yes", "on")
 
 # check_arm asks four things of a process this campaign cannot sample from the inside: the

@@ -174,8 +174,9 @@ class WireLayout:
 MAX_LANES = 64
 
 
-# The CPU experts' input rows (cpu_token_table.h): CpuTokenTable::kHeaderBytes and kMaxTokens.
+# The CPU experts' input rows (cpu_token_table.h): CpuTokenTable::kHeaderBytes, kLiveTokens and kMaxTokens.
 CPU_TOKEN_TABLE_HEADER = 16
+CPU_TOKEN_TABLE_LIVE = 4
 CPU_TOKENS_MAX = 32
 
 

@@ -18,14 +18,14 @@ def test_duplicate_dsv41_budget_knobs_are_gone():
 
 
 def test_streaming_knobs_that_remain():
-    assert envs.SGLANG_DSV41_EXPERT_STREAM.get() is False
-    assert envs.SGLANG_DSV41_EXPERT_DIR.get() == ""
-    assert envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get() == ""
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.get() == ""
+    assert envs.SGLANG_EXPERT_STREAM_TRACE.get() == ""
     assert envs.SGLANG_DSV41_ENGRAM_RAM_GIB.get() == 0.0
     # The framework budgets EXL3 streaming uses instead.
-    assert envs.SGLANG_MOE_PINNED_HOST_MB.get() == 0
-    assert envs.SGLANG_MOE_HOT_GPU_MB.get() == 0
-    assert envs.SGLANG_MOE_HOT_SEED.get() == ""
+    assert envs.SGLANG_EXPERT_STREAM_PINNED_HOST_MB.get() == 0
+    assert envs.SGLANG_EXPERT_STREAM_HOT_GPU_MB.get() == 0
+    assert envs.SGLANG_EXPERT_STREAM_HOT_SEED.get() == ""
 
 
 if __name__ == "__main__":

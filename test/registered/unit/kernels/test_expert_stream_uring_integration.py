@@ -1,14 +1,16 @@
 """Python tables -> native FFI -> RowReader with real registered-file/buffer I/O."""
 
 import errno
+import json
 import os
+import re
 from dataclasses import replace
 
 import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab_arena
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -16,6 +18,18 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 from test_expert_stream_uring_native import _run_native, uring_native_binary  # noqa: F401
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+
+def _node_of_cpu(cpu):
+    """The NUMA node a core lives on (0 when sysfs does not say)."""
+    try:
+        for entry in os.listdir(f"/sys/devices/system/cpu/cpu{cpu}"):
+            match = re.fullmatch(r"node(\d+)", entry)
+            if match:
+                return int(match.group(1))
+    except OSError:
+        pass
+    return 0
 
 
 def _use_shared_slab_arenas(setup):
@@ -57,15 +71,13 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
     # An optional feature may skip only after the native harness probes the
     # running kernel and verifies production refusal; FFI failures below fail.
     _run_native(uring_native_binary, tmp_path, mode=mode, read_mode=read_mode, fixed_files=True)
-    for name in list(os.environ):
-        if name.startswith("SGLANG_EXPERT_STREAM_URING_"):
-            monkeypatch.delenv(name)
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_MODE", mode)
+    for name in ("SGLANG_EXPERT_STREAM_URING", "SGLANG_EXPERT_STREAM_NUMA_CORES"):
+        monkeypatch.delenv(name, raising=False)
+    uring = {"mode": mode, "read_mode": read_mode, "fixed_files": True, "diagnostics": True}
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING", json.dumps(uring))
     if "sqpoll" in mode:
-        monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU", str(min(os.sched_getaffinity(0))))
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_READ_MODE", read_mode)
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_FIXED_FILES", "1")
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS", "1")
+        sq_cpu = min(os.sched_getaffinity(0))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_NUMA_CORES", f"{_node_of_cpu(sq_cpu)}:sq={sq_cpu}")
     (tmp_path / "checkpoint").mkdir()
     setup = ram_miss_setup(
         tmp_path / "checkpoint", capacity=3, experts=6, mirror_weights=(1.0, 1.0),
@@ -74,7 +86,7 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
     # A fixed read reserves all its legs at once, so a fanned-out read needs a ring at least as deep as it is wide:
     # the row-image reads meet every named slab (one leg per segment).
     depth = int(setup.tables.segments.shape[0])
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH", str(depth))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING", json.dumps({**uring, "queue_depth": depth}))
     _use_shared_slab_arenas(setup)
     # The metadata crossing FFI describes each named slab of each layer, with
     # its row size, never the arena as a whole (an arena can exceed 1 GiB).

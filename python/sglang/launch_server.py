@@ -6,6 +6,7 @@ import sys
 import warnings
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.layers.moe.expert_engine.removed_env import check_removed_env
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
@@ -16,6 +17,9 @@ suppress_noisy_warnings()
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    # A stale launch script must fail here, naming the replacement, before anything is resolved or started.
+    check_removed_env()
+
     # smg-grpc-servicer reads the raw `server_args.tokenizer_path`, which
     # resolution defaults into the stash but never writes back. Seed it here,
     # before resolve_once() seals the record.

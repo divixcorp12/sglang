@@ -45,7 +45,7 @@ TRIALS = 4
 
 def load_slot_rows(device, layer: int = LAYER, experts=EXPERTS) -> dict:
     """Real EXL3 expert rows of one layer, in hot-cache slot layout (as the P2 probe reads them)."""
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 
@@ -457,7 +457,7 @@ def _optimized_cpu_build() -> bool:
 
 @pytest.mark.skipif(
     not _optimized_cpu_build(),
-    reason="the CPU kernel's ops exist only in the optimized EXL3 extension: set SGLANG_DSV41_CPU_EXPERTS=1",
+    reason="the CPU kernel's ops exist only in the optimized EXL3 extension: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1",
 )
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
     """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
@@ -466,7 +466,7 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     threads = min(4, len(os.sched_getaffinity(0)))
     device = slot_rows["w13_trellis"].device
     fused = _fused(slot_rows, device, True)

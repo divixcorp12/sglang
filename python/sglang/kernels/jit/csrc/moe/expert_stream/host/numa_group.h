@@ -42,7 +42,7 @@ struct NumaGroup {
   }
 
   const int index;          // the wire's node axis: Wire::home(expert) == index for every expert it serves
-  const int sq_thread_cpu;  // its ring's SQPOLL core; -1 unpinned, -2 the env's (BasicUringReader::kEnvSqThreadCpu)
+  const int sq_thread_cpu;  // its ring's SQPOLL core; -1 unpinned, -2 the options' (BasicUringReader::kOptionsSqThreadCpu)
   Source reader;            // its own io_uring ring
   std::vector<GroupRow> rows;
   // Per (row, group): the service thread takes it, then the pool mutex, while it touches the row's tier; a claimer takes

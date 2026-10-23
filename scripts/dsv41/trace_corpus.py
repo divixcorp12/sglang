@@ -1,7 +1,7 @@
 """Run corpus first turns through the streamed full model and time each session.
 
-The caller sets the streaming environment: SGLANG_DSV41_EXPERT_STREAM / _DIR /
-_TRACE_PATH, the framework's SGLANG_MOE_* tier budgets, and the Engram knobs.
+The caller sets the streaming environment: SGLANG_EXPERT_STREAM_ENABLE / _EXPERT_DIR /
+the ``expert_path`` of SGLANG_EXPERT_STREAM_TRACE, the SGLANG_EXPERT_STREAM_* tier budgets, and the Engram knobs.
 This script drives the Engine and records timings. It turns on the per-pass
 expert distribution recorder, which the hot cache's dynamic residency needs.
 
