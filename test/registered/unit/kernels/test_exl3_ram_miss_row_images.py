@@ -336,9 +336,9 @@ def _moved(extents, *, offset=0, cut=0, gap=0):
         # A table the direct mode could not land exactly: refused when the tables are read.
         # Past the image into its padding: the image-sized slot refuses it before the image check can.
         (lambda t: dict(extents=_shifted(t.extents, (1, 2, 1, 2), 512)), "outside its bounce slot"),
-        (lambda t: dict(extents=_shifted(t.extents, (1, 2, 1, 2), -512)), "exactly its image"),
+        (lambda t: dict(extents=_shifted(t.extents, (1, 2, 1, 2), -512)), "exactly its layer's image"),
         (lambda t: dict(starts=_shifted(t.starts, (0, 0), 512)), "start every row at 0"),
-        (lambda t: dict(segments=_shifted(t.segments, (2, 2), 512)), "tile the image"),
+        (lambda t: dict(segments=_shifted(t.segments, (0, 2, 2), 512)), "tile the image"),
         (lambda t: dict(extents=_moved(t.extents, gap=512)), "tile it in part order"),
     ],
     ids=["offset", "length", "slab", "padding", "short", "start", "segment_gap", "part_gap"],
