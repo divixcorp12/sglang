@@ -2,9 +2,10 @@
 
 The kernel is built -Ofast (FMA contraction, reassociation), so a revision's dump differs from another's in the last
 bits. Statuses and case names must match exactly; each case's values must satisfy |got - want| <= RTOL * max|want|
-over that case's output row (plus a floor of 1e-30 for an all-zero row). Default RTOL 1e-4: a case's outputs are
-sums of up to a few thousand fp32 terms through two Q8_0 requantizations, and the largest difference measured between
-the old bit-exact build and this one is printed so the bound can be re-derived.
+over that case's output row (plus a floor of 1e-30 for an all-zero row). Default RTOL 1e-2: an fp32 rounding change
+anywhere before a Q8_0 requantization (input, or the gated-SiLU intermediate) can flip one value to the next
+quantum, which is 1/127 = 7.9e-3 of its block's amax, and that flip is the largest single change the forward can
+see. Measured against the pre-change bit-exact build (2026-10-23, divix01): worst 3.03e-3 at x86-64-v3 and x86-64.
 """
 
 import struct
@@ -33,7 +34,7 @@ def read(path):
 
 def main():
     want, got = read(sys.argv[1]), read(sys.argv[2])
-    rtol = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-4
+    rtol = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-2
     if want.keys() != got.keys():
         sys.exit("the dumps hold different cases")
     worst, worst_case, bad = 0.0, "", []

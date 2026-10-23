@@ -4,7 +4,7 @@
 #   run_nvfp4_cpu_forward_checks.sh WORKTREE OUT BASE_OUT     ... then compare each dump with BASE_OUT's at a tolerance
 # Variants: avx2 (a build at -march=x86-64-v3) and scalar (-march=x86-64), each its own build of the harness: the ISA
 # tier is the build's -march. The kernel is built -Ofast, so a dump is compared with nvfp4_cpu_dump_compare.py's
-# relative tolerance (NVFP4_AB_RTOL, default 1e-4), not byte for byte; the harness itself still checks that a batched
+# relative tolerance (NVFP4_AB_RTOL, default 1e-2: one Q8_0 quantum), not byte for byte; the harness itself still checks that a batched
 # call equals its one-row calls bit for bit.
 # CXX defaults to GCC 15; NVFP4_AB_CORES to 0-7 (NUMA node 0).
 # NVFP4_AB_BASE_NAMES names BASE_OUT's dumps for avx2,scalar (default avx2,scalar).
@@ -14,7 +14,7 @@ wt=$(realpath "$1"); out=$2; base=${3:-}
 cxx=${CXX:-/opt/rh/gcc-toolset-15/root/usr/bin/g++}
 py=/data/models/slang/.venv-upstream/bin/python
 cores=${NVFP4_AB_CORES:-0,1,2,3,4,5,6,7}
-rtol=${NVFP4_AB_RTOL:-1e-4}
+rtol=${NVFP4_AB_RTOL:-1e-2}
 build=$wt/python/sglang/srt/layers/quantization/nvfp4/build.py
 harness=${NVFP4_AB_HARNESS:-$wt/test/manual/dsv41/nvfp4_cpu_forward_ab.cpp}
 compare=$wt/test/manual/dsv41/nvfp4_cpu_dump_compare.py

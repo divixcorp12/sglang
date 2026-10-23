@@ -7,7 +7,6 @@ loads it). The two native harnesses are the ones the removed CMake build ran und
 
 import importlib.util
 import os
-import re
 import shutil
 import subprocess
 import sys
