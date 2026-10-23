@@ -411,12 +411,12 @@ def test_the_service_opens_images_only_with_mirrors_and_o_direct(tmp_path):
     unconditional, so there is no lease refusal left to pin."""
     s = ram_miss_setup(tmp_path, capacity=3)
     mirrors = dict(roots=s.roots, policy=StaticSplitPolicy((1.0,)), source_root=str(tmp_path))
-    segments, layers = s.fmt.segment_map(), {0: None, 1: None}
+    layers = {0: None, 1: None}
     with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_MIRROR"):
-        open_service_row_images(s.layout, segments, {}, True, layers)
+        open_service_row_images(s.layout, {}, True, layers)
     with pytest.raises(RuntimeError, match="uring_direct"):
-        open_service_row_images(s.layout, segments, mirrors, False, layers)
-    images = open_service_row_images(s.layout, segments, mirrors, True, layers)
+        open_service_row_images(s.layout, mirrors, False, layers)
+    images = open_service_row_images(s.layout, mirrors, True, layers)
     assert sorted(images.paths) == [0, 1] and images.roots == s.roots
 
 
