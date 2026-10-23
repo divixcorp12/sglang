@@ -32,6 +32,12 @@ def _R(env: str, field: str, note: str = "") -> Replacement:
     return Replacement(env, field, note)
 
 
+# The env that lists the vendored-kernel names (``EXL3_MOE_CPU_PIN``, ...) the engine itself set from its config, as a
+# comma-separated list: the vendored kernel reads those names with getenv, so they stay in the process and its
+# children, and ``check_removed_env`` must not mistake them for a stale launch script.
+VENDORED_ENV_MARKER = "SGLANG_EXL3_VENDORED_ENV"
+
+
 class RemovedEnvError(ValueError):
     """A removed env name is set; the message names each one and its replacement."""
 
@@ -238,10 +244,13 @@ def check_removed_env(environ: Optional[Mapping[str, str]] = None) -> None:
     """Raise ``RemovedEnvError`` naming every removed env that is set in ``environ`` and what replaces it.
 
     Call it once at process start, before ``ExpertStreamConfig.from_envs``. ``environ`` defaults to ``os.environ``.
-    A name set to an empty string still counts as set.
+    A name set to an empty string still counts as set. A name the engine itself set for a vendored kernel
+    (``exl3/ext.py``) is listed in ``VENDORED_ENV_MARKER`` and is skipped, so a child process that inherits it
+    is not refused; any other set name still is.
     """
     environ = os.environ if environ is None else environ
-    stale = [name for name in REMOVED_ENV if name in environ]
+    engine_set = {name.strip() for name in environ.get(VENDORED_ENV_MARKER, "").split(",")}
+    stale = [name for name in REMOVED_ENV if name in environ and name not in engine_set]
     if not stale:
         return
     lines = "\n".join(f"  {describe(name)}" for name in stale)

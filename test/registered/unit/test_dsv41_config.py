@@ -5,6 +5,7 @@ import pytest
 
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -21,62 +22,7 @@ def test_defaults_match_the_env_declarations():
         engram_host_node_cache_uring=False,
         enable_engram_device_wait=False,
         engram_verify_in_graph=True,
-        expert_stream=False,
-        expert_dir="",
-        expert_trace_path="",
-        router_capture_path="",
-        residency_capture=False,
-        verify_accept_log_path="",
-        ram_miss_timeout_ms=2000,
-        ram_miss_idle_spin_us=5000,
-        ram_miss_copy_idle_spin_us=5000,
-        ram_miss_spin_core=None,
         ram_miss_fault="",
-        enable_ram_miss_copy_engine=False,
-        enable_ram_miss_sm_small_copies=False,
-        ram_hit_copy="ce",
-        enable_lease_pdl=False,
-        cpu_experts=False,
-        cpu_experts_cores="",
-        cpu_experts_threads=0,
-        cpu_experts_split="",
-        cpu_experts_split_layers="",
-        cpu_experts_cpu_ms=0.52,
-        cpu_experts_link_ms=1.0,
-        cpu_experts_handoff_ms=0.02,
-        cpu_experts_retune_batches=0,
-        enable_cpu_experts_calibration=True,
-        cpu_experts_calibration_reps=10,
-        cpu_experts_misses=False,
-        cpu_split_miss_cut=1,
-        cpu_split_miss_cut_max=3,
-        cpu_two_stage=False,
-        cpu_two_stage_w13_weights="",
-        cpu_two_stage_w2_weights="",
-        enable_dspark_cpu_experts=False,
-        dspark_cpu_experts_cores="",
-        dspark_cpu_experts_threads=0,
-        disable_dspark_draft_graph=False,
-        dspark_draft_resident_path="",
-        cpu_experts_keep_warm_us=2000,
-        ram_prefetch=False,
-        ram_prefetch_per_token=1,
-        ram_prefetch_per_layer=1,
-        ram_prefetch_spec_share=2,
-        ram_prefetch_top_k_only=False,
-        ram_prefetch_scorer="gpu",
-        ram_prefetch_margin_floors=None,
-        ram_prefetch_idle_drive=False,
-        ram_prefetch_idle_deadline_us=4000,
-        ram_prefetch_idle_spread=False,
-        ram_prefetch_idle_pieces=1,
-        ram_prefetch_promote=False,
-        ram_prefetch_horizon=1,
-        enable_prefill_fills=False,
-        enable_prefill_share=False,
-        enable_prefill_route_plan=False,
-        enable_prefill_split_gather=False,
-        enable_moe_side_stream=False,
         enable_layer_fusion=False,
         enable_exl3_cast_fusion=False,
         torch_prefill_indexer=False,
@@ -85,30 +31,55 @@ def test_defaults_match_the_env_declarations():
     )
 
 
+# The DSV41-prefixed knobs that are not Dsv41Config fields: the DSV4.1 profile's own (Dsv41ProfileConfig), and the
+# Engram native-cache size, which its table reads directly.
+PROFILE_OR_DIRECT_KNOBS = {
+    "SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM",
+    "SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH",
+    "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS",
+    "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD",
+    "SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH",
+    "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB",
+}
+
+
 def test_one_field_per_knob():
     declared = {
         name
         for name in vars(type(envs))
         if name.startswith(("SGLANG_DSV41_", "SGLANG_ENABLE_DSV41_", "SGLANG_TEST_DSV41_"))
     }
-    assert len(declared) == len(msgspec.structs.fields(Dsv41Config))
+    assert PROFILE_OR_DIRECT_KNOBS <= declared
+    assert len(declared - PROFILE_OR_DIRECT_KNOBS) == len(msgspec.structs.fields(Dsv41Config))
 
 
 def test_the_config_is_frozen():
     cfg = Dsv41Config.from_envs()
     with pytest.raises(AttributeError):
-        cfg.expert_stream = True
+        cfg.engram_host_table = True
 
 
 def test_from_envs_observes_an_override_and_reverts_after():
-    assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is False
-    with envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"):
-        assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is True
-        with envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(40_000):
+    assert Dsv41Config.from_envs().engram_ram_gib == 0.0
+    with envs.SGLANG_DSV41_ENGRAM_RAM_GIB.override(2.0):
+        assert Dsv41Config.from_envs().engram_ram_gib == 2.0
+        with envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.override("per_rank"):
             inner = Dsv41Config.from_envs()
-            assert inner.ram_miss_timeout_ms == 40_000 and inner.enable_ram_miss_copy_engine is True
-        assert Dsv41Config.from_envs().ram_miss_timeout_ms == 2000
-    assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is False
+            assert inner.engram_host_table_layout == "per_rank" and inner.engram_ram_gib == 2.0
+        assert Dsv41Config.from_envs().engram_host_table_layout == "shared"
+    assert Dsv41Config.from_envs().engram_ram_gib == 0.0
+
+
+def test_the_stream_config_observes_an_override_and_reverts_after():
+    """The expert-streaming knobs moved to ExpertStreamConfig (F145): it resolves afresh too."""
+    assert ExpertStreamConfig.from_envs().copy.timeout_ms == 2000
+    with envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"):
+        assert ExpertStreamConfig.from_envs().copy.mode.value == "copy_engine"
+        with envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(40_000):
+            inner = ExpertStreamConfig.from_envs()
+            assert inner.copy.timeout_ms == 40_000 and inner.copy.mode.value == "copy_engine"
+        assert ExpertStreamConfig.from_envs().copy.timeout_ms == 2000
+    assert ExpertStreamConfig.from_envs().copy.mode.value == "sm_copy"
 
 
 def test_from_envs_maps_the_renamed_fields():
@@ -164,14 +135,13 @@ def test_removed_ram_miss_knobs_warn(monkeypatch):
 
 def test_the_lease_pdl_flag_is_off_by_default_and_observed_when_overridden():
     assert envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.get() is False
-    assert Dsv41Config.from_envs().enable_lease_pdl is False
+    assert ExpertStreamConfig.from_envs().copy.lease_pdl is False
     with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(True):
-        assert Dsv41Config.from_envs().enable_lease_pdl is True
-    assert Dsv41Config.from_envs().enable_lease_pdl is False
+        assert ExpertStreamConfig.from_envs().copy.lease_pdl is True
+    assert ExpertStreamConfig.from_envs().copy.lease_pdl is False
 
 
 if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
-

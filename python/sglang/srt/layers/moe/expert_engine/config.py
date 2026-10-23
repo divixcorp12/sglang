@@ -49,9 +49,17 @@ class PullMode(enum.Enum):
     ALWAYS = "always"
 
 
-def _choice(env_or_field: str, value: str, allowed: tuple[str, ...]) -> None:
-    if value not in allowed:
-        raise ValueError(f"{env_or_field}={value!r}: expected one of {', '.join(map(repr, allowed))}")
+def _choice(env_name: str, value: str, allowed: tuple[str, ...], *, key: str = "", words: bool = False) -> None:
+    """Refuse a value outside ``allowed``, naming the env the user sets (and the group key inside a group env).
+
+    ``words`` phrases the allowed values as "ce or sm" instead of "one of 'ce', 'sm'".
+    """
+    if value in allowed:
+        return
+    label = f"{env_name} {key}" if key else env_name
+    if words:
+        raise ValueError(f"{label} must be {' or '.join(allowed)}, got {value!r}")
+    raise ValueError(f"{label} must be one of {', '.join(map(repr, allowed))}, got {value!r}")
 
 
 def _coerce(env_name: str, value: Any, annotation: Any) -> Any:
@@ -100,10 +108,10 @@ def _decode_group(env_name: str, raw: str, struct_type: type):
         return struct_type()
     try:
         return msgspec.json.decode(raw, type=struct_type, strict=True)
-    except msgspec.DecodeError as error:
-        raise ValueError(f"{env_name}: {error}") from None
-    except ValueError as error:
-        raise ValueError(f"{env_name}: {error}") from None
+    except (msgspec.DecodeError, ValueError) as error:
+        # A member's own refusal already names the env; a decode error ("unknown field ...") does not.
+        message = str(error)
+        raise ValueError(message if message.startswith(env_name) else f"{env_name}: {message}") from None
 
 
 def env_fields(config_type: type = None, prefix: str = "") -> dict[str, str]:
@@ -143,14 +151,15 @@ class UringConfig(_Config):
     slab_arena: bool = False
 
     def __post_init__(self):
-        _choice("uring.mode", self.mode, ("default", "iopoll", "sqpoll", "sqpoll_iopoll"))
-        _choice("uring.read_mode", self.read_mode, ("normal", "fixed", "readv_fixed"))
-        _choice("uring.wait_mode", self.wait_mode, ("block", "spin"))
-        _choice("uring.read_cuts", self.read_cuts, ("auto", "0", "1"))
+        env = self._GROUP_ENV
+        _choice(env, self.mode, ("default", "iopoll", "sqpoll", "sqpoll_iopoll"), key="mode")
+        _choice(env, self.read_mode, ("normal", "fixed", "readv_fixed"), key="read_mode")
+        _choice(env, self.wait_mode, ("block", "spin"), key="wait_mode")
+        _choice(env, self.read_cuts, ("auto", "0", "1"), key="read_cuts")
         if not 0 <= self.queue_depth <= 32768:
-            raise ValueError(f"uring.queue_depth={self.queue_depth}: expected 0..32768")
+            raise ValueError(f"{env} queue_depth must be 0..32768, got {self.queue_depth}")
         if self.sq_thread_idle_ms < 0:
-            raise ValueError(f"uring.sq_thread_idle_ms={self.sq_thread_idle_ms}: expected >= 0")
+            raise ValueError(f"{env} sq_thread_idle_ms must be >= 0, got {self.sq_thread_idle_ms}")
 
 
 class MirrorConfig(_Config):
@@ -260,7 +269,7 @@ class CopyConfig(_Config):
     gpu_drip: GpuDripConfig = msgspec.field(default_factory=GpuDripConfig)
 
     def __post_init__(self):
-        _choice("copy.ram_hit_copy", self.ram_hit_copy, ("ce", "sm"))
+        _choice(self._ENV["ram_hit_copy"], self.ram_hit_copy, ("ce", "sm"), words=True)
 
     # The RAM-miss timeout T feeds four limits that were written out inline in several places; they are defined once.
 
@@ -373,7 +382,7 @@ class RamPrefetchConfig(_Config):
     horizon: int = 1
 
     def __post_init__(self):
-        _choice("prefetch.ram.scorer", self.scorer, ("cpu", "gpu"))
+        _choice(self._ENV["scorer"], self.scorer, ("cpu", "gpu"))
 
 
 class ShadowPrefetchConfig(_Config):
@@ -401,7 +410,9 @@ class ShadowPrefetchConfig(_Config):
 
     def __post_init__(self):
         if not self.predictor and self.pull_mode is not PullMode.OFF:
-            raise ValueError(f"prefetch.shadow.pull_mode={self.pull_mode.value!r} needs prefetch.shadow.predictor")
+            raise ValueError(
+                f"{self._GROUP_ENV} pull_mode={self.pull_mode.value!r} needs a predictor ('llapor' or 'apex')"
+            )
 
 
 class PrefetchConfig(_Config):

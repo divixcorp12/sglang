@@ -145,12 +145,12 @@ def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(name, bad):
 
 
 def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch):
-    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0)
+    # A trait resolves the config at first use and keeps it, so each environment gets its own trait.
     monkeypatch.delenv("SGLANG_EXL3_MOE_CPU_PIN", raising=False)
     with pytest.raises(ValueError, match="SGLANG_EXL3_MOE_CPU_PIN=0"):
-        trait.check_environment()
+        Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).check_environment()
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
-    trait.check_environment()
+    Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).check_environment()
 
 
 @pytest.fixture(autouse=True)
@@ -516,8 +516,8 @@ def test_calibration_pushes_the_measured_split_once_and_stops_retuning(capsys):
 
     host = FakeHost()
     host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
-    svc = _calibrating_service(host)
     with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"calibration_reps": 3})):
+        svc = _calibrating_service(host)  # the service reads its config once, at construction
         split = svc.calibrate(-1)
     assert split == split_from_grid(host.grid)
     assert host.splits == [split] and svc.split == split and svc.calibrated
@@ -577,10 +577,12 @@ def test_calibration_is_skipped_when_off_or_when_the_split_is_fixed():
 
     host = FakeHost()
     host.grid = _grid(lambda n, k: 1.0)
-    svc = _calibrating_service(host)
+    # The service reads its config once, at construction, so each setting gets its own service.
     with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"calibration": False})):
+        svc = _calibrating_service(host)
         assert svc.calibrate(-1) is None
     with envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override(json.dumps({"table": "0,1,1,2,3,3,4,5,5"})):
+        svc = _calibrating_service(host)
         assert svc.calibrate(-1) is None
     assert host.calibrations == [] and host.splits == [] and not svc.calibrated
 

@@ -14,6 +14,7 @@ from typing import Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_engine.config import ResolvedConfig, resolved_config
+from sglang.srt.layers.moe.expert_engine.removed_env import VENDORED_ENV_MARKER
 
 EXLLAMAV3_COMMIT = "02aef45cd681b960a00afcd0749a4ab99e6c1bfe"
 
@@ -152,9 +153,15 @@ def set_vendored_kernel_env(config: ResolvedConfig) -> None:
         "EXL3_MOE_CPU_SMALL_WORKERS": str(cpu.small_workers) if cpu.small_workers else None,
         "EXL3_MOE_CPU_MAX_ISA": config.stream.cpu_experts.max_isa or None,
     }
+    set_names = []
     for name, value in vendored.items():
         if value is not None:
             os.environ[name] = value
+            set_names.append(name)
+    if set_names:
+        # check_removed_env in a child process would refuse these names; the marker says the engine set them.
+        known = [n for n in os.environ.get(VENDORED_ENV_MARKER, "").split(",") if n]
+        os.environ[VENDORED_ENV_MARKER] = ",".join(dict.fromkeys(known + set_names))
 
 
 def extension_sources(ext_dir: str, cpu_kernel: str | None = None) -> list[str]:

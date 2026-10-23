@@ -312,6 +312,41 @@ def test_every_set_removed_name_is_listed_at_once():
     assert """SGLANG_EXPERT_STREAM_TRACE='{"draft_trigger": {"forward_us": <value>}}'""" in message
 
 
+def test_a_vendored_name_the_engine_set_is_not_refused_but_any_other_still_is():
+    """exl3/ext.py sets EXL3_MOE_CPU_PIN for the vendored kernel and lists it in the marker env; a child that inherits
+    it must start, while the same name set by a launch script (no marker) or a name the marker does not list is refused."""
+    marked = {rem.VENDORED_ENV_MARKER: "EXL3_MOE_CPU_PIN,EXL3_MOE_CPU_MAX_ISA", "EXL3_MOE_CPU_PIN": "0"}
+    rem.check_removed_env({**marked, "EXL3_MOE_CPU_MAX_ISA": "avx2"})
+    with pytest.raises(rem.RemovedEnvError, match="EXL3_MOE_CPU_SMALL_WORKERS"):
+        rem.check_removed_env({**marked, "EXL3_MOE_CPU_SMALL_WORKERS": "2"})
+    with pytest.raises(rem.RemovedEnvError, match="EXL3_MOE_CPU_PIN"):
+        rem.check_removed_env({"EXL3_MOE_CPU_PIN": "0"})
+
+
+def test_the_vendored_kernel_env_ext_sets_passes_the_removed_name_check(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import ext
+
+    # A private copy of the environment, so nothing the engine sets leaks into other tests.
+    private = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("EXL3_MOE_CPU_PIN", "EXL3_MOE_CPU_SMALL_WORKERS", "EXL3_MOE_CPU_MAX_ISA", rem.VENDORED_ENV_MARKER)
+    }
+    monkeypatch.setattr(os, "environ", private)
+    config = cfg.ResolvedConfig(
+        stream=cfg.ExpertStreamConfig(),
+        dsv41=cfg.Dsv41ProfileConfig(),
+        exl3=cfg.Exl3FormatConfig(cpu=cfg.Exl3CpuConfig(pin="0", small_workers=2)),
+    )
+    ext.set_vendored_kernel_env(config)
+    assert os.environ["EXL3_MOE_CPU_PIN"] == "0" and os.environ["EXL3_MOE_CPU_SMALL_WORKERS"] == "2"
+    assert "EXL3_MOE_CPU_MAX_ISA" not in os.environ, "an unconfigured cap leaves the kernel's default"
+    rem.check_removed_env(dict(os.environ))  # what a child process sees
+    os.environ["EXL3_MOE_CPU_MAX_ISA"] = "avx2"  # set by the user, not the engine
+    with pytest.raises(rem.RemovedEnvError, match="EXL3_MOE_CPU_MAX_ISA"):
+        rem.check_removed_env(dict(os.environ))
+
+
 def _resolves(field: str) -> bool:
     if field.startswith("exl3."):
         root, rest = cfg.Exl3FormatConfig, field[len("exl3."):]
