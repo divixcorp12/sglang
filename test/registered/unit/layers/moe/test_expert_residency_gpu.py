@@ -917,7 +917,7 @@ class TestInsertOnMiss(unittest.TestCase):
         from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
         from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
 
-        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always"}'):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always", "predictor": "llapor"}'):
             manager = _manager(self.model, gpu=True, **IOM)
         cache, streamer = manager.caches[0], manager.streamers[0]
         self.assertTrue(cache.reserves_prefetch_pull_row)
@@ -1515,8 +1515,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
 
-        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always"}'):
-            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE=off"):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "always", "predictor": "llapor"}'):
+            with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_SHADOW_PREFETCH pull_mode=off"):
                 _manager(_model(), gpu=True, **DIRECT)
 
         # A plan whose buffers are not the gather's own: a backend that posts its own plan buffers

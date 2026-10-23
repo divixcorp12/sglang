@@ -231,7 +231,7 @@ class TestExpertHotCache(unittest.TestCase):
 
         with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "off"})):
             off = self.cache_type(self.streamer, capacity=2, scratch_rows=3)
-        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always"})):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always", "predictor": "llapor"})):
             on = self.cache_type(self.streamer, capacity=2, scratch_rows=3)
 
         off_rows = next(iter(off.tensors.values())).shape[0]
@@ -261,7 +261,7 @@ class TestExpertHotCache(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_EXPERT_STREAM_SHADOW_PREFETCH", None)
-            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "count_zero"})):
+            with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "count_zero", "predictor": "llapor"})):
                 cache = self.cache_type(self.streamer, capacity=2, scratch_rows=3)
 
         slot = DedicatedPrefetchSlot(capacity=cache.capacity, demand_rows=cache.scratch_rows)
@@ -648,12 +648,12 @@ class TestExpertHotCacheManager(unittest.TestCase):
         """A one-row budget cannot silently allocate a resident plus its pull row."""
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always"})):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always", "predictor": "llapor"})):
             manager = self.manager(budget_bytes=20, dynamic=False)
 
         self.assertIsNone(manager)
 
-        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always"})):
+        with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always", "predictor": "llapor"})):
             manager = self.manager(budget_bytes=40, dynamic=False)
 
         self.assertEqual({layer: cache.capacity for layer, cache in manager.caches.items()}, {0: 1})
