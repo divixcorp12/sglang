@@ -33,8 +33,12 @@ def test_prod_serves_the_dspark_mode_with_its_own_settings():
 # MERGE_PLAN_1016.md: production is the best served arm, RAM prefetch included, with both startup calibrations on.
 PROD_DSPARK_SETTINGS = {
     "SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS": ",".join(str(layer) for layer in range(40)),
-    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "207244",
-    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:103622,1:103622",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "197086",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:98543,1:98543",
+    # Master, 2026-10-22: the DIRECT insert score without eager routes, decay 0.999, newcomer probation.
+    "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS": "0",
+    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY": "0.999",
+    "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION": "1",
     "SGLANG_ENABLE_SCHEDULER_MLOCK": "1",
     "SGLANG_HICACHE_HOST_NUMA_NODE": "1",
     "SGLANG_SM120_TRITON_FLASHMLA_MERGE_BUDGET_MB": "128",

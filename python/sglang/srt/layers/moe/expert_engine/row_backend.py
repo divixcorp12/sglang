@@ -26,7 +26,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
 )
 from sglang.srt.layers.moe.expert_engine.config import CopyConfig, CopyMode
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
-from sglang.srt.layers.moe.expert_stream import ram_prefetch_spec_share
+from sglang.srt.layers.moe.expert_stream import model_fully_pinned, ram_prefetch_spec_share
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
@@ -76,9 +76,12 @@ class NativePinnedSlotTable:
         """HeldBackSlots, before the service starts: an upper bound on each group's staging and pool slots.
 
         Staging is at most the victim lanes under spill, else the miss lanes, else the widest wire
-        (plan_graph_gather); the pool is the RAM prefetch's share.
+        (plan_graph_gather); the pool is the RAM prefetch's share. A fully pinned model holds back neither: no expert
+        can miss, so it has no staging (staging_width) and no prefetch (ram_prefetch_spec_share).
         """
         stream = self.service.config.stream
+        if model_fully_pinned(config=stream):
+            return 0
         staging = stream.copy.graph_gather_victim_lanes or stream.copy.graph_gather_miss_lanes or MAX_LANES
         return min(staging, MAX_LANES) + ram_prefetch_spec_share(config=stream)
 

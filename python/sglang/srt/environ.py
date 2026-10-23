@@ -498,6 +498,14 @@ class Envs:
     SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE = EnvInt(InsertOnMissStage.OFF)
     # Per-token decay of the scores that pick insert-on-miss victims.
     SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
+    # Count eager forwards' routes in that insert-on-miss score. False leaves them out, so the score follows the routes
+    # the graph gathers count (verifies/decodes; with the verify graphed, the eager forwards are the prefills). The
+    # decay still advances by their tokens. A prefill small enough for the graph gather is still counted. Needs
+    # HOT_INSERT_ON_MISS_STAGE.
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS = EnvBool(True)
+    # Put each slot a DIRECT gather inserted into on probation: it ranks first for eviction until a later forward
+    # routes it again. Needs HOT_INSERT_ON_MISS_STAGE=2.
+    SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION = EnvBool(False)
     # Run stage 1's boundary insert copies through the fused masked Triton kernel (byte-identical, one pass).
     SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT = EnvBool(False)
 

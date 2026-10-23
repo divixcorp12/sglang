@@ -326,6 +326,8 @@ class ResidencyConfig(_Config):
         "insert_on_miss_stage": "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE",
         "insert_on_miss_decay": "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY",
         "fused_insert": "SGLANG_EXPERT_STREAM_ENABLE_HOT_FUSED_INSERT",
+        "insert_eager_counts": "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS",
+        "insert_probation": "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION",
     }
 
     dynamic: bool = False
@@ -342,6 +344,11 @@ class ResidencyConfig(_Config):
     insert_on_miss_stage: InsertOnMissStage = InsertOnMissStage.OFF
     insert_on_miss_decay: float = 0.98
     fused_insert: bool = False
+    # False leaves eager (prefill) routes out of the insert-on-miss score; needs insert_on_miss_stage.
+    insert_eager_counts: bool = True
+    # A slot a DIRECT gather inserted into ranks first for eviction until a later forward routes it again; needs
+    # insert_on_miss_stage DIRECT.
+    insert_probation: bool = False
 
 
 # --- prefetch ---------------------------------------------------------------------------------------------------

@@ -629,6 +629,9 @@
         continue;
       }
       if (is_miss(lane.kind)) {
+        // Only reserve_staging(0) leaves a reserved row no staging slot: every expert is mapped, so a miss is a bug.
+        if (own.staging_reserved && own.staging.empty())
+          fail(" is a RAM miss on a row with no staging slots (staging is off: every streamed layer is fully pinned)");
         if (lane.slot < 0) {
           // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim or swaps
           // in its pool row.

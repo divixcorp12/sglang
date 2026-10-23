@@ -84,8 +84,8 @@ from sglang.srt.layers.moe.expert_engine.startup import (
 )
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_stream import (
+    model_fully_pinned,
     pinned_full_layers,
-    ram_prefetch_redundant,
     ram_prefetch_spec_share,
 )
 from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
@@ -396,8 +396,11 @@ class ExpertEngineService:
         return wire_layout(self._gather_planned or 1).lanes
 
     def staging_width(self) -> int:
-        """The staging slots every row asks for: the planned victim lanes under spill, the planned gather width, else
+        """The staging slots every row asks for: none when the model is fully pinned (model_fully_pinned: every expert
+        is mapped, so no RAM miss can happen), else the planned victim lanes under spill, the planned gather width, else
         the build's lanes."""
+        if model_fully_pinned(config=self.config.stream):
+            return 0
         return self._staging_planned or self._gather_planned or self.resolved_lanes()
 
     def _check_spill_room(self, row: int, streamer, width: int) -> None:
@@ -652,11 +655,14 @@ class ExpertEngineService:
             # plan_gather_width.
             host.reserve_staging(self.staging_width())
             spec_share = ram_prefetch_spec_share(config=stream)
-            if stream.prefetch.ram.enabled and ram_prefetch_redundant(config=stream):
+            if model_fully_pinned(config=stream):
                 logger.info(
-                    "exl3 RAM miss prefetch: off although SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1: every streamed "
-                    "layer is in SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS, so no expert is left on NVMe to "
-                    "prefetch (no pool, scorer or speculative cores)"
+                    "exl3 RAM miss: every streamed layer is in SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS, so every "
+                    "expert is mapped in RAM and none can miss: staging is off (0 staging slots a row)%s",
+                    "; the RAM prefetch is off although SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1, as no expert is "
+                    "left on NVMe to prefetch (no pool, scorer or speculative cores)"
+                    if stream.prefetch.ram.enabled
+                    else "",
                 )
             if spec_share:
                 if not stream.cpu_experts.enabled:
@@ -1204,7 +1210,8 @@ class ExpertEngineService:
         victims = getattr(manager.gpu_residency, "victim_lanes", None)
         want = max(1, min(streamer.graph_miss_width, victims) if victims else streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
-        if staged < want:
+        # Fully pinned: no miss, so no staging (staging_width).
+        if staged < want and not model_fully_pinned(config=self.config.stream):
             logger.warning(
                 "exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d",
                 row,

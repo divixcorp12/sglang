@@ -1603,6 +1603,8 @@ class ExpertHotCacheManager:
                 insert_on_miss=int(insert_on_miss),
                 insert_on_miss_decay=float(insert_on_miss_decay),
                 fused_insert=fused_insert,
+                insert_eager_counts=config.residency.insert_eager_counts,
+                insert_probation=config.residency.insert_probation,
                 config=config,
             )
         devices = {cache.device for cache in manager.caches.values()}

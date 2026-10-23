@@ -851,18 +851,20 @@ def record_streamed_layers(layer_ids: Iterable[int] | None) -> None:
     _streamed_layer_ids = None if layer_ids is None else frozenset(layer_ids)
 
 
-def ram_prefetch_redundant(*, config: ExpertStreamConfig | None = None) -> bool:
+def model_fully_pinned(*, config: ExpertStreamConfig | None = None) -> bool:
     """True when ``tiers.pinned_host_full_layers`` covers every streamed layer: every expert is mapped in RAM, so
-    the RAM prefetch has nothing left to read from NVMe and only costs its pool slots, its scoring and its cores."""
+    nothing is ever read from NVMe after startup. No RAM miss can happen, so the RAM-miss staging slots are off
+    (the service's staging_width is 0), and the RAM prefetch has nothing to read and only costs its pool slots,
+    its scoring and its cores (ram_prefetch_active). False until the tier records its streamed layers."""
     if not _streamed_layer_ids:
         return False
     return _streamed_layer_ids <= set(pinned_full_layers(config=config))
 
 
 def ram_prefetch_active(*, config: ExpertStreamConfig | None = None) -> bool:
-    """``prefetch.ram.enabled``, off when the full layers leave it nothing to read (ram_prefetch_redundant)."""
+    """``prefetch.ram.enabled``, off when the model is fully pinned (model_fully_pinned): nothing is left to read."""
     config = stream_config() if config is None else config
-    return config.prefetch.ram.enabled and not ram_prefetch_redundant(config=config)
+    return config.prefetch.ram.enabled and not model_fully_pinned(config=config)
 
 
 def ram_prefetch_spec_share(*, config: ExpertStreamConfig | None = None) -> int:

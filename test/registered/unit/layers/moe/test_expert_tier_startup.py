@@ -144,7 +144,7 @@ class TestFullLayers(unittest.TestCase):
                 self.assertEqual(expert_stream.ram_prefetch_spec_share(), 2)
             with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
                 ExpertPinnedHostCacheManager.from_model(model, budget_bytes=2 * EXPERTS * row)
-                self.assertTrue(expert_stream.ram_prefetch_redundant())
+                self.assertTrue(expert_stream.model_fully_pinned())
                 self.assertFalse(expert_stream.ram_prefetch_active())
                 self.assertEqual(expert_stream.ram_prefetch_spec_share(), 0)
         with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(False), envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
