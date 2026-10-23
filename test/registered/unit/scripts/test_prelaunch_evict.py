@@ -26,6 +26,16 @@ def _sample(free1_gib, shmem1_gib):
     return json.dumps({"nodes": {"0": {"MemFree": 0}, "1": {"MemFree": free1_gib * GIB, "Shmem": shmem1_gib * GIB}}})
 
 
+def test_the_default_paths_cover_the_served_draft_and_engram_tables():
+    """A model move changed arm_env's draft and Engram dirs but not these defaults: the new tables' page cache survived
+    every eviction pass and production refused below the node-1 floor."""
+    arm_path = os.path.join(os.path.dirname(_PATH), "..", "..", "..", "benchmarks", "dsv41_baseline", "arm_env.py")
+    spec = importlib.util.spec_from_file_location("arm_env_for_prelaunch", arm_path)
+    arm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(arm)
+    assert {arm.DSPARK_DRAFT, arm.ENGRAM_TABLE_DIR} <= set(pe.PATHS)
+
+
 def test_the_rest_is_the_previous_runs_node1_need_less_its_hicache_pools(tmp_path):
     # 60 GiB free at start, 4 at the lowest: a 56 GiB need, of which 12 GiB of Shmem appeared (HiCache on node 1).
     lines = [_sample(60, 0.4), _sample(30, 0.4), _sample(4, 12.4), _sample(10, 12.4), "{\"numastat\": \"x\"}"]
