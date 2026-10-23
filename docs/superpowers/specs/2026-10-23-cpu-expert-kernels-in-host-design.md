@@ -32,12 +32,15 @@ The 2026-10-04 reasons for that shape no longer hold:
 - D2. Each build compiles both plan shapes at that one tier: EXL3's DSV4.1 plan (only when the tier is Bw or above;
   `if constexpr`) and its generic plan. A mixed-K checkpoint (DSV4.1-1017: K3 layers on the DSV4.1 plan, layers 18-22
   K2 on the generic plan) needs both in one process. No per-model plan selection in the build.
-- D3. One flag set for every CPU kernel and the host module: `-Ofast -fno-finite-math-only -march=<resolved>`.
-  `-fno-finite-math-only` keeps `std::isfinite`/`std::isnan` meaningful: the kernel's call check refuses non-finite
-  weights (`cpu_experts/expert_forward.hpp`), and host code has NaN checks (`gate_scorer.h`,
-  `ram_tier_fill_copy_cpu.inc.h`).
-- D4. NVFP4 drops its bitwise contract with GGML and its `-ffp-contract=off`/baseline-arch build; its GGML checks
-  become tolerance checks. Its row-vs-one-row invariance test stays only if it still holds under D3.
+- D3. Two flag sets, chosen per source file (owner, 2026-10-23, after step 1's bisection). Kernel files: `-Ofast
+  -march=<resolved>`, exactly EXL3's flags today. Host files: `-Ofast -fno-finite-math-only -march=<resolved>`, so host
+  NaN checks (`gate_scorer.h`, `ram_tier_fill_copy_cpu.inc.h`) keep their meaning. One flag set was tried first:
+  `-fno-finite-math-only` in the EXL3 kernel made 70 of 72 VNNI cases differ, because glibc declares the vector `expf`
+  (`_ZGVdN8v_expf`, `_ZGVbN4v_expf`) only under full fast-math, so SiLU fell back to scalar `expf`. A kernel file's own
+  finite checks (the call check's non-finite-weight refusal, `cpu_experts/expert_forward.hpp`) use a bit-pattern test
+  that finite-math cannot fold. Step 2 adds per-source flags to `load_jit`.
+- D4. NVFP4 drops its bitwise contract with GGML and its `-ffp-contract=off`/baseline-arch build, and takes D3's kernel
+  flags; its GGML checks become tolerance checks. Its row-vs-one-row invariance test stays only if it still holds.
 - D5. The format's kernel sources are compiled straight into the host module (extra `cpp_files` of its `load_jit`): no
   separate library, no static archive, no address hand-off. Each kernel stays one translation unit; its internals may
   keep internal linkage, and only the entry type the host calls has a named namespace.
