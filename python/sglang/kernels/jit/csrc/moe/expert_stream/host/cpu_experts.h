@@ -38,11 +38,12 @@ namespace sglang::expert_stream {
 /// Every row's CPU expert layer, one per RamTier and shared by every group's engine (a layer addresses its row's whole
 /// slab). Set once per row from any thread, read lock-free by the engines, and destroyed with the tier after every
 /// engine has stopped (RamTier's member order).
+template <class Layer>
 class CpuExpertLayers {
  public:
   explicit CpuExpertLayers(int64_t rows)
       : rows_(rows),
-        layers_(std::make_unique<cpu_experts::ExpertLayer[]>(static_cast<size_t>(rows))),
+        layers_(std::make_unique<Layer[]>(static_cast<size_t>(rows))),
         state_(std::make_unique<std::atomic<uint8_t>[]>(static_cast<size_t>(rows))) {
     for (int64_t r = 0; r < rows_; ++r)
       state_[r].store(kEmpty, std::memory_order_relaxed);
@@ -56,7 +57,7 @@ class CpuExpertLayers {
 
   /// Installs `layer` as `row`'s (the caller checks both); false when the row already has one. The release pairs with
   /// get()'s acquire, so an engine that sees the layer sees all of it.
-  bool set(int64_t row, const cpu_experts::ExpertLayer& layer) {
+  bool set(int64_t row, const Layer& layer) {
     uint8_t empty = kEmpty;
     if (!state_[row].compare_exchange_strong(empty, kWriting, std::memory_order_relaxed)) return false;
     layers_[row] = layer;
@@ -65,7 +66,7 @@ class CpuExpertLayers {
   }
 
   /// `row`'s layer; nullptr outside [0, rows) or before set() completes.
-  const cpu_experts::ExpertLayer* get(int64_t row) const {
+  const Layer* get(int64_t row) const {
     if (row < 0 || row >= rows_ || state_[row].load(std::memory_order_acquire) != kReady) return nullptr;
     return &layers_[row];
   }
@@ -73,7 +74,7 @@ class CpuExpertLayers {
  private:
   static constexpr uint8_t kEmpty = 0, kWriting = 1, kReady = 2;
   int64_t rows_;
-  std::unique_ptr<cpu_experts::ExpertLayer[]> layers_;
+  std::unique_ptr<Layer[]> layers_;
   std::unique_ptr<std::atomic<uint8_t>[]> state_;
 };
 
@@ -116,9 +117,9 @@ struct CpuJob {
 
 /// The pinned tables a CpuExpertEngine reads and writes, and how it runs. Row r's input is at x_base + r * x_stride
 /// (written by the post kernel); its part p fp32 output at out_base + r * out_stride + p * out_part_stride.
+template <class Layer>
 struct CpuExpertConfig {
-  const cpu_experts::CpuExpertKernel* kernel = nullptr;
-  const CpuExpertLayers* layers = nullptr;  // RamTier sets it
+  const CpuExpertLayers<Layer>* layers = nullptr;  // RamTier sets it
   const uint8_t* x_base = nullptr;
   int64_t x_stride = 0;
   uint8_t* out_base = nullptr;
@@ -169,11 +170,18 @@ constexpr int kCpuFitMoments = 9;
 template <BuildPolicy Build>
 class BasicCpuExpertEngine {
  public:
+  /// The format's kernel type (cpu_experts/binding.hpp), its layers and the engine's inputs on them.
+  using Kernel = typename Build::CpuKernel;
+  using Layer = typename Kernel::Layer;
+  using Layers = CpuExpertLayers<Layer>;
+  using Config = CpuExpertConfig<Layer>;
+  using DraftSource = DraftSourceOf<Layer>;
+
   /// A record has at most one CPU-hit job and one job per CPU miss: the ring holds every job that can be outstanding.
   static constexpr size_t kRing =
       std::bit_ceil(static_cast<size_t>(wire::Wire::kDemandRecords) * (wire::Wire::kLanes + 1));
 
-  BasicCpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
+  BasicCpuExpertEngine(Config config, std::string prefix, std::string thread_name)
       : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)), trace_(thread_name_) {
     validate();
   }
@@ -212,7 +220,7 @@ class BasicCpuExpertEngine {
     return config_.tokens;
   }
   /// The tables and geometry it was enabled with: the RAM prefetch's scorer reads the staged inputs through them.
-  const CpuExpertConfig& config() const {
+  const Config& config() const {
     return config_;
   }
 
@@ -397,12 +405,12 @@ class BasicCpuExpertEngine {
  private:
   /// Refuses a config the forwards would refuse later, since a refused forward aborts the process.
   void validate() const {
-    const CpuExpertConfig& c = config_;
-    if (c.kernel == nullptr) throw std::runtime_error(prefix_ + "no CPU expert kernel");
+    const Config& c = config_;
+    if constexpr (!Kernel::usable()) throw std::runtime_error(prefix_ + "no CPU expert kernel");
     if (!c.draft_only) {
-      if (c.kernel->max_routes() < wire::Wire::kLanes || c.kernel->max_rows() < 1)
+      if (Kernel::max_routes() < wire::Wire::kLanes || Kernel::max_rows() < 1)
         throw std::runtime_error(
-            prefix_ + "kernel " + c.kernel->name() + " takes " + std::to_string(c.kernel->max_routes()) +
+            prefix_ + "kernel " + Kernel::name() + " takes " + std::to_string(Kernel::max_routes()) +
             " routes per forward, a job up to " + std::to_string(wire::Wire::kLanes));
       if (c.layers == nullptr) throw std::runtime_error(prefix_ + "no CPU expert layers");
       if (c.x_base == nullptr || c.out_base == nullptr || c.x_stride <= 0 || c.out_stride <= 0)
@@ -412,9 +420,9 @@ class BasicCpuExpertEngine {
       if (c.tokens < 1 || c.tokens > CpuTokenTable::kMaxTokens || (c.tokens > 1 && c.x_token_bytes < 2 * c.hidden))
         throw std::runtime_error(prefix_ + "the CPU expert rows hold 1-32 tokens of the hidden size");
       // A per_token job runs `tokens` rows through one forward: a kernel with fewer would fail at the first verify.
-      if (c.tokens > c.kernel->max_rows())
+      if (c.tokens > Kernel::max_rows())
         throw std::runtime_error(
-            prefix_ + "kernel " + c.kernel->name() + " takes " + std::to_string(c.kernel->max_rows()) +
+            prefix_ + "kernel " + Kernel::name() + " takes " + std::to_string(Kernel::max_rows()) +
             " rows per forward, a job up to " + std::to_string(c.tokens));
     }
     check_cpu_expert_team(prefix_, c.cores, c.threads);
@@ -439,7 +447,7 @@ class BasicCpuExpertEngine {
     std::string error = pin();
     if (error.empty()) {
       try {
-        team_.emplace(config_.cores, config_.threads, config_.kernel, config_.keep_warm_ns, thread_name_.c_str());
+        team_.emplace(config_.cores, config_.threads, &Kernel::warm, config_.keep_warm_ns, thread_name_.c_str());
       } catch (const std::exception& e) {
         error = std::string("CPU expert team: ") + e.what();
       }
@@ -520,16 +528,16 @@ class BasicCpuExpertEngine {
       }
     }
     try {
-      const cpu_experts::ExpertLayer* layer = config_.layers->get(job.row);
+      const Layer* layer = config_.layers->get(job.row);
       if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
-      if (config_.check_calls) config_.kernel->check(*layer, call);
-      config_.kernel->forward(*layer, call, *team_);
+      if (config_.check_calls) Kernel::check(*layer, call);
+      Kernel::forward(*layer, call, *team_);
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
     }
     // A kernel built before ForwardCall::stage_two would run Down on rows still landing: refuse its output.
     if (job.staged && !stage_called_)
-      fail_stop(prefix_ + "kernel " + config_.kernel->name() + " never waited for row " + std::to_string(job.row) +
+      fail_stop(prefix_ + "kernel " + Kernel::name() + " never waited for row " + std::to_string(job.row) +
                 "'s second stage (rebuild it with SGLANG_EXPERT_STREAM_CPU_TWO_STAGE's ForwardCall)");
     const int64_t end = now_ns();
     add(compute_ns_, end - start);
@@ -656,7 +664,7 @@ class BasicCpuExpertEngine {
     fit_version_.store(version + 2, std::memory_order_release);
   }
 
-  CpuExpertConfig config_;
+  Config config_;
   std::string prefix_;
   std::string thread_name_;
   [[no_unique_address]] JobTrace<Build::kMetrics> trace_;
@@ -685,9 +693,9 @@ class BasicCpuExpertEngine {
   std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_slots_{};
   std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_weights_{};
   std::atomic<bool> stop_{false};
-  // The DSpark draft source and its read of the channel (attach_draft): the team's kernel, threads and cores, and the
+  // The DSpark draft source and its read of the channel (attach_draft): the team's threads and cores, and the
   // engine's trace and trigger, are its.
-  DraftExperts<Build> draft_{config_.kernel, config_.threads, config_.cores, trace_, delay_trigger_};
+  DraftExperts<Build> draft_{config_.threads, config_.cores, trace_, delay_trigger_};
   std::atomic<bool> watchdog_stop_{false};
   int64_t fatal_wait_ns_ = 0;
   std::thread watchdog_;
@@ -695,7 +703,5 @@ class BasicCpuExpertEngine {
   std::atomic<int64_t> job_started_ns_{0}, job_id_{0};
   std::atomic<int32_t> job_kind_{0};
 };
-
-using CpuExpertEngine = BasicCpuExpertEngine<ProdBuild>;
 
 }  // namespace sglang::expert_stream

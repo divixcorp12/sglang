@@ -325,7 +325,7 @@
   // last split[n] of its n eligible lanes (the node's table at Wire::kSplit, written here and by set_cpu_split). The
   // service hands them to the group's CPU expert thread and the copy thread waits for them, so CopyDone covers them.
   // Needs the copy engine; call before the service thread starts.
-  void enable_cpu_experts(int g, CpuExpertConfig config, std::vector<int64_t> split) {
+  void enable_cpu_experts(int g, typename CpuExpertEngine::Config config, std::vector<int64_t> split) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
     if (g < 0 || g >= groups())
@@ -338,7 +338,8 @@
     if (cpu != nullptr)
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU experts are already enabled for group " + std::to_string(g));
-    if (config.kernel == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the format's kernel");
+    if constexpr (!CpuKernel::usable())
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the format's kernel");
     if (config.two_stage && dist_.group(g).reader.second_stage() == 0)
       throw std::runtime_error(
           error_prefix<Layout>() + "two-stage CPU misses need row images whose second stage follows the first");
@@ -349,11 +350,7 @@
           span_weight_units(config.span_weights[0], parts, "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights"),
           span_weight_units(config.span_weights[1], parts, "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w2_weights"));
     }
-    if (cpu_kernel_ != nullptr && cpu_kernel_ != config.kernel)
-      throw std::runtime_error(
-          error_prefix<Layout>() + "every group's CPU experts run one kernel: group " + std::to_string(g) +
-          " names " + config.kernel->name() + ", another group " + cpu_kernel_->name());
-    cpu_kernel_ = config.kernel;
+    cpu_enabled_ = true;
     config.layers = cpu_layers_.get();
     config.check_calls = Build::kFaults;
     store_split(g, split.data(), static_cast<int64_t>(split.size()));
@@ -369,28 +366,22 @@
   // Installs `row`'s layer, made by the enabled kernel, for every group's engine: the layer addresses the whole slab,
   // so one serves them all. Any time, once per row; until then no post types a CPU lane for the row. The layer must
   // hold every slot of the row (make_cpu_layer checks it): forwards take the tier's slots unchecked.
-  void set_cpu_layer(int64_t row, const cpu_experts::ExpertLayer& layer) {
-    if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+  void set_cpu_layer(int64_t row, const CpuLayer& layer) {
+    if (!cpu_enabled_) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     check_cpu_layer_row(row);
-    if (layer.kernel != cpu_kernel_)
-      throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer must come from the enabled kernel");
     if (!cpu_layers_->set(row, layer))
       throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer is registered once");
   }
 
-  // set_cpu_layer of the enabled kernel's make_layer over `shape` and `params` (its std::invalid_argument propagates).
-  void make_cpu_layer(int64_t row, const cpu_experts::ExpertLayer& shape, std::span<const std::byte> params) {
-    if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+  // set_cpu_layer of the kernel's make_layer over `shape`, slabs and params set (its std::invalid_argument propagates).
+  void make_cpu_layer(int64_t row, const CpuLayer& shape) {
+    if (!cpu_enabled_) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     check_cpu_layer_row(row);
     if (shape.capacity < row_capacity(row))
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU expert layer for row " + std::to_string(row) + " holds " +
           std::to_string(shape.capacity) + " slots, the row " + std::to_string(row_capacity(row)));
-    set_cpu_layer(row, cpu_kernel_->make_layer(shape, params));
-  }
-
-  const cpu_experts::CpuExpertKernel* cpu_kernel() const {
-    return cpu_kernel_;
+    set_cpu_layer(row, CpuKernel::make_layer(shape));
   }
 
   // The DSpark draft channel on group g's CPU expert engine (CpuExpertEngine::attach_draft): draft_open makes the
@@ -400,17 +391,18 @@
     pending_draft_[g] = std::move(source);
     draft_fatal_ns_[g] = fatal_wait_ns;
   }
-  void draft_set_layer(int g, int stage, const cpu_experts::ExpertLayer& layer) {
+  void draft_set_layer(int g, int stage, const CpuLayer& layer) {
     DraftSource* d = pending_draft_[g].get();
     if (d == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
     if (stage < 0 || stage >= static_cast<int>(d->layers.size()))
       throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(stage) + " is out of range");
     d->layers[stage] = layer;
+    d->made[stage] = 1;
   }
   void draft_start(int g) {
     if (pending_draft_[g] == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
     for (size_t s = 0; s < pending_draft_[g]->layers.size(); ++s)
-      if (pending_draft_[g]->layers[s].kernel == nullptr)
+      if (!pending_draft_[g]->made[s])
         throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(s) + " has no layer");
     draft_cpu(g).attach_draft(std::move(pending_draft_[g]), draft_fatal_ns_[g]);
   }
@@ -921,7 +913,7 @@
       if (dist_.group(g).cpu == nullptr)
         throw std::runtime_error(
             prefix + "it needs CPU experts on group " + std::to_string(g) + ", whose records stage the scorer's input");
-    const CpuExpertConfig& cpu = dist_.group(0).cpu->config();
+    const typename CpuExpertEngine::Config& cpu = dist_.group(0).cpu->config();
     if (!gpu && config.hidden != cpu.hidden)
       throw std::runtime_error(
           prefix + "the gate's hidden size " + std::to_string(config.hidden) + " is not the CPU rows' " +

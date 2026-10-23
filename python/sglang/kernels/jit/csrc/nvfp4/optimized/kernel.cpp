@@ -42,13 +42,27 @@ int Nvfp4Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCal
 
 }  // namespace
 
-const ::sglang::cpu_experts::CpuExpertKernel& nvfp4_cpu_kernel()
+namespace {
+using Forward = ::sglang::cpu_experts::ExpertForward<Nvfp4Quant>;
+}  // namespace
+
+const char* Nvfp4CpuKernel::name() noexcept { return Forward::name(); }
+Nvfp4CpuKernel::Layer Nvfp4CpuKernel::make_layer(const Layer& shape) { return Forward::make_layer(shape); }
+int32_t Nvfp4CpuKernel::max_routes() noexcept { return Forward::max_routes(); }
+int32_t Nvfp4CpuKernel::max_rows() noexcept { return Forward::max_rows(); }
+void Nvfp4CpuKernel::check(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call) { Forward::check(layer, call); }
+
+void Nvfp4CpuKernel::forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team)
 {
-    static const ::sglang::cpu_experts::ExpertForward<Nvfp4Quant> kernel{};
-    return kernel;
+    Forward::forward(layer, call, team);
 }
 
-std::vector<std::byte> nvfp4_cpu_param_bytes(std::span<const int64_t> values)
+int32_t Nvfp4CpuKernel::warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
+{
+    return Forward::warm(word, seen, deadline_ns);
+}
+
+Nvfp4CpuKernel::Params Nvfp4CpuKernel::params(std::span<const int64_t> values)
 {
     if (values.size() != 3)
         throw std::invalid_argument("NVFP4 CPU params are [w13_layout, inv_input_scale13 bits, inv_input_scale2 bits], got "
@@ -58,14 +72,13 @@ std::vector<std::byte> nvfp4_cpu_param_bytes(std::span<const int64_t> values)
     for (const int64_t bits : {values[1], values[2]})
         if (bits < 0 || bits > int64_t(UINT32_MAX))
             throw std::invalid_argument("NVFP4 CPU params: " + std::to_string(bits) + " is not a binary32 bit pattern");
-    SglangNvfp4CpuParams params;
+    Params params;
     params.w13_layout = static_cast<int32_t>(values[0]);
     const uint32_t scale_bits[2] = {static_cast<uint32_t>(values[1]), static_cast<uint32_t>(values[2])};
     static_assert(sizeof(params) == 12, "SglangNvfp4CpuParams is int32 plus two binary32");
     std::memcpy(&params.inv_input_scale13, &scale_bits[0], sizeof(float));
     std::memcpy(&params.inv_input_scale2, &scale_bits[1], sizeof(float));
-    const auto* bytes = reinterpret_cast<const std::byte*>(&params);
-    return {bytes, bytes + sizeof(params)};
+    return params;
 }
 }  // namespace sglang::nvfp4_cpu
 

@@ -1,5 +1,6 @@
-// The EXL3 CPU expert kernel (kernel.cpp): the CpuExpertKernel the expert-stream host module compiles in and calls
-// (formats/exl3/format.h), and the one the benches link. Its layers are slab layers only (make_layer). No torch.
+// The EXL3 CPU expert kernel (kernel.cpp): the kernel type Exl3CpuKernel (entry.h) the expert-stream host module
+// compiles in and calls (formats/exl3/format.h), and the one the benches link, with the kernel's own typed plan
+// interface below. Its layers are slab layers only (make_layer). No torch.
 #pragma once
 #include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include "entry.h"
@@ -20,23 +21,10 @@ enum SglangExl3CpuPlan : int32_t {
     kSglangExl3CpuPlanDsv41 = 1,    // ForwardPlan<Dsv41Shape, Bw>
 };
 
-// A layer's params: make_layer's `params` bytes are this struct, as exl3_cpu_params builds it from the int64 list Python
-// passes, so Python never restates its layout. slabs: w13_trellis, w13_suh, w13_svh,
-// w2_trellis, w2_suh, w2_svh (exl3_expert_format.EXL3_STREAMED_NAMES order); slot s of each starts s * slot_bytes[i]
-// in, w13 rows holding gate then up. hidden and intermediate are multiples of 128 in [128, 8192]; activation 0 (gated SiLU, clamped
-// at act_limit when it is nonzero). A layer stores views. At most kMaxParamBytes (16, cpu_experts/kernel.hpp).
-struct SglangExl3CpuParams {
-    int16_t bits_w13;      // gate and up trellis bits per weight, 1..8
-    int16_t bits_w2;       // down trellis bits per weight, 1..8
-    int16_t swizzled;      // 0 or 1: band-contiguous trellis layout; an 8-bit projection is never swizzled
-    int16_t row_weighted;  // 0 or 1: the layer's gate/up and down tiles are split by chunk row count
-                           // (tile_assignment.hpp), the same arithmetic in another worker's hands
-    int32_t plan;          // a SglangExl3CpuPlan; make_layer refuses one that does not accept the layer
-};
-
 // One compiled plan as exl3_cpu_plans lists it (and the host export expert_stream_cpu_kernel_plans as JSON). A fixed
-// plan accepts exactly the layer facts below; the generic plan (fixed false, facts 0) accepts any layer. available: the build conditions hold (the activation layout
-// the plan's kernels assume) and min_isa is within the kernel's tier; make_layer refuses an unavailable plan.
+// plan accepts exactly the layer facts below; the generic plan (fixed false, facts 0) accepts any layer. available: the
+// build conditions hold (the activation layout the plan's kernels assume) and min_isa is within the kernel's tier;
+// make_layer refuses an unavailable plan.
 struct SglangExl3CpuPlanInfo {
     int32_t id;
     const char* name;
@@ -48,7 +36,7 @@ struct SglangExl3CpuPlanInfo {
 };
 
 namespace sglang::exl3_cpu {
-// The forwards since load by the plan they took (entry.h lists them as [dsv41, generic]).
+// The forwards since load by the plan they took (Exl3CpuKernel::plan_calls lists them as [dsv41, generic]).
 __attribute__((visibility("hidden"))) SglangExl3CpuPlanCalls exl3_cpu_plan_calls();
 // The compiled plans, the generic plan first; `available` follows the build's -march.
 __attribute__((visibility("hidden"))) std::vector<SglangExl3CpuPlanInfo> exl3_cpu_plans();

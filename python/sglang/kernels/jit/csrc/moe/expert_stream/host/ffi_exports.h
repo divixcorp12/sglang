@@ -40,11 +40,15 @@ using tvm::ffi::TensorView;
 template <
     ExpertRowLayout Layout,
     AsyncFileReader Reader,
-    class Build,
+    class BuildIn,
     class CpuKernel = cpu_experts::UnsupportedCpuKernel<cpu_experts::UnnamedFormat>>
 struct HostExports {
-  static_assert(BuildPolicy<Build>);
+  static_assert(BuildPolicy<BuildIn>);
+  // The policy every host class reads, with the format's kernel (build_policy.h).
+  using Build = BuildWithKernel<BuildIn, CpuKernel>;
   using CpuExpertEngine = BasicCpuExpertEngine<Build>;
+  using CpuLayer = typename CpuKernel::Layer;
+  using DraftSource = typename CpuExpertEngine::DraftSource;
   using Source = RowReader<Layout, Reader, Build>;
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
@@ -487,18 +491,21 @@ struct HostExports {
     }
   }
 
-  // A slab table and a layer's scalars as the ExpertLayer make_layer takes (set_cpu_layer, the test export kernel_layer):
-  // `slabs` int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab),
-  // n <= kMaxSlabs.
-  static cpu_experts::ExpertLayer layer_shape(
-      TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit) {
+  // A slab table, a layer's scalars and its parameter list as the layer make_layer takes (set_cpu_layer, the test export
+  // kernel_layer): `slabs` int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent
+  // optional slab), n <= kMaxSlabs; `params` int64 [m], the format's parameter list (CpuKernel::params builds and
+  // validates the struct).
+  static CpuLayer layer_shape(
+      TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit,
+      TensorView params) {
     using namespace host;
+    require_cpu_kernel("CPU experts");
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("slabs", TensorMatcher({-1, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
     if (slabs.size(0) > cpu_experts::kMaxSlabs)
       throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer has at most " +
                                std::to_string(cpu_experts::kMaxSlabs) + " slabs");
-    cpu_experts::ExpertLayer d;
+    CpuLayer d;
     d.capacity = static_cast<int32_t>(capacity);
     d.hidden = static_cast<int32_t>(hidden);
     d.intermediate = static_cast<int32_t>(intermediate);
@@ -510,41 +517,15 @@ struct HostExports {
       d.slabs[i] = reinterpret_cast<const void*>(static_cast<intptr_t>(s[2 * i]));
       d.slot_bytes[i] = static_cast<uint64_t>(s[2 * i + 1]);
     }
-    return d;
-  }
-
-  // The kernel the engine runs in place of the format's, set by the test export test_kernel_address and cleared when
-  // the tier or draft engine closes; null in serving. Temporary: the fake-kernel test format replaces it.
-  static std::atomic<const cpu_experts::CpuExpertKernel*>& kernel_override() {
-    static std::atomic<const cpu_experts::CpuExpertKernel*> kernel{nullptr};
-    return kernel;
-  }
-
-  // The kernel CPU experts run: the test override, else the format's compiled-in one.
-  static const cpu_experts::CpuExpertKernel* active_kernel() {
-    require_cpu_kernel("CPU experts");
-    const cpu_experts::CpuExpertKernel* test = kernel_override().load(std::memory_order_acquire);
-    return test != nullptr ? test : CpuKernel::kernel();
-  }
-
-  // A layer's params tensor (int64 [m], the format's parameter list) as the bytes `kernel`'s make_layer takes: the
-  // format's kernel converts and validates the list (CpuKernel::params); any other kernel (the test fake) takes the
-  // list's int64 words as they are.
-  static std::vector<std::byte> params_bytes(const cpu_experts::CpuExpertKernel* kernel, TensorView params) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
     expert_stream::verify_named("params", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), params);
-    const std::span<const int64_t> values(static_cast<const int64_t*>(params.data_ptr()), static_cast<size_t>(params.size(0)));
-    if constexpr (CpuKernel::usable()) {
-      if (kernel == CpuKernel::kernel()) return CpuKernel::params(values);
-    }
-    const auto bytes = std::as_bytes(values);
-    return {bytes.begin(), bytes.end()};
+    d.params = CpuKernel::params(
+        std::span<const int64_t>(static_cast<const int64_t*>(params.data_ptr()), static_cast<size_t>(params.size(0))));
+    return d;
   }
 
   // The format's kernel options: its compiled plans (JSON), the forwards each plan took, the chunk size, the ISA tier
   // and the kernel's configuration (worker trace). A format whose kernel has none refuses.
-  static constexpr bool kHasKernelOptions = requires { CpuKernel::Kernel::plans_json(); };
+  static constexpr bool kHasKernelOptions = requires { CpuKernel::plans_json(); };
 
   static void require_kernel_options([[maybe_unused]] const char* what) {
     if constexpr (!kHasKernelOptions) {
@@ -555,7 +536,7 @@ struct HostExports {
 
   static std::string cpu_kernel_plans() {
     require_kernel_options("cpu_kernel_plans");
-    if constexpr (kHasKernelOptions) return CpuKernel::Kernel::plans_json();
+    if constexpr (kHasKernelOptions) return CpuKernel::plans_json();
     return {};
   }
 
@@ -563,7 +544,7 @@ struct HostExports {
     using namespace host;
     require_kernel_options("cpu_kernel_plan_calls");
     if constexpr (kHasKernelOptions) {
-      const std::vector<int64_t> calls = CpuKernel::Kernel::plan_calls();
+      const std::vector<int64_t> calls = CpuKernel::plan_calls();
       auto cpu = SymbolicDevice{};
       expert_stream::verify_named(
           "out", TensorMatcher({static_cast<int64_t>(calls.size())}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
@@ -573,13 +554,13 @@ struct HostExports {
 
   static int64_t cpu_kernel_chunk_m() {
     require_kernel_options("cpu_kernel_chunk_m");
-    if constexpr (kHasKernelOptions) return CpuKernel::Kernel::chunk_m();
+    if constexpr (kHasKernelOptions) return CpuKernel::chunk_m();
     return 0;
   }
 
   static std::string cpu_kernel_isa() {
     require_kernel_options("cpu_kernel_isa");
-    if constexpr (kHasKernelOptions) return CpuKernel::Kernel::isa();
+    if constexpr (kHasKernelOptions) return CpuKernel::isa();
     return {};
   }
 
@@ -589,7 +570,7 @@ struct HostExports {
       std::string scratch_trace_prefix, std::string trace_gate_path) {
     require_kernel_options("cpu_kernel_configure");
     if constexpr (kHasKernelOptions)
-      CpuKernel::Kernel::configure(
+      CpuKernel::configure(
           std::move(worker_trace_prefix), worker_trace_capacity, worker_trace_min_us, std::move(scratch_trace_prefix),
           std::move(trace_gate_path));
   }
@@ -633,8 +614,7 @@ struct HostExports {
         "x_rows", TensorMatcher({rows, -1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), x_rows);
     expert_stream::verify_named(
         "out_rows", TensorMatcher({rows, -1}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), out_rows);
-    expert_stream::CpuExpertConfig config;
-    config.kernel = active_kernel();
+    typename CpuExpertEngine::Config config;
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
       config.cores.push_back(static_cast<int>(c[i]));
@@ -693,14 +673,13 @@ struct HostExports {
       double act_limit,
       TensorView params) {
     find(handle)->make_cpu_layer(
-        row, layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit),
-        params_bytes(active_kernel(), params));
+        row, layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit, params));
   }
 
   // A DSpark draft-only launch's engine (the target's CPU experts off): node 0's team with the draft channel its only
   // job source (CpuExpertConfig::draft_only), built at draft_cpu_start once every stage has a layer.
   struct DraftOnly {
-    CpuExpertConfig config;
+    typename CpuExpertEngine::Config config;
     std::unique_ptr<DraftSource> source;
     int64_t fatal_wait_ns = 0;
     std::unique_ptr<CpuExpertEngine> engine;
@@ -757,6 +736,7 @@ struct HostExports {
     source->out = static_cast<float*>(out.data_ptr());
     source->hidden = hidden;
     source->layers.resize(static_cast<size_t>(stages));
+    source->made.assign(static_cast<size_t>(stages), 0);
     source->test_hooks = Build::kFaults;
     return source;
   }
@@ -799,17 +779,15 @@ struct HostExports {
     return handle;
   }
 
-  // The layer of `stage` made by the active kernel's make_layer (the arguments as set_cpu_layer's).
-  static cpu_experts::ExpertLayer make_draft_layer(
+  // The layer of `stage` made by the kernel's make_layer (the arguments as set_cpu_layer's).
+  static CpuLayer make_draft_layer(
       TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit,
       TensorView params) {
     require_cpu_kernel("DSpark draft CPU experts");
-    const cpu_experts::CpuExpertKernel* k = active_kernel();
-    return k->make_layer(
-        layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(k, params));
+    return CpuKernel::make_layer(layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit, params));
   }
 
-  // `stage`'s layer, made by the active kernel's make_layer (the arguments as set_cpu_layer's); before draft_cpu_start.
+  // `stage`'s layer, made by the kernel's make_layer (the arguments as set_cpu_layer's); before draft_cpu_start.
   static void draft_cpu_set_layer(
       int64_t handle,
       int64_t stage,
@@ -824,21 +802,17 @@ struct HostExports {
     if (d->engine) throw std::runtime_error("DSpark draft CPU experts: set_layer after start");
     if (stage < 0 || stage >= static_cast<int64_t>(d->source->layers.size()))
       throw std::runtime_error("DSpark draft CPU experts: stage " + std::to_string(stage) + " is out of range");
-    cpu_experts::ExpertLayer layer =
+    d->source->layers[static_cast<size_t>(stage)] =
         make_draft_layer(slabs, capacity, hidden, intermediate, activation, act_limit, params);
-    for (const cpu_experts::ExpertLayer& other : d->source->layers)
-      if (other.kernel != nullptr && other.kernel != layer.kernel)
-        throw std::runtime_error("DSpark draft CPU experts: every stage runs on one kernel");
-    d->source->layers[static_cast<size_t>(stage)] = std::move(layer);
+    d->source->made[static_cast<size_t>(stage)] = 1;
   }
 
   static void draft_cpu_start(int64_t handle) {
     const auto d = find_draft(handle);
     if (d->engine) throw std::runtime_error("DSpark draft CPU experts: already started");
     for (size_t s = 0; s < d->source->layers.size(); ++s)
-      if (d->source->layers[s].kernel == nullptr)
+      if (!d->source->made[s])
         throw std::runtime_error("DSpark draft CPU experts: stage " + std::to_string(s) + " has no layer");
-    d->config.kernel = d->source->layers[0].kernel;
     d->engine = std::make_unique<CpuExpertEngine>(d->config, CpuExpertEngine::kDraftPrefix, "dspark-cpu");
     d->engine->start();
     d->engine->attach_draft(std::move(d->source), d->fatal_wait_ns);
@@ -855,7 +829,6 @@ struct HostExports {
       draft_registry().erase(found);
     }
     if (d->engine) d->engine->stop();
-    kernel_override().store(nullptr, std::memory_order_release);
   }
 
   static void write_draft_stats(const typename CpuExpertEngine::DraftStats& st, TensorView out) {
@@ -1372,7 +1345,6 @@ struct HostExports {
     // A service still running also ends any armed copy wait first (its lease block is alive: the thread uses it).
     if (thread && tier) tier->open_closed_gate();
     if (thread) thread->stop();
-    kernel_override().store(nullptr, std::memory_order_release);
   }
 };
 

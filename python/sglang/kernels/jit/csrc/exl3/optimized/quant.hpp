@@ -19,6 +19,9 @@ namespace sglang::exl3_cpu {
 namespace {
 using namespace ::sglang::cpu_experts;
 
+// The layer type of this quant's kernel (entry.h's Exl3CpuKernel::Layer).
+using ExpertLayer = ::sglang::cpu_experts::ExpertLayer<SglangExl3CpuParams>;
+
 // The pinned tier's slabs, in exl3_expert_format.EXL3_STREAMED_NAMES order: one row per expert slot.
 enum SlabName { kW13Trellis, kW13Suh, kW13Svh, kW2Trellis, kW2Suh, kW2Svh, kSlabNames };
 

@@ -18,13 +18,17 @@
 #include <string_view>
 #include <type_traits>
 
+#include "cpu_experts/binding.hpp"
+
 namespace sglang::expert_stream {
 
-// The production policy: no metrics, no fault injection.
+// The production policy: no metrics, no fault injection. CpuKernel is the format's CPU expert kernel type
+// (cpu_experts/binding.hpp), which every host class reads through its Build; BuildWithKernel sets it.
 struct ProdBuild {
   static constexpr bool kMetrics = false;
   static constexpr bool kFaults = false;
   static constexpr std::string_view kName = "prod";
+  using CpuKernel = cpu_experts::UnsupportedCpuKernel<cpu_experts::UnnamedFormat>;
 };
 
 // The instrumented policy: metrics and fault injection for tests and benchmarks.
@@ -32,10 +36,17 @@ struct InstrBuild {
   static constexpr bool kMetrics = true;
   static constexpr bool kFaults = true;
   static constexpr std::string_view kName = "instr";
+  using CpuKernel = cpu_experts::UnsupportedCpuKernel<cpu_experts::UnnamedFormat>;
+};
+
+/// \brief `Base` (ProdBuild or InstrBuild) with `Kernel` as the CPU expert kernel the host classes run.
+template <class Base, class Kernel>
+struct BuildWithKernel : Base {
+  using CpuKernel = Kernel;
 };
 
 template <class B>
-concept BuildPolicy = std::is_same_v<B, ProdBuild> || std::is_same_v<B, InstrBuild>;
+concept BuildPolicy = std::is_base_of_v<ProdBuild, B> || std::is_base_of_v<InstrBuild, B>;
 
 // The refusal of a test-only entry point (fault injection, SQE logs, stress harnesses) on ProdBuild, which compiles
 // none of their machinery. One message, so Python and C++ refusals read alike.

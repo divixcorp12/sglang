@@ -1,20 +1,29 @@
-// How an expert format binds to a CPU expert kernel (format.h's `using CpuKernel`).
+// What a format's CPU expert kernel type (format.h's `using CpuKernel`) offers the host, as a concept, and the stub of a
+// format with none.
 //
-// A format's CPU kernel is a CpuExpertKernel (kernel.hpp) compiled into the host module as its own translation unit,
-// with the kernel flags (-Ofast, -march) the host files do not take (expert_stream_transport.py's kernel sources and
-// load_jit's source_cflags). ExpertForward<Quant> has internal linkage there, so the host cannot name that type; the
-// translation unit exports a named accessor instead, and the host calls the kernel through the vtable. The two
-// bindings below say, at compile time, which world a format is in:
-//   ExternalCpuKernel<Entry>    the format has a compiled-in kernel. Entry names it: `static const CpuExpertKernel&
-//                               kernel()` and `static std::vector<std::byte> params(std::span<const int64_t>)`, the
-//                               int64 list Python passes for a layer made into the params bytes make_layer takes
-//                               (validated there). An Entry may also give the format's kernel options (plans_json,
-//                               plan_calls, chunk_m, configure, isa; ffi_exports.h's cpu_kernel_* exports). usable()
-//                               is true.
-//   UnsupportedCpuKernel<Name>  the format has none; Name::value is the format's name. usable() is false, so the engine
-//                               offers no CPU lanes and refuses a request for them at startup; kernel() is a stand-in
-//                               CpuExpertKernel whose make_layer, check, forward and warm abort naming the format, so a
-//                               bug that reaches it is loud.
+// A kernel type is concrete: static functions declared where the host can see them (the kernel's entry.h; no kernel
+// internals) and defined in the kernel's own translation unit, which the host module compiles with the kernel flags
+// (-Ofast, -march; expert_stream_transport.py's kernel sources and load_jit's source_cflags). The host calls them
+// directly. A kernel type has:
+//   Params, Layer                 the format's parameter struct and ExpertLayer<Params>
+//   usable()                      constexpr, true
+//   name()                        the format's name
+//   params(span<const int64_t>)   the Params from the int64 list Python passes for a layer (std::invalid_argument for a
+//                                 count or value the struct cannot hold; make_layer checks the values themselves)
+//   make_layer(shape)             `shape` (slabs and params set), accepted: the layer forwards run over; throws
+//                                 std::invalid_argument for a shape, slab or parameter the quant cannot run
+//   max_routes(), max_rows()      the largest k and rows a forward takes; the host checks its jobs fit when it enables
+//                                 the kernel
+//   check(layer, call)            throws std::invalid_argument for a call forward may not take
+//   forward(layer, call, team)    runs a call check would pass on `team`
+//   warm(word, seen, deadline_ns) register-only work until *word != seen or the clock reaches deadline_ns (a Team's
+//                                 idle loop, so a core keeps the license the forward runs at)
+// A kernel type may also offer the format's options (plans_json, plan_calls, chunk_m, isa, configure; the host's
+// cpu_kernel_* exports).
+//
+// UnsupportedCpuKernel<Name> is the kernel of a format with none; Name::value is the format's name. usable() is false,
+// so the engine offers no CPU lanes and refuses a request for them at startup; its functions abort naming the format,
+// so a bug that reaches one is loud.
 #pragma once
 
 #include <cstddef>
@@ -23,52 +32,36 @@
 #include <cstdlib>
 #include <span>
 #include <string_view>
-#include <vector>
 
 #include "kernel.hpp"
 
 namespace sglang::cpu_experts {
 
-/// \brief A format whose CPU kernel is compiled into the host module (see the file comment for `Entry`).
-template <class Entry>
-struct ExternalCpuKernel {
-  using Kernel = Entry;
-
-  static constexpr bool usable() noexcept { return true; }
-  static const CpuExpertKernel* kernel() noexcept { return &Entry::kernel(); }
-
-  /// \brief A layer's params bytes from the int64 list Python passes; throws std::invalid_argument for a list the
-  /// kernel's params cannot take.
-  static std::vector<std::byte> params(std::span<const int64_t> values) { return Entry::params(values); }
-};
+/// \brief The parameters of a format with no kernel.
+struct NoParams {};
 
 /// \brief The tag of an UnsupportedCpuKernel whose format is not named (HostExports' default binding).
 struct UnnamedFormat {
   static constexpr char value[] = "unnamed";
 };
 
-/// \brief The stub of a format with no CPU expert kernel.
+/// \brief The kernel type of a format with no CPU expert kernel.
 template <class Name>
-class UnsupportedCpuKernel final : public CpuExpertKernel {
- public:
+struct UnsupportedCpuKernel {
+  using Params = NoParams;
+  using Layer = ExpertLayer<Params>;
+
   static constexpr bool usable() noexcept { return false; }
   static constexpr std::string_view kFormat = Name::value;
 
-  /// The stub's address, in place of a library's: what a harness that must hold some CpuExpertKernel passes.
-  static const CpuExpertKernel* kernel() noexcept {
-    static const UnsupportedCpuKernel stub;
-    return &stub;
-  }
-
-  using CpuExpertKernel::forward;
-
-  const char* name() const noexcept override { return Name::value; }
-  ExpertLayer make_layer(const ExpertLayer&, std::span<const std::byte>) const override { unsupported("make_layer"); }
-  int32_t max_routes() const noexcept override { return 0; }
-  int32_t max_rows() const noexcept override { return 0; }
-  void check(const ExpertLayer&, const ForwardCall&) const override { unsupported("check"); }
-  void forward(const ExpertLayer&, const ForwardCall&, Team&) const override { unsupported("forward"); }
-  int32_t warm(const uint32_t*, uint32_t, int64_t) const override { unsupported("warm"); }
+  static const char* name() noexcept { return Name::value; }
+  static Params params(std::span<const int64_t>) { unsupported("params"); }
+  static Layer make_layer(const Layer&) { unsupported("make_layer"); }
+  static int32_t max_routes() noexcept { return 0; }
+  static int32_t max_rows() noexcept { return 0; }
+  static void check(const Layer&, const ForwardCall&) { unsupported("check"); }
+  static void forward(const Layer&, const ForwardCall&, Team&) { unsupported("forward"); }
+  static int32_t warm(const uint32_t*, uint32_t, int64_t) { unsupported("warm"); }
 
  private:
   [[noreturn]] static void unsupported(const char* call) noexcept {

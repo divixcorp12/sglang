@@ -50,14 +50,16 @@ using draft::DraftChannel;
 /// The DSpark draft channel (draft_channel.h) as a CpuExpertEngine's second job source (plan 2026-10-06 Task 11): each
 /// posted record is a stage's M-row forward over the stage's pinned areas, completed through the lease channel (done,
 /// then the Dekker open of the gate). The stages' layers read the draft's own slabs (pageable host memory).
-struct DraftSource {
+template <class Layer>
+struct DraftSourceOf {
   uint8_t* channel = nullptr;      // draft::kChannelBytes, pinned: the page and the completion block
   const uint8_t* x = nullptr;      // fp16 [stages, kMaxRows, hidden]
   const int32_t* slots = nullptr;  // [stages, kMaxRows, kMaxK]
   const float* weights = nullptr;  // [stages, kMaxRows, kMaxK]
   float* out = nullptr;            // [stages, kMaxRows, hidden]
   int64_t hidden = 0;
-  std::vector<cpu_experts::ExpertLayer> layers;  // one per stage, each on the engine's kernel
+  std::vector<Layer> layers;  // one per stage, each made by the format's kernel
+  std::vector<char> made;     // per stage: its layer is set
   bool test_hooks = false;                       // the instr build's: honour draft::g_test_poll_pause_us
 };
 
@@ -69,17 +71,19 @@ struct DraftSource {
 template <BuildPolicy Build>
 class DraftExperts {
  public:
+  using Kernel = typename Build::CpuKernel;
+  using DraftSource = DraftSourceOf<typename Kernel::Layer>;
   static constexpr const char* kPrefix = "DSpark draft CPU experts: ";
 
   struct Stats {
     int64_t jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns;
   };
 
-  /// `kernel`, `threads` and `cores` are the engine's team's; every draft forward runs on it. `trace` and `trigger`
+  /// `threads` and `cores` are the engine's team's; every draft forward runs on it. `trace` and `trigger`
   /// are the engine's, written on the engine thread only.
-  DraftExperts(const cpu_experts::CpuExpertKernel* kernel, int threads, std::span<const int> cores,
-               JobTrace<Build::kMetrics>& trace, DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger)
-      : kernel_(kernel), threads_(threads), cores_(cores), trace_(trace), trigger_(trigger) {}
+  DraftExperts(int threads, std::span<const int> cores, JobTrace<Build::kMetrics>& trace,
+               DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger)
+      : threads_(threads), cores_(cores), trace_(trace), trigger_(trigger) {}
   DraftExperts(const DraftExperts&) = delete;
   DraftExperts& operator=(const DraftExperts&) = delete;
 
@@ -91,15 +95,12 @@ class DraftExperts {
     if (!d.channel || !d.x || !d.slots || !d.weights || !d.out || d.hidden <= 0 || d.layers.empty())
       throw std::runtime_error(std::string(kPrefix) + "the channel, the stage areas and a layer per stage are required");
     for (size_t s = 0; s < d.layers.size(); ++s) {
-      if (d.layers[s].kernel != kernel_)
-        throw std::runtime_error(std::string(kPrefix) + "stage " + std::to_string(s) +
-                                 " runs on another kernel than the team's");
       if (d.layers[s].hidden != d.hidden)
         throw std::runtime_error(std::string(kPrefix) + "stage " + std::to_string(s) + "'s layer has hidden " +
                                  std::to_string(d.layers[s].hidden) + ", the areas " + std::to_string(d.hidden));
     }
-    if (kernel_->max_routes() < draft::kMaxK || kernel_->max_rows() < draft::kMaxRows)
-      throw std::runtime_error(std::string(kPrefix) + "kernel " + kernel_->name() +
+    if (Kernel::max_routes() < draft::kMaxK || Kernel::max_rows() < draft::kMaxRows)
+      throw std::runtime_error(std::string(kPrefix) + "kernel " + Kernel::name() +
                                " takes fewer rows or routes than a draft call");
     const uint32_t head = channel::head<DraftChannel>(d.channel);
     completed_.store(head, std::memory_order_relaxed);
@@ -200,7 +201,7 @@ class DraftExperts {
         weights[t * k + i] = w[t * draft::kMaxK + i];
       }
     const int shared = draft::count_shared_routes(slots, rows * k);
-    const cpu_experts::ExpertLayer& layer = d.layers[stage];
+    const auto& layer = d.layers[stage];
     cpu_experts::ForwardCall call;
     call.rows = rows;
     call.k = k;
@@ -229,7 +230,7 @@ class DraftExperts {
     if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
     if constexpr (Build::kMetrics) trace_.resources("draft_faults_start", "draft_switches_start", stage, epoch, seq);
     try {
-      layer.kernel->forward(layer, call, team);
+      Kernel::forward(layer, call, team);
     } catch (const std::exception& e) {
       fail_stop(std::string(kPrefix) + "forward of record " + std::to_string(seq) + " (stage " + std::to_string(stage) +
                 ") failed: " + e.what());
@@ -271,7 +272,6 @@ class DraftExperts {
     counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
   }
 
-  const cpu_experts::CpuExpertKernel* kernel_;
   int threads_;
   std::span<const int> cores_;
   JobTrace<Build::kMetrics>& trace_;

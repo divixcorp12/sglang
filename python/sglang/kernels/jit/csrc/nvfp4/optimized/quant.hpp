@@ -27,6 +27,9 @@ namespace sglang::nvfp4_cpu {
 namespace {
 using namespace ::sglang::cpu_experts;
 
+// The layer type of this quant's kernel (entry.h's Nvfp4CpuKernel::Layer).
+using ExpertLayer = ::sglang::cpu_experts::ExpertLayer<SglangNvfp4CpuParams>;
+
 constexpr size_t rounded(size_t x, size_t n) { return (x + n - 1) / n * n; }
 // Inverse address of utils.swizzle_blockscale's reshape/permute.
 inline size_t sf_index(int row, int group, int groups) {

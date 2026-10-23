@@ -1,9 +1,9 @@
-// The validation and dispatch every CPU expert quant shares, generic over the quant. ExpertForward<Quant> is the
-// quant's CpuExpertKernel (kernel.hpp): each library holds one behind its accessor; it holds no layer table and takes
-// no lock. The Quant contract:
+// The validation and dispatch every CPU expert quant shares, generic over the quant. ExpertForward<Quant> implements the
+// operations of a format's kernel type (binding.hpp): the kernel's translation unit defines the kernel's static
+// functions by calling these. It holds no layer table and takes no lock. The Quant contract:
 //   kName, kSlabs, kOptionalSlabs (a bit per slab that may be absent), kMaxRoutes, kMaxRows,
 //   kTopIsa                              the quant's facts and its highest ISA tier
-//   Params                               its per-layer parameters, trivially copyable, stored in the layer
+//   Params                               its per-layer parameters, stored in the layer
 //   row_bytes(layer, params)             the fewest bytes one slot's row of each slab holds
 //   validate(layer, params)              nullptr when the quant runs the layer, else why not; may normalize params
 //   usable(layer, params, slot)          whether a routed slot's contents can be run (check() only)
@@ -17,45 +17,38 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 
 namespace sglang::cpu_experts {
-// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// Internal linkage: each kernel translation unit owns its state. Inline statics with external linkage
 // are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
 namespace {
 
 template <class Quant>
-class ExpertForward final : public CpuExpertKernel
+struct ExpertForward
 {
-public:
     static_assert(Quant::kSlabs >= 1 && Quant::kSlabs <= kMaxSlabs);
     static_assert(Quant::kMaxRows >= 1 && Quant::kMaxRoutes >= 1);
 
     using Params = typename Quant::Params;
-    static_assert(std::is_trivially_copyable_v<Params> && sizeof(Params) <= kMaxParamBytes,
-                  "params are stored in the layer as bytes");
-
-    using CpuExpertKernel::forward;
+    using Layer = ExpertLayer<Params>;
 
     // The tier forwards run at: the build's (isa.hpp's kBuildIsa), or the quant's top tier when that is lower.
     static constexpr Isa isa() { return kBuildIsa < Quant::kTopIsa ? kBuildIsa : Quant::kTopIsa; }
 
-    const char* name() const noexcept override { return Quant::kName; }
+    static const char* name() noexcept { return Quant::kName; }
 
-    ExpertLayer make_layer(const ExpertLayer& shape, std::span<const std::byte> params) const override
+    // `shape` with its slabs and params, accepted: the layer to forward over (the quant may normalize its params).
+    // Throws std::invalid_argument for a shape, slab or parameter the quant cannot run.
+    static Layer make_layer(const Layer& shape)
     {
-        if (params.size() != sizeof(Params))
-            refuse("params hold " + std::to_string(params.size()) + " bytes, the quant's hold "
-                   + std::to_string(sizeof(Params)));
-        Params p;
-        std::memcpy(&p, params.data(), sizeof(Params));
+        Layer layer = shape;
         if (shape.capacity < 1 || shape.slab_count != Quant::kSlabs)
             refuse("a layer needs capacity >= 1 and " + std::to_string(Quant::kSlabs) + " slabs");
-        if (const char* why = Quant::validate(shape, p)) refuse(why);
-        const std::array<uint64_t, Quant::kSlabs> minimum = Quant::row_bytes(shape, p);
+        if (const char* why = Quant::validate(shape, layer.params)) refuse(why);
+        const std::array<uint64_t, Quant::kSlabs> minimum = Quant::row_bytes(shape, layer.params);
         for (int i = 0; i < Quant::kSlabs; ++i) {
             if (!shape.slabs[i]) {
                 if (Quant::kOptionalSlabs >> i & 1u) continue;
@@ -65,51 +58,52 @@ public:
                 refuse("slab " + std::to_string(i) + "'s slots hold " + std::to_string(shape.slot_bytes[i])
                        + " bytes, at least " + std::to_string(minimum[i]));
         }
-        ExpertLayer layer = shape;
-        layer.kernel = this;
-        layer.params = {};
-        std::memcpy(layer.params.data(), &p, sizeof(Params));
         return layer;
     }
 
-    int32_t max_routes() const noexcept override { return Quant::kMaxRoutes; }
-    int32_t max_rows() const noexcept override { return Quant::kMaxRows; }
+    static int32_t max_routes() noexcept { return Quant::kMaxRoutes; }
+    static int32_t max_rows() noexcept { return Quant::kMaxRows; }
 
-    void check(const ExpertLayer& layer, const ForwardCall& c) const override
+    // Throws std::invalid_argument for a call forward may not take: rows, k, threads or a buffer out of range, cores
+    // out of range or repeated, or fewer cores than threads, a slot outside the layer's capacity or unusable, a
+    // non-finite weight. forward checks none of it; a caller whose calls are not built to fit (a test, a harness)
+    // calls check first.
+    static void check(const Layer& layer, const ForwardCall& c)
     {
-        if (layer.kernel != this)
-            refuse(std::string("a layer of kernel ") + (layer.kernel ? layer.kernel->name() : "(none)")
-                   + " (another library's or object's)");
         if (!c.x || !c.out || c.rows < 1 || c.rows > Quant::kMaxRows || c.k < 0 || c.k > Quant::kMaxRoutes
             || c.threads < 1 || c.threads > 4096 || (c.k && (!c.slots || !c.weights)))
             refuse("rows, k, threads or a buffer out of range");
         if (!c.cores.empty() && size_t(c.threads) > c.cores.size())
             refuse(std::to_string(c.threads) + " workers on " + std::to_string(c.cores.size()) + " cores");
         check_cores(c.cores);
-        const Params p = layer.params_as<Params>();
         const size_t n = size_t(c.rows) * size_t(c.k);
         for (size_t j = 0; j < n; ++j) {
             const int32_t slot = c.slots[j];
             if (slot < -1 || slot >= layer.capacity || !is_finite_bits(c.weights[j]))
                 refuse("slot " + std::to_string(slot) + " outside the layer's " + std::to_string(layer.capacity)
                        + " or a non-finite weight");
-            if (slot >= 0 && !Quant::usable(layer, p, slot)) refuse("slot " + std::to_string(slot) + " is unusable");
+            if (slot >= 0 && !Quant::usable(layer, layer.params, slot)) refuse("slot " + std::to_string(slot) + " is unusable");
         }
     }
 
-    void forward(const ExpertLayer& layer, const ForwardCall& c, Team& team) const override
+    // Runs a call check would pass on `team`: every worker of the team, the caller (the team's owner) as worker 0.
+    // Throws std::invalid_argument when the input itself refuses (the quant cannot represent it), std::runtime_error
+    // for a failure; out is untouched when it throws.
+    static void forward(const Layer& layer, const ForwardCall& c, Team& team)
     {
         if constexpr (!kStagedForward) {
             if (c.stage_two) c.stage_two(c.stage_two_ctx);
         }
-        const int status = Quant::dispatch(layer, layer.params_as<Params>(), c, isa(), team);
+        const int status = Quant::dispatch(layer, layer.params, c, isa(), team);
 
         if (status != 0) [[unlikely]]
             failed(status);
     }
 
-    // The register work at the build's tier for this quant.
-    int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override
+    // Register-only work at the forward's vector width (keep_warm.hpp) until *word != seen or CLOCK_MONOTONIC reaches
+    // deadline_ns: a Team's idle loop, so a core keeps the license the forward runs at. Returns a value for the caller
+    // to sink.
+    static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
     {
         return keep_warm_loop<isa()>(word, seen, deadline_ns);
     }

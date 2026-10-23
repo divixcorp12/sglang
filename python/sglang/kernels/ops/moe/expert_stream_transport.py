@@ -79,6 +79,9 @@ MXFP4_BUILD: BuildKey = ("mxfp4", "sigmoid")
 # MiMo V2.6 Pro once converted to NVFP4: the NVFP4 rows with MiMo's sigmoid router. The same host and device sources,
 # so only the -D macros (and so the JIT keys) differ from NVFP4_BUILD.
 NVFP4_MIMO_BUILD: BuildKey = ("nvfp4", "sigmoid")
+# The test format: EXL3's row layout and a fake CPU expert kernel that records its calls (csrc/moe/formats/fake). Tests
+# that drive the host's CPU expert engine without a real quant build it.
+FAKE_BUILD: BuildKey = ("fake", "sqrt_softplus")
 
 _ENGINE_HOST = "moe/expert_stream/engine_host.cpp"
 _ENGINE_DEVICE = "moe/expert_stream/engine_device.cuh"
@@ -101,7 +104,7 @@ def _engine_build(key: BuildKey) -> TransportBuild:
 # build is absent: ``_build_for`` raises with the JIT key it looked for. Adding a format
 # adds a ``csrc/moe/formats/<format>/format.h`` and an entry here.
 LAYOUTS: dict[BuildKey, TransportBuild] = {
-    key: _engine_build(key) for key in (EXL3_BUILD, NVFP4_BUILD, NVFP4_MIMO_BUILD, MXFP4_BUILD)
+    key: _engine_build(key) for key in (EXL3_BUILD, NVFP4_BUILD, NVFP4_MIMO_BUILD, MXFP4_BUILD, FAKE_BUILD)
 }
 
 # The two host builds: production (ProdBuild) and instrumented (InstrBuild), selected
@@ -157,10 +160,10 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "pause_ns",
     "read_record_fields",
     "pump_group",
-    "test_kernel_address",
-    "test_kernel_calls",
-    "test_kernel_hold",
-    "test_kernel_max_rows",
+    "fake_kernel_reset",
+    "fake_kernel_calls",
+    "fake_kernel_hold",
+    "fake_kernel_max_rows",
     "draft_test_post",
     "draft_test_tear",
     "draft_test_finish_close",
@@ -1815,17 +1818,15 @@ def read_record_fields(
 _kernel_layer_keep: dict[int, tuple] = {}
 
 
-def kernel_layer(kernel: int, spec, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> int:
-    """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id. ``kernel`` 0 is
-    the format's compiled-in kernel; a test's fake is the address ``ExpertStreamHost.test_kernel_address`` returned.
+def kernel_layer(spec, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> int:
+    """``layout``'s compiled-in kernel's make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
 
-    ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: the DSpark draft's CPU experts
-    (``cpu_experts/draft.py``) run through it, and tests.
+    ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: tests and harnesses run single forwards
+    through it (:func:`kernel_forward`).
     """
     slabs, params = _layer_tensors(spec)
     layer = int(
         _host_module(layout, variant).expert_stream_kernel_layer(
-            int(kernel),
             slabs,
             int(spec.capacity),
             int(spec.hidden),
@@ -2744,7 +2745,7 @@ class ExpertStreamHost:
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
-        The kernel is the one compiled into the host module (a test's fake, once :meth:`test_kernel_address` ran).
+        The kernel is the one compiled into the host module (the fake's, in the ``FAKE_BUILD`` host).
         Each row joins once its layer is set (:meth:`set_cpu_layer`). Of a captured
         post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..``wire.lanes``;
         the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
@@ -2946,29 +2947,28 @@ class ExpertStreamHost:
         """The compiled-in CPU kernel's plans as JSON (:meth:`CpuKernelOptions.cpu_kernel_plans`)."""
         return CpuKernelOptions(self._module).cpu_kernel_plans()
 
-    def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
-        """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset, and the
-        kernel the module's CPU experts and draft layers run from now until this host closes. The address is for
-        :func:`kernel_layer`.
+    def fake_kernel_reset(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> None:
+        """Test only: reset the fake CPU expert kernel (``FakeCpuKernel``, formats/fake/fake_kernel.h), the kernel of the
+        ``FAKE_BUILD`` host build; any other build raises RuntimeError.
 
         A forward spins ``ns_per_expert`` per expert and writes ``out[j] = (out[j] if accumulate else j) + sum(w * (s +
         1))`` (``zero``: a zero partial); ``fail`` nonzero makes every forward throw. Instrumented build only.
         """
-        _refuse_test_only("test_kernel_address", self.variant)
-        return int(self._module.expert_stream_test_kernel_address(int(ns_per_expert), int(fail), int(bool(zero))))
+        _refuse_test_only("fake_kernel_reset", self.variant)
+        self._module.expert_stream_fake_kernel_reset(int(ns_per_expert), int(fail), int(bool(zero)))
 
-    def test_kernel_calls(self) -> list[dict]:
-        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, one per row, in order.
+    def fake_kernel_calls(self) -> list[dict]:
+        """Test only: the fake kernel's forwards since :meth:`fake_kernel_reset`, one per row, in order.
 
         ``staged`` says the forward was a two-stage one; over a six-slab layer ``w13`` and ``w2`` are the byte sums of
         its live slots' w13 slabs at its start and w2 slabs after its stage-two wait (else 0).
         """
-        _refuse_test_only("test_kernel_calls", self.variant)
+        _refuse_test_only("fake_kernel_calls", self.variant)
         lanes = self.wire.lanes
         width = 9 + 2 * lanes
-        count = int(self._module.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+        count = int(self._module.expert_stream_fake_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
         out = torch.zeros((count, width), dtype=torch.float64)
-        self._module.expert_stream_test_kernel_calls(out)
+        self._module.expert_stream_fake_kernel_calls(out)
         calls = []
         for row in out.tolist()[:count]:
             k = int(row[4])
@@ -2980,16 +2980,16 @@ class ExpertStreamHost:
             })
         return calls
 
-    def test_kernel_hold(self, core: int, on: bool = True) -> None:
+    def fake_kernel_hold(self, core: int, on: bool = True) -> None:
         """Test only: hold (or release) the fake forwards whose worker-0 core is ``core``."""
-        _refuse_test_only("test_kernel_hold", self.variant)
-        self._module.expert_stream_test_kernel_hold(int(core), int(bool(on)))
+        _refuse_test_only("fake_kernel_hold", self.variant)
+        self._module.expert_stream_fake_kernel_hold(int(core), int(bool(on)))
 
-    def test_kernel_max_rows(self, rows: int) -> None:
-        """Test only: the fake kernel's max_rows (restored by :meth:`test_kernel_address`); call it before the engine
+    def fake_kernel_max_rows(self, rows: int) -> None:
+        """Test only: the fake kernel's max_rows (restored by :meth:`fake_kernel_reset`); call it before the engine
         is enabled, whose validation reads it."""
-        _refuse_test_only("test_kernel_max_rows", self.variant)
-        self._module.expert_stream_test_kernel_max_rows(int(rows))
+        _refuse_test_only("fake_kernel_max_rows", self.variant)
+        self._module.expert_stream_fake_kernel_max_rows(int(rows))
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Return whether every job given to the copy thread finished in ``timeout_s``.

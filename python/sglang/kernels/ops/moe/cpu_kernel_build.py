@@ -121,8 +121,16 @@ def _nvfp4(config: ExpertStreamConfig) -> CpuKernelBuild:
     )
 
 
+def _fake(config: ExpertStreamConfig) -> CpuKernelBuild:
+    """The test format's fake kernel: an ordinary optimized host-flag file, no fast-math."""
+    return CpuKernelBuild(
+        cpp_files=("moe/formats/fake/fake_kernel.cpp",),
+        source_cflags=(("moe/formats/fake/fake_kernel.cpp", ("-std=c++20", "-O2", "-pthread", *_HIDDEN)),),
+    )
+
+
 # The formats that have a CPU kernel; one with none (mxfp4) compiles none.
-_KERNELS = {"exl3": _exl3, "nvfp4": _nvfp4}
+_KERNELS = {"exl3": _exl3, "nvfp4": _nvfp4, "fake": _fake}
 
 
 def cpu_kernel_build(fmt: str, config: ExpertStreamConfig) -> Optional[CpuKernelBuild]:
