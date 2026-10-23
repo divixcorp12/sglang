@@ -267,18 +267,18 @@ def fake_cpu_layer(hidden: int = 8):
     its hidden size. Its capacity covers any test tier's row: the host refuses a layer smaller than the row."""
     from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 
-    return CpuExpertLayerSpec(capacity=1 << 20, hidden=hidden, intermediate=0, act_limit=0.0, slabs=(), params=b"")
+    return CpuExpertLayerSpec(capacity=1 << 20, hidden=hidden, intermediate=0, act_limit=0.0, slabs=(), params=())
 
 
-def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, keep_warm_us: int,
+def draft_cpu_host(mode: str, areas, *, cores, threads: int, keep_warm_us: int,
                    fatal_wait_s: float, tmp_path, variant: str = "instr", ns_per_expert: int = 0):
     """A DSpark draft channel server, unstarted, with DraftCpuHost's interface, in one of the two shapes the shared CPU
     team allows (plan 2026-10-06 Task 11):
       draft_only  a draft-only engine (DraftCpuHost), as a launch with the target's CPU experts off builds;
-      shared      group 0's CPU expert engine of an ExpertStreamHost whose CPU experts are on (the fake kernel at
-                  `kernel`), the draft attached as its second job source; .expert_host is that host and .sim its
-                  ChainSim, so a test can post target jobs to the same team. stop() detaches the draft; the caller
-                  stops .expert_host.
+      shared      group 0's CPU expert engine of an ExpertStreamHost whose CPU experts are on, the draft attached as its
+                  second job source; .expert_host is that host and .sim its ChainSim, so a test can post target jobs to
+                  the same team. stop() detaches the draft; the caller stops .expert_host.
+    Both run the fake kernel the caller installed (the module's ``expert_stream_test_kernel_address``) before this.
     """
     from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuHost
     from sglang.kernels.ops.moe.expert_lease_block import wire_layout
@@ -304,7 +304,7 @@ def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, keep_w
     out_rows = torch.zeros((2, 2, 8), dtype=torch.float32)
     split = [0] * (host.wire.lanes + 1)
     split[1] = 1  # one eligible hit lane: the CPU's
-    host.enable_cpu_experts(kernel, split, cores, x_rows, out_rows, threads=threads, keep_warm_us=keep_warm_us)
+    host.enable_cpu_experts(split, cores, x_rows, out_rows, threads=threads, keep_warm_us=keep_warm_us)
     # The target's layer holds fewer slots than a draft stage's (>= 1 << 20), which the fake kernel records per call: a test
     # tells a target forward from a draft one by it.
     host.set_cpu_layer(row, dataclasses.replace(fake_cpu_layer(8), capacity=1024))

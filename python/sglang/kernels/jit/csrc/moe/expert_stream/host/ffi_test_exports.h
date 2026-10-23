@@ -1253,13 +1253,15 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     return kernel;
   }
 
-  // Test only: the fake kernel's address, its calls reset; `fail` nonzero makes every forward
-  // throw, `zero` makes it write a zero partial.
+  // Test only: the fake kernel's address, its calls reset, and the engine's kernel from here until the tier or draft
+  // engine closes (enable_cpu_experts, the draft layers); `fail` nonzero makes every forward throw, `zero` makes it
+  // write a zero partial. The address is for kernel_layer.
   static int64_t test_kernel_address(int64_t ns_per_expert, int64_t fail, int64_t zero) {
     if constexpr (!Build::kFaults) {
       test_only("test_kernel_address");
     } else {
       fake_kernel().reset(ns_per_expert, fail, zero != 0);
+      Base::kernel_override().store(&fake_kernel(), std::memory_order_release);
       return static_cast<int64_t>(reinterpret_cast<intptr_t>(&fake_kernel()));
     }
   }
@@ -1399,14 +1401,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     return text;
   }
 
-  // Kernel `kernel`'s make_layer over a slab table as set_cpu_layer takes it; returns the layer's id. The
-  // kernel's std::invalid_argument propagates.
+  // Kernel `kernel`'s make_layer over a slab table as set_cpu_layer takes it (`kernel` 0: the format's compiled-in
+  // kernel, else the address test_kernel_address returned); returns the layer's id. The kernel's std::invalid_argument
+  // propagates.
   static int64_t kernel_layer(int64_t kernel, TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate,
                               int64_t activation, double act_limit, TensorView params) {
-    const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
+    Base::require_cpu_kernel("kernel_layer");
+    const auto* k = kernel == 0 ? CpuKernel::kernel()
+                                : reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
     cpu_experts::ExpertLayer layer =
         k->make_layer(Base::layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit),
-                      Base::params_bytes(params));
+                      Base::params_bytes(k, params));
     std::lock_guard<std::mutex> lock(kernel_layers_mutex());
     kernel_layers().push_back({layer, hidden});
     return static_cast<int64_t>(kernel_layers().size() - 1);

@@ -650,7 +650,7 @@ class Exl3BuildConfig(_Config):
     # The exllamav3 checkout the extension is JIT-built from; required to use EXL3.
     src: str = ""
     dir: str = "~/.cache/sglang/exl3_ext"
-    # The optimized CPU kernel's compiler, which must be GCC 15; empty uses CXX.
+    # Names the GCC 15 g++ the optimized CPU kernel's host module builds with; it must equal CXX, empty uses CXX.
     cxx: str = ""
 
 

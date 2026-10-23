@@ -1,12 +1,12 @@
 """EXL3 binding of the CPU expert kernel, as a ``CpuExpertQuantTrait``.
 
-The kernel is the optimized build of exllamav3's CPU MoE kernel, ``csrc/exl3/optimized/kernel.cpp`` (built by
-SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1). ``Exl3CpuQuantTrait`` describes each streamed layer's pinned slabs for the
-kernel's ``make_layer`` (``layer_spec``) and hands out the kernel's address (the extension's torch op
-``sglang_exl3_cpu::kernel_address``), after passing it its options (``sglang_exl3_cpu::configure``).
+The kernel is the optimized build of exllamav3's CPU MoE kernel, ``csrc/exl3/optimized/kernel.cpp``, compiled into the
+expert-stream host module. ``Exl3CpuQuantTrait`` describes each streamed layer's pinned slabs and parameters for the
+kernel's ``make_layer`` (``layer_spec``); the host takes the kernel in-process and its options from the module
+(``expert_stream_transport._install_host_options``).
 
 Each layer runs one of the kernel's compiled plans, chosen here once, at registration: the first available fixed plan
-whose facts (``sglang_exl3_cpu::plans``) equal the layer's, read off its slabs, else the generic plan. The kernel
+whose facts (the host's ``cpu_kernel_plans``) equal the layer's, read off its slabs, else the generic plan. The kernel
 refuses a plan that does not accept the layer and never re-chooses per call.
 """
 
@@ -38,7 +38,7 @@ class Exl3LayerFacts(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Exl3CpuPlan(msgspec.Struct, frozen=True, kw_only=True):
-    """One compiled plan, as ``sglang_exl3_cpu::plans`` lists it (kernel.h's ``SglangExl3CpuPlanInfo``). A fixed plan
+    """One compiled plan, as the host's ``cpu_kernel_plans`` lists it (kernel.h's ``SglangExl3CpuPlanInfo``). A fixed plan
     accepts exactly its facts; the generic plan (``fixed`` false) accepts any layer."""
 
     id: int
@@ -80,12 +80,12 @@ def choose_exl3_cpu_plan(plans: Sequence[Exl3CpuPlan], facts: Exl3LayerFacts) ->
 class Exl3CpuQuantTrait:
     """The EXL3 CPU kernel's trait: fp16 activations in, fp32 routed sum out.
 
-    ``ext`` is the EXL3 extension module. ``act_limit`` is the SwiGLU clamp the layers
-    run with; the RAM-miss service fills it in at the first registration when it is
+    ``act_limit`` is the SwiGLU clamp the layers run with; the RAM-miss service fills it in at the first registration when it is
     ``None``. ``swizzled`` selects the band-contiguous weight layout, which is
     bit-identical to the native one. ``row_weighted`` splits the layers' output tiles among the workers by chunk row
     count (tile_assignment.hpp), bit-identical too. ``config`` is the process's resolved config (default
-    ``resolved_config()`` when first needed): its worker trace goes to the kernel.
+    ``resolved_config()`` when first needed). The plan list comes from the host module the layers run on
+    (:meth:`attach_host`).
     """
 
     name = "exl3"
@@ -96,17 +96,16 @@ class Exl3CpuQuantTrait:
 
     def __init__(
         self,
-        ext: Any,
         act_limit: Optional[float],
         swizzled: bool = False,
         row_weighted: bool = False,
         config: Optional[ResolvedConfig] = None,
     ):
-        self.ext = ext
         self.act_limit = act_limit
         self.swizzled = swizzled
         self.row_weighted = row_weighted
         self._config = config
+        self._host: Any = None
         self._plan_list: Optional[tuple[Exl3CpuPlan, ...]] = None
 
     def _resolved(self) -> ResolvedConfig:
@@ -173,52 +172,27 @@ class Exl3CpuQuantTrait:
             swizzled=int(self.swizzled),
         )
 
-    def _op(self, name: str):
-        """The optimized extension's torch op ``sglang_exl3_cpu::<name>``."""
-        try:
-            return getattr(torch.ops.sglang_exl3_cpu, name)
-        except (AttributeError, RuntimeError) as error:
-            raise RuntimeError(
-                f"the EXL3 extension {self.ext.__file__} has no sglang_exl3_cpu::{name}: CPU experts need the "
-                "optimized CPU kernel, which SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 builds (csrc/exl3/optimized)"
-            ) from error
-
-    def _configure(self) -> None:
-        """Pass the kernel its options (``sglang_exl3_cpu::configure``), before its first forward."""
-        stream = self._resolved().stream
-        worker = stream.trace.cpu_worker
-        self._op("configure")(
-            worker.prefix,
-            int(worker.capacity),
-            int(worker.min_us),
-            worker.scratch_prefix,
-            stream.trace.gate_path,
-        )
-
-    def kernel_address(self) -> int:
-        """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``),
-        once the kernel has its options (``sglang_exl3_cpu::configure``, before its first forward)."""
-        self._configure()
-        return int(self._op("kernel_address")())
+    def attach_host(self, host) -> None:
+        """Take the host (or ``CpuKernelOptions``) whose module's kernel the layers run on, for its plan list."""
+        self._host = host
+        self._plan_list = None
 
     def _plans(self) -> tuple[Exl3CpuPlan, ...]:
-        """The kernel's compiled plans (``sglang_exl3_cpu::plans``), read once; their availability follows the
-        extension's -march."""
+        """The kernel's compiled plans (the host's ``cpu_kernel_plans``), read once; their availability follows the
+        module's -march."""
         if self._plan_list is None:
-            self._configure()
-            self._plan_list = tuple(msgspec.json.decode(self._op("plans")(), type=list[Exl3CpuPlan]))
+            if self._host is None:
+                raise RuntimeError("the EXL3 CPU trait needs a host module (attach_host) to read the kernel's plans")
+            self._plan_list = tuple(msgspec.json.decode(self._host.cpu_kernel_plans(), type=list[Exl3CpuPlan]))
         return self._plan_list
 
-    def _params(self, facts: Exl3LayerFacts, plan: int) -> bytes:
-        """``SglangExl3CpuParams``' bytes as the extension packs them (its torch op ``sglang_exl3_cpu::params``)."""
-        return (
-            self._op("params")(facts.bits_w13, facts.bits_w2, facts.swizzled, int(self.row_weighted), plan)
-            .numpy()
-            .tobytes()
-        )
+    def _params(self, facts: Exl3LayerFacts, plan: int) -> tuple[int, ...]:
+        """The kernel's parameter list (kernel.h's ``SglangExl3CpuParams`` fields in order); the host builds and
+        validates the struct."""
+        return (facts.bits_w13, facts.bits_w2, facts.swizzled, int(self.row_weighted), plan)
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
-        """The layer's six slabs by base pointer and row size, and ``SglangExl3CpuParams``' bytes, naming the plan
+        """The layer's six slabs by base pointer and row size, and the kernel's parameter list, naming the plan
         chosen for the layer's facts."""
         facts = self._facts(slabs, capacity)
         plan = choose_exl3_cpu_plan(self._plans(), facts)

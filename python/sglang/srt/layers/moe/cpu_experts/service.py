@@ -37,12 +37,12 @@ from sglang.srt.layers.moe.expert_engine.formats import get_format
 logger = logging.getLogger(__name__)
 
 
-def cpu_trait_for(format_key: str, ext=None, *, source: str):
+def cpu_trait_for(format_key: str, *, source: str):
     """The quant trait of a registered expert format for ``source``'s layers ("draft" or "target").
 
     ValueError when the format has no CPU kernel (``cpu_trait`` returns None).
     """
-    trait = get_format(format_key).cpu_trait(source=source, ext=ext)
+    trait = get_format(format_key).cpu_trait(source=source)
     if trait is None:
         raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
     return trait
@@ -147,6 +147,7 @@ class CpuExpertService:
         trait.check_environment()
         self.config = stream_config().cpu_experts if config is None else config
         self.host, self.trait = host, trait
+        trait.attach_host(host)
         self.group = group
         # The split table covers n = 0..lanes resident lanes, as the host's wire does.
         self.lanes = host.wire.lanes
@@ -186,7 +187,6 @@ class CpuExpertService:
 
             self.span_weights = two_stage_span_weights()
         host.enable_cpu_experts(
-            trait.kernel_address(),
             self.split,
             self.cores,
             self.x_rows,

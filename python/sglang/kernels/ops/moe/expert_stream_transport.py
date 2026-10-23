@@ -39,6 +39,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe.cpu_kernel_build import CpuKernelBuild, cpu_kernel_build
 from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKENS_MAX, cpu_row_bytes
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
@@ -169,12 +170,12 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
 
 
 def _layer_tensors(spec) -> tuple[torch.Tensor, torch.Tensor]:
-    """A ``CpuExpertLayerSpec``'s slab table (int64 ``[n, 2]`` of {address, slot bytes}) and params (uint8 ``[m]``),
-    as the host's set_cpu_layer and kernel_layer take them. ``reshape(n, 2)``: torch refuses ``reshape(-1, 2)`` of a
-    zero-slab table (the fake kernel's layers have none)."""
+    """A ``CpuExpertLayerSpec``'s slab table (int64 ``[n, 2]`` of {address, slot bytes}) and params (int64 ``[m]``, the
+    format's parameter list), as the host's set_cpu_layer and kernel_layer take them. ``reshape(n, 2)``: torch refuses
+    ``reshape(-1, 2)`` of a zero-slab table (the fake kernel's layers have none)."""
     flat = [int(v) for pair in spec.slabs for v in pair]
     slabs = torch.tensor(flat, dtype=torch.int64).reshape(len(spec.slabs), 2)
-    params = torch.tensor(list(spec.params), dtype=torch.uint8)
+    params = torch.tensor(list(spec.params), dtype=torch.int64)
     return slabs, params
 
 
@@ -209,8 +210,10 @@ def _host_module(
     variant = host_variant(config) if variant is None else variant
     wire = expert_lease_block.wire_layout(lanes, nodes)
     lanes, nodes = wire.lanes, wire.nodes
+    fmt = _check_key(layout)[0]
+    kernel = cpu_kernel_build(fmt, config)
     if variant == "instr_tsan" and _ALLOW_TSAN:
-        return _install_host_options(_host_module_tsan(layout, lanes, nodes), config)
+        return _install_host_options(_host_module_tsan(layout, lanes, nodes, kernel), config, fmt)
     if variant not in VARIANTS:
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
@@ -220,7 +223,9 @@ def _host_module(
         raise ValueError(f"build {layout!r} has no {variant!r} host build variant")
     if trigger_only and variant != "prod":
         raise ValueError("SGLANG_EXPERT_STREAM_TRACE draft_trigger.trigger_only requires the production host build")
-    return _install_host_options(_host_module_cached(layout, variant, lanes, nodes, trigger_only), config)
+    return _install_host_options(
+        _host_module_cached(layout, variant, lanes, nodes, trigger_only, kernel), config, fmt
+    )
 
 
 # The options last installed in each loaded host module, by id(module): a module is cached for the process, so an
@@ -228,9 +233,17 @@ def _host_module(
 _INSTALLED_OPTIONS: dict[int, tuple] = {}
 
 
-def _install_host_options(module: Module, config: ExpertStreamConfig) -> Module:
-    """Install ``config``'s C++ options in ``module`` (trace_options.h, uring_options.h); returns the module."""
+def _install_host_options(module: Module, config: ExpertStreamConfig, fmt: str) -> Module:
+    """Install ``config``'s C++ options in ``module`` (trace_options.h, uring_options.h, and the options of the
+    ``fmt`` CPU kernel compiled into it); returns the module."""
     trace, uring = config.trace, config.tiers.uring
+    worker = trace.cpu_worker
+    # EXL3's kernel records the worker trace; NVFP4's has no options.
+    kernel_args = (
+        (worker.prefix, int(worker.capacity), int(worker.min_us), worker.scratch_prefix, trace.gate_path)
+        if fmt == "exl3"
+        else None
+    )
     trace_args = (
         trace.job.prefix,
         int(trace.job.capacity),
@@ -251,11 +264,50 @@ def _install_host_options(module: Module, config: ExpertStreamConfig) -> Module:
         bool(uring.diagnostics),
         uring.read_cuts,
     )
-    if _INSTALLED_OPTIONS.get(id(module)) != (trace_args, uring_args):
+    if _INSTALLED_OPTIONS.get(id(module)) != (trace_args, uring_args, kernel_args):
         module.expert_stream_set_trace_options(*trace_args)
         module.expert_stream_set_uring_options(*uring_args)
-        _INSTALLED_OPTIONS[id(module)] = (trace_args, uring_args)
+        if kernel_args is not None:
+            module.expert_stream_cpu_kernel_configure(*kernel_args)
+        _INSTALLED_OPTIONS[id(module)] = (trace_args, uring_args, kernel_args)
     return module
+
+
+class CpuKernelOptions:
+    """The options exports of the CPU kernel compiled into one host module (EXL3's: its compiled plans, the forwards
+    each took, its chunk size and ISA tier); a format whose kernel has none raises RuntimeError naming it.
+
+    ``ExpertStreamHost`` and the draft hosts give the same ``cpu_kernel_plans`` for their own module, which is what
+    a kernel trait reads (``attach_host``)."""
+
+    def __init__(self, module: Module):
+        self._module = module
+
+    def cpu_kernel_plans(self) -> str:
+        """The kernel's compiled plans as JSON (EXL3: kernel.h's ``SglangExl3CpuPlanInfo`` objects); ``available``
+        follows the build's -march."""
+        return str(self._module.expert_stream_cpu_kernel_plans())
+
+    def cpu_kernel_plan_calls(self) -> list[int]:
+        """The forwards since load by plan, ``[dsv41, generic]`` for EXL3."""
+        out = torch.zeros(2, dtype=torch.int64)
+        self._module.expert_stream_cpu_kernel_plan_calls(out)
+        return out.tolist()
+
+    def cpu_kernel_chunk_m(self) -> int:
+        """The most tokens a chunk holds in this build."""
+        return int(self._module.expert_stream_cpu_kernel_chunk_m())
+
+    def cpu_kernel_isa(self) -> str:
+        """The tier this build runs at: scalar, avx2, bw, vnni or vbmi."""
+        return str(self._module.expert_stream_cpu_kernel_isa())
+
+
+def cpu_kernel_options(
+    layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None, lanes: int = 8
+) -> CpuKernelOptions:
+    """The CPU kernel options of ``layout``'s host module (``variant``: the default build)."""
+    return CpuKernelOptions(_host_module(layout, variant, lanes))
 
 
 def _check_key(layout) -> BuildKey:
@@ -295,14 +347,23 @@ def _build_for(layout: BuildKey, jit_key: str) -> TransportBuild:
 
 
 @cache_once
-def _host_module_cached(layout: BuildKey, variant: str, lanes: int, nodes: int, trigger_only: bool = False) -> Module:
+def _host_module_cached(
+    layout: BuildKey,
+    variant: str,
+    lanes: int,
+    nodes: int,
+    trigger_only: bool = False,
+    kernel: Optional[CpuKernelBuild] = None,
+) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
+    # The format's CPU kernel (None: it has none) is extra sources with their own flags, in the key through them.
     key = host_jit_key(layout, variant, lanes, nodes, trigger_only)
     build = _build_for(layout, key)
     return load_jit(
         key,
-        cpp_files=[build.host_sources[variant]],
+        cpp_files=[build.host_sources[variant], *(kernel.cpp_files if kernel else ())],
+        source_cflags=dict(kernel.source_cflags) if kernel else None,
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
@@ -312,7 +373,7 @@ def _host_module_cached(layout: BuildKey, variant: str, lanes: int, nodes: int, 
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
             *(["-DSGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY=1"] if trigger_only else []),
         ],
-        extra_ldflags=["-luring", "-lpthread", "-ldl"],
+        extra_ldflags=["-luring", "-lpthread", "-ldl", *(kernel.ldflags if kernel else ())],
         header_only=False,
     )
 
@@ -326,11 +387,12 @@ _ALLOW_TSAN = False
 
 
 @cache_once
-def _host_module_tsan(layout: BuildKey, lanes: int, nodes: int) -> Module:
+def _host_module_tsan(layout: BuildKey, lanes: int, nodes: int, kernel: Optional[CpuKernelBuild] = None) -> Module:
     key = host_jit_key(layout, "instr_tsan", lanes, nodes)
     return load_jit(
         key,
-        cpp_files=[_build_for(layout, key).host_sources["instr"]],
+        cpp_files=[_build_for(layout, key).host_sources["instr"], *(kernel.cpp_files if kernel else ())],
+        source_cflags=dict(kernel.source_cflags) if kernel else None,
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
@@ -342,7 +404,7 @@ def _host_module_tsan(layout: BuildKey, lanes: int, nodes: int) -> Module:
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
-        extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread"],
+        extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread", *(kernel.ldflags if kernel else ())],
         header_only=False,
     )
 
@@ -1754,7 +1816,8 @@ _kernel_layer_keep: dict[int, tuple] = {}
 
 
 def kernel_layer(kernel: int, spec, *, layout: BuildKey = EXL3_BUILD, variant: Optional[str] = None) -> int:
-    """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
+    """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id. ``kernel`` 0 is
+    the format's compiled-in kernel; a test's fake is the address ``ExpertStreamHost.test_kernel_address`` returned.
 
     ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: the DSpark draft's CPU experts
     (``cpu_experts/draft.py``) run through it, and tests.
@@ -2667,7 +2730,6 @@ class ExpertStreamHost:
 
     def enable_cpu_experts(
         self,
-        kernel: int,
         split: Sequence[int],
         cores: Sequence[int],
         x_rows: torch.Tensor,
@@ -2682,9 +2744,8 @@ class ExpertStreamHost:
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
-        ``kernel`` is the format's ``CpuExpertKernel`` address (the trait's ``kernel_address()``);
-        its library must stay loaded while the host runs. Each row joins once its layer is set
-        (:meth:`set_cpu_layer`). Of a captured
+        The kernel is the one compiled into the host module (a test's fake, once :meth:`test_kernel_address` ran).
+        Each row joins once its layer is set (:meth:`set_cpu_layer`). Of a captured
         post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..``wire.lanes``;
         the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
         (float32 ``[rows, hidden]`` at one node, otherwise ``[rows, 2 * nodes, hidden]``:
@@ -2733,7 +2794,6 @@ class ExpertStreamHost:
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
             int(group),
-            int(kernel),
             torch.tensor(list(split), dtype=torch.int64),
             torch.tensor(list(cores), dtype=torch.int64),
             x_rows,
@@ -2882,8 +2942,14 @@ class ExpertStreamHost:
         )
         return out.tolist()
 
+    def cpu_kernel_plans(self) -> str:
+        """The compiled-in CPU kernel's plans as JSON (:meth:`CpuKernelOptions.cpu_kernel_plans`)."""
+        return CpuKernelOptions(self._module).cpu_kernel_plans()
+
     def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
-        """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset.
+        """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset, and the
+        kernel the module's CPU experts and draft layers run from now until this host closes. The address is for
+        :func:`kernel_layer`.
 
         A forward spins ``ns_per_expert`` per expert and writes ``out[j] = (out[j] if accumulate else j) + sum(w * (s +
         1))`` (``zero``: a zero partial); ``fail`` nonzero makes every forward throw. Instrumented build only.

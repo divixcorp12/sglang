@@ -20,7 +20,6 @@ See DSV41_REFERENCE.md section 9.1 for the pinned-tier budget these formats use.
 from __future__ import annotations
 
 import functools
-import hashlib
 import logging
 import math
 import os
@@ -410,27 +409,21 @@ class Exl3ExpertFormat:
         return build_exl3_expert_streamer(layer)
 
     @staticmethod
-    def cpu_trait(*, source: str, ext=None):
+    def cpu_trait(*, source: str):
         """The EXL3 CPU kernel's quant trait for ``source``'s layers ("draft" or "target").
 
         Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice.
         """
         from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
-        from sglang.srt.layers.quantization.exl3.ext import exl3_ext
         from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-        if ext is None:
-            ext = exl3_ext()
         row_weighted = source in row_weighted_sources()
-        path = getattr(ext, "__file__", None)
         logger.info(
-            "CPU experts: the %s's EXL3 layers use %s tile assignment (extension %s, sha256 %s)",
+            "CPU experts: the %s's EXL3 layers use %s tile assignment",
             source,
             "row-weighted" if row_weighted else "even",
-            path,
-            _short_sha256(path),
         )
-        return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
+        return Exl3CpuQuantTrait(act_limit=None, row_weighted=row_weighted)
 
     def prepare_host_rows(
         self, layer: torch.nn.Module, name: str, tensor: torch.Tensor
@@ -595,17 +588,6 @@ def exl3_mirror_config(
 
 logger = logging.getLogger(__name__)
 _WARNED_WITHOUT_PINNED_TIER = False
-
-
-def _short_sha256(path: Optional[str]) -> str:
-    """First 12 hex digits of the file's sha256, so a log line names the exact shared object that served an arm."""
-    if not path:
-        return "?"
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:12]
-    except OSError:
-        return "?"
 
 
 @functools.lru_cache(maxsize=4)

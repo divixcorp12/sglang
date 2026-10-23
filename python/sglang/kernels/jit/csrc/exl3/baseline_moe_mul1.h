@@ -1,20 +1,18 @@
 #pragma once
 
-#include <ATen/Tensor.h>
-#include <cstdint>
-#include <vector>
-
-// CPU-side MoE expert GEMM for mul1 (cb2) EXL3 tensors, standalone from the module code so it
-// can be registered and driven directly. A layer is registered once (raw pointers into CPU
-// trellis/suh/svh tensors, which the caller must keep alive) and then invoked per forward with
-// the routing results. Kernels dispatch at runtime on scalar / AVX2 / AVX-512BW / AVX-512+VNNI;
-// the mul1 codebook is affine in a byte-sum, so dequantization and the activation product
-// fuse into integer dot products (see exl3_moe_cpu_forward for the math).
+// The upstream per-expert API of the vendored kernel (moe_mul1.cpp), as the expert-stream bench's baseline backend
+// builds it (expert_stream/bench/CMakeLists.txt replaces the vendored file's include of upstream's cpu/moe_mul1.h with
+// this one). The extension's vendored flavor compiles against exllamav3's own header instead, which declares the
+// same names; the optimized kernel (optimized/) uses neither.
 //
 // Current limits: mul1 codebook only, K in [1, 8]. Gated experts with silu/gelu/swiglu_oai
 // (act_limit) or gateless with relu2; optional per-expert biases (uniform per projection).
 
-struct Exl3Projection
+#include <ATen/Tensor.h>
+#include <cstdint>
+#include <vector>
+
+struct MoeCpuMatrix
 {
     const uint16_t* trellis;
     const at::Half* suh;
@@ -28,15 +26,11 @@ struct Exl3Projection
     int swz = 0;
 };
 
-// The vendored per-expert kernel (exl3/moe_mul1.cpp) keeps upstream's name: production builds it against
-// upstream's cpu/moe_mul1.h, the bench baseline against this header.
-using MoeCpuMatrix = Exl3Projection;
-
 struct MoeCpuLayer
 {
-    std::vector<Exl3Projection> gates;
-    std::vector<Exl3Projection> ups;
-    std::vector<Exl3Projection> downs;
+    std::vector<MoeCpuMatrix> gates;
+    std::vector<MoeCpuMatrix> ups;
+    std::vector<MoeCpuMatrix> downs;
     // Tensor references keeping the CPU weight storage alive
     std::vector<at::Tensor> refs;
     int num_experts;
@@ -73,8 +67,6 @@ void exl3_moe_cpu_free_layer(int64_t handle);
 //   selected: [m, top_k] int64, CPU (global expert ids; -1 skips)
 //   weights:  [m, top_k] fp16, CPU
 //   out:      [m, hidden] fp32, CPU (overwritten)
-// This build's kernel takes slab layers only (exl3_cpu_kernel(), kernel.h): exl3_moe_cpu_make_layer, its forwards and
-// free_layer refuse, and exist so upstream's bindings link.
 void exl3_moe_cpu_forward
 (
     int64_t handle,
@@ -85,7 +77,7 @@ void exl3_moe_cpu_forward
     int64_t num_threads
 );
 
-// Raw-pointer variant used by upstream's persistent worker (moe_handoff.cu); refuses, as above
+// Raw-pointer variant used by upstream's persistent worker (moe_handoff.cu)
 void exl3_moe_cpu_forward_raw
 (
     int64_t handle,
@@ -101,15 +93,12 @@ void exl3_moe_cpu_forward_raw
 // Per-phase profiling of the forward, printed to stdout per call.
 void exl3_moe_cpu_set_prof(bool enabled);
 
-// Upstream link compatibility only (bindings.cpp, cpu/moe_handoff.cu): both fail if called.
+// Upstream link compatibility only (bindings.cpp, cpu/moe_handoff.cu).
 void exl3_moe_cpu_stage_experts(int64_t handle, const uint32_t* expert_ids, int count, uint8_t* dst, int threads);
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
-// has_avx512_vbmi and has_avx512_bw additionally gate the swizzled weight layout in the child
-// loader (the VBMI tier's wide swizzle bands need the byte-gather kernels' low temporary count).
 bool exl3_moe_cpu_has_avx2();
 bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();
-

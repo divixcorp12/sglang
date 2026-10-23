@@ -1434,8 +1434,8 @@ class Envs:
     # chunks differ in token count (PlanTraits::kClaimMixedChunks), the only calls row weighting changes, so there the
     # setting has no effect: it still weights the generic plan's layers.
     SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT = EnvStr("")
-    # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
-    # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
+    # The optimized EXL3 CPU kernel is compiled into the expert-stream host module, with CXX, which must be GCC 15
+    # (kernels/ops/moe/cpu_kernel_build.py check_kernel_compiler). When set it must name the same compiler as CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
     # The vendored EXL3 CPU kernel pins its workers to the first cores unless this is "0", and the engine (which pins
     # its own workers) refuses anything else. Unset leaves the kernel's default (the previous EXL3_MOE_CPU_PIN).

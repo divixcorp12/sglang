@@ -1,10 +1,11 @@
 """NVFP4 binding of the CPU expert kernel, as a ``CpuExpertQuantTrait``.
 
-The kernel is ``python/sglang/kernels/jit/csrc/nvfp4/optimized/kernel.cpp``, built and loaded by
-``nvfp4.ext.nvfp4_cpu_module``. ``Nvfp4CpuQuantTrait`` describes a layer's pinned slabs for the kernel's ``make_layer``
-(``layer_spec``) and hands out the kernel's address (the library's tvm-ffi export ``nvfp4_cpu_kernel_address``).
+The kernel is ``python/sglang/kernels/jit/csrc/nvfp4/optimized/kernel.cpp``, compiled into the expert-stream host
+module. ``Nvfp4CpuQuantTrait`` describes a layer's pinned slabs and parameters for the kernel's ``make_layer``
+(``layer_spec``).
 """
 
+import struct
 from typing import Mapping, Optional
 
 import torch
@@ -24,8 +25,7 @@ class Nvfp4CpuQuantTrait:
     every slab's slot stride against them at registration. ``w13_layout`` is 0 for [gate, up], 1 for [up, gate], 2
     for alternating 64-row [up, gate] chunks. ``inv_input_scale13``/``inv_input_scale2`` cancel activation scales
     folded into GPU GEMM alphas (1 for weight-only alphas). ``act_limit`` 0 means no SwiGLU clamp; ``None`` lets the
-    RAM-miss service fill it in at the first registration. ``module`` is the library loaded with tvm-ffi, by default
-    ``nvfp4_cpu_module()``.
+    RAM-miss service fill it in at the first registration.
     """
 
     name = "nvfp4"
@@ -42,7 +42,6 @@ class Nvfp4CpuQuantTrait:
         w13_layout: int = 0,
         inv_input_scale13: float = 1.0,
         inv_input_scale2: float = 1.0,
-        module=None,
     ):
         self.hidden = hidden
         self.intermediate = intermediate
@@ -50,7 +49,6 @@ class Nvfp4CpuQuantTrait:
         self.w13_layout = w13_layout
         self.inv_input_scale13 = inv_input_scale13
         self.inv_input_scale2 = inv_input_scale2
-        self.module = module
 
     def check_environment(self) -> None:
         """Nothing to check: the kernel pins its workers only to the cores a call names."""
@@ -72,20 +70,17 @@ class Nvfp4CpuQuantTrait:
                 raise ValueError(f"NVFP4 slab {name} {shape} is not {capacity} contiguous CPU rows")
         return names
 
-    def _module(self):
-        """The library as a tvm-ffi module: ``module``, else the process's cached ``nvfp4_cpu_module()``."""
-        if self.module is not None:
-            return self.module
-        from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_module
+    def attach_host(self, host) -> None:
+        """Nothing to take: the kernel's parameters need no host query."""
 
-        return nvfp4_cpu_module()
-
-    def kernel_address(self) -> int:
-        """The address of the library's NVFP4 CpuExpertKernel (its tvm-ffi export ``nvfp4_cpu_kernel_address``)."""
-        return int(self._module().nvfp4_cpu_kernel_address())
+    @staticmethod
+    def _float_bits(value: float) -> int:
+        """``value`` as the IEEE binary32 bit pattern the host's params list carries."""
+        return struct.unpack("<I", struct.pack("<f", value))[0]
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
-        """The seven slabs (up_alpha (0, 0) when absent) and ``SglangNvfp4CpuParams``' bytes."""
+        """The seven slabs (up_alpha (0, 0) when absent) and ``SglangNvfp4CpuParams``' fields as a list: w13_layout,
+        then the two inverse scales' binary32 bits."""
         names = self._checked(slabs, capacity)
         views = [slabs[name] for name in names]
         pairs = [(v.data_ptr(), v[0].numel() * v.element_size()) for v in views]
@@ -95,9 +90,10 @@ class Nvfp4CpuQuantTrait:
             intermediate=self.intermediate,
             act_limit=float(self.act_limit),
             slabs=tuple(pairs + [(0, 0)] * (len(self.slab_names) + 1 - len(pairs))),
-            # SglangNvfp4CpuParams as the library packs them (its tvm-ffi export nvfp4_cpu_params).
-            params=bytes(
-                self._module().nvfp4_cpu_params(self.w13_layout, self.inv_input_scale13, self.inv_input_scale2)
+            params=(
+                int(self.w13_layout),
+                self._float_bits(self.inv_input_scale13),
+                self._float_bits(self.inv_input_scale2),
             ),
             keep=tuple(views),
         )

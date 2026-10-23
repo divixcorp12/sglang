@@ -8,6 +8,11 @@
 #include "math_scalar.hpp"
 #include "math_avx2.hpp"
 
+#include <cstring>
+#include <span>
+#include <stdexcept>
+#include <string>
+
 namespace sglang::nvfp4_cpu {
 namespace {
 
@@ -41,6 +46,26 @@ const ::sglang::cpu_experts::CpuExpertKernel& nvfp4_cpu_kernel()
 {
     static const ::sglang::cpu_experts::ExpertForward<Nvfp4Quant> kernel{};
     return kernel;
+}
+
+std::vector<std::byte> nvfp4_cpu_param_bytes(std::span<const int64_t> values)
+{
+    if (values.size() != 3)
+        throw std::invalid_argument("NVFP4 CPU params are [w13_layout, inv_input_scale13 bits, inv_input_scale2 bits], got "
+                                    + std::to_string(values.size()) + " values");
+    if (values[0] < INT32_MIN || values[0] > INT32_MAX)
+        throw std::invalid_argument("NVFP4 CPU params: w13_layout " + std::to_string(values[0]) + " does not fit int32");
+    for (const int64_t bits : {values[1], values[2]})
+        if (bits < 0 || bits > int64_t(UINT32_MAX))
+            throw std::invalid_argument("NVFP4 CPU params: " + std::to_string(bits) + " is not a binary32 bit pattern");
+    SglangNvfp4CpuParams params;
+    params.w13_layout = static_cast<int32_t>(values[0]);
+    const uint32_t scale_bits[2] = {static_cast<uint32_t>(values[1]), static_cast<uint32_t>(values[2])};
+    static_assert(sizeof(params) == 12, "SglangNvfp4CpuParams is int32 plus two binary32");
+    std::memcpy(&params.inv_input_scale13, &scale_bits[0], sizeof(float));
+    std::memcpy(&params.inv_input_scale2, &scale_bits[1], sizeof(float));
+    const auto* bytes = reinterpret_cast<const std::byte*>(&params);
+    return {bytes, bytes + sizeof(params)};
 }
 }  // namespace sglang::nvfp4_cpu
 

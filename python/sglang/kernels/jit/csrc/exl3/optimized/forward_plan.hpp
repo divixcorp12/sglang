@@ -16,7 +16,6 @@
 #include "shapes.hpp"
 #include "worker_trace.hpp"
 #include "tile_assignment.hpp"
-#include <c10/util/Half.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -198,7 +197,7 @@ void run_tiles(
 struct ForwardCtx
 {
     const ExpertLayer* layer;
-    const at::Half* x;
+    const Fp16* x;
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
@@ -751,7 +750,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
 {
     ForwardCtx ctx;
     ctx.layer = &l;
-    ctx.x = static_cast<const at::Half*>(c.x);
+    ctx.x = static_cast<const Fp16*>(c.x);
     ctx.out = c.out;
     ctx.m_total = c.rows;
     ctx.zero_out = !c.accumulate;
@@ -784,7 +783,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         for (; i < routes.size() && routes[i].first == ch.expert && ch.m < chunk_m; ++i, ++ch.m)
         {
             ch.token[ch.m] = routes[i].second / c.k;
-            ch.weight[ch.m] = half_to_float(at::Half(c.weights[routes[i].second]));
+            ch.weight[ch.m] = half_to_float(float_to_fp16(c.weights[routes[i].second]));
         }
         ctx.chunks.push_back(ch);
     }

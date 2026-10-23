@@ -42,13 +42,13 @@ class DraftLayer:
 
 
 class DraftKernel:
-    """A format's CPU expert kernel as the draft thread takes it: the kernel's address and a stage's layer spec."""
+    """A format's CPU expert kernel as the draft thread takes it: a stage's layer spec."""
 
     def __init__(self, trait):
         self.trait = trait
 
-    def address(self) -> int:
-        return self.trait.kernel_address()
+    def attach_host(self, host) -> None:
+        self.trait.attach_host(host)
 
     def spec(self, slabs: Mapping[str, torch.Tensor], capacity: int):
         return self.trait.layer_spec(slabs, capacity)
@@ -136,8 +136,9 @@ class DraftCpuExperts:
                 fatal_wait_s=fatal_wait_s,
             )
         try:
+            kernel.attach_host(self.host)
             for key in keys:
-                self.host.set_layer(key, kernel.address(), kernel.spec(layers[key].slabs, self.capacity[key]))
+                self.host.set_layer(key, kernel.spec(layers[key].slabs, self.capacity[key]))
             self.host.start()
         except BaseException:
             self.host.stop()

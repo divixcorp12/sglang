@@ -5,10 +5,9 @@
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
-#include "moe_mul1.h"
+#include "projection.hpp"
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
 #include "kernel.h"
-#include <c10/util/Half.h>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -43,8 +42,8 @@ inline Exl3Projection exl3_projection(
 {
     Exl3Projection m;
     m.trellis = reinterpret_cast<const uint16_t*>(trellis);
-    m.suh = reinterpret_cast<const at::Half*>(suh);
-    m.svh = reinterpret_cast<const at::Half*>(svh);
+    m.suh = reinterpret_cast<const Fp16*>(suh);
+    m.svh = reinterpret_cast<const Fp16*>(svh);
     m.bias = nullptr;
     m.k = k;
     m.n = n;

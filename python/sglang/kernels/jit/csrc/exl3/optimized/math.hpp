@@ -29,7 +29,6 @@
 
 #pragma once
 #include "quant.hpp"
-#include <c10/util/Half.h>
 #include <immintrin.h>
 #include <algorithm>
 #include <array>
@@ -37,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 namespace sglang::exl3_cpu {
 namespace {
@@ -92,12 +92,17 @@ thread_local int tl_swz_tiles_k = 0;
 #endif
 
 
-inline float half_to_float(at::Half h) { return static_cast<float>(h); }
+// A violated precondition of the tile kernels (the plans only call them with whole tiles); out of line and cold.
+[[noreturn, gnu::cold, gnu::noinline]] inline void check_failed(const char* message) { throw std::invalid_argument(message); }
+#define EXL3_CHECK(cond, message) \
+    do { if (!(cond)) [[unlikely]] check_failed(message); } while (0)
+
+inline float half_to_float(Fp16 h) { return fp16_to_float(h); }
 
 inline float mul1_k_inv()
 {
     // fp16 0x1eee
-    static const float v = half_to_float(c10::Half(uint16_t(0x1eee), c10::Half::from_bits()));
+    static const float v = half_to_float(Fp16{uint16_t(0x1eee)});
     return v;
 }
 
@@ -430,7 +435,7 @@ void quantize_act(PreparedIn& p, int r, int m, int k, const float* src, bool dup
 
 template <Isa I>
 M1_TARGET_AVX2
-void prepare_block_avx2(const void* srcv, bool f16, const at::Half* suh, float* dst, int k)
+void prepare_block_avx2(const void* srcv, bool f16, const Fp16* suh, float* dst, int k)
 {
     const __m256 hs = _mm256_set1_ps(HAD_SCALE);
     for (int block = 0; block < k; block += 128)
@@ -571,7 +576,7 @@ template <Isa I>
 void prepare_rows
 (
     const Exl3Projection& mat,
-    const at::Half* src_f16, const float* src_f32, int src_stride,
+    const Fp16* src_f16, const float* src_f32, int src_stride,
     const int* token_idx, int m,
     PreparedIn& p
 )

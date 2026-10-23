@@ -76,11 +76,11 @@ def prefetch_rig(
         x_rows = torch.zeros((rows, tokens * x_token_bytes() + table), dtype=torch.uint8)
         shape = (rows, 2 * nodes, HIDDEN) if tokens == 1 else (rows, 2 * nodes, tokens, HIDDEN)
         out_rows = torch.zeros(shape, dtype=torch.float32)
-        kernel = host.test_kernel_address()
+        host.test_kernel_address()
         cores = sorted(os.sched_getaffinity(0))
         for g in range(nodes):
             host.enable_cpu_experts(
-                kernel, list(range(LANES + 1)), [cores[g % len(cores)]], x_rows, out_rows, threads=1, group=g
+                list(range(LANES + 1)), [cores[g % len(cores)]], x_rows, out_rows, threads=1, group=g
             )
         for row in range(rows):
             host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))

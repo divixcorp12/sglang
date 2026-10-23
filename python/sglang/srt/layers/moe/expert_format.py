@@ -131,7 +131,7 @@ class DenseLayerFormat:
             "a dense format is attached by its quantization method, not by the expert engine"
         )
 
-    def cpu_trait(self, *, source: str, ext: Any = None) -> None:
+    def cpu_trait(self, *, source: str) -> None:
         return None
 
     def prepare_host_rows(
