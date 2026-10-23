@@ -2,7 +2,7 @@
 2026-09-28-reader-crtp-uring-registration, Task 8).
 
 A native harness maps a populated 1.5 GiB slab of dsv41 rows (460 x 3,501,056 B) and a 64-row slab of 49,152 B rows,
-configures the UringReader from the environment (SGLANG_EXPERT_STREAM_URING: read_mode fixed or readv_fixed, fixed_files true) with both
+configures the UringReader with the options Python installs (SGLANG_EXPERT_STREAM_URING: read_mode fixed or readv_fixed, fixed_files true) with both
 slabs as RegisteredRegions under the default 1 GiB cap, and reads a 16 MiB O_DIRECT file into them through
 fixed_legs + prep_readv_fixed. It proves that the big slab registers as 306 + 154 rows (chunk 1 starts at
 306 x 3,501,056), that the two rows around the cut land in buffers 0 and 1, that an iovec straddling the cut is
@@ -145,12 +145,12 @@ void same(const uint8_t* got, const DataFile& file, size_t off, size_t n, const 
 int main(int argc, char** argv) {
   try {
     require(argc == 3, "usage: harness <dir> read|memlock|reset");
-    // SGLANG_EXPERT_STREAM_URING is one JSON object (the test writes it with json.dumps).
-    const std::string uring = setting("SGLANG_EXPERT_STREAM_URING", "");
-    require(uring.find("\"read_mode\": \"fixed\"") != std::string::npos ||
-                uring.find("\"read_mode\": \"readv_fixed\"") != std::string::npos,
-            "read_mode must be fixed or readv_fixed");
-    require(uring.find("\"fixed_files\": true") != std::string::npos, "fixed_files must be true");
+    // The host reads no environment: this harness takes the read mode from its own BIG_READ_MODE and installs
+    // SGLANG_EXPERT_STREAM_URING's members as Python would (fixed_files true, diagnostics on).
+    const std::string read_mode = setting("BIG_READ_MODE", "readv_fixed");
+    require(read_mode == "fixed" || read_mode == "readv_fixed", "read_mode must be fixed or readv_fixed");
+    sglang::expert_stream::set_uring_options(sglang::expert_stream::UringOptions::parse(
+        "default", 0, true, read_mode, "block", 10000, true, "auto"));
     Slab big(kBigBytes), small(kSmallBytes);
     DataFile file(argv[1]);
     const std::vector<int> fds{file.fd};
@@ -294,10 +294,8 @@ def harness(tmp_path_factory):
 
 
 def _env():
-    env = dict(os.environ)
-    env["SGLANG_EXPERT_STREAM_URING"] = json.dumps(
-        {"read_mode": "readv_fixed", "fixed_files": True, "diagnostics": True}
-    )
+    env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_URING"}
+    env["BIG_READ_MODE"] = "readv_fixed"
     return env
 
 
