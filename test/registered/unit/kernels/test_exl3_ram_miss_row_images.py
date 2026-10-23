@@ -91,6 +91,63 @@ def test_every_slab_byte_is_the_checkpoints_after_a_run_of_reads(tmp_path, weigh
                     assert same_bytes(have, want[name][0]), (layer, slot, name, expert)
 
 
+# ---- A mixed-K checkpoint: every layer is read in its own row shape ----
+
+
+# Layer 0 keeps the fake's K3 throughout; layer 1 is K2 throughout and layer 2 differs from layer 0 in w2 only, so the
+# three layers have three row shapes and layer 2 shares layer 0's w13 slab rows.
+MIXED_BITS = {1: (2, 2), 2: (3, 2)}
+
+
+@pytest.mark.parametrize("weights", [None, (1.0, 1.0)], ids=["one", "halves"])
+@pytest.mark.parametrize("pieces", [False, True], ids=["rows", "pieces"])
+def test_a_mixed_k_checkpoint_lands_each_layers_exact_bytes(tmp_path, weights, pieces):
+    """Derived property: a mixed-K checkpoint's layers have rows of different sizes and segment maps, so a read into
+    one layer's slabs must scatter by that layer's row shape. A reader that cut every layer by one layer's shape would
+    land the other layers' bytes at the wrong slab offsets (or refuse them), which the byte check against each layer's
+    own checkpoint oracle shows; the slots no request named keep the sentinel."""
+    s = ram_miss_setup(
+        tmp_path, capacity=4, layers=3, experts=6, mirror_weights=weights, layer_bits=MIXED_BITS
+    )
+    row_bytes = [tuple(r) for r in s.tables.row_bytes.tolist()]
+    assert len(set(row_bytes)) == 3 and row_bytes[0][:3] == row_bytes[2][:3]
+    images = ri.row_image_layouts(s.layout, range(3))
+    assert s.tables.slot_bytes == max(image.image_bytes for image in images.values()) == images[0].image_bytes
+    _sentinel_all(s)
+    experts, slots = [5, 0, 3], [1, 3, 0]
+    extra = dict(piece_stream=True) if pieces else {}
+    for row in (2, 1, 0):  # the default-shape layer last: nothing it leaves behind can make the others pass
+        assert read_rows_traced(s.tables, row, experts, slots, **extra)[0] == 1, row
+    for layer in range(3):
+        for slot in range(4):
+            expert = dict(zip(slots, experts)).get(slot)
+            want = s.reference(layer, [expert]) if expert is not None else None
+            for name in EXL3_STREAMED_NAMES:
+                have = s.slabs[layer][name][slot]
+                if want is None:
+                    assert bool((have.contiguous().view(torch.uint8) == 0x5A).all()), (layer, slot, name)
+                else:
+                    assert same_bytes(have, want[name][0]), (layer, slot, name, expert)
+
+
+def test_the_cpp_tables_check_each_layer_against_its_own_row_shape(tmp_path):
+    """Completeness of the open-time checks per layer: tables_from must refuse a layer whose slab row sizes are not
+    the ones its segments tile, and a layer whose parts read another layer's image length, as it refuses them for a
+    uniform checkpoint. Checked against one layer's shape only, both mixed-K tables would open and misread."""
+    import dataclasses
+
+    s = ram_miss_setup(tmp_path, capacity=2, layers=2, experts=3, layer_bits={1: (2, 2)})
+    assert ops.read_rows_once(s.tables, 1, [0], [0]) == 1
+    row_bytes = s.tables.row_bytes.clone()
+    row_bytes[1] = row_bytes[0]  # layer 1's segments still tile its K2 rows
+    with pytest.raises(RuntimeError, match="tile"):
+        ops.read_rows_once(dataclasses.replace(s.tables, row_bytes=row_bytes), 1, [0], [0])
+    extents = s.tables.extents.clone()
+    extents[1, :, 0, 2] = extents[0, :, 0, 2]  # layer 1's part reads layer 0's (longer) image length
+    with pytest.raises(RuntimeError, match="exactly its layer's image"):
+        ops.read_rows_once(dataclasses.replace(s.tables, extents=extents), 1, [0], [0])
+
+
 # ---- A resubmission resumes inside the iovec list ----
 
 
@@ -109,7 +166,7 @@ def test_a_short_read_resumes_at_the_byte_it_stopped_even_mid_row(tmp_path, shor
     holding that offset, and the later iovecs are whole rows. An off-by-one-segment (or restarting the iovecs from the
     part's start at the new file offset) lands every later byte in the wrong row, which the byte check shows."""
     s = ram_miss_setup(tmp_path, capacity=6)
-    assert s.tables.segments[:, 2].tolist() == IMAGE_ROW_STARTS  # the boundaries the cases are placed around
+    assert s.tables.segments[1, :, 2].tolist() == IMAGE_ROW_STARTS  # the boundaries the cases are placed around
     experts, slots = [3, 0, 5], [0, 1, 2]
     result, sqes, info, record = read_rows_sqes(
         s.tables, 1, experts, slots, part=0, part_short=short, ordinal=1
@@ -223,7 +280,7 @@ def test_the_reader_refuses_shard_tables(tmp_path):
     refused at open, naming the converter, never read through a bounce buffer."""
     s = ram_miss_setup(tmp_path)
     with pytest.raises((ValueError, RuntimeError), match="row image"):
-        exl3_ram_miss_tables(s.layout, s.fmt.segment_map(), s.slabs)  # no row_images: shard tables
+        exl3_ram_miss_tables(s.layout, s.slabs)  # no row_images: shard tables
 
 
 def test_the_cpp_reader_refuses_tables_not_marked_row_images(tmp_path):
@@ -308,7 +365,7 @@ def test_the_tables_refuse_images_opened_for_other_roots(tmp_path):
     images = ri.open_row_images(s.roots, s.layout, str(tmp_path), [0, 1])
     with pytest.raises(ValueError, match="row images are on"):
         exl3_ram_miss_tables(
-            s.layout, s.fmt.segment_map(), s.slabs, roots=s.roots[::-1], policy=StaticSplitPolicy((1.0, 1.0)),
+            s.layout, s.slabs, roots=s.roots[::-1], policy=StaticSplitPolicy((1.0, 1.0)),
             source_root=str(tmp_path), row_images=images,
         )
 

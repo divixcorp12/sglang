@@ -415,7 +415,7 @@ def _lengths(s, layer, experts):
 
 
 def _segment_bytes(s):
-    return int(s.tables.segments[:, 3].sum())
+    return int(s.tables.segments[0, :, 3].sum())  # one layer's row: every layer of the fake shares it
 
 
 @pytest.mark.parametrize("part", [0, 1])
@@ -627,7 +627,7 @@ def _exact_or_untouched(s, layer, experts, slots):
 
 def _assert_pieces_exact_or_untouched(s, layer, expert, slot, reference):
     _, pieces = ops.piece_geometry(s.tables, layer, expert)
-    segments = s.tables.segments.tolist()
+    segments = s.tables.segments[layer].tolist()
     for j, piece in enumerate(pieces):
         states = set()
         for (name_index, _dst, _src, _n), (lo, hi) in zip(segments, piece["runs"]):

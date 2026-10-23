@@ -393,7 +393,6 @@ class Exl3ExpertFormat:
         direct = self._resolve_direct()
         return exl3_ram_miss_tables(
             self.layout,
-            self.segment_map(),
             {
                 layer_id: s.pinned_host_cache.tensors
                 for layer_id, s in streamers.items()

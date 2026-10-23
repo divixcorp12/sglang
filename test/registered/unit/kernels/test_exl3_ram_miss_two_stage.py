@@ -47,8 +47,8 @@ SHAPE_IDS = ["one_root", "halves", "thirds", "drive_speed", "zero_first", "zero_
 
 
 def _segments(tables):
-    """(name, dst, src, bytes) per segment."""
-    return [tuple(int(v) for v in line) for line in tables.segments.tolist()]
+    """(name, dst, src, bytes) per segment of layer row 0 (every layer of the fake checkpoint shares its row shape)."""
+    return [tuple(int(v) for v in line) for line in tables.segments[0].tolist()]
 
 
 def _split_at(tables):

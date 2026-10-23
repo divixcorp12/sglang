@@ -24,6 +24,16 @@ struct Segment {
   int64_t dst;
   int64_t src;
   int64_t bytes;
+  bool operator==(const Segment&) const = default;
+};
+
+// One layer's row shape: its segments, each name's slab row size and the bytes a row needs. A mixed-K checkpoint's
+// layers have rows of different sizes; layers that share a shape share one RowShape (Tables::layer_shape).
+struct RowShape {
+  std::vector<Segment> segments;
+  std::vector<int64_t> row_bytes;  // [names]
+  int64_t need_end = 0;            // the row's last needed byte + 1, from its start: max(src + bytes) over segments
+  bool operator==(const RowShape&) const = default;
 };
 
 // One part of a row's aligned read: `length` bytes of `file` at `offset`, into the row's bounce
@@ -46,19 +56,26 @@ struct Tables {
   int64_t layers = 0;
   int64_t experts = 0;
   int64_t parts = 1;
-  int64_t slot_bytes = 0;
+  int64_t slot_bytes = 0;  // the largest layer's row image
   std::vector<std::string> paths;
   std::vector<std::string> source_paths;  // paths[f]'s source shard: a mirror is a copy of it
   std::vector<int64_t> file_sizes;        // the source size of every file, mirrors included
   std::vector<Read> extents;              // [layers][experts][parts]
   std::vector<int64_t> starts;            // [layers][experts]: where the row starts in its aligned superset
-  std::vector<Segment> segments;
-  int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
+  std::vector<RowShape> shapes;           // the distinct row shapes, each with the same number of segments
+  std::vector<int32_t> layer_shape;       // [layers]: each layer's index into shapes
   std::vector<std::vector<uint8_t*>> slabs;
-  std::vector<int64_t> row_bytes;
   // One per named slab tensor retained by Python tables.keepalive, with its row size: registered as row-aligned chunks.
   std::vector<RegisteredRegion> buffer_regions;
   bool images = false;  // always on: the files are row images
+
+  const RowShape& shape(int64_t layer) const {
+    return shapes[static_cast<size_t>(layer_shape[static_cast<size_t>(layer)])];
+  }
+  // Every row's segment count (tables_from refuses shapes that disagree): what per-row scratch is sized by.
+  size_t segment_count() const {
+    return shapes.empty() ? 0 : shapes.front().segments.size();
+  }
 };
 
 // Copies a 1-D int64 tensor into a vector of expert ids.
@@ -70,20 +87,17 @@ inline std::vector<int32_t> ids_of(TensorView tensor) {
 // Throws unless the tables satisfy the row-image invariants.
 //
 // The reader scatters each read straight into slab rows (RowReader::image_iovecs), which is only right when every
-// byte a read returns has exactly one destination and the row's reads return exactly its image. So: each row starts
-// at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and each row's
-// reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is checked at open, by
-// RowReader::check_image_alignment.
+// byte a read returns has exactly one destination and the row's reads return exactly its image. So, for every layer
+// against its own row shape: each row starts at 0 of its reads, the segments tile [0, need_end) in source order inside
+// their names' slab rows, and each row's reading parts tile [0, need_end) in part order. The 512-byte alignment
+// O_DIRECT needs is checked at open, by RowReader::check_image_alignment.
 template <ExpertRowLayout Layout>
-inline void check_image_tables(const Tables& t) {
+inline void check_image_shape(const RowShape& shape) {
   const std::string prefix = error_prefix<Layout>();
-  for (int64_t start : t.starts) {
-    if (start != 0) throw std::runtime_error(prefix + "row images start every row at 0 of its reads");
-  }
   int64_t cursor = 0;
-  for (const Segment& s : t.segments) {
-    if (s.name < 0 || s.name >= static_cast<int64_t>(t.row_bytes.size()) || s.src != cursor || s.bytes <= 0 ||
-        s.dst < 0 || s.dst + s.bytes > t.row_bytes[s.name]) {
+  for (const Segment& s : shape.segments) {
+    if (s.name < 0 || s.name >= static_cast<int64_t>(shape.row_bytes.size()) || s.src != cursor || s.bytes <= 0 ||
+        s.dst < 0 || s.dst + s.bytes > shape.row_bytes[s.name]) {
       throw std::runtime_error(
           prefix + "row-image segments must tile the image in source order, each inside its slab row");
     }
@@ -91,9 +105,9 @@ inline void check_image_tables(const Tables& t) {
   }
   // On the destination side each name's segments must also tile its slab row: two segments landing on the same slab
   // bytes would pass the source check and silently keep whichever read landed last.
-  for (int64_t name = 0; name < static_cast<int64_t>(t.row_bytes.size()); ++name) {
+  for (int64_t name = 0; name < static_cast<int64_t>(shape.row_bytes.size()); ++name) {
     std::vector<std::pair<int64_t, int64_t>> spans;
-    for (const Segment& s : t.segments) {
+    for (const Segment& s : shape.segments) {
       if (s.name == name) spans.emplace_back(s.dst, s.dst + s.bytes);
     }
     std::sort(spans.begin(), spans.end());
@@ -102,8 +116,19 @@ inline void check_image_tables(const Tables& t) {
       if (span.first != at) throw std::runtime_error(prefix + "row-image segments must tile each slab row once");
       at = span.second;
     }
-    if (at != t.row_bytes[name]) throw std::runtime_error(prefix + "row-image segments must tile each slab row once");
+    if (at != shape.row_bytes[name])
+      throw std::runtime_error(prefix + "row-image segments must tile each slab row once");
   }
+}
+
+template <ExpertRowLayout Layout>
+inline void check_image_tables(const Tables& t) {
+  const std::string prefix = error_prefix<Layout>();
+  for (int64_t start : t.starts) {
+    if (start != 0) throw std::runtime_error(prefix + "row images start every row at 0 of its reads");
+  }
+  for (const RowShape& shape : t.shapes)
+    check_image_shape<Layout>(shape);
   const size_t parts = static_cast<size_t>(t.parts);
   for (size_t base = 0; base < t.extents.size(); base += parts) {
     int64_t at = 0;
@@ -113,15 +138,19 @@ inline void check_image_tables(const Tables& t) {
       if (e.dest != at) throw std::runtime_error(prefix + "a row image's parts must tile it in part order");
       at += e.length;
     }
-    if (at != t.need_end) {
-      throw std::runtime_error(prefix + "a row image's parts must read exactly its image, never its padding");
+    const int64_t layer = static_cast<int64_t>(base / parts) / t.experts;
+    if (at != t.shape(layer).need_end) {
+      throw std::runtime_error(
+          prefix + "a row image's parts must read exactly its layer's image, never its padding (layer row " +
+          std::to_string(layer) + ")");
     }
   }
 }
 
 // Builds Tables from Python's tensors, refusing any table the reader would otherwise trust blindly (extents outside
-// their slot, parts that disagree on base or file size, segments naming no tensor). `paths` and `source_paths` are
-// newline-separated, one entry per file. Throws std::runtime_error on a bad table.
+// their slot, parts that disagree on base or file size, segments naming no tensor). `segments` is int64
+// [layers, S, 4] and `row_bytes` int64 [layers, names]: each layer's own, deduplicated into Tables::shapes. `paths`
+// and `source_paths` are newline-separated, one entry per file. Throws std::runtime_error on a bad table.
 template <ExpertRowLayout Layout>
 inline Tables tables_from(
     TensorView extents,
@@ -136,10 +165,15 @@ inline Tables tables_from(
     int64_t slot_bytes,
     int64_t row_images) {
   const std::string prefix = error_prefix<Layout>();
-  if (slabs.size(1) != kNumNames<Layout> || row_bytes.size(0) != kNumNames<Layout>) {
+  if (slabs.size(1) != kNumNames<Layout> || row_bytes.dim() != 2 || row_bytes.size(1) != kNumNames<Layout>) {
     throw std::runtime_error(
         prefix + "slabs and row_bytes must have " + std::to_string(kNumNames<Layout>) + " names (the layout's), got " +
-        std::to_string(slabs.size(1)) + " and " + std::to_string(row_bytes.size(0)));
+        std::to_string(slabs.size(1)) + " and " + std::to_string(row_bytes.size(row_bytes.dim() - 1)));
+  }
+  if (segments.dim() != 3 || segments.size(2) != 4 || segments.size(0) != extents.size(0) ||
+      row_bytes.size(0) != extents.size(0) || slabs.size(0) != extents.size(0)) {
+    throw std::runtime_error(
+        prefix + "segments [layers, S, 4], row_bytes [layers, names] and slabs [layers, names] need one row per layer");
   }
   Tables t;
   const auto* regions = static_cast<const int64_t*>(buffer_regions.data_ptr());
@@ -212,15 +246,24 @@ inline Tables tables_from(
   const auto* start_data = static_cast<const int64_t*>(starts.data_ptr());
   t.starts.assign(start_data, start_data + t.layers * t.experts);
   const auto* segment_data = static_cast<const int64_t*>(segments.data_ptr());
-  t.segments.resize(static_cast<size_t>(segments.size(0)));
-  for (size_t i = 0; i < t.segments.size(); ++i) {
-    t.segments[i] =
-        Segment{segment_data[4 * i], segment_data[4 * i + 1], segment_data[4 * i + 2], segment_data[4 * i + 3]};
-    if (t.segments[i].name < 0 || t.segments[i].name >= kNumNames<Layout>) {
-      throw std::runtime_error(
-          prefix + "a segment names a tensor outside the layout's " + std::to_string(kNumNames<Layout>) + " names");
+  const auto* rows = static_cast<const int64_t*>(row_bytes.data_ptr());
+  const size_t per_row = static_cast<size_t>(segments.size(1));
+  for (int64_t layer = 0; layer < t.layers; ++layer) {
+    RowShape shape;
+    const int64_t* line = segment_data + static_cast<size_t>(layer) * per_row * 4;
+    for (size_t i = 0; i < per_row; ++i) {
+      const Segment s{line[4 * i], line[4 * i + 1], line[4 * i + 2], line[4 * i + 3]};
+      if (s.name < 0 || s.name >= kNumNames<Layout>) {
+        throw std::runtime_error(
+            prefix + "a segment names a tensor outside the layout's " + std::to_string(kNumNames<Layout>) + " names");
+      }
+      shape.segments.push_back(s);
+      shape.need_end = std::max(shape.need_end, s.src + s.bytes);
     }
-    t.need_end = std::max(t.need_end, t.segments[i].src + t.segments[i].bytes);
+    shape.row_bytes.assign(rows + layer * kNumNames<Layout>, rows + (layer + 1) * kNumNames<Layout>);
+    const auto known = std::find(t.shapes.begin(), t.shapes.end(), shape);
+    t.layer_shape.push_back(static_cast<int32_t>(known - t.shapes.begin()));
+    if (known == t.shapes.end()) t.shapes.push_back(std::move(shape));
   }
   const auto* slab_data = static_cast<const int64_t*>(slabs.data_ptr());
   const int64_t names = slabs.size(1);
@@ -230,8 +273,6 @@ inline Tables tables_from(
       t.slabs[row].push_back(reinterpret_cast<uint8_t*>(static_cast<intptr_t>(slab_data[row * names + name])));
     }
   }
-  const auto* rows = static_cast<const int64_t*>(row_bytes.data_ptr());
-  t.row_bytes.assign(rows, rows + row_bytes.size(0));
   if (t.images) check_image_tables<Layout>(t);
   return t;
 }

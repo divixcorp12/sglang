@@ -159,7 +159,7 @@ class ReaderCore {
       for (size_t row = 0; row < t_.slabs.size(); ++row) {
         for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
           if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kPieceAlign != 0 ||
-              t_.row_bytes[name] % kPieceAlign != 0) {
+              t_.shape(static_cast<int64_t>(row)).row_bytes[name] % kPieceAlign != 0) {
             throw std::runtime_error(
                 error_prefix<Layout>() + "piece streaming needs every slab row base 128 B aligned");
           }
@@ -177,9 +177,10 @@ class ReaderCore {
     return piece_stream_;
   }
 
-  // Where the layout's second stage begins in a row image: what a two-span read splits at; 0 when it cannot.
+  // Where the layout's second stage begins in the row images, the earliest over the row shapes; 0 when some row shape
+  // cannot be read in two spans (a two-span read splits each row at its own shape's start, second_stages_).
   int64_t second_stage() const {
-    return second_stage_;
+    return second_stages_.empty() ? 0 : *std::min_element(second_stages_.begin(), second_stages_.end());
   }
 
   // The per-span weights of a two-span row (row_geometry_two_span's, span_weight_units), w13's then w2's; an empty one
@@ -570,7 +571,7 @@ class ReaderCore {
       c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
     }
     c.publish = piece_stream_ ? publish : nullptr;
-    c.two_span = piece_stream_ && second_stage_ > 0 ? two_span.rows : nullptr;
+    c.two_span = piece_stream_ && second_stage() > 0 ? two_span.rows : nullptr;
     c.prefix = two_span.prefix;
     if (packed) packed->assign(c.total, 0);
     if (c.prefix) c.prefix->assign(c.total, 0);
@@ -662,7 +663,10 @@ class ReaderCore {
   // `direct` opens the files with O_DIRECT. Queue depth, read cuts and the read mode come from the module's
   // installed uring options (installed_uring_options).
   ReaderCore(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {
-    if constexpr (requires { Layout::kSecondStageMask; }) second_stage_ = second_stage_start(t_, Layout::kSecondStageMask);
+    if constexpr (requires { Layout::kSecondStageMask; }) {
+      for (const RowShape& shape : t_.shapes)
+        second_stages_.push_back(second_stage_start(shape, Layout::kSecondStageMask));
+    }
     const UringOptions options = installed_uring_options();
     configured_queue_depth_ = options.queue_depth;
     cuts_requested_ = options.read_cuts_on();
@@ -970,7 +974,7 @@ class ReaderCore {
     cut_scratch_.assign(leg_stride_, CutLeg{});
     fixed_scratch_.assign(iov_stride_, FixedLeg{});
     piece_runs_.assign(
-        piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
+        piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segment_count() : 0, PieceRun{});
     return true;
   }
 
@@ -1198,7 +1202,8 @@ class ReaderCore {
       }
       // A row with no extent reads nothing, so packing it would publish stale bytes.
       if (head == nullptr) return false;
-      if (head->offset - head->dest + t_.starts[row_index] + t_.need_end > t_.file_sizes[head->file]) return false;
+      if (head->offset - head->dest + t_.starts[row_index] + t_.shape(c.layer).need_end > t_.file_sizes[head->file])
+        return false;
       // Every reading part must have at least one byte in its own file. A builder table never violates this (a part
       // spans whole pages and a superset overruns end of file by less than one page, so a reading part always starts
       // strictly inside the file), which is why it must fail loudly here instead of being clamped to an expectation
@@ -1223,7 +1228,7 @@ class ReaderCore {
       const size_t row_index = static_cast<size_t>(c.layer * t_.experts + c.experts[ordinal]);
       const size_t base = row_index * parts;
       rows_[slot] = BounceRow{RowState::Reading, ordinal, 0};
-      rows_[slot].needed = t_.starts[row_index] + t_.need_end;
+      rows_[slot].needed = t_.starts[row_index] + t_.shape(c.layer).need_end;
       ++rows_busy_[bank];
       ++c.reading_rows;
       if constexpr (Build::kFaults) {
@@ -1274,12 +1279,14 @@ class ReaderCore {
   // `two`. Returns false to refuse the batch: the row cannot be cut, or a sub-read would start at or past end of file
   // (the per-part check in admit_batch, per sub-read).
   bool plan_pieces(size_t slot, size_t row_index, RowGeometry& g, bool two) {
-    const size_t segments = t_.segments.size();
+    const size_t segments = t_.segment_count();
     PieceRun* runs = &piece_runs_[slot * kPieces * segments];
     const int64_t* weights[2] = {
         span_weights_[0].empty() ? nullptr : span_weights_[0].data(),
         span_weights_[1].empty() ? nullptr : span_weights_[1].data()};
-    if (!(two ? row_geometry_two_span(t_, row_index, second_stage_, g, runs, weights)
+    const int64_t layer = static_cast<int64_t>(row_index) / t_.experts;
+    const int64_t split = second_stages_.empty() ? 0 : second_stages_[static_cast<size_t>(t_.layer_shape[layer])];
+    if (!(two ? row_geometry_two_span(t_, row_index, split, g, runs, weights)
               : row_geometry(t_, row_index, g, runs)))
       return false;
     for (int s = 0; s < g.subs; ++s) {
@@ -1376,12 +1383,13 @@ class ReaderCore {
   // covers only what it returned.
   bool piece_delivered(size_t slot, int j) const {
     const BounceRow& r = rows_[slot];
-    const size_t segments = t_.segments.size();
+    const std::vector<Segment>& row_segments = t_.shape(c_.layer).segments;
+    const size_t segments = row_segments.size();
     const PieceRun* runs = &piece_runs_[(slot * kPieces + static_cast<size_t>(j)) * segments];
     for (size_t i = 0; i < segments; ++i) {
       if (runs[i].lo >= runs[i].hi) continue;
-      int64_t at = r.start + t_.segments[i].src + runs[i].lo;
-      const int64_t end = r.start + t_.segments[i].src + runs[i].hi;
+      int64_t at = r.start + row_segments[i].src + runs[i].lo;
+      const int64_t end = r.start + row_segments[i].src + runs[i].hi;
       for (int s = 0; s < r.subs; ++s) {
         if (((r.landed >> s) & 1u) && r.sub_dest[s] <= at && at < r.sub_dest[s] + r.sub_done[s]) {
           at = r.sub_dest[s] + r.sub_done[s];
@@ -1860,7 +1868,7 @@ class ReaderCore {
       } else {
         ++t.rows_untraced;
       }
-      for (const Segment& segment : t_.segments)
+      for (const Segment& segment : t_.shape(c.layer).segments)
         t.useful_bytes += segment.bytes;
       // Rows pack in completion order and may overlap, so the first to finish is not always the first to start.
       if (t.pack_start == 0 || start < t.pack_start) t.pack_start = start;
@@ -2099,8 +2107,9 @@ class ReaderCore {
   // validation and admission. All are sized at open() or set_piece_stream(), and empty with the flag off.
   bool piece_stream_ = false;
   size_t subs_ = 1;
-  // Where the layout's second stage begins in a row image (second_stage_start); 0: rows cannot be read in two spans.
-  int64_t second_stage_ = 0;
+  // Per row shape (Tables::shapes), where the layout's second stage begins in its row image (second_stage_start); 0:
+  // its rows cannot be read in two spans. Empty for a layout without a second stage.
+  std::vector<int64_t> second_stages_;
   std::vector<int64_t> span_weights_[2];  // set_span_weights
   std::vector<Read> sub_reads_;
   std::vector<PieceRun> piece_runs_;

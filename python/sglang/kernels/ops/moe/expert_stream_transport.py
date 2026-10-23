@@ -1141,7 +1141,7 @@ def piece_geometry(
     (``SGLANG_EXPERT_STREAM_CPU_TWO_STAGE``): the first span's sub-reads are ``k`` 0, the
     second's ``k`` 1, each span divided by ``span_weights`` (w13's, w2's) when given.
     """
-    segments = int(tables.segments.shape[0])
+    segments = int(tables.segments.shape[1])
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
@@ -3064,7 +3064,7 @@ class ExpertStreamHost:
         """
         tables = self.tables
         runs = torch.zeros(
-            (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2),
+            (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[1]), 2),
             dtype=torch.int32,
         )
         refused = int(
@@ -3485,13 +3485,13 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
                 f"streamed name {name}'s slab is the source of {len(hits)} copy-table entries"
             )
         if hits:
-            if table[hits[0]][2] != int(tables.row_bytes[name]):
+            if table[hits[0]][2] != int(tables.row_bytes[row, name]):
                 raise ValueError(
                     f"streamed name {name}: the copy table's rows hold {table[hits[0]][2]} B, "
-                    f"the slab's {int(tables.row_bytes[name])} B"
+                    f"the slab's {int(tables.row_bytes[row, name])} B"
                 )
             entry_of[name] = hits[0]
-    names = [int(name) for name in tables.segments[:, 0].tolist()]
+    names = [int(name) for name in tables.segments[row, :, 0].tolist()]
     missing = sorted(set(names) - set(entry_of))
     if missing:
         raise ValueError(

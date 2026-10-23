@@ -69,9 +69,14 @@ inline es::Tables image_tables(const RowSet& set) {
     for (int64_t e = 0; e < set.experts; ++e)
       t.extents.push_back(es::Read{row, e * layout.row_stride, layout.image_bytes, 0});
   t.starts.assign(static_cast<size_t>(rows * set.experts), 0);
+  // Every row shares one image layout: one row shape.
+  es::RowShape shape;
   for (int n = 0; n < kNames; ++n)
-    t.segments.push_back(es::Segment{n, 0, layout.name_offsets[n], layout.row_bytes[n]});
-  t.need_end = layout.image_bytes;
+    shape.segments.push_back(es::Segment{n, 0, layout.name_offsets[n], layout.row_bytes[n]});
+  shape.need_end = layout.image_bytes;
+  shape.row_bytes.assign(layout.row_bytes.begin(), layout.row_bytes.end());
+  t.shapes.push_back(std::move(shape));
+  t.layer_shape.assign(static_cast<size_t>(rows), 0);
   for (int64_t row = 0; row < rows; ++row) {
     t.slabs.emplace_back(set.slabs[row].begin(), set.slabs[row].end());
     for (int n = 0; n < kNames; ++n)
@@ -81,7 +86,6 @@ inline es::Tables image_tables(const RowSet& set) {
               static_cast<size_t>(set.capacity * layout.row_bytes[n]),
               static_cast<size_t>(layout.row_bytes[n])});
   }
-  t.row_bytes.assign(layout.row_bytes.begin(), layout.row_bytes.end());
   t.images = true;
   es::check_image_tables<::sglang::exl3::Exl3RowLayout>(t);
   return t;

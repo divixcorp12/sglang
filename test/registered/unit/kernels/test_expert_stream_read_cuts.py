@@ -222,7 +222,7 @@ def _pieces(on):
 
 def test_cuts_off_keeps_todays_credit_and_legs(tmp_path, uring_env):
     s = _setup(tmp_path, (1.0, 1.0, 1.0))
-    assert s.tables.segments.shape[0] > 1  # a multi-segment row image: a read has several iovecs
+    assert s.tables.segments.shape[1] > 1  # a multi-segment row image: a read has several iovecs
     result, _, info, _, _ = _read(s)
     assert result == 1 and info["cut_reads"] == 0 and info["min_cut_bytes"] == 0
     assert info["credit"] == 16 * 3

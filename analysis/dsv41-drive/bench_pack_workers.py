@@ -117,7 +117,7 @@ def build_setup(root: Path, experts: int, mirror_roots: tuple[Path, Path] | None
         for r in roots:
             shutil.copytree(root, r)
         mirror_args = dict(roots=roots, policy=StaticSplitPolicy((1.0, 1.0)), source_root=str(root))
-    tables = exl3_ram_miss_tables(layout, fmt.segment_map(), slabs, **mirror_args)
+    tables = exl3_ram_miss_tables(layout, slabs, **mirror_args)
     return tables, slabs
 
 

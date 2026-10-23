@@ -104,7 +104,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
     for (size_t layer = 0; layer < t_.slabs.size(); ++layer) {
       for (size_t name = 0; name < t_.slabs[layer].size(); ++name) {
         const auto base = reinterpret_cast<uintptr_t>(t_.slabs[layer][name]);
-        const auto row = static_cast<uint64_t>(t_.row_bytes[name]);
+        const auto row = static_cast<uint64_t>(t_.shape(static_cast<int64_t>(layer)).row_bytes[name]);
         if (base == 0 || row == 0) continue;
         const std::string slab = "slab " + std::string(Layout::kNames[name]) + " of layer " + std::to_string(layer);
         const RegisteredRegion* holder = nullptr;
@@ -133,7 +133,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   }
 
   size_t max_iovecs() const {
-    return t_.segments.size();
+    return t_.segment_count();
   }
 
   // Where descriptor `d`'s remaining bytes land, as iovecs in `out` (max_iovecs of them). Returns how many.
@@ -186,7 +186,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
         }
       }
     }
-    const size_t segments = t_.segments.size();
+    const size_t segments = t_.segment_count();
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots) && !c.failed; ++s) {
       BounceRow& r = rows_[s];
       if (r.state == RowState::Free) continue;
@@ -215,16 +215,19 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   }
 
   // Writes the iovecs that land image bytes [from, to) of the row in `slot` in its destination slab rows, one per
-  // segment the range meets (the segments tile the image in source order: check_image_tables). Returns how many.
+  // segment of the call's layer's row shape the range meets (the segments tile the image in source order:
+  // check_image_tables). Returns how many.
   unsigned image_iovecs(size_t slot, int64_t from, int64_t to, iovec* out) const {
     const Call& c = c_;
     const int64_t dest = c.slots[rows_[slot].ordinal];
+    const RowShape& shape = t_.shape(c.layer);
     unsigned count = 0;
-    for (const Segment& s : t_.segments) {
+    for (const Segment& s : shape.segments) {
       const int64_t lo = std::max(from, s.src), hi = std::min(to, s.src + s.bytes);
       if (lo >= hi) continue;
       out[count++] = iovec{
-          t_.slabs[c.layer][s.name] + dest * t_.row_bytes[s.name] + s.dst + (lo - s.src), static_cast<size_t>(hi - lo)};
+          t_.slabs[c.layer][s.name] + dest * shape.row_bytes[s.name] + s.dst + (lo - s.src),
+          static_cast<size_t>(hi - lo)};
     }
     return count;
   }
@@ -236,8 +239,9 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   {
     const Call& c = c_;
     const int64_t dest = c.slots[rows_[slot].ordinal];
+    const std::vector<int64_t>& row_bytes = t_.shape(c.layer).row_bytes;
     for (size_t name = 0; name < t_.slabs[c.layer].size(); ++name) {
-      std::memset(t_.slabs[c.layer][name] + dest * t_.row_bytes[name], fill, static_cast<size_t>(t_.row_bytes[name]));
+      std::memset(t_.slabs[c.layer][name] + dest * row_bytes[name], fill, static_cast<size_t>(row_bytes[name]));
     }
   }
 
@@ -265,14 +269,17 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
 #endif
     for (size_t row = 0; row < t_.slabs.size(); ++row) {
       for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
-        if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kImageAlign != 0 || off(t_.row_bytes[name])) {
+        if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kImageAlign != 0 ||
+            off(t_.shape(static_cast<int64_t>(row)).row_bytes[name])) {
           throw std::runtime_error(error_prefix<Layout>() + "row images need every slab row 512 B aligned");
         }
       }
     }
-    for (const Segment& s : t_.segments) {
-      if (off(s.src) || off(s.dst) || off(s.bytes)) {
-        throw std::runtime_error(error_prefix<Layout>() + "row images need every segment 512 B aligned");
+    for (const RowShape& shape : t_.shapes) {
+      for (const Segment& s : shape.segments) {
+        if (off(s.src) || off(s.dst) || off(s.bytes)) {
+          throw std::runtime_error(error_prefix<Layout>() + "row images need every segment 512 B aligned");
+        }
       }
     }
     for (const Read& e : t_.extents) {

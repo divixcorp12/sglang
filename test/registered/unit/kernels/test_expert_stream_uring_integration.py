@@ -85,7 +85,7 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
     )
     # A fixed read reserves all its legs at once, so a fanned-out read needs a ring at least as deep as it is wide:
     # the row-image reads meet every named slab (one leg per segment).
-    depth = int(setup.tables.segments.shape[0])
+    depth = int(setup.tables.segments.shape[1])
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING", json.dumps({**uring, "queue_depth": depth}))
     _use_shared_slab_arenas(setup)
     # The metadata crossing FFI describes each named slab of each layer, with

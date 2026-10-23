@@ -34,16 +34,18 @@ class RamMissSetup:
     slabs: dict
     tables: object
     roots: tuple = ()  # the row-image roots, one per mirror weight
+    # Each layer's specs; ``fmt`` and ``specs`` are layer 0's, which a mixed-K checkpoint's other layers differ from.
+    layer_specs: dict = dataclasses.field(default_factory=dict)
 
     def reference(self, layer: int, experts: list[int]) -> dict[str, torch.Tensor]:
-        """Exl3ShardRowSource's split of ``experts`` of ``layer`` (the byte oracle)."""
+        """Exl3ShardRowSource's split of ``experts`` of ``layer`` (the byte oracle), in that layer's row shapes."""
+        specs = self.layer_specs.get(layer, self.specs)
         out = {
-            name: torch.empty((len(experts),) + self.specs[name].row_shape, dtype=self.specs[name].dtype)
+            name: torch.empty((len(experts),) + specs[name].row_shape, dtype=specs[name].dtype)
             for name in EXL3_STREAMED_NAMES
         }
-        Exl3ShardRowSource.for_layer(self.layout, layer, self.fmt.segment_map(), direct=False).read(
-            torch.tensor(experts), out
-        )
+        segments = Exl3ExpertFormat(self.layout, layer, direct=False).segment_map()
+        Exl3ShardRowSource.for_layer(self.layout, layer, segments, direct=False).read(torch.tensor(experts), out)
         return out
 
 
@@ -136,7 +138,7 @@ def dsv41_exl3_pairing() -> dict:
     return dict(expert_format=get_format("exl3"), profile=get_profile_by_name("dsv41"))
 
 
-def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=None):
+def image_tables(layout, slabs_by_layer, source_root, mirror_weights=None):
     """``exl3_ram_miss_tables`` over row images of the fake checkpoint at ``source_root``, built by
     ``write_row_images`` for the layers in ``slabs_by_layer``: one image root beside the checkpoint per mirror weight
     (``<source_root>_images<i>``; one root, weight 1, when ``mirror_weights`` is None), split as the weights say. The
@@ -155,7 +157,7 @@ def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=N
     write_row_images(layout, source, roots, layers)
     images = open_row_images(roots, layout, source, layers)
     tables = exl3_ram_miss_tables(
-        layout, segments, slabs_by_layer, roots=roots, policy=StaticSplitPolicy(weights), row_images=images
+        layout, slabs_by_layer, roots=roots, policy=StaticSplitPolicy(weights), row_images=images
     )
     require_o_direct(tables.paths[0])
     return tables, roots
@@ -186,6 +188,7 @@ def ram_miss_setup(
     hidden=None,
     inter=None,
     row_images: bool = True,
+    layer_bits=None,
 ) -> RamMissSetup:
     """``mirror_weights``: one weight per mirror root; image roots are made beside ``tmp_path`` and the
     tables split every row across them (``parts == len(mirror_weights)``). ``hidden``/``inter`` size the fake
@@ -197,7 +200,8 @@ def ram_miss_setup(
     still the checkpoint read by Exl3ShardRowSource: the oracle every row the reader lands is compared against. The
     image files must take O_DIRECT (``require_o_direct``): production reads them with nothing else. ``row_images``
     stays only so existing ``row_images=True`` callers keep working; ``False`` (shard tables) is refused, since the
-    packed reader that read them is gone."""
+    packed reader that read them is gone. ``layer_bits`` is ``write_fake_exl3``'s: a mixed-K checkpoint, whose layers'
+    slabs each take their own row shapes (``layer_specs``)."""
     if not row_images:
         raise ValueError(
             "ram_miss_setup(row_images=False): shard tables were read only by the deleted packed path; the reader "
@@ -206,19 +210,22 @@ def ram_miss_setup(
     hidden = ROW_IMAGE_DIM if hidden is None else hidden
     inter = ROW_IMAGE_DIM if inter is None else inter
     dims = {k: v for k, v in (("hidden", hidden), ("inter", inter)) if v is not None}
-    write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts, **dims)
+    write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts, layer_bits=layer_bits, **dims)
     layout = build_exl3_expert_layout(str(tmp_path))
     fmt = Exl3ExpertFormat(layout, 0, direct=False)
-    specs = {spec.name: spec for spec in fmt.tensor_specs(None)}
+    layer_specs = {
+        layer: {spec.name: spec for spec in Exl3ExpertFormat(layout, layer, direct=False).tensor_specs(None)}
+        for layer in range(layers)
+    }
     slabs = {
         layer: {
             name: allocate_host_slab(capacity, specs[name].row_shape, specs[name].dtype, register=False)
             for name in EXL3_STREAMED_NAMES
         }
-        for layer in range(layers)
+        for layer, specs in layer_specs.items()
     }
-    tables, roots = image_tables(layout, fmt.segment_map(), slabs, tmp_path, mirror_weights)
-    return RamMissSetup(layout, fmt, specs, slabs, tables, roots)
+    tables, roots = image_tables(layout, slabs, tmp_path, mirror_weights)
+    return RamMissSetup(layout, fmt, layer_specs[0], slabs, tables, roots, layer_specs)
 
 
 class DirectUpdaterStandIn:
