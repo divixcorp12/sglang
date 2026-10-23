@@ -16,12 +16,12 @@
 namespace {
 int64_t kernel_address() { return reinterpret_cast<int64_t>(&::sglang::exl3_cpu::exl3_cpu_kernel()); }
 
-void configure(std::string max_isa, bool report_isa, std::string worker_trace_prefix, int64_t worker_trace_capacity,
-               int64_t worker_trace_min_us, std::string scratch_trace_prefix, std::string trace_gate_path)
+void configure(std::string worker_trace_prefix, int64_t worker_trace_capacity, int64_t worker_trace_min_us,
+               std::string scratch_trace_prefix, std::string trace_gate_path)
 {
-    ::sglang::exl3_cpu::exl3_cpu_configure({std::move(max_isa), report_isa, std::move(worker_trace_prefix),
-                                            worker_trace_capacity, worker_trace_min_us,
-                                            std::move(scratch_trace_prefix), std::move(trace_gate_path)});
+    ::sglang::exl3_cpu::exl3_cpu_configure({std::move(worker_trace_prefix), worker_trace_capacity,
+                                            worker_trace_min_us, std::move(scratch_trace_prefix),
+                                            std::move(trace_gate_path)});
 }
 
 at::Tensor params(int64_t bits_w13, int64_t bits_w2, int64_t swizzled, int64_t row_weighted, int64_t plan)
@@ -72,7 +72,7 @@ TORCH_LIBRARY(sglang_exl3_cpu, m)
     m.def("plans() -> str", &plans);
     m.def("plan_calls() -> int[]", &plan_calls);
     m.def("chunk_m() -> int", &chunk_m);
-    m.def("configure(str max_isa, bool report_isa, str worker_trace_prefix, int worker_trace_capacity, "
-          "int worker_trace_min_us, str scratch_trace_prefix, str trace_gate_path) -> ()",
+    m.def("configure(str worker_trace_prefix, int worker_trace_capacity, int worker_trace_min_us, "
+          "str scratch_trace_prefix, str trace_gate_path) -> ()",
           &configure);
 }

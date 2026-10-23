@@ -2,7 +2,7 @@
 // quant's CpuExpertKernel (kernel.hpp): each library holds one behind its accessor; it holds no layer table and takes
 // no lock. The Quant contract:
 //   kName, kSlabs, kOptionalSlabs (a bit per slab that may be absent), kMaxRoutes, kMaxRows,
-//   kTopIsa                              the quant's facts and its ISA tier's cap
+//   kTopIsa                              the quant's facts and its highest ISA tier
 //   Params                               its per-layer parameters, trivially copyable, stored in the layer
 //   row_bytes(layer, params)             the fewest bytes one slot's row of each slab holds
 //   validate(layer, params)              nullptr when the quant runs the layer, else why not; may normalize params
@@ -40,38 +40,8 @@ public:
 
     using CpuExpertKernel::forward;
 
-    // The tier's cap and report (SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA), which the library's configure export
-    // passes from Python. They take effect only before the tier is fixed, at the first isa() call; a later call
-    // changes nothing, as a later env edit did not.
-    struct IsaOptions
-    {
-        std::string cap;  // empty: no cap
-        bool report = false;
-    };
-    static IsaOptions& isa_options()
-    {
-        static IsaOptions options;
-        return options;
-    }
-    static void configure_isa(const std::string& cap, bool report)
-    {
-        IsaOptions& o = isa_options();
-        o.cap = cap;
-        o.report = report;
-    }
-
-    // Computed at the first call from the configured cap. Then, when the report is set, prints "<kName> isa <tier>"
-    // to stderr, once.
-    static Isa isa()
-    {
-        static const Isa isa = [] {
-            const IsaOptions& o = isa_options();
-            const Isa detected = detect_isa(Quant::kTopIsa, o.cap);
-            report_isa(Quant::kName, detected, o.report);
-            return detected;
-        }();
-        return isa;
-    }
+    // The tier forwards run at: the build's (isa.hpp's kBuildIsa), or the quant's top tier when that is lower.
+    static constexpr Isa isa() { return kBuildIsa < Quant::kTopIsa ? kBuildIsa : Quant::kTopIsa; }
 
     const char* name() const noexcept override { return Quant::kName; }
 
@@ -138,10 +108,10 @@ public:
             failed(status);
     }
 
-    // The register work at this quant's tier, compiling only the loops up to kTopIsa.
+    // The register work at the build's tier for this quant.
     int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override
     {
-        return keep_warm_loop<Quant::kTopIsa>(isa(), word, seen, deadline_ns);
+        return keep_warm_loop<isa()>(word, seen, deadline_ns);
     }
 
 private:

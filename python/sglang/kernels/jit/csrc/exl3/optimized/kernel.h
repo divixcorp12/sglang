@@ -52,7 +52,7 @@ namespace sglang::exl3_cpu {
 // Hidden: another library defining it in the same process (the extension and a standalone build) never interposes.
 __attribute__((visibility("hidden"))) const ::sglang::cpu_experts::CpuExpertKernel& exl3_cpu_kernel();
 __attribute__((visibility("hidden"))) SglangExl3CpuPlanCalls exl3_cpu_plan_calls();
-// The compiled plans, the generic plan first. Fixes the kernel's ISA tier (as a forward does), so configure first.
+// The compiled plans, the generic plan first; `available` follows the build's -march.
 __attribute__((visibility("hidden"))) std::vector<SglangExl3CpuPlanInfo> exl3_cpu_plans();
 // The first available fixed plan that accepts these layer facts, else the generic plan: for native harnesses (the
 // benches); Python chooses from exl3_cpu_plans' list itself.
@@ -61,12 +61,9 @@ __attribute__((visibility("hidden"))) int32_t exl3_cpu_match_plan(
 // The most tokens a chunk holds in this build (math.hpp's CHUNK_M = MAX_M / ACT_ROWS).
 __attribute__((visibility("hidden"))) int32_t exl3_cpu_chunk_m();
 
-// The kernel's options from Python's config, before its first forward: the ISA cap ("" none) and report
-// (SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA), and the worker trace (SGLANG_EXPERT_STREAM_TRACE's cpu_worker and
-// gate_path; worker_trace.hpp), which only a -DEXL3_MOE_CPU_WORKER_TRACE=1 build records.
+// The kernel's options from Python's config, before its first forward: the worker trace (SGLANG_EXPERT_STREAM_TRACE's
+// cpu_worker and gate_path; worker_trace.hpp), which only a -DEXL3_MOE_CPU_WORKER_TRACE=1 build records.
 struct Exl3CpuOptions {
-    std::string max_isa;
-    bool report_isa = false;
     std::string worker_trace_prefix;
     int64_t worker_trace_capacity = 65536;
     int64_t worker_trace_min_us = 6000;

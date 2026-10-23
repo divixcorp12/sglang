@@ -2,7 +2,7 @@
 // quantize_block; dot_rows<I, M> from math_scalar.hpp and math_avx2.hpp) and kChunkRows.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
-// dot product's tier, the one ExpertForward detected at run time.
+// dot product's tier, the build's (kBuildIsa, at most Avx2).
 //
 // A call's routes are grouped by slot into units, one per (token, slot), and units into chunks of up to kChunkRows of
 // one slot, so dot_rows decodes each weight row once per chunk. Each token's output is still its own routes' sum in
@@ -267,16 +267,14 @@ private:
         }
     }
 
-    // The AVX2 tier's entries: one call per phase per worker, compiled for AVX2 with everything below inlined
-    // (flatten), so the dot product, GpuRow, swiglu and the down sum run under one target and the Shape's constants fold
-    // into them. Instantiated only by the Avx2 plans. -ffp-contract=off holds here as everywhere in the library.
-    SGLANG_TARGET_AVX2 __attribute__((flatten)) static void gate_up_avx2(ForwardCtx& c, int64_t r0, int64_t r1)
+    // The AVX2 tier's entries: one call per phase per worker, with everything below inlined (flatten), so the dot
+    // product, GpuRow, swiglu and the down sum are one function and the Shape's constants fold into them.
+    __attribute__((flatten)) static void gate_up_avx2(ForwardCtx& c, int64_t r0, int64_t r1)
     {
         gate_up_rows(c, r0, r1);
     }
 
-    SGLANG_TARGET_AVX2 __attribute__((flatten)) static void down_avx2(ForwardCtx& c, float* partial, int64_t h0,
-                                                                       int64_t h1)
+    __attribute__((flatten)) static void down_avx2(ForwardCtx& c, float* partial, int64_t h0, int64_t h1)
     {
         down_rows(c, partial, h0, h1);
     }

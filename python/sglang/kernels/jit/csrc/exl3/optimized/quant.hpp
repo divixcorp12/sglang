@@ -60,7 +60,7 @@ struct Exl3Quant
     static constexpr uint32_t kOptionalSlabs = 0;
     static constexpr int kMaxRoutes = 64;     // the forward's k limit: a job's lanes, up to the wire's 64 (dispatch sizes everything from k)
     static constexpr int kMaxRows = 65536;    // the forward's rows limit
-    // The library holds every tier and runs min(host, the configured cap: SGLANG_EXPERT_STREAM_CPU_MAX_ISA).
+    // The library compiles one tier, the build's (isa.hpp's kBuildIsa).
     static constexpr Isa kTopIsa = Isa::Vbmi;
     // dispatch calls ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh, so it waits there.
     static constexpr bool kStagedForward = true;

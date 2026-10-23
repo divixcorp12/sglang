@@ -81,15 +81,8 @@ class Nvfp4CpuQuantTrait:
         return nvfp4_cpu_module()
 
     def kernel_address(self) -> int:
-        """The address of the library's NVFP4 CpuExpertKernel (its tvm-ffi export ``nvfp4_cpu_kernel_address``), once
-        the kernel has its ISA cap and report (``nvfp4_cpu_configure``, before its first forward fixes the tier;
-        SGLANG_EXPERT_STREAM_CPU_MAX_ISA / _REPORT_ISA of ``resolved_config()``)."""
-        from sglang.srt.layers.moe.expert_engine.config import stream_config
-
-        cpu = stream_config().cpu_experts
-        module = self._module()
-        module.nvfp4_cpu_configure(cpu.max_isa, bool(cpu.report_isa))
-        return int(module.nvfp4_cpu_kernel_address())
+        """The address of the library's NVFP4 CpuExpertKernel (its tvm-ffi export ``nvfp4_cpu_kernel_address``)."""
+        return int(self._module().nvfp4_cpu_kernel_address())
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
         """The seven slabs (up_alpha (0, 0) when absent) and ``SglangNvfp4CpuParams``' bytes."""

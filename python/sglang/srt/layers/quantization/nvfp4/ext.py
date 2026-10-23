@@ -3,8 +3,8 @@ export hands out the kernel's address).
 
 The library is cached under ``build_dir`` by a hash of its sources, the build flags and the compiler's version, so an
 edit or a compiler change builds a new one; a file lock keeps concurrent processes from building the same one twice.
-The build targets baseline x86-64 and picks its ISA tier at run time, so the host CPU is not part of the key. The
-compiler is $CXX, else g++.
+The build targets the resolved -march (SGLANG_JIT_HOST_MARCH, else this machine's) and fixes its ISA tier from it, so
+the -march is part of the key. The compiler is $CXX, else g++.
 """
 
 import functools
@@ -47,7 +47,7 @@ def library_path(build_dir: Path, cxx: str) -> Path:
     digest = hashlib.sha256()
     digest.update(tvm_ffi.__version__.encode())
     digest.update(subprocess.check_output([cxx, "--version"]))
-    digest.update(" ".join(build.CXX_FLAGS + build.C_FLAGS + build.ARCH_FLAGS).encode())
+    digest.update(" ".join(build.CXX_FLAGS + build.C_FLAGS + build.arch_flags(cxx)).encode())
     for path in _sources():
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
