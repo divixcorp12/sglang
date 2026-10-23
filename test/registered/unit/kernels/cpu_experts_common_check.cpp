@@ -400,7 +400,7 @@ int main()
         }
         // Every tier's loop, as far as this CPU runs them, through the free function.
         for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
-            if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, nullptr)) break;
+            if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, "")) break;
             word = 5;
             std::thread mover([&] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
