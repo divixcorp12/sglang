@@ -23,10 +23,15 @@ def test_uring_environment_validation(tmp_path):
     source = tmp_path / "options.cpp"
     source.write_text(r"""
 #include "moe/expert_stream/host/uring_options.h"
+#include <cstdlib>
 #include <iostream>
-int main() {
+// The host reads no environment: Python passes SGLANG_EXPERT_STREAM_URING's members. argv is mode, queue_depth,
+// fixed_files (0/1), read_mode, wait_mode, sq_thread_idle_ms, diagnostics (0/1), read_cuts.
+int main(int argc, char** argv) {
+ if (argc != 9) return 3;
  try {
-   auto o = sglang::expert_stream::UringOptions::from_env();
+   auto o = sglang::expert_stream::UringOptions::parse(argv[1], std::atoll(argv[2]), argv[3][0] == '1', argv[4], argv[5],
+                                                       std::atoll(argv[6]), argv[7][0] == '1', argv[8]);
    std::cout << o.queue_depth << " " << o.sq_thread_idle_ms << " " << o.read_cuts_name() << " " << o.read_cuts_on();
  }
  catch (const std::exception& e) { std::cerr << e.what(); return 2; }
@@ -37,62 +42,56 @@ int main() {
         [compiler, "-std=c++20", "-I", str(INCLUDE), str(source), "-o", str(binary)],
         check=True,
     )
-    env = {k: v for k, v in os.environ.items() if not k.startswith(PREFIX)}
-    # Defaults: depth 0 (16 * parts), SQPOLL idle 10 s (user, 2026-09-28), cuts auto and off outside IOPOLL.
-    assert subprocess.check_output([binary], env=env, text=True) == "0 10000 auto 0"
+    # The members, in argv order, with the config's defaults (UringConfig).
+    defaults = {
+        "mode": "default", "queue_depth": "0", "fixed_files": "0", "read_mode": "normal", "wait_mode": "block",
+        "sq_thread_idle_ms": "10000", "diagnostics": "0", "read_cuts": "auto",
+    }
+
+    def run(**values):
+        members = defaults | values
+        return subprocess.run([binary, *members.values()], capture_output=True, text=True)
 
     def probe(**values):
-        return subprocess.check_output(
-            [binary], env=env | {PREFIX + k: v for k, v in values.items()}, text=True
-        ).split()
+        result = run(**values)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.split()
 
-    assert probe(MODE="iopoll")[2:] == ["auto", "1"]  # auto follows IOPOLL
-    assert probe(MODE="sqpoll_iopoll")[2:] == ["auto", "1"]
-    assert probe(MODE="sqpoll")[2:] == ["auto", "0"]
-    assert probe(READ_CUTS="1")[2:] == ["on", "1"]
-    assert probe(MODE="iopoll", READ_CUTS="0")[2:] == ["off", "0"]
-    assert probe(SQ_THREAD_IDLE_MS="1000")[1] == "1000"  # an explicit value still wins
+    # Defaults: depth 0 (16 * parts), SQPOLL idle 10 s (user, 2026-09-28), cuts auto and off outside IOPOLL.
+    assert probe() == ["0", "10000", "auto", "0"]
+    assert probe(mode="iopoll")[2:] == ["auto", "1"]  # auto follows IOPOLL
+    assert probe(mode="sqpoll_iopoll")[2:] == ["auto", "1"]
+    assert probe(mode="sqpoll")[2:] == ["auto", "0"]
+    assert probe(read_cuts="1")[2:] == ["on", "1"]
+    assert probe(mode="iopoll", read_cuts="0")[2:] == ["off", "0"]
+    assert probe(sq_thread_idle_ms="1000")[1] == "1000"  # an explicit value still wins
     for key, value in [
-        ("QUEUE_DEPTH", "64"),
-        ("MODE", "sqpoll_iopoll"),
-        ("READ_MODE", "readv_fixed"),
-        ("WAIT_MODE", "spin"),
-        ("FIXED_FILES", "1"),
-        ("DIAGNOSTICS", "1"),
-        ("SQ_THREAD_CPU", "2"),
-        ("SQ_THREAD_IDLE_MS", "0"),
-        ("READ_CUTS", "auto"),
+        ("queue_depth", "64"),
+        ("mode", "sqpoll_iopoll"),
+        ("read_mode", "readv_fixed"),
+        ("wait_mode", "spin"),
+        ("fixed_files", "1"),
+        ("diagnostics", "1"),
+        ("sq_thread_idle_ms", "0"),
+        ("read_cuts", "auto"),
     ]:
-        result = subprocess.run(
-            [binary], env=env | {PREFIX + key: value}, capture_output=True, text=True
-        )
-        # Explicit affinity requires SQPOLL; parser rejects a meaningless option.
-        if key == "SQ_THREAD_CPU":
-            assert result.returncode == 2
-        else:
-            assert result.returncode == 0, result.stderr
+        result = run(**{key: value})
+        assert result.returncode == 0, result.stderr
     for key, value in [
-        ("QUEUE_DEPTH", "-1"),
-        ("QUEUE_DEPTH", "65536"),
-        ("QUEUE_DEPTH", " 2"),
-        ("QUEUE_DEPTH", "2x"),
-        ("QUEUE_DEPTH", ""),
-        ("MODE", "fast"),
-        ("READ_MODE", "auto"),
-        ("WAIT_MODE", "poll"),
-        ("FIXED_FILES", "true"),
-        ("SQ_THREAD_CPU", "-2"),
-        ("SQ_THREAD_IDLE_MS", "-1"),
-        ("DIAGNOSTICS", "yes"),
-        ("READ_CUTS", "on"),
-        ("READ_CUTS", "2"),
-        ("READ_CUTS", ""),
+        ("queue_depth", "-1"),
+        ("queue_depth", "65536"),
+        ("mode", "fast"),
+        ("read_mode", "auto"),
+        ("wait_mode", "poll"),
+        ("sq_thread_idle_ms", "-1"),
+        ("read_cuts", "on"),
+        ("read_cuts", "2"),
+        ("read_cuts", ""),
     ]:
-        result = subprocess.run(
-            [binary], env=env | {PREFIX + key: value}, capture_output=True, text=True
-        )
+        result = run(**{key: value})
         assert result.returncode == 2, (key, value, result.stdout, result.stderr)
-        assert PREFIX + key in result.stderr
+        # The refusal names the group env and the member, as the config's own does.
+        assert f"SGLANG_EXPERT_STREAM_URING {key}" in result.stderr
 
 
 _FAKE_LIBURING = r"""
@@ -217,7 +216,15 @@ _FAKE_CASES = r"""
 #include <cstdlib>
 #include <iostream>
 using namespace sglang::expert_stream;
-void env(const char* key,const char* value) { std::string k="SGLANG_EXPERT_STREAM_URING_";setenv((k+key).c_str(),value,1); }
+// The host reads no environment: Python installs SGLANG_EXPERT_STREAM_URING's members (set_uring_options). env() keeps the
+// cases below as they were: it changes one member of the installed options, named by its old suffix.
+struct Members { std::string mode="default", read="normal", wait="block", cuts="auto"; int64_t depth=0, idle=10000; bool fixed_files=false, diagnostics=false; } members;
+void env(const char* key,const char* value) {
+ const std::string k=key, v=value;
+ if(k=="MODE")members.mode=v; else if(k=="READ_MODE")members.read=v; else if(k=="WAIT_MODE")members.wait=v;
+ else if(k=="FIXED_FILES")members.fixed_files=(v=="1"); else assert(false);
+ set_uring_options(UringOptions::parse(members.mode,members.depth,members.fixed_files,members.read,members.wait,members.idle,members.diagnostics,members.cuts));
+}
 template<class F> void rejected(F f) { bool bad=false;try {f();}catch(const std::exception&){bad=true;}assert(bad); }
 // Fixed read modes prepare through fixed_legs + prep_readv_fixed (ReaderCore's path): one leg expected.
 bool fixed(UringReader& r,int fd,const iovec* v,unsigned n,uint64_t off,uint64_t tag) {
@@ -336,6 +343,8 @@ int main() {
  env("MODE","iopoll");
  { UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,false);}); }
  env("MODE","default");
+ // A core for the SQPOLL thread (the thread plan's sq=) needs a sqpoll mode: a meaningless pin is refused.
+ { UringReader r;r.set_sq_thread_cpu(2);rejected([&]{r.init(8);}); }
  registered_file_error=-EMFILE;{UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,true);});}
  registered_file_error=0;env("READ_MODE","fixed");registered_buffer_error=-ENOMEM;
  {int old=unregister_files_calls,old_buffers=unregister_buffers_calls;

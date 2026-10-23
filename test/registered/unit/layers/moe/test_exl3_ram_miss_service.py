@@ -589,7 +589,7 @@ def test_router_capture_is_refused_without_the_stage_trace(tiers, monkeypatch, t
     service, streamers, caches = tiers
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: exl3_stream_trace.Exl3StreamTrace(""))
     with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"router_capture_path": str(tmp_path / "router")})):
-        with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_TRACE expert_path"):
+        with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_TRACE's router_capture_path needs its expert_path"):
             _reconfigure(service).ensure_started()
     assert service.host is None
 
