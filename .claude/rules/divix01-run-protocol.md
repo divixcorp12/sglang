@@ -122,6 +122,21 @@ A suite runner should load the modules once before `-n 8` (the session runner do
 fix on a cold cache without touching anyone's cache, set `SGLANG_JIT_HOST_MARCH` to a name not used before (for example
 `x86-64-v2`), which gives every module a new key.
 
+## Run GPU tests with `-n 8`
+
+GPU test files (`register_cuda_ci` files, `test/manual/dsv41`, `test/registered/unit/kernels`) run under
+`pytest -n 8`, like the CPU tests. Run serially, they leave the RTX 5090 almost idle: on 2026-10-22 a serial
+`unit/kernels` run took 19m48s with the GPU at ~0% utilization and ~1.8 GiB used, and the expert-engine GPU selection
+took ~2 min under `-n 8` against ~15 min serially. Tests share the card without `cc-gpu.lock` (see "CPU and cores");
+A/Bs, timed benchmarks and nsys captures still take the lock and never run with `-n`.
+
+- Warm the JIT modules first, serially, as above: a cold cache under `-n 8` queues builds behind the build lock and
+  times out child processes.
+- Compare against a base run made the same way. Load-sensitive tests (idle-spin, keep-warm, timing windows) flake under
+  `-n 8`; rerun a branch-only failure serially before calling it a regression.
+- A serving process holding most of the card's memory makes GPU tests fail with out-of-memory on both sides; that is
+  not a result. Check `nvidia-smi` before reading one.
+
 ## What this costs
 
 Running unverified code needs a commit first. That is the intended trade: the
