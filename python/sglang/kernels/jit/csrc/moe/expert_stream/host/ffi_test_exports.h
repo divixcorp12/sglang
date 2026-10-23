@@ -85,10 +85,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     return out;
   }
 
-  // The layout's second-stage start in `t` (ReaderCore::second_stage_); 0 for a layout without one.
-  static int64_t second_stage_of(const Tables& t) {
+  // The layout's second-stage start in streamed row `row`'s row shape (ReaderCore::second_stages_); 0 for a layout
+  // without one.
+  static int64_t second_stage_of(const Tables& t, int64_t row) {
     if constexpr (requires { Layout::kSecondStageMask; }) {
-      return second_stage_start(t, Layout::kSecondStageMask);
+      return second_stage_start(t.shape(row), Layout::kSecondStageMask);
     } else {
       return 0;
     }
@@ -736,7 +737,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       const std::vector<int32_t> ids = ids_of(experts);
       const std::vector<int64_t> dest = slots_of(slots);
       const std::vector<uint8_t> spans = two_span_of(f, ids.size());
-      const int64_t split = second_stage_of(t);
+      const int64_t split = second_stage_of(t, row);
+      const RowShape& shape = t.shape(row);
       const auto* ref_table = static_cast<const int64_t*>(reference.data_ptr());
       const auto* ref_slot = static_cast<const int64_t*>(ref_slots.data_ptr());
       Source reader(Tables(t), direct != 0);
@@ -753,12 +755,12 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       prefix.reserve(ids.size());
       const auto first_stage_same = [&](size_t o) {
         bool same = true;
-        for (const Segment& s : t.segments) {
+        for (const Segment& s : shape.segments) {
           if (s.src + s.bytes > split) continue;
-          const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst;
+          const uint8_t* got = t.slabs[row][s.name] + dest[o] * shape.row_bytes[s.name] + s.dst;
           const auto* ref_base = reinterpret_cast<const uint8_t*>(
               static_cast<intptr_t>(ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
-          same = same && std::memcmp(got, ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst, static_cast<size_t>(s.bytes)) == 0;
+          same = same && std::memcmp(got, ref_base + ref_slot[o] * shape.row_bytes[s.name] + s.dst, static_cast<size_t>(s.bytes)) == 0;
         }
         return same;
       };
@@ -885,7 +887,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       verify_named("reference", TensorMatcher({-1, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), reference);
       verify_named("ref_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), ref_slots);
     }
-    const size_t count = t.segments.size();
+    const RowShape& shape = t.shape(row);
+    const size_t count = shape.segments.size();
     std::vector<PieceRun> runs(ids.size() * kPieces * count);
     const auto* ref_table = checking ? static_cast<const int64_t*>(reference.data_ptr()) : nullptr;
     const auto* ref_slot = checking ? static_cast<const int64_t*>(ref_slots.data_ptr()) : nullptr;
@@ -894,7 +897,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
         RowGeometry g;
         const size_t index = static_cast<size_t>(row * t.experts + ids[o]);
         PieceRun* at = &runs[o * kPieces * count];
-        const int64_t split = second_stage_of(t);
+        const int64_t split = second_stage_of(t, row);
         if (!(f[32] >> o & 1 && split > 0 ? row_geometry_two_span(t, index, split, g, at) : row_geometry(t, index, g, at))) {
           throw std::runtime_error(error_prefix<Layout>() + "the checker cannot cut a row");
         }
@@ -911,13 +914,13 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
           if ((fresh >> j & 1u) == 0) continue;
           bool same = true;
           for (size_t i = 0; i < count; ++i) {
-            const Segment& s = t.segments[i];
+            const Segment& s = shape.segments[i];
             const PieceRun& run = runs[(o * kPieces + static_cast<size_t>(j)) * count + i];
             if (run.lo >= run.hi) continue;
-            const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst + run.lo;
+            const uint8_t* got = t.slabs[row][s.name] + dest[o] * shape.row_bytes[s.name] + s.dst + run.lo;
             const auto* ref_base = reinterpret_cast<const uint8_t*>(
                 static_cast<intptr_t>(ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
-            const uint8_t* want = ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst + run.lo;
+            const uint8_t* want = ref_base + ref_slot[o] * shape.row_bytes[s.name] + s.dst + run.lo;
             same = same && std::memcmp(got, want, static_cast<size_t>(run.hi - run.lo)) == 0;
           }
           ++checked;
@@ -1009,7 +1012,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
         source_paths,
         slot_bytes,
         row_images);
-    const size_t count = t.segments.size();
+    const RowShape& shape = t.shape(row);
+    const size_t count = shape.segments.size();
     verify_named(
         "pieces",
         TensorMatcher({kPieces, 1 + 2 * static_cast<int64_t>(count)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
@@ -1017,7 +1021,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     RowGeometry g;
     std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
     const size_t index = static_cast<size_t>(row * t.experts + expert);
-    const int64_t split = second_stage_of(t);
+    const int64_t split = second_stage_of(t, row);
     const SpanWeights w = span_weights_of(span_weights, t.parts);
     if (!(two_span != 0 && split > 0 ? row_geometry_two_span(t, index, split, g, runs.data(), w.ptrs)
                                      : row_geometry(t, index, g, runs.data())))
@@ -1034,8 +1038,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       line[0] = g.deps[j];
       for (size_t i = 0; i < count; ++i) {
         const PieceRun& run = runs[static_cast<size_t>(j) * count + i];
-        line[1 + 2 * i] = t.segments[i].dst + run.lo;
-        line[2 + 2 * i] = t.segments[i].dst + run.hi;
+        line[1 + 2 * i] = shape.segments[i].dst + run.lo;
+        line[2 + 2 * i] = shape.segments[i].dst + run.hi;
       }
     }
     return g.subs | static_cast<int64_t>(g.prefix) << 8;

@@ -59,7 +59,7 @@ class Rig:
         self.slabs = {lid: {n: allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
                             for n in self.names} for lid in range(LAYERS)}
         # Row images are the only reader (plan 2026-09-29-hotpath-zero-overhead D4), read with O_DIRECT.
-        tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp)
+        tables, _ = image_tables(self.layout, self.slabs, tmp)
         self.page = new_page(pin=True, wire=wire_layout(8))
         slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
         self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map)

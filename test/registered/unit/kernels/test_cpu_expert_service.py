@@ -3,6 +3,7 @@
 import itertools
 import json
 
+import msgspec
 import pytest
 import torch
 
@@ -101,14 +102,14 @@ class FakeExt:
         self.freed.append(handle)
 
 
-def _exl3_slabs():
+def _exl3_slabs(bits_w13=3, bits_w2=3):
     i16, f16 = torch.int16, torch.float16
-    n = CAP * 2 * (H // 16) * (INTER // 16) * 48
+    n = CAP * 2 * (H // 16) * (INTER // 16) * 16 * bits_w13
     return {
-        "w13_trellis": torch.arange(n, dtype=i16).view(CAP, 2, H // 16, INTER // 16, 48),
+        "w13_trellis": torch.arange(n, dtype=i16).view(CAP, 2, H // 16, INTER // 16, 16 * bits_w13),
         "w13_suh": torch.zeros(CAP, 2, H, dtype=f16),
         "w13_svh": torch.zeros(CAP, 2, INTER, dtype=f16),
-        "w2_trellis": torch.zeros(CAP, INTER // 16, H // 16, 48, dtype=i16),
+        "w2_trellis": torch.zeros(CAP, INTER // 16, H // 16, 16 * bits_w2, dtype=i16),
         "w2_suh": torch.zeros(CAP, INTER, dtype=f16),
         "w2_svh": torch.zeros(CAP, H, dtype=f16),
     }
@@ -153,31 +154,80 @@ def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch)
     Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).check_environment()
 
 
+def _plan(id, name, fixed, **facts):
+    from sglang.srt.layers.quantization.exl3.schemes.exl3_cpu_experts import Exl3CpuPlan
+
+    zero = dict(hidden=0, intermediate=0, bits_w13=0, bits_w2=0, swizzled=0, act_limit=0.0)
+    return Exl3CpuPlan(id=id, name=name, fixed=fixed, min_isa="scalar", available=True, **{**zero, **facts})
+
+
+# A kernel's list as sglang_exl3_cpu::plans gives it: the generic plan first, then a fixed plan for this file's shape.
+FAKE_PLANS = (
+    _plan(0, "generic", False),
+    _plan(7, "fixed", True, hidden=H, intermediate=INTER, bits_w13=3, bits_w2=3, act_limit=10.0),
+)
+
+
 @pytest.fixture(autouse=True)
 def exl3_params(monkeypatch):
-    """The extension packs SglangExl3CpuParams (its torch op sglang_exl3_cpu::params, which needs the optimized
-    extension: test_cpu_expert_engines_exl3.py checks its bytes); here the trait's params name what it passed."""
+    """The extension packs SglangExl3CpuParams and lists its plans (torch ops sglang_exl3_cpu::params and ::plans, which
+    need the optimized extension: test_cpu_expert_engines_exl3.py checks them); here the trait's params name what it
+    passed, and the plans are FAKE_PLANS."""
     monkeypatch.setattr(
-        Exl3CpuQuantTrait, "_params", lambda self, bits: f"bits={bits} swizzled={int(self.swizzled)}".encode()
+        Exl3CpuQuantTrait,
+        "_params",
+        lambda self, facts, plan: (
+            f"w13={facts.bits_w13} w2={facts.bits_w2} swizzled={facts.swizzled} plan={plan}".encode()
+        ),
     )
+    monkeypatch.setattr(Exl3CpuQuantTrait, "_plans", lambda self: FAKE_PLANS)
 
 
+@pytest.mark.parametrize("bits_w13, bits_w2", [(3, 3), (3, 2), (2, 4)])
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
-def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
+def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout, bits_w13, bits_w2):
     """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape,
-    the clamp and the params the extension packs from {bits, swizzled, row_weighted}."""
-    slabs = _exl3_slabs()
+    the clamp and the params the extension packs from {bits_w13, bits_w2, swizzled, row_weighted, plan}. Gate/up and
+    down are read separately: a w2 whose K differs from w13's gets its own row size and K."""
+    slabs = _exl3_slabs(bits_w13, bits_w2)
     if tier_layout:
         slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
     trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0, swizzled=True)
     spec = trait.layer_spec(slabs, CAP)
     names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
-    trellis = H * INTER * 3 // 8  # bytes of one 3-bit [k/16, n/16, 48] trellis
-    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's row_bytes
+    w13, w2 = H * INTER * bits_w13 // 8, H * INTER * bits_w2 // 8  # bytes of one [k/16, n/16, 16 * K] trellis
+    row_bytes = [2 * w13, 2 * 2 * H, 2 * 2 * INTER, w2, 2 * INTER, 2 * H]  # quant.hpp's row_bytes
     assert spec.slabs == tuple(zip([slabs[n].data_ptr() for n in names], row_bytes))
     assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit, spec.activation) == (CAP, H, INTER, 10.0, 0)
-    assert spec.params == b"bits=3 swizzled=1"
+    assert spec.params == f"w13={bits_w13} w2={bits_w2} swizzled=1 plan=0".encode()
     assert all(any(k is slabs[n] for k in spec.keep) for n in names)
+
+
+@pytest.mark.parametrize(
+    "bits_w13, bits_w2, swizzled, act_limit, plans, want",
+    [
+        (3, 3, False, 10.0, FAKE_PLANS, "fixed"),
+        (2, 2, False, 10.0, FAKE_PLANS, "generic"),  # a K2 layer
+        (3, 2, False, 10.0, FAKE_PLANS, "generic"),  # w2 differs from the plan's
+        (2, 3, False, 10.0, FAKE_PLANS, "generic"),  # w13 differs
+        (3, 3, True, 10.0, FAKE_PLANS, "generic"),  # the plan is unswizzled
+        (3, 3, False, 7.0, FAKE_PLANS, "generic"),  # another clamp
+        (3, 3, False, 10.0, (FAKE_PLANS[0], msgspec.structs.replace(FAKE_PLANS[1], available=False)), "generic"),
+    ],
+    ids=["match", "k2", "w2-differs", "w13-differs", "swizzled", "act-limit", "unavailable"],
+)
+def test_exl3_trait_takes_a_fixed_plan_only_for_a_layer_with_exactly_its_facts(
+    monkeypatch, bits_w13, bits_w2, swizzled, act_limit, plans, want
+):
+    """The plan is chosen once per layer from the kernel's list: the first available fixed plan whose every fact
+    equals the layer's, else the generic plan. The params name its id and the spec names it for the log."""
+    monkeypatch.setattr(Exl3CpuQuantTrait, "_plans", lambda self: plans)
+    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=act_limit, swizzled=swizzled)
+    spec = trait.layer_spec(_exl3_slabs(bits_w13, bits_w2), CAP)
+    plan_id = {"fixed": 7, "generic": 0}[want]
+    assert spec.params.endswith(f"plan={plan_id}".encode())
+    assert spec.plan.startswith(f"EXL3 CPU plan {want} (")
+    assert f"K w13 {bits_w13}, K w2 {bits_w2}" in spec.plan
 
 
 class FakeServiceTrait(FakeTrait):

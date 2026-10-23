@@ -23,7 +23,7 @@ CAP = 6
 LIMIT = 10.0
 
 
-def _random_slabs(seed, hidden, inter):
+def _random_slabs(seed, hidden, inter, bits_w13=3, bits_w2=3):
     g = torch.Generator().manual_seed(seed)
 
     def signs(*shape):
@@ -33,10 +33,10 @@ def _random_slabs(seed, hidden, inter):
         return torch.randint(-32768, 32767, shape, generator=g, dtype=torch.int16)
 
     return {
-        "w13_trellis": codes(CAP, 2, hidden // 16, inter // 16, 48),
+        "w13_trellis": codes(CAP, 2, hidden // 16, inter // 16, 16 * bits_w13),
         "w13_suh": signs(CAP, 2, hidden),
         "w13_svh": signs(CAP, 2, inter),
-        "w2_trellis": codes(CAP, inter // 16, hidden // 16, 48),
+        "w2_trellis": codes(CAP, inter // 16, hidden // 16, 16 * bits_w2),
         "w2_suh": signs(CAP, inter),
         "w2_svh": signs(CAP, hidden),
     }
@@ -105,30 +105,88 @@ def test_the_extension_hands_out_one_kernel_address():
     assert address != 0 and trait.kernel_address() == address
 
 
+def _facts(bits_w13, bits_w2, swizzled=0):
+    from sglang.srt.layers.quantization.exl3.schemes.exl3_cpu_experts import Exl3LayerFacts
+
+    return Exl3LayerFacts(
+        hidden=HIDDEN, intermediate=INTER, bits_w13=bits_w13, bits_w2=bits_w2, act_limit=LIMIT, swizzled=swizzled
+    )
+
+
+# SglangExl3CpuParams (kernel.h): int16 bits_w13, bits_w2, swizzled, row_weighted; int32 plan; little-endian.
+PARAMS = "<hhhhi"
+GENERIC, DSV41 = 0, 1  # kernel.h's SglangExl3CpuPlan
+
+
 def test_the_extension_packs_the_params_make_layer_reads():
-    """sglang_exl3_cpu::params is SglangExl3CpuParams {int32 bits, int32 swizzled, int32 row_weighted}, little-endian."""
     import struct
 
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     trait, _ = _kernel()
-    swizzled = Exl3CpuQuantTrait(trait.ext, act_limit=10.0, swizzled=True)
     weighted = Exl3CpuQuantTrait(trait.ext, act_limit=10.0, row_weighted=True)
-    assert trait._params(3) == struct.pack("<iii", 3, 0, 0)
-    assert swizzled._params(4) == struct.pack("<iii", 4, 1, 0)
-    assert weighted._params(3) == struct.pack("<iii", 3, 0, 1)
+    assert trait._params(_facts(3, 3), DSV41) == struct.pack(PARAMS, 3, 3, 0, 0, DSV41)
+    assert trait._params(_facts(4, 2, swizzled=1), GENERIC) == struct.pack(PARAMS, 4, 2, 1, 0, GENERIC)
+    assert weighted._params(_facts(3, 5), GENERIC) == struct.pack(PARAMS, 3, 5, 0, 1, GENERIC)
 
 
-def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
+def test_the_extension_lists_its_plans_generic_first():
+    """sglang_exl3_cpu::plans: the generic plan first, which any layer may take, then the DSV4.1 plan with exactly the
+    facts its Shape fixes; on an AVX-512 build of the residual block-128 activations, it is available."""
+    trait, _ = _kernel()
+    plans = trait._plans()
+    assert [(p.id, p.name, p.fixed) for p in plans] == [(GENERIC, "generic", False), (DSV41, "dsv41", True)]
+    dsv41 = plans[1]
+    assert (dsv41.hidden, dsv41.intermediate, dsv41.bits_w13, dsv41.bits_w2, dsv41.swizzled, dsv41.act_limit) == (
+        5120, 2304, 3, 3, 0, 10.0
+    )
+    assert (dsv41.min_isa, plans[0].available) == ("bw", True)
+    assert dsv41.available == bool(trait.ext.exl3_moe_cpu_has_avx512_bw())
+
+
+def _refused(trait, slabs, params):
     import dataclasses
-    import struct
 
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
+    spec = dataclasses.replace(trait.layer_spec(slabs, CAP), params=params)
+    with pytest.raises(Exception) as refused:
+        es.kernel_layer(trait.kernel_address(), spec, variant="prod")
+    return str(refused.value)
+
+
+def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
+    import struct
+
     trait, _ = _kernel()
-    spec = trait.layer_spec(_random_slabs(20261008, HIDDEN, INTER), CAP)
-    with pytest.raises(Exception, match="row_weighted must be 0 or 1"):
-        es.kernel_layer(trait.kernel_address(), dataclasses.replace(spec, params=struct.pack("<iii", 3, 0, 2)), variant="prod")
+    why = _refused(trait, _random_slabs(20261008, HIDDEN, INTER), struct.pack(PARAMS, 3, 3, 0, 2, GENERIC))
+    assert "row_weighted must be 0 or 1" in why
+
+
+@pytest.mark.parametrize(
+    "bits_w13, bits_w2, swizzled, limit, plan, why",
+    [
+        (2, 2, 0, LIMIT, DSV41, "plan dsv41 does not accept the layer"),  # a K2 layer forced onto the K3 plan
+        (3, 2, 0, LIMIT, DSV41, "plan dsv41 does not accept the layer"),  # w2 differs
+        (3, 3, 1, LIMIT, DSV41, "plan dsv41 does not accept the layer"),  # swizzled
+        (3, 3, 0, 7.0, DSV41, "plan dsv41 does not accept the layer"),  # another clamp
+        (3, 3, 0, LIMIT, 5, "plan is not a compiled plan id"),
+    ],
+    ids=["k2", "w2-differs", "swizzled", "act-limit", "unknown-id"],
+)
+def test_registration_refuses_a_plan_that_does_not_accept_the_layer(bits_w13, bits_w2, swizzled, limit, plan, why):
+    """A layer's params name its plan; make_layer refuses one whose facts the layer does not have, so a forward never
+    runs a plan whose compiled shape, K or layout differs from the slabs'."""
+    import struct
+
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+    trait, _ = _kernel()
+    if not trait.ext.exl3_moe_cpu_has_avx512_bw():
+        pytest.skip("the DSV4.1 plan needs AVX-512BW")
+    trait = Exl3CpuQuantTrait(trait.ext, act_limit=limit)
+    slabs = _random_slabs(20261008, HIDDEN, INTER, bits_w13=bits_w13, bits_w2=bits_w2)
+    assert why in _refused(trait, slabs, struct.pack(PARAMS, bits_w13, bits_w2, swizzled, 0, plan))
 
 
 def _seeded_routes(seed, rows, k):

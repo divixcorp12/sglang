@@ -70,10 +70,11 @@ struct HostExports {
     verify_named("extents", TensorMatcher({L_, E_, P_, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), extents);
     verify_named("starts", TensorMatcher({L_, E_}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), starts);
     verify_named("file_sizes", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), file_sizes);
-    verify_named("segments", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), segments);
+    // segments and row_bytes are per layer: a mixed-K checkpoint's layers have rows of different sizes.
+    verify_named("segments", TensorMatcher({L_, -1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), segments);
     verify_named("slabs", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
     verify_named(
-        "row_bytes", TensorMatcher({kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), row_bytes);
+        "row_bytes", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), row_bytes);
     verify_named(
         "buffer_regions", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), buffer_regions);
   }
@@ -206,7 +207,7 @@ struct HostExports {
         source_paths,
         slot_bytes,
         row_images);
-    const size_t count = t.segments.size();
+    const size_t count = t.segment_count();
     const size_t rows = static_cast<size_t>(t.layers * t.experts);
     if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
         runs.size(3) != static_cast<int64_t>(count) || runs.size(4) != 2) {
@@ -224,7 +225,7 @@ struct HostExports {
         continue;
       }
       for (size_t k = 0; k < static_cast<size_t>(kPieces) * count; ++k) {
-        const Segment& segment = t.segments[k % count];
+        const Segment& segment = t.shape(static_cast<int64_t>(row) / t.experts).segments[k % count];
         if (segment.dst + piece[k].hi > INT32_MAX) {
           throw std::runtime_error(
               error_prefix<Layout>() + "a piece run ends past the int32 range of the stream kernel's table");

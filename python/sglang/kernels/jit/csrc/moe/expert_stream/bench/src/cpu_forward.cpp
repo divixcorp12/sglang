@@ -243,7 +243,10 @@ struct SlabLayer {
       shape.slabs[n] = slabs[n].get();
       shape.slot_bytes[n] = row;
     }
-    const SglangExl3CpuParams params{3, 0};  // bits, swizzled, row_weighted
+    // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
+    const SglangExl3CpuParams params{
+        3, 3, 0, 0,
+        ::sglang::exl3_cpu::exl3_cpu_match_plan(shape.hidden, shape.intermediate, 3, 3, 0, shape.act_limit)};
     layer = ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(
         shape, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
   }

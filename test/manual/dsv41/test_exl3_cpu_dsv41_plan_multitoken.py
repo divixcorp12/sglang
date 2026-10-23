@@ -4,8 +4,8 @@ Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_
 MAX_M / 2, so 8 by default (SGLANG_EXL3_CPU_MAX_M=16) and 2 in a SGLANG_EXL3_CPU_MAX_M=0 build; the generic plan's
 chunks stay at most 4 tokens). Each case runs one call on a DeepSeek
 V4.1-shaped layer:
-  - unswizzled (native), which Dsv41Shape::accepts may take on AVX-512BW;
-  - swizzled, which it always refuses, so it runs the generic plan;
+  - unswizzled (native), for which registration chooses the DSV4.1 plan on AVX-512BW;
+  - swizzled, which that plan does not accept, so it registers on the generic plan;
   - token by token, through the native layer.
 The three must agree bit for bit. The plan counter (sglang_exl3_cpu::plan_calls) shows which plan each call took. The
 chunk-size cases are generated from the build's CHUNK_M, so a larger MAX_M widens them with no edit here.
@@ -33,8 +33,8 @@ def _swizzle(t):
     return t.reshape(-1, tk, tn // 8, 8, ps).permute(0, 2, 1, 3, 4).contiguous().view(t.shape)
 
 
-def _slabs(seed):
-    """The pinned tier's six slabs, CAP slots of random 3-bit codes and signs."""
+def _slabs(seed, bits=3):
+    """The pinned tier's six slabs, CAP slots of random `bits`-bit codes and signs."""
     g = torch.Generator().manual_seed(seed)
 
     def signs(*shape):
@@ -44,10 +44,10 @@ def _slabs(seed):
         return torch.randint(-32768, 32767, shape, generator=g, dtype=torch.int16)
 
     return {
-        "w13_trellis": codes(CAP, 2, H // 16, I // 16, 48),
+        "w13_trellis": codes(CAP, 2, H // 16, I // 16, 16 * bits),
         "w13_suh": signs(CAP, 2, H),
         "w13_svh": signs(CAP, 2, I),
-        "w2_trellis": codes(CAP, 1, I // 16, H // 16, 48),
+        "w2_trellis": codes(CAP, 1, I // 16, H // 16, 16 * bits),
         "w2_suh": signs(CAP, 1, I),
         "w2_svh": signs(CAP, 1, H),
     }
@@ -119,7 +119,10 @@ def layers():
         swizzled = layout == "swizzled"
         trait = Exl3CpuQuantTrait(ext, act_limit=LIMIT, swizzled=swizzled)
         held = {n: _swizzle(t) if swizzled and n.endswith("_trellis") else t for n, t in slabs.items()}
-        handles[layout] = es.kernel_layer(trait.kernel_address(), trait.layer_spec(held, CAP), variant="instr")
+        spec = trait.layer_spec(held, CAP)
+        # Python chose each layer's plan at registration: the K3 layer the DSV4.1 plan, the swizzled one generic.
+        assert spec.plan.startswith(f"EXL3 CPU plan {'generic' if swizzled else 'dsv41'} ("), spec.plan
+        handles[layout] = es.kernel_layer(trait.kernel_address(), spec, variant="instr")
     yield handles
     for handle in handles.values():
         es.kernel_drop(handle, variant="instr")
@@ -174,6 +177,25 @@ def test_every_chunk_size_matches_the_generic_plan(layers):
         _check(layers, f"m{m}-one-expert", [[3]] * m)
         _check(layers, f"m{m}-three-experts", [[4, 0, 5]] * m)
     _check(layers, f"m{chunk_m + 1}-overflow", [[2]] * (chunk_m + 1))
+
+
+def test_a_k2_layer_of_the_dsv41_shape_takes_the_generic_plan(layers):
+    """The DSV4.1 plan is compiled for 3-bit gate/up and down: a 2-bit layer of the same shape (the mixed-K
+    checkpoint's layers 18-22) gets the generic plan at registration, and its forwards run it."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+    trait = Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT)
+    spec = trait.layer_spec(_slabs(20261023, bits=2), CAP)
+    assert spec.plan.startswith("EXL3 CPU plan generic (") and "K w13 2, K w2 2" in spec.plan, spec.plan
+    handle = es.kernel_layer(trait.kernel_address(), spec, variant="instr")
+    try:
+        x, slots, weights = _inputs("k2", [[4, 0, 5], [0, 4, 5]])
+        out, plan = _forward(handle, x, slots, weights)
+    finally:
+        es.kernel_drop(handle, variant="instr")
+    assert plan == "generic" and torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("threads", [1, 3, 16])

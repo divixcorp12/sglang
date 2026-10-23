@@ -65,7 +65,7 @@ class Chain:
                 for n in self.names:
                     spec = self.specs[n]
                     self.slabs[row][n] = allocate_host_slab(capacity, spec.row_shape, spec.dtype, register=True)
-            self.tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path, mirror_weights)
+            self.tables, _ = image_tables(self.layout, self.slabs, tmp_path, mirror_weights)
             self.page = new_page(pin=True, wire=wire)
             self.hot_page = new_hot_page(experts, pin=True) if gpu_hot else None
             self.host = ExpertStreamHost(

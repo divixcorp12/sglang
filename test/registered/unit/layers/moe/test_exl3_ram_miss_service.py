@@ -724,7 +724,7 @@ def _attach_with_copy_tables(service, streamers, *, drop_name=None):
     for layer_id, streamer in streamers.items():
         row = service.row_of(layer_id)
         entries = [
-            [int(tables.slabs[row, n]), 4096 * (n + 1), int(tables.row_bytes[n])]
+            [int(tables.slabs[row, n]), 4096 * (n + 1), int(tables.row_bytes[row, n])]
             for n in range(len(EXL3_STREAMED_NAMES))
             if n != drop_name
         ]
@@ -747,9 +747,9 @@ def test_every_backend_streams_with_a_segment_map_per_copy_table(tiers):
     tables = _attach_with_copy_tables(service, streamers)
     dev = service.device_side
     assert torch.equal(dev.piece_runs, service.host.piece_runs())
-    assert tuple(dev.piece_runs.shape) == (LAYERS, EXPERTS, 8, int(tables.segments.shape[0]), 2)
+    assert tuple(dev.piece_runs.shape) == (LAYERS, EXPERTS, 8, int(tables.segments.shape[1]), 2)
     assert dev.piece_runs.abs().sum() > 0, "the piece table must cut the rows, not be all empty"
-    names = [int(n) for n in tables.segments[:, 0].tolist()]
+    names = [int(n) for n in tables.segments[0, :, 0].tolist()]
     for streamer in streamers.values():
         backend = streamer.row_backend
         assert backend.stream_maps[0].tolist() == names + [0] * 6, "every entry is a named slab: none copied whole"

@@ -213,8 +213,8 @@ def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
 
     tables = SimpleNamespace(
         slabs=torch.tensor([[0x10000, 0x20000]]),
-        row_bytes=torch.tensor([32, 64]),
-        segments=torch.tensor([[0, 0, 0, 32], [1, 0, 32, 64]]),
+        row_bytes=torch.tensor([[32, 64]]),
+        segments=torch.tensor([[[0, 0, 0, 32], [1, 0, 32, 64]]]),
     )
 
     def table(*rows):
@@ -224,7 +224,7 @@ def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
     assert good.tolist() == [0, 1, 0, 0]
     with pytest.raises(ValueError, match="16-byte"):
         ram_miss.stream_segment_map(table([0x10000, 0x40008, 32], [0x20000, 0x80000, 64]), tables, 0)
-    tables.row_bytes = torch.tensor([40, 64])
+    tables.row_bytes = torch.tensor([[40, 64]])
     with pytest.raises(ValueError, match="16-byte"):
         ram_miss.stream_segment_map(table([0x10000, 0x40000, 40], [0x20000, 0x80000, 64]), tables, 0)
 

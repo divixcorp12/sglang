@@ -33,6 +33,19 @@ SglangExl3CpuPlanCalls exl3_cpu_plan_calls()
     return {g_plan_calls[0].load(std::memory_order_relaxed), g_plan_calls[1].load(std::memory_order_relaxed)};
 }
 
+std::vector<SglangExl3CpuPlanInfo> exl3_cpu_plans() { return plan_infos(); }
+
+int32_t exl3_cpu_match_plan(
+    int32_t hidden, int32_t intermediate, int32_t bits_w13, int32_t bits_w2, int32_t swizzled, float act_limit)
+{
+    for (const SglangExl3CpuPlanInfo& plan : plan_infos())
+        if (plan.fixed && plan.available && plan.hidden == hidden && plan.intermediate == intermediate
+            && plan.bits_w13 == bits_w13 && plan.bits_w2 == bits_w2 && plan.swizzled == swizzled
+            && plan.act_limit == act_limit)
+            return plan.id;
+    return kSglangExl3CpuPlanGeneric;
+}
+
 int32_t exl3_cpu_chunk_m() { return CHUNK_M; }
 
 void exl3_cpu_configure(const Exl3CpuOptions& options)

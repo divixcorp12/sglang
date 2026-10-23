@@ -713,11 +713,11 @@ private:
 // exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
 std::atomic<int64_t> g_plan_calls[2];
 
-// Runs the call's plan at tier `isa`: the DSV4.1 plan when it accepts the call, else the generic plan at the tier.
+// Runs the layer's plan (p.plan, which registration checked against the layer, the build and the tier) at tier `isa`.
 void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team, Isa isa)
 {
     const ExpertLayer& l = *ctx.layer;
-    if (isa >= Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
+    if (p.plan == Dsv41Shape::kPlan) {
         g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
         // The plan is written for AVX-512BW. A VNNI host (Vnni, Vbmi) runs it with the vpdpwssd register kernels.
         const Experts<Dsv41Shape> E{&l, p};
@@ -769,7 +769,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
     std::sort(routes.begin(), routes.end());
     // The DSV4.1 plan takes chunks of up to CHUNK_M tokens, the generic plan up to GENERIC_CHUNK_M (math.hpp).
-    const int chunk_m = isa >= Isa::Bw && Dsv41Shape::accepts_layer(l, p) ? CHUNK_M : GENERIC_CHUNK_M;
+    const int chunk_m = p.plan == Dsv41Shape::kPlan ? CHUNK_M : GENERIC_CHUNK_M;
     for (size_t i = 0; i < routes.size();)
     {
         Chunk ch;
@@ -809,6 +809,49 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     }
     give_back();
     return 0;
+}
+
+// -------------------------------------------------------------------------------------------
+//   Plan registry
+// -------------------------------------------------------------------------------------------
+
+// The tier forwards run at, fixed at its first query (ExpertForward::isa).
+inline Isa kernel_isa() { return ExpertForward<Exl3Quant>::isa(); }
+
+template <class Shape>
+SglangExl3CpuPlanInfo plan_info()
+{
+    SglangExl3CpuPlanInfo info{};
+    info.id = Shape::kPlan;
+    info.name = Shape::kName;
+    info.fixed = Shape::kFixed;
+    if constexpr (Shape::kFixed) {
+        info.hidden = Shape::kHidden;
+        info.intermediate = Shape::kIntermediate;
+        info.bits_w13 = Shape::kBitsW13;
+        info.bits_w2 = Shape::kBitsW2;
+        info.swizzled = Shape::kSwizzled;
+        info.act_limit = Shape::kActLimit;
+    }
+    info.min_isa = isa_name(Shape::kMinIsa);
+    info.available = Shape::kBuilt && kernel_isa() >= Shape::kMinIsa;
+    return info;
+}
+
+// Every compiled plan, the generic plan first; sglang_exl3_cpu::plans lists these.
+std::vector<SglangExl3CpuPlanInfo> plan_infos() { return {plan_info<GenericShape>(), plan_info<Dsv41Shape>()}; }
+
+const char* plan_rejects(const ExpertLayer& l, const SglangExl3CpuParams& p)
+{
+    if (p.plan == GenericShape::kPlan) return nullptr;
+    if (p.plan != Dsv41Shape::kPlan) return "plan is not a compiled plan id (sglang_exl3_cpu::plans)";
+    if (!Dsv41Shape::kBuilt)
+        return "plan dsv41 is not built: it needs residual activations in 128-wide blocks (ACT_ROWS 2, act block 128)";
+    if (kernel_isa() < Dsv41Shape::kMinIsa) return "plan dsv41 needs AVX-512BW, above the kernel's ISA tier";
+    if (!Dsv41Shape::matches(l, p))
+        return "plan dsv41 does not accept the layer: it runs hidden 5120, intermediate 2304, act_limit 10, 3-bit "
+               "gate/up and down, unswizzled";
+    return nullptr;
 }
 
 }  // namespace

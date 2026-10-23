@@ -216,7 +216,7 @@ def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
     check_table_tensors now runs before tables_from and refuses a 5-wide slabs table on shape alone, naming the
     tensor (Ruling 3's verify_named prefix), so tables_from's own "6 names" message is never reached."""
     s = ram_miss_setup(tmp_path)
-    narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:5])
+    narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:, :5])
     with pytest.raises(RuntimeError, match="^slabs: "):
         expert_stream_transport.read_rows_once(narrow, row=0, experts=[0], slots=[0])
 

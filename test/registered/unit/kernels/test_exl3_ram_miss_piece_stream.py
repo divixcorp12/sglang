@@ -107,7 +107,7 @@ def _assert_geometry(tables, row, expert):
         assert [s["dest"] for s in mine] == [dest + sum(m["length"] for m in mine[:i]) for i in range(len(mine))]
         assert sum(s["length"] for s in mine) == max(length, 0)
     start = int(tables.starts[row, expert])
-    segments = tables.segments.tolist()
+    segments = tables.segments[row].tolist()
     for i, (_name, dst, src, nbytes) in enumerate(segments):
         runs = [piece["runs"][i] for piece in pieces]
         # A partition of the segment, in piece order.
@@ -192,9 +192,9 @@ def _synthetic_tables(seed, *, experts=8, parts=2):
         extents=extents,
         starts=starts,
         file_sizes=torch.tensor([last_end] * parts, dtype=torch.int64),  # the last row's tail is past EOF
-        segments=torch.tensor(segments, dtype=torch.int64),
+        segments=torch.tensor([segments] * layers, dtype=torch.int64),
         slabs=torch.zeros((layers, names), dtype=torch.int64),
-        row_bytes=torch.tensor([max(d, 1) for d in dst], dtype=torch.int64),
+        row_bytes=torch.tensor([[max(d, 1) for d in dst]] * layers, dtype=torch.int64),
         paths=[f"/nonexistent/{p}" for p in range(parts)],
         source_paths=["/nonexistent/source"] * parts,
         slot_bytes=slot_bytes,
@@ -232,13 +232,13 @@ def _one_row_tables(part_pages):
     for p, pages in enumerate(part_pages):
         extents[0, 0, p] = torch.tensor([p, dest, pages * PAGE, dest])
         dest += pages * PAGE
-    row_bytes = torch.zeros((names,), dtype=torch.int64)
-    row_bytes[0] = total
+    row_bytes = torch.zeros((1, names), dtype=torch.int64)
+    row_bytes[0, 0] = total
     return SimpleNamespace(
         extents=extents,
         starts=torch.zeros((1, 1), dtype=torch.int64),
         file_sizes=torch.tensor([total] * parts, dtype=torch.int64),
-        segments=torch.tensor([(0, 0, 0, total)], dtype=torch.int64),
+        segments=torch.tensor([[(0, 0, 0, total)]], dtype=torch.int64),
         slabs=torch.zeros((1, names), dtype=torch.int64),
         row_bytes=row_bytes,
         paths=[f"/nonexistent/{p}" for p in range(parts)],
