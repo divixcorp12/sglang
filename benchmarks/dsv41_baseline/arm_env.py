@@ -522,7 +522,9 @@ def prod_dspark_env() -> dict[str, str]:
         "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "1",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "gpu",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON": "2",
-        "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": PROD_RAM_PREFETCH_LEARNED_HEAD,
+        # Off (native candidate select) since the 1017 checkpoint: the head was trained on the old model's routes.
+        # Owner, 2026-10-23; restore PROD_RAM_PREFETCH_LEARNED_HEAD once a head is refit on 1017.
+        "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": "",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "2",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN": "1",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE": "2",

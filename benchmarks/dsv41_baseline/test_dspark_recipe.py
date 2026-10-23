@@ -173,14 +173,14 @@ PREFETCH_PREFIXES = (
 )
 
 
-def test_prod_serves_the_best_arms_prefetch_with_the_checksummed_head():
+def test_prod_serves_the_best_arms_prefetch_with_the_head_off_until_refit():
     env = arm_env.prod_env()
     prefetch = {k: v for k, v in env.items() if k.startswith(PREFETCH_PREFIXES)}
     head = prefetch.pop("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD")
     legacy = "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES"
     assert {**prefetch, legacy: env[legacy]} == SERVED_PREFETCH
-    assert head == arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD
-    assert head.startswith("/data/models/slang/prod-assets/") and len(arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) == 64
+    # The head was trained on the pre-1017 model's routes; "" is the native candidate select.
+    assert head == ""
     # The arms keep their own: dspark_env() states no prefetch.
     assert not any(k.startswith(PREFETCH_PREFIXES) for k in arm_env.dspark_env())
 
