@@ -2,7 +2,7 @@
 
 Arms, each a fresh Engine (shut down before the next), with its own environment
 (the scheduler subprocess inherits os.environ, so each run sets it first):
-  eager   - no CUDA graphs, SGLANG_MOE_EXPERT_GRAPH_GATHER=0 (the exl3_moe_loop path);
+  eager   - no CUDA graphs, SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0 (the exl3_moe_loop path);
   graph   - breakable decode graph at bs 1; graph gather as --graph-gather says;
   debug   - (--debug-arm) the graph arm with --debug-cuda-graph: the whole forward runs
             as one eager break (graph gather on). Replay runs with capture mode off, so
@@ -57,7 +57,7 @@ def run_env(arm: str, graph_gather: bool) -> dict[str, str]:
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}")
     on = arm == "debug" or (arm == "graph" and graph_gather)
-    return {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "1" if on else "0"}
+    return {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1" if on else "0"}
 
 
 def overlap_env(overlap: bool) -> dict[str, str]:

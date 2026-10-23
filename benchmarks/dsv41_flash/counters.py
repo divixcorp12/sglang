@@ -1,7 +1,7 @@
 """The RAM-miss service counters of a run, and the check that the lease path really ran.
 
 The service lives in the scheduler subprocess, so an Engine's driver cannot call service.host.counters() the way
-open11_serving_path.py does. The stream trace (SGLANG_DSV41_EXPERT_TRACE_PATH) is the channel that exists: each
+open11_serving_path.py does. The stream trace (SGLANG_EXPERT_STREAM_TRACE, key expert_path) is the channel that exists: each
 decode graph step appends a line carrying the service's cumulative counters, line-buffered because the scheduler
 is SIGKILLed at Engine shutdown. Tracing also turns on the service's stage timestamps in both arms.
 """

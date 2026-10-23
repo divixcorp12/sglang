@@ -15,13 +15,12 @@ The record layout is ``residency_capture_ref``'s. One record per forward, in ``s
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.layers.moe.dsv41_strata import stratum
 from sglang.srt.layers.moe.residency_capture_ref import HORIZONS, MASK_WORDS, VALIDITY_RULE
 
 
@@ -47,16 +46,19 @@ class ResidencyRecords(msgspec.Struct, frozen=True):
     keys: Any  # int64 [records, 3]: seq, pass id, live tokens
 
 
-def residency_rows(layer_ids: Sequence[int], *, gates: Mapping[int, Any]) -> list[ResidencyRow]:
+def residency_rows(
+    layer_ids: Sequence[int], *, gates: Mapping[int, Any], strata: Callable[[int], str]
+) -> list[ResidencyRow]:
     """The header entry of each map row; ``gates`` is ``ram_prefetch.registered_gates()``, and a row without a
-    registered gate (or with a hash-routed one, bias None) has no correction bias."""
+    registered gate (or with a hash-routed one, bias None) has no correction bias. ``strata`` is the model
+    profile's layer-stratum labeller."""
     rows = []
     for layer in layer_ids:
         gate = gates.get(int(layer))
         rows.append(
             ResidencyRow(
                 layer_id=int(layer),
-                stratum=stratum(int(layer)),
+                stratum=strata(int(layer)),
                 gate_has_bias=gate is not None and gate.bias is not None,
             )
         )

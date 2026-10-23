@@ -11,13 +11,30 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
-from sglang.srt.models.deepseek_v4_exl3_weights import (
-    is_streamed_expert_weight,
-    streamed_expert_skip_hook,
-)
+from sglang.srt.layers.moe.expert_engine.formats import get_format
+from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+PROFILE = get_profile_by_name("dsv41")
+
+
+def _format_of(quant_method):
+    """The expert format a checkpoint's quant method names: only "exl3" has one."""
+    return get_format("exl3") if quant_method == "exl3" else None
+
+
+def is_streamed_expert_weight(name, quant_method, streaming):
+    return PROFILE.is_streamed_expert_weight(
+        name, streaming=streaming, expert_format=_format_of(quant_method)
+    )
+
+
+def streamed_expert_skip_hook(quant_method, streaming):
+    return PROFILE.streamed_weight_skip_hook(
+        streaming=streaming, expert_format=_format_of(quant_method)
+    )
 
 
 def _shard(tmp_path):

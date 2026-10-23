@@ -46,7 +46,7 @@ def arm(args):
     cores = list(range(6, 16)) if args.group == 0 else list(range(18, 28))
     # Allocate/fill tensors on this group's node, before the team pins worker 0.
     os.sched_setaffinity(0, {cores[0]})
-    os.environ["EXL3_MOE_CPU_MAX_ISA"] = "bw"
+    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = "bw"
     import torch
     import sglang
     import exl3_cpu_forward_ab as fixture
@@ -77,7 +77,7 @@ def arm(args):
         "measurement": args.measurement, "reps": args.reps, "warmups": args.warmups,
         "weight_capacity": CAPACITY, "weight_bytes": weight_bytes,
         "policy": {k: os.environ.get(k) for k in ("OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "OMP_NUM_THREADS")},
-        "trace_prefix": os.environ.get("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX"),
+        "trace_prefix": json.loads(os.environ.get("SGLANG_EXPERT_STREAM_TRACE") or "{}").get("cpu_worker", {}).get("prefix"),
         "tid": __import__("threading").get_native_id(),
         "case_order_seed": 619,
         "library": ext.__file__,
@@ -152,11 +152,11 @@ def matrix(args):
     # Import/build environment from the previous diagnostic arm, stripping its tracing settings.
     env = {**os.environ, **reference}
     for key in tuple(env):
-        if key.startswith(("SGLANG_DSV41_EXPERT_JOB_TRACE", "SGLANG_EXL3_CPU_WORKER_TRACE")) or key == "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE":
+        if key == "SGLANG_EXPERT_STREAM_TRACE":
             env.pop(key)
     root = Path(__file__).resolve().parents[3]
     env.update(PYTHONPATH=str(root / "python"), OMP_NUM_THREADS="10", MKL_NUM_THREADS="1",
-               OPENBLAS_NUM_THREADS="1", MAX_JOBS="4", EXL3_MOE_CPU_PIN="0",
+               OPENBLAS_NUM_THREADS="1", MAX_JOBS="4", SGLANG_EXL3_MOE_CPU_PIN="0",
                SGLANG_EXL3_BUILD_DIR=str(args.output / "exl3-build"))
     # Reuse CUDA build artifacts, never copy a source checkout. Changed CPU sources are rebuilt by ninja.
     if not args.prebuilt_base:
@@ -179,10 +179,9 @@ def matrix(args):
                     if policy == "bounded-spin":
                         arm_env.update(OMP_WAIT_POLICY="ACTIVE", GOMP_SPINCOUNT="100000")
                     if trace:
-                        arm_env.update(SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=str(args.output / "unused-job-events"),
-                                       SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=str(args.output / name),
-                                       SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US="0",
-                                       SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="131072")
+                        arm_env.update(SGLANG_EXPERT_STREAM_TRACE=json.dumps({
+                            "job": {"prefix": str(args.output / "unused-job-events")},
+                            "cpu_worker": {"prefix": str(args.output / name), "min_us": 0, "capacity": 131072}}))
                     command = [sys.executable, __file__, "arm", "--measurement", measurement,
                                "--group", str(group), "--reps", str(args.reps), "--warmups", "5",
                                "--output", str(args.output / f"{name}.json")]

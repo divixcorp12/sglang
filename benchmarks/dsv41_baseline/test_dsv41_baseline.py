@@ -172,7 +172,7 @@ def test_verify_env_passes_when_actual_matches_expected():
 
 def test_verify_env_raises_on_a_silently_unset_flag():
     with pytest.raises(tenancy.EnvVerificationError):
-        tenancy.verify_env(actual={}, expected={"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": "1"})
+        tenancy.verify_env(actual={}, expected={"SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS": "1"})
 
 
 def test_parse_proc_environ_splits_nul_separated_kv():
@@ -584,8 +584,8 @@ def test_merge_sessions_tolerates_missing_side_data():
 
 
 SERVER_ENV = {
-    "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
+    "SGLANG_EXPERT_STREAM_FILE_READER": "uring_direct",
+    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1",
     "PYTHONPATH": "/x/python",
 }
 
@@ -618,17 +618,17 @@ def test_build_report_puts_the_servers_env_where_check_arm_reads_it():
     report = _build(
         harness_provenance={
             "git": {"head": "abc"},
-            "sglang_env": {"SGLANG_MOE_EXPERT_FILE_READER": "mmap"},
-            "sglang_env_resolved": {"SGLANG_MOE_EXPERT_FILE_READER": "mmap"},
+            "sglang_env": {"SGLANG_EXPERT_STREAM_FILE_READER": "mmap"},
+            "sglang_env_resolved": {"SGLANG_EXPERT_STREAM_FILE_READER": "mmap"},
             "sglang_file": "/harness/python/sglang/__init__.py",
         },
-        server_env_actual={**SERVER_ENV, "SGLANG_MOE_EXPERT_MIRROR_DIRS": "/mnt/nvme0/x:/mnt/nvme4/x"},
+        server_env_actual={**SERVER_ENV, "SGLANG_EXPERT_STREAM_MIRROR": json.dumps({"dirs": "/mnt/nvme0/x:/mnt/nvme4/x"})},
     )
     prov = report["provenance"]
-    assert prov["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "uring_direct"
-    assert prov["sglang_env"]["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == "/mnt/nvme0/x:/mnt/nvme4/x"
+    assert prov["sglang_env"]["SGLANG_EXPERT_STREAM_FILE_READER"] == "uring_direct"
+    assert json.loads(prov["sglang_env"]["SGLANG_EXPERT_STREAM_MIRROR"])["dirs"] == "/mnt/nvme0/x:/mnt/nvme4/x"
     # the harness's own values are kept, but not where they can be mistaken for the server's
-    assert prov["harness_process"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "mmap"
+    assert prov["harness_process"]["sglang_env"]["SGLANG_EXPERT_STREAM_FILE_READER"] == "mmap"
     assert prov["harness_process"]["sglang_file"] == "/harness/python/sglang/__init__.py"
 
 
@@ -721,7 +721,7 @@ def test_server_env_problems_is_silent_on_a_correctly_configured_server():
 
 def test_server_env_problems_catches_the_wrong_reader():
     report = _sample_report()
-    report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] = "mmap"
+    report["provenance"]["sglang_env"]["SGLANG_EXPERT_STREAM_FILE_READER"] = "mmap"
     [problem] = verdict.server_env_problems(report, root="/x")
     assert "mmap" in problem and "page cache" in problem
 
@@ -730,14 +730,14 @@ def test_server_env_problems_separates_unset_from_wrong():
     """An unset knob is a default applied inside a process this harness cannot read. Reporting it
     as a wrong value would be the same mistake, one layer down."""
     report = _sample_report()
-    del report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"]
+    del report["provenance"]["sglang_env"]["SGLANG_EXPERT_STREAM_FILE_READER"]
     [problem] = verdict.server_env_problems(report, root="/x")
     assert "is unset in the server" in problem
 
 
 def test_server_env_problems_catches_a_falsy_graph_gather():
     report = _sample_report()
-    report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = "0"
+    report["provenance"]["sglang_env"]["SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"] = "0"
     [problem] = verdict.server_env_problems(report, root="/x")
     assert "in-graph reader" in problem
 
@@ -745,7 +745,7 @@ def test_server_env_problems_catches_a_falsy_graph_gather():
 def test_server_env_problems_accepts_the_other_true_spellings():
     for spelling in ("1", "true", "TRUE", "yes", "on"):
         report = _sample_report()
-        report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = spelling
+        report["provenance"]["sglang_env"]["SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"] = spelling
         assert verdict.server_env_problems(report, root="/x") == [], spelling
 
 
@@ -767,12 +767,12 @@ def test_judge_acknowledges_only_the_unknowable_form_of_each_server_check():
     """check_arm's four unanswerable-over-HTTP checks are acknowledged; the measured stand-ins
     are not, so a genuinely misconfigured server still reads unacknowledged-INVALID."""
     report = _sample_report()
-    report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] = "mmap"
+    report["provenance"]["sglang_env"]["SGLANG_EXPERT_STREAM_FILE_READER"] = "mmap"
     fake = _FakeTask1Verdict(problems=[
         "imported sglang from None, not /x/python/sglang",
         "provenance fields unavailable: ['sglang_env_resolved', 'sglang_file']",
-        "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
-        "SGLANG_MOE_EXPERT_GRAPH_GATHER did not resolve to true: this is not the in-graph reader",
+        "SGLANG_EXPERT_STREAM_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
+        "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER did not resolve to true: this is not the in-graph reader",
     ])
     result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
     assert len(result["acknowledged_problems"]) == 4
@@ -783,7 +783,7 @@ def test_judge_acknowledges_only_the_unknowable_form_of_each_server_check():
 
 def test_judge_is_clean_when_the_server_env_answers_the_acknowledged_checks():
     fake = _FakeTask1Verdict(problems=[
-        "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
+        "SGLANG_EXPERT_STREAM_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
     ])
     result = verdict.judge(_sample_report(), root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
     assert result["unacknowledged_problems"] == []
@@ -1054,7 +1054,7 @@ def test_server_args_includes_decode_log_interval_when_set():
 
 def test_base_env_launches_the_lease_chain_with_pdl():
     env = arm_env.base_env()
-    assert env["SGLANG_DSV41_ENABLE_LEASE_PDL"] == "1"
+    assert env["SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL"] == "1"
     # Lease mode, row images and the packed path's workers are no longer knobs (2026-09-29): a set value only warns,
     # so the recipe sets none of them.
     for removed in (
@@ -1066,15 +1066,16 @@ def test_base_env_launches_the_lease_chain_with_pdl():
 
 
 def test_base_env_mirrors_expert_rows_by_default():
-    assert arm_env.base_env()["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == arm_env.EXPERT_MIRROR_DIRS
+    mirror = json.loads(arm_env.base_env()["SGLANG_EXPERT_STREAM_MIRROR"])
+    assert mirror["dirs"] == arm_env.EXPERT_MIRROR_DIRS
 
 
 def test_base_env_enables_fused_expert_plan_with_direct_insertion():
     defaults = arm_env.base_env()
-    assert defaults["SGLANG_MOE_EXPERT_FUSED_PLAN"] == "1"
-    assert defaults["SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"] == "2"
-    assert arm_env.arm_env({"SGLANG_MOE_EXPERT_FUSED_PLAN": "0"})[
-        "SGLANG_MOE_EXPERT_FUSED_PLAN"
+    assert defaults["SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"] == "1"
+    assert defaults["SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE"] == "2"
+    assert arm_env.arm_env({"SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN": "0"})[
+        "SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"
     ] == "0"
 
 
@@ -1088,17 +1089,17 @@ def test_default_mirror_roots_are_three_absolute_paths_on_distinct_drives():
 
 def test_an_arm_turns_mirroring_off_with_an_empty_override():
     # Not by dropping the key: base_env always supplies one, so the empty string is the
-    # only way off, and exl3_expert_format.exl3_mirror_config reads it as off.
-    env = arm_env.arm_env({"SGLANG_MOE_EXPERT_MIRROR_DIRS": ""})
-    assert env["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == ""
+    # only way off, and expert_engine.formats.exl3.exl3_mirror_config reads it as off.
+    env = arm_env.arm_env({"SGLANG_EXPERT_STREAM_MIRROR": json.dumps({"dirs": ""})})
+    assert json.loads(env["SGLANG_EXPERT_STREAM_MIRROR"])["dirs"] == ""
 
 
 def test_the_verdicts_mirror_flag_follows_the_value_not_the_key():
     # The expression under test is run_arm.sh's, kept in sync by hand; a key-presence
     # test would call an unmirrored arm mirrored now that base_env always sets the key.
-    mirror = lambda env: bool(env.get("SGLANG_MOE_EXPERT_MIRROR_DIRS"))
+    mirror = lambda env: bool(json.loads(env.get("SGLANG_EXPERT_STREAM_MIRROR", "{}")).get("dirs"))
     assert mirror(arm_env.base_env()) is True
-    assert mirror(arm_env.arm_env({"SGLANG_MOE_EXPERT_MIRROR_DIRS": ""})) is False
+    assert mirror(arm_env.arm_env({"SGLANG_EXPERT_STREAM_MIRROR": json.dumps({"dirs": ""})})) is False
 
 
 # --- arm_env: the server's cores stay on NUMA node 0 (the 2026-09-22 startup hang) ---
@@ -1163,7 +1164,7 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     topology = _divix01_topology(tc, tmp_path)
     config = tc.ThreadingConfig.resolve(
         nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES),
-        topology=topology, settings=tc.CoreSettings(spin_core=arm_env.SPIN_CORE),
+        topology=topology, settings=tc.CoreSettings(numa_cores=arm_env.base_env()["SGLANG_EXPERT_STREAM_NUMA_CORES"]),
     )
     assert config.plans[0].ram == arm_env.SPIN_CORE and config.plans[0].busy_poll
     taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES)
@@ -1173,7 +1174,7 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     for plan in config.plans:
         ram = topology.siblings[plan.ram]
         assert not (ram & _cores(arm_env.FREE_CORES)), (plan.ram, sorted(ram & _cores(arm_env.FREE_CORES)))
-    assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
+    assert f"ram={arm_env.SPIN_CORE}" in arm_env.base_env()["SGLANG_EXPERT_STREAM_NUMA_CORES"]
 
 
 def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_server_and_driver(tmp_path):
@@ -1181,12 +1182,14 @@ def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_serv
     # expert-stream thread (engine, RAM, copy) shares a physical core with the server or the benchmark driver.
     tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
     env = arm_env.base_env()
-    assert env["SGLANG_DSV41_CPU_EXPERTS"] == "1" and env["EXL3_MOE_CPU_PIN"] == "0"
-    threads = int(env["SGLANG_DSV41_CPU_EXPERTS_THREADS"])
+    assert env["SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"] == "1" and env["SGLANG_EXL3_MOE_CPU_PIN"] == "0"
+    threads = int(env["SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS"])
     topology = _divix01_topology(tc, tmp_path)
     config = tc.ThreadingConfig.resolve(
         nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES), topology=topology,
-        settings=tc.CoreSettings(cpu_experts=True, threads=threads, spin_core=arm_env.SPIN_CORE),
+        settings=tc.CoreSettings(
+            cpu_experts=True, threads=threads, numa_cores=env["SGLANG_EXPERT_STREAM_NUMA_CORES"]
+        ),
     )
     assert [plan.threads for plan in config.plans] == [threads] * len(_recipe_nodes())
     busy = {c for plan in config.plans for c in plan.cores()} | set(config.copy_cpus)
@@ -1204,7 +1207,7 @@ def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_serv
 
 @pytest.mark.parametrize("smt", [False, True], ids=["cores", "smt"])
 def test_the_recipes_expert_pools_with_or_without_siblings_leave_the_driver_helpers_server_and_free_cores(tmp_path, smt):
-    # The recipe's 16 experts per node (6-21, 28-43), and with SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT their siblings
+    # The recipe's 16 experts per node (6-21, 28-43), and with SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT their siblings
     # (62-77, 84-99): no CPU of a pool, the RAM or copy thread, or a sibling of one, is the server's, the driver's, a
     # helper's or a FREE core. Mutant: DRIVER_CORES back at 18-21 -- red (experts 18-21).
     tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
@@ -1212,7 +1215,8 @@ def test_the_recipes_expert_pools_with_or_without_siblings_leave_the_driver_help
     config = tc.ThreadingConfig.resolve(
         nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES), topology=topology,
         settings=tc.CoreSettings(
-            cpu_experts=True, threads=arm_env.CPU_EXPERTS_THREADS, smt=smt, spin_core=arm_env.SPIN_CORE
+            cpu_experts=True, threads=arm_env.CPU_EXPERTS_THREADS, smt=smt,
+            numa_cores=arm_env.base_env()["SGLANG_EXPERT_STREAM_NUMA_CORES"],
         ),
     )
     assert [plan.threads for plan in config.plans] == [arm_env.CPU_EXPERTS_THREADS * (2 if smt else 1)] * 2
@@ -1266,20 +1270,20 @@ def test_run_arm_pins_the_server_with_arm_envs_core_list_not_a_literal():
 
 
 def test_base_env_uses_the_declared_pinned_host_budget():
-    assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_MB"] == arm_env.PINNED_HOST_MB
+    assert arm_env.base_env()["SGLANG_EXPERT_STREAM_PINNED_HOST_MB"] == arm_env.PINNED_HOST_MB
 
 
 def test_engram_host_node_defaults_on_while_async_scores_stay_off_in_gpu_residency_mode():
     defaults = arm_env.base_env()
-    assert defaults["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
+    assert defaults["SGLANG_EXPERT_STREAM_ENABLE_ASYNC_RESIDENCY_SCORES"] == "0"
     assert defaults["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] == "1"
     off_arm = arm_env.arm_env(
         {"SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "0"}
     )
-    assert off_arm["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
+    assert off_arm["SGLANG_EXPERT_STREAM_ENABLE_ASYNC_RESIDENCY_SCORES"] == "0"
     assert off_arm["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] == "0"
-    assert off_arm["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "1"
-    assert off_arm["SGLANG_MOE_HOT_DYNAMIC"] == "1"
+    assert off_arm["SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"] == "1"
+    assert off_arm["SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC"] == "1"
 
 
 def _placement():
@@ -1302,7 +1306,7 @@ def test_pinned_buffer_share_and_weights_fit_in_node_0s_free_memory():
 def test_the_numa_placement_is_in_the_env_and_sums_to_the_budget():
     # The loader refuses a placement that disagrees with the budget, so a recipe
     # edit that changes one without the other could not start.
-    assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_NUMA_MB"] == arm_env.PINNED_HOST_NUMA_MB
+    assert arm_env.base_env()["SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB"] == arm_env.PINNED_HOST_NUMA_MB
     assert sum(_placement().values()) == int(arm_env.PINNED_HOST_MB)
 
 
@@ -1315,7 +1319,7 @@ def _run_arm_script():
 
 def test_nsys_graph_trace_defaults_to_graph():
     assert nsys_capture.graph_trace_mode(None, {}) == "graph"
-    off = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "0"})
+    off = arm_env.arm_env({"SGLANG_EXPERT_STREAM_COPY_MODE": "sm_copy"})
     assert nsys_capture.graph_trace_mode("", off) == "graph"
 
 
@@ -1326,14 +1330,14 @@ def test_nsys_graph_trace_default_is_refused_for_the_default_arm():
 
 
 def test_nsys_graph_trace_accepts_node_with_or_without_the_copy_engine():
-    on = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "1"})
+    on = arm_env.arm_env({"SGLANG_EXPERT_STREAM_COPY_MODE": "copy_engine"})
     assert nsys_capture.graph_trace_mode("node", on) == "node"
     assert nsys_capture.graph_trace_mode("node", arm_env.base_env()) == "node"
 
 
-@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "y"])
+@pytest.mark.parametrize("value", ["copy_engine"])
 def test_nsys_graph_trace_refuses_graph_with_the_copy_engine_on(value):
-    env = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": value})
+    env = arm_env.arm_env({"SGLANG_EXPERT_STREAM_COPY_MODE": value})
     with pytest.raises(ValueError, match="deadlocks"):
         nsys_capture.graph_trace_mode("graph", env)
     with pytest.raises(ValueError, match="deadlocks"):
@@ -1341,7 +1345,7 @@ def test_nsys_graph_trace_refuses_graph_with_the_copy_engine_on(value):
 
 
 def test_nsys_graph_trace_allows_graph_with_the_copy_engine_off():
-    env = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "0"})
+    env = arm_env.arm_env({"SGLANG_EXPERT_STREAM_COPY_MODE": "sm_copy"})
     assert nsys_capture.graph_trace_mode("graph", env) == "graph"
 
 

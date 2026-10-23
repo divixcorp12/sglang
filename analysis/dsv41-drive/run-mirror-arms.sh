@@ -3,7 +3,7 @@
 #
 # Why revised: exl3_ram_miss_tables() builds its path table straight from
 # layout.records[].path, so the native (graph) RAM-miss reader never sees
-# SGLANG_MOE_EXPERT_MIRROR_DIRS. The mirror source is only reachable on the
+# the `dirs` of SGLANG_EXPERT_STREAM_MIRROR. The mirror source is only reachable on the
 # eager row-source path. These arms measure that directly instead of assuming
 # it: per-drive sectors-read across each run is the evidence.
 #
@@ -57,13 +57,13 @@ run_arm() {
 
   local mirror_env=()
   if [ -n "$mirror" ]; then
-    mirror_env=(SGLANG_MOE_EXPERT_MIRROR_DIRS="$mirror")
+    mirror_env=(SGLANG_EXPERT_STREAM_MIRROR="{\"dirs\": \"$mirror\"}")
   fi
 
   local t0 t1
   t0=$(date +%s.%N)
   $ANA/gpu-run.sh env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
-    SGLANG_MOE_EXPERT_GRAPH_GATHER="$gather" \
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="$gather" \
     "${mirror_env[@]}" \
     "$PY" scripts/dsv41/trace_corpus.py \
     --model "$FULL" \

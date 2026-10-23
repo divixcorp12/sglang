@@ -49,10 +49,12 @@ def write_sessions(corpus: str, out: str, *, skip: int, n: int) -> str:
 def server_env(out_dir: str) -> dict:
     return arm_env.arm_env({
         **arm_env.dspark_env(),
-        "SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(out_dir, "trace.jsonl"),
-        "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(out_dir, "router"),
-        # The served RAM-miss counters the replay's tier model is validated against.
-        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out_dir, "metrics.jsonl"),
+        # The served RAM-miss counters (hot_metrics_file) the replay's tier model is validated against.
+        "SGLANG_EXPERT_STREAM_TRACE": json.dumps({
+            "expert_path": os.path.join(out_dir, "trace.jsonl"),
+            "router_capture_path": os.path.join(out_dir, "router"),
+            "hot_metrics_file": os.path.join(out_dir, "metrics.jsonl"),
+        }),
     })
 
 

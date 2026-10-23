@@ -162,7 +162,7 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
 
     def _finalize(self, layer):
         with (
-            patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}),
+            patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}),
             patch.object(modelopt_quant, "get_moe_runner_backend", _backend),
             patch.object(
                 modelopt_quant,
@@ -178,8 +178,8 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "SGLANG_MOE_EXPERT_STREAM": "1",
-                "SGLANG_MOE_EXPERT_FILE_DIR": directory,
+                "SGLANG_EXPERT_STREAM_ENABLE": "1",
+                "SGLANG_EXPERT_STREAM_FILE_CACHE_DIR": directory,
             },
         ):
             offloader.maybe_offload_to_cpu(layer)
@@ -364,7 +364,7 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
         layer = _finalization_layer()
 
         with (
-            patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}),
+            patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}),
             patch.object(modelopt_quant, "get_moe_runner_backend", _backend),
             patch.object(
                 modelopt_quant.ModelOptNvFp4FusedMoEMethod,
@@ -479,7 +479,7 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
         layer.moe_ep_size = 2
 
         with (
-            patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}),
+            patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}),
             patch.object(modelopt_quant, "get_moe_runner_backend", _backend),
             patch.object(
                 modelopt_quant.ModelOptNvFp4FusedMoEMethod,
@@ -540,7 +540,7 @@ class TestStreamingCompatibilityGuards(unittest.TestCase):
         layer.num_experts = 4
         layer.moe_runner_config = method.moe_runner_config
         with (
-            patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}),
+            patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}),
             patch.object(modelopt_quant, "get_moe_runner_backend", _backend),
             patch.object(
                 modelopt_quant,

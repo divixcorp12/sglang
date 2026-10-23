@@ -19,12 +19,14 @@ def _session(sid, turns=2):
 
 def test_the_server_env_is_the_misscut_arm_with_prefetch_off_and_the_capture_files(tmp_path):
     env = b0.server_env(str(tmp_path))
-    assert env["SGLANG_DSV41_RAM_PREFETCH"] == "0"
-    assert env["SGLANG_DSV41_CPU_SPLIT_MISS_CUT"] == "1"
-    assert env["SGLANG_DSV41_RESIDENCY_CAPTURE"] == "1"
-    assert env["SGLANG_DSV41_ROUTER_CAPTURE_PATH"] == str(tmp_path / "router")
-    assert env["SGLANG_DSV41_EXPERT_TRACE_PATH"] == str(tmp_path / "trace.jsonl")
-    assert env["SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH"] == str(tmp_path / "verify-accept")
+    assert env["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == "0"
+    assert json.loads(env["SGLANG_EXPERT_STREAM_CPU_SPLIT"])["miss_cut"] == 1
+    trace = json.loads(env["SGLANG_EXPERT_STREAM_TRACE"])
+    assert trace["residency_capture"] is True
+    assert trace["router_capture_path"] == str(tmp_path / "router")
+    assert trace["expert_path"] == str(tmp_path / "trace.jsonl")
+    assert trace["verify_accept_path"] == str(tmp_path / "verify-accept")
+    assert trace["hot_metrics_file"] == str(tmp_path / "metrics.jsonl")
 
 
 def test_rids_map_to_session_turn_and_split():

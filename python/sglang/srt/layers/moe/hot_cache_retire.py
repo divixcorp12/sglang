@@ -70,9 +70,9 @@ class RetireRefused(RuntimeError):
 
 
 def _service():
-    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
 
-    return Exl3RamMissService._instance
+    return ExpertEngineService._instance
 
 
 def census_error(manager, *, service: Any = "auto") -> Optional[str]:

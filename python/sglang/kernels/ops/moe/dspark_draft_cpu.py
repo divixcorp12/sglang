@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -80,13 +81,18 @@ class DraftCpuAreas:
         self.out = _pinned_zeros((stages, w.max_rows, hidden), torch.float32, pin)
 
 
+def device_module(config: Optional[ExpertStreamConfig] = None) -> Module:
+    """The draft channel's kernels (draft_kernels.cuh); with a job trace (``config``'s ``trace.job.prefix``, default
+    ``stream_config()``), the build that stamps request times."""
+    return _device_module_cached(bool((config or stream_config()).trace.job.prefix))
+
+
 @cache_once
-def device_module() -> Module:
-    """The draft channel's kernels (draft_kernels.cuh)."""
+def _device_module_cached(request_trace: bool) -> Module:
     return load_jit(
         "dspark_draft_channel",
         cuda_files=["moe/expert_stream/draft_kernels.cuh"],
-        extra_cuda_cflags=["-DSGLANG_DRAFT_REQUEST_TRACE=1"] if os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX") else [],
+        extra_cuda_cflags=["-DSGLANG_DRAFT_REQUEST_TRACE=1"] if request_trace else [],
         cuda_wrappers=[
             ("post", "expert_stream::draft::DraftChannelKernels::post"),
             ("finish", "expert_stream::draft::DraftChannelKernels::finish"),
@@ -121,14 +127,17 @@ class DraftCpuDevice:
     """The device side: `state` int32 [6] on the GPU (the channel's words), `on_cpu` uint8 [stages, E] (which experts
     of each stage the host computes)."""
 
-    def __init__(self, areas: DraftCpuAreas, on_cpu: torch.Tensor, device):
+    def __init__(
+        self, areas: DraftCpuAreas, on_cpu: torch.Tensor, device, config: Optional[ExpertStreamConfig] = None
+    ):
         if on_cpu.dim() != 2 or on_cpu.shape[0] != areas.stages:
             raise ValueError(f"on_cpu must be [stages={areas.stages}, experts], not {tuple(on_cpu.shape)}")
+        config = config or stream_config()
         self.areas, self.wire = areas, areas.wire
         self.state = torch.zeros(_STATE_WORDS, dtype=torch.int32, device=device)
         self.on_cpu = on_cpu.to(device=device, dtype=torch.uint8).contiguous()
-        self.module = device_module()
-        prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
+        self.module = device_module(config)
+        prefix = config.trace.job.prefix
         if prefix:
             # Calibration IO is initialization only, never post()/finish() or graph replay.
             anchor = calibrate_gpu_clock(self.module, self.state, str(prefix) + f".{os.getpid()}.draft-clock.json")
@@ -175,13 +184,14 @@ class DraftCpuHost:
         keep_warm_us: int,
         fatal_wait_s: float,
         variant: Optional[str] = None,
-        layout: str = "exl3",
+        layout: tuple[str, str] = ("exl3", "sqrt_softplus"),  # the transport build's (format, router) key
+        config: Optional[ExpertStreamConfig] = None,  # its module's C++ options; None is stream_config()
     ):
         from sglang.kernels.ops.moe import expert_stream_transport as ops
 
         self.areas = areas
         self._ops = ops
-        self._module = ops._host_module(layout, variant)
+        self._module = ops._host_module(layout, variant, config=config)
         self._keep: dict[int, tuple] = {}  # each stage's spec.keep: the slabs its layer reads
         self.handle = int(
             self._module.expert_stream_draft_cpu_open(

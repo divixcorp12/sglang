@@ -13,6 +13,11 @@ from sglang.srt.arg_groups.expert_stream_requirements import (
     expert_stream_requirements_for,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import (
+    CpuSplitConfig,
+    CpuTwoStageConfig,
+    MirrorConfig,
+)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -25,25 +30,35 @@ BREAKABLE_BS1 = CudaGraphConfig(
 
 # Plan Task 17's env.sh, less the paths: the dynamic arm.
 WINDOW_C_ENV = {
-    "SGLANG_DSV41_EXPERT_STREAM": True,
-    "SGLANG_MOE_EXPERT_ROW_SOURCE": "shards",
-    "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
-    "SGLANG_MOE_PINNED_HOST_MB": 71680,
-    "SGLANG_MOE_HOT_GPU_MB": 16384,
-    "SGLANG_MOE_HOT_DYNAMIC": True,
-    "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": 256,
-    "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": 32,
-    "SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS": 8,
-    "SGLANG_MOE_HOT_ASYNC_PROMOTIONS": False,
-    "SGLANG_MOE_HOT_LOG_INTERVAL": 64,
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER": False,
-    "SGLANG_MOE_GPU_RESIDENCY_UPDATE": False,
-    "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": 0,
+    "SGLANG_EXPERT_STREAM_ENABLE": True,
+    "SGLANG_EXPERT_STREAM_ROW_SOURCE": "shards",
+    "SGLANG_EXPERT_STREAM_FILE_READER": "uring_direct",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": 71680,
+    "SGLANG_EXPERT_STREAM_HOT_GPU_MB": 16384,
+    "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": True,
+    "SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS": 256,
+    "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS": 32,
+    "SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS": 8,
+    "SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS": False,
+    "SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL": 64,
+    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": False,
+    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": False,
+    "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES": 0,
 }
 
 
 # The residency the RAM-miss service needs: the in-graph updater at insert-on-miss stage 2.
-DIRECT = {"SGLANG_MOE_GPU_RESIDENCY_UPDATE": True, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 2}
+DIRECT = {"SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": True, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 2}
+
+
+MIRROR = "SGLANG_EXPERT_STREAM_MIRROR"
+CPU_SPLIT = "SGLANG_EXPERT_STREAM_CPU_SPLIT"
+CPU_TWO_STAGE = "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE"
+
+
+def _group(env, **members):
+    """A group env, whose value is one JSON object of its members."""
+    return {env: json.dumps(members)}
 
 
 @pytest.fixture
@@ -120,21 +135,21 @@ def test_the_removed_doorbell_variable_does_not_gate_an_exl3_launch(model_dir, m
 
 def test_window_c_launches_pass(model_dir):
     _gate(_launch(model_dir))  # dynamic residency, per-pass recorder
-    _gate(_launch(model_dir, expert_distribution_recorder_mode=None), SGLANG_MOE_HOT_DYNAMIC=False)  # static seeded arm
-    _gate(_launch(model_dir), SGLANG_MOE_HOT_GPU_MB=0)  # pinned tier only
+    _gate(_launch(model_dir, expert_distribution_recorder_mode=None), SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC=False)  # static seeded arm
+    _gate(_launch(model_dir), SGLANG_EXPERT_STREAM_HOT_GPU_MB=0)  # pinned tier only
 
 
 @pytest.mark.parametrize(
     "launch_changes, env_changes, match",
     [
-        ({}, {"SGLANG_DSV41_EXPERT_STREAM": False}, "requires SGLANG_DSV41_EXPERT_STREAM=1"),
-        ({}, {"SGLANG_MOE_PINNED_HOST_MB": 0, "SGLANG_MOE_EXPERT_HOST_ARENA": True}, "SGLANG_MOE_EXPERT_HOST_ARENA"),
+        ({}, {"SGLANG_EXPERT_STREAM_ENABLE": False}, "requires SGLANG_EXPERT_STREAM_ENABLE=1"),
+        ({}, {"SGLANG_EXPERT_STREAM_PINNED_HOST_MB": 0, "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA": True}, "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA"),
         ({"expert_distribution_recorder_mode": None}, {}, "stat or per_pass"),
         ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="full", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {}, "cannot run the Engram"),
         ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1, 2], max_bs=2), prefill=PhaseConfig(backend="disabled"))}, {}, "max batch size 1"),
         ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="breakable"))}, {}, "runs prefill eagerly"),
-        ({}, {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_MOE_HOT_ASYNC_PROMOTIONS"),
-        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_MOE_HOT_ASYNC_PROMOTIONS"),
+        ({}, {"SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS"),
+        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {"SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS"),
         ({"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1}, {}, "DSpark"),
     ],
 )
@@ -159,7 +174,7 @@ def test_dspark_speculation_passes_with_decode_disabled(model_dir):
 
 
 # DSpark's verify in the breakable decode graph (DSV41_REFERENCE.md §33.8): DIRECT residency at W miss lanes.
-GRAPHED_VERIFY = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 8}
+GRAPHED_VERIFY = {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": True, **DIRECT, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": 8}
 
 
 def test_dspark_verify_in_the_breakable_decode_graph_passes(model_dir):
@@ -170,19 +185,19 @@ def test_dspark_verify_in_the_breakable_decode_graph_passes(model_dir):
     "launch_changes, env_changes, match",
     [
         ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 65}, "MISS_LANES=1-64"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}, "INSERT_ON_MISS_STAGE=2"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False}, "SGLANG_MOE_EXPERT_GRAPH_GATHER=1"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": 65}, "MISS_LANES=1-64"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 1}, "INSERT_ON_MISS_STAGE=2"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": False}, "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1"),
         ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "SGLANG_DSV41_CPU_EXPERTS needs"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": True}, "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs"),
     ],
 )
 def test_a_graphed_dspark_verify_needs_its_configuration(model_dir, launch_changes, env_changes, match):
     launch = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1) | launch_changes
     with pytest.raises(ValueError, match=match) as raised:
         _gate(_launch(model_dir, **launch), **env_changes)
-    if match != "SGLANG_DSV41_CPU_EXPERTS needs":
+    if match != "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs":
         assert "--cuda-graph-backend-decode disabled" in str(raised.value)
 
 
@@ -225,26 +240,26 @@ def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(model_d
 
 
 def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, **DIRECT)
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True, **DIRECT)
     with pytest.raises(ValueError, match="GRAPH_GATHER"):
-        _gate(_launch(model_dir), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+        _gate(_launch(model_dir), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True)
     with pytest.raises(ValueError, match="PINNED_HOST_MB"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_PINNED_HOST_MB=0)
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True, SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0)
     with pytest.raises(ValueError, match="HOT_GPU_MB"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_HOT_GPU_MB=0)
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True, SGLANG_EXPERT_STREAM_HOT_GPU_MB=0)
 
 
 def test_only_exl3_direct_graph_gather_admits_gpu_residency_update(model_dir):
     direct = dict(
-        SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
-        SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
-        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+        SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=True,
+        SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2,
+        SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True,
     )
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **direct)
     with pytest.raises(ValueError, match="GPU_RESIDENCY_UPDATE"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1})
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 1})
     with pytest.raises(ValueError, match="GPU_RESIDENCY_UPDATE"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False})
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": False})
     with pytest.raises(ValueError, match="GRAPH_GATHER"):
         _gate(_launch(model_dir), **direct)
 
@@ -252,9 +267,9 @@ def test_only_exl3_direct_graph_gather_admits_gpu_residency_update(model_dir):
 @pytest.mark.parametrize(
     "off",
     [
-        {"SGLANG_MOE_GPU_RESIDENCY_UPDATE": False},
-        {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1},
-        {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 0},
+        {"SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": False},
+        {"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 1},
+        {"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 0},
     ],
     ids=["no_updater", "stage_1", "stage_0"],
 )
@@ -262,9 +277,9 @@ def test_graph_gather_needs_direct_residency(model_dir, off):
     """The RAM-miss service reads the VRAM-hot set from the DIRECT updater's records: no other residency mode feeds it.
     Mutation: the gate admits a graph-gather launch whose residency is not DIRECT."""
     direct = dict(
-        SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
-        SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
-        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+        SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=True,
+        SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2,
+        SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True,
     )
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **direct)
     with pytest.raises(ValueError, match="needs DIRECT residency.*GPU_RESIDENCY_UPDATE=1.*INSERT_ON_MISS_STAGE=2"):
@@ -277,7 +292,7 @@ def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model
     # CLI value (None for flag-only launches). That pass must not read it as eager
     # decode and refuse graph gather (the Task 16 option C Engine launch failed this way).
     raw = None
-    _gate(_launch(model_dir, cuda_graph_config=raw), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    _gate(_launch(model_dir, cuda_graph_config=raw), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True)
 
 
 class _PipelineStopped(Exception):
@@ -342,18 +357,18 @@ def test_a_flag_only_full_decode_graph_launch_passes_pass_one_and_is_refused_aft
     hooks = {"handle_cuda_graph_config": parse, "handle_offload_compatibility": offload}
     with pytest.raises(ValueError, match="cannot run the Engram"):
         _under_window_c_env(
-            {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True},
+            {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": True},
             lambda: _resolution_pipeline_hooks(args, hooks.get),
         )
     assert seen == ["offload passed", "parsed"]  # pass 1 accepted; pass 2 raised inside its own call
     # The parsed config alone is what refuses it: the same launch with the config already parsed.
     with pytest.raises(ValueError, match="cannot run the Engram"):
-        _gate(_launch(model_dir, cuda_graph_config=parsed), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+        _gate(_launch(model_dir, cuda_graph_config=parsed), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True)
 
 
 def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
     # The fused MoE's temp buffers are shared by every layer: sound only on one stream.
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, **DIRECT)
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True, **DIRECT)
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
@@ -369,24 +384,24 @@ if __name__ == "__main__":
 
 
 CPU_EXPERTS_ENV = dict(
-    SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
-    SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True,
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True,
+    SGLANG_EXPERT_STREAM_COPY_MODE="copy_engine",
     SGLANG_DSV41_ENABLE_LAYER_FUSION=True,
-    SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
-    SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
-    SGLANG_MOE_EXPERT_FUSED_PLAN=True,
-    SGLANG_DSV41_CPU_EXPERTS=True,
+    SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=True,
+    SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2,
+    SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN=True,
+    SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=True,
 )
 
 
-@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
+@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"])
 def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
     """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused
     MoE (layer fusion), not the lowest-scored misses (DIRECT residency's keys, which only the fused plan sorts by), or
     run on no cores; the refusal names the one that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
-    off = {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}.get(missing, False)
-    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
+    off = {"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 1, "SGLANG_EXPERT_STREAM_COPY_MODE": "sm_copy"}.get(missing, False)
+    with pytest.raises(ValueError, match=f"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs {missing}"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
 
 
@@ -397,9 +412,9 @@ def test_cpu_experts_without_direct_residency_are_refused(model_dir, update):
     With the residency update on, the update's own EXL3 rule would say to turn it off.
     The CPU-experts rule runs first and names what to set instead: the update on, at stage 2.
     """
-    env = {**CPU_EXPERTS_ENV, "SGLANG_MOE_GPU_RESIDENCY_UPDATE": update, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}
-    wanted = ("" if update else "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, ") + "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"
-    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {wanted}$") as refused:
+    env = {**CPU_EXPERTS_ENV, "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": update, "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 1}
+    wanted = ("" if update else "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1, ") + "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2"
+    with pytest.raises(ValueError, match=f"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs {wanted}$") as refused:
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **env)
     assert "set it to 0" not in str(refused.value)
 
@@ -412,7 +427,7 @@ FULL_BS1 = CudaGraphConfig(
 
 # With decode graphs disabled, the generic rule "graph gather requires decode CUDA graphs" refuses first;
 # graph gather off is how a disabled launch reaches the EXL3 rules.
-_EAGER_DECODE = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": False}
+_EAGER_DECODE = {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": False}
 
 
 @pytest.mark.parametrize(
@@ -434,32 +449,32 @@ def test_cpu_experts_need_the_breakable_decode_graph(model_dir, changes, env):
 
 
 def test_cpu_misses_need_cpu_experts(model_dir):
-    """SGLANG_DSV41_CPU_EXPERTS_MISSES only widens which lanes the CPU may take; without CPU experts no CPU thread
+    """SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES only widens which lanes the CPU may take; without CPU experts no CPU thread
     exists to compute them, and the device would type misses CPU that nothing completes. With CPU experts it passes."""
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES=True)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES=True)
 
 
 def test_the_split_miss_cut_needs_cpu_experts(model_dir):
-    """SGLANG_DSV41_CPU_SPLIT_MISS_CUT trims the CPU's split; without CPU experts there is no split to trim, so a set
+    """The split's miss_cut trims the CPU's split; without CPU experts there is no split to trim, so a set
     cut is a launch typo. With CPU experts it passes, and a zero cut passes either way."""
     launch = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    _gate(launch, **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX=3)
-    _gate(launch, SGLANG_DSV41_CPU_SPLIT_MISS_CUT=0)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_SPLIT_MISS_CUT needs SGLANG_DSV41_CPU_EXPERTS=1"):
-        _gate(launch, SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1)
+    _gate(launch, **CPU_EXPERTS_ENV, **_group(CPU_SPLIT, miss_cut=1, miss_cut_max=3))
+    _gate(launch, **_group(CPU_SPLIT, miss_cut=0))
+    with pytest.raises(ValueError, match="miss_cut needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1"):
+        _gate(launch, **_group(CPU_SPLIT, miss_cut=1))
 
 
-@pytest.mark.parametrize("name", ["SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX"])
+@pytest.mark.parametrize("name", ["miss_cut", "miss_cut_max"])
 def test_a_negative_split_miss_cut_option_is_refused(model_dir, name):
     with pytest.raises(ValueError, match=f"{name} must be >= 0, got -1"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **{name: -1})
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **_group(CPU_SPLIT, **{name: -1}))
 
 
 def test_the_split_miss_cut_is_on_by_default():
-    assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get() == 1
-    assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get() == 3
+    assert CpuSplitConfig().miss_cut == 1
+    assert CpuSplitConfig().miss_cut_max == 3
 
 
 def test_the_default_split_miss_cut_does_not_refuse_a_launch_without_cpu_experts(model_dir):
@@ -468,13 +483,13 @@ def test_the_default_split_miss_cut_does_not_refuse_a_launch_without_cpu_experts
 
 
 def test_the_cpu_two_stage_needs_cpu_experts(model_dir):
-    """SGLANG_DSV41_CPU_TWO_STAGE splits a CPU miss's read and forward in two; without CPU experts there is no CPU
+    """The two-stage option splits a CPU miss's read and forward in two; without CPU experts there is no CPU
     miss to split, so a set flag is a launch typo. With CPU experts it passes, and off passes either way."""
     launch = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    _gate(launch, **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_TWO_STAGE=True)
-    _gate(launch, SGLANG_DSV41_CPU_TWO_STAGE=False)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_TWO_STAGE needs SGLANG_DSV41_CPU_EXPERTS=1"):
-        _gate(launch, SGLANG_DSV41_CPU_TWO_STAGE=True)
+    _gate(launch, **CPU_EXPERTS_ENV, **_group(CPU_TWO_STAGE, enabled=True))
+    _gate(launch, **_group(CPU_TWO_STAGE, enabled=False))
+    with pytest.raises(ValueError, match="two_stage needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1"):
+        _gate(launch, **_group(CPU_TWO_STAGE, enabled=True))
 
 
 def _three_roots(tmp_path):
@@ -484,73 +499,73 @@ def _three_roots(tmp_path):
     return ":".join(str(root) for root in roots)
 
 
-W13, W2 = "SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS", "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS"
+W13, W2 = "w13_weights", "w2_weights"  # keys of the SGLANG_EXPERT_STREAM_CPU_TWO_STAGE group
 
 
 def test_the_span_weights_pass_with_the_two_stage_flag_and_a_matching_mirror(model_dir, tmp_path):
     launch = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    mirror = dict(SGLANG_MOE_EXPERT_MIRROR_DIRS=_three_roots(tmp_path), SGLANG_MOE_EXPERT_MIRROR_WEIGHTS="16:10:16")
-    _gate(launch, **CPU_EXPERTS_ENV, **mirror, SGLANG_DSV41_CPU_TWO_STAGE=True, **{W13: "6:10:6", W2: "1:0:1"})
-    _gate(launch, **CPU_EXPERTS_ENV, **mirror, SGLANG_DSV41_CPU_TWO_STAGE=True, **{W13: "0:1:0"})
+    mirror = _group(MIRROR, dirs=_three_roots(tmp_path), weights="16:10:16")
+    _gate(launch, **CPU_EXPERTS_ENV, **mirror, **_group(CPU_TWO_STAGE, enabled=True, **{W13: "6:10:6", W2: "1:0:1"}))
+    _gate(launch, **CPU_EXPERTS_ENV, **mirror, **_group(CPU_TWO_STAGE, enabled=True, **{W13: "0:1:0"}))
 
 
 @pytest.mark.parametrize("name", [W13, W2])
 def test_a_span_weight_without_the_two_stage_flag_is_refused(model_dir, tmp_path, name):
-    with pytest.raises(ValueError, match=f"{name} needs SGLANG_DSV41_CPU_TWO_STAGE=1"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **{name: "1:0:1"})
+    with pytest.raises(ValueError, match=f"{name} needs two_stage.enabled"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **_group(CPU_TWO_STAGE, **{name: "1:0:1"}))
 
 
 @pytest.mark.parametrize(
     "value, why",
-    [("1:1", "lists 2 weights but SGLANG_MOE_EXPERT_MIRROR_DIRS lists 3 roots"), ("0:0:0", "every weight is zero"),
+    [("1:1", "lists 2 weights but SGLANG_EXPERT_STREAM_MIRROR dirs lists 3 roots"), ("0:0:0", "every weight is zero"),
      ("1:x:1", "is not a number")],
     ids=["root_count", "all_zero", "malformed"],
 )
 @pytest.mark.parametrize("name", [W13, W2])
 def test_a_bad_span_weight_list_is_refused(model_dir, tmp_path, name, value, why):
-    mirror = dict(SGLANG_MOE_EXPERT_MIRROR_DIRS=_three_roots(tmp_path), SGLANG_MOE_EXPERT_MIRROR_WEIGHTS="16:10:16")
+    mirror = _group(MIRROR, dirs=_three_roots(tmp_path), weights="16:10:16")
     with pytest.raises(ValueError, match=f"{name}=.*{why}|{name} {why}"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **mirror,
-              SGLANG_DSV41_CPU_TWO_STAGE=True, **{name: value})
+              **_group(CPU_TWO_STAGE, enabled=True, **{name: value}))
 
 
 def test_a_span_weight_on_a_root_the_mirror_reads_nothing_from_is_refused(model_dir, tmp_path):
     """A root with mirror weight 0 has no extent to read a span from."""
-    mirror = dict(SGLANG_MOE_EXPERT_MIRROR_DIRS=_three_roots(tmp_path), SGLANG_MOE_EXPERT_MIRROR_WEIGHTS="1:0:1")
-    with pytest.raises(ValueError, match=f"{W2} gives root 1 a share, but SGLANG_MOE_EXPERT_MIRROR_WEIGHTS gives it 0"):
+    mirror = _group(MIRROR, dirs=_three_roots(tmp_path), weights="1:0:1")
+    with pytest.raises(ValueError, match=f"{W2} gives root 1 a share, but SGLANG_EXPERT_STREAM_MIRROR weights gives it 0"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **mirror,
-              SGLANG_DSV41_CPU_TWO_STAGE=True, **{W2: "1:1:1"})
+              **_group(CPU_TWO_STAGE, enabled=True, **{W2: "1:1:1"}))
 
 
 def test_the_cpu_two_stage_is_off_by_default():
-    assert envs.SGLANG_DSV41_CPU_TWO_STAGE.get() is False
-    assert envs.SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS.get() == "" and envs.SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS.get() == ""
+    assert CpuTwoStageConfig().enabled is False
+    assert CpuTwoStageConfig().w13_weights == "" and CpuTwoStageConfig().w2_weights == ""
 
 
 @pytest.mark.parametrize("value", ["ce", "sm"])
 def test_either_hit_copy_passes_with_cpu_experts(model_dir, value):
     """CPU completion uses the copy thread and the gate whichever way the hits are copied."""
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_HIT_COPY=value)
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_RAM_HIT_COPY=value)
 
 
 def test_an_unknown_hit_copy_is_refused(model_dir):
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_HIT_COPY must be ce or sm"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_RAM_HIT_COPY="dma")
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_HIT_COPY must be ce or sm"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_EXPERT_STREAM_RAM_HIT_COPY="dma")
 
 
 def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
     """The join moves a route to the pulled slot after planning: a CPU lane's route would match no plan slot and be
     computed on the GPU as well as on the CPU."""
-    with pytest.raises(ValueError, match="PREFETCH_PULL_MODE"):
+    with pytest.raises(ValueError, match="pull_mode"):
         _gate(
             _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
-            **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE": "always"},
+            **{**CPU_EXPERTS_ENV, **_group("SGLANG_EXPERT_STREAM_SHADOW_PREFETCH", pull_mode="always")},
         )
 
 
 DSPARK_CPU_ENV = dict(
-    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=True,
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES="6-15",
+    SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS=True,
+    SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES="6-15",
     SGLANG_EXL3_CPU_ACT_RESIDUAL=True,
     SGLANG_EXL3_CPU_ACT_BLOCK=128,
 )
@@ -558,7 +573,7 @@ DSPARK_CPU_ENV = dict(
 
 @pytest.fixture
 def cpu_pin_off(monkeypatch):
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
 
 
 def test_dspark_cpu_experts_pass_with_dspark_and_cores(model_dir, cpu_pin_off):
@@ -571,10 +586,10 @@ def test_dspark_cpu_experts_without_dspark_are_refused(model_dir):
 
 
 def test_dspark_cpu_experts_named_cores_need_two(model_dir):
-    with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"):
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
-            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "18"},
+            **{**DSPARK_CPU_ENV, "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES": "18"},
         )
 
 
@@ -582,7 +597,7 @@ def test_dspark_cpu_experts_without_named_cores_pass(model_dir, cpu_pin_off):
     """Unset cores: ThreadingConfig derives the draft's cores at its start, so the launch does not ask for them."""
     _gate(
         _launch(model_dir, speculative_algorithm="DSPARK"),
-        **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": ""},
+        **{**DSPARK_CPU_ENV, "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES": ""},
     )
 
 
@@ -592,21 +607,21 @@ def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path, cpu_pin_o
     with pytest.raises(ValueError, match="resident.json"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
-            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": str(bad)},
+            **{**DSPARK_CPU_ENV, "SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH": str(bad)},
         )
 
 
 def test_dspark_cpu_experts_need_the_kernel_pin_off(model_dir, monkeypatch):
-    monkeypatch.delenv("EXL3_MOE_CPU_PIN", raising=False)
-    with pytest.raises(ValueError, match="EXL3_MOE_CPU_PIN=0"):
+    monkeypatch.delenv("SGLANG_EXL3_MOE_CPU_PIN", raising=False)
+    with pytest.raises(ValueError, match="SGLANG_EXL3_MOE_CPU_PIN=0"):
         _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **DSPARK_CPU_ENV)
 
 
 def test_dspark_cpu_experts_refuse_more_threads_than_cores(model_dir, cpu_pin_off):
-    with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"):
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
-            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS": 13},
+            **{**DSPARK_CPU_ENV, "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS": 13},
         )
 
 
@@ -616,11 +631,11 @@ def test_dspark_cpu_experts_refuse_the_nvme_interrupt_cores(model_dir, cpu_pin_o
     with pytest.raises(ValueError, match="52"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
-            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "50-53"},
+            **{**DSPARK_CPU_ENV, "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES": "50-53"},
         )
 
 
-NO_EXPERT_CACHE = dict(SGLANG_MOE_HOT_GPU_MB=0, SGLANG_MOE_PINNED_HOST_MB=0, SGLANG_MOE_EXPERT_HOST_ARENA=False)
+NO_EXPERT_CACHE = dict(SGLANG_EXPERT_STREAM_HOT_GPU_MB=0, SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0, SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA=False)
 
 
 def test_dspark_cpu_experts_are_checked_without_an_expert_cache(model_dir, cpu_pin_off):
@@ -629,7 +644,7 @@ def test_dspark_cpu_experts_are_checked_without_an_expert_cache(model_dir, cpu_p
     args = _launch(model_dir, speculative_algorithm="DSPARK")
     _gate(args, **DSPARK_CPU_ENV, **NO_EXPERT_CACHE)
     with pytest.raises(ValueError, match="52"):
-        _gate(args, **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "50-53"}, **NO_EXPERT_CACHE)
+        _gate(args, **{**DSPARK_CPU_ENV, "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES": "50-53"}, **NO_EXPERT_CACHE)
 
 
 @pytest.mark.parametrize(
@@ -645,18 +660,18 @@ def test_dspark_cpu_experts_need_the_optimized_cpu_kernel_build(model_dir, cpu_p
 
 DSPARK_BREAKABLE = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1)
 # The recipe's DSpark mode: a lane per route (MISS_LANES unset), 8 victim lanes.
-SPILL = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 8}
+SPILL = {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": True, **DIRECT, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES": 8}
 
 
 @pytest.mark.parametrize(
     "name, value",
-    [("SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES", "12-15"), ("SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS", 4)],
+    [("SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES", "12-15"), ("SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS", 4)],
 )
 def test_draft_cores_are_refused_when_the_draft_shares_the_cpu_team(model_dir, name, value):
     env = {
         **CPU_EXPERTS_ENV,
         **SPILL,
-        "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": True,
+        "SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS": True,
         "SGLANG_EXL3_CPU_ACT_RESIDUAL": True,
         "SGLANG_EXL3_CPU_ACT_BLOCK": 128,
         name: value,
@@ -675,14 +690,14 @@ def _exl3_launch(model_dir, **changes):
 
 
 def test_cpu_experts_with_a_graphed_dspark_verify_pass(model_dir):
-    # The envs share SGLANG_MOE_EXPERT_GRAPH_GATHER and the DIRECT pair, so they merge rather than splat twice.
+    # The envs share SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER and the DIRECT pair, so they merge rather than splat twice.
     _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **SPILL})
 
 
 def test_a_graphed_dspark_verify_with_cpu_experts_needs_victim_lanes(model_dir):
     """A narrowed MISS_LANES verify with CPU experts and no spill was never run on a GPU; the tested shape is a lane per
     route plus VICTIM_LANES."""
-    with pytest.raises(ValueError, match="SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES") as refused:
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES") as refused:
         _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **GRAPHED_VERIFY})
     assert "graphed DSpark verify" in str(refused.value)
 
@@ -691,7 +706,7 @@ def test_a_graphed_dspark_verify_with_cpu_experts_needs_victim_lanes(model_dir):
     "launch, env, match",
     [
         ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
         ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
     ],
 )
@@ -701,14 +716,14 @@ def test_cpu_experts_under_speculation_need_the_graphed_dspark_verify(model_dir,
     with pytest.raises(ValueError, match=match) as refused:
         _gate(_exl3_launch(model_dir, **(DSPARK_BREAKABLE | launch)), **{**CPU_EXPERTS_ENV, **env})
     assert "--cuda-graph-backend-decode disabled" not in str(refused.value)
-    assert "SGLANG_DSV41_CPU_EXPERTS" in str(refused.value)
+    assert "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS" in str(refused.value)
 
 
 @pytest.mark.parametrize(
     "env, match",
     [
-        ({"SGLANG_DSV41_CPU_EXPERTS": False}, "needs SGLANG_DSV41_CPU_EXPERTS=1"),
-        ({"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 36}, "unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"),
+        ({"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": False}, "needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1"),
+        ({"SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": 36}, "unset SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES"),
     ],
 )
 def test_victim_lanes_need_cpu_experts_and_a_lane_per_route(model_dir, env, match):
@@ -741,7 +756,7 @@ def test_victim_lanes_stay_below_the_verify_routes(top_k_6_model_dir, victims, p
     """Block size 5 verifies 6 tokens x top-k 6 = 36 routes; _init_insert_direct refuses V >= 36 after the load, so the
     gate refuses it first."""
     launch = _exl3_launch(top_k_6_model_dir, speculative_dspark_block_size=5, **DSPARK_BREAKABLE)
-    env = {**CPU_EXPERTS_ENV, **SPILL, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": victims}
+    env = {**CPU_EXPERTS_ENV, **SPILL, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES": victims}
     if passes:
         _gate(launch, **env)
     else:
@@ -752,7 +767,7 @@ def test_victim_lanes_stay_below_the_verify_routes(top_k_6_model_dir, victims, p
 def test_victim_lanes_are_unbounded_when_the_top_k_is_unknown(model_dir):
     """A config.json without num_experts_per_tok gives the gate no top-k; it bounds nothing rather than guess."""
     launch = _exl3_launch(model_dir, speculative_dspark_block_size=5, **DSPARK_BREAKABLE)
-    _gate(launch, **{**CPU_EXPERTS_ENV, **SPILL, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 64})
+    _gate(launch, **{**CPU_EXPERTS_ENV, **SPILL, "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES": 64})
 
 
 def test_the_recipe_budget_a_passes_with_both_cpu_expert_clients(top_k_6_model_dir, cpu_pin_off):
@@ -765,8 +780,8 @@ def test_the_recipe_budget_a_passes_with_both_cpu_expert_clients(top_k_6_model_d
             **CPU_EXPERTS_ENV,
             **SPILL,
             "SGLANG_RAGGED_VERIFY_MODE": "static",
-            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": True,
-            "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "",
+            "SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS": True,
+            "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES": "",
             "SGLANG_EXL3_CPU_ACT_RESIDUAL": True,
             "SGLANG_EXL3_CPU_ACT_BLOCK": 128,
         },
@@ -778,11 +793,11 @@ def test_row_weighted_assignment_needs_the_cpu_experts_it_names(model_dir, cpu_p
     experts are off would log a change no kernel runs."""
     draft = dict(DSPARK_CPU_ENV, SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT="draft")
     _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **draft)
-    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT=target needs SGLANG_DSV41_CPU_EXPERTS"):
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT=target needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"):
         _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**draft, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"})
     target = dict(CPU_EXPERTS_ENV, SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT="target")
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **target)
-    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT=both needs SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"):
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT=both needs SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**target, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "both"})
     with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**target, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "1"})
@@ -790,30 +805,30 @@ def test_row_weighted_assignment_needs_the_cpu_experts_it_names(model_dir, cpu_p
 
 def test_ram_prefetch_options_default_off_at_the_replays_budget():
     """Off until a served A/B is accepted; one candidate per token, one row per layer (DSV41_REFERENCE.md 33.13)."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH.get() is False
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN.get() == 1
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get() == 1
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() == 2
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN.get() == 1
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER.get() == 1
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.get() == 2
 
 
 def test_ram_prefetch_needs_cpu_experts(model_dir):
     """Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS=1"):
-        _gate(args, SGLANG_DSV41_RAM_PREFETCH=True)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1"):
+        _gate(args, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True)
 
 
 @pytest.mark.parametrize(
     "name, value",
     [
-        ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", 0),
-        ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", 13),
-        ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", 0),
-        ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", 9),
-        ("SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE", 0),
-        ("SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE", 5),
+        ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN", 0),
+        ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN", 13),
+        ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER", 0),
+        ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER", 9),
+        ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE", 0),
+        ("SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE", 5),
     ],
 )
 def test_ram_prefetch_options_outside_the_hosts_bounds_are_refused(model_dir, name, value):
@@ -821,24 +836,24 @@ def test_ram_prefetch_options_outside_the_hosts_bounds_are_refused(model_dir, na
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
     with pytest.raises(ValueError, match=f"{name} must be in"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, **{name: value})
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, **{name: value})
 
 
 def test_the_ram_prefetch_scorer_defaults_to_the_gpu():
     """The prefetch's best measured arm (DSV41_REFERENCE.md 33.14-33.18); the prefetch itself stays off."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get() == "gpu"
-    assert envs.SGLANG_DSV41_RAM_PREFETCH.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.get() == "gpu"
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.get() is False
 
 
 def test_the_prefetch_off_with_nothing_set_passes_with_or_without_the_copy_engine(model_dir):
     """The GPU scorer default must not refuse a launch that does not prefetch."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
-    assert not envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.is_set()
+    assert not envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER.is_set()
     assert not envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.is_set()
     _gate(args, **CPU_EXPERTS_ENV)
-    _gate(args, SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True)
-    _gate(args, SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=False)
+    _gate(args, SGLANG_EXPERT_STREAM_COPY_MODE="copy_engine")
+    _gate(args, SGLANG_EXPERT_STREAM_COPY_MODE="sm_copy")
 
 
 def test_the_default_gpu_scorer_without_the_copy_engine_is_refused_as_the_cpu_scorer_would_be(model_dir):
@@ -846,31 +861,31 @@ def test_the_default_gpu_scorer_without_the_copy_engine_is_refused_as_the_cpu_sc
     copy engine whatever the scorer, so the message names the copy engine, not the CPU scorer."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
-    no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": False}
+    no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_EXPERT_STREAM_COPY_MODE": "sm_copy"}
     with pytest.raises(ValueError, match="runs after the copy-engine post.*gpu is the default scorer"):
-        _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1"):
-        _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
+        _gate(args, **no_copy_engine, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine"):
+        _gate(args, **no_copy_engine, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="cpu")
 
 
 def test_the_gpu_scorer_runs_on_the_prefetch_and_the_captured_copy_engine_post(model_dir):
     """gpu needs the prefetch it feeds, and the copy-engine post whose capture the scoring kernels follow."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu needs SGLANG_DSV41_RAM_PREFETCH=1"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
-    no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": False}
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu runs after the copy-engine post"):
-        _gate(args, **no_copy_engine, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="gpu")
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="gpu")
+    no_copy_engine = {**CPU_EXPERTS_ENV, "SGLANG_EXPERT_STREAM_COPY_MODE": "sm_copy"}
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu runs after the copy-engine post"):
+        _gate(args, **no_copy_engine, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="gpu")
 
 
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_an_unknown_ram_prefetch_scorer_is_refused_whether_or_not_the_prefetch_is_on(model_dir, prefetch):
     """A typo must not fall back to the CPU scorer silently, nor pass while the prefetch is off."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=prefetch, SGLANG_DSV41_RAM_PREFETCH_SCORER="tpu")
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER must be one of"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=prefetch, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="tpu")
 
 
 def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_path):
@@ -879,16 +894,16 @@ def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_pa
     assert expert_stream_requirements_for(args, args).label == "EXL3"
     path = tmp_path / "floors.json"
     path.write_text('{"min_margin": {"1": 0.25}}')
-    gpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    gpu = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="gpu")
     _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
-    cpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu"):
+    cpu = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="cpu")
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu"):
         _gate(args, **cpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
     # Unset, the floors are the GPU scorer's packaged table alone; empty, none.
     _gate(args, **cpu)
     _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="")
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH=1"):
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"):
         _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(tmp_path / "missing.json"))
@@ -896,21 +911,21 @@ def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_pa
 
 def test_idle_drive_speculative_reads_default_off_with_a_4_ms_deadline():
     """Off until its served A/B is accepted (design 2026-10-09-dsv41-drive-aware-reads, change (2))."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get() is False
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() == 4000
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US.get() == 4000
 
 
 def test_idle_drive_reads_need_the_prefetch_and_a_bounded_deadline(model_dir):
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
-    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE=True)
     _gate(args, **on)
-    _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=100_000)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_DSV41_RAM_PREFETCH=1"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    _gate(args, **on, SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US=100_000)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE=True)
     for deadline in (0, 100_001):
-        with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US must be in"):
-            _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US=deadline)
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US must be in"):
+            _gate(args, **on, SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US=deadline)
 
 
 def test_prefetch_promote_needs_the_prefetch_and_defaults_off(model_dir):
@@ -918,40 +933,40 @@ def test_prefetch_promote_needs_the_prefetch_and_defaults_off(model_dir):
 
     Mutant: the refusal dropped from the prefetch-off branch -- red (the launch passes silently).
     """
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_PROMOTE.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE.get() is False
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_PROMOTE=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_PROMOTE needs SGLANG_DSV41_RAM_PREFETCH=1"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_PROMOTE=True)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE=True)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE=True)
 
 
 def test_prefetch_pool_serve_needs_the_prefetch_and_defaults_off(model_dir):
     """Pool serving copies from the prefetch pool. Mutant: the refusal dropped -- red (the launch passes silently)."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE.get() is False
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE needs SGLANG_DSV41_RAM_PREFETCH=1"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE=True)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE=True)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE=True)
 
 
 def test_idle_drive_spread_and_pieces_default_to_todays_reads():
     """Off until their served A/B is accepted: ties to the lowest root, the row on its root, one piece in flight."""
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get() is False
-    assert envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get() == 1
+    assert envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD.get() is False
+    assert envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES.get() == 1
 
 
 def test_idle_drive_pieces_must_be_1_to_4_like_the_deadline_whatever_the_drive_flag(model_dir):
     """Bounded on every launch, as the deadline is; like the deadline, neither knob is refused with the drive flag off
     (they do nothing there)."""
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE=True)
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE=True)
     for pieces in (1, 4):
-        _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=2)
+        _gate(args, **on, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES=pieces)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES=2)
     for env in (on, CPU_EXPERTS_ENV):
         for pieces in (0, 5):
-            with pytest.raises(ValueError, match=r"SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES must be in \[1, 4\]"):
-                _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES=pieces)
+            with pytest.raises(ValueError, match=r"SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES must be in \[1, 4\]"):
+                _gate(args, **env, SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES=pieces)
 
 
 def test_the_prefetch_horizon_is_bounded_on_every_launch_and_needs_the_prefetch_above_one(model_dir):
@@ -961,16 +976,16 @@ def test_the_prefetch_horizon_is_bounded_on_every_launch_and_needs_the_prefetch_
     Mutant: the prefetch-off branch drops the horizon refusal -- red (2 passes silently).
     """
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
-    on = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True)
+    on = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True)
     for horizon in (1, 4):
-        _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="", SGLANG_DSV41_RAM_PREFETCH_HORIZON=horizon)
-    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_HORIZON=1)
+        _gate(args, **on, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="", SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=horizon)
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=1)
     for env in (on, CPU_EXPERTS_ENV):
         for horizon in (0, 5):
-            with pytest.raises(ValueError, match=r"SGLANG_DSV41_RAM_PREFETCH_HORIZON must be in \[1, 4\], got"):
-                _gate(args, **env, SGLANG_DSV41_RAM_PREFETCH_HORIZON=horizon)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_HORIZON needs SGLANG_DSV41_RAM_PREFETCH=1"):
-        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2)
+            with pytest.raises(ValueError, match=r"SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON must be in \[1, 4\], got"):
+                _gate(args, **env, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=horizon)
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=2)
 
 
 def test_a_horizon_above_one_is_refused_with_the_packaged_gpu_floors(model_dir, tmp_path):
@@ -982,13 +997,13 @@ def test_a_horizon_above_one_is_refused_with_the_packaged_gpu_floors(model_dir, 
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     path = tmp_path / "floors.json"
     path.write_text('{"min_margin": {"1": 0.25}}')
-    gpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    gpu = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="gpu")
     with pytest.raises(ValueError, match="packaged margin floors were fit for horizon 1"):
-        _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2)
-    _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="")
-    _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
-    cpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="cpu")
-    _gate(args, **cpu, SGLANG_DSV41_RAM_PREFETCH_HORIZON=2)
+        _gate(args, **gpu, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=2)
+    _gate(args, **gpu, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=2, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS="")
+    _gate(args, **gpu, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=2, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+    cpu = dict(**CPU_EXPERTS_ENV, SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=True, SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER="cpu")
+    _gate(args, **cpu, SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON=2)
 
 
 THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
@@ -996,38 +1011,37 @@ THREE_ROOTS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_fl
 
 def test_the_dynamic_mirror_root_choice_defaults_off():
     """Off until its served A/B is accepted (design 2026-10-09-dsv41-drive-aware-reads, change (3))."""
-    assert envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get() is False
-    assert envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get() == ""
+    assert MirrorConfig().dynamic is False
+    assert MirrorConfig().caps == ""
 
 
 def test_dynamic_mirror_caps_pass_with_one_positive_cap_per_root(model_dir):
     args = _exl3_launch(model_dir)
-    _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS, SGLANG_MOE_EXPERT_MIRROR_DYNAMIC=True,
-          SGLANG_MOE_EXPERT_MIRROR_CAPS="4,2,4")
-    _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS)  # static: no caps needed
+    _gate(args, **_group(MIRROR, dirs=THREE_ROOTS, dynamic=True, caps="4,2,4"))
+    _gate(args, **_group(MIRROR, dirs=THREE_ROOTS))  # static: no caps needed
 
 
 @pytest.mark.parametrize(
     "env, match",
     [
-        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True}, "needs SGLANG_MOE_EXPERT_MIRROR_CAPS"),
-        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2"}, "lists 2 caps but"),
-        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,0,4"}, "positive integer"),
-        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,x,4"}, "positive integer"),
-        ({"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": True, "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,-1,4"}, "positive integer"),
-        ({"SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2,4"}, "silently ignored"),
+        ({"dynamic": True}, "needs mirror.caps"),
+        ({"dynamic": True, "caps": "4,2"}, "lists 2 caps but"),
+        ({"dynamic": True, "caps": "4,0,4"}, "positive integer"),
+        ({"dynamic": True, "caps": "4,x,4"}, "positive integer"),
+        ({"dynamic": True, "caps": "4,-1,4"}, "positive integer"),
+        ({"caps": "4,2,4"}, "silently ignored"),
     ],
 )
 def test_bad_dynamic_mirror_caps_are_refused_at_launch(model_dir, env, match):
     args = _exl3_launch(model_dir)
     with pytest.raises(ValueError, match=match):
-        _gate(args, SGLANG_MOE_EXPERT_MIRROR_DIRS=THREE_ROOTS, **env)
+        _gate(args, **_group(MIRROR, dirs=THREE_ROOTS, **env))
 
 
 def test_dynamic_mirror_caps_need_mirror_roots(model_dir):
     args = _exl3_launch(model_dir)
-    with pytest.raises(ValueError, match="needs SGLANG_MOE_EXPERT_MIRROR_DIRS"):
-        _gate(args, SGLANG_MOE_EXPERT_MIRROR_DYNAMIC=True, SGLANG_MOE_EXPERT_MIRROR_CAPS="4")
+    with pytest.raises(ValueError, match="needs mirror.dirs"):
+        _gate(args, **_group(MIRROR, dynamic=True, caps="4"))
 
 
 def test_the_mirror_caps_parser():

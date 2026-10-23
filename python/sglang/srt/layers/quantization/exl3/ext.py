@@ -10,8 +10,11 @@ from __future__ import annotations
 import functools
 import os
 import subprocess
+from typing import Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import ResolvedConfig, resolved_config
+from sglang.srt.layers.moe.expert_engine.removed_env import VENDORED_ENV_MARKER
 
 EXLLAMAV3_COMMIT = "02aef45cd681b960a00afcd0749a4ab99e6c1bfe"
 
@@ -73,24 +76,26 @@ def _max_m_defines() -> list[str]:
     return [f"-DEXL3_MOE_CPU_MAX_M={max_m}"]
 
 
-def cpu_act_defines() -> list[str]:
+def cpu_act_defines(config: Optional[ResolvedConfig] = None) -> list[str]:
     """Compiler defines for the CPU kernel's activation quantization options; empty when both are off.
 
-    With SGLANG_DSV41_CPU_EXPERTS the CPU experts run only the optimized kernel (csrc/exl3/optimized), so the
-    defines are always its residual/128 pair; a flag explicitly set to anything else is refused."""
-    if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+    With SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS the CPU experts run only the optimized kernel (csrc/exl3/optimized),
+    so the defines are always its residual/128 pair; a flag explicitly set to anything else is refused. ``config``
+    defaults to ``resolved_config()``."""
+    config = config or resolved_config()
+    if config.stream.cpu_experts.enabled:
         residual, block = envs.SGLANG_EXL3_CPU_ACT_RESIDUAL, envs.SGLANG_EXL3_CPU_ACT_BLOCK
         if (residual.is_set() and not residual.get()) or (block.is_set() and block.get() != 128):
             raise ValueError(
-                "SGLANG_DSV41_CPU_EXPERTS builds the optimized EXL3 CPU kernel (SGLANG_EXL3_CPU_ACT_RESIDUAL=1, "
-                f"SGLANG_EXL3_CPU_ACT_BLOCK=128), but residual={residual.get()} block={block.get()} are set: "
-                "unset them or set those values"
+                "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS builds the optimized EXL3 CPU kernel "
+                f"(SGLANG_EXL3_CPU_ACT_RESIDUAL=1, SGLANG_EXL3_CPU_ACT_BLOCK=128), but residual={residual.get()} "
+                f"block={block.get()} are set: unset them or set those values"
             )
         return list(OPTIMIZED_CPU_DEFINES) + _max_m_defines()
     if envs.SGLANG_EXL3_CPU_MAX_M.is_set() and envs.SGLANG_EXL3_CPU_MAX_M.get():
         raise ValueError(
-            "SGLANG_EXL3_CPU_MAX_M sizes the optimized EXL3 CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds; "
-            "the vendored kernel keeps its own"
+            "SGLANG_EXL3_CPU_MAX_M sizes the optimized EXL3 CPU kernel, which SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 "
+            "builds; the vendored kernel keeps its own"
         )
     defines = []
     if envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get():
@@ -118,15 +123,45 @@ def build_flavor(defines: list[str]) -> str:
     return flavor
 
 
-def worker_trace_defines() -> list[str]:
-    """A separate diagnostic CPU build; normal forwards compile no worker trace state or clock reads."""
-    if not os.environ.get("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX"):
+def worker_trace_defines(config: Optional[ResolvedConfig] = None) -> list[str]:
+    """A separate diagnostic CPU build; normal forwards compile no worker trace state or clock reads.
+
+    On with SGLANG_EXPERT_STREAM_TRACE's cpu_worker.prefix; ``config`` defaults to ``resolved_config()``."""
+    stream = (config or resolved_config()).stream
+    if not stream.trace.cpu_worker.prefix:
         return []
-    if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+    if not stream.cpu_experts.enabled:
         raise ValueError("EXL3 worker tracing requires the optimized CPU expert kernel")
-    if not os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"):
+    if not stream.trace.job.prefix:
         raise ValueError("EXL3 worker tracing requires instrumented expert job tracing for attribution")
     return ["-DEXL3_MOE_CPU_WORKER_TRACE=1"]
+
+
+def set_vendored_kernel_env(config: ResolvedConfig) -> None:
+    """Set the environment variables the vendored and upstream CPU kernels (moe_mul1.cpp) read for themselves.
+
+    Those kernels are exllamav3's code, whose thread pinning, small-job worker cap and ISA cap are read with getenv
+    (the ISA cap at library load), so they cannot take a parameter. This is the one place the engine config reaches
+    them: EXL3_MOE_CPU_PIN from SGLANG_EXL3_MOE_CPU_PIN, EXL3_MOE_CPU_SMALL_WORKERS from
+    SGLANG_EXL3_MOE_CPU_SMALL_WORKERS and EXL3_MOE_CPU_MAX_ISA from SGLANG_EXPERT_STREAM_CPU_MAX_ISA, each only when
+    configured, so an unconfigured launch leaves the kernels' defaults. The optimized kernel takes the ISA cap through
+    its configure op instead and reads none of these.
+    """
+    cpu = config.exl3.cpu
+    vendored = {
+        "EXL3_MOE_CPU_PIN": cpu.pin,
+        "EXL3_MOE_CPU_SMALL_WORKERS": str(cpu.small_workers) if cpu.small_workers else None,
+        "EXL3_MOE_CPU_MAX_ISA": config.stream.cpu_experts.max_isa or None,
+    }
+    set_names = []
+    for name, value in vendored.items():
+        if value is not None:
+            os.environ[name] = value
+            set_names.append(name)
+    if set_names:
+        # check_removed_env in a child process would refuse these names; the marker says the engine set them.
+        known = [n for n in os.environ.get(VENDORED_ENV_MARKER, "").split(",") if n]
+        os.environ[VENDORED_ENV_MARKER] = ",".join(dict.fromkeys(known + set_names))
 
 
 def extension_sources(ext_dir: str, cpu_kernel: str | None = None) -> list[str]:
@@ -162,16 +197,19 @@ def exl3_ext():
     if not src:
         raise RuntimeError("SGLANG_EXL3_SRC must point at an exllamav3 checkout")
     ext_dir = _checked_ext_dir(src)
-    defines = cpu_act_defines()
+    config = resolved_config()
+    defines = cpu_act_defines(config)
     flavor = build_flavor(defines)
     optimized = optimized_cpu(defines)
     if optimized:
         check_cpu_compiler()
+    else:
+        set_vendored_kernel_env(config)
     # One build directory per flavor: extensions sharing a directory overwrite each other's build.ninja.
     build_dir = os.path.expanduser(envs.SGLANG_EXL3_BUILD_DIR.get())
     if flavor:
         build_dir = os.path.join(build_dir, flavor.lstrip("_"))
-    trace_defines = worker_trace_defines()
+    trace_defines = worker_trace_defines(config)
     if trace_defines:
         # Same extension name/CUDA flags, separate build directory: CUDA objects may be reused, CPU flags differ.
         build_dir = os.path.join(build_dir, "worker_trace")

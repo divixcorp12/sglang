@@ -372,12 +372,13 @@ def test_a_stale_hot_record_on_a_hit_only_record_is_an_overrun_not_fatal(tmp_pat
         host.stop()
 
 
-# ---- SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: CW reads the small tensors itself ----
+# ---- SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES: CW reads the small tensors itself ----
 
 
 def _sm_copy_engine(s, host):
     """As _copy_engine, with the row's small (non-trellis) entries left to CW's SM reads."""
-    from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
+    from sglang.kernels.ops.moe.expert_stream_transport import EXL3_BUILD
+    from sglang.srt.layers.moe.expert_engine.row_backend import sm_copy_mask
 
     host.enable_copy_engine(-1)
     names = list(s.slabs[ROW])
@@ -385,7 +386,7 @@ def _sm_copy_engine(s, host):
         name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
         for name, slab in s.slabs[ROW].items()
     }
-    mask = sm_copy_mask(names)
+    mask = sm_copy_mask(names, build=EXL3_BUILD)
     host.set_copy_table(ROW, _copy_table(s, dst), DST_ROWS, sm_mask=mask)
     host.arm_copy_engine()
     sm_names = [n for i, n in enumerate(names) if mask >> i & 1]
@@ -393,8 +394,9 @@ def _sm_copy_engine(s, host):
 
 
 def test_the_sm_mask_leaves_exactly_the_trellis_tensors_on_the_copy_engine():
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-    from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
+    from sglang.kernels.ops.moe.expert_stream_transport import EXL3_BUILD
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.row_backend import sm_copy_mask
 
     assert list(EXL3_STREAMED_NAMES) == [
         "w13_trellis",
@@ -404,14 +406,14 @@ def test_the_sm_mask_leaves_exactly_the_trellis_tensors_on_the_copy_engine():
         "w2_suh",
         "w2_svh",
     ]
-    assert sm_copy_mask(EXL3_STREAMED_NAMES) == 0b110110
+    assert sm_copy_mask(EXL3_STREAMED_NAMES, build=EXL3_BUILD) == 0b110110
 
 
 def test_the_python_names_are_the_host_modules_layout():
     """EXL3_STREAMED_NAMES orders the slab table and the copy table; the C++ trait orders the SM mask. A reorder on
     one side would SM-copy a trellis and DMA a scale vector."""
     from sglang.kernels.ops.moe.expert_stream_transport import host_layout
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
     names, small_mask = host_layout()
     assert names == EXL3_STREAMED_NAMES
@@ -461,19 +463,15 @@ def test_sm_entries_skip_the_dma(tmp_path):
 def test_sm_small_copies_are_refused_without_the_copy_engine():
     import msgspec
 
-    from sglang.srt.dsv41_config import Dsv41Config
-    from sglang.srt.layers.moe.exl3_ram_miss import check_sm_small_copies
+    from sglang.srt.layers.moe.expert_engine.config import CopyConfig, CopyMode
+    from sglang.srt.layers.moe.expert_engine.row_backend import check_sm_small_copies
 
-    base = Dsv41Config.from_envs()
+    base = CopyConfig()
     check_sm_small_copies(base)  # off: nothing to check
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"):
-        check_sm_small_copies(
-            msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True)
-        )
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_COPY_MODE"):
+        check_sm_small_copies(msgspec.structs.replace(base, sm_small_copies=True))
     check_sm_small_copies(
-        msgspec.structs.replace(
-            base, enable_ram_miss_sm_small_copies=True, enable_ram_miss_copy_engine=True
-        )
+        msgspec.structs.replace(base, sm_small_copies=True, mode=CopyMode.COPY_ENGINE)
     )
 
 
@@ -482,7 +480,7 @@ def test_the_sm_table_refuses_a_small_tensor_off_16_byte_alignment():
     bind time rather than run the slow path silently."""
     from types import SimpleNamespace
 
-    from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_table
+    from sglang.srt.layers.moe.expert_engine.row_backend import sm_copy_table
 
     table = torch.tensor(
         [
@@ -586,7 +584,14 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
 
     host = Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host"
     # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
-    tier = " ".join((host / "ram_tier.h").read_text().split())
+    # ram_tier.h's class body is split into the .inc.h fragments it includes (a pure move), and Tier into ram_tier_slots.h.
+    tier = " ".join(
+        " ".join((host / name).read_text().split())
+        for name in (
+            "ram_tier.h", "ram_tier_slots.h", "ram_tier_fill_copy_cpu.inc.h", "ram_tier_record_support.inc.h",
+            "ram_tier_spec_serve.inc.h",
+        )
+    )
     assert "store_release(lease_ + Wire::kLeaseCopyGate" not in tier
     assert (
         tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1

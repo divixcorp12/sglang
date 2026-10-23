@@ -5,7 +5,7 @@
 (DELTA_MAX_ENTRIES entries that leave the map as it is). This is the path a post takes after any miss.
 
 Run on divix01 under cc-gpu.lock from test/manual/dsv41, with PYTHONPATH pointing at the tree under test. For the
-kernel's own duration, run it under nsys and read exl3_ram_miss_post_kernel's row in cuda_gpu_kern_sum.
+kernel's own duration, run it under nsys and read expert_stream_post_kernel's row in cuda_gpu_kern_sum.
 """
 
 import argparse

@@ -29,7 +29,7 @@ CAPACITY = 1 << 20  # stage s's layer has capacity CAPACITY + s, which the fake 
 
 
 def _module():
-    return ops._host_module("exl3", VARIANT)
+    return ops._host_module(ops.EXL3_BUILD, VARIANT)
 
 
 def _u32(t: torch.Tensor, off: int) -> int:
@@ -172,7 +172,7 @@ def test_draft_shape_counts_the_cpu_routes_and_their_distinct_experts(request, m
     repeated slot twice -- red."""
     import json
 
-    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     areas, host = _host(request, mode)
     slots = [[0, 1, 2], [2, -1, 5]]
     _stage(areas, 0, len(slots), 3)
@@ -250,7 +250,7 @@ from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
-m = ops._host_module("exl3", "instr")
+m = ops._host_module(ops.EXL3_BUILD, "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 1 if case == "fail" else 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]
@@ -298,7 +298,7 @@ from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
 mode = sys.argv[2]
-m = ops._host_module("exl3", "instr")
+m = ops._host_module(ops.EXL3_BUILD, "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]

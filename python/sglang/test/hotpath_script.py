@@ -16,7 +16,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     new_page,
     page_word,
 )
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes

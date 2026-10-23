@@ -114,7 +114,7 @@ class TestPinnedManagerStartup(unittest.TestCase):
 
 
 class TestFullLayers(unittest.TestCase):
-    """SGLANG_MOE_PINNED_HOST_FULL_LAYERS: listed layers are bought whole first, the rest round-robins as without."""
+    """SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS: listed layers are bought whole first, the rest round-robins as without."""
 
     def setUp(self):
         expert_format._WARNED_WITHOUT_TIER_OPTIONS.clear()
@@ -123,12 +123,12 @@ class TestFullLayers(unittest.TestCase):
         model, _ = _model(tier_options={"device": "cpu"})
         row = model.get_submodule("0")._nvfp4_expert_streamer.host_bytes_per_expert
         # Without the list the same 11 rows split 6/5; with it layer 1 takes every expert.
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
             manager = ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
         self.assertEqual({k: c.capacity for k, c in manager.caches.items()}, {0: 3, 1: EXPERTS})
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"), self.assertRaisesRegex(ValueError, "fewer layers"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"), self.assertRaisesRegex(ValueError, "fewer layers"):
             ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS - 1) * row)
-        with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("2"), self.assertRaisesRegex(ValueError, "not streamed"):
+        with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("2"), self.assertRaisesRegex(ValueError, "not streamed"):
             ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
 
     def test_the_ram_prefetch_is_off_only_when_every_streamed_layer_is_full(self):
@@ -136,18 +136,18 @@ class TestFullLayers(unittest.TestCase):
         model, _ = _model(tier_options={"device": "cpu"})
         row = model.get_submodule("0")._nvfp4_expert_streamer.host_bytes_per_expert
         self.addCleanup(expert_stream.record_streamed_layers, None)
-        with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(2):
             self.assertTrue(expert_stream.ram_prefetch_active(), "before the build nothing is known: as requested")
-            with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+            with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
                 ExpertPinnedHostCacheManager.from_model(model, budget_bytes=(EXPERTS + 3) * row)
                 self.assertTrue(expert_stream.ram_prefetch_active())
                 self.assertEqual(expert_stream.ram_prefetch_spec_share(), 2)
-            with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1"):
+            with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1"):
                 ExpertPinnedHostCacheManager.from_model(model, budget_bytes=2 * EXPERTS * row)
                 self.assertTrue(expert_stream.model_fully_pinned())
                 self.assertFalse(expert_stream.ram_prefetch_active())
                 self.assertEqual(expert_stream.ram_prefetch_spec_share(), 0)
-        with envs.SGLANG_DSV41_RAM_PREFETCH.override(False), envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("1"):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(False), envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("1"):
             self.assertFalse(expert_stream.ram_prefetch_active())
 
     def test_each_group_holds_its_homed_experts_and_what_its_table_holds_back(self):

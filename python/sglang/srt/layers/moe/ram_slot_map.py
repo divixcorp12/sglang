@@ -23,7 +23,7 @@ class LaneKind(IntEnum):
 class LaneOverflow(ValueError):
     """Forced lanes (DIRECT found them no VRAM victim, the post's spill) cannot be CPU lanes: no host lanes (the copy
     engine is not armed) or no CPU layer. The post then serves the unforced prefix and flags the forward
-    (exl3_ram_miss_post_kernel)."""
+    (expert_stream_post_kernel)."""
 
 
 def split_miss_cut(cut: int, cut_max: int, *, cpu_experts: bool) -> tuple[int, int]:
@@ -64,7 +64,7 @@ SPLIT_MODEL_RESIDENCY_TIEBREAK = 1
 
 
 def split_model_overrides(overrides: str, nodes: int) -> tuple[dict, dict]:
-    """``SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS`` parsed: ({(key, node): ms} for per-node costs, {key: ms} for shared ones).
+    """``cpu_experts.split.model_costs`` parsed: ({(key, node): ms} for per-node costs, {key: ms} for shared ones).
 
     ``overrides`` is ``name=ms`` pairs, comma-separated; a per-node name takes ``.node`` (``hit_c.1=0.4``), and without
     it sets every node. Raises ValueError for a pair it cannot read."""
@@ -99,11 +99,11 @@ def split_model_overrides_complete(overrides: str, nodes: int) -> bool:
 def split_model_words(nodes: int, overrides: str = "", base: Optional[dict] = None,
                       residency_tiebreak: bool = False) -> list[int]:
     """The model-based split's cost words, in ns: per node ``SPLIT_MODEL_NODE_KEYS``, then ``SPLIT_MODEL_KEYS``, then
-    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK).
+    a flags word (``SPLIT_MODEL_RESIDENCY_TIEBREAK``, cpu_experts.split.model_residency_tiebreak).
 
     ``base`` maps each key to ms, a per-node key to one value per node (node n past them takes the last's): the
     calibrated costs in service (split_model_calibration.SplitModelCosts.base), the fixture costs when omitted, which
-    only tests and synthetic fixtures do. ``overrides`` (SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS, split_model_overrides)
+    only tests and synthetic fixtures do. ``overrides`` (cpu_experts.split.model_costs, split_model_overrides)
     replace the costs they name."""
     base = SPLIT_MODEL_FIXTURE_MS if base is None else base
     per_node = [
@@ -248,12 +248,12 @@ def type_lanes(
     lanes in plan order (miss_keys descending, so the lowest-scored): RAM hits, plus NVMe misses with
     ``cpu_misses``.
 
-    Lanes from ``forced_from`` on (spill, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) found no VRAM victim: each is a
+    Lanes from ``forced_from`` on (spill, copy.graph_gather_victim_lanes) found no VRAM victim: each is a
     CPU lane whatever the split. A forced hit runs from its RAM slot; a forced miss gets slot -1 and no staging slot,
     since the host reads it into a RAM victim (RamTier::reserve_victims_locked). The split counts only the lanes before
     ``forced_from``. Raises LaneOverflow when forced lanes cannot be CPU lanes (no host lanes, no CPU layer).
 
-    Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX): a forced CPU miss runs on its node's CPU behind the record's
+    Experiment (cpu_experts.split.miss_cut / miss_cut_max): a forced CPU miss runs on its node's CPU behind the record's
     CPU-hit job, so a node with 1..``miss_cut_max`` forced misses takes ``miss_cut`` fewer of its split's lanes (at
     least 0). Forced lanes stay CPU lanes; ``miss_cut`` 0 is the typing without the cut.
 
@@ -261,7 +261,7 @@ def type_lanes(
     row, else -1. With host lanes, an unforced lane with a scratch slot is HIT_SCRATCH at that slot, before any RAM
     lookup: it takes no staging slot and is not eligible, so the split sees one lane fewer.
 
-    Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): with ``split_model`` (split_model_words) and the copy engine able
+    Experiment (cpu_experts.split.model): with ``split_model`` (split_model_words) and the copy engine able
     to take hits, model_cpu_lanes picks the unforced CPU lanes in place of the split and the miss cut, from each lane's
     ``tokens`` (the routes that name its expert); words whose copy_lane is SPLIT_MODEL_OFF keep the table's typing, and
     count nothing. ``model_stats`` (split_model_stats_words long) counts what the device

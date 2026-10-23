@@ -21,7 +21,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 
 
@@ -147,7 +146,9 @@ def get_draft_top_prob_log() -> Optional[DraftTopProbLog]:
     """The process's log, opened on first use when the path is set; None otherwise."""
     global _log, _resolved
     if not _resolved:
-        prefix = envs.SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH.get()
+        from sglang.srt.layers.moe.expert_engine.config import resolved_config
+
+        prefix = resolved_config().dsv41.trace.draft_top_prob_path
         _log = DraftTopProbLog(prefix) if prefix else None
         if _log is not None:
             atexit.register(_log.close)

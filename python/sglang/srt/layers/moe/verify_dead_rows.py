@@ -155,18 +155,20 @@ def attach_verify_dead_rows(model: torch.nn.Module, dead_rows: VerifyDeadRows) -
     """Point every expert-streamed EXL3 MoE layer and every Engram embedding of ``model`` at ``dead_rows``; returns
     how many EXL3 layers it reached."""
     from sglang.srt.layers.engram import EngramEmbedding
+    from sglang.srt.layers.moe.expert_engine.formats import format_for_quant_method
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.exl3.exl3 import Exl3MoEMethod
 
     attached = 0
     for module in model.modules():
         if isinstance(module, EngramEmbedding):
             module.verify_dead_rows = dead_rows.dead
-        elif (
-            isinstance(module, FusedMoE)
-            and isinstance(module.quant_method, Exl3MoEMethod)
-            and not module.quant_method.draft
-        ):
-            module.quant_method.verify_dead_rows = dead_rows.dead
-            attached += 1
+        elif isinstance(module, FusedMoE):
+            expert_format = format_for_quant_method(module.quant_method)
+            if (
+                expert_format is not None
+                and expert_format.supports_dead_rows
+                and not module.quant_method.draft
+            ):
+                module.quant_method.verify_dead_rows = dead_rows.dead
+                attached += 1
     return attached

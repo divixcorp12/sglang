@@ -283,7 +283,7 @@ def test_repeats_that_overrun_the_read_budget_fail_fast(tmp_path):
 
 
 def test_the_repacked_copy_is_sparse_at_expert_id_offsets(tmp_path):
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 
     ckpt, work = tmp_path / "ckpt", tmp_path / "work"

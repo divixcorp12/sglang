@@ -99,3 +99,12 @@ def inflight_busy(path: str) -> bool:
             return any(int(value) for value in f.read().split())
     except (OSError, ValueError):
         return False
+
+
+def cuda_module_loading_env() -> dict[str, str]:
+    """The process's ``CUDA_MODULE_LOADING`` alone, as the mapping the expert engine's copy-engine launch check takes.
+
+    Read here, outside the engine package, which reads no process environment.
+    """
+    value = os.environ.get("CUDA_MODULE_LOADING")
+    return {} if value is None else {"CUDA_MODULE_LOADING": value}

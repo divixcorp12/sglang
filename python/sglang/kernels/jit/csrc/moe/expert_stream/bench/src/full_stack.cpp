@@ -53,7 +53,9 @@ struct Options {
   int warmup = 128;
   int gap_us = 0;
   int keep_warm_us = 0;
-  bool smt = false;  // --smt: each group's workers' SMT siblings join it, after them (SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT)
+  // --smt: each group's workers' SMT siblings join it, after them (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT)
+  bool smt = false;
+  std::string max_isa;  // --max-isa=TIER: the kernel's ISA cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA); empty, the host's
   int wait_timeout_ms = 2000;
   bool validate_only = false;
   bool self_test = false;
@@ -92,6 +94,8 @@ Options parse_options(int& argc, char** argv) {
       opt.keep_warm_us = number(value("--keep-warm-us="));
     else if (arg == "--smt")
       opt.smt = true;
+    else if (arg.starts_with("--max-isa="))
+      opt.max_isa = value("--max-isa=");
     else if (arg.starts_with("--wait-timeout-ms="))
       opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
     else if (arg == "--validate-only")
@@ -111,6 +115,7 @@ Options parse_options(int& argc, char** argv) {
              "--keep-warm-us: register work after each job, before the held CPU team falls back to PAUSE\n"
              "  (0: PAUSE only)\n"
              "--smt: each group's --cpus also run on their SMT siblings, after them (twice the workers)\n"
+             "--max-isa=scalar|avx2|bw|vnni|vbmi caps the kernel's tier (default: the host's)\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
              "--cpus=3 (two groups: --copy-cpu=1 --service-cpu=2,3 --cpus=4/5)\n"
              "Google Benchmark flags are also accepted.\n";
@@ -690,9 +695,7 @@ int main(int argc, char** argv) {
     validate_placement(placement, system_topology(), !options.self_test);
     if (options.self_test) return run_self_test(placement, options.image_dir) == 0 ? 0 : 1;
 
-    setenv("EXL3_MOE_CPU_PIN", "0", 1);
-    setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
-    configure_cpu_kernel_runtime();
+    configure_cpu_kernel_runtime(options.max_isa);
     std::vector<int> group_nodes;
     for (int g = 0; g < kGroups; ++g)
       group_nodes.push_back(placement.groups[g].node);

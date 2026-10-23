@@ -66,9 +66,9 @@ def test_resident_for_follows_the_env_and_refuses_an_unlisted_stage(tmp_path):
     path = tmp_path / "resident.json"
     write_resident_set(str(path), {0: [3]}, n=1, source="")
     draft_resident._cache.clear()
-    with envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(""):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.override(""):
         assert resident_for(0) == frozenset()
-    with envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+    with envs.SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.override(str(path)):
         assert resident_for(0) == frozenset({3})
         with pytest.raises(ValueError, match="stage 1"):
             resident_for(1)

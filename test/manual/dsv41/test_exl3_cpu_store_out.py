@@ -1,4 +1,4 @@
-"""The EXL3 CPU kernel's store-first overwrite (ForwardCall::store_first, SGLANG_DSV41_CPU_EXPERTS_STORE_OUT) gives the
+"""The EXL3 CPU kernel's store-first overwrite (ForwardCall::store_first, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT) gives the
 bits of the zero-then-accumulate it replaces (csrc/exl3/optimized/forward_plan.hpp).
 
 The CPU expert engine (cpu_experts.h run_job) ran a verify's per-token job as: zero the job's token rows, then an
@@ -8,7 +8,7 @@ zeroed rows and the new one into rows full of NaN (whatever an earlier record le
 (store_first off, the memset inside the team), and compares the bits (int32 views, so a -0 against +0 fails). A
 second, accumulating job on the same rows (a record's later CPU misses into part 1) must then agree too.
 
-Needs SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1 and the bw tier (EXL3_MOE_CPU_MAX_ISA=bw on a host above it). Run on
+Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and the bw tier (SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw on a host above it). Run on
 divix01 under taskset -c 0-51,56-107.
 """
 
@@ -45,13 +45,13 @@ ZERO_WEIGHT = {"6-tokens-dead-route": (0, 0)}
 
 @pytest.fixture(scope="module")
 def layer():
-    os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
+    os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     if not optimized_cpu(cpu_act_defines()):
-        pytest.skip("the kernel under test is the optimized one: set SGLANG_DSV41_CPU_EXPERTS=1")
+        pytest.skip("the kernel under test is the optimized one: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1")
     ext = exl3_ext()
     trait = Exl3CpuQuantTrait(ext, act_limit=LIMIT)
     handle = es.kernel_layer(trait.kernel_address(), trait.layer_spec(_slabs(20261015), CAP), variant="instr")

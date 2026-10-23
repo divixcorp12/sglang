@@ -68,7 +68,7 @@ inline void check_dedicated_core(int core, const std::vector<int>& cpu_expert_co
     if (listed(cpu_expert_cores, sibling)) {
       throw std::runtime_error(
           prefix + "busy_poll: core " + std::to_string(sibling) + " shares the physical core of cpu_core " +
-          std::to_string(core) + " and is a CPU expert core (SGLANG_DSV41_CPU_EXPERTS_CORES)");
+          std::to_string(core) + " and is a CPU expert core (SGLANG_EXPERT_STREAM_NUMA_CORES cpu=)");
     }
   }
 }

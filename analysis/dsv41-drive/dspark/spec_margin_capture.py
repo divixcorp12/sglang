@@ -1,6 +1,6 @@
 """A diagnostic served run of an A/B arm with the InstrBuild job trace, for spec_margin.py and layer_misses.py.
 
-Starts an arm's server of both_cpu_ab.py (``--arm``, the ``dspark-both-prefetch`` arm by default) with ``SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX`` set (which
+Starts an arm's server of both_cpu_ab.py (``--arm``, the ``dspark-both-prefetch`` arm by default) with the ``job.prefix`` of ``SGLANG_EXPERT_STREAM_TRACE`` set (which
 loads the instrumented host), serves the A/B's session set through logprob_probe.py, and shuts the launcher down
 alone so every engine flushes its event file. Then breaks the layer records down (layer_misses.py) and, when the arm
 prefetches, bins the speculative reads by gate rank and margin. The instrumented build's timings are not a throughput
@@ -58,19 +58,21 @@ def server_env(out_dir: str, top_k_only: bool, scorer: str | None = None, arm: s
     if arm in both_cpu_ab.STS_COLLECT_ARMS:
         asked[both_cpu_ab.STS_COLLECT] = both_cpu_ab.sts_collect_stem(out_dir)
     if top_k_only:
-        asked["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] = "1"
+        asked["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY"] = "1"
     if scorer is not None:
-        asked["SGLANG_DSV41_RAM_PREFETCH_SCORER"] = scorer
-    return arm_env.arm_env({
+        asked["SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER"] = scorer
+    trace = both_cpu_ab.member
+    return arm_env.arm_env(both_cpu_ab.collapse({
         **overrides,
         **asked,
-        **({"SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(out_dir, "stages.jsonl"),
-            "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(out_dir, "router"),
-            "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH": os.path.join(out_dir, "verify-accept")} if verify_split else {}),
-        "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": os.path.join(out_dir, "events"),
-        "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "524288",
-        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out_dir, "metrics.jsonl"),
-    })
+        **({trace(both_cpu_ab.TRACE, "expert_path"): os.path.join(out_dir, "stages.jsonl"),
+            trace(both_cpu_ab.TRACE, "router_capture_path"): os.path.join(out_dir, "router"),
+            trace(both_cpu_ab.TRACE, "verify_accept_path"): os.path.join(out_dir, "verify-accept")}
+           if verify_split else {}),
+        trace(both_cpu_ab.TRACE, "job.prefix"): os.path.join(out_dir, "events"),
+        trace(both_cpu_ab.TRACE, "job.capacity"): 524288,
+        trace(both_cpu_ab.TRACE, "hot_metrics_file"): os.path.join(out_dir, "metrics.jsonl"),
+    }))
 
 
 def counter_summary(log_path: str) -> dict:
@@ -245,7 +247,9 @@ def capture_env(a: argparse.Namespace) -> dict:
     """What the capture sets over the caller's env for its server; a caller's value for one of these keys is lost."""
     env = server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)
     if a.long_prompt or a.prompts_file:
-        env["SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY"] = LONG_TRACE_CAPACITY
+        trace = json.loads(env[both_cpu_ab.TRACE])
+        trace["job"]["capacity"] = int(LONG_TRACE_CAPACITY)
+        env[both_cpu_ab.TRACE] = json.dumps(trace)
     if a.draft_top_prob:
         env["SGLANG_DSV41_DRAFT_TOP_PROB_LOG_PATH"] = os.path.join(a.out_dir, "draft-top-prob")
     return env
@@ -310,7 +314,7 @@ def post_run(a: argparse.Namespace) -> int:
         [sys.executable, os.path.join(HERE, "layer_misses.py"), events, "--json",
          os.path.join(a.out_dir, "layer_misses.json")]
     ).returncode
-    if server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)["SGLANG_DSV41_RAM_PREFETCH"] == "1":
+    if server_env(a.out_dir, a.top_k_only, a.scorer, a.arm, a.verify_split)["SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"] == "1":
         rc = rc or subprocess.run(
             [sys.executable, os.path.join(HERE, "spec_margin.py"), events, "--json",
              os.path.join(a.out_dir, "spec_margin.json")]

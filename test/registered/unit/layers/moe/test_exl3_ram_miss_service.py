@@ -3,6 +3,7 @@ check, residency pushes and the per-step graph trace (CPU; the thread runs, no d
 
 import contextlib
 import faulthandler
+import json
 import os
 import shutil
 import time
@@ -13,10 +14,12 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import exl3_ram_miss as module
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+from sglang.srt.layers.moe.expert_engine import row_backend
+from sglang.srt.layers.moe.expert_engine.config import resolved_config
+from sglang.srt.layers.moe.expert_engine import service as module
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
@@ -24,6 +27,7 @@ from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import (
     ROW_IMAGE_DIM,
     DirectUpdaterStandIn,
+    dsv41_exl3_pairing,
     paused,
     service_row_images,
     write_row_images,
@@ -49,15 +53,16 @@ def tiers(tmp_path, monkeypatch):
     device posts it (_demand)."""
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
+    module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     streamers, caches = {}, {}
     with contextlib.ExitStack() as stack:
         stack.enter_context(service_row_images(tmp_path))
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
-                # No ``direct`` with images: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
+                # No ``direct`` with images: SGLANG_EXPERT_STREAM_FILE_READER=uring_direct decides it, as in production.
                 fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
@@ -65,11 +70,22 @@ def tiers(tmp_path, monkeypatch):
                 # One more than the mappable rows: the service stages one slot per row (the planned width of 1).
                 caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY + 1, device="cpu", **options)
                 streamers[layer_id] = streamer
-        service = module.Exl3RamMissService.get()
+        service = module.ExpertEngineService.get()
         service.plan_gather_width(1)
         yield service, streamers, caches
         service.shutdown()
-    module.Exl3RamMissService._instance = None
+    module.ExpertEngineService._instance = None
+
+
+def _reconfigure(service):
+    """Give the service the config the current environment resolves to.
+
+    A service resolves its config once, when it is built, and reads no env after that; a test that sets an env after
+    the ``tiers`` fixture built the service calls this inside the override, as a launch that set it first would have
+    built the service with it. The service has not started, so nothing was derived from the old config yet.
+    """
+    service.config = resolved_config()
+    return service
 
 
 def _holds(host, row, expert):
@@ -104,7 +120,7 @@ def _demand(service, row, experts):
 def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
     service, streamers, caches = tiers
     cache = caches[1]
-    assert isinstance(cache._lru, module.NativePinnedSlotTable)
+    assert isinstance(cache._lru, row_backend.NativePinnedSlotTable)
     cache.ensure_rows(torch.tensor([4, 2]))
     row = service.row_of(1)
     assert _holds(service.host, row, 4) and _holds(service.host, row, 2)
@@ -119,9 +135,9 @@ def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_pat
         shutil.copytree(tmp_path, root)
     fmt = streamers[1].format
     write_row_images(fmt.layout, fmt.segment_map(), str(tmp_path), [str(root) for root in roots])
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(os.pathsep.join(map(str, roots))):
-        with envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override("3:1"):
-            caches[1].ensure_rows(torch.tensor([4, 2]))
+    mirror = {"dirs": os.pathsep.join(map(str, roots)), "weights": "3:1"}
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps(mirror)):
+        caches[1].ensure_rows(torch.tensor([4, 2]))
     tables = service.host.tables
     assert tables.parts == 2
     assert all(path.startswith(str(root)) for path, root in zip(tables.paths, roots * len(tables.paths)))
@@ -136,7 +152,7 @@ def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_pat
 
 def test_the_service_refuses_a_mirror_configuration_the_eager_source_refuses(tiers, tmp_path):
     service, streamers, caches = tiers
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)):  # the checkpoint itself
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": str(tmp_path)})):  # the checkpoint itself
         with pytest.raises(ValueError, match="not a mirror of it"):
             caches[1].ensure_rows(torch.tensor([4]))
 
@@ -148,7 +164,7 @@ def _start_service_on_mirrors_without_images(tiers, tmp_path):
     root = tmp_path.parent / f"{tmp_path.name}_mirror_without_images"
     shutil.copytree(tmp_path, root)
     assert not (root / "exl3_row_images").exists()
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(root)):
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": str(root)})):
         service.ensure_started()
 
 
@@ -372,8 +388,10 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
 
     source = torch.zeros(8, dtype=torch.int64)
     count = torch.zeros(1, dtype=torch.int32)
-    fmt = SimpleNamespace(key="exl3", graph_source_kind="pinned_tier", supports_graph_gather=False)
-    backend = object.__new__(module.Exl3RamMissRowBackend)
+    fmt = SimpleNamespace(
+        key="exl3", engine_served=True, graph_source_kind="pinned_tier", supports_graph_gather=False
+    )
+    backend = object.__new__(row_backend.ExpertEngineRowBackend)
     streamer = SimpleNamespace(
         format=fmt, layer_id=0, pinned_host_cache=SimpleNamespace(capacity=16),
         has_spec_only_tensors=True, _graph_source_rows=source, _graph_miss_count=count,
@@ -383,21 +401,22 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
     # update rejection. Only the DIRECT caller opts into pinned-tier support.
     for stage in (0, 1):
         with pytest.raises(ValueError, match="does not support graph gather"):
-            require_graph_gather_support([streamer], exl3_direct_ok=False)
-    require_graph_gather_support([streamer], exl3_direct_ok=True)
+            require_graph_gather_support([streamer], engine_direct_ok=False)
+    require_graph_gather_support([streamer], engine_direct_ok=True)
     updater = object.__new__(GpuResidencyUpdater)
     updater.insert_direct = True
     updater.streamers = [streamer]
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"):
+    with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "off"})):
         # Leases are unconditional (the RAM-miss service always runs in lease mode), so DIRECT needs no lease switch.
         updater.check_miss_plans()
-        streamer.row_backend = object()
+        streamer.row_backend = SimpleNamespace(leased=False)
         with pytest.raises(ValueError, match="native EXL3 RAM-miss backend"):
             updater.check_miss_plans()
         streamer.row_backend = backend
         updater.check_miss_plans()
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
-        with pytest.raises(ValueError, match="PREFETCH_PULL_MODE=off"):
+    # A pull mode needs a predictor (the config refuses one without), so the pull is configured with one.
+    with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "always", "predictor": "llapor"})):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_SHADOW_PREFETCH pull_mode=off"):
             updater.check_miss_plans()
 
 
@@ -457,7 +476,7 @@ def test_expert_to_slot_and_slot_to_expert_read_the_published_map_not_a_snapshot
 
 
 def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, monkeypatch):
-    """Minor 5: the watchdog's limit follows SGLANG_DSV41_RAM_MISS_TIMEOUT_MS, so a slow drive's
+    """Minor 5: the watchdog's limit follows SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS, so a slow drive's
     demand fails stop through the device wait, not the watchdog's abort."""
     service, streamers, caches = tiers
     for timeout_ms in (50, 2000, 14_000, 40_000, 120_000):
@@ -469,23 +488,23 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     monkeypatch.setattr(
         module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
     )
-    with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
-        service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(40_000):
+        _reconfigure(service).ensure_started()
     assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000), "spin_us": 5000}]
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
 
 
 @pytest.mark.parametrize("spin_us", [-1, 0, 777])
 def test_the_service_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
-    """SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US reaches start_thread: -1 never sleeps, else the spin before the idle sleep."""
+    """SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US reaches start_thread: -1 never sleeps, else the spin before the idle sleep."""
     service, streamers, caches = tiers
     started = []
     start = module.ExpertStreamHost.start_thread
     monkeypatch.setattr(
         module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
     )
-    with envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.override(spin_us):
-        service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US.override(spin_us):
+        _reconfigure(service).ensure_started()
     assert [kw["spin_us"] for kw in started] == [spin_us]
 
 
@@ -535,7 +554,7 @@ def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypa
     from sglang.srt.layers.moe import expert_row_plan
 
     monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", lambda *args: None)
-    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *args: None)
+    monkeypatch.setattr(row_backend, "copy_expert_row_segments_gpu", lambda *args: None)
     # The fixture's teardown shuts the service down, which reads the real device side's state: restore it first.
     real_sides = (service.device_side, [backend.device_side for backend in backends])
     service.device_side = SimpleNamespace(
@@ -569,9 +588,9 @@ def test_router_capture_is_refused_without_the_stage_trace(tiers, monkeypatch, t
 
     service, streamers, caches = tiers
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: exl3_stream_trace.Exl3StreamTrace(""))
-    with envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.override(str(tmp_path / "router")):
-        with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_EXPERT_TRACE_PATH"):
-            service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"router_capture_path": str(tmp_path / "router")})):
+        with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_TRACE's router_capture_path needs its expert_path"):
+            _reconfigure(service).ensure_started()
     assert service.host is None
 
 
@@ -585,7 +604,8 @@ def test_router_capture_rides_the_route_log_only_when_its_path_is_set(tiers, mon
     trace = exl3_stream_trace.Exl3StreamTrace(str(tmp_path / "trace.jsonl"))
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
     prefix = str(tmp_path / "router")
-    with envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.override(prefix if router else ""):
+    with envs.SGLANG_EXPERT_STREAM_TRACE.override(json.dumps({"router_capture_path": prefix if router else ""})):
+        _reconfigure(service)
         _attach_all(service, streamers, capacity=12)
     log = service.route_log
     assert all(streamer.row_backend.route_log is log for streamer in streamers.values())
@@ -615,12 +635,14 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
     monkeypatch.setattr(exl3_fused_moe, "exl3_fused_moe_for",
                         lambda layer, streamer: SimpleNamespace(
                             layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
-    backend = module.Exl3RamMissRowBackend(
+    backend = row_backend.ExpertEngineRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(8)), 0, 6, {0: None},
         route_log=route_log
     )
     remap = torch.zeros(6, dtype=torch.int32)
-    streamer = SimpleNamespace(row_backend=backend, gather=lambda topk_ids: (remap, None))
+    streamer = SimpleNamespace(
+        row_backend=backend, gather=lambda topk_ids: (remap, None), format=object.__new__(Exl3ExpertFormat)
+    )
     x = torch.arange(16, dtype=torch.float32).to(torch.bfloat16).reshape(1, 16)
     weights = torch.full((1, 6), 0.25)
     with Ops() as mode:
@@ -668,14 +690,15 @@ def tier_sim_load_forwards(path):
 
 @pytest.mark.parametrize("pdl", [False, True], ids=["pdl_off", "pdl_on"])
 def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl):
-    """SGLANG_DSV41_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
+    """SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
     it to the six chain launchers (test_exl3_ram_miss_device_args.py)."""
     service, streamers, caches = tiers
-    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(pdl):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(pdl):
+        _reconfigure(service)
         _attach_all(service, streamers)
     assert service.lease_pdl is pdl and service.device_side.lease_pdl is pdl
-    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(not pdl):
-        service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(not pdl):
+        service.ensure_started()  # the config was resolved once: a later env change is not seen
     assert service.device_side.lease_pdl is pdl
 
 
@@ -691,7 +714,7 @@ def test_the_device_side_carries_the_hosts_lease_block_and_piece_table(tiers):
 def _attach_with_copy_tables(service, streamers, *, drop_name=None):
     """``_attach_all`` with a copy table per layer whose sources are that row's slabs, as a real graph gather's
     are: the stream kernel's segment map is built from them. ``drop_name`` leaves one streamed name out."""
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
     service.ensure_started()
     tables = service.host.tables
@@ -766,10 +789,10 @@ def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
 
 def test_ensure_started_refuses_a_host_module_whose_layout_disagrees_with_exl3_streamed_names(tiers, monkeypatch):
     """Review Focus 4 (final-review.md Minor 8) was tested only statically: nothing exercised the refusal at
-    exl3_ram_miss.py:770-774 with a reordered host layout. A host module built against a different name order
+    expert_engine/service.py with a reordered host layout. A host module built against a different name order
     than the Python EXL3_STREAMED_NAMES would stream bytes into the wrong tensor; ensure_started must refuse it
     rather than start."""
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
     service, streamers, caches = tiers
     reordered = tuple(reversed(EXL3_STREAMED_NAMES))
@@ -781,14 +804,14 @@ def test_ensure_started_refuses_a_host_module_whose_layout_disagrees_with_exl3_s
 
 def test_the_layout_is_read_from_the_module_the_launch_builds(tiers, monkeypatch):
     """A 16-lane launch reads the 16-lane host module's names; the 8-lane default would JIT-build a second host."""
-    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
     service, streamers, caches = tiers
     asked = []
     monkeypatch.setattr(module, "host_layout", lambda **kwargs: asked.append(kwargs) or (EXL3_STREAMED_NAMES, 0))
     service.plan_gather_width(12)
     service.ensure_started()
-    assert asked == [{"lanes": 16}]
+    assert asked == [{"layout": ("exl3", "sqrt_softplus"), "lanes": 16}]
 
 
 def test_the_wire_and_lanes_are_unreadable_before_the_service_starts(tiers):
@@ -823,7 +846,7 @@ def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monke
 
 
 def test_shutdown_freezes_native_reader_before_final_trace(monkeypatch):
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     order = []
 
     class Host:
@@ -854,7 +877,7 @@ def test_shutdown_freezes_native_reader_before_final_trace(monkeypatch):
 
 
 def test_shutdown_quarantines_after_native_stop_failure(monkeypatch):
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service._stages_traced = True
     order = []
 
@@ -892,7 +915,7 @@ def test_the_quarantine_keeps_every_device_buffer_a_kernel_may_still_touch(monke
         experts=4, piece_runs=torch.zeros((1, 4, STAGE_PIECES, 1, 2), dtype=torch.int32), row_capacities=[5],
         timeout_ms=10,
     )
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service.device_side = side
     kept = []
     monkeypatch.setattr(module, "quarantine_host_slabs", lambda owned: kept.extend(owned))
@@ -954,7 +977,7 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     trace = SimpleNamespace(enabled=True, record_graph_step=lambda **kw: lines.append(kw))
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
     demand_rows = [[0, 0]]
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service._manager = manager
     service.routed_rows_per_step = 12  # 6 routed rows in each of the two layers
     counters = {"rows_read": 0}
@@ -1002,7 +1025,7 @@ def test_graph_trace_defers_cuda_readback_until_a_later_check(monkeypatch):
         lambda: SimpleNamespace(enabled=True, record_graph_step=lambda **kw: lines.append(kw)),
     )
     graph_rows = torch.zeros((2, 2), dtype=torch.int64, device="cuda")
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service._manager = SimpleNamespace(_registers={"decode": {"graph_rows": graph_rows}})
     service.routed_rows_per_step = 12
     demand_rows = [[0, 0]]
@@ -1052,7 +1075,7 @@ def test_graph_trace_coalesces_busy_slot_and_flushes_final_sample(monkeypatch):
     delayed = DelayedEvent(enable_timing=False)
     monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: delayed)
     graph_rows = torch.zeros((2, 2), dtype=torch.int64, device="cuda")
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service._manager = SimpleNamespace(_registers={"decode": {"graph_rows": graph_rows}})
     service.routed_rows_per_step = 12
     demand_rows = [[0, 0]]
@@ -1092,7 +1115,7 @@ def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
     def gather(topk_ids):
         raise Gathered  # stop before the fused MoE: only the routes copy is under test
 
-    backend = SimpleNamespace(routes=torch.full((6,), 7, dtype=torch.int64), keep=torch.ones(1))
+    backend = SimpleNamespace(routes=torch.full((6,), 7, dtype=torch.int64), keep=torch.ones(1), leased=False)
     streamer = SimpleNamespace(row_backend=backend, gather=gather)
     ids = torch.tensor([[5, 2, 9, 0]], dtype=torch.int32)
     with pytest.raises(Gathered):
@@ -1112,8 +1135,8 @@ def test_the_row_backend_hands_the_kernels_at_least_the_wires_planned_lanes(monk
         copy_wait=lambda count, dst_slots, sm: calls.append(("copy_wait", None)),
         host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False, wire=lease.wire_layout(lanes),
     )
-    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
-    backend = module.Exl3RamMissRowBackend(
+    monkeypatch.setattr(row_backend, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
+    backend = row_backend.ExpertEngineRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, 6, {0: None}
     )
     assert backend.planned.numel() >= lanes
@@ -1160,7 +1183,7 @@ def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
     trace = SimpleNamespace(enabled=True, record_ram_miss_requests=lambda records, layer_ids: sent.append((records, layer_ids)))
     monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
     drained = []
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service._rows = {7: 0, 3: 1}  # layer id -> row
     service.host = SimpleNamespace(
         drain_trace=lambda: drained.append(1) or [{"row": 1}], trace_dropped=lambda: 0
@@ -1174,7 +1197,7 @@ def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
 
 def _copy_engine_service(monkeypatch):
     """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md, "Copy engine")."""
-    service = module.Exl3RamMissService()
+    service = module.ExpertEngineService(**dsv41_exl3_pairing())
     service.copy_engine = True
     # No split model (an empty word tensor): the pause calibrates the table alone.
     service.device_side = SimpleNamespace(copy_engine_captured=True, split_model=torch.empty(0))
@@ -1304,8 +1327,9 @@ def test_the_quiet_probes_read_the_ram_thread_copy_engine_tier_reads_and_the_dri
     service.host = _quiet_host({"ram_miss_thread": 1, "copy_engine_jobs": 1, "tier_drive_reads": 1})
     monkeypatch.setattr(module, "block_device_inflight_paths", lambda dirs: {"nvme9n1": "/x"} if list(dirs) else {})
     monkeypatch.setattr(module, "inflight_busy", lambda path: path == "/x")
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)), envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.override(""):
-        probes = service.quiet_probes()
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": str(tmp_path)})), \
+            envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.override(""):
+        probes = _reconfigure(service).quiet_probes()
     assert list(probes) == ["ram_miss_thread", "copy_engine_jobs", "tier_drive_reads", "nvme9n1_inflight"]
     assert [probe() for probe in probes.values()] == [True, True, True, True]
     assert [probe() for probe in probes.values()] == [False, False, False, True]
@@ -1384,7 +1408,8 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
     # reaches enable_copy_engine here would leak the copy-engine config into every later test.
-    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_COPY_MODE", "copy_engine")
+    _reconfigure(service)
     if value == "EAGER":
         with pytest.raises(_CopyEngineReached):
             service.ensure_started()
@@ -1396,7 +1421,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
 
 @pytest.mark.parametrize("spin_us", [None, -1, 321])
 def test_the_copy_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
-    """SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US reaches enable_copy_engine (default 5000 us; -1 never sleeps)."""
+    """SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US reaches enable_copy_engine (default 5000 us; -1 never sleeps)."""
     service, streamers, caches = tiers
     monkeypatch.setenv("CUDA_MODULE_LOADING", "EAGER")
     seen = []
@@ -1407,11 +1432,12 @@ def test_the_copy_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us)
 
     monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_COPY_MODE", "copy_engine")
     if spin_us is None:
-        monkeypatch.delenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", raising=False)
+        monkeypatch.delenv("SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US", raising=False)
     else:
-        monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", str(spin_us))
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US", str(spin_us))
+    _reconfigure(service)
     with pytest.raises(_CopyEngineReached):
         service.ensure_started()
     assert [kw["spin_us"] for kw in seen] == [5000 if spin_us is None else spin_us]
@@ -1475,8 +1501,8 @@ def _prefill_share_service(tiers, monkeypatch, *, on, share=1):
     service, _, caches = tiers
     recorder = _Recorder()
     monkeypatch.setattr(expert_distribution, "get_global_expert_distribution_recorder", lambda: recorder)
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(on), envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.override(share):
-        service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE.override(on), envs.SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS.override(share):
+        _reconfigure(service).ensure_started()
     return service, caches, recorder
 
 
@@ -1542,18 +1568,20 @@ def test_the_share_sized_at_start_reaches_set_prefill_share(tiers, monkeypatch):
 
 
 def test_a_forced_share_below_one_is_refused(tiers, monkeypatch):
-    with pytest.raises(ValueError, match="SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"):
+    with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS"):
         _prefill_share_service(tiers, monkeypatch, on=True, share=0)
 
 
 def test_a_tier_of_only_full_layers_sizes_no_prefill_share():
     """Every layer full (production's whole-model tier): no layer admits, so the share is 0 and the start goes on."""
     tables = SimpleNamespace(layer_ids=[0, 1, 2])
-    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1,2"):
-        assert module.Exl3RamMissService._size_prefill_share(SimpleNamespace(), tables, 2) == 0
-    with envs.SGLANG_MOE_PINNED_HOST_FULL_LAYERS.override("0,1,2"), envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.override(0):
-        with pytest.raises(ValueError, match="SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS"):
-            module.Exl3RamMissService._size_prefill_share(SimpleNamespace(), tables, 2)
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1,2"):
+        service = SimpleNamespace(config=resolved_config())  # _size_prefill_share reads only the service's config here
+        assert module.ExpertEngineService._size_prefill_share(service, tables, 2) == 0
+    with envs.SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS.override("0,1,2"), envs.SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS.override(0):
+        service = SimpleNamespace(config=resolved_config())
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS"):
+            module.ExpertEngineService._size_prefill_share(service, tables, 2)
 
 
 def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
@@ -1566,9 +1594,9 @@ def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
         "get_global_expert_distribution_recorder",
         lambda: expert_distribution._ExpertDistributionRecorderNoop(),
     )
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(True):
-        with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_PREFILL_SHARE"):
-            service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE"):
+            _reconfigure(service).ensure_started()
 
 
 def _place_tier_off_the_gpu_node(monkeypatch):
@@ -1589,7 +1617,7 @@ def test_draft_host_starts_the_service_first(tiers, monkeypatch):
     started = []
     ensure_started = service.ensure_started
     monkeypatch.setattr(service, "ensure_started", lambda: (started.append(True), ensure_started())[1])
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_CPU_EXPERTS is off"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS is off"):
         service.draft_host([], fatal_wait_s=1.0)
     assert started == [True]
     assert service.host is not None
@@ -1599,12 +1627,12 @@ def test_draft_host_refuses_without_cpu_experts(tiers):
     service, _, _ = tiers
     service.ensure_started()
     assert service.cpu_experts is None
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_CPU_EXPERTS is off"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS is off"):
         service.draft_host([], fatal_wait_s=1.0)
 
 
 def test_a_tier_placement_without_the_gpu_node_starts_without_a_draft(tiers, monkeypatch):
-    """The GPU node's group is needed only by the DSpark draft: a launch whose SGLANG_MOE_PINNED_HOST_NUMA_MB leaves the
+    """The GPU node's group is needed only by the DSpark draft: a launch whose SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB leaves the
     GPU's node out must still start (it did before the draft channel existed)."""
     service, _, _ = tiers
     _place_tier_off_the_gpu_node(monkeypatch)
@@ -1618,7 +1646,7 @@ def test_draft_host_names_the_placement_when_the_gpu_node_has_no_group(tiers, mo
     service.ensure_started()
     service.cpu_experts = object()  # as if the CPU experts had started
     try:
-        with pytest.raises(RuntimeError, match=r"GPU's node 99.*SGLANG_MOE_PINNED_HOST_NUMA_MB"):
+        with pytest.raises(RuntimeError, match=r"GPU's node 99.*SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB"):
             service.draft_host([], fatal_wait_s=1.0)
     finally:
         service.cpu_experts = None
@@ -1635,29 +1663,30 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
         "cpu_trait_for",
         lambda key, *, source: sources.append(source) or SimpleNamespace(hidden_size=lambda slabs: 8),
     )
-    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
+    cfg = SimpleNamespace(enable_layer_fusion=True)
     streamers = {
         3: SimpleNamespace(
             pinned_host_cache=SimpleNamespace(tensors={}), layer=SimpleNamespace(layer_id=3), graph_gather_rows=36
         )
     }
-    with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(True):
+    with envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"), envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(True):
         with pytest.raises(RuntimeError, match="layer 3.*top_k"):
-            module.Exl3RamMissService._start_cpu_experts(
-                cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36
+            module.ExpertEngineService._start_cpu_experts(
+                cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36,
+                stream=resolved_config().stream,
             )
     assert sources == ["target"]
 
 
 def test_ram_prefetch_without_cpu_experts_is_refused_at_start(tiers):
     service, _, _ = tiers
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
-        with pytest.raises(RuntimeError, match="SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS"):
-            service.ensure_started()
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"):
+            _reconfigure(service).ensure_started()
 
 
 def _prefetch_with_cpu_expert_stand_in(service, monkeypatch):
-    """SGLANG_DSV41_CPU_EXPERTS on, with a stand-in engine (hidden ROW_IMAGE_DIM) and plans without CPU cores."""
+    """SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS on, with a stand-in engine (hidden ROW_IMAGE_DIM) and plans without CPU cores."""
     from sglang.srt.layers.moe.ram_prefetch import clear_router_gates
 
     clear_router_gates()
@@ -1676,10 +1705,10 @@ def test_a_failed_ram_prefetch_enable_stops_the_host_and_leaves_the_service_unst
     stopped = []
     stop = module.ExpertStreamHost.stop
     monkeypatch.setattr(module.ExpertStreamHost, "stop", lambda host: (stopped.append(host), stop(host))[1])
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(1):
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(1):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True):
             with pytest.raises(ValueError, match="no streamed row has a next layer"):
-                service.ensure_started()
+                _reconfigure(service).ensure_started()
     assert len(stopped) == 1 and not stopped[0]._close.alive
     assert service.host is None and service.cpu_experts is None and service.pool_slots() == 0
 
@@ -1688,9 +1717,9 @@ def test_a_ram_prefetch_share_that_leaves_a_row_too_few_slots_is_refused_at_star
     """CAPACITY + 1 slots, one staging: a share of 2 leaves one assignable slot, the host needs 2 per group."""
     service, _, _ = tiers
     _prefetch_with_cpu_expert_stand_in(service, monkeypatch)
-    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
-            refused = r"SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's group 0 slots \[0, 4\)"
+    with envs.SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH.override(True), envs.SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE.override(2):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS.override(True):
+            refused = r"SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's group 0 slots \[0, 4\)"
             with pytest.raises(RuntimeError, match=refused):
-                service.ensure_started()
+                _reconfigure(service).ensure_started()
     assert service.host is None

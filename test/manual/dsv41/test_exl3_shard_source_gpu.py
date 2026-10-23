@@ -7,7 +7,7 @@ import torch
 from safetensors import safe_open
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
@@ -46,7 +46,7 @@ def _streamer(ckpt):
     layer = torch.nn.Module()
     layer.layer_id = LAYER
     fmt = Exl3ExpertFormat(build_exl3_expert_layout(str(ckpt)), LAYER, direct=False)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+    with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
         return ExpertStreamer(layer, fmt.names, layer_id=LAYER, format=fmt)
 
 
@@ -107,7 +107,7 @@ def test_the_managers_build_inclusive_tiers(tmp_path):
         fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
         # A 6-expert fake: shrink the gather reserve so the clamp leaves hot slots.
         fmt.max_gather_rows = 2
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+        with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
             layer._nvfp4_expert_streamer = ExpertStreamer(
                 layer, fmt.names, layer_id=layer_id, format=fmt
             )

@@ -1,6 +1,6 @@
 """Offline replay of the CPU split's miss cut on a traced DSpark capture: today's flat cut against a graded one.
 
-Today (SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, _MAX=3; ram_slot_map.type_lanes and lease_device.cuh type_lanes) a node
+Today (miss_cut=1, miss_cut_max=3 of SGLANG_EXPERT_STREAM_CPU_SPLIT; ram_slot_map.type_lanes and lease_device.cuh type_lanes) a node
 with 1..3 forced CPU misses takes one fewer of its split's CPU-hit lanes, and that lane goes to the copy engine. The
 graded cut sizes the cut per node from what the device knows when it types the lanes: the node's forced misses m,
 its split take t, its forced CPU hits f and the record's DMA lanes. It predicts that miss i (1-based) lands at
@@ -530,7 +530,7 @@ def main() -> int:
     p.add_argument("--skip", type=int, default=8)
     p.add_argument("--tokens-per-verify", type=float, default=3.6)
     p.add_argument("--split", default="0,1,2,2,3,3,4,5,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17,17,18,19,19,"
-                   "20,21,21,22,23,23,24,24,25,26,26", help="SGLANG_DSV41_CPU_EXPERTS_SPLIT of the capture")
+                   "20,21,21,22,23,23,24,24,25,26,26", help="the split table (the table of SGLANG_EXPERT_STREAM_CPU_SPLIT) of the capture")
     p.add_argument("--infer-forced", action="store_true", help="infer forced CPU hits even when lane_kind is traced")
     p.add_argument("--stream-coupling", type=float, default=STREAM_COUPLING,
                    help="the GPU stream kernel's delay per added copy lane, in copy lanes (layer_effect); 0: none")

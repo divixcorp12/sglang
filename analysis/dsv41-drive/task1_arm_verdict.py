@@ -24,9 +24,38 @@ import sys
 SECRET_NAME = re.compile(r"(API_?KEY|SECRET(_?KEY)?|PASSWORD|CREDENTIALS?|(AUTH|ACCESS|API|HF|BEARER)_TOKEN)$", re.I)
 REDACTED = "<redacted>"
 MAX_EXPERT_CACHE_GROWTH_BYTES = 1 << 30
-READER = "SGLANG_MOE_EXPERT_FILE_READER"
-MIRRORS_ENV = "SGLANG_MOE_EXPERT_MIRROR_DIRS"
-TRACE_ENV = "SGLANG_DSV41_EXPERT_TRACE_PATH"
+# An arm json records the process environment under the names the tree it ran used. Arms from before the F145 rename
+# carry the first name of each pair; the second is the group env or renamed knob that replaced it.
+READER = "SGLANG_EXPERT_STREAM_FILE_READER"
+READER_OLD = "SGLANG_MOE_EXPERT_FILE_READER"
+MIRRORS_ENV = "SGLANG_EXPERT_STREAM_MIRROR"  # JSON object, the roots in its "dirs"
+MIRRORS_ENV_OLD = "SGLANG_MOE_EXPERT_MIRROR_DIRS"
+TRACE_ENV = "SGLANG_EXPERT_STREAM_TRACE"  # JSON object, the stage trace path in its "expert_path"
+TRACE_ENV_OLD = "SGLANG_DSV41_EXPERT_TRACE_PATH"
+GRAPH_GATHER = "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"
+GRAPH_GATHER_OLD = "SGLANG_MOE_EXPERT_GRAPH_GATHER"
+
+
+def group_key(env: dict, group: str, key: str):
+    """``key`` of the JSON group env ``group`` in a recorded process environment; None when unset or not JSON."""
+    raw = env.get(group)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value.get(key) if isinstance(value, dict) else None
+
+
+def mirror_dirs(env: dict):
+    """The mirror roots a recorded process environment set, from either spelling; falsy when none."""
+    return group_key(env, MIRRORS_ENV, "dirs") or env.get(MIRRORS_ENV_OLD)
+
+
+def trace_path(env: dict):
+    """The stage trace path a recorded process environment set, from either spelling; falsy when none."""
+    return group_key(env, TRACE_ENV, "expert_path") or env.get(TRACE_ENV_OLD)
 
 
 def check_arm(report: dict, *, root: str, head: str, mirror: bool, traced: bool, sessions: int = 4) -> tuple[list, list]:
@@ -56,17 +85,18 @@ def check_arm(report: dict, *, root: str, head: str, mirror: bool, traced: bool,
         wrongly = sorted(k for k, v in (prov.get(table) or {}).items() if v == REDACTED and not SECRET_NAME.search(k))
         if wrongly:
             problems.append(f"{table} redacted knobs that are not secrets, so their values are lost: {wrongly}")
-    if resolved.get(READER) != "uring_direct":
-        problems.append(f"{READER} resolved to {resolved.get(READER)!r}, not 'uring_direct': reads may fill the page cache")
+    reader = resolved.get(READER, resolved.get(READER_OLD))
+    if reader != "uring_direct":
+        problems.append(f"{READER} resolved to {reader!r}, not 'uring_direct': reads may fill the page cache")
     env = prov.get("sglang_env") or {}
-    if mirror and not env.get(MIRRORS_ENV):
-        problems.append(f"arm claims mirrors on but {MIRRORS_ENV} is unset in the process")
-    if not mirror and env.get(MIRRORS_ENV):
-        problems.append(f"arm claims mirrors off but {MIRRORS_ENV}={env[MIRRORS_ENV]!r} in the process")
-    if traced != bool(env.get(TRACE_ENV)):
-        problems.append(f"arm claims traced={traced} but {TRACE_ENV} is {env.get(TRACE_ENV)!r}")
-    if resolved.get("SGLANG_MOE_EXPERT_GRAPH_GATHER") is not True:
-        problems.append("SGLANG_MOE_EXPERT_GRAPH_GATHER did not resolve to true: this is not the in-graph reader")
+    if mirror and not mirror_dirs(env):
+        problems.append(f"arm claims mirrors on but the {MIRRORS_ENV} dirs are unset in the process")
+    if not mirror and mirror_dirs(env):
+        problems.append(f"arm claims mirrors off but the mirror dirs are {mirror_dirs(env)!r} in the process")
+    if traced != bool(trace_path(env)):
+        problems.append(f"arm claims traced={traced} but the {TRACE_ENV} expert_path is {trace_path(env)!r}")
+    if resolved.get(GRAPH_GATHER, resolved.get(GRAPH_GATHER_OLD)) is not True:
+        problems.append(f"{GRAPH_GATHER} did not resolve to true: this is not the in-graph reader")
 
     idle = prov.get("drive_idle_check") or {}
     if idle.get("idle") is not True:

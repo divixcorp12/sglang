@@ -1,20 +1,17 @@
-"""RAM-miss service for EXL3 streamed experts.
+"""The expert engine service: RAM-miss service for streamed experts.
 
 A native service thread fills the pinned RAM tier's slots: it reads the missing experts'
 row images with O_DIRECT straight into the layers' pinned slabs, with no Python on the
 path. Device kernels in the decode graph exchange records with that thread over the
 slot-map protocol (``analysis/dsv41-drive/LEASE_PROTOCOL.md``).
 
-The pieces, in file order:
+``ExpertEngineService`` is built from an expert format and a model profile, and loads the
+transport build keyed by ``(format.transport_build, profile.router)``. A key the transport
+does not build, a model beyond the profile's caps, or CPU experts or a draft requested of
+a format or profile that only has a stub, refuse at startup.
 
-- ``Exl3RamMissTables`` and ``exl3_ram_miss_tables``: flatten a checkpoint's row images
-  and each layer's pinned slabs into the int64 tensors the native thread reads.
-- Copy-engine helpers: the small-copy table, and the checks that refuse an unsafe
-  launch configuration.
-- ``NativePinnedSlotTable``: a layer's ``PinnedSlotTable`` over the native bookkeeping.
-- ``Exl3RamMissRowBackend``: a layer's gather, the lease chain of device kernels.
-- ``Exl3RamMissService``: the process-wide singleton that starts the thread, owns the
-  device side and the hooks, runs per-batch upkeep and shuts everything down safely.
+The pieces around it: ``startup`` (the checks), ``row_backend`` (a layer's slot table and
+gather), ``formats/exl3_tables`` (the EXL3 flat tables the native reader runs from).
 """
 
 from __future__ import annotations
@@ -28,17 +25,12 @@ import threading
 import time
 import weakref
 from contextlib import nullcontext
-from dataclasses import dataclass, field
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional
 
 import torch
 
-from sglang.kernels.ops.moe.expert_cache_transfer import (
-    copy_expert_row_segments_gpu,
-    device_copy_grid_blocks,
-    expert_row_segments,
-)
-from sglang.kernels.ops.moe.expert_lease_block import MAX_LANES, WireLayout, wire_layout
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DRIP_TABLE_SLOTS,
     ExpertStreamDevice,
@@ -51,24 +43,46 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     stream_segment_map,
 )
 from sglang.srt.dsv41_config import Dsv41Config
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.copy_engine_quiet import (
     QuietReport,
     block_device_inflight_paths,
+    cuda_module_loading_env,
     inflight_busy,
     wait_for_quiet,
 )
 from sglang.srt.layers.moe.cpu_experts.threading_config import ThreadingConfig
-from sglang.srt.layers.moe.exl3_expert_format import (
-    EXL3_STREAMED_NAMES,
-    RowSegment,
-)
-from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
-from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy, mirror_caps
-from sglang.srt.layers.moe.exl3_row_image import RowImageSet
+from sglang.srt.layers.moe.exl3_read_split import mirror_caps
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
+from sglang.srt.layers.moe.expert_engine.config import (
+    CopyMode,
+    CpuSplitConfig,
+    ExpertStreamConfig,
+    GpuDripConfig,
+    PullMode,
+    ResolvedConfig,
+    resolved_config,
+)
+from sglang.srt.layers.moe.expert_engine.formats import ExpertFormat
+from sglang.srt.layers.moe.expert_engine.profiles import ModelProfile
+from sglang.srt.layers.moe.expert_engine.row_backend import (
+    PREFILL_SHARE_FRACTION,
+    ExpertEngineRowBackend,
+    NativePinnedSlotTable,
+    check_sm_small_copies,
+    full_layer_shortfall,
+    padded_plan_width,
+    pool_room_shortfall,
+    prefill_share_rows,
+    sm_copy_mask,
+    sm_copy_table,
+    spill_room_shortfall,
+    usable_rows,
+)
+from sglang.srt.layers.moe.expert_engine.startup import (
+    check_requested_capabilities,
+    resolve_transport_build,
+)
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
-from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.layers.moe.expert_stream import (
     model_fully_pinned,
     pinned_full_layers,
@@ -83,11 +97,9 @@ from sglang.srt.layers.moe.ram_slot_map import (
 )
 
 logger = logging.getLogger(__name__)
-# NVTX ranges around the eager host-use pause's stream sync and thread pause.
-_SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
 
 
-def _quarantine_service_at_exit(service: weakref.ref[Exl3RamMissService]) -> None:
+def _quarantine_service_at_exit(service: weakref.ref[ExpertEngineService]) -> None:
     """Exit hook: quarantine the tiers, never free them.
 
     No device barrier is attempted in an exit handler, so nothing can prove a GPU
@@ -98,716 +110,6 @@ def _quarantine_service_at_exit(service: weakref.ref[Exl3RamMissService]) -> Non
         live.shutdown(at_exit=True)
 
 
-@dataclass(frozen=True)
-class Exl3RamMissTables:
-    """The flat tables the native RAM-miss reader runs from.
-
-    Dimensions: ``L`` streamed layers (ascending layer id is row order), ``E`` experts
-    per layer, ``F`` files, ``P`` parts (mirror roots) per row, ``S`` segments.
-
-    Files and extents:
-
-    - ``paths``, ``source_paths``, ``file_sizes`` (int64 ``[F]``): per file, its path,
-      the source shard it copies (itself with no mirror roots) and its size.
-    - ``extents`` (int64 ``[L, E, P, 4]``): file index, aligned offset, aligned length
-      and destination offset in the row's slot. Part ``p`` of a row is served by root
-      ``p``. Parts sum to the row's aligned length, and a zero-length part means this
-      root serves none of the row (no read is issued).
-    - ``starts`` (int64 ``[L, E]``): where the row starts inside its aligned superset.
-    - ``parts``: ``P``, mirror roots per row (1 with no roots).
-
-    Destination:
-
-    - ``segments`` (int64 ``[S, 4]``): name index, destination offset, source offset,
-      bytes.
-    - ``slabs`` (int64 ``[L, 6]``): slab base addresses in ``EXL3_STREAMED_NAMES``
-      order. ``row_bytes`` (int64 ``[6]``) is each slab's row size and ``capacity``
-      (int64 ``[L]``) each layer's row count.
-    - ``slot_bytes``: bytes of one row slot, the image size.
-
-    ``row_images`` marks the only supported source: the files are row-image layer
-    files (see ``exl3_row_image``), a row's parts tile its image (``starts`` is 0 and
-    the extents' destination is the position in the image), the segments are the six
-    identity segments, and the reader reads straight into the slabs (its direct mode).
-
-    ``keepalive`` holds every slab tensor whose address is in ``slabs``: the native
-    reader writes through those raw addresses, so the tables must keep the slabs alive.
-    """
-
-    layer_ids: list[int]
-    paths: list[str]
-    source_paths: list[str]
-    file_sizes: torch.Tensor
-    extents: torch.Tensor
-    starts: torch.Tensor
-    parts: int
-    segments: torch.Tensor
-    slabs: torch.Tensor
-    row_bytes: torch.Tensor
-    capacity: torch.Tensor
-    slot_bytes: int
-    row_images: bool = False
-    keepalive: tuple = field(default=(), repr=False, compare=False)
-
-
-def exl3_ram_miss_tables(
-    layout: Exl3ExpertLayout,
-    segments: Sequence[RowSegment],
-    slabs_by_layer: Mapping[int, Mapping[str, torch.Tensor]],
-    *,
-    roots: Sequence[str] = (),
-    policy: Optional[SplitPolicy] = None,
-    source_root: Optional[str] = None,
-    row_images: Optional[RowImageSet] = None,
-) -> Exl3RamMissTables:
-    """Tables for the streamed layers in ``slabs_by_layer`` (ascending id is row order).
-
-    ``row_images`` is an ``open_row_images`` set over ``roots``, split across them as
-    ``policy`` splits the mirrors; see ``_row_image_tables``. ``source_root`` is
-    accepted only so ``mirror_table_args()`` can be passed whole.
-
-    Row images are the only supported source: the native reader reads them with
-    O_DIRECT straight into the slabs, and shard tables would need a bounce-and-pack
-    path that no longer exists. A call without ``row_images`` raises ``ValueError``
-    naming the converter.
-    """
-    # The images carry their own paths, so the mirrors' source root names nothing here.
-    del source_root
-    if row_images is None:
-        raise ValueError(
-            "the RAM-miss reader reads row images only: build them for this checkpoint with "
-            "scripts/dsv41/build_row_images.py and pass the opened set (row_images=...); shard tables were refused"
-        )
-    return _row_image_tables(
-        layout, segments, slabs_by_layer, row_images, roots=roots, policy=policy
-    )
-
-
-def _slab_table(
-    layer_ids, slabs_by_layer, row_bytes, names
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Every streamed layer's slab base addresses (int64 ``[L, 6]``) and row counts.
-
-    Raises ``ValueError`` for a slab the native reader could not write through its raw
-    address: non-contiguous, not on the CPU, or with a row size other than
-    ``row_bytes``.
-    """
-    slabs = torch.empty((len(layer_ids), len(EXL3_STREAMED_NAMES)), dtype=torch.int64)
-    capacity = torch.empty(len(layer_ids), dtype=torch.int64)
-    for row, layer_id in enumerate(layer_ids):
-        tensors = slabs_by_layer[layer_id]
-        rows = {int(tensors[name].shape[0]) for name in EXL3_STREAMED_NAMES}
-        if len(rows) != 1:
-            raise ValueError(
-                f"layer {layer_id}: pinned slabs disagree on their row count {rows}"
-            )
-        capacity[row] = rows.pop()
-        for name, index in names.items():
-            slab = tensors[name]
-            if not slab.is_contiguous() or slab.device.type != "cpu":
-                raise ValueError(
-                    f"layer {layer_id} {name}: slab must be a contiguous CPU tensor"
-                )
-            per_row = slab.numel() * slab.element_size() // max(int(capacity[row]), 1)
-            if per_row != int(row_bytes[index]):
-                raise ValueError(
-                    f"layer {layer_id} {name}: slab rows hold {per_row} B, expected {int(row_bytes[index])}"
-                )
-            slabs[row, index] = slab.data_ptr()
-    return slabs, capacity
-
-
-def _row_image_tables(
-    layout: Exl3ExpertLayout,
-    segments: Sequence[RowSegment],
-    slabs_by_layer: Mapping[int, Mapping[str, torch.Tensor]],
-    images: RowImageSet,
-    *,
-    roots: Sequence[str],
-    policy: Optional[SplitPolicy],
-) -> Exl3RamMissTables:
-    """The native reader's tables over row images.
-
-    File ``row * parts + p`` is root ``p``'s image file of streamed row ``row``. Expert
-    ``e``'s image is split across the roots as ``policy`` splits its page-rounded
-    ``row_stride`` (the mirrors' split), each part clipped at ``image_bytes``. The last
-    part ends exactly at the image's end because the padding after it is never read: a
-    ``readv`` of it would run past the last slab row.
-
-    Part ``p`` is ``(file, e * row_stride + start, bytes, start)``, with ``start`` its
-    position in the image. ``starts`` is 0 and the segments are the identity (name
-    ``n``'s slab row is image bytes ``[name_offsets[n], + row_bytes[n])``), so piece
-    ``j`` of the reader's geometry is exactly sub-read ``j``. Every length and offset
-    is a multiple of 512, as the image layout's names are; the reader re-checks that at
-    open against O_DIRECT's alignment.
-    """
-    parts = len(images.roots)
-    if tuple(roots) and tuple(roots) != tuple(images.roots):
-        raise ValueError(
-            f"row images are on {images.roots}, the tables were asked for roots {tuple(roots)}"
-        )
-    if policy is None:
-        if parts != 1:
-            raise ValueError(
-                "row images on several roots need the split policy the mirrors use"
-            )
-        policy = StaticSplitPolicy((1.0,))
-    image = images.layout
-    if images.num_experts != layout.num_experts:
-        raise ValueError(
-            f"row images hold {images.num_experts} experts per layer, the layout {layout.num_experts}"
-        )
-    if image.segments != tuple(segments):
-        raise ValueError(
-            "row images were opened for a different segment map than the tables are built from"
-        )
-    split = policy.plan(image.row_stride)
-    if len(split.part_bytes) != parts:
-        raise ValueError(
-            f"split policy plans {len(split.part_bytes)} parts for {parts} row-image roots"
-        )
-    clipped = [
-        (min(start, image.image_bytes), min(start + nbytes, image.image_bytes))
-        for start, nbytes in zip(split.starts, split.part_bytes)
-    ]
-    layer_ids = sorted(slabs_by_layer)
-    missing = [layer for layer in layer_ids if layer not in images.paths]
-    if missing:
-        raise ValueError(f"row images were not opened for streamed layers {missing}")
-    extents = torch.empty(
-        (len(layer_ids), layout.num_experts, parts, 4), dtype=torch.int64
-    )
-    experts = torch.arange(layout.num_experts, dtype=torch.int64) * image.row_stride
-    for row in range(len(layer_ids)):
-        for part, (lo, hi) in enumerate(clipped):
-            extents[row, :, part, 0] = row * parts + part
-            extents[row, :, part, 1] = experts + lo
-            extents[row, :, part, 2] = hi - lo
-            extents[row, :, part, 3] = lo
-    paths = [images.paths[layer][part] for layer in layer_ids for part in range(parts)]
-    # Every root's file of a layer copies root 0's; the reader's open-time size check
-    # names that source.
-    copied = [images.paths[layer][0] for layer in layer_ids for _ in range(parts)]
-    file_bytes = layout.num_experts * image.row_stride
-    names = {name: index for index, name in enumerate(EXL3_STREAMED_NAMES)}
-    segment_table = torch.tensor(
-        [
-            [n, 0, image.name_offsets[n], image.row_bytes[n]]
-            for n in range(len(EXL3_STREAMED_NAMES))
-        ],
-        dtype=torch.int64,
-    )
-    slabs, capacity = _slab_table(layer_ids, slabs_by_layer, image.row_bytes, names)
-    return Exl3RamMissTables(
-        layer_ids=layer_ids,
-        paths=paths,
-        source_paths=copied,
-        file_sizes=torch.full((len(paths),), file_bytes, dtype=torch.int64),
-        extents=extents,
-        starts=torch.zeros((len(layer_ids), layout.num_experts), dtype=torch.int64),
-        parts=parts,
-        segments=segment_table,
-        slabs=slabs,
-        row_bytes=torch.tensor(image.row_bytes, dtype=torch.int64),
-        capacity=capacity,
-        slot_bytes=image.image_bytes,
-        row_images=True,
-        keepalive=tuple(
-            slabs_by_layer[layer_id][name]
-            for layer_id in layer_ids
-            for name in EXL3_STREAMED_NAMES
-        ),
-    )
-
-
-def sm_copy_mask(names: Sequence[str], lanes: int = 8) -> int:
-    """Bitmask of the copy-table entries the copy wait copies itself.
-
-    With ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` the copy wait moves the host
-    layout's small tensors, wherever they sit in ``names``.
-    """
-    layout_names, small = host_layout(lanes=lanes)
-    small_names = {name for i, name in enumerate(layout_names) if small >> i & 1}
-    return sum(1 << i for i, name in enumerate(names) if name in small_names)
-
-
-def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
-    """The rows of ``segments.table`` (the device copy table) that ``sm_mask`` names.
-
-    Raises ``ValueError`` unless every source, destination and row size is 16-byte
-    aligned.
-    """
-    rows = [i for i in range(segments.table.shape[0]) if sm_mask >> i & 1]
-    table = segments.table[rows].contiguous()
-    for source, destination, row_bytes in table.tolist():
-        # The copy wait falls back to 1-byte loads off 16-byte alignment: refuse the
-        # slow path rather than take it silently.
-        if (source | destination | row_bytes) % 16:
-            raise ValueError(
-                f"CW reads 16-byte units: source {source:#x}, destination {destination:#x} and rows of "
-                f"{row_bytes} B are not all 16-byte aligned"
-            )
-    return table
-
-
-def check_sm_small_copies(cfg: Dsv41Config) -> None:
-    """Refuse ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` without the copy engine.
-
-    It moves part of the copy engine's work into the copy wait, which only the
-    copy-engine chain runs.
-    """
-    if cfg.enable_ram_miss_sm_small_copies and not cfg.enable_ram_miss_copy_engine:
-        raise RuntimeError(
-            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"
-        )
-
-
-def open_service_row_images(
-    layout, segments, mirrors: dict, direct: bool, streamers
-) -> RowImageSet:
-    """Open the row images the service reads with; they are its only row source.
-
-    The images live beside the mirrored shards, one set per mirror root, and are split
-    across the roots exactly as the mirrors are (``mirrors`` is
-    ``mirror_table_args()``). Raises ``RuntimeError`` without mirror dirs (there is
-    nowhere to read from) and without O_DIRECT reads (the point is a ``readv`` straight
-    into the pinned slabs). ``open_row_images`` raises unless every root holds a
-    complete set matching this checkpoint for every streamed layer, and names the
-    converter (``scripts/dsv41/build_row_images.py``).
-
-    A direct read overwrites its victim slot from submission, so only the lease check
-    in victim selection keeps a slot that a GPU copy may still be reading from being
-    chosen.
-    """
-    if not mirrors:
-        raise RuntimeError(
-            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_MIRROR_DIRS (roots "
-            "holding images built by scripts/dsv41/build_row_images.py)"
-        )
-    if not direct:
-        raise RuntimeError(
-            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_FILE_READER=uring_direct"
-        )
-    from sglang.srt.layers.moe.exl3_row_image import open_row_images
-
-    return open_row_images(
-        mirrors["roots"], layout, segments, mirrors["source_root"], list(streamers)
-    )
-
-
-class NativePinnedSlotTable:
-    """``PinnedSlotTable`` over the C++ service's bookkeeping for one streamed layer.
-
-    Created at pinned-tier construction (from ``pinned_tier_options``) and registered
-    with the service; the service itself starts on first use, once every layer's slabs
-    exist. ``capacity`` is bound later by ``ExpertPinnedHostCache.__init__`` to the
-    tier's row count.
-
-    Host use nests: ``_depth`` counts this table's nesting, and the service counts the
-    process-wide pause apart. Only the outermost level of a table pushes its hot set
-    and refreshes the device slot map.
-    """
-
-    def __init__(
-        self,
-        service: Exl3RamMissService,
-        layer_id: int,
-        streamer_of: Callable[[], object],
-    ):
-        self.service = service
-        self.layer_id = layer_id
-        self.capacity: Optional[int] = None
-        self.streamer_of = streamer_of
-        self._seen_version = -1
-        self._slots: dict[int, int] = {}
-        self._slots_version = -1
-        self._depth = 0
-        service.register(layer_id, self)
-
-    def bind_capacity(self, capacity: int) -> None:
-        self.capacity = int(capacity)
-
-    def held_back_per_group(self) -> int:
-        """HeldBackSlots, before the service starts: an upper bound on each group's staging and pool slots.
-
-        Staging is at most the victim lanes under spill, else the miss lanes, else the widest wire
-        (plan_graph_gather); the pool is the RAM prefetch's share. A fully pinned model holds back neither: no expert
-        can miss, so it has no staging (staging_width) and no prefetch (ram_prefetch_spec_share).
-        """
-        if model_fully_pinned():
-            return 0
-        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
-        staging = victims or envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get() or MAX_LANES
-        return min(staging, MAX_LANES) + ram_prefetch_spec_share()
-
-    @property
-    def reserved_rows(self) -> int:
-        """The row's staging and RAM prefetch pool slots: the service owns them, so ``assign`` never hands one out."""
-        return self.service.staging_for(self.capacity) + self.service.pool_slots()
-
-    @property
-    def _row(self) -> int:
-        self.service.ensure_started()
-        return self.service.row_of(self.layer_id)
-
-    @property
-    def slot_to_expert(self) -> list[int]:
-        """The READY slots' experts, -1 elsewhere: the inverse of the published map."""
-        slots = [-1] * self.capacity
-        for expert, slot in enumerate(self.service.host.mapping(self._row)):
-            if slot >= 0:
-                slots[slot] = expert
-        return slots
-
-    @property
-    def expert_to_slot(self) -> dict[int, int]:
-        """Resident experts and their slots, rebuilt when the C++ map version moves.
-
-        Promotions read this once per promoted row. Every change of membership bumps
-        the version. Callers must not mutate the returned dict.
-        """
-        row = self._row
-        version = self.service.host.version()
-        if self._slots_version != version:
-            self._slots = {
-                expert: slot
-                for expert, slot in enumerate(self.service.host.mapping(row))
-                if slot >= 0
-            }
-            self._slots_version = version
-        return self._slots
-
-    def __contains__(self, expert_id: int) -> bool:
-        return self.service.host.contains(self._row, int(expert_id))
-
-    def touch(self, expert_id: int) -> None:
-        self.service.host.touch(self._row, int(expert_id))
-
-    def assign(
-        self, expert_id: int, protected=frozenset()
-    ) -> tuple[int, Optional[int]]:
-        return self.service.host.assign(
-            self._row, int(expert_id), [int(e) for e in protected]
-        )
-
-    def release(self, slot: int) -> None:
-        self.service.host.release(self._row, int(slot))
-
-    def mapping(self, num_experts: int) -> list[int]:
-        return self.service.host.mapping(self._row)
-
-    # PinnedRowFills (SGLANG_DSV41_ENABLE_PREFILL_FILLS): the service's reader fills
-    # this layer's slots while the tier's host use holds the thread paused.
-    def fill_begin(self, experts, protected, fallback: bool) -> tuple[list[int], int]:
-        return self.service.host.fill_begin(self._row, experts, protected, fallback)
-
-    def fill_wait(self, rows: int) -> None:
-        self.service.host.fill_wait(rows, self.service.fill_timeout_s)
-
-    def fill_landed(self) -> int:
-        return self.service.host.fill_landed()
-
-    def fill_end(self) -> bool:
-        return self.service.host.fill_end()
-
-    def before_host_use(self, cache) -> None:
-        """Pause the service thread (the service counts nesting).
-
-        At this table's outermost level only, also push the layer's hot set to C++ and
-        refresh the device slot map if the thread changed the C++ map.
-        """
-        self.service.before_host_use()
-        try:
-            if self._depth == 0:
-                self._push_hot()
-                version = self.service.host.version()
-                if version != self._seen_version:
-                    cache._refresh_mapping()
-                    self._seen_version = version
-        except BaseException:
-            self.service.after_host_use()
-            raise
-        self._depth += 1
-
-    def after_host_use(self, cache) -> None:
-        self._depth -= 1
-        self.service.after_host_use()
-
-    def _push_hot(self) -> None:
-        """Make the C++ victim choice protect what ``is_pinned`` protects right now.
-
-        Until the updater is attached (start-up promotions) that is the hot cache's
-        slots, which it reserves before promoting them in chunks, each in its own host
-        use. Without this push, a later chunk's admission could evict an earlier
-        chunk's expert from RAM, leaving a VRAM-hot expert with no pinned copy. After
-        the updater is attached it is the snapshot taken at the pause.
-        """
-        streamer = self.streamer_of()
-        hot = None if streamer is None else getattr(streamer, "hot_cache", None)
-        if hot is not None:
-            self.service.host.set_hot(
-                self._row,
-                self.service.hot_experts(self.layer_id)
-                if self.service.gpu_hot_enabled
-                else hot.slot_to_expert,
-            )
-
-
-def padded_plan_width(capacity: int, lanes: int) -> int:
-    """The length of a row backend's ``planned`` tensor: its plan width, and at least the build's lanes."""
-    return max(capacity, lanes)
-
-
-def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int, pool: int = 0) -> list[tuple[int, int, int]]:
-    """The node ranges of a layer that cannot give every forced CPU miss a RAM victim, as (group, slots, needed).
-
-    A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor a speculative pool
-    slot (`pool`, SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE), nor an expert the record routes (at most `lanes` less the
-    forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a range of at least
-    staging + pool + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
-    need = staging + pool + lanes + hot
-    return [(g, hi - lo, need) for g, (lo, hi) in enumerate(ranges) if hi - lo < need]
-
-
-def pool_room_shortfall(ranges, *, staging_width: int, share: int) -> list[tuple[int, int, int, int]]:
-    """The groups of a row the host's reserve_spec_pool would refuse, as (group, lo, hi, staging): each group stages
-    min(width, its slots - 1) and needs 2 assignable slots past its ``share`` pool slots (ram_tier.h)."""
-    short = []
-    for g, (lo, hi) in enumerate(ranges):
-        staging = min(staging_width, hi - lo - 1)
-        if hi - lo - staging - share < 2:
-            short.append((g, lo, hi, staging))
-    return short
-
-
-def full_layer_shortfall(ranges, *, staging_width: int, share: int, experts: int) -> list[tuple[int, int, int]]:
-    """The groups of a row that cannot map every expert homed on them at once, as (group, assignable, homed).
-
-    A group keeps min(width, its slots - 1) staging and ``share`` pool slots out of its range (ram_tier.h,
-    reserve_staging and reserve_spec_pool); the rest must hold the experts e with e % groups == group.
-    """
-    short = []
-    for g, (lo, hi) in enumerate(ranges):
-        assignable = hi - lo - min(staging_width, hi - lo - 1) - share
-        homed = len(range(g, experts, len(ranges)))
-        if assignable < homed:
-            short.append((g, assignable, homed))
-    return short
-
-
-def usable_rows(ranges, *, staging_width: int, share: int) -> int:
-    """The slots of a row that can hold a mapped expert, over every group: each group's range less its
-    min(width, slots - 1) staging slots and ``share`` pool slots (ram_tier.h, reserve_staging and reserve_spec_pool).
-    The prefill share is counted over the same groups (owned_in_row)."""
-    return sum(max(0, hi - lo - min(staging_width, hi - lo - 1) - share) for lo, hi in ranges)
-
-
-def prefill_share_rows(usable: list[int], fraction: Optional[float] = None) -> int:
-    """The prefill share for rows of ``usable`` mapped slots each: ``fraction`` (default PREFILL_SHARE_FRACTION) of
-    the smallest, at least 1. The host keeps one share for every layer (set_prefill_share), so the smallest row
-    decides."""
-    if not usable:
-        raise ValueError("exl3 RAM miss: the prefill share needs at least one row that admits")
-    return max(1, round((PREFILL_SHARE_FRACTION if fraction is None else fraction) * min(usable)))
-
-
-class Exl3RamMissRowBackend(PinnedTierRowBackend):
-    """``PinnedTierRowBackend`` whose gather is the lease chain.
-
-    One gather posts a linear chain of kernels in one stream (see
-    ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "The chain"): the post kernel, which
-    types the lanes from the device's slot map; C1, which copies the compacted
-    ``HIT_SM`` lanes; with the GPU drip, C1s, which copies the ``HIT_SCRATCH`` lanes
-    from the drip's VRAM scratch; S, which copies the misses piece by piece; the copy
-    wait (CW); a stream wait; and the copy check (CC).
-
-    ``routes`` holds the layer's routed experts (the protect set); ``_apply_graph``
-    copies them in before each gather. ``planned`` pads the plan's expert ids to at
-    least the wire's lanes (-1 past the plan): the post kernel reads
-    ``min(count, lanes)`` lanes and ``count`` lives on the device, so no host check
-    can bound it. Every lane of a gather is delivered or the process stops, so ``keep``
-    stays 1 and the delivered count is the plan's.
-
-    With CPU experts, ``_apply_graph`` sets ``cpu_input`` (``x`` and the routes'
-    weights) around each gather and the post stages it for the CPU expert thread.
-    """
-
-    name = "exl3_ram_miss"
-
-    def __init__(
-        self,
-        segments,
-        host_row_map: torch.Tensor,
-        device_side: ExpertStreamDevice,
-        row: int,
-        capacity: int,
-        stream_maps: Mapping[int, torch.Tensor],
-        hot_slots: Optional[torch.Tensor] = None,
-        hot_capacity: int = 0,
-        route_log=None,
-        copy_engine: bool = False,
-        copy_sm_table: Optional[torch.Tensor] = None,
-        cpu_experts: bool = False,
-        streamer_of: Optional[Callable[[], object]] = None,
-    ) -> None:
-        super().__init__(segments, host_row_map, capacity)
-        self.device_side = device_side
-        self.row = row
-        self.routes = torch.full(
-            (capacity,), -1, dtype=torch.int64, device=host_row_map.device
-        )
-        self.planned = torch.full(
-            (padded_plan_width(capacity, device_side.wire.lanes),),
-            -1,
-            dtype=torch.int64,
-            device=host_row_map.device,
-        )
-        self.hot_slots = hot_slots
-        self.hot_capacity = hot_capacity
-        # Per tag, the miss stream's map of that tag's copy table (stream_segment_map).
-        if set(stream_maps) != set(self.segments):
-            raise ValueError(
-                "the stream kernel needs a stream segment map for every copy table"
-            )
-        self.stream_maps = dict(stream_maps)
-        # A GraphRouteLog only when the stage trace is on; None is the untraced chain.
-        self.route_log = route_log
-        # The service may copy a captured post's hits with its copy engine, which the
-        # copy wait waits for.
-        self.copy_engine = copy_engine
-        # SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: rows the copy wait copies.
-        self.copy_sm_table = copy_sm_table
-        # SGLANG_DSV41_CPU_EXPERTS: the service may compute resident lanes on the CPU.
-        if cpu_experts and not copy_engine:
-            raise ValueError("CPU experts are completed by the copy engine's copy wait")
-        if cpu_experts and streamer_of is None:
-            raise ValueError(
-                "CPU experts check the layer's miss order at capture: pass streamer_of"
-            )
-        self.cpu_experts = cpu_experts
-        self.cpu_input = None
-        # A verify's dead rows ([max_rows, 1] bool) next to cpu_input, for the lane head; None when all rows are live.
-        self.verify_dead = None
-        self.spill = None  # DIRECT's (overflow flag, this layer's counter) under spill; set by Exl3RamMissService.attach
-        self.streamer_of = streamer_of
-        self._delivered: Optional[torch.Tensor] = None
-        # The GPU scorer (Exl3RamMissService._bind_spec_scores): whether this row has a target, and its SpecScoreRow
-        # once the target row attached.
-        self.spec_expected = False
-        self.spec_score = None
-        # SGLANG_DSV41_RESIDENCY_CAPTURE: a ResidencyHook set by Exl3RamMissService.attach; None is the uncaptured post.
-        self.residency_hook = None
-        # SGLANG_DSV41_GPU_DRIP_SLOTS: C1s's segments, from the drip's scratch slots to this row's destinations (set by
-        # Exl3RamMissService.attach); None: no C1s.
-        self.drip_segments = None
-
-    @property
-    def delivered_count(self) -> torch.Tensor:
-        if self._delivered is None:
-            raise RuntimeError(
-                "EXL3 DIRECT reads the delivered count of a gather this backend posted"
-            )
-        return self._delivered
-
-    def _stage_planned(self, plan) -> None:
-        """Copy the plan's lane experts into the captured ``planned`` buffer.
-
-        The plan is bounded first; the post kernel reads each lane's expert out of
-        ``planned``, which is otherwise still at its -1 fill.
-        """
-        lanes = plan.expert_ids.numel()
-        if lanes > self.planned.numel():
-            raise ValueError(
-                f"a plan of {lanes} lanes does not fit the backend's {self.planned.numel()}"
-            )
-        # A device copy: captured, so every replay refreshes it.
-        self.planned[:lanes].copy_(plan.expert_ids)
-
-    def post(self, tag, plan) -> None:
-        """Enqueue this gather's lease chain on the current stream (see class doc)."""
-        if self.route_log is not None:
-            # ``routes`` (by _apply_graph) and ``plan.count`` (by the planner) were
-            # both refreshed earlier in this gather on this stream.
-            self.route_log.record(self.row, self.routes, plan.count)
-        self._stage_planned(plan)
-        # Only a captured graph lets the service copy: an eager forward may load a
-        # kernel module while the copy wait holds the stream, and a load blocks the copy
-        # thread's driver calls (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Copy engine").
-        captured = self.copy_engine and torch.cuda.is_current_stream_capturing()
-        if captured and self.cpu_experts and self.cpu_input is None:
-            raise RuntimeError(
-                f"CPU experts: row {self.row} gathered without its input (Exl3MoEMethod._apply_graph)"
-            )
-        if captured and self.cpu_experts:
-            streamer = self.streamer_of()
-            if streamer is None:
-                raise RuntimeError(f"CPU experts: row {self.row}'s streamer is gone")
-            if getattr(streamer, "_plan_miss_keys", None) is None:
-                # attach installs the keys and a later enable_graph_gather resets them.
-                # An unsorted plan would send the CPU the last-routed misses, not the
-                # lowest-scored ones.
-                raise RuntimeError(
-                    f"CPU experts: row {self.row}'s route plan has no miss order (Exl3RamMissService.attach)"
-                )
-        if self.spec_expected and self.spec_score is None:
-            raise RuntimeError(
-                f"RAM prefetch: row {self.row} posted before its target row attached; the GPU scorer's table is built "
-                "at attach"
-            )
-        side = self.device_side
-        side.post(
-            self.row,
-            self.planned,
-            plan.count,
-            self.routes,
-            plan.slots,
-            self.hot_slots,
-            self.hot_capacity,
-            captured=captured,
-            cpu_input=self.cpu_input if captured and self.cpu_experts else None,
-            spill=self.spill,
-        )
-        if self.residency_hook is not None:
-            self.residency_hook.launch(
-                side=side, routes=self.routes, planned=self.planned, count=plan.count, route_log=self.route_log
-            )
-        if self.spec_expected:
-            # Layer T+1's gate on this layer's input, forked off this stream so C1 does not wait for it; joined below.
-            x = self.cpu_input[0] if self.cpu_input is not None else None
-            side.spec_score(
-                entry=self.spec_score,
-                x=x,
-                routes=self.routes,
-                route_weights=self.cpu_input[1] if self.cpu_input is not None else None,
-            )
-        side.copy_engine_captured |= captured
-        copy_expert_row_segments_gpu(
-            self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1
-        )
-        if self.drip_segments is not None:
-            # C1s: the HIT_SCRATCH lanes, from the GPU drip's scratch slots (LEASE_PROTOCOL.md, "The GPU drip").
-            copy_expert_row_segments_gpu(
-                self.drip_segments,
-                side.scratch_rows_1,
-                side.scratch_dst_1,
-                side.scratch_go_1,
-                grid_blocks=device_copy_grid_blocks(self.drip_segments.table.device),
-            )
-        side.stream(
-            self.row,
-            self.planned,
-            plan.count,
-            plan.slots,
-            self.segments[tag],
-            self.stream_maps[tag],
-        )
-        side.copy_wait(plan.count, plan.slots, self.copy_sm_table)
-        if self.spec_expected:
-            # After the copy wait the scoring overlapped; before the next post rewrites the seq it published under.
-            side.spec_join()
-        self._delivered = plan.count
-
-
 # Decode forwards, counted after the first copy-engine capture, that run unarmed. The
 # kernels a decode step launches for the first time (lazily loaded under
 # CUDA_MODULE_LOADING=LAZY, outside any hook) then load while no copy wait can spin
@@ -816,13 +118,6 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 # deadlocked (at thresholds of 4 batches and of 1). 16 covers the warm-up; the value
 # beyond that is arbitrary.
 COPY_ENGINE_ARM_DECODES = 16
-# The prefill share's size, as a fraction of a layer's usable RAM rows (prefill_share_rows): 64 of the 187 usable rows
-# of the served layout, the share served at 64 rows (/mnt/nvme1/share64-ab-20261016: -3.46 ms/token, TTFT -0.48 s).
-# The tier-priced sweep's decode knee is ~0.15 (lane_eval.py --shares --rows-scale on lane-tier-replay, outputs
-# /mnt/nvme1/lane-tier-replay/sweep/), but served at 0.15 (28 rows, /mnt/nvme1/share28-ab-20261016) it cost +1.58 s of
-# TTFT per prompt for a decode gain within noise (-1.78 ms/token, 95% CI -4.53 .. +0.82): below ~900 generated tokens a
-# request loses, so the larger share stays.
-PREFILL_SHARE_FRACTION = 64 / 187
 # CPU experts log their cumulative counters every this many batches, about twice per
 # 128-token turn at batch 1.
 CPU_STATS_LOG_BATCHES = 64
@@ -845,7 +140,7 @@ def check_copy_engine_module_loading(environ: Mapping[str, str]) -> None:
     value = environ.get("CUDA_MODULE_LOADING", "")
     if value != COPY_ENGINE_MODULE_LOADING:
         raise RuntimeError(
-            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs CUDA_MODULE_LOADING="
+            "exl3 RAM miss: SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine needs CUDA_MODULE_LOADING="
             f"{COPY_ENGINE_MODULE_LOADING} in the server's environment (it is {value or 'unset'}): a kernel loaded "
             "lazily after the copy engine arms can hold its copies back until the RAM-miss deadline stops the server. "
             "EAGER costs ~1 GiB of device memory; raise --mem-fraction-static by ~0.03."
@@ -864,7 +159,7 @@ def watchdog_wait_s(timeout_ms: int) -> float:
 
 
 def parse_fault(spec: str) -> Optional[tuple[int, float]]:
-    """Parse ``SGLANG_TEST_DSV41_RAM_MISS_FAULT``, ``"<demands>:<seconds>"``.
+    """Parse ``Dsv41Config.ram_miss_fault``, ``"<demands>:<seconds>"``.
 
     The fault delays each demand read by ``seconds`` once ``demands`` demands have read
     rows. An empty spec means no fault (``None``).
@@ -875,13 +170,17 @@ def parse_fault(spec: str) -> Optional[tuple[int, float]]:
     return int(demands), float(seconds)
 
 
-class Exl3RamMissService:
-    """The process-wide RAM-miss service: native thread, device kernels and hooks.
+class ExpertEngineService:
+    """The process-wide expert engine service: native thread, device kernels and hooks.
 
-    A singleton (``get``). Pinned tiers register their ``NativePinnedSlotTable`` before
-    the service starts; it starts lazily on first use (``ensure_started``), once every
-    layer's slabs exist, and refuses a tier built afterwards. ``attach`` then runs once
-    per streamed layer to install its row backend.
+    Built from an expert format and a model profile, and loads the transport build keyed by
+    ``(format.transport_build, profile.router)``. A singleton: ``bind`` creates it for a pairing
+    (a second, different pairing in one process raises) and ``get`` returns it.
+
+    Pinned tiers register their ``NativePinnedSlotTable`` before the service starts; it
+    starts lazily on first use (``ensure_started``), once every layer's slabs exist, and
+    refuses a tier built afterwards. ``attach`` then runs once per streamed layer to
+    install its row backend.
 
     Eager use of a pinned tier brackets with ``before_host_use`` / ``after_host_use``,
     which drain queued device work and pause the thread (nesting counted); the eager
@@ -900,15 +199,61 @@ class Exl3RamMissService:
     exit (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Shutdown").
     """
 
-    _instance: Optional[Exl3RamMissService] = None
+    _instance: Optional[ExpertEngineService] = None
 
     @classmethod
-    def get(cls) -> Exl3RamMissService:
+    def bind(
+        cls,
+        *,
+        expert_format: type[ExpertFormat],
+        profile: ModelProfile,
+        config: Optional[ResolvedConfig] = None,
+    ) -> ExpertEngineService:
+        """The process's service for this (format, profile) pairing, created on first use.
+
+        ``config`` is the process's resolved config (``resolved_config()`` when None); a later bind keeps the first's.
+        Raises when a service is bound to another pairing, or when the pairing has no transport build.
+        """
         if cls._instance is None:
-            cls._instance = cls()
+            cls._instance = cls(expert_format=expert_format, profile=profile, config=config)
+            return cls._instance
+        bound = cls._instance
+        if bound.expert_format.key != expert_format.key or bound.profile.name != profile.name:
+            raise RuntimeError(
+                f"the expert engine is bound to format {bound.expert_format.key!r} with profile "
+                f"{bound.profile.name!r}; it cannot also serve format {expert_format.key!r} with profile "
+                f"{profile.name!r} in one process"
+            )
+        return bound
+
+    @classmethod
+    def get(cls) -> ExpertEngineService:
+        if cls._instance is None:
+            raise RuntimeError(
+                "no expert engine service is bound: quant_hook.attach binds it when the first streamed layer loads"
+            )
         return cls._instance
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        expert_format: type[ExpertFormat],
+        profile: ModelProfile,
+        config: Optional[ResolvedConfig] = None,
+    ) -> None:
+        # Resolved once: every engine knob below is read from it, never from the environment.
+        self.config = resolved_config() if config is None else config
+        if self.config.stream.copy.mode is CopyMode.DMA:
+            raise ValueError(
+                "SGLANG_EXPERT_STREAM_COPY_MODE=dma: dma is the legacy Qwen streamer's copy mode; the native engine "
+                "takes sm_copy or copy_engine"
+            )
+        # NVTX ranges around the eager host-use pause's stream sync and thread pause.
+        self._sync_wait_nvtx = self.config.stream.trace.sync_wait_nvtx
+        self.expert_format = expert_format
+        self.profile = profile
+        # (format, router): which transport build this service loads; refused here when the pair is not built.
+        self.build_key = resolve_transport_build(expert_format=expert_format, profile=profile)
         self.tables: dict[int, NativePinnedSlotTable] = {}
         self.host: Optional[ExpertStreamHost] = None
         # The wire group of the GPU's node, whose CPU expert engine serves the DSpark draft (set by ensure_started).
@@ -920,12 +265,13 @@ class Exl3RamMissService:
         self._node_ranges = None
         # The RAM prefetch's pool slots per row and group, set at start (0: no pool).
         self._spec_share = 0
-        # SGLANG_DSV41_ENABLE_PREFILL_SHARE: the rows per layer a prefill may own, set at start (0: off).
+        # SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE: the rows per layer a prefill may own, set at start (0: off).
         self._prefill_share_rows = 0
-        # The GPU scorer (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu), set at start; its per-row table is built as rows attach.
+        # The GPU scorer (SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu), set at start; its per-row table is built as
+        # rows attach.
         self._spec_gpu = None
         self._spec_hot: dict[int, tuple] = {}
-        # SGLANG_DSV41_GPU_DRIP_SLOTS: (slots, picks) once enabled at start, and the scratch tensors the first attach
+        # SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS: (slots, picks) once enabled at start, and the scratch tensors the first attach
         # allocates; None when off.
         self._drip: Optional[tuple[int, int]] = None
         self._drip_scratch: Optional[list[torch.Tensor]] = None
@@ -955,19 +301,19 @@ class Exl3RamMissService:
         # Enabled at start; armed later (see the class doc).
         self.copy_engine = False
         self.sm_small_copies = False
-        # SGLANG_DSV41_CPU_EXPERTS: the CPU expert service; None when off.
+        # SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS: the CPU expert service; None when off.
         self.cpu_experts = None
-        # SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: {layer id: its own split table}, set at start.
+        # SGLANG_EXPERT_STREAM_CPU_SPLIT's layer_tables: {layer id: its own split table}, set at start.
         self._layer_splits: dict[int, list[int]] = {}
         self._cpu_retune_batches = 0
         self._cpu_batches = 0
         self._cpu_log_batches = 0
-        # SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL: the live refinement of its calibrated costs, None until the calibration
-        # published them (or when the model is off), and SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES' count.
+        # SGLANG_EXPERT_STREAM_CPU_SPLIT's model: the live refinement of its calibrated costs, None until the
+        # calibration published them (or when the model is off), and its model_refine_batches count.
         self._split_model_refiner = None
         self._split_model_refine_batches = 0
         self._split_model_batches = 0
-        # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
+        # SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
         self._gather_planned: Optional[int] = None
@@ -1053,7 +399,7 @@ class Exl3RamMissService:
         """The staging slots every row asks for: none when the model is fully pinned (model_fully_pinned: every expert
         is mapped, so no RAM miss can happen), else the planned victim lanes under spill, the planned gather width, else
         the build's lanes."""
-        if model_fully_pinned():
+        if model_fully_pinned(config=self.config.stream):
             return 0
         return self._staging_planned or self._gather_planned or self.resolved_lanes()
 
@@ -1072,8 +418,8 @@ class Exl3RamMissService:
         if short:
             raise ValueError(
                 f"exl3 RAM miss: spill reads every forced CPU miss into a RAM victim; layer {streamer.layer_id}'s "
-                f"node ranges (group, slots, needed) {short} are too small: raise SGLANG_MOE_PINNED_HOST_NUMA_MB or "
-                "lower SGLANG_MOE_HOT_GPU_MB"
+                f"node ranges (group, slots, needed) {short} are too small: raise SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB "
+                "or lower SGLANG_EXPERT_STREAM_HOT_GPU_MB"
             )
 
     def pool_slots(self) -> int:
@@ -1089,16 +435,16 @@ class Exl3RamMissService:
             if short:
                 g, lo, hi, staging = short[0]
                 raise RuntimeError(
-                    f"exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE={share} leaves layer {layer_id}'s group {g} "
+                    f"exl3 RAM miss: SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE={share} leaves layer {layer_id}'s group {g} "
                     f"slots [{lo}, {hi}) fewer than 2 assignable slots after {staging} staging and {share} pool "
                     "slots: lower the share or raise the pinned tier"
                 )
 
     def _check_full_layers(self, tables, experts: int) -> None:
-        """Refuse a SGLANG_MOE_PINNED_HOST_FULL_LAYERS layer whose groups cannot map every expert past their staging
+        """Refuse a SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS layer whose groups cannot map every expert past their staging
         and pool slots (full_layer_shortfall)."""
-        full = pinned_full_layers()
-        share = ram_prefetch_spec_share()
+        full = pinned_full_layers(config=self.config.stream)
+        share = ram_prefetch_spec_share(config=self.config.stream)
         for row, layer_id in enumerate(tables.layer_ids):
             if layer_id not in full:
                 continue
@@ -1107,32 +453,37 @@ class Exl3RamMissService:
             short = full_layer_shortfall(ranges, staging_width=self.staging_width(), share=share, experts=experts)
             if short:
                 raise ValueError(
-                    f"exl3 RAM miss: layer {layer_id} is in SGLANG_MOE_PINNED_HOST_FULL_LAYERS, but its {capacity} "
+                    f"exl3 RAM miss: layer {layer_id} is in SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS, but its {capacity} "
                     f"slots leave groups (group, assignable slots, homed experts) {short} short of every expert"
                 )
 
     @staticmethod
-    def _configured_layer_splits(tables, lanes: int) -> dict[int, list[int]]:
-        """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS for a ``lanes``-lane build; refused without CPU experts or for a
-        layer the service does not stream."""
+    def _configured_layer_splits(
+        tables, lanes: int, *, cpu_experts: bool, split: Optional[CpuSplitConfig] = None
+    ) -> dict[int, list[int]]:
+        """SGLANG_EXPERT_STREAM_CPU_SPLIT's layer_tables (``split``; the process's when None) for a ``lanes``-lane
+        build; refused without CPU experts (``cpu_experts``) or for a layer the service does not stream."""
         from sglang.srt.layers.moe.cpu_experts.service import configured_layer_splits
 
-        splits = configured_layer_splits(lanes)
+        splits = configured_layer_splits(lanes, config=split)
         if not splits:
             return splits
-        if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
-            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS needs SGLANG_DSV41_CPU_EXPERTS")
+        if not cpu_experts:
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_CPU_SPLIT's layer_tables needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"
+            )
         unknown = sorted(set(splits) - {int(layer_id) for layer_id in tables.layer_ids})
         if unknown:
             raise ValueError(
-                f"exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS names layers {unknown}, which are not streamed"
+                f"exl3 RAM miss: SGLANG_EXPERT_STREAM_CPU_SPLIT's layer_tables names layers {unknown}, which are not "
+                "streamed"
             )
         for layer_id, split in sorted(splits.items()):
             logger.info("exl3 RAM miss: layer %d uses its own CPU split %s on every node", layer_id, split)
         return splits
 
     def _fill_full_layer(self, streamer) -> None:
-        """Read every expert of a SGLANG_MOE_PINNED_HOST_FULL_LAYERS layer into its tier, so no verify reads one."""
+        """Read every expert of a SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS layer into its tier, so no verify reads one."""
         began = time.perf_counter()
         streamer.pinned_host_cache.ensure_rows(torch.arange(streamer.num_experts))
         mapping = self.host.mapping(self.row_of(streamer.layer_id))
@@ -1169,14 +520,19 @@ class Exl3RamMissService:
     def draft_host(self, areas, *, fatal_wait_s: float):
         """The DSpark draft channel on the GPU node's CPU expert engine (one team per node): a SharedDraftHost. Starts
         the service first when the draft is prepared before the target's first gather."""
+        check_requested_capabilities(
+            expert_format=self.expert_format, profile=self.profile, cpu_experts=True, draft=True, cpu_draft=True
+        )
         self.ensure_started()
         if self.cpu_experts is None:
-            raise RuntimeError("exl3 RAM miss: the draft shares the CPU expert team, but SGLANG_DSV41_CPU_EXPERTS is off")
+            raise RuntimeError(
+                "exl3 RAM miss: the draft shares the CPU expert team, but SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS is off"
+            )
         if self.gpu_group is None:
             gpu_node, nodes = self._gpu_node_placement
             raise RuntimeError(
                 f"exl3 RAM miss: the draft runs on the GPU's node {gpu_node} CPU expert team, but the tier's placement "
-                f"(SGLANG_MOE_PINNED_HOST_NUMA_MB) covers only nodes {nodes}; place the tier on node {gpu_node} too"
+                f"(SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB) covers only nodes {nodes}; place the tier on node {gpu_node} too"
             )
         return self.host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=self.gpu_group)
 
@@ -1193,22 +549,18 @@ class Exl3RamMissService:
             return
         from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-        if (
-            envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get()
-            and not get_exl3_stream_trace().enabled
-        ):
+        stream = self.config.stream
+        if stream.trace.router_capture_path and not get_exl3_stream_trace().enabled:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_ROUTER_CAPTURE_PATH needs SGLANG_DSV41_EXPERT_TRACE_PATH: the "
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_TRACE's router_capture_path needs its expert_path: the "
                 "router capture is written by the stage trace's graph route log"
             )
-        if (
-            envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get()
-            and not envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get()
-        ):
+        if stream.trace.residency_capture and not stream.trace.router_capture_path:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_RESIDENCY_CAPTURE needs SGLANG_DSV41_ROUTER_CAPTURE_PATH: the "
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_TRACE's residency_capture needs its router_capture_path: the "
                 "residency capture is written beside the router capture"
             )
+        # The DSV4.1 knobs outside the engine config: layer fusion and the test fault.
         cfg = Dsv41Config.from_envs()
         streamers = {
             layer_id: table.streamer_of()
@@ -1224,31 +576,23 @@ class Exl3RamMissService:
                 f"exl3 RAM miss: layers {missing} have no pinned tier yet"
             )
         fmt = next(iter(streamers.values())).format
-        # The mirror roots and direct-read setting the eager row source uses, validated
-        # by the same code.
-        mirrors = fmt.mirror_table_args()
-        direct = fmt._resolve_direct()
-        tables = exl3_ram_miss_tables(
-            fmt.layout,
-            fmt.segment_map(),
-            {
-                layer_id: s.pinned_host_cache.tensors
-                for layer_id, s in streamers.items()
-            },
-            **mirrors,
-            row_images=open_service_row_images(
-                fmt.layout, fmt.segment_map(), mirrors, direct, streamers
-            ),
+        check_requested_capabilities(
+            expert_format=self.expert_format,
+            profile=self.profile,
+            cpu_experts=stream.cpu_experts.enabled,
+            draft=False,
         )
+        tables = fmt.engine_tables(streamers)
         lanes = self.resolved_lanes()
-        layout_names, _ = host_layout(lanes=lanes)
-        if layout_names != EXL3_STREAMED_NAMES:
+        layout_names, _ = host_layout(layout=self.build_key, lanes=lanes)
+        if layout_names != fmt.names:
             raise RuntimeError(
-                f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
+                f"exl3 RAM miss: the host module's layout {layout_names} is not the format's names {fmt.names}"
             )
         numa = ThreadingConfig.from_env(
-            cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
+            cpu_experts=stream.cpu_experts.enabled,
             device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+            config=stream,
         )
         # None when the tier's placement leaves out the GPU's node: only the DSpark draft needs the group (draft_host).
         self.gpu_group = next((p.group for p in numa.plans if p.node == numa.gpu_node), None)
@@ -1266,8 +610,10 @@ class Exl3RamMissService:
                 [plan.node for plan in numa.plans],
             )
         self._node_ranges = node_ranges
-        self._check_full_layers(tables, fmt.layout.num_experts)
-        layer_splits = self._configured_layer_splits(tables, wire_layout(lanes).lanes)
+        self._check_full_layers(tables, fmt.num_experts(next(iter(streamers.values())).layer))
+        layer_splits = self._configured_layer_splits(
+            tables, wire_layout(lanes).lanes, cpu_experts=stream.cpu_experts.enabled, split=stream.cpu_experts.split
+        )
         pin = torch.cuda.is_available()
         self._wire = wire_layout(lanes, numa.nodes)
         page = new_page(pin=pin, wire=self._wire)
@@ -1286,19 +632,18 @@ class Exl3RamMissService:
             page=page,
             slot_map=slot_map,
             hot_page=hot_page,
+            layout=self.build_key,
             variant="instr" if instrumented else None,
             lanes=self.lanes,
             node_ranges=node_ranges,
             sq_thread_cpus=[-1 if p.sq is None else p.sq for p in numa.plans],
+            config=stream,
         )
         try:
-            # SGLANG_MOE_EXPERT_MIRROR_DYNAMIC (validated at launch): before the thread
+            # SGLANG_EXPERT_STREAM_MIRROR's dynamic (validated at launch): before the thread
             # starts, every group's reader picks each sub-read's root under these caps.
-            caps = mirror_caps(
-                envs.SGLANG_MOE_EXPERT_MIRROR_DYNAMIC.get(),
-                envs.SGLANG_MOE_EXPERT_MIRROR_CAPS.get(),
-                envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get(),
-            )
+            mirror = stream.tiers.mirror
+            caps = mirror_caps(mirror.dynamic, mirror.caps, mirror.dirs)
             if caps is not None:
                 host.set_mirror_caps(caps)
             logger.info(
@@ -1309,52 +654,57 @@ class Exl3RamMissService:
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
             host.reserve_staging(self.staging_width())
-            spec_share = ram_prefetch_spec_share()
-            if model_fully_pinned():
+            spec_share = ram_prefetch_spec_share(config=stream)
+            if model_fully_pinned(config=stream):
                 logger.info(
-                    "exl3 RAM miss: every streamed layer is in SGLANG_MOE_PINNED_HOST_FULL_LAYERS, so every expert is "
-                    "mapped in RAM and none can miss: staging is off (0 staging slots a row)%s",
-                    "; the RAM prefetch is off although SGLANG_DSV41_RAM_PREFETCH=1, as no expert is left on NVMe to "
-                    "prefetch (no pool, scorer or speculative cores)"
-                    if envs.SGLANG_DSV41_RAM_PREFETCH.get()
+                    "exl3 RAM miss: every streamed layer is in SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS, so every "
+                    "expert is mapped in RAM and none can miss: staging is off (0 staging slots a row)%s",
+                    "; the RAM prefetch is off although SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH=1, as no expert is "
+                    "left on NVMe to prefetch (no pool, scorer or speculative cores)"
+                    if stream.prefetch.ram.enabled
                     else "",
                 )
             if spec_share:
-                if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
-                    raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
+                if not stream.cpu_experts.enabled:
+                    raise RuntimeError(
+                        "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH needs "
+                        "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"
+                    )
                 self._check_pool_room(tables, spec_share)
                 # Right after the staging slots, before the hot cache fills any slot.
                 host.reserve_spec_pool(spec_share)
-            copy_engine = cfg.enable_ram_miss_copy_engine
-            check_sm_small_copies(cfg)
+            copy_engine = stream.copy.mode is CopyMode.COPY_ENGINE
+            check_sm_small_copies(stream.copy)
             if copy_engine:
-                check_copy_engine_module_loading(os.environ)
+                check_copy_engine_module_loading(cuda_module_loading_env())
                 # Before the thread starts, and unarmed. The watchdog bounds each copy
                 # wait by the RAM-miss timeout.
                 host.enable_copy_engine(
                     torch.cuda.current_device(),
-                    spin_us=envs.SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US.get(),
-                    wait_timeout_ms=cfg.ram_miss_timeout_ms,
+                    spin_us=stream.copy.copy_idle_spin_us,
+                    wait_timeout_ms=stream.copy.timeout_ms,
                     cpus=numa.copy_cpus,
                 )
             cpu_experts = None
-            if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+            if stream.cpu_experts.enabled:
                 cpu_experts = self._start_cpu_experts(
-                    cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned
+                    cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned, stream=stream
                 )
             spec_gpu = (
-                self._enable_ram_prefetch(host, list(tables.layer_ids), numa, cpu_experts, pin=pin)
+                self._enable_ram_prefetch(
+                    host, list(tables.layer_ids), numa, cpu_experts, pin=pin, config=self.config
+                )
                 if spec_share
                 else None
             )
-            if cfg.gpu_drip_slots:
-                self._enable_gpu_drip(cfg, host, spec_gpu, copy_engine=copy_engine)
+            if stream.copy.gpu_drip.slots:
+                self._enable_gpu_drip(stream.copy.gpu_drip, host, spec_gpu, copy_engine=copy_engine)
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
                 self._stages_traced = True
             share_recorder = None
-            if cfg.enable_prefill_share:
+            if stream.copy.prefill.share:
                 from sglang.srt.eplb.expert_distribution import (
                     _ExpertDistributionRecorderNoop,
                     get_global_expert_distribution_recorder,
@@ -1365,21 +715,21 @@ class Exl3RamMissService:
                     # The no-op recorder drops pre-forward observers, so the share would
                     # never be set.
                     raise RuntimeError(
-                        "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
+                        "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
                 self._prefill_share_rows = self._size_prefill_share(tables, spec_share)
             cores =[-1 if plan.ram is None else plan.ram for plan in numa.plans]
             busy_poll = all(plan.busy_poll for plan in numa.plans)
-            spin_us = envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.get()
+            spin_us = stream.copy.idle_spin_us
             if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
                 # The server's affinity: the thread spins there with PAUSE, then sleeps.
-                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms), spin_us=spin_us)
+                host.start_thread(fatal_wait_s=stream.copy.watchdog_wait_s(), spin_us=spin_us)
             else:
                 host.start_thread(
                     cpu_core=cores if numa.nodes > 1 else cores[0],
                     busy_poll=busy_poll,
-                    fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
+                    fatal_wait_s=stream.copy.watchdog_wait_s(),
                     spin_us=spin_us,
                 )
             if fault is not None:
@@ -1403,11 +753,11 @@ class Exl3RamMissService:
         self.copy_engine = copy_engine
         self.cpu_experts = cpu_experts
         self._layer_splits = layer_splits
-        self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
-        self._split_model_refine_batches = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES.get()
-        self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
-        self.lease_pdl = cfg.enable_lease_pdl
-        self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
+        self._cpu_retune_batches = stream.cpu_experts.split.retune_batches
+        self._split_model_refine_batches = stream.cpu_experts.split.model_refine_batches
+        self.sm_small_copies = stream.copy.sm_small_copies
+        self.lease_pdl = stream.copy.lease_pdl
+        self.fill_timeout_s = stream.copy.fill_timeout_s()
         # Order matters. atexit runs last-registered first, and weakref.finalize
         # installs its single exit hook when the first finalizer (any tier's slab
         # unregister) is created. Registering here, after every tier exists (register()
@@ -1424,7 +774,7 @@ class Exl3RamMissService:
             len(tables.layer_ids),
             len(tables.paths),
             tables.slot_bytes,
-            cfg.ram_miss_timeout_ms,
+            stream.copy.timeout_ms,
             "on" if copy_engine else "off",
             "on" if cpu_experts is not None else "off",
             f"share {spec_share}, {'GPU' if spec_gpu else 'CPU'} scorer" if spec_share else "off",
@@ -1433,9 +783,18 @@ class Exl3RamMissService:
 
     @staticmethod
     def _start_cpu_experts(
-        cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig, planned_routes: int = 0
+        cfg: Dsv41Config,
+        host,
+        fmt,
+        streamers,
+        pin: bool,
+        numa: ThreadingConfig,
+        planned_routes: int = 0,
+        *,
+        stream: Optional[ExpertStreamConfig] = None,
     ):
-        """Build the CPU expert service for ``SGLANG_DSV41_CPU_EXPERTS``.
+        """Build the CPU expert service for ``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS``; ``stream`` is the service's
+        config (``resolved_config().stream`` when None).
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
         lanes complete in the copy wait and leave the fused MoE through layer fusion's
@@ -1448,23 +807,24 @@ class Exl3RamMissService:
             cpu_trait_for,
         )
 
-        if not cfg.enable_ram_miss_copy_engine:
+        stream = resolved_config().stream if stream is None else stream
+        if stream.copy.mode is not CopyMode.COPY_ENGINE:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine"
             )
         if not cfg.enable_layer_fusion:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION"
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION"
             )
-        if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+        if stream.prefetch.shadow.pull_mode is not PullMode.OFF:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS cannot run with the prefetch pull join"
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS cannot run with the prefetch pull join"
             )
-        if not envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get():
+        if not stream.copy.fused_plan:
             # Only the fused plan sorts the miss lanes, which makes the tail lanes the
             # lowest-scored.
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_MOE_EXPERT_FUSED_PLAN"
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"
             )
         # Rows in layer order, as exl3_ram_miss_tables numbers them.
         caches = {
@@ -1482,8 +842,8 @@ class Exl3RamMissService:
         for layer_id, s in streamers.items():
             if (s.graph_gather_rows or planned_routes) and getattr(s.layer, "top_k", None) is None:
                 raise RuntimeError(
-                    f"exl3 RAM miss: layer {layer_id}'s experts module has no top_k, which SGLANG_DSV41_CPU_EXPERTS "
-                    "sizes its rows from"
+                    f"exl3 RAM miss: layer {layer_id}'s experts module has no top_k, which "
+                    "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS sizes its rows from"
                 )
         tokens = max(
             (
@@ -1494,25 +854,28 @@ class Exl3RamMissService:
             default=1,
         )
         # Spill: a split entry is only read for the live lanes, at most the victim lanes.
-        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() or None
+        victims = stream.copy.graph_gather_victim_lanes or None
         return CpuExpertGroups(
             host,
             trait,
             caches,
             hidden=hidden.pop(),
             plans=numa.plans,
-            split=configured_split(host.wire.lanes),
+            split=configured_split(host.wire.lanes, config=stream.cpu_experts.split),
             pin=pin,
             tokens=tokens,
             calibration_lanes=victims,
+            config=stream.cpu_experts,
         )
 
     @staticmethod
-    def _enable_ram_prefetch(host, layer_ids, numa, cpu_experts, *, pin: bool = False):
+    def _enable_ram_prefetch(
+        host, layer_ids, numa, cpu_experts, *, pin: bool = False, config: Optional[ResolvedConfig] = None
+    ):
         """Start the RAM prefetch over the pool reserved at start, each group's speculative thread on its plan's spare
         cores. CPU scorer: the router gates the model registered at load, copied to host memory once; returns None.
         GPU scorer: the targets and a candidate page (pinned when ``pin``) the host reads; returns the GpuScorer whose
-        per-row table attach builds."""
+        per-row table attach builds. ``config`` is the service's (``resolved_config()`` when None)."""
         from sglang.srt.layers.moe.ram_prefetch import (
             SCORERS,
             GpuScorer,
@@ -1523,32 +886,36 @@ class Exl3RamMissService:
             registered_gates,
         )
 
+        config = resolved_config() if config is None else config
         if cpu_experts is None:
-            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
-        scorer = envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.get()
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"
+            )
+        ram = config.stream.prefetch.ram
+        scorer = ram.scorer
         if scorer not in SCORERS:
-            raise ValueError(f"SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of {SCORERS}, got {scorer!r}")
-        per_token = envs.SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN.get()
-        per_layer = envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get()
-        top_k_only = envs.SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY.get()
+            raise ValueError(f"SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER must be one of {SCORERS}, got {scorer!r}")
+        per_token = ram.per_token
+        per_layer = ram.per_layer
+        top_k_only = ram.top_k_only
         hidden = cpu_experts.services[0].hidden
         cores = [list(plan.spec) for plan in numa.plans]
-        floors = margin_floors_path(scorer)
-        horizon = envs.SGLANG_DSV41_RAM_PREFETCH_HORIZON.get()
+        floors = margin_floors_path(scorer, dsv41=config.dsv41)
+        horizon = ram.horizon
         idle = dict(
-            idle_drive=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE.get(),
-            idle_deadline_s=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US.get() / 1e6,
-            idle_spread=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD.get(),
-            idle_pieces=envs.SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES.get(),
+            idle_drive=ram.idle_drive,
+            idle_deadline_s=ram.idle_deadline_us / 1e6,
+            idle_spread=ram.idle_spread,
+            idle_pieces=ram.idle_pieces,
         )
-        promote = envs.SGLANG_DSV41_RAM_PREFETCH_PROMOTE.get()
-        pool_serve = envs.SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE.get()
+        promote = ram.promote
+        pool_serve = ram.pool_serve
         if scorer == "gpu":
             picked = prefetch_targets(layer_ids, registered_gates(), hidden=hidden, horizon=horizon)
             candidates = new_candidate_page(pin=pin)
             min_margin = load_margin_floors(floors, len(layer_ids)) if floors else None
             learned = None
-            head_path = envs.SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD.get()
+            head_path = config.dsv41.ram_prefetch.learned_head_path
             if head_path:
                 from sglang.srt.layers.moe.ram_prefetch_learned_head import load_learned_head
 
@@ -1614,32 +981,33 @@ class Exl3RamMissService:
         )
         return result
 
-    def _enable_gpu_drip(self, cfg: Dsv41Config, host, spec_gpu, *, copy_engine: bool) -> None:
-        """SGLANG_DSV41_GPU_DRIP_SLOTS (host/gpu_drip.h): the copy thread drips the GPU scorer's picks of RAM-resident
-        experts into VRAM scratch slots, allocated at the first attach. Before the service thread starts."""
+    def _enable_gpu_drip(self, drip: GpuDripConfig, host, spec_gpu, *, copy_engine: bool) -> None:
+        """SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS (host/gpu_drip.h): the copy thread drips the GPU scorer's picks of
+        RAM-resident experts into VRAM scratch slots, allocated at the first attach. Before the service thread
+        starts."""
         if not copy_engine:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_GPU_DRIP_SLOTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE, which copies "
-                "the drips"
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS needs SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine, "
+                "which copies the drips"
             )
         if spec_gpu is None:
             raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_GPU_DRIP_SLOTS needs SGLANG_DSV41_RAM_PREFETCH with "
-                "SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu, whose scoring picks the drips"
+                "exl3 RAM miss: SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS needs SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH with "
+                "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER=gpu, whose scoring picks the drips"
             )
         host.enable_gpu_drip(
-            cfg.gpu_drip_slots,
-            picks=cfg.gpu_drip_picks,
-            chunk_bytes=cfg.gpu_drip_chunk_kb * 1024,
+            drip.slots,
+            picks=drip.picks,
+            chunk_bytes=drip.chunk_kb * 1024,
             targets=spec_gpu.picked.targets[:, 0].tolist(),
             candidates=spec_gpu.candidates,
         )
-        self._drip = (cfg.gpu_drip_slots, cfg.gpu_drip_picks)
+        self._drip = (drip.slots, drip.picks)
         logger.info(
             "exl3 RAM miss GPU drip: %d scratch slots, %d picks per scored record, %d KiB chunks",
-            cfg.gpu_drip_slots,
-            cfg.gpu_drip_picks,
-            cfg.gpu_drip_chunk_kb,
+            drip.slots,
+            drip.picks,
+            drip.chunk_kb,
         )
 
     def _drip_segments(self, row: int, segments):
@@ -1673,18 +1041,16 @@ class Exl3RamMissService:
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 with (
                     torch.cuda.nvtx.range("dsv41.ram_miss.before_host_use_stream_sync")
-                    if _SYNC_WAIT_NVTX
+                    if self._sync_wait_nvtx
                     else nullcontext()
                 ):
                     torch.cuda.current_stream().synchronize()
             with (
                 torch.cuda.nvtx.range("dsv41.ram_miss.before_host_use_thread_pause")
-                if _SYNC_WAIT_NVTX
+                if self._sync_wait_nvtx
                 else nullcontext()
             ):
-                self.host.pause(
-                    2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0
-                )
+                self.host.pause(self.config.stream.copy.eager_pause_bound_s())
             if self.gpu_hot_enabled:
                 self._refresh_hot_lists()
         self._pause_depth += 1
@@ -1715,8 +1081,8 @@ class Exl3RamMissService:
             updater = getattr(manager, "gpu_residency", None)
             if updater is None or not updater.insert_direct:
                 raise RuntimeError(
-                    "exl3 RAM miss: the service needs DIRECT residency (SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): every record carries its hot set, and the CPU experts' "
+                    "exl3 RAM miss: the service needs DIRECT residency (SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1, "
+                    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2): every record carries its hot set, and the CPU experts' "
                     "miss lanes are ordered by its ranking"
                 )
             self._manager = manager
@@ -1726,7 +1092,7 @@ class Exl3RamMissService:
                 updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
-        if streamer.layer_id in pinned_full_layers():
+        if streamer.layer_id in pinned_full_layers(config=self.config.stream):
             self._fill_full_layer(streamer)
         width = streamer.graph_miss_width
         if width > self.lanes:
@@ -1740,7 +1106,7 @@ class Exl3RamMissService:
         if self.cpu_experts is None and getattr(manager, "lane_head", None) is not None:
             raise ValueError(
                 "SGLANG_OPT_LANE_HEAD_PATH orders the CPU experts' miss lanes; this launch has no CPU experts "
-                "(SGLANG_DSV41_CPU_EXPERTS)"
+                "(SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS)"
             )
         if self.cpu_experts is not None:
             # The fused plan sorts this layer's miss lanes by residency key, highest
@@ -1757,30 +1123,34 @@ class Exl3RamMissService:
             else:
                 streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
         if self.device_side is None:
-            miss_cut, miss_cut_max = split_miss_cut(envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
-                                                    envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
-                                                    cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get())
+            stream = self.config.stream
+            split = stream.cpu_experts.split
+            miss_cut, miss_cut_max = split_miss_cut(
+                split.miss_cut, split.miss_cut_max, cpu_experts=stream.cpu_experts.enabled
+            )
             self.device_side = ExpertStreamDevice(
                 self.page,
                 # The host allocates the lease block; the device reads the same one.
                 self.host.lease_block,
+                layout=self.build_key,
                 device=cache.device,
                 layers=len(self._rows),
                 experts=self.host.experts,
-                timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
+                timeout_ms=stream.copy.timeout_ms,
                 piece_runs=self.host.piece_runs(),
                 row_capacities=[int(c) for c in self.host.tables.capacity],
                 hot_page=self.hot_page,
                 lease_pdl=self.lease_pdl,
-                hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
-                cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
+                hit_copy=stream.copy.ram_hit_copy,
+                cpu_misses=stream.cpu_experts.misses,
                 miss_cut=miss_cut,
                 miss_cut_max=miss_cut_max,
                 lanes=self.lanes,
                 nodes=self.wire.nodes,
                 split_model=self._split_model_words(),
+                config=stream,
             )
-            if device_stamps_enabled():
+            if device_stamps_enabled(stream):
                 self.device_side.enable_device_stamps()
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(
@@ -1840,7 +1210,8 @@ class Exl3RamMissService:
         victims = getattr(manager.gpu_residency, "victim_lanes", None)
         want = max(1, min(streamer.graph_miss_width, victims) if victims else streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
-        if staged < want and not model_fully_pinned():  # fully pinned: no miss, so no staging (staging_width)
+        # Fully pinned: no miss, so no staging (staging_width).
+        if staged < want and not model_fully_pinned(config=self.config.stream):
             logger.warning(
                 "exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d",
                 row,
@@ -1866,9 +1237,9 @@ class Exl3RamMissService:
                     raise ValueError(
                         f"exl3 RAM miss: layer {streamer.layer_id}'s copy table does not match its sources {names}"
                     )
-                sm_mask = sm_copy_mask(names, self.lanes)
+                sm_mask = sm_copy_mask(names, self.lanes, build=self.build_key)
                 copy_sm = sm_copy_table(segments, sm_mask) if sm_mask else None
-        streamer.row_backend = Exl3RamMissRowBackend(
+        streamer.row_backend = ExpertEngineRowBackend(
             previous.segments,
             previous.host_row_map,
             self.device_side,
@@ -1950,7 +1321,7 @@ class Exl3RamMissService:
         )
         from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-        router_prefix = envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get()
+        router_prefix = self.config.stream.trace.router_capture_path
         # The router rings hold ~400 KB per forward, so they get a shallower ring: 32
         # deep is ~13 MB of VRAM.
         log = GraphRouteLog(
@@ -1958,14 +1329,15 @@ class Exl3RamMissService:
         )
         if router_prefix:
             log.enable_router(router_prefix)
-        if envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get():
+        if self.config.stream.trace.residency_capture:
             from sglang.srt.layers.moe.ram_prefetch import registered_gates
             from sglang.srt.layers.moe.residency_capture import residency_rows
 
             # ensure_started refused the switch without a router prefix.
             layer_ids = sorted(self._rows, key=self._rows.__getitem__)
             log.enable_residency(
-                router_prefix + ".res", rows=residency_rows(layer_ids, gates=registered_gates())
+                router_prefix + ".res",
+                rows=residency_rows(layer_ids, gates=registered_gates(), strata=self.profile.strata),
             )
         if self._gpu_hot_updater is not None:
             log.bind_hot(
@@ -2041,9 +1413,9 @@ class Exl3RamMissService:
 
     def _size_prefill_share(self, tables, spec_share: int) -> int:
         """The prefill share's rows per layer: PREFILL_SHARE_FRACTION of the smallest admitting row's usable rows
-        (full layers map every expert and admit nothing), or SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS when set. Logs its
-        inputs."""
-        full = pinned_full_layers()
+        (full layers map every expert and admit nothing), or SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS when set.
+        Logs its inputs."""
+        full = pinned_full_layers(config=self.config.stream)
         usable = {}
         for row, layer_id in enumerate(tables.layer_ids):
             if layer_id in full:
@@ -2051,9 +1423,11 @@ class Exl3RamMissService:
             capacity = int(tables.capacity[row])
             ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
             usable[int(layer_id)] = usable_rows(ranges, staging_width=self.staging_width(), share=spec_share)
-        forced = envs.SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS.get()
+        forced = self.config.stream.copy.prefill.share_rows
         if forced is not None and forced < 1:
-            raise ValueError(f"exl3 RAM miss: SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS={forced} must be at least 1")
+            raise ValueError(
+                f"exl3 RAM miss: SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS={forced} must be at least 1"
+            )
         if not usable:
             logger.info("exl3 RAM miss prefill share: every layer is a full layer and admits nothing, so no share")
             return 0
@@ -2063,7 +1437,7 @@ class Exl3RamMissService:
             "exl3 RAM miss prefill share: %d rows per layer (%s; computed %d = %.2f x the smallest layer's %d usable "
             "rows; usable rows per layer %d-%d over %d admitting layers, staging %d and pool %d slots per group)",
             rows,
-            "computed" if forced is None else "SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS",
+            "computed" if forced is None else "SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS",
             computed,
             PREFILL_SHARE_FRACTION,
             min(usable.values()),
@@ -2076,7 +1450,7 @@ class Exl3RamMissService:
         return rows
 
     def _set_prefill_share(self, forward_pass_id: int, forward_batch) -> None:
-        """Pre-forward observer for ``SGLANG_DSV41_ENABLE_PREFILL_SHARE``.
+        """Pre-forward observer for ``SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE``.
 
         A prefill's pinned-tier admissions own at most the share sized at start rows per
         layer (then they evict their own); any other forward's own none. The value holds
@@ -2134,8 +1508,8 @@ class Exl3RamMissService:
             "copy_engine_jobs": lambda: not host.copy_engine_idle(0.0),
             "tier_drive_reads": drive_reads,
         }
-        dirs = [d for d in envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get().split(os.pathsep) if d]
-        dirs += [d for d in (envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get(),) if d]
+        dirs = [d for d in self.config.stream.tiers.mirror.dirs.split(os.pathsep) if d]
+        dirs += [d for d in (Dsv41Config.from_envs().engram_table_dir,) if d]
         for disk, path in block_device_inflight_paths(dirs).items():
             probes[f"{disk}_inflight"] = functools.partial(inflight_busy, path)
         return probes
@@ -2190,20 +1564,20 @@ class Exl3RamMissService:
             self.after_host_use()
 
     def _calibrate_split_model(self) -> None:
-        """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL: measure its costs on the loaded model and publish them
+        """SGLANG_EXPERT_STREAM_CPU_SPLIT's model: measure its costs on the loaded model and publish them
         (split_model_calibration.py), in _calibrate_cpu_split's paused window. Runs whenever the model is on, whatever
-        SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION and SGLANG_DSV41_CPU_EXPERTS_SPLIT say, and not when
-        SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS names every cost. A failure warns and leaves the model off (its words'
-        SPLIT_MODEL_OFF): the split table types the CPU's lanes."""
+        the split's calibration and table say, and not when its model_costs names every cost. A failure warns and
+        leaves the model off (its words' SPLIT_MODEL_OFF): the split table types the CPU's lanes."""
         from sglang.srt.layers.moe import split_model_calibration as calib
 
         if self.device_side is None or self.device_side.split_model.numel() == 0:
             return
-        overrides = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS.get()
+        split = self.config.stream.cpu_experts.split
+        overrides = split.model_costs
         if split_model_overrides_complete(overrides, self.wire.nodes):
             costs = calib.costs_from_words(split_model_words(self.wire.nodes, overrides), self.wire.nodes)
-            logger.info("exl3 RAM miss split model: every cost from SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS, not calibrated: "
-                        "%s", costs.line())
+            logger.info("exl3 RAM miss split model: every cost from SGLANG_EXPERT_STREAM_CPU_SPLIT's model_costs, not "
+                        "calibrated: %s", costs.line())
         else:
             services = self.cpu_experts.services
             before = [self.host.cpu_stats(s.group) for s in services]
@@ -2211,7 +1585,7 @@ class Exl3RamMissService:
                 costs, clamped, seconds = calib.calibrate(
                     self.host, services, self.device_side,
                     device=torch.cuda.current_device() if torch.cuda.is_available() else -1,
-                    reps=envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.get(), staging_width=self.staging_width(),
+                    reps=split.calibration_reps, staging_width=self.staging_width(),
                 )
             except (calib.SplitModelCalibrationError, RuntimeError, torch.cuda.OutOfMemoryError) as error:
                 logger.warning("exl3 RAM miss split model calibration failed (%s): the model stays off and the split "
@@ -2223,14 +1597,15 @@ class Exl3RamMissService:
             costs = calib.apply_overrides(costs, overrides)
             logger.info("exl3 RAM miss split model calibrated in %.2f s%s%s: %s", seconds,
                         f", clamped {', '.join(clamped)}" if clamped else "",
-                        ", with SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS" if overrides.strip() else "", costs.line())
+                        ", with SGLANG_EXPERT_STREAM_CPU_SPLIT's model_costs" if overrides.strip() else "",
+                        costs.line())
         self._publish_split_model(costs)
         self._split_model_refiner = calib.SplitModelRefiner(costs, self._split_model_moments(), overrides)
 
     def _publish_split_model(self, costs) -> None:
-        """Write ``costs`` (SplitModelCosts) and the flags word (SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK) to the
-        device."""
-        tiebreak = envs.SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK.get()
+        """Write ``costs`` (SplitModelCosts) and the flags word (SGLANG_EXPERT_STREAM_CPU_SPLIT's
+        model_residency_tiebreak) to the device."""
+        tiebreak = self.config.stream.cpu_experts.split.model_residency_tiebreak
         self.device_side.set_split_model_costs(costs.words(residency_tiebreak=tiebreak))
 
     def _split_model_moments(self) -> list:
@@ -2238,7 +1613,7 @@ class Exl3RamMissService:
         return [self.host.cpu_fit_moments(s.group) for s in self.cpu_experts.services]
 
     def _refine_split_model(self) -> None:
-        """SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES: refit the CPU costs from the jobs served since the last refit and
+        """SGLANG_EXPERT_STREAM_CPU_SPLIT's model_refine_batches: refit the CPU costs from the jobs served since the last refit and
         publish them (SplitModelRefiner). A failure is logged and stops the refinement; the published costs stay."""
         refiner = self._split_model_refiner
         try:
@@ -2430,7 +1805,7 @@ class Exl3RamMissService:
     def _completion_deadline_s(self) -> float:
         # The miss stream is bounded by its deadline (a trap), the copy wait by the
         # watchdog's copy-wait timeout (an abort).
-        return envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 5.0
+        return self.config.stream.copy.completion_deadline_s()
 
     def _establish_gpu_completion(self) -> Optional[str]:
         """None when every GPU reader is known to have finished, else the reason not.
@@ -2475,16 +1850,16 @@ class Exl3RamMissService:
             logger.warning("exl3 RAM miss: reading the DSpark draft's counters failed: %r", error)
 
     def _split_model_words(self) -> Optional[list[int]]:
-        """SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL's first cost words for the device, or None when it is off or there is no
-        CPU split to replace. They hold the model off (split_model_off_words) until _calibrate_split_model publishes its
-        costs, as the copy engine arms; before that the device types no CPU lane anyway."""
-        if not envs.SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL.get() or self.cpu_experts is None:
+        """SGLANG_EXPERT_STREAM_CPU_SPLIT's model: its first cost words for the device, or None when it is off or there
+        is no CPU split to replace. They hold the model off (split_model_off_words) until _calibrate_split_model
+        publishes its costs, as the copy engine arms; before that the device types no CPU lane anyway."""
+        if not self.config.stream.cpu_experts.split.model or self.cpu_experts is None:
             return None
         logger.info("exl3 RAM miss split model on: its costs are calibrated when the copy engine arms")
         return split_model_off_words(self.wire.nodes)
 
     def _log_split_model_stats(self) -> None:
-        """The split model's device counters (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL), after the GPU barrier; nothing when
+        """The split model's device counters (SGLANG_EXPERT_STREAM_CPU_SPLIT's model), after the GPU barrier; nothing when
         it is off. A failure is logged, not raised."""
         try:
             stats = self.device_side.split_model_stats()
@@ -2497,7 +1872,7 @@ class Exl3RamMissService:
     def _dump_device_stamps(self) -> None:
         """Write the chain's device stamps beside the job trace, as ``<prefix>.<pid>.device-stamps.jsonl``. A failure is
         logged, not raised: it must not turn an orderly shutdown into a quarantine."""
-        prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
+        prefix = self.config.stream.trace.job.prefix
         if not prefix:
             return
         path = f"{prefix}.{os.getpid()}.device-stamps.jsonl"
@@ -2524,7 +1899,7 @@ class Exl3RamMissService:
 
         ``at_exit`` is the exit hook's path: no device barrier is attempted in an exit
         handler, so the tiers are quarantined unconditionally. The scheduler's graceful
-        shutdown takes the orderly path through ``shutdown_exl3_ram_miss_service``.
+        shutdown takes the orderly path through ``shutdown_expert_engine_service``.
         """
         if self._completed or (self._shut_down and not at_exit):
             return
@@ -2559,9 +1934,7 @@ class Exl3RamMissService:
                     # host.stop() closes its native handle, so freeze the reader between
                     # requests before taking its final demand counters. The GPU barrier
                     # above has retired every demand and lease.
-                    self.host.pause(
-                        2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0
-                    )
+                    self.host.pause(self.config.stream.copy.eager_pause_bound_s())
                     self._trace_step(final=True)
         except BaseException as error:  # noqa: BLE001
             # A failure even to close admission leaves the state uncertain.
@@ -2672,12 +2045,12 @@ class Exl3RamMissService:
         self._quarantined = True
 
 
-def shutdown_exl3_ram_miss_service() -> None:
+def shutdown_expert_engine_service() -> None:
     """The scheduler's graceful-shutdown entry: shut the service down if one exists.
 
-    A no-op when no service was ever created, so a run without EXL3 does not construct
+    A no-op when no service was ever created, so a run without expert streaming does not construct
     the singleton at shutdown.
     """
-    service = Exl3RamMissService._instance
+    service = ExpertEngineService._instance
     if service is not None:
         service.shutdown()

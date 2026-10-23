@@ -101,7 +101,7 @@ class Nvfp4ExpertOffloadTests(unittest.TestCase):
             for name in OFFLOAD_NAMES
         )
 
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}):
             result = offloader_module.OffloaderV1(target_bytes).maybe_offload_to_cpu(
                 layer
             )
@@ -127,7 +127,7 @@ class Nvfp4ExpertOffloadTests(unittest.TestCase):
             * getattr(layer.decoder_experts, name).element_size()
             for name in OFFLOAD_NAMES
         )
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}):
             offloader_module.OffloaderV1(target_bytes).maybe_offload_to_cpu(layer)
 
         with device_loading_context(layer.decoder_experts, torch.device("cuda")):
@@ -145,7 +145,7 @@ class Nvfp4ExpertOffloadTests(unittest.TestCase):
             for name in OFFLOAD_NAMES
         )
 
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}):
             with self.assertRaisesRegex(RuntimeError, "complete ModelOpt NVFP4 expert"):
                 offloader_module.OffloaderV1(target_bytes - 1).maybe_offload_to_cpu(
                     layer
@@ -176,8 +176,8 @@ class FileExpertOffloadTests(unittest.TestCase):
         environment = patch.dict(
             os.environ,
             {
-                "SGLANG_MOE_EXPERT_STREAM": "1",
-                "SGLANG_MOE_EXPERT_FILE_DIR": self.directory.name,
+                "SGLANG_EXPERT_STREAM_ENABLE": "1",
+                "SGLANG_EXPERT_STREAM_FILE_CACHE_DIR": self.directory.name,
             },
         )
         environment.start()
@@ -354,7 +354,7 @@ class FileExpertOffloadTests(unittest.TestCase):
         self.assertIsNone(layer.w13_weight._sglang_file_cache_group._lock)
 
     def test_empty_directory_keeps_anonymous_cpu_offload(self):
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_FILE_DIR": ""}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_FILE_CACHE_DIR": ""}):
             _, layer = self._bind()
         for tag in OFFLOAD_NAMES:
             parameter = getattr(layer, tag)
@@ -363,7 +363,7 @@ class FileExpertOffloadTests(unittest.TestCase):
         self.assertEqual(list(Path(self.directory.name).iterdir()), [])
 
     def test_file_directory_does_not_enable_streaming(self):
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "0"}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "0"}):
             _, layer = self._bind()
         self.assertFalse(hasattr(layer.w13_weight, "_sglang_file_cache_group"))
         self.assertEqual(list(Path(self.directory.name).iterdir()), [])
@@ -379,7 +379,7 @@ class FileExpertOffloadTests(unittest.TestCase):
         layer = self._layer()
         layer.w13_blockscale_swizzled = None
         layer.w2_blockscale_swizzled = None
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_FILE_DIR": ""}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_FILE_CACHE_DIR": ""}):
             _, layer = self._bind(layer)
         self.assertTrue(layer.w13_weight._sglang_skip_device_loading)
         self.assertIsNone(layer.w13_blockscale_swizzled)
@@ -606,11 +606,11 @@ class OffloadCompatibilityTests(unittest.TestCase):
                 memory_hook.handle_offload_compatibility(self._args(cpu_offload_gb=1))
 
     def test_ple_and_cpu_offload_allowed_for_selected_expert_streaming(self):
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}):
             memory_hook.handle_offload_compatibility(self._args(cpu_offload_gb=1))
 
     def test_ple_and_group_offload_rejected_with_streaming(self):
-        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}):
+        with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_ENABLE": "1"}):
             with self.assertRaisesRegex(ValueError, "offload-group-size"):
                 memory_hook.handle_offload_compatibility(
                     self._args(offload_group_size=1)
@@ -647,12 +647,19 @@ class RouteTraceConfigurationTests(unittest.TestCase):
         args.cuda_graph_config.decode.backend = decode
         return args
 
+    def set_route_trace(self, **route):
+        trace = json.loads(os.environ.get("SGLANG_EXPERT_STREAM_TRACE") or "{}")
+        trace.setdefault("route", {}).update(route)
+        os.environ["SGLANG_EXPERT_STREAM_TRACE"] = json.dumps(trace)
+
     def enable_trace(self):
-        os.environ["SGLANG_MOE_ROUTE_TRACE_DIR"] = "/tmp/route-trace"
+        self.set_route_trace(dir="/tmp/route-trace")
 
     def test_trace_is_disabled_by_default(self):
-        self.assertEqual(envs.SGLANG_MOE_ROUTE_TRACE_DIR.get(), "")
-        self.assertEqual(envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get(), 2048)
+        self.assertEqual(envs.SGLANG_EXPERT_STREAM_TRACE.get(), "")
+        from sglang.srt.layers.moe.expert_engine.config import RouteTraceConfig
+
+        self.assertEqual(RouteTraceConfig().max_tokens, 2048)
         memory_hook.handle_offload_compatibility(self.args(decode="breakable"))
 
     def test_trace_accepts_eager_decode(self):
@@ -670,8 +677,8 @@ class RouteTraceConfigurationTests(unittest.TestCase):
 
     def test_trace_rejects_graph_gather(self):
         self.enable_trace()
-        os.environ["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = "1"
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_GRAPH_GATHER=0"):
+        os.environ["SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"] = "1"
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=0"):
             memory_hook.handle_offload_compatibility(self.args())
 
     def test_trace_rejects_unobservable_runtimes(self):
@@ -694,7 +701,7 @@ class RouteTraceConfigurationTests(unittest.TestCase):
 
     def enable_speculative_trace(self):
         self.enable_trace()
-        os.environ["SGLANG_MOE_ROUTE_TRACE_SPECULATIVE"] = "1"
+        self.set_route_trace(speculative=True)
 
     def speculative_args(self, decode="disabled", **changes):
         values = dict(
@@ -714,9 +721,9 @@ class RouteTraceConfigurationTests(unittest.TestCase):
                 )
 
     def test_speculative_nextn_requires_the_speculative_trace_flag(self):
-        self.assertFalse(envs.SGLANG_MOE_ROUTE_TRACE_SPECULATIVE.get())
+        self.assertEqual(envs.SGLANG_EXPERT_STREAM_TRACE.get(), "")
         self.enable_trace()
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE=1"):
+        with self.assertRaisesRegex(ValueError, "route.speculative"):
             memory_hook.handle_offload_compatibility(self.speculative_args())
 
     def test_speculative_trace_rejects_other_draft_configurations(self):
@@ -757,20 +764,20 @@ class RouteTraceConfigurationTests(unittest.TestCase):
 
     def test_trace_rejects_nonpositive_token_budget(self):
         self.enable_trace()
-        os.environ["SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS"] = "0"
-        with self.assertRaisesRegex(ValueError, "MAX_TOKENS must be positive"):
+        self.set_route_trace(max_tokens=0)
+        with self.assertRaisesRegex(ValueError, "max_tokens must be positive"):
             memory_hook.handle_offload_compatibility(self.args())
 
     def test_trace_launch_envelope_with_file_ple_and_dynamic_hot_cache(self):
         self.enable_trace()
         os.environ.update(
-            SGLANG_MOE_EXPERT_STREAM="1",
-            SGLANG_MOE_HOT_GPU_MB="10240",
-            SGLANG_MOE_PINNED_HOST_MB="0",
-            SGLANG_MOE_EXPERT_HOST_ARENA="1",
-            SGLANG_MOE_EXPERT_GRAPH_GATHER="0",
-            SGLANG_MOE_HOT_DYNAMIC="1",
-            SGLANG_MOE_EXPERT_COPY_BACKEND="dma",
+            SGLANG_EXPERT_STREAM_ENABLE="1",
+            SGLANG_EXPERT_STREAM_HOT_GPU_MB="10240",
+            SGLANG_EXPERT_STREAM_PINNED_HOST_MB="0",
+            SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA="1",
+            SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="0",
+            SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC="1",
+            SGLANG_EXPERT_STREAM_COPY_MODE="dma",
         )
         args = self.args(
             ple_offload_embedding=True,
@@ -841,46 +848,46 @@ class HotCacheConfigurationTests(unittest.TestCase):
         return SimpleNamespace(**values)
 
     def enable(self):
-        os.environ.update(SGLANG_MOE_EXPERT_STREAM="1", SGLANG_MOE_HOT_GPU_MB="1")
+        os.environ.update(SGLANG_EXPERT_STREAM_ENABLE="1", SGLANG_EXPERT_STREAM_HOT_GPU_MB="1")
 
     def test_hot_cache_defaults_are_disabled_with_bounded_update_policy(self):
         expected = dict(
-            SGLANG_MOE_EXPERT_FILE_DIR="",
-            SGLANG_MOE_PINNED_HOST_MB=0,
-            SGLANG_MOE_HOT_GPU_MB=0,
-            SGLANG_MOE_HOT_SEED="",
-            SGLANG_MOE_HOT_DYNAMIC=False,
-            SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS=1024,
-            SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=0,
-            SGLANG_MOE_HOT_DECAY_TOKENS=0,
-            SGLANG_MOE_HOT_PROMOTION_SIGMAS=0.0,
-            SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS=8,
-            SGLANG_MOE_HOT_BENEFIT_RATIO=1.0,
-            SGLANG_MOE_HOT_LOG_INTERVAL=100,
-            SGLANG_MOE_PREFETCH_MAX_CANDIDATES=0,
+            SGLANG_EXPERT_STREAM_FILE_CACHE_DIR="",
+            SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0,
+            SGLANG_EXPERT_STREAM_HOT_GPU_MB=0,
+            SGLANG_EXPERT_STREAM_HOT_SEED="",
+            SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC=False,
+            SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS=1024,
+            SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS=0,
+            SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS=0,
+            SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS=0.0,
+            SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS=8,
+            SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO=1.0,
+            SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL=100,
+            SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES=0,
         )
         for name, value in expected.items():
             with self.subTest(name=name):
                 self.assertEqual(getattr(envs, name).get(), value)
 
     def test_prefetch_requires_the_complete_single_request_cache_envelope(self):
-        os.environ["SGLANG_MOE_PREFETCH_MAX_CANDIDATES"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES"] = "1"
         with self.assertRaisesRegex(ValueError, "hot GPU and pinned host"):
             memory_hook.handle_offload_compatibility(self.args())
         self.enable()
         with self.assertRaisesRegex(ValueError, "hot GPU and pinned host"):
             memory_hook.handle_offload_compatibility(self.args())
-        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_PINNED_HOST_MB"] = "1"
         memory_hook.handle_offload_compatibility(self.args())
 
     def test_hot_cache_requires_streaming(self):
-        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "1"
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM"):
+        os.environ["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] = "1"
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE"):
             memory_hook.handle_offload_compatibility(self.args())
 
     def test_pinned_host_cache_requires_streaming(self):
-        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "1"
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM"):
+        os.environ["SGLANG_EXPERT_STREAM_PINNED_HOST_MB"] = "1"
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE"):
             memory_hook.handle_offload_compatibility(self.args())
 
     def test_unsupported_runtime_combinations_fail_early(self):
@@ -916,7 +923,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Waterfill"):
             memory_hook.handle_offload_compatibility(args)
         self.assertEqual(args.moe_a2a_backend, "none")
-        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "0"
+        os.environ["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] = "0"
         memory_hook.handle_offload_compatibility(args)
 
     def test_nonzero_ep_join_rank_offset_is_rejected(self):
@@ -966,8 +973,8 @@ class HotCacheConfigurationTests(unittest.TestCase):
 
     def test_pinned_host_cache_allows_decode_breakable_cuda_graph(self):
         self.enable()
-        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "0"
-        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] = "0"
+        os.environ["SGLANG_EXPERT_STREAM_PINNED_HOST_MB"] = "1"
         allowed = self.args()
         allowed.cuda_graph_config.decode.backend = "breakable"
         memory_hook.handle_offload_compatibility(allowed)
@@ -975,7 +982,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
     def enable_graph_gather(self):
         self.enable()
         os.environ.update(
-            SGLANG_MOE_EXPERT_GRAPH_GATHER="1", SGLANG_MOE_EXPERT_HOST_ARENA="1"
+            SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="1", SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA="1"
         )
 
     def decode_args(self, backend, **changes):
@@ -1061,13 +1068,13 @@ class HotCacheConfigurationTests(unittest.TestCase):
         overlap = self.decode_args(
             "breakable", disable_overlap_schedule=False, **file_ple
         )
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1"):
             memory_hook.handle_offload_compatibility(overlap)
-        os.environ["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE"] = "1"
         memory_hook.handle_offload_compatibility(overlap)
 
         os.environ.update(
-            SGLANG_MOE_EXPERT_GRAPH_GATHER="0", SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY="0"
+            SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER="0", SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY="0"
         )
         with self.assertRaisesRegex(ValueError, "disable-overlap-schedule"):
             memory_hook.handle_offload_compatibility(
@@ -1077,10 +1084,10 @@ class HotCacheConfigurationTests(unittest.TestCase):
     def test_graph_gather_requires_its_cache_envelope(self):
         self.enable_graph_gather()
         cases = (
-            (dict(SGLANG_MOE_HOT_GPU_MB="0"), "requires SGLANG_MOE_HOT_GPU_MB"),
-            (dict(SGLANG_MOE_EXPERT_HOST_ARENA="0"), "SGLANG_MOE_EXPERT_HOST_ARENA=1"),
-            (dict(SGLANG_MOE_PINNED_HOST_MB="1"), "SGLANG_MOE_PINNED_HOST_MB=0"),
-            (dict(SGLANG_MOE_PREFETCH_MAX_CANDIDATES="1"), "expert prefetch"),
+            (dict(SGLANG_EXPERT_STREAM_HOT_GPU_MB="0"), "requires SGLANG_EXPERT_STREAM_HOT_GPU_MB"),
+            (dict(SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA="0"), "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA=1"),
+            (dict(SGLANG_EXPERT_STREAM_PINNED_HOST_MB="1"), "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0"),
+            (dict(SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES="1"), "expert prefetch"),
         )
         for environment, message in cases:
             with (
@@ -1094,11 +1101,11 @@ class HotCacheConfigurationTests(unittest.TestCase):
 
     def test_host_arena_rejects_the_pinned_host_cache(self):
         os.environ.update(
-            SGLANG_MOE_EXPERT_STREAM="1",
-            SGLANG_MOE_EXPERT_HOST_ARENA="1",
-            SGLANG_MOE_PINNED_HOST_MB="1",
+            SGLANG_EXPERT_STREAM_ENABLE="1",
+            SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA="1",
+            SGLANG_EXPERT_STREAM_PINNED_HOST_MB="1",
         )
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_PINNED_HOST_MB=0"):
+        with self.assertRaisesRegex(ValueError, "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0"):
             memory_hook.handle_offload_compatibility(self.args())
 
     def test_early_graph_resolution_and_repeated_validation_are_safe(self):
@@ -1111,7 +1118,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
 
     def test_dynamic_mode_requires_a_recorder_reporting_physical_counts(self):
         self.enable()
-        os.environ["SGLANG_MOE_HOT_DYNAMIC"] = "1"
+        os.environ["SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC"] = "1"
         for recorder in (None, "stat_approx", "per_token"):
             with (
                 self.subTest(recorder=recorder),
@@ -1146,10 +1153,10 @@ class HotCacheConfigurationTests(unittest.TestCase):
 
     def test_zero_budget_ignores_unused_seed_dynamic_and_policy_settings(self):
         os.environ.update(
-            SGLANG_MOE_HOT_GPU_MB="0",
-            SGLANG_MOE_HOT_SEED="/missing/seed",
-            SGLANG_MOE_HOT_DYNAMIC="1",
-            SGLANG_MOE_HOT_LOG_INTERVAL="0",
+            SGLANG_EXPERT_STREAM_HOT_GPU_MB="0",
+            SGLANG_EXPERT_STREAM_HOT_SEED="/missing/seed",
+            SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC="1",
+            SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL="0",
         )
         memory_hook.handle_offload_compatibility(
             self.args(
@@ -1163,14 +1170,14 @@ class HotCacheConfigurationTests(unittest.TestCase):
     def test_invalid_policy_is_rejected_before_loading(self):
         self.enable()
         for name, value in (
-            ("SGLANG_MOE_HOT_GPU_MB", "-1"),
-            ("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS", "0"),
-            ("SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS", "-1"),
-            ("SGLANG_MOE_HOT_DECAY_TOKENS", "-1"),
-            ("SGLANG_MOE_HOT_PROMOTION_SIGMAS", "nan"),
-            ("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS", "-1"),
-            ("SGLANG_MOE_HOT_BENEFIT_RATIO", "nan"),
-            ("SGLANG_MOE_HOT_LOG_INTERVAL", "0"),
+            ("SGLANG_EXPERT_STREAM_HOT_GPU_MB", "-1"),
+            ("SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS", "0"),
+            ("SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS", "-1"),
+            ("SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS", "-1"),
+            ("SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS", "nan"),
+            ("SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS", "-1"),
+            ("SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO", "nan"),
+            ("SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL", "0"),
         ):
             with patch.dict(os.environ, {name: value}), self.subTest(name=name):
                 with self.assertRaises(ValueError):
@@ -1190,10 +1197,10 @@ class HotCacheStartupTests(unittest.TestCase):
                     patch.dict(
                         os.environ,
                         {
-                            "SGLANG_MOE_HOT_GPU_MB": "2",
-                            "SGLANG_MOE_HOT_SEED": "seed.pt",
-                            "SGLANG_MOE_HOT_DYNAMIC": str(int(dynamic)),
-                            "SGLANG_MOE_HOT_LOG_INTERVAL": "7",
+                            "SGLANG_EXPERT_STREAM_HOT_GPU_MB": "2",
+                            "SGLANG_EXPERT_STREAM_HOT_SEED": "seed.pt",
+                            "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": str(int(dynamic)),
+                            "SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL": "7",
                         },
                     )
                 )
@@ -1288,14 +1295,18 @@ class HotCacheStartupTests(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
-                    "SGLANG_MOE_HOT_GPU_MB": "0",
-                    "SGLANG_MOE_HOT_SEED": "/missing/seed",
-                    "SGLANG_MOE_HOT_DYNAMIC": "1",
-                    "SGLANG_MOE_HOT_LOG_INTERVAL": "invalid",
+                    "SGLANG_EXPERT_STREAM_HOT_GPU_MB": "0",
+                    "SGLANG_EXPERT_STREAM_HOT_SEED": "/missing/seed",
+                    "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": "1",
+                    "SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL": "invalid",
                 },
             ),
             patch.object(ExpertHotCacheManager, "from_model") as factory,
         ):
+            # ModelRunner.__init__ resolves the config once; this runner skips __init__, so resolve it as it does.
+            from sglang.srt.layers.moe.expert_engine.config import stream_config
+
+            runner.expert_stream_config = stream_config()
             runner.maybe_init_expert_hot_cache()
         self.assertIsNone(runner.expert_hot_cache_manager)
         factory.assert_not_called()

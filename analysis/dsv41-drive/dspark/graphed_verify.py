@@ -30,18 +30,18 @@ import arm_env  # noqa: E402
 MISS_LANES = os.environ.get("D23_MISS_LANES", "8")
 # COMMON turns the recipe's in-graph expert path off for an eager verify; a graphed verify keeps the recipe's.
 EAGER_ONLY = (
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER",
-    "SGLANG_MOE_GPU_RESIDENCY_UPDATE",
-    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE",
-    "SGLANG_MOE_EXPERT_FUSED_PLAN",
-    "SGLANG_DSV41_ENABLE_PREFILL_FILLS",
+    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER",
+    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE",
+    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE",
+    "SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN",
+    "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS",
 )
 GRAPHED = {
     **{k: v for k, v in COMMON.items() if k not in EAGER_ONLY},
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
-    "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "1",
-    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "2",
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": MISS_LANES,
+    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1",
+    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": "1",
+    "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": "2",
+    "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": MISS_LANES,
     "SGLANG_RAGGED_VERIFY_MODE": "static",
 }
 D23_ARMS = {
@@ -56,9 +56,10 @@ DRAFT_ARMS = ("draft-eager", "draft-graph")
 DRAFT_CPU_LINE = re.compile(r"DSpark CPU experts: (\{.*\})")
 
 
-# Cores the recipe and ab_cpu_draft name for their own affinities. Unset, ThreadingConfig derives the RAM threads' and
-# the draft's cores from this run's affinity (the recipe's server cores, 0-5,56-61), keeping them apart.
-HAND_PINNED = ("SGLANG_DSV41_RAM_MISS_SPIN_CORE", "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES")
+# Cores the recipe and ab_cpu_draft name for their own affinities (the recipe's NUMA_CORES holds only the RAM thread's
+# core). Unset, ThreadingConfig derives the RAM threads' and the draft's cores from this run's affinity (the recipe's
+# server cores, 0-5,56-61), keeping them apart.
+HAND_PINNED = ("SGLANG_EXPERT_STREAM_NUMA_CORES", "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES")
 
 
 def arm_environment(arm: str, outdir: str) -> dict:
@@ -66,7 +67,7 @@ def arm_environment(arm: str, outdir: str) -> dict:
     overrides = {
         **overrides,
         "SGLANG_DSPARK_DEBUG_DUMP": "target_verify_gpu_time,draft_gpu_time" if arm in DRAFT_ARMS else "target_verify_gpu_time",
-        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(outdir, f"{arm}.metrics.jsonl"),
+        "SGLANG_EXPERT_STREAM_TRACE": json.dumps({"hot_metrics_file": os.path.join(outdir, f"{arm}.metrics.jsonl")}),
     }
     env = {k: v for k, v in (os.environ | arm_env.arm_env(overrides)).items() if k not in HAND_PINNED}
     env["PYTHONPATH"] = os.path.join(REPO, "python")

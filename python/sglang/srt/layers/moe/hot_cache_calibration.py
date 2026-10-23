@@ -470,7 +470,7 @@ def check_kv_pin(*, pinned: Optional[int], sized: Optional[int]) -> None:
     if pinned and sized is not None and sized < pinned:
         raise KvPinMissed(
             f"hot cache calibration: the KV pool has {sized} tokens, below --max-total-tokens {pinned}; "
-            "raise --mem-fraction-static or lower SGLANG_MOE_HOT_GPU_MB"
+            "raise --mem-fraction-static or lower SGLANG_EXPERT_STREAM_HOT_GPU_MB"
         )
 
 

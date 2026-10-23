@@ -65,7 +65,7 @@ def test_graph_source_kind_defaults_to_dense():
 
 
 def _streamer(kind, pinned):
-    fmt = SimpleNamespace(key="k", supports_graph_gather=False, graph_source_kind=kind)
+    fmt = SimpleNamespace(key="k", engine_served=False, supports_graph_gather=False, graph_source_kind=kind)
     return SimpleNamespace(format=fmt, has_spec_only_tensors=True, pinned_host_cache=pinned, layer_id=3)
 
 

@@ -102,7 +102,7 @@ class ExpertResidencyPolicy:
             self.num_experts, dtype=torch.float32, device=self.device
         )
         self._scores = torch.zeros_like(self._pending_counts)
-        # Set by GpuResidencyUpdater under SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0: eager counts also land here, so its
+        # Set by GpuResidencyUpdater when residency.insert_eager_counts is False: eager counts also land here, so its
         # insert score can leave them out.
         self._eager_counts: torch.Tensor | None = None
         if initial_scores is not None:

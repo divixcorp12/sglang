@@ -7,7 +7,7 @@ import os
 import pytest
 
 from sglang.srt.layers.moe import exl3_row_image as ri
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout, Exl3ExpertRecord, Exl3TensorSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 

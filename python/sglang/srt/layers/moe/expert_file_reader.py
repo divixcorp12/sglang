@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable, Mapping, Optional
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.layers.moe.expert_row_source import (
     HostSlotLayout,
     RowReadStats,
@@ -75,9 +75,11 @@ class ExpertFileRowReader(SynchronousSubmit):
         tensor_names: Iterable[str],
         mode: Optional[str] = None,
     ) -> Optional[ExpertFileRowReader]:
-        """Build a reader for the CPU expert tensors of ``layer``, or None for ``mmap``."""
+        """Build a reader for the CPU expert tensors of ``layer``, or None for ``mmap``.
+
+        ``mode`` defaults to the process config's ``tiers.file_reader``."""
         mode = validate_file_reader_mode(
-            envs.SGLANG_MOE_EXPERT_FILE_READER.get() if mode is None else mode
+            stream_config().tiers.file_reader if mode is None else mode
         )
         if mode == "mmap":
             return None
@@ -96,9 +98,9 @@ class ExpertFileRowReader(SynchronousSubmit):
             tag = getattr(parameter, "_sglang_file_cache_tag", None)
             if group is None or tag is None:
                 raise ValueError(
-                    f"SGLANG_MOE_EXPERT_FILE_READER={mode} needs file-backed expert "
+                    f"SGLANG_EXPERT_STREAM_FILE_READER={mode} needs file-backed expert "
                     f"tensors, but {name!r} has no expert file; set "
-                    "SGLANG_MOE_EXPERT_FILE_DIR or use the mmap reader"
+                    "SGLANG_EXPERT_STREAM_FILE_CACHE_DIR or use the mmap reader"
                 )
             if (
                 data.shape[0] == 0
@@ -142,15 +144,15 @@ class ExpertFileRowReader(SynchronousSubmit):
         """Build a reader for members ``names`` (default: all) of an open cache group.
 
         Each member must be a contiguous ``[experts, ...]`` tensor; the member
-        tag is the streamed tensor name.
+        tag is the streamed tensor name. ``mode`` defaults to the process config's ``tiers.file_reader``.
         """
         mode = validate_file_reader_mode(
-            envs.SGLANG_MOE_EXPERT_FILE_READER.get() if mode is None else mode
+            stream_config().tiers.file_reader if mode is None else mode
         )
         if mode == "mmap":
             raise ValueError(
                 "ExpertFileRowReader.from_group reads through io_uring; with "
-                "SGLANG_MOE_EXPERT_FILE_READER=mmap read the group's mapped "
+                "SGLANG_EXPERT_STREAM_FILE_READER=mmap read the group's mapped "
                 "tensors through a TensorRowSource"
             )
         specs = {spec.tag: spec for spec in group.specs}

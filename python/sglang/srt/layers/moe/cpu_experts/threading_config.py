@@ -1,11 +1,10 @@
 """Where the expert stream's threads run: one plan per NUMA node of the pinned tier.
 
-ThreadingConfig is the only reader of the core settings (SGLANG_DSV41_CPU_EXPERTS_CORES and _THREADS,
-SGLANG_DSV41_RAM_MISS_SPIN_CORE, SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU, SGLANG_EXPERT_NUMA_CORES, and the DSpark
-draft's SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and _THREADS), of the process affinity and of the reserved cores; C++
-receives resolved core lists only. A core a setting names is used as given; every other core is derived. The rules are the design's
-(docs/superpowers/specs/2026-10-03-numa-node-distributor-design.md, Part 2). ``resolve`` reads nothing, so it runs
-on any topology; ``from_env`` gathers the machine's.
+ThreadingConfig is the only reader of the core settings (the engine config's ``tiers.numa_cores`` per-node plans,
+``cpu_experts.threads`` and the DSpark draft's ``draft.cores`` and ``draft.threads``), of the process affinity and of
+the reserved cores; C++ receives resolved core lists only. A core a setting names is used as given; every other core
+is derived. The rules are the design's (docs/superpowers/specs/2026-10-03-numa-node-distributor-design.md, Part 2).
+``resolve`` reads nothing, so it runs on any topology; ``from_env`` gathers the machine's.
 """
 
 from __future__ import annotations
@@ -57,15 +56,17 @@ def _format_cpus(cores: Sequence[int]) -> str:
 
 
 def parse_numa_cores(spec: str) -> dict[int, dict[str, list[int]]]:
-    """SGLANG_EXPERT_NUMA_CORES as {node: {"ram" | "cpu" | "sq": cores}}; raises ValueError when malformed."""
+    """SGLANG_EXPERT_STREAM_NUMA_CORES as {node: {"ram" | "cpu" | "sq": cores}}; raises ValueError when malformed."""
     plans: dict[int, dict[str, list[int]]] = {}
     for entry in filter(None, (e.strip() for e in spec.split(";"))):
         node_text, sep, body = entry.partition(":")
         if not sep or not node_text.strip().isdigit():
-            raise ValueError(f"SGLANG_EXPERT_NUMA_CORES entry {entry!r} does not start with a node, as in 1:ram=35")
+            raise ValueError(
+                f"SGLANG_EXPERT_STREAM_NUMA_CORES entry {entry!r} does not start with a node, as in 1:ram=35"
+            )
         node = int(node_text)
         if node in plans:
-            raise ValueError(f"SGLANG_EXPERT_NUMA_CORES names node {node} twice")
+            raise ValueError(f"SGLANG_EXPERT_STREAM_NUMA_CORES names node {node} twice")
         items: dict[str, list[str]] = {}
         key = None
         for item in (i.strip() for i in body.split(",")):
@@ -73,12 +74,12 @@ def parse_numa_cores(spec: str) -> dict[int, dict[str, list[int]]]:
             if eq:
                 key = name.strip()
                 if key not in ("ram", "cpu", "sq"):
-                    raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: unknown key {key!r}; expected ram, cpu or sq")
+                    raise ValueError(f"SGLANG_EXPERT_STREAM_NUMA_CORES: unknown key {key!r}; expected ram, cpu or sq")
                 if key in items:
-                    raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: node {node} sets {key} twice")
+                    raise ValueError(f"SGLANG_EXPERT_STREAM_NUMA_CORES: node {node} sets {key} twice")
                 items[key] = [value]
             elif key is None:
-                raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: {item!r} on node {node} follows no key")
+                raise ValueError(f"SGLANG_EXPERT_STREAM_NUMA_CORES: {item!r} on node {node} follows no key")
             else:
                 items[key].append(item)
         plans[node] = {}
@@ -87,11 +88,11 @@ def parse_numa_cores(spec: str) -> dict[int, dict[str, list[int]]]:
                 plans[node][k] = parse_cpu_list(",".join(v))
             except ValueError as refusal:
                 raise ValueError(
-                    f"SGLANG_EXPERT_NUMA_CORES: node {node}'s entry {k}={','.join(v)} is not a taskset core list"
+                    f"SGLANG_EXPERT_STREAM_NUMA_CORES: node {node}'s entry {k}={','.join(v)} is not a taskset core list"
                 ) from refusal
         for k in ("ram", "sq"):
             if k in plans[node] and len(plans[node][k]) != 1:
-                raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: node {node}'s {k} is one core")
+                raise ValueError(f"SGLANG_EXPERT_STREAM_NUMA_CORES: node {node}'s {k} is one core")
     return plans
 
 
@@ -164,18 +165,15 @@ class Topology:
 
 @dataclass(frozen=True)
 class CoreSettings:
-    cpu_experts: bool = False  # SGLANG_DSV41_CPU_EXPERTS
-    cores: str = ""  # SGLANG_DSV41_CPU_EXPERTS_CORES
-    threads: int = 0  # SGLANG_DSV41_CPU_EXPERTS_THREADS, 0: no cap
-    smt: bool = False  # SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: each CPU expert core's SMT siblings join its pool
-    spin_core: Optional[int] = None  # SGLANG_DSV41_RAM_MISS_SPIN_CORE
-    sqpoll: bool = False  # SGLANG_EXPERT_STREAM_URING_MODE names a sqpoll mode
-    sq_thread_cpu: Optional[int] = None  # SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU
-    numa_cores: str = ""  # SGLANG_EXPERT_NUMA_CORES
-    draft: bool = False  # SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS
-    draft_cores: str = ""  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES; empty derives them on the GPU's node
-    draft_threads: int = 0  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS, 0: no cap on the derived cores
-    ram_prefetch: bool = False  # SGLANG_DSV41_RAM_PREFETCH: each group's speculative thread needs cores
+    cpu_experts: bool = False  # the target's CPU experts run (cpu_experts.enabled for the service)
+    threads: int = 0  # cpu_experts.threads, 0: no cap
+    smt: bool = False  # cpu_experts.smt: each CPU expert core's SMT siblings join its pool
+    sqpoll: bool = False  # tiers.uring.mode names a sqpoll mode
+    numa_cores: str = ""  # tiers.numa_cores: the per-node ram=, cpu= and sq= cores
+    draft: bool = False  # draft.cpu_experts
+    draft_cores: str = ""  # draft.cores; empty derives them on the GPU's node
+    draft_threads: int = 0  # draft.threads, 0: no cap on the derived cores
+    ram_prefetch: bool = False  # prefetch.ram.enabled while it runs: each group's speculative thread needs cores
 
 
 @dataclass(frozen=True)
@@ -224,27 +222,29 @@ class ThreadingConfig:
         return lines
 
     @classmethod
-    def from_env(cls, *, cpu_experts: bool, device: Optional[int]) -> "ThreadingConfig":
-        """The machine's plan: its sysfs topology, this process's affinity and the core env vars."""
-        from sglang.srt.environ import envs
+    def from_env(cls, *, cpu_experts: bool, device: Optional[int], config=None) -> "ThreadingConfig":
+        """The machine's plan: its sysfs topology, this process's affinity and the engine config's core settings.
+
+        ``config`` is the ExpertStreamConfig; None resolves the process's.
+        """
+        from sglang.srt.layers.moe.expert_engine.config import stream_config
         from sglang.srt.layers.moe.expert_stream import ram_prefetch_active
         from sglang.srt.layers.moe.host_numa import parse_placement
 
+        if config is None:
+            config = stream_config()
         settings = CoreSettings(
             cpu_experts=cpu_experts,
-            cores=envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get(),
-            threads=envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.get(),
-            smt=envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT.get(),
-            spin_core=envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.get(),
-            sqpoll="sqpoll" in envs.SGLANG_EXPERT_STREAM_URING_MODE.get(),
-            sq_thread_cpu=envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.get(),
-            numa_cores=envs.SGLANG_EXPERT_NUMA_CORES.get(),
-            draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get(),
-            draft_cores=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get(),
-            draft_threads=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get(),
+            threads=config.cpu_experts.threads,
+            smt=config.cpu_experts.smt,
+            sqpoll="sqpoll" in config.tiers.uring.mode,
+            numa_cores=config.tiers.numa_cores,
+            draft=config.draft.cpu_experts,
+            draft_cores=config.draft.cores,
+            draft_threads=config.draft.threads,
             ram_prefetch=ram_prefetch_active(),
         )
-        placement = parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get())
+        placement = parse_placement(config.tiers.pinned_host_numa_mb)
         gpu_node = gpu_numa_node(device)
         return cls.resolve(
             nodes=[node for node, _ in placement] or [gpu_node if gpu_node is not None else 0],
@@ -268,50 +268,16 @@ class ThreadingConfig:
         if settings.cpu_experts and settings.draft and (settings.draft_cores or settings.draft_threads):
             # One team per node (plan 2026-10-06 Task 11): the draft is a job source on the GPU node's CPU expert team.
             raise ValueError(
-                "the DSpark draft shares the GPU node's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
-                "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
+                "the DSpark draft shares the GPU node's CPU expert team under SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS; "
+                "unset SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES and SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS"
             )
         gpu = gpu_node if gpu_node is not None else nodes[0]
         overrides = parse_numa_cores(settings.numa_cores)
         for node in overrides:
             if node not in nodes:
-                raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: node {node} is not one of the tier's nodes {list(nodes)}")
-        if settings.cores:
-            cores = parse_cpu_list(settings.cores)
-            homes = {topology.node_of(c) for c in cores}
-            if len(homes) != 1:
-                raise ValueError(f"SGLANG_DSV41_CPU_EXPERTS_CORES {settings.cores!r} spans two nodes")
-            home = homes.pop()
-            if home not in nodes:
-                raise ValueError(f"SGLANG_DSV41_CPU_EXPERTS_CORES: core {cores[0]} is on node {home}, off the tier")
-            if "cpu" in overrides.get(home, {}):
                 raise ValueError(
-                    f"node {home}'s CPU cores are set both by SGLANG_DSV41_CPU_EXPERTS_CORES and SGLANG_EXPERT_NUMA_CORES"
+                    f"SGLANG_EXPERT_STREAM_NUMA_CORES: node {node} is not one of the tier's nodes {list(nodes)}"
                 )
-            overrides.setdefault(home, {})["cpu"] = cores
-        if settings.spin_core is not None:
-            check_not_reserved(settings.spin_core)
-            home = topology.node_of(settings.spin_core)
-            if home not in nodes:
-                raise ValueError(f"SGLANG_DSV41_RAM_MISS_SPIN_CORE: core {settings.spin_core} is on node {home}")
-            if "ram" in overrides.get(home, {}):
-                raise ValueError(
-                    f"node {home}'s RAM core is set both by SGLANG_DSV41_RAM_MISS_SPIN_CORE and SGLANG_EXPERT_NUMA_CORES"
-                )
-            overrides.setdefault(home, {})["ram"] = [settings.spin_core]
-        if settings.sq_thread_cpu is not None and settings.sq_thread_cpu >= 0:
-            if len(nodes) > 1:
-                raise ValueError(
-                    "SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU names one core for several NUMA groups; "
-                    "set each group's sq= in SGLANG_EXPERT_NUMA_CORES"
-                )
-            if "sq" in overrides.get(nodes[0], {}):
-                raise ValueError(
-                    f"node {nodes[0]}'s SQPOLL core is set both by SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU "
-                    "and SGLANG_EXPERT_NUMA_CORES"
-                )
-            check_not_reserved(settings.sq_thread_cpu)
-            overrides.setdefault(nodes[0], {})["sq"] = [settings.sq_thread_cpu]
         named_draft = parse_cpu_list(settings.draft_cores) if settings.draft and settings.draft_cores else []
         for node, plan_keys in overrides.items():
             for key, cores in plan_keys.items():
@@ -319,16 +285,27 @@ class ThreadingConfig:
                     if topology.siblings[core] & set(named_draft):
                         raise ValueError(
                             f"core {core} is named both for the DSpark draft's CPU experts "
-                            f"(SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES={settings.draft_cores}) and as node {node}'s {key} core"
+                            f"(SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES={settings.draft_cores}) "
+                            f"and as node {node}'s {key} core"
                         )
         if not settings.sqpoll:
             for node, plan_keys in overrides.items():
                 if "sq" in plan_keys:
-                    raise ValueError(f"node {node} sets an SQPOLL core, but SGLANG_EXPERT_STREAM_URING_MODE is not sqpoll")
-        derive = len(nodes) > 1 or settings.cpu_experts or bool(settings.numa_cores) or settings.draft
+                    raise ValueError(
+                        f"node {node} sets an SQPOLL core, but SGLANG_EXPERT_STREAM_URING's mode is not sqpoll"
+                    )
+        lone = overrides.get(nodes[0], {})
+        derive = len(nodes) > 1 or settings.cpu_experts or settings.draft or not set(lone) <= {"ram", "sq"}
         if not derive:
-            ram = settings.spin_core
-            sq = overrides.get(nodes[0], {}).get("sq", [None])[0]
+            # A one-node plan naming only ram= and sq= pins those threads and derives nothing else, as the retired
+            # single-core settings it replaces did; the sq= core may sit off the node, as theirs could.
+            for core in lone.values():
+                check_not_reserved(core[0])
+            ram = lone.get("ram", [None])[0]
+            if ram is not None and topology.node_of(ram) != nodes[0]:
+                home = topology.node_of(ram)
+                raise ValueError(f"SGLANG_EXPERT_STREAM_NUMA_CORES: node {nodes[0]}'s ram core {ram} is on node {home}")
+            sq = lone.get("sq", [None])[0]
             plan = NodePlan(group=0, node=nodes[0], ram=ram, cpu=(), sq=sq, busy_poll=ram is not None)
             return ThreadingConfig((plan,), (), gpu)
         copy = _copy_core(gpu, overrides, topology, affinity, named_draft)
@@ -350,8 +327,8 @@ class ThreadingConfig:
 
 def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
     """The DSpark draft's CPU expert cores: the GPU node's physical cores left after the copy thread and every node's
-    plan, lowest first, capped at SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS. Derived last, so the busy-polling threads
-    get their dedicated cores first."""
+    plan, lowest first, capped at SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS. Derived last, so the busy-polling
+    threads get their dedicated cores first."""
     free = sorted(
         c
         for c in topology.physical(gpu)
@@ -360,13 +337,14 @@ def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
     if len(free) < 2:
         raise ValueError(
             f"node {gpu}: {free} is left for the DSpark draft's CPU experts, which need at least 2 cores; "
-            "free more of the node from the server's affinity or name them in SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"
+            "free more of the node from the server's affinity or name them in "
+            "SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_CORES"
         )
     if settings.draft_threads:
         try:
             check_engine_cores(free, settings.draft_threads)
         except ValueError as refusal:
-            raise ValueError(f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS on node {gpu}: {refusal}") from None
+            raise ValueError(f"SGLANG_EXPERT_STREAM_DRAFT_CPU_EXPERTS_THREADS on node {gpu}: {refusal}") from None
         free = free[: settings.draft_threads]
     return tuple(free)
 
@@ -458,8 +436,9 @@ def _derive(group, node, override, topology, affinity, settings, taken) -> NodeP
 
 
 def _smt_siblings(node, cores, topology, affinity, taken) -> tuple[int, ...]:
-    """SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: the SMT siblings of the pool's cores, in the cores' order, for the pool to
-    run after them. Raises ValueError for a sibling the server's affinity, the reserved cores or another role holds."""
+    """SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT: the SMT siblings of the pool's cores, in the cores' order, for the
+    pool to run after them. Raises ValueError for a sibling the server's affinity, the reserved cores or another role
+    holds."""
     pool = set(cores)
     siblings = []
     for core in cores:
@@ -468,8 +447,8 @@ def _smt_siblings(node, cores, topology, affinity, taken) -> tuple[int, ...]:
                 continue
             if sibling in affinity or sibling in RESERVED_CORES or sibling in taken:
                 raise ValueError(
-                    f"node {node}: SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT adds core {core}'s SMT sibling {sibling} to the "
-                    "CPU expert pool, but the server's affinity, the reserved cores or another role holds it"
+                    f"node {node}: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT adds core {core}'s SMT sibling {sibling} "
+                    "to the CPU expert pool, but the server's affinity, the reserved cores or another role holds it"
                 )
             siblings.append(sibling)
     return tuple(siblings)
@@ -489,7 +468,7 @@ def _check_plan(plan: NodePlan, topology: Topology, affinity: frozenset[int], se
         if core in affinity:
             raise ValueError(f"node {plan.node}: core {core} is in the server's affinity")
     for a, b in combinations(cores, 2):
-        # SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT: the pool's own cores may share physical cores with each other.
+        # SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT: the pool's own cores may share physical cores with each other.
         if settings.smt and a in plan.cpu and b in plan.cpu:
             continue
         if b in topology.siblings[a]:

@@ -81,7 +81,7 @@ def _write_head(path: str) -> l2_fast_torch.FoldedHead:
 
 
 def _serving_head(path: str) -> head_file.ServingHead:
-    """The file through the serving loader, as ``Exl3RamMissService.attach`` loads it."""
+    """The file through the serving loader, as ``ExpertEngineService.attach`` loads it."""
     targets = torch.full((LAYERS, 2), -1, dtype=torch.int64)
     targets[0, 0], targets[1, 0] = 2, 3
     loaded = head_file.load_learned_head(path, layer_ids=LAYER_IDS, targets=targets)

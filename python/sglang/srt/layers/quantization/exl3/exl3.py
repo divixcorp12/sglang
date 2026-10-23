@@ -15,19 +15,18 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import (
-    EXL3_STREAMED_NAMES,
-    build_exl3_expert_streamer,
-)
 from sglang.srt.layers.moe.exl3_stream_trace import (
     capturing_graphs,
     get_exl3_stream_trace,
 )
-from sglang.srt.layers.moe.expert_format import STREAMER_ATTRIBUTE, expert_streamer_of
-from sglang.srt.layers.moe.verify_dead_rows import (
-    mask_dead_routes,
-    mask_dead_rows_for_graph,
-)
+from sglang.srt.layers.moe.expert_engine import quant_hook
+from sglang.srt.layers.moe.expert_engine.config import stream_config
+from sglang.srt.layers.moe.expert_engine.formats import format_for_quantization_config
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
+from sglang.srt.layers.moe.expert_engine.startup import check_requested_capabilities
+from sglang.srt.layers.moe.expert_format import expert_streamer_of
+from sglang.srt.layers.moe.verify_dead_rows import mask_dead_routes
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -52,6 +51,9 @@ UNQUANTIZED_PREFIX_SUFFIXES = (".gate", ".weights_proj")
 
 
 class Exl3Config(QuantizationConfig):
+    # The EXL3 export exists for DeepSeek V4.1 only: this is the expert-engine model profile its MoE layers stream for.
+    expert_profile_name = "dsv41"
+
     def __init__(self, bits: float, head_bits: int, codebook: str, version: str):
         super().__init__()
         if codebook != "mul1":
@@ -111,17 +113,23 @@ class Exl3Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Exl3LinearMethod(self)
         if isinstance(layer, FusedMoE):
-            from sglang.srt.models.deepseek_v4_exl3_weights import (
-                is_dspark_draft_expert_module,
-                is_streamed_expert_module,
-            )
-
-            draft = is_dspark_draft_expert_module(prefix)
+            profile = get_profile_by_name(self.expert_profile_name)
+            cpu_draft_requested = stream_config().draft.cpu_experts
+            if cpu_draft_requested:
+                check_requested_capabilities(
+                    expert_format=format_for_quantization_config(self),
+                    profile=profile,
+                    cpu_experts=False,
+                    draft=True,
+                    cpu_draft=True,
+                )
+            adapter = profile.draft_adapter()
+            draft = adapter is not None and adapter.is_draft_module(prefix)
             return Exl3MoEMethod(
                 self,
-                streamed=is_streamed_expert_module(prefix),
+                streamed=profile.is_streamed_module(prefix),
                 draft=draft,
-                cpu_draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get() and draft,
+                cpu_draft=cpu_draft_requested and draft,
             )
         return None
 
@@ -353,10 +361,12 @@ EXL3_ROW_VIEWS = Exl3RowViews()
 _DRAFT_ROUTES_LOCK = threading.Lock()
 
 
-def record_draft_routes(layer_id: int, topk_ids: torch.Tensor) -> None:
-    """Append one draft MoE call's topk ids to ``SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH`` as a JSON line (the probe
-    ``draft_resident.top_n_resident_set`` calibrates from); a no-op when the path is unset."""
-    path = envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get()
+def record_draft_routes(layer_id: int, topk_ids: torch.Tensor, path: Optional[str] = None) -> None:
+    """Append one draft MoE call's topk ids to ``path`` (``SGLANG_EXPERT_STREAM_TRACE``'s ``draft_routes_path`` when
+    None) as a JSON line (the probe ``draft_resident.top_n_resident_set`` calibrates from); a no-op when it is
+    empty."""
+    if path is None:
+        path = stream_config().trace.draft_routes_path
     if not path:
         return
     import json
@@ -379,8 +389,11 @@ def check_draft_coverage(layer_id: int, on_cpu: torch.Tensor, gpu: frozenset, *,
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
+    expert_format_name = "exl3"
+
     def __init__(self, config: Exl3Config, *, streamed: bool, draft: bool = False, cpu_draft: bool = False):
         self.config = config
+        self.expert_profile_name = config.expert_profile_name
         self.streamed = streamed
         # A DSpark draft stage: its GPU experts run through DraftResidentMoe (draft_moe.py), graph-safe.
         self.draft = draft or cpu_draft
@@ -388,7 +401,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.cpu_draft = cpu_draft
         self.moe_runner_config = None
         self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
-        self.route_plan = envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get()
+        stream = stream_config()
+        self.route_plan = stream.copy.prefill.route_plan
+        # SGLANG_EXPERT_STREAM_TRACE's draft_routes_path, read here so a draft forward reads no config.
+        self._draft_routes_path = stream.trace.draft_routes_path
         # [max_rows, 1] bool: a speculative verify's dead rows (layers/moe/verify_dead_rows.py), or None.
         self.verify_dead_rows: Optional[torch.Tensor] = None
 
@@ -419,7 +435,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden = hidden_size
         layer.exl3_inter = intermediate_size_per_partition
         layer.exl3_loaded = set()
-        layer.exl3_streamed = self.streamed and envs.SGLANG_DSV41_EXPERT_STREAM.get()
+        layer.exl3_streamed = self.streamed and stream_config().enabled
         if layer.exl3_streamed:
             # Routed experts stay on disk. With no parameters, load_weights skips
             # them (deepseek_v4.load_weights' skip_unmaterialized_expert_param),
@@ -459,7 +475,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if getattr(layer, "exl3_streamed", False):
-            setattr(layer, STREAMER_ATTRIBUTE, build_exl3_expert_streamer(layer))
+            quant_hook.attach(layer, self)
             return
         for e in range(layer.exl3_num_experts):
             for prefix, slots in (("w13", (0, 1)), ("w2", (0,))):
@@ -525,7 +541,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         The parameters are the pinned tier's slab layout ([expert, part, ...]), so they register as they are.
         """
-        from sglang.srt.layers.moe.cpu_experts import draft
         from sglang.srt.layers.moe.cpu_experts.draft_resident import resident_for
         from sglang.srt.layers.quantization.exl3.draft_moe import DraftResidentMoe
 
@@ -542,11 +557,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         on_cpu[sorted(gpu)] = False
         check_draft_coverage(layer.layer_id, on_cpu, gpu, n_routed=n_routed)
         slabs = {name: getattr(layer, name).data for name in EXL3_STREAMED_NAMES}
-        layer.exl3_cpu_draft_key = draft.DRAFT_CPU_EXPERTS.register(
-            slabs, on_cpu, layer.moe_runner_config.swiglu_limit, layer_id=layer.layer_id
+        layer.exl3_cpu_draft_key = self._draft_cpu_experts().register(
+            slabs,
+            on_cpu,
+            layer.moe_runner_config.swiglu_limit,
+            layer_id=layer.layer_id,
+            format_key=self.expert_format_name,
         )
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         layer.exl3_draft_moe = DraftResidentMoe(layer, sorted(gpu), layer.exl3_num_experts, device)
+
+    def _draft_cpu_experts(self):
+        """The CPU-expert registry of the model profile's draft adapter."""
+        return get_profile_by_name(self.expert_profile_name).draft_adapter().cpu_experts()
 
     def _apply_draft(self, layer, x, topk_weights, topk_ids, swiglu_limit) -> torch.Tensor:
         """The draft stage's routed experts, graph-safe: the CPU share posted first, the GPU share while it runs, then
@@ -555,9 +578,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         moe = layer.exl3_draft_moe
         cpu = None
         if self.cpu_draft:
-            from sglang.srt.layers.moe.cpu_experts import draft
-
-            cpu = draft.DRAFT_CPU_EXPERTS.runtime()
+            cpu = self._draft_cpu_experts().runtime()
         out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
         for lo in range(0, x.shape[0], moe.tokens):
             hi = min(lo + moe.tokens, x.shape[0])
@@ -650,8 +671,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 route_plan=self.route_plan,
             )
         elif self.draft:
-            if envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get() and not _capturing():
-                record_draft_routes(layer.layer_id, topk_ids)
+            if self._draft_routes_path and not _capturing():
+                record_draft_routes(layer.layer_id, topk_ids, self._draft_routes_path)
             out = self._apply_draft(layer, x, topk_weights, topk_ids, cfg.swiglu_limit)
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
@@ -678,104 +699,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def _apply_graph(
         layer, streamer, x, topk_weights, topk_ids, swiglu_limit, cast=True, dead=None
     ):
-        """BS1 decode inside a CUDA graph: device-only gather, then the fused MoE over slots.
-
-        Hits are read in place from the hot cache, misses land in scratch rows from
-        the pinned tier (PinnedTierRowBackend), and routes are recorded on the device
-        by the planner. A row missing from RAM sets the backend's ``keep`` to 0,
-        which drops this layer's routed output. Only option C (Task 14) serves such
-        a miss and fail-stops on one it cannot serve, so a plain
-        ``PinnedTierRowBackend`` is refused unless the layer sets the test-only
-        ``_exl3_allow_p3_only``.
-        """
-        from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
-        from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
-        from sglang.srt.layers.quantization.exl3.fused_moe import exl3_fused_moe_for
-
-        if type(streamer.row_backend) is PinnedTierRowBackend and not getattr(
-            layer, "_exl3_allow_p3_only", False
-        ):
-            # Without option C nothing serves or checks a RAM miss inside a replay.
-            raise RuntimeError(
-                f"exl3 in-graph MoE, layer {getattr(layer, 'layer_id', '?')}: the graph gather "
-                "reads the pinned tier, but option C is not installed (the row backend is a "
-                "plain PinnedTierRowBackend, not Exl3RamMissRowBackend), so a RAM miss inside a "
-                "replay would be neither served nor fail-stopped. Option C installs when "
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER is on at load and the hot cache manager "
-                "attaches the EXL3 format."
-            )
-        if swiglu_limit is None:
-            raise NotImplementedError(
-                "exl3 in-graph MoE: a swiglu_limit is required (DSV4.1 sets 10.0)"
-            )
-        routes = getattr(streamer.row_backend, "routes", None)
-        backend = streamer.row_backend
-        cpu_experts = isinstance(backend, Exl3RamMissRowBackend) and backend.cpu_experts
-        cpu_x = x
-        if dead is not None:
-            # A verify's dead rows take row 0's experts at weight 0, and -1 routes that keep them out of the
-            # protect set, the CPU token mask and the prefetch scorer (verify_dead_rows.py).
-            topk_ids, topk_weights, row0_x = mask_dead_rows_for_graph(
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                dead=dead,
-                routes=routes,
-                x=x if cpu_experts else None,
-            )
-            if cpu_experts:
-                cpu_x = row0_x
-            if routes is not None:
-                routes[topk_ids.numel() :].fill_(-1)
-        elif routes is not None:
-            # The option C post protects every routed expert of this layer. Captured as a
-            # device copy, so every replay refreshes it from the live topk_ids.
-            flat = topk_ids.reshape(-1)
-            routes[: flat.numel()].copy_(flat)
-            routes[flat.numel() :].fill_(-1)
-        if cpu_experts:
-            from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
-
-            # The first graph-path forward of the layer is a warmup, before capture: the only place that knows the
-            # layer's activation limit registers its pinned slabs with the CPU kernel.
-            Exl3RamMissService.get().cpu_experts.register(backend.row, float(swiglu_limit))
-            # The post stages x and the lanes' weights for the CPU expert thread (Exl3RamMissRowBackend.post).
-            backend.cpu_input = (cpu_x, topk_weights)
-            # The lane head (SGLANG_OPT_LANE_HEAD_PATH) counts live rows only; a dead row repeats row 0's routes.
-            backend.verify_dead = dead
-        # The fused plan leaves a dead row's routes out of the residency route counts.
-        streamer.verify_dead = dead
-        try:
-            remap, _ = streamer.gather(topk_ids)
-        finally:
-            streamer.verify_dead = None
-            if cpu_experts:
-                backend.cpu_input = None
-                backend.verify_dead = None
-        if isinstance(backend, Exl3RamMissRowBackend) and backend.route_log is not None:
-            if backend.route_log.router is not None:
-                # After the gather: its post ran the layer's route_log.record, which row 0 used to take the slot.
-                backend.route_log.record_router(backend.row, x, topk_ids, topk_weights)
-        fused = exl3_fused_moe_for(layer, streamer)
-        out = fused.run(
+        """BS1 decode inside a CUDA graph: ``quant_hook.apply`` gathers, then EXL3's fused MoE runs over slots."""
+        return quant_hook.apply(
+            layer,
+            streamer,
             x,
-            topk_weights.reshape(-1),
-            # Layer fusion takes the router's int32 remap and writes the int64 copy inside its one kernel.
-            remap.reshape(-1) if fused.layer_fusion else remap.reshape(-1).long(),
-            streamer.row_backend.keep,
+            topk_weights,
+            topk_ids,
             swiglu_limit,
-            cpu=(
-                (
-                    backend.device_side.cpu_lanes,
-                    streamer.row_plan.slots,
-                    backend.device_side.cpu_out_address(backend.row),
-                    backend.device_side.cpu_out_part_stride(),
-                )
-                if cpu_experts
-                else None
-            ),
+            cast=cast,
+            dead=dead,
         )
-        # cast=False hands the fp32 output to exl3_scale_to_bf16, which casts and scales in one kernel.
-        return out.to(x.dtype) if cast else out
 
     @staticmethod
     def _apply_streamed(
@@ -795,7 +729,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # Warmup and capture forwards route dummy tokens; they must not move residency.
             streamer.record_routes(routed)
         if route_plan:
-            # SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN: one readback before any gather of this layer, then none
+            # SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN: one readback before any gather of this layer, then none
             # between a chunk's gather and its compute, so the host queues the compute behind the gather.
             plan = Exl3RoutePlan.from_topk(topk_ids)
             source_ids = plan.source_ids
@@ -803,7 +737,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             source_ids = torch.unique(routed)
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         gathered = False
-        # A no-op unless SGLANG_DSV41_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
+        # A no-op unless SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
         with streamer.prefill_fills(source_ids):
             if route_plan:
                 for experts, row_of_source, rows in streamer.iter_gather_experts_host(

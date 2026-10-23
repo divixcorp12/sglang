@@ -8,7 +8,7 @@ import torch
 from safetensors import safe_open
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
 from sglang.srt.layers.moe.exl3_shard_row_source import (
@@ -167,12 +167,12 @@ def test_reader_mode_follows_the_file_reader_knob(tmp_path):
     layout = _checkpoint(tmp_path)
     fmt = Exl3ExpertFormat(layout, 0)
     specs = fmt.tensor_specs(None)
-    with envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"):
-        with pytest.raises(ValueError, match="SGLANG_MOE_EXPERT_FILE_READER=uring_direct"):
+    with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("mmap"):
+        with pytest.raises(ValueError, match="SGLANG_EXPERT_STREAM_FILE_READER=uring_direct"):
             fmt.default_row_source(None, specs, "shards")
-    with envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring_direct"):
+    with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring_direct"):
         assert fmt.default_row_source(None, specs, "shards").reader is shared_row_reader(layout, True)
-    with envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"):
+    with envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"):
         assert fmt.default_row_source(None, specs, "shards").reader is shared_row_reader(layout, False)
 
 
@@ -187,7 +187,18 @@ def test_shared_row_reader_is_keyed_by_source_root(tmp_path):
     assert shared_row_reader(layout, True) is plain
 
 
-def test_pinned_tier_options_protect_hot_cache_experts(tmp_path):
+@pytest.fixture
+def bound_engine(monkeypatch):
+    """The bound expert engine service that is_pinned consults once a hot cache exists (quant_hook.attach binds it
+    in a launch); a stand-in without GPU-resident hot experts, so the hot cache's slot map decides."""
+    from sglang.srt.layers.moe.expert_engine.service import ExpertEngineService
+
+    service = SimpleNamespace(gpu_hot_enabled=False, hot_experts=lambda layer_id: [])
+    monkeypatch.setattr(ExpertEngineService, "_instance", service)
+    return service
+
+
+def test_pinned_tier_options_protect_hot_cache_experts(tmp_path, bound_engine):
     layout = _checkpoint(tmp_path)
     fmt = Exl3ExpertFormat(layout, 1, direct=False)
     assert fmt.inclusive_pinned_tier is True
@@ -200,6 +211,10 @@ def test_pinned_tier_options_protect_hot_cache_experts(tmp_path):
     assert is_pinned(3) and not is_pinned(4)
     layer._nvfp4_expert_streamer.hot_cache.slot_to_expert[0] = 4  # residency moved
     assert is_pinned(4) and not is_pinned(3)
+    # With the GPU-resident hot set on, the engine's snapshot decides instead of the slot map.
+    bound_engine.gpu_hot_enabled = True
+    bound_engine.hot_experts = lambda layer_id: [1]
+    assert is_pinned(1) and not is_pinned(4)
 
 
 def test_streamer_reads_shards_through_a_cpu_pinned_tier(tmp_path):
@@ -210,7 +225,7 @@ def test_streamer_reads_shards_through_a_cpu_pinned_tier(tmp_path):
     layer = torch.nn.Module()
     layer.layer_id = 1
     fmt = Exl3ExpertFormat(layout, 1)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"):
+    with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"), envs.SGLANG_EXPERT_STREAM_FILE_READER.override("uring"):
         streamer = ExpertStreamer(layer, fmt.names, layer_id=1, format=fmt)
     assert isinstance(streamer.row_source, Exl3ShardRowSource)
     assert streamer.has_spec_only_tensors
@@ -226,7 +241,7 @@ def test_streamer_reads_shards_through_a_cpu_pinned_tier(tmp_path):
         assert _same(output, reference[name][ids]), name
 
 
-def test_an_inclusive_cpu_pinned_tier_keeps_hot_experts(tmp_path):
+def test_an_inclusive_cpu_pinned_tier_keeps_hot_experts(tmp_path, bound_engine):
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 
     layout = _checkpoint(tmp_path)
@@ -234,7 +249,7 @@ def test_an_inclusive_cpu_pinned_tier_keeps_hot_experts(tmp_path):
     layer = torch.nn.Module()
     layer.layer_id = 1
     fmt = Exl3ExpertFormat(layout, 1, direct=False)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+    with envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"):
         streamer = ExpertStreamer(layer, fmt.names, layer_id=1, format=fmt)
     layer._nvfp4_expert_streamer = streamer
     cache = ExpertPinnedHostCache(streamer, 3, device="cpu", **fmt.pinned_tier_options(layer))

@@ -123,6 +123,15 @@ def test_a_pause_waits_for_an_outstanding_copy(tmp_path):
         host.stop()
 
 
+RAM_TIER_FILES = (
+    "ram_tier.h",
+    "ram_tier_slots.h",
+    "ram_tier_fill_copy_cpu.inc.h",
+    "ram_tier_record_support.inc.h",
+    "ram_tier_spec_serve.inc.h",
+)
+
+
 def _code(path):
     """The source with its // comments cut, so prose that names a lock proves nothing either way."""
     return "\n".join(line.split("//", 1)[0] for line in path.read_text().splitlines())
@@ -149,12 +158,14 @@ def test_the_tier_declares_only_the_callers_mutex():
     The RAM prefetch (ram_prefetch.h) adds two, off the request path's own state: the pool's per-group mutex
     (SpecPool::mutex, taken as pool_->mutex(g)) over its entries' transitions, and SpecGroup::turn, the shared
     reader's turn between a demand read and a speculative one, which an idle-drive group
-    (SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes.
+    (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE, its own reader) never takes.
 
-    The promote flag (SGLANG_DSV41_RAM_PREFETCH_PROMOTE) adds NumaGroup::row_mutex[row], declared in numa_group.h: the
+    The promote flag (SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE) adds NumaGroup::row_mutex[row], declared in numa_group.h: the
     claimer locks it (owner.row_mutex[row]) beside the pool mutex(g), and an InstrBuild test hold takes
     dist_.group(g).row_mutex[row]. Order is fixed: row_mutex[row] of g, then pool mutex(g)."""
-    code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
+    # ram_tier.h's class body lives in the .inc.h fragments it includes (42f2ce8130, a pure move), and Tier in
+    # ram_tier_slots.h: the tier is all of them.
+    code = "\n".join(_code(MOE / "expert_stream" / "host" / name) for name in RAM_TIER_FILES)
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex", "turn"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
     assert "std::mutex mutex;" in _struct(code, "TraceState"), "the trace guard left TraceState"

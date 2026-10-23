@@ -93,6 +93,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -4325,6 +4326,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        self.expert_stream_config = stream_config()
         # None unless streamed EXL3 experts can be skipped; see Source.init_new.
         self.skip_checkpoint_weight = self._streamed_expert_skip_hook()
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
@@ -4777,15 +4779,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
         if (
-            envs.SGLANG_DSV41_RAM_PREFETCH.get()
-            or envs.SGLANG_DSV41_RESIDENCY_CAPTURE.get()
+            self.expert_stream_config.prefetch.ram.enabled
+            or self.expert_stream_config.trace.residency_capture
         ):
-            from sglang.srt.layers.moe.ram_prefetch import register_moe_gates
-
-            register_moe_gates(
-                {i: self.model.layers[i] for i in range(self.model.start_layer, self.model.end_layer)},
-                self.config.num_experts_per_tok,
+            from sglang.srt.layers.moe.expert_engine.profiles import (
+                profile_for_hf_config,
             )
+
+            profile_for_hf_config(self.config).register_gates(self)
         layers = self.model.layers
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
@@ -4955,13 +4956,14 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def _streamed_expert_skip_hook(self):
         """Streamed EXL3 routed experts stay on disk; their expert streamer reads them."""
-        from sglang.srt.models.deepseek_v4_exl3_weights import (
-            streamed_expert_skip_hook,
+        from sglang.srt.layers.moe.expert_engine.formats import (
+            format_for_quantization_config,
         )
+        from sglang.srt.layers.moe.expert_engine.profiles import profile_for_hf_config
 
-        return streamed_expert_skip_hook(
-            self.quant_config.get_name() if self.quant_config is not None else None,
-            envs.SGLANG_DSV41_EXPERT_STREAM.get(),
+        return profile_for_hf_config(self.config).streamed_weight_skip_hook(
+            streaming=self.expert_stream_config.enabled,
+            expert_format=format_for_quantization_config(self.quant_config),
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

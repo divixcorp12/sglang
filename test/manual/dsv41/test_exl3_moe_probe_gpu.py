@@ -114,7 +114,7 @@ def fused_moe_slots(ext, bufs: FusedBuffers, x16, weights, remap, tables, *, act
 
 
 def _load_slots(device):
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 

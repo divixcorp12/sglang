@@ -20,6 +20,15 @@ from pathlib import Path
 import mirror3_report as m
 
 
+def mirror_weights(env):
+    """The mirror weights a run's recorded server env set: the ``weights`` of SGLANG_EXPERT_STREAM_MIRROR, or the
+    SGLANG_MOE_EXPERT_MIRROR_WEIGHTS of a run from before the F145 rename."""
+    group = env.get("SGLANG_EXPERT_STREAM_MIRROR")
+    if group:
+        return json.loads(group).get("weights")
+    return env.get("SGLANG_MOE_EXPERT_MIRROR_WEIGHTS")
+
+
 def pairs(names):
     """{pair: (W arm, U arm)} for every number with both kinds; the order they ran in is kept by the caller."""
     by = {}
@@ -67,7 +76,7 @@ def arm(out_dir, name, run_dir, devices):
     env = json.loads((Path(run_dir) / "server-env-actual.json").read_text()) if (Path(run_dir) / "server-env-actual.json").exists() else {}
     return {
         "run_dir": run_dir,
-        "weights_env": env.get("SGLANG_MOE_EXPERT_MIRROR_WEIGHTS") if isinstance(env, dict) else None,
+        "weights_env": mirror_weights(env) if isinstance(env, dict) else None,
         "decode": m.decode(run_dir),
         "clocks": {"timed_window": m.clock_summary(Path(out_dir) / f"{name}-clocks.csv", *m.timed_window_utc(run_dir)),
                    "session_start_end_mhz": m.session_clocks(run_dir)},

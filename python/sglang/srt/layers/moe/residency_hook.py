@@ -1,4 +1,4 @@
-"""SGLANG_DSV41_RESIDENCY_CAPTURE's per-row hook on the RAM-miss row post.
+"""trace.residency_capture's per-row hook on the RAM-miss row post.
 
 Right after a row's post kernel typed its lanes, ``ResidencyHook.launch`` runs the snapshot and label kernels into
 the hook's staging buffers and copies them into the route log's residency rings. Record layout:

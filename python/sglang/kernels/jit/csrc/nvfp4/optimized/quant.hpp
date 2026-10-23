@@ -84,10 +84,9 @@ struct Nvfp4Quant
     static constexpr uint32_t kOptionalSlabs = 1u << kUpAlpha;  // absent: up shares the gate alpha
     static constexpr int kMaxRoutes = 8;      // the forward's k limit
     static constexpr int kMaxRows = 1 << 16;  // the forward's rows limit; arbitrary, it keeps every scratch index in range
-    // The library holds both tiers and runs min(host, NVFP4_CPU_MAX_ISA): AVX2 on an AVX2/FMA host, else scalar.
+    // The library holds both tiers and runs min(host, the configured cap: SGLANG_EXPERT_STREAM_CPU_MAX_ISA): AVX2 on
+    // an AVX2/FMA host, else scalar.
     static constexpr Isa kTopIsa = Isa::Avx2;
-    static constexpr const char* kIsaCapEnv = "NVFP4_CPU_MAX_ISA";
-    static constexpr const char* kIsaReportEnv = "NVFP4_CPU_REPORT_ISA";
     using Params = SglangNvfp4CpuParams;
 
     // One expert slot read as NVFP4: its three projections, over its ExpertRow.

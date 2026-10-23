@@ -41,11 +41,11 @@ def test_the_bitwise_gate_has_zero_tolerance():
 def test_each_arm_sets_its_own_graph_gather_env():
     # The eager and control Engines must launch with graph gather off: the gate refuses
     # graph gather without decode graphs.
-    assert graph_parity.run_env("eager", True) == {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "0"}
-    assert graph_parity.run_env("control", True) == {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "0"}
-    assert graph_parity.run_env("graph", True) == {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "1"}
-    assert graph_parity.run_env("graph", False) == {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "0"}
-    assert graph_parity.run_env("debug", False) == {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "1"}
+    assert graph_parity.run_env("eager", True) == {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "0"}
+    assert graph_parity.run_env("control", True) == {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "0"}
+    assert graph_parity.run_env("graph", True) == {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1"}
+    assert graph_parity.run_env("graph", False) == {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "0"}
+    assert graph_parity.run_env("debug", False) == {"SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1"}
     with pytest.raises(ValueError):
         graph_parity.run_env("full", True)
 
@@ -68,7 +68,7 @@ def test_decode_sets_the_env_for_the_engine_and_restores_it(monkeypatch):
 
     class _Engine:
         def __init__(self, **kwargs):
-            seen["env"] = os.environ.get("SGLANG_MOE_EXPERT_GRAPH_GATHER")
+            seen["env"] = os.environ.get("SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER")
             seen["kwargs"] = kwargs
 
         def generate(self, **kwargs):
@@ -78,10 +78,10 @@ def test_decode_sets_the_env_for_the_engine_and_restores_it(monkeypatch):
             seen["shutdown"] = True
 
     monkeypatch.setitem(sys.modules, "sglang", types.SimpleNamespace(Engine=_Engine))
-    monkeypatch.setenv("SGLANG_MOE_EXPERT_GRAPH_GATHER", "1")
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER", "1")
     run = graph_parity._decode("/m", [1, 2], 1, "eager", True, 0.8)
     assert seen["env"] == "0" and seen["shutdown"] and run == {"tokens": [7], "logprobs": [-0.5]}
-    assert os.environ["SGLANG_MOE_EXPERT_GRAPH_GATHER"] == "1"
+    assert os.environ["SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER"] == "1"
 
 
 def test_the_alt_stream_overlap_is_pinned_per_run():

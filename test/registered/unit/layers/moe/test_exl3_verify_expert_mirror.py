@@ -3,6 +3,7 @@
 Every fixture is a few KB under ``tmp_path``; nothing here touches a real drive.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -19,7 +20,7 @@ sys.path.insert(
 
 import verify_expert_mirror as vem  # noqa: E402
 
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat  # noqa: E402
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat  # noqa: E402
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout  # noqa: E402
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
@@ -579,7 +580,7 @@ def test_roots_default_to_the_environment_knob(tmp_path, capsys):
     from sglang.srt.environ import envs
 
     fx = _Fixture(tmp_path)
-    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(os.pathsep.join(fx.roots)):
+    with envs.SGLANG_EXPERT_STREAM_MIRROR.override(json.dumps({"dirs": os.pathsep.join(fx.roots)})):
         assert vem.main(["--source", str(fx.source), "--buffered"]) == 3
     out = capsys.readouterr().out
     assert all(root in out for root in fx.roots)
@@ -637,7 +638,7 @@ def test_the_verified_verdict_states_what_it_covers_and_what_it_does_not():
     assert "does NOT mean the files are identical" in verdict
     for excluded in ("mul1", "headers", "padding", "index", "outside the layout"):
         assert excluded in verdict
-    assert "SGLANG_DSV41_EXPERT_DIR is ever pointed at a mirror" in verdict
+    assert "SGLANG_EXPERT_STREAM_EXPERT_DIR is ever pointed at a mirror" in verdict
     assert "PASS\n" in text and "elapsed: 1.5 s" in text
 
 

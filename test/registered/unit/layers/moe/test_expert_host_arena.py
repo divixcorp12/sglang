@@ -68,7 +68,7 @@ class TestExpertHostArena(unittest.TestCase):
             with (
                 self.subTest(mode=mode),
                 tempfile.TemporaryDirectory() as directory,
-                patch.dict(os.environ, {"SGLANG_MOE_EXPERT_FILE_READER": mode}),
+                patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_FILE_READER": mode}),
             ):
                 group, model, layer = self._file_backed_model(directory)
                 streamer = layer._nvfp4_expert_streamer

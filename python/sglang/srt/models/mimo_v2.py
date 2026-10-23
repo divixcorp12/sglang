@@ -453,6 +453,13 @@ class MiMoV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        # Streamed MXFP4 experts take slot ids from the engine's gather, which needs explicit STANDARD top-k ids.
+        from sglang.srt.layers.moe.expert_engine.formats.mxfp4 import streams_experts
+
+        self.streams_experts = streams_experts(
+            quant_config, add_prefix("experts", prefix)
+        )
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             layer_id=self.layer_id,
@@ -468,7 +475,11 @@ class MiMoV2MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if quant_config is None or self.streams_experts
+                else None
+            ),
         )
 
         uses_mxfp4_runner = isinstance(
@@ -1272,6 +1283,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
+        # None unless streamed MXFP4 routed experts can be skipped; see Source.init_new.
+        self.skip_checkpoint_weight = self._streamed_expert_skip_hook()
 
         if not self.config.encoder_only:
             self.model = MiMoV2Model(
@@ -1513,6 +1526,28 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         # matching the draft's extract_context_feature (offset=1).
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def _streamed_expert_skip_hook(self):
+        """Streamed MXFP4 routed experts stay on disk; the expert engine reads them, so the loader skips them."""
+        from sglang.srt.layers.moe.expert_engine.formats.mxfp4 import (
+            Mxfp4ExpertFormat,
+            expert_stream_enabled,
+        )
+        from sglang.srt.layers.moe.expert_engine.profiles.mimo_v26 import (
+            MimoV26Profile,
+        )
+
+        quant_config = self.quant_config
+        self._experts_streamed = (
+            quant_config is not None
+            and getattr(quant_config, "is_fp4_experts", False)
+            and not getattr(quant_config, "is_dsv4_fp4_experts", False)
+            and expert_stream_enabled()
+        )
+        return MimoV26Profile().streamed_weight_skip_hook(
+            streaming=self._experts_streamed,
+            expert_format=Mxfp4ExpertFormat if self._experts_streamed else None,
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1708,6 +1743,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                skip_unmaterialized_expert_param = False
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -1717,6 +1753,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     # while Fp8MoEMethod registers them as *_weight_scale_inv.
                     if name.endswith("weight_scale") and (name + "_inv" in params_dict):
                         name = name + "_inv"
+                    if (
+                        getattr(self, "_experts_streamed", False)
+                        and name not in params_dict
+                    ):
+                        # Streamed experts have no parameters: the expert engine reads them from disk.
+                        skip_unmaterialized_expert_param = True
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1728,6 +1771,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     )
                     break
                 else:
+                    if skip_unmaterialized_expert_param:
+                        continue
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -1762,6 +1807,20 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 config=self.config,
                 model=self,
             )
+
+        if getattr(self, "_experts_streamed", False) and self.model is not None:
+            from sglang.srt.layers.moe.expert_engine.formats.mxfp4 import (
+                ram_prefetch_enabled,
+            )
+
+            if ram_prefetch_enabled():
+                # The RAM prefetch scores each next layer with its router gate (mlp.gate), so register them
+                # once the gates are loaded.
+                from sglang.srt.layers.moe.expert_engine.profiles.mimo_v26 import (
+                    MimoV26Profile,
+                )
+
+                MimoV26Profile().register_gates(self)
 
     def get_embed_and_head(self):
         assert self.model is not None and self.lm_head is not None, (

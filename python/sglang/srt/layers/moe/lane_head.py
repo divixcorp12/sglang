@@ -77,7 +77,7 @@ class LaneHeadMeta(msgspec.Struct, frozen=True):
     # "bf16" (26 MB at 40 layers, rank 64) or "fp32" (the training's own projection, bit for bit).
     pca_proj_dtype: str
     # The score feature's per-token decay (next_verify_head.DECAY), also the training captures' hot-cache insert decay;
-    # a launch with another SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is refused (check_serving_matches_training).
+    # a launch with another SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY is refused (check_serving_matches_training).
     score_decay: float
     # Features constant in training, with the value training saw; serving feeds exactly that value.
     constant_features: dict[str, float]
@@ -247,7 +247,7 @@ def check_serving_matches_training(
     if abs(float(insert_decay) - meta.score_decay) > 1e-12:
         raise ValueError(
             f"SGLANG_OPT_LANE_HEAD_PATH: the head was trained with insert decay {meta.score_decay}; "
-            f"SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY is {insert_decay}"
+            f"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY is {insert_decay}"
         )
 
 

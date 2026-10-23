@@ -271,10 +271,11 @@ def test_the_cpu_scorer_never_counts_late(tmp_path):
 
 def test_spec_submit_carries_the_gpus_rank_and_margin_and_the_wait_is_metered(tmp_path, monkeypatch):
     """gen = rank << 32 | the margin's fp32 bits, from the slot; spec_scored / spec_score_ns count the host's wait."""
+    # The host copies the trace options installed when it is built, so the prefix is set before the rig.
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_TRACE", json.dumps({"job": {"prefix": str(tmp_path / "jobs")}}))
     (tmp_path / "rig").mkdir()
     rig = prefetch_rig(tmp_path / "rig")
     try:
-        monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
         page = enable_gpu(rig)
         req = _record(rig)
         write_candidate_slot(page, req.seq, [(2, 3, 0.75)])

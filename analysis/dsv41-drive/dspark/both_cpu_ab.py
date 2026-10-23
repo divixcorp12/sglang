@@ -33,15 +33,67 @@ import run_locks  # noqa: E402
 PORT = 30017
 PROBE_PORT = 30018
 SESSIONS = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
+
+# Group envs: one JSON object each, keyed by a config field (python/sglang/srt/layers/moe/expert_engine/config.py).
+# An arm's overrides name one of its entries as member(GROUP, key) with a native value (bool, int or str), so arms still
+# layer key by key ({**other_arm, member(...): v}); collapse() turns the members into the group's JSON for the launch.
+CPU_SPLIT = "SGLANG_EXPERT_STREAM_CPU_SPLIT"
+TWO_STAGE = "SGLANG_EXPERT_STREAM_CPU_TWO_STAGE"
+MIRROR = "SGLANG_EXPERT_STREAM_MIRROR"
+TRACE = "SGLANG_EXPERT_STREAM_TRACE"
+GROUP_ENVS = (CPU_SPLIT, TWO_STAGE, MIRROR, TRACE)
+
+
+def member(group: str, key: str) -> str:
+    """The overrides key of one entry of the group env ``group``."""
+    return f"{group}.{key}"
+
+
+def flat(env: dict) -> dict:
+    """An arm_env recipe with each group env's JSON object spread into member keys, so layering it on an arm replaces
+    entries one by one, as the separate envs did."""
+    out = {}
+    for name, value in env.items():
+        if name in GROUP_ENVS and value:
+            out.update({member(name, key): entry for key, entry in json.loads(value).items()})
+        else:
+            out[name] = value
+    return out
+
+
+def collapse(overrides: dict) -> dict:
+    """``overrides`` with the member keys gathered into one JSON object per group env, on top of the group's value in
+    arm_env's base recipe (MIRROR names the roots there; an arm that sets only its weights must keep them)."""
+    out = {}
+    members: dict[str, dict] = {}
+    for name, value in overrides.items():
+        group, dot, key = name.partition(".")
+        if dot:
+            members.setdefault(group, {})[key] = value
+        else:
+            out[name] = value
+    for group, entries in members.items():
+        merged = json.loads(out.get(group) or arm_env.base_env().get(group) or "{}")
+        for key, value in entries.items():
+            *parents, leaf = key.split(".")  # "job.prefix" is the nested object's entry
+            slot = merged
+            for parent in parents:
+                slot = slot.setdefault(parent, {})
+            slot[leaf] = value
+        out[group] = json.dumps(merged)
+    return out
+
+
 DRAFT_ONLY = {
-    "SGLANG_DSV41_CPU_EXPERTS": "0",
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": "8",
-    "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "0",
+    "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": "0",
+    "SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES": "8",
+    "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES": "0",
 }
 # Every arm but the prefetch's states the RAM prefetch off, so a shell that exports it cannot carry it into an arm.
-PREFETCH_OFF = {"SGLANG_DSV41_RAM_PREFETCH": "0", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": ""}
+PREFETCH_OFF = {"SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "0", "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": ""}
 # Every arm but the miss cut's states the CPU split's miss cut off, likewise.
-MISS_CUT_OFF = {"SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
+MISS_CUT_OFF = {member(CPU_SPLIT, "miss_cut"): 0, member(CPU_SPLIT, "miss_cut_max"): 3}
+MISS_CUT_ON = {member(CPU_SPLIT, "miss_cut"): 1, member(CPU_SPLIT, "miss_cut_max"): 3}
 # The GPU scorer's margin floors fit by spec_margin.py's admission sweep (the file says on what), packaged as its default.
 MARGIN_FLOORS = os.path.join(REPO, "python", "sglang", "srt", "layers", "moe", "ram_prefetch_margin_floors.json")
 # arm: (overrides on base_env, DSpark argv)
@@ -63,12 +115,12 @@ ARMS = {
     "dspark-both-prefetch": (
         {
             **arm_env.dspark_env(),
-            "SGLANG_DSV41_RAM_PREFETCH": "1",
-            "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
-            "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
-            "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
-            "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
-            "SGLANG_DSV41_RAM_PREFETCH_SCORER": "cpu",
+            "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "1",
+            "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN": "1",
+            "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "1",
+            "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE": "2",
+            "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY": "0",
+            "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "cpu",
             "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
             **MISS_CUT_OFF,
         },
@@ -78,12 +130,12 @@ ARMS = {
 # Experiment: a miss-aware CPU split. A node with 1..3 forced CPU misses gives one of its split's lanes back to the
 # copy engine or GPU, since its misses queue behind the CPU-hit job (analysis/dsv41-drive/dspark/miss_timeline.py).
 ARMS["dspark-both-misscut"] = (
-    {**ARMS["dspark-both"][0], "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"},
+    {**ARMS["dspark-both"][0], **MISS_CUT_ON},
     True,
 )
 # The cut arm with a two-stage CPU miss: w13 read first, the CPU's gate/up GEMVs overlapping the w2 read.
 ARMS["dspark-both-misscut-twostage"] = (
-    {**ARMS["dspark-both-misscut"][0], "SGLANG_DSV41_CPU_TWO_STAGE": "1"},
+    {**ARMS["dspark-both-misscut"][0], member(TWO_STAGE, "enabled"): True},
     True,
 )
 # The two-stage arm with the SPCC (nvme4, the middle root) on w13 alone, so it reads one contiguous piece a row: w13 at
@@ -92,14 +144,14 @@ ARMS["dspark-both-misscut-twostage"] = (
 ARMS["dspark-both-misscut-twostage-spcc13"] = (
     {
         **ARMS["dspark-both-misscut-twostage"][0],
-        "SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS": "6:10:6",
-        "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS": "1:0:1",
+        member(TWO_STAGE, "w13_weights"): "6:10:6",
+        member(TWO_STAGE, "w2_weights"): "1:0:1",
     },
     True,
 )
 # The cut arm with each row's parts sized by drive speed (fio QD1: 3.35 / 2.19 / 3.38 GB/s, DSV41_REFERENCE.md 33.16).
 ARMS["dspark-both-weights-misscut"] = (
-    {**ARMS["dspark-both-misscut"][0], "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS": "16:10:16"},
+    {**ARMS["dspark-both-misscut"][0], member(MIRROR, "weights"): "16:10:16"},
     True,
 )
 # The cut arm with 4 tokens per CPU chunk (CHUNK_M 4, not 2): an expert shared by 3-4 verify tokens decodes its
@@ -110,16 +162,16 @@ ARMS["dspark-both-misscut-maxm8"] = (
 )
 # The same, picking only among each token's predicted top_k (DSV41_REFERENCE.md 33.14's unused reads).
 ARMS["dspark-both-prefetch-topk"] = (
-    {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
+    {**ARMS["dspark-both-prefetch"][0], "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY": "1"},
     True,
 )
 # The same arm scored on the GPU after each layer's post (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer-design).
 ARMS["dspark-both-prefetch-gpu"] = (
-    {**ARMS["dspark-both-prefetch"][0], "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu"},
+    {**ARMS["dspark-both-prefetch"][0], "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "gpu"},
     True,
 )
 ARMS["dspark-both-prefetch-gpu-topk"] = (
-    {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "1"},
+    {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY": "1"},
     True,
 )
 # The GPU arm reading only the candidates at or over their target row's margin floor.
@@ -129,12 +181,12 @@ ARMS["dspark-both-prefetch-gpu-floors"] = (
 )
 # The GPU-prefetch arm with the miss-aware split cut on: does the prefetch add to the cut.
 ARMS["dspark-both-prefetch-gpu-misscut"] = (
-    {**ARMS["dspark-both-prefetch-gpu"][0], "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"},
+    {**ARMS["dspark-both-prefetch-gpu"][0], **MISS_CUT_ON},
     True,
 )
 # The dynamic mirror root choice (design 2026-10-09-dsv41-drive-aware-reads, change (3)) is off in every arm but the
 # cap arm, pinned so a shell that exports it cannot carry it into one.
-MIRROR_STATIC = {"SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": "0", "SGLANG_MOE_EXPERT_MIRROR_CAPS": ""}
+MIRROR_STATIC = {member(MIRROR, "dynamic"): False, member(MIRROR, "caps"): ""}
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(MIRROR_STATIC)
 # The GPU arm with a per-drive in-flight cap: each sub-read picks its root late, skipping a root with that many
@@ -143,33 +195,33 @@ for _overrides_of_arm, _ in ARMS.values():
 ARMS["dspark-both-prefetch-gpu-cap"] = (
     {
         **ARMS["dspark-both-prefetch-gpu"][0],
-        "SGLANG_MOE_EXPERT_MIRROR_DYNAMIC": "1",
-        "SGLANG_MOE_EXPERT_MIRROR_CAPS": "4,2,4",
+        member(MIRROR, "dynamic"): True,
+        member(MIRROR, "caps"): "4,2,4",
     },
     True,
 )
 # Speculative reads only to an idle drive (design 2026-10-09-dsv41-drive-aware-reads, change (2)) are off in every arm
 # but the idle arm, deadline included, pinned so a shell that exports them cannot carry them into one.
 IDLE_DRIVE_OFF = {
-    "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "0",
-    "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
-    "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "0",
-    "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "1",
+    "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE": "0",
+    "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
+    "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD": "0",
+    "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES": "1",
 }
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(IDLE_DRIVE_OFF)
 # Promoting landed speculative rows into the tier map is off in every arm but the promote one, pinned so a shell that
 # exports it cannot carry it into one.
-PROMOTE = "SGLANG_DSV41_RAM_PREFETCH_PROMOTE"
+PROMOTE = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[PROMOTE] = "0"
 # Serving GPU misses from landed pool rows is off in every arm but the pool-serve one, likewise pinned.
-POOL_SERVE = "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE"
+POOL_SERVE = "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[POOL_SERVE] = "0"
 # The prefetch scores the gate of layer T+horizon on layer T's hidden state; every arm but the L+2 one states 1, so a
 # shell that exports it cannot carry it into one.
-HORIZON_DEFAULT = {"SGLANG_DSV41_RAM_PREFETCH_HORIZON": "1"}
+HORIZON_DEFAULT = {"SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON": "1"}
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm.update(HORIZON_DEFAULT)
 # The learned L+2 head file is unset in every arm but the T3 one, so a shell that exports it cannot carry it into one.
@@ -179,7 +231,7 @@ for _overrides_of_arm, _ in ARMS.values():
 # The GPU-prefetch miss-cut arm with each group's speculative reads on a reader of its own, one piece at a time from a
 # drive no demand reads (DSV41_REFERENCE.md 33.16 item 2: demand reads were 0.4-0.5 ms slower beside them).
 ARMS["dspark-both-prefetch-gpu-misscut-idle"] = (
-    {**ARMS["dspark-both-prefetch-gpu-misscut"][0], "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "1"},
+    {**ARMS["dspark-both-prefetch-gpu-misscut"][0], "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE": "1"},
     True,
 )
 # The idle arm with each row's pieces spread over the idle drives and two in flight (DSV41_REFERENCE.md 33.18: one
@@ -187,8 +239,8 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle"] = (
 ARMS["dspark-both-prefetch-gpu-misscut-idle2"] = (
     {
         **ARMS["dspark-both-prefetch-gpu-misscut-idle"][0],
-        "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "2",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES": "2",
     },
     True,
 )
@@ -202,7 +254,7 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-floors"] = (
 ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2"] = (
     {
         **ARMS["dspark-both-prefetch-gpu-misscut-idle2"][0],
-        "SGLANG_DSV41_RAM_PREFETCH_HORIZON": "2",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON": "2",
         "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
     },
     True,
@@ -217,14 +269,14 @@ ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3"] = (
 # The L+2 and T3 arms at two speculative rows per layer (DSV41_REFERENCE.md 33.33: cap 1 covers ~14 of ~88 misses per
 # verify); T3 keeps its cap-1 calib threshold, so its second read is any block at or above it.
 for _cap1 in ("dspark-both-prefetch-gpu-misscut-idle2-l2", "dspark-both-prefetch-gpu-misscut-idle2-l2-t3"):
-    ARMS[f"{_cap1}-cap2"] = ({**ARMS[_cap1][0], "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "2"}, True)
+    ARMS[f"{_cap1}-cap2"] = ({**ARMS[_cap1][0], "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "2"}, True)
 # T3 at three rows per layer, with three pool slots per row and group: with two, a layer's third read that lands in the
 # same group as its other two finds no claimable slot (a job never reclaims its own pick) and is dropped.
 ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap3"] = (
     {
         **ARMS["dspark-both-prefetch-gpu-misscut-idle2-l2-t3"][0],
-        "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "3",
-        "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "3",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "3",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE": "3",
     },
     True,
 )
@@ -242,10 +294,18 @@ ARMS[POOL_SERVE_ARM] = ({**ARMS[PROMOTE_OFF_ARM][0], POOL_SERVE: "1"}, True)
 # pool; its reference is the promote-on arm, so the A/B reads pool serve alone.
 PROMOTE_POOL_SERVE_ARM = "dspark-both-prefetch-gpu-misscut-idle2-l2-t3-cap2-promote-poolserve"
 ARMS[PROMOTE_POOL_SERVE_ARM] = ({**ARMS[PROMOTE_ON_ARM][0], POOL_SERVE: "1"}, True)
-# The pair's fixed-split option: the CPU split is the off capture's table (the driver's SGLANG_DSV41_CPU_EXPERTS_SPLIT)
-# with calibration off, so both arms split alike and the A/B does not read calibration drift.
-FIXED_SPLIT_VAR = "SGLANG_DSV41_CPU_EXPERTS_SPLIT"
-FIXED_SPLIT_CALIBRATION_OFF = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "0"}
+# The pair's fixed-split option: the CPU split is the off capture's table (the driver's environment: the `table` key of
+# SGLANG_EXPERT_STREAM_CPU_SPLIT, FIXED_SPLIT_ENV) with calibration off, so both arms split alike and the A/B does not
+# read calibration drift.
+FIXED_SPLIT_ENV = CPU_SPLIT
+FIXED_SPLIT_VAR = member(CPU_SPLIT, "table")
+FIXED_SPLIT_CALIBRATION_OFF = {member(CPU_SPLIT, "calibration"): False}
+
+
+def fixed_split_table() -> str:
+    """The off capture's split table the driver was given, '' when it has none."""
+    raw = os.environ.get(FIXED_SPLIT_ENV)
+    return str(json.loads(raw).get("table", "")) if raw else ""
 FIXED_SPLIT_SUFFIX = "-fixedsplit"
 for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_SERVE_ARM):
     ARMS[_pair_arm + FIXED_SPLIT_SUFFIX] = ({**ARMS[_pair_arm][0], **FIXED_SPLIT_CALIBRATION_OFF}, True)
@@ -256,8 +316,9 @@ for _pair_arm in (PROMOTE_OFF_ARM, PROMOTE_ON_ARM, POOL_SERVE_ARM, PROMOTE_POOL_
 ARMS[PROMOTE_POOL_SERVE_ARM + "-cores13" + FIXED_SPLIT_SUFFIX] = (
     {
         **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
-        "SGLANG_DSV41_CPU_EXPERTS_THREADS": "13",
-        "SGLANG_EXPERT_NUMA_CORES": "0:cpu=6-15;1:ram=51,cpu=28-40",
+        "SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS": "13",
+        # NUMA_CORES is one value, so node 0's entry also carries the recipe's RAM core (base_env's).
+        "SGLANG_EXPERT_STREAM_NUMA_CORES": f"{arm_env.node_of_cpu(arm_env.SPIN_CORE)}:ram={arm_env.SPIN_CORE},cpu=6-15;1:ram=51,cpu=28-40",
     },
     True,
 )
@@ -273,7 +334,7 @@ TOP_PROB_GATE_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-confgate"
 ARMS[TOP_PROB_GATE_ARM] = ({**ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0], TOP_PROB_GATE: "0.4"}, True)
 # The GPU drip (host/gpu_drip.h) is off in every arm but the drip one, pinned so a shell that exports it cannot carry it
 # into one.
-GPU_DRIP = "SGLANG_DSV41_GPU_DRIP_SLOTS"
+GPU_DRIP = "SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[GPU_DRIP] = "0"
 # The promote and pool-serve fixed-split arm with the T3 scorer's best RAM-resident, not VRAM-hot experts of layer +2
@@ -285,8 +346,8 @@ ARMS[GPU_DRIP_ARM] = (
     {
         **ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0],
         GPU_DRIP: "24",
-        "SGLANG_DSV41_GPU_DRIP_PICKS": "4",
-        "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "256",
+        "SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS": "4",
+        "SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB": "256",
     },
     True,
 )
@@ -294,28 +355,31 @@ ARMS[GPU_DRIP_ARM] = (
 # (about 5 us of link a pull or post can wait behind); same reference.
 GPU_DRIP_LEAN_ARM = GPU_DRIP_ARM + "-c64p2"
 ARMS[GPU_DRIP_LEAN_ARM] = (
-    {**ARMS[GPU_DRIP_ARM][0], "SGLANG_DSV41_GPU_DRIP_PICKS": "2", "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": "64"},
+    {**ARMS[GPU_DRIP_ARM][0], "SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS": "2", "SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB": "64"},
     True,
 )
 # Whole layers held in the pinned tier and per-layer CPU split tables are off in every arm but the pin ones, pinned so
 # a shell that exports them cannot carry them into one.
-FULL_LAYERS = "SGLANG_MOE_PINNED_HOST_FULL_LAYERS"
-SPLIT_LAYERS = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
+FULL_LAYERS = "SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS"
+SPLIT_LAYERS = member(CPU_SPLIT, "layer_tables")
 # The model-based split (and its cost overrides) likewise: off in every arm but -splitmodel.
-SPLIT_MODEL = "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL"
-SPLIT_MODEL_COSTS = "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS"
+SPLIT_MODEL = member(CPU_SPLIT, "model")
+SPLIT_MODEL_COSTS = member(CPU_SPLIT, "model_costs")
 # The scheduler's mlockall, off in every arm but the -mem ones.
 MLOCK = "SGLANG_ENABLE_SCHEDULER_MLOCK"
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[FULL_LAYERS] = ""
     _overrides_of_arm[SPLIT_LAYERS] = ""
-    _overrides_of_arm[SPLIT_MODEL] = "0"
+    _overrides_of_arm[SPLIT_MODEL] = False
     _overrides_of_arm[SPLIT_MODEL_COSTS] = ""
     _overrides_of_arm[MLOCK] = "0"
 # Layers 0 and 1 read 6.6 and 4.5 experts a verify from NVMe, which the L+2 prefetch cannot reach
 # (ram-prefetch/breakdown-20261015). Each full layer takes 204 rows a node (192 homed experts, 8 staging, 2 pool, 2
 # seam), 5182 MiB a node for the pair; the other 7:6 remainder buys the 7966 rows layers 2-39 hold today (210/209).
-PIN01_BUDGET = {"SGLANG_MOE_PINNED_HOST_MB": "111530", "SGLANG_MOE_PINNED_HOST_NUMA_MB": "0:59656,1:51874"}
+PIN01_BUDGET = {
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "111530",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:59656,1:51874",
+}
 PIN01_ARM = PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX + "-pin01"
 ARMS[PIN01_ARM] = ({**ARMS[PROMOTE_POOL_SERVE_ARM + FIXED_SPLIT_SUFFIX][0], FULL_LAYERS: "0,1", **PIN01_BUDGET}, True)
 # k*(n) with each group's forced CPU lanes counted (8.4 at layer 0, 4.9 at layer 1, the spilled lanes above), at 0.55
@@ -328,7 +392,7 @@ ARMS[PIN01_GPU01_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_LAYERS: f"0:{PIN01_SPLIT_L
 # pin01 with the model-based split in place of split A and the miss cut (misscut-replay, split_replay.py: the
 # token-weighted greedy, +17 ms a verify on breakdown-20261015/base at untraced CPU costs), at its default costs.
 PIN01_SPLIT_MODEL_ARM = PIN01_ARM + "-splitmodel"
-ARMS[PIN01_SPLIT_MODEL_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_MODEL: "1"}, True)
+ARMS[PIN01_SPLIT_MODEL_ARM] = ({**ARMS[PIN01_ARM][0], SPLIT_MODEL: True}, True)
 # Node-0 headroom (cores-ab-20261014/splitmodel-stream swapped node 0 in load and decode): -mem adds the scheduler's
 # mlockall and drops each safetensors shard's page cache after loading it (server_flags), and nothing else.
 MEM_SUFFIX = "-mem"
@@ -339,12 +403,12 @@ for _base in (PIN01_ARM, PIN01_SPLIT_MODEL_ARM):
 # native Engram row cache off (5 GiB). The node is an EnvInt with no valid "unset" value, so only these arms name it.
 HICACHE_NODE = "SGLANG_HICACHE_HOST_NUMA_NODE"
 ENGRAM_NATIVE_GIB = "SGLANG_DSV41_ENGRAM_NATIVE_CACHE_GIB"
-HOT_DECAY = "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY"
-RESIDENCY_TIEBREAK = "SGLANG_DSV41_CPU_SPLIT_MODEL_RESIDENCY_TIEBREAK"
+HOT_DECAY = "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY"
+RESIDENCY_TIEBREAK = member(CPU_SPLIT, "model_residency_tiebreak")
 for _overrides_of_arm, _ in ARMS.values():
     _overrides_of_arm[ENGRAM_NATIVE_GIB] = "5"
     _overrides_of_arm[HOT_DECAY] = "0.98"
-    _overrides_of_arm[RESIDENCY_TIEBREAK] = "0"
+    _overrides_of_arm[RESIDENCY_TIEBREAK] = False
 PIN01_SPLIT_MODEL_HICACHE1_ARM = PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX + "-hicache1"
 ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_ARM + MEM_SUFFIX][0], HICACHE_NODE: "1"}, True)
 PIN01_SPLIT_MODEL_ENGRAM0_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-engram0"
@@ -356,20 +420,20 @@ ARMS[PIN01_SPLIT_MODEL_DECAY_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0],
 # The split model's residency tiebreak (equal-token lanes of a node: the CPU takes the lowest residency keys): the
 # breakdown-base replay gives the same saving with 56% fewer inverted pairs; compared with -hicache1.
 PIN01_SPLIT_MODEL_TIEBREAK_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-tiebreak"
-ARMS[PIN01_SPLIT_MODEL_TIEBREAK_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], RESIDENCY_TIEBREAK: "1"}, True)
+ARMS[PIN01_SPLIT_MODEL_TIEBREAK_ARM] = ({**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], RESIDENCY_TIEBREAK: True}, True)
 # Since split-model-calib the model's costs are calibrated at startup, so every arm above with the model on now runs
 # calibrated. -fixedcosts names every cost, the 2026-10-15 offline fits (ram_slot_map.SPLIT_MODEL_FIXTURE_MS), so it
 # skips the calibration and types as -hicache1 did before it; -refine is the calibrated model with the live refinement
 # of its CPU costs, compared with -fixedcosts.
-SPLIT_MODEL_REFINE = "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES"
+SPLIT_MODEL_REFINE = member(CPU_SPLIT, "model_refine_batches")
 SPLIT_MODEL_FIXED_COSTS = (
     "hit_a.0=0.016,hit_a.1=-0.050,hit_b.0=0.154,hit_b.1=0.179,hit_c.0=0.395,hit_c.1=0.390,"
     "miss_a.0=0.331,miss_a.1=0.291,miss_c.0=0.193,miss_c.1=0.245,"
     "copy_lane=1.05,first_byte=0.8,per_expert=1.6,stream_lane=0.65,stream_base=0"
 )
-REFINE_BATCHES = "50"
+REFINE_BATCHES = 50
 for _overrides_of_arm, _ in ARMS.values():
-    _overrides_of_arm[SPLIT_MODEL_REFINE] = "0"
+    _overrides_of_arm[SPLIT_MODEL_REFINE] = 0
 PIN01_SPLIT_MODEL_FIXED_COSTS_ARM = PIN01_SPLIT_MODEL_HICACHE1_ARM + "-fixedcosts"
 ARMS[PIN01_SPLIT_MODEL_FIXED_COSTS_ARM] = (
     {**ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0], SPLIT_MODEL_COSTS: SPLIT_MODEL_FIXED_COSTS}, True
@@ -439,7 +503,7 @@ def hot_mb_for_margin(
     probe_pre_load_gib: float = PROBE_PRE_LOAD_GIB,
     held_back_slots: int = 0,
 ) -> int:
-    """The largest SGLANG_MOE_HOT_GPU_MB whose slots leave margin_mib free at a measured prefill peak (a probe run's
+    """The largest SGLANG_EXPERT_STREAM_HOT_GPU_MB whose slots leave margin_mib free at a measured prefill peak (a probe run's
     slots, memory.free and free-before-load), at the lowest free-before-load seen, with the pool pinned: the probe's
     slots plus the whole slots the spare buys, less held_back_slots."""
     worst_free = probe_free_mib * 2**20 - (probe_pre_load_gib - MIN_PRE_LOAD_GIB) * 2**30
@@ -458,7 +522,7 @@ ARMS[MERGE_CHUNK_ARM] = (
     {
         **ARMS[PIN01_SPLIT_MODEL_HICACHE1_ARM][0],
         MERGE_BUDGET: str(MERGE_CHUNK_MB),
-        "SGLANG_MOE_HOT_GPU_MB": str(MERGE_HOT_GPU_MB),
+        "SGLANG_EXPERT_STREAM_HOT_GPU_MB": str(MERGE_HOT_GPU_MB),
     },
     True,
 )
@@ -480,7 +544,7 @@ ARMS[MERGE_CHUNK_EXPSEG_ARM] = (
     {
         **ARMS[MERGE_CHUNK_ARM][0],
         ALLOC_CONF: "expandable_segments:True",
-        "SGLANG_MOE_HOT_GPU_MB": str(EXPSEG_HOT_GPU_MB),
+        "SGLANG_EXPERT_STREAM_HOT_GPU_MB": str(EXPSEG_HOT_GPU_MB),
     },
     True,
 )
@@ -584,7 +648,7 @@ for _overrides_of_arm, _ in ARMS.values():
 # the prefetch head's checksummed copy) and production's server flags. It takes no fixed split, as production
 # calibrates its table at startup (_takes_fixed_split). The two cut arms build on it and are compared with it.
 PROD_ARM = MERGE_CHUNK_EXPSEG_ARM + "-prod"
-ARMS[PROD_ARM] = ({**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], **arm_env.prod_dspark_env(), FIXED_SPLIT_VAR: ""}, True)
+ARMS[PROD_ARM] = ({**ARMS[MERGE_CHUNK_EXPSEG_ARM][0], **flat(arm_env.prod_dspark_env()), FIXED_SPLIT_VAR: ""}, True)
 # Step 1 of the cut's calibration, STS collection: the flag on with SGLANG_DSPARK_STS_COLLECT_PATH set and no STS file
 # is collect mode. The head is built under static, the cut does not apply, and every verify covers all gamma + 1 rows
 # with identity temperatures, so each verify's raw head logits and accepted prefix are valid; StsDataRecorder saves
@@ -636,7 +700,7 @@ RESIDENCY_ROWS = 360
 LAYER_MAJOR_SMALL_HOT_MB = int(arm_env.PROD_DSPARK_HOT_GPU_MB) - -(-RESIDENCY_ROWS * HOT_SLOT_BYTES // 2**20)
 LAYER_MAJOR_SMALL_HOT_ARM = LAYER_MAJOR_ARM + "-smallhot"
 ARMS[LAYER_MAJOR_SMALL_HOT_ARM] = (
-    {**ARMS[LAYER_MAJOR_ARM][0], "SGLANG_MOE_HOT_GPU_MB": str(LAYER_MAJOR_SMALL_HOT_MB), CALIBRATE: "0", RESIDENCY: "0"},
+    {**ARMS[LAYER_MAJOR_ARM][0], "SGLANG_EXPERT_STREAM_HOT_GPU_MB": str(LAYER_MAJOR_SMALL_HOT_MB), CALIBRATE: "0", RESIDENCY: "0"},
     True,
 )
 LAYER_MAJOR_RESIDENCY_ARM = LAYER_MAJOR_ARM + "-res"
@@ -742,9 +806,9 @@ RAM_KEYS = (
 # Every arm but the two-stage ones states it off and its span weights unset, so a shell that exports them cannot carry
 # them into an arm.
 TWO_STAGE_OFF = {
-    "SGLANG_DSV41_CPU_TWO_STAGE": "0",
-    "SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS": "",
-    "SGLANG_DSV41_CPU_TWO_STAGE_W2_WEIGHTS": "",
+    member(TWO_STAGE, "enabled"): False,
+    member(TWO_STAGE, "w13_weights"): "",
+    member(TWO_STAGE, "w2_weights"): "",
 }
 
 
@@ -756,20 +820,21 @@ def _takes_fixed_split(arm: str) -> bool:
 def _overrides(arm: str, out: str) -> dict:
     overrides, _ = ARMS[arm]
     passed = {k: os.environ[k] for k in PASSTHROUGH if os.environ.get(k)}
-    if _takes_fixed_split(arm) and os.environ.get(FIXED_SPLIT_VAR):
-        passed[FIXED_SPLIT_VAR] = os.environ[FIXED_SPLIT_VAR]
+    if _takes_fixed_split(arm) and fixed_split_table():
+        passed[FIXED_SPLIT_VAR] = fixed_split_table()
     if arm in STS_COLLECT_ARMS:
         passed[STS_COLLECT] = sts_collect_stem(os.path.join(out, arm))
-    return {
-        **TWO_STAGE_OFF, **overrides, **passed, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")
-    }
+    return collapse(
+        {**TWO_STAGE_OFF, **overrides, **passed, member(TRACE, "hot_metrics_file"): os.path.join(out, f"{arm}.metrics.jsonl")}
+    )
 
 
 def _probe_overrides(arm: str, out: str) -> dict:
     """The arm's overrides for the probe server, with a metrics file and STS shards of its own: the timed server's
     metrics file is appended to and summarize() reads its last record, which a second server would replace, and a
     second recorder would overwrite the timed server's shards from shard 0."""
-    probe = {**_overrides(arm, out), "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.probe.metrics.jsonl")}
+    probe = _overrides(arm, out)
+    probe[TRACE] = json.dumps({**json.loads(probe[TRACE]), "hot_metrics_file": os.path.join(out, f"{arm}.probe.metrics.jsonl")})
     if arm in STS_COLLECT_ARMS:
         probe[STS_COLLECT] = sts_collect_stem(os.path.join(out, f"{arm}.probe"))
     return probe
@@ -1011,8 +1076,8 @@ def main():
     sessions = ",".join(str(int(i)) for i in a.sessions.split(","))
     out = os.path.abspath(a.out)
     arms = a.arms or list(ARMS)
-    if not os.environ.get(FIXED_SPLIT_VAR) and any(_takes_fixed_split(arm) for arm in arms):
-        sys.exit(f"a {FIXED_SPLIT_SUFFIX} arm needs {FIXED_SPLIT_VAR} set to the off capture's split table")
+    if not fixed_split_table() and any(_takes_fixed_split(arm) for arm in arms):
+        sys.exit(f"a {FIXED_SPLIT_SUFFIX} arm needs {FIXED_SPLIT_ENV} set to {{\"table\": \"<the off capture's split table>\"}}")
     if a.baseline:
         references = {REFERENCE[arm] for arm in arms if arm in REFERENCE}
         if len(references) != 1 or references & set(arms):

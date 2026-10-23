@@ -42,7 +42,7 @@ def test_calibrate_fits_every_cost_on_a_small_fixture(tmp_path):
         group=0, layers={ROW: None}, tokens=TOKENS, _group_slots=lambda r: 12, slabs_by_row={ROW: pinned},
         trait=SimpleNamespace(slab_names=list(pinned)),
     )
-    module = ops._device_module("exl3", 8, 1)
+    module = ops._device_module(ops.EXL3_BUILD, 8, 1)
     device_side = SimpleNamespace(calibration_pull=module.expert_stream_calibration_pull)
     costs, clamped, seconds = calib.calibrate(
         host, [service], device_side, device=torch.cuda.current_device(), reps=5, staging_width=4

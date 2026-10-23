@@ -19,7 +19,7 @@ H, STAGES, ROW, CAPACITY = 64, 3, 1, 1 << 20
 
 
 def _m():
-    return ops._host_module("exl3", "instr")
+    return ops._host_module(ops.EXL3_BUILD, "instr")
 
 
 def _cores():
@@ -109,7 +109,7 @@ from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 kind, when = sys.argv[1], sys.argv[2]   # kind: draft | target; when: run (left stuck) | stop (stop() during it)
-m = ops._host_module("exl3", "instr")
+m = ops._host_module(ops.EXL3_BUILD, "instr")
 slow = when == "slow"
 kernel = int(m.expert_stream_test_kernel_address(200_000_000 if slow else 0, 0, 0))
 areas = DraftCpuAreas(3, 64, pin=False)

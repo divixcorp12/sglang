@@ -56,10 +56,8 @@ struct Exl3Quant
     static constexpr uint32_t kOptionalSlabs = 0;
     static constexpr int kMaxRoutes = 64;     // the forward's k limit: a job's lanes, up to the wire's 64 (dispatch sizes everything from k)
     static constexpr int kMaxRows = 65536;    // the forward's rows limit
-    // The library holds every tier and runs min(host, EXL3_MOE_CPU_MAX_ISA).
+    // The library holds every tier and runs min(host, the configured cap: SGLANG_EXPERT_STREAM_CPU_MAX_ISA).
     static constexpr Isa kTopIsa = Isa::Vbmi;
-    static constexpr const char* kIsaCapEnv = "EXL3_MOE_CPU_MAX_ISA";
-    static constexpr const char* kIsaReportEnv = "EXL3_MOE_CPU_REPORT_ISA";
     // dispatch calls ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh, so it waits there.
     static constexpr bool kStagedForward = true;
     using Params = SglangExl3CpuParams;

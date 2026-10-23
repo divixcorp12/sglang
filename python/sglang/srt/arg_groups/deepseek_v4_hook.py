@@ -271,14 +271,18 @@ def validate_layer_major_expert_residency() -> None:
         )
     # The lend is on by default and does nothing without residency rows, so it is checked only with them.
     if envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_ROWS.get() > 0 and envs.SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND.get():
+        from sglang.srt.layers.moe.expert_engine.config import PullMode, stream_config
+
+        stream = stream_config()
         # Both could write or read a late layer's slots while the pass has them lent.
-        if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+        if stream.prefetch.shadow.pull_mode is not PullMode.OFF:
             raise ValueError(
-                "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND cannot be combined with SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE"
+                "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND cannot be combined with a shadow prefetch pull "
+                "(SGLANG_EXPERT_STREAM_SHADOW_PREFETCH's pull_mode)"
             )
-        if envs.SGLANG_DSV41_GPU_DRIP_SLOTS.get() > 0:
+        if stream.copy.gpu_drip.slots > 0:
             raise ValueError(
-                "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND cannot be combined with SGLANG_DSV41_GPU_DRIP_SLOTS"
+                "SGLANG_LAYER_MAJOR_EXPERT_RESIDENCY_LEND cannot be combined with SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS"
             )
 
 

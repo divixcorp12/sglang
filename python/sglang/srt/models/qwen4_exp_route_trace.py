@@ -1,8 +1,8 @@
 """Debug-only MoE routing trace for Qwen4-Exp decode forwards.
 
-Setting ``SGLANG_MOE_ROUTE_TRACE_DIR`` makes :func:`maybe_install_moe_route_trace`
+Setting ``trace.route.dir`` (``SGLANG_EXPERT_STREAM_TRACE``) makes :func:`maybe_install_moe_route_trace`
 attach module hooks (and wrap two hyper-connection ``mix`` calls) on the language
-model. When the variable is unset it returns before touching the model, so the
+model. When the directory is unset it returns before touching the model, so the
 serving path carries no hook, wrapper or extra branch. Tracing reads GPU tensors
 on the host every decode step and is only valid for eager decode; startup
 validation lives in ``arg_groups/memory_hook.py``.
@@ -36,7 +36,7 @@ are the tokens sampled by the previous decode forward of the same request.
 
 Speculative mode
 ----------------
-With ``SGLANG_MOE_ROUTE_TRACE_SPECULATIVE`` (NEXTN, eager target and draft) the
+With ``trace.route.speculative`` (NEXTN, eager target and draft) the
 target trace records every token of each target verify forward instead, keeping
 only ``topk_ids`` (int32), ``topk_weights``, ``final_hidden`` and the token
 fields ``input_ids``, ``positions``, ``req_pool_indices``, ``forward_index``,
@@ -50,7 +50,7 @@ forwards, plus ``input_ids``, ``positions``, ``req_pool_indices``,
 manifest's ``forward_modes``), ``sequence``, ``accept_len`` (int32) and
 ``selected`` (int8). See :func:`_mtp_rows` for which rows are kept and how
 ``accept_len`` / ``selected`` are derived. The MTP trace closes when the target
-trace ends, or after ``4 * SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS`` rows. Both
+trace ends, or after ``4 * trace.route.max_tokens`` rows. Both
 speculative manifests name the cause in ``closed_by``: ``cap``, ``atexit`` or
 ``abandoned`` for either writer, plus ``target_complete`` and
 ``target_abandoned`` for the MTP writer; null after an explicit ``close()``.
@@ -837,23 +837,22 @@ def _output_hook(writer: MoeRouteTraceWriter, field: str, layer_id: int):
 
 
 def maybe_install_moe_route_trace(language_model: nn.Module) -> Optional[MoeRouteTrace]:
-    """Install the route trace when ``SGLANG_MOE_ROUTE_TRACE_DIR`` is set."""
-    from sglang.srt.environ import envs
+    """Install the route trace when ``trace.route.dir`` is set."""
+    from sglang.srt.layers.moe.expert_engine.config import stream_config
 
-    directory = envs.SGLANG_MOE_ROUTE_TRACE_DIR.get()
+    route = stream_config().trace.route
+    directory = route.dir
     if not directory:
         return None
-    if envs.SGLANG_MOE_ROUTE_TRACE_SPECULATIVE.get():
+    if route.speculative:
         return install_moe_route_trace(
             language_model,
             directory,
-            envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get(),
+            route.max_tokens,
             speculative=True,
             speculative_settings=_published_speculative_settings(),
         )
-    return install_moe_route_trace(
-        language_model, directory, envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get()
-    )
+    return install_moe_route_trace(language_model, directory, route.max_tokens)
 
 
 def _settings_metadata(
@@ -1001,14 +1000,14 @@ def install_mtp_hidden_trace(
 
 def maybe_install_mtp_hidden_trace(mtp_model: nn.Module) -> Optional[MoeRouteTrace]:
     """Install the MTP trace when the route trace runs in speculative mode."""
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.expert_engine.config import stream_config
 
-    directory = envs.SGLANG_MOE_ROUTE_TRACE_DIR.get()
-    if not directory or not envs.SGLANG_MOE_ROUTE_TRACE_SPECULATIVE.get():
+    route = stream_config().trace.route
+    if not route.dir or not route.speculative:
         return None
     return install_mtp_hidden_trace(
         mtp_model,
-        directory,
-        envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get(),
+        route.dir,
+        route.max_tokens,
         speculative_settings=_published_speculative_settings(),
     )

@@ -17,8 +17,8 @@ import test_exl3_ram_miss_split as split
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_pieces, read_rows_sqes, read_rows_traced
 from sglang.srt.layers.moe import exl3_row_image as ri
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables, open_service_row_images
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.expert_engine.formats.exl3_tables import exl3_ram_miss_tables, open_service_row_images
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -238,9 +238,9 @@ def test_the_reader_refuses_buffered_reads_of_row_images(tmp_path):
     """Row images are read with O_DIRECT only: a buffered read would copy through the page cache (spec section 3)."""
     s = ram_miss_setup(tmp_path)
     fault = ops._fault_tensor()
-    record = torch.zeros(ops._stage_words("exl3"), dtype=torch.int64)
+    record = torch.zeros(ops._stage_words(ops.EXL3_BUILD), dtype=torch.int64)
     with pytest.raises(Exception, match="O_DIRECT"):
-        ops._host_module("exl3").expert_stream_read_rows_traced(
+        ops._host_module(ops.EXL3_BUILD).expert_stream_read_rows_traced(
             *ops._table_args(s.tables, False), 0, torch.tensor([1]), torch.tensor([0]), 8, fault, record, -1)
 
 
@@ -355,7 +355,7 @@ def test_the_service_opens_images_only_with_mirrors_and_o_direct(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3)
     mirrors = dict(roots=s.roots, policy=StaticSplitPolicy((1.0,)), source_root=str(tmp_path))
     segments, layers = s.fmt.segment_map(), {0: None, 1: None}
-    with pytest.raises(RuntimeError, match="SGLANG_MOE_EXPERT_MIRROR_DIRS"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_MIRROR"):
         open_service_row_images(s.layout, segments, {}, True, layers)
     with pytest.raises(RuntimeError, match="uring_direct"):
         open_service_row_images(s.layout, segments, mirrors, False, layers)

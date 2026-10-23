@@ -88,6 +88,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.expert_engine.config import stream_config
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -712,12 +713,13 @@ class ModelRunner:
         self.sampler = create_sampler()
         self.load_model()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
+        self.expert_stream_config = stream_config()
         self.maybe_init_expert_host_arena()
         self.maybe_init_expert_pinned_host_cache()
         self.maybe_init_expert_hot_cache()
         if self.expert_hot_cache_manager is not None:
             self.expert_hot_cache_manager.enable_next_layer_prefetch(
-                envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
+                self.expert_stream_config.prefetch.legacy_max_candidates
             )
         self.maybe_init_expert_prediction()
 
@@ -743,12 +745,13 @@ class ModelRunner:
     def maybe_init_expert_hot_cache(self):
         """Allocate expert residency before remaining startup and pool sizing."""
         self.expert_hot_cache_manager = None
-        budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
+        config = self.expert_stream_config
+        budget_mb = config.hot_cache.gpu_mb
         graph_gather_batch_size = 0
-        if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+        if config.copy.graph_gather:
             if budget_mb == 0:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
+                    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER requires SGLANG_EXPERT_STREAM_HOT_GPU_MB"
                 )
             from sglang.srt.layers.moe.expert_format import (
                 graph_gather_needs_host_arena,
@@ -762,32 +765,32 @@ class ModelRunner:
                 self, "expert_host_arena", None
             ) is None and graph_gather_needs_host_arena(self.model):
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
+                    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER requires SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA=1"
                 )
-            if envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get() > 0:
+            if config.prefetch.legacy_max_candidates > 0:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_GRAPH_GATHER cannot run with expert prefetch"
+                    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER cannot run with expert prefetch"
                 )
             graph_gather_batch_size = (
                 get_exec().graph.cuda_graph_config.decode.max_bs or 0
             )
             if graph_gather_batch_size < 1:
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires decode CUDA graphs"
+                    "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER requires decode CUDA graphs"
                 )
             if self.spec_algorithm.is_speculative():
                 verify_tokens = self.decode_num_tokens_per_req(
                     num_draft_tokens=max_speculative_num_draft_tokens()
                 )
                 graph_gather_batch_size *= verify_tokens
-                scratch_cap = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get()
+                scratch_cap = config.copy.graph_gather_scratch_rows
                 request_routes = verify_tokens * max(
                     getattr(streamer.layer, "top_k", 0) or 0
                     for streamer in iter_expert_streamers(self.model)
                 )
                 if 0 < scratch_cap < request_routes:
                     raise ValueError(
-                        "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS="
+                        "SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS="
                         f"{scratch_cap} is below one verify request's "
                         f"{request_routes} routes, so no verify would use the graph "
                         "gather; capped scratch (option B) needs the overflow "
@@ -795,39 +798,42 @@ class ModelRunner:
                     )
         if budget_mb == 0:
             return
-        if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():
+        residency = config.residency
+        if residency.gpu_update:
             if get_parallel().attn_dp_enabled:
                 raise ValueError(
-                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with DP attention: "
+                    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE cannot run with DP attention: "
                     "idle batches replay the decode graph and would count twice"
                 )
             if (get_exec().graph.cuda_graph_config.decode.max_bs or 0) > 1:
                 raise ValueError(
-                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE needs a decode CUDA graph batch "
+                    "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE needs a decode CUDA graph batch "
                     "size of 1: padded batches would add graph rows as tokens"
                 )
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+        from sglang.srt.layers.moe.expert_transfer import legacy_copy_backend
 
         manager = ExpertHotCacheManager.from_model(
             self.model,
             budget_bytes=budget_mb * 1024 * 1024,
-            seed_path=envs.SGLANG_MOE_HOT_SEED.get() or None,
-            dynamic=envs.SGLANG_MOE_HOT_DYNAMIC.get(),
-            update_prefill_tokens=envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get(),
-            update_decode_forwards=envs.SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS.get(),
-            decay_tokens=envs.SGLANG_MOE_HOT_DECAY_TOKENS.get(),
-            promotion_sigmas=envs.SGLANG_MOE_HOT_PROMOTION_SIGMAS.get(),
-            min_residence_forwards=envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get(),
-            benefit_ratio=envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get(),
-            log_interval=envs.SGLANG_MOE_HOT_LOG_INTERVAL.get(),
-            metrics_path=envs.SGLANG_MOE_HOT_METRICS_FILE.get() or None,
-            copy_backend=envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get(),
+            seed_path=config.hot_cache.seed_path or None,
+            dynamic=residency.dynamic,
+            update_prefill_tokens=residency.update_prefill_tokens,
+            update_decode_forwards=residency.update_decode_forwards,
+            decay_tokens=residency.decay_tokens,
+            promotion_sigmas=residency.promotion_sigmas,
+            min_residence_forwards=residency.min_residence_forwards,
+            benefit_ratio=residency.benefit_ratio,
+            log_interval=config.hot_cache.log_interval,
+            metrics_path=config.trace.hot_metrics_file or None,
+            # The legacy streamer's backend: its copy engine under dma, the SM copy otherwise.
+            copy_backend=legacy_copy_backend(config),
             graph_gather_batch_size=graph_gather_batch_size,
-            graph_gather_max_rows=envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get(),
-            async_promotions=envs.SGLANG_MOE_HOT_ASYNC_PROMOTIONS.get(),
-            async_residency_scores=envs.SGLANG_MOE_ASYNC_RESIDENCY_SCORES.get(),
-            gpu_residency_update=envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get(),
-            gpu_residency_max_promotions=envs.SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS.get(),
+            graph_gather_max_rows=config.copy.graph_gather_scratch_rows,
+            async_promotions=residency.async_promotions,
+            async_residency_scores=residency.async_scores,
+            gpu_residency_update=residency.gpu_update,
+            gpu_residency_max_promotions=residency.gpu_max_promotions,
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:
@@ -842,10 +848,11 @@ class ModelRunner:
     def maybe_init_expert_prediction(self):
         """Attach MoE expert prediction shadow scoring and capture before CUDA graph capture."""
         self.expert_prediction_runtime = None
+        config = self.expert_stream_config
         if self.is_draft_worker or not (
-            envs.SGLANG_MOE_EXPERT_PREDICTOR.get()
-            or envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.get()
-            or envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
+            config.prefetch.shadow.predictors
+            or config.trace.predictor_capture.dir
+            or config.prefetch.shadow.predictor
         ):
             return
         from sglang.srt.layers.moe.expert_prediction.runtime import (
@@ -876,12 +883,12 @@ class ModelRunner:
     def maybe_init_expert_host_arena(self):
         """Move host expert rows into registered memory before the expert caches."""
         self.expert_host_arena = None
-        if not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
+        if not self.expert_stream_config.tiers.host_arena:
             return
-        if envs.SGLANG_MOE_PINNED_HOST_MB.get():
+        if self.expert_stream_config.tiers.pinned_host_mb:
             raise ValueError(
-                "SGLANG_MOE_EXPERT_HOST_ARENA replaces the pinned expert cache; "
-                "set SGLANG_MOE_PINNED_HOST_MB=0"
+                "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA replaces the pinned expert cache; "
+                "set SGLANG_EXPERT_STREAM_PINNED_HOST_MB=0"
             )
         from sglang.srt.layers.moe.expert_host_arena import ExpertHostArena
 
@@ -890,7 +897,7 @@ class ModelRunner:
     def maybe_init_expert_pinned_host_cache(self):
         """Allocate the bounded on-demand pinned-host expert row cache."""
         self.expert_pinned_host_cache_manager = None
-        budget_mb = envs.SGLANG_MOE_PINNED_HOST_MB.get()
+        budget_mb = self.expert_stream_config.tiers.pinned_host_mb
         if budget_mb == 0:
             return
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCacheManager

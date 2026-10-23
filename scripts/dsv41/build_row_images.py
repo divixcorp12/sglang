@@ -44,7 +44,7 @@ from verify_expert_mirror import parse_layers
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_row_image as ri
-from sglang.srt.layers.moe.exl3_expert_format import _row_schema, parse_mirror_roots
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import _row_schema, parse_mirror_roots
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
     build_exl3_expert_layout,
@@ -532,11 +532,11 @@ def verify(src: Source, roots: Sequence[str], layers: Sequence[int], threads: in
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--model-dir", default=None, help="the source checkpoint (default: SGLANG_DSV41_EXPERT_DIR)")
+    parser.add_argument("--model-dir", default=None, help="the source checkpoint (default: SGLANG_EXPERT_STREAM_EXPERT_DIR)")
     parser.add_argument(
         "--roots",
         default=None,
-        help=f"{os.pathsep!r}-separated mirror roots (default: SGLANG_MOE_EXPERT_MIRROR_DIRS)",
+        help=f"{os.pathsep!r}-separated mirror roots (default: the dirs of SGLANG_EXPERT_STREAM_MIRROR)",
     )
     parser.add_argument("--layers", default="all", help="'all' (default), or layers such as 0,3,10-12")
     parser.add_argument("--verify", action="store_true", help="re-check an existing image set; write nothing")
@@ -548,12 +548,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     log = lambda line: print(line, flush=True)  # noqa: E731
     try:
-        model_dir = args.model_dir or envs.SGLANG_DSV41_EXPERT_DIR.get()
+        model_dir = args.model_dir or envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.get()
         if not model_dir:
-            raise ValueError("no source given: pass --model-dir or set SGLANG_DSV41_EXPERT_DIR")
-        roots_spec = args.roots or envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get()
+            raise ValueError("no source given: pass --model-dir or set SGLANG_EXPERT_STREAM_EXPERT_DIR")
+        roots_spec = args.roots or json.loads(envs.SGLANG_EXPERT_STREAM_MIRROR.get() or "{}").get("dirs", "")
         if not roots_spec:
-            raise ValueError("no roots given: pass --roots or set SGLANG_MOE_EXPERT_MIRROR_DIRS")
+            raise ValueError("no roots given: pass --roots or set the dirs of SGLANG_EXPERT_STREAM_MIRROR")
         roots = parse_mirror_roots(roots_spec)
         if args.threads < 1:
             raise ValueError("--threads must be at least 1")

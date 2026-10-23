@@ -137,17 +137,18 @@ struct RamPrefetchConfig {
   // GPU scorer only: per target row, the least margin a candidate needs to be read; a candidate under it neither reads
   // nor counts toward per_layer. Empty: no floors.
   std::vector<float> min_margin;
-  // SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE: > 0 gives each group a speculative reader of its own whose reads go only to
+  // SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE: > 0 gives each group a speculative reader of its own whose reads go only to
   // a drive no demand reads (IdleRoots), abandoned after waiting this long for one; 0 shares the group's demand reader,
   // taking turns with the demand reads.
   int64_t idle_deadline_ns = 0;
-  // With idle-drive reads: SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD and _IDLE_PIECES (IdleRoots::spread, max_inflight).
+  // With idle-drive reads: SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD and
+  // SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES (IdleRoots::spread, max_inflight).
   bool idle_spread = false;
   int idle_pieces = 1;
   static constexpr int kMaxIdlePieces = 4;
-  // SGLANG_DSV41_RAM_PREFETCH_PROMOTE: landed pool rows are mapped into the target layer's map delta before its record.
+  // SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE: landed pool rows are mapped into the target layer's map delta before its record.
   bool promote = false;
-  // SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE: a GPU miss whose row landed in its group's pool is streamed by S straight
+  // SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE: a GPU miss whose row landed in its group's pool is streamed by S straight
   // from the pool slot (the lane's PieceSource word) instead of read from NVMe.
   bool pool_serve = false;
 };

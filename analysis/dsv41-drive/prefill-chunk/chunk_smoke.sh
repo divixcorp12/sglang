@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prefill chunk-size smoke on divix01: one cold server on today's recipe (arm_env as is) with its
-# --chunked-prefill-size and SGLANG_MOE_HOT_GPU_MB replaced, one short greedy warm-up request, then one
+# --chunked-prefill-size and SGLANG_EXPERT_STREAM_HOT_GPU_MB replaced, one short greedy warm-up request, then one
 # long-prompt request (hot-cache-size/long_prompt.py), with a 50 ms nvidia-smi memory.used sampler from
 # before launch to after shutdown. Derived from indexer-cap/smoke.sh.
 #
@@ -54,15 +54,15 @@ ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exi
 rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
-e = arm_env.arm_env({'SGLANG_MOE_HOT_GPU_MB': '$HOT_MB', **dict(kv.split('=', 1) for kv in '${SMOKE_ENV:-}'.split())})
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+e = arm_env.arm_env({'SGLANG_EXPERT_STREAM_HOT_GPU_MB': '$HOT_MB', **dict(kv.split('=', 1) for kv in '${SMOKE_ENV:-}'.split())})
+e['SGLANG_EXPERT_STREAM_TRACE'] = '{\"expert_path\": \"$OUT/stages.jsonl\"}'
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')
 ")
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
-grep -q "^SGLANG_MOE_HOT_GPU_MB=$HOT_MB\$" $OUT/env.txt || { say "hot size missing from env; refusing"; exit 1; }
+grep -q "^SGLANG_EXPERT_STREAM_HOT_GPU_MB=$HOT_MB\$" $OUT/env.txt || { say "hot size missing from env; refusing"; exit 1; }
 mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 argv = arm_env.ServerArgs(port=$PORT).argv()

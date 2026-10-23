@@ -2,7 +2,7 @@
 
 The service's own threads run the kernel. For each captured post, the post kernel types
 the last ``split[n]`` of its ``n`` eligible lanes as CPU lanes: RAM hits, and NVMe
-misses when ``SGLANG_DSV41_CPU_EXPERTS_MISSES`` is set. The device plan sorts the
+misses when ``cpu_experts.misses`` is set. The device plan sorts the
 lanes, so those are the lowest-scored. The service thread hands them to the CPU expert
 thread (``expert_stream/host/cpu_experts.h``): hits at once into part 0 of the row's
 output, each miss into part 1 as soon as its read lands. The copy wait releases the
@@ -16,55 +16,36 @@ arithmetic is in ``cpu_experts/policy.py``.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import Mapping, Optional, Sequence
 
 import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import cpu_row_bytes
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
 from sglang.srt.layers.moe.cpu_experts.policy import (
     capped_split,
     format_calibration,
     split_table,
 )
+from sglang.srt.layers.moe.expert_engine.config import (
+    CpuExpertsConfig,
+    CpuSplitConfig,
+    stream_config,
+)
+from sglang.srt.layers.moe.expert_engine.formats import get_format
 
 logger = logging.getLogger(__name__)
 
 
-def _short_sha256(path: Optional[str]) -> str:
-    """First 12 hex digits of the file's sha256, so a log line names the exact shared object that served an arm."""
-    if not path:
-        return "?"
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:12]
-    except OSError:
-        return "?"
-
-
 def cpu_trait_for(format_key: str, ext=None, *, source: str):
-    """The quant trait of a streamed expert format for ``source``'s layers ("draft" or "target"); only EXL3 has a
-    CPU kernel today. Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice."""
-    if format_key == "exl3":
-        from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
-        from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    """The quant trait of a registered expert format for ``source``'s layers ("draft" or "target").
 
-        if ext is None:
-            ext = exl3_ext()
-        row_weighted = source in row_weighted_sources()
-        path = getattr(ext, "__file__", None)
-        logger.info(
-            "CPU experts: the %s's EXL3 layers use %s tile assignment (extension %s, sha256 %s)",
-            source,
-            "row-weighted" if row_weighted else "even",
-            path,
-            _short_sha256(path),
-        )
-        return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
-    raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
+    ValueError when the format has no CPU kernel (``cpu_trait`` returns None).
+    """
+    trait = get_format(format_key).cpu_trait(source=source, ext=ext)
+    if trait is None:
+        raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
+    return trait
 
 
 def _parsed_split(spec: str, lanes: int, name: str) -> list[int]:
@@ -78,14 +59,17 @@ def _parsed_split(spec: str, lanes: int, name: str) -> list[int]:
     return split
 
 
-def configured_layer_splits(lanes: int) -> dict[int, list[int]]:
-    """``SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS`` as {layer id: split table} for a ``lanes``-lane build.
+def configured_layer_splits(lanes: int, *, config: Optional[CpuSplitConfig] = None) -> dict[int, list[int]]:
+    """``cpu_experts.split.layer_tables`` as {layer id: split table} for a ``lanes``-lane build.
 
-    Raises ``ValueError`` for an entry without ``LAYERS:TABLE``, a bad table, or a layer named twice.
+    ``config`` is the split config; None resolves the process's. Raises ``ValueError`` for an entry without
+    ``LAYERS:TABLE``, a bad table, or a layer named twice.
     """
-    name = "SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS"
+    if config is None:
+        config = stream_config().cpu_experts.split
+    name = "SGLANG_EXPERT_STREAM_CPU_SPLIT's layer_tables"
     splits: dict[int, list[int]] = {}
-    for entry in (e.strip() for e in envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS.get().split(";")):
+    for entry in (e.strip() for e in config.layer_tables.split(";")):
         if not entry:
             continue
         layers, sep, table = entry.partition(":")
@@ -99,21 +83,17 @@ def configured_layer_splits(lanes: int) -> dict[int, list[int]]:
     return splits
 
 
-def configured_split(lanes: int) -> list[int]:
-    """The split table for a ``lanes``-lane build: ``SGLANG_DSV41_CPU_EXPERTS_SPLIT`` when set, else ``k_star(n)``.
+def configured_split(lanes: int, *, config: Optional[CpuSplitConfig] = None) -> list[int]:
+    """The split table for a ``lanes``-lane build: ``cpu_experts.split.table`` when set, else ``k_star(n)``.
 
-    The fallback uses the configured per-expert CPU, link and handoff costs. Raises
-    ``ValueError`` for a malformed explicit split.
+    The fallback uses the configured per-expert CPU, link and handoff costs. ``config`` is the split config; None
+    resolves the process's. Raises ``ValueError`` for a malformed explicit split.
     """
-    spec = envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get()
-    if spec:
-        return _parsed_split(spec, lanes, "SGLANG_DSV41_CPU_EXPERTS_SPLIT")
-    return split_table(
-        lanes,
-        envs.SGLANG_DSV41_CPU_EXPERTS_CPU_MS.get(),
-        envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(),
-        envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get(),
-    ).tolist()
+    if config is None:
+        config = stream_config().cpu_experts.split
+    if config.table:
+        return _parsed_split(config.table, lanes, "SGLANG_EXPERT_STREAM_CPU_SPLIT's table")
+    return split_table(lanes, config.cpu_ms, config.link_ms, config.handoff_ms).tolist()
 
 
 class CpuExpertService:
@@ -140,7 +120,7 @@ class CpuExpertService:
 
     A verify's rows (``tokens`` > 1) hold each token's input and output, and the post's token table after the inputs.
     Under spill, calibration stops at ``calibration_lanes`` (the victim lanes), the most eligible lanes a split entry is
-    ever read for.
+    ever read for. ``config`` is the engine's ``cpu_experts`` config; None resolves the process's.
     """
 
     def __init__(
@@ -158,12 +138,14 @@ class CpuExpertService:
         shared: Optional["CpuExpertService"] = None,
         tokens: int = 1,
         calibration_lanes: Optional[int] = None,
+        config: Optional[CpuExpertsConfig] = None,
     ):
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_engine_cores
 
         cores = sorted(set(cores))
         check_engine_cores(cores, threads)
         trait.check_environment()
+        self.config = stream_config().cpu_experts if config is None else config
         self.host, self.trait = host, trait
         self.group = group
         # The split table covers n = 0..lanes resident lanes, as the host's wire does.
@@ -195,12 +177,12 @@ class CpuExpertService:
                     self.out_rows.pin_memory(),
                 )
             self.layers: dict[int, object] = {}
-        keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
-        self.two_stage = envs.SGLANG_DSV41_CPU_TWO_STAGE.get()
-        self.store_out = envs.SGLANG_DSV41_CPU_EXPERTS_STORE_OUT.get()
+        keep_warm_us = self.config.keep_warm_us
+        self.two_stage = self.config.two_stage.enabled
+        self.store_out = self.config.store_out
         self.span_weights = (None, None)
         if self.two_stage:
-            from sglang.srt.layers.moe.exl3_expert_format import two_stage_span_weights
+            from sglang.srt.layers.moe.expert_engine.formats.exl3 import two_stage_span_weights
 
             self.span_weights = two_stage_span_weights()
         host.enable_cpu_experts(
@@ -228,19 +210,20 @@ class CpuExpertService:
         logger.info(
             "CPU experts group %d split miss cut: %d lanes for 1..%d forced misses on a node (0: off)",
             self.group,
-            envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get(),
-            envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get(),
+            self.config.split.miss_cut,
+            self.config.split.miss_cut_max,
         )
         span = lambda w: "mirror" if w is None else ":".join(f"{v:g}" for v in w)  # noqa: E731
         logger.info(
-            "CPU experts group %d two-stage misses (SGLANG_DSV41_CPU_TWO_STAGE): %s",
+            "CPU experts group %d two-stage misses (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): %s",
             self.group,
             f"on, w13 weights {span(self.span_weights[0])}, w2 weights {span(self.span_weights[1])}"
             if self.two_stage
             else "off",
         )
         logger.info(
-            "CPU experts group %d kernel stores its output rows (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT): %s",
+            "CPU experts group %d kernel stores its output rows "
+            "(SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT): %s",
             self.group,
             "on" if self.store_out else "off",
         )
@@ -341,12 +324,7 @@ class CpuExpertService:
             return None
         self._last_stats = stats
         c_cpu = ns / lanes / 1e6
-        split = split_table(
-            self.lanes,
-            c_cpu,
-            envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(),
-            envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get(),
-        ).tolist()
+        split = split_table(self.lanes, c_cpu, self.config.split.link_ms, self.config.split.handoff_ms).tolist()
         if split == self.split:
             return None
         self.split = split
@@ -364,14 +342,11 @@ class CpuExpertService:
 
         The caller owns the tier (the RAM thread paused) and has not armed the copy
         engine. Returns the new split, or ``None`` when calibration is off, the split
-        is fixed by ``SGLANG_DSV41_CPU_EXPERTS_SPLIT``, or it could not run (a warning
+        is fixed by ``cpu_experts.split.table``, or it could not run (a warning
         says why and the split stays as it was). The native measurement is
         ``expert_stream/host/split_calibration.h``.
         """
-        if (
-            envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get()
-            or not envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.get()
-        ):
+        if self.config.split.table or not self.config.split.calibration:
             return None
         width = self.calibration_lanes
         row = calibration_row({r: self._group_slots(r) for r in self.layers}, width)
@@ -383,7 +358,7 @@ class CpuExpertService:
                 self.split,
             )
             return None
-        reps = envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.get()
+        reps = self.config.split.calibration_reps
         before = self.host.cpu_stats(self.group)
         scratch = None
         try:
@@ -456,8 +431,9 @@ class CpuExpertGroups:
 
     def __init__(
         self, host, trait, slabs_by_row, *, hidden: int, plans, split: Sequence[int], pin: bool = True,
-        tokens: int = 1, calibration_lanes: Optional[int] = None,
+        tokens: int = 1, calibration_lanes: Optional[int] = None, config: Optional[CpuExpertsConfig] = None,
     ):
+        config = stream_config().cpu_experts if config is None else config
         self.services: list[CpuExpertService] = []
         for plan in plans:
             self.services.append(
@@ -474,6 +450,7 @@ class CpuExpertGroups:
                     shared=self.services[0] if self.services else None,
                     tokens=tokens,
                     calibration_lanes=calibration_lanes,
+                    config=config,
                 )
             )
         self.x_rows, self.out_rows = self.services[0].x_rows, self.services[0].out_rows

@@ -42,7 +42,7 @@ if [ "$MODE" = ab ] || [ "$MODE" = all ]; then
 fi
 if [ "$MODE" = traced ] || [ "$MODE" = all ]; then
     at $TIP split-landed-tip
-    OVERRIDES=SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:45056 arm split-landed-B-node EXPECT_SHA=$TIP \
+    OVERRIDES=SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:57344,1:45056 arm split-landed-B-node EXPECT_SHA=$TIP \
         NSYS_TMPDIR=/mnt/nvme1/nsys-tmp NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node NSYS_GPU_METRICS=0
 fi
 say "DRIVER DONE"

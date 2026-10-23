@@ -56,7 +56,7 @@ def _scheduler_stub(manager):
 
 def test_the_scheduler_hook_runs_the_managers_checks():
     """The real, unbound Scheduler method on a stub. EXL3's RAM-miss service registers
-    its per-batch fail-stop here (exl3_ram_miss.py), and this hook is its only caller."""
+    its per-batch fail-stop here (expert_engine/service.py), and this hook is its only caller."""
     from sglang.srt.managers.scheduler import Scheduler
 
     manager = _manager()

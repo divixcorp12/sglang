@@ -24,7 +24,7 @@ LOOSE_BOUND = 2.5e-2  # graph vs loop (Task 9)
 
 def _source_rows(tmp_path, layer_id=0, num_experts=EXPERTS):
     """Every expert's streamed rows of one layer, read afresh from the checkpoint."""
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 
@@ -68,26 +68,26 @@ def _rel(y, ref):
 
 def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import exl3_ram_miss as service_module
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine import service as service_module
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, dsv41_exl3_pairing, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=num_layers, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
-    service_module.Exl3RamMissService._instance = None
+    service_module.ExpertEngineService._instance = None
     # The staging slots the service reserves at start: the graph's misses, and the rest of the tier is mappable.
-    service_module.Exl3RamMissService.get().plan_gather_width(TOP_K)
+    service_module.ExpertEngineService.bind(**dsv41_exl3_pairing()).plan_gather_width(TOP_K)
     with (
         # The service reads row images with O_DIRECT, in lease mode (always on), as in production.
         service_row_images(tmp_path),
-        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-        envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
+        envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+        envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
         # Read when attach builds the device side, so attach runs inside this block.
-        envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
+        envs.SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
     ):
         pairs, hots = [], []
         # Every pinned tier registers before the service starts, and a tier built after it is refused.
@@ -95,7 +95,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
             layer = torch.nn.Module()
             layer.layer_id = layer_id
             layer.top_k = TOP_K
-            # No ``direct``: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
+            # No ``direct``: SGLANG_EXPERT_STREAM_FILE_READER=uring_direct decides it, as in production.
             fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
@@ -118,7 +118,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
         )()
         for _, streamer in pairs:
             streamer.format.attach_hot_cache_manager(manager, streamer)
-    service = service_module.Exl3RamMissService.get()
+    service = service_module.ExpertEngineService.get()
     assert service.device_side.lease_block is not None
     if num_layers == 1:
         return (*pairs[0], service, checks)  # the shape every single-layer test unpacks
@@ -136,29 +136,30 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     """Runs only on divix01: actual EXL3 bytes, the native slot-map chain, and captured
     MoE output across a DIRECT insertion and an eager pinned-tier eviction."""
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import exl3_ram_miss as service_module
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine import service as service_module
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine.row_backend import ExpertEngineRowBackend
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import paused, service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import dsv41_exl3_pairing, paused, service_row_images
 
     experts = 36
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=experts, hidden=HIDDEN, inter=INTER, finite=True)
     source = _source_rows(tmp_path, num_experts=experts)
     layout = build_exl3_expert_layout(str(tmp_path))
-    service_module.Exl3RamMissService._instance = None
-    service = service_module.Exl3RamMissService.get()
+    service_module.ExpertEngineService._instance = None
+    service = service_module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     service.plan_gather_width(TOP_K)
     try:
         with (
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
-            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
+            envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused),
         ):
             model = torch.nn.Module()
             layer = torch.nn.Module()
@@ -181,7 +182,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             assert streamer._fused_plan_enabled is fused
             assert (streamer._graph_fused_slots_scratch is not None) is fused
             assert (streamer._graph_fused_remaps is not None) is fused
-            assert isinstance(streamer.row_backend, service_module.Exl3RamMissRowBackend)
+            assert isinstance(streamer.row_backend, ExpertEngineRowBackend)
             assert service.gpu_hot_enabled
             assert manager.caches[0].scratch_rows == 0
             assert manager.caches[0].capacity == 2 * TOP_K
@@ -469,7 +470,7 @@ def test_residency_capture_adds_exactly_its_nodes_to_the_graph_and_fills_its_rin
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
     layer, streamer, service, _ = _layers(tmp_path)
-    snapshot_kernel, label_kernel = "exl3_residency_snapshot_kernel", "exl3_route_labels_kernel"
+    snapshot_kernel, label_kernel = "expert_stream_residency_snapshot_kernel", "expert_stream_route_labels_kernel"
     try:
         backend = streamer.row_backend
         assert backend.residency_hook is None and backend.route_log is None

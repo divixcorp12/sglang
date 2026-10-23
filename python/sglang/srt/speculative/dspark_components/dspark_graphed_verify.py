@@ -39,7 +39,9 @@ def draft_runs_exl3(draft_model) -> bool:
 def draft_graph_allowed(draft_model) -> bool:
     """An EXL3 draft captures its decode graphs (its MoE is graph-safe: draft_moe.py and the draft channel) unless
     SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH keeps it eager for an A/B."""
-    return not (draft_runs_exl3(draft_model) and envs.SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH.get())
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
+
+    return not (draft_runs_exl3(draft_model) and not resolved_config().dsv41.dspark_draft_graph)
 
 
 def target_gather_is_narrow(model_runner) -> bool:

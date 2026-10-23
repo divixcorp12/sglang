@@ -2,7 +2,7 @@
 on together (CPU; the deferred both-flags check, MERGE_PLAN_1016.md).
 
 The two meet in the hot-cache budget: the head's device bytes (~57.5 MB at 40 layers) come out of
-SGLANG_MOE_HOT_GPU_MB before the cache is sized, and the head is allocated in from_model, at model load, so the
+SGLANG_EXPERT_STREAM_HOT_GPU_MB before the cache is sized, and the head is allocated in from_model, at model load, so the
 calibration's later free-memory measurement sees it. Calibration then resizes through set_hot_capacity, whose census
 must not miss a holder of the capacity: the head keys experts, not slots, so it holds none, and it resets its
 per-request state after capture, so the calibration's dummy forwards and trial capture leave nothing behind.

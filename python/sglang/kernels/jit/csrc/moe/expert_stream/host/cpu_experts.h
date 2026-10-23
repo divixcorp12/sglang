@@ -132,11 +132,12 @@ struct CpuExpertConfig {
   int64_t keep_warm_ns = 0;  // how long after each job the idle team runs register work instead of PAUSE
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
-  bool two_stage = false;    // SGLANG_DSV41_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job (CpuJob::staged)
-  // SGLANG_DSV41_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (ForwardCall::store_first), not a zeroing of
+  bool two_stage = false;    // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job
+                             // (CpuJob::staged)
+  // SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (ForwardCall::store_first), not a zeroing of
   // the job's token rows on this thread followed by an accumulating forward.
   bool store_out = false;
-  // SGLANG_DSV41_CPU_TWO_STAGE_W13_WEIGHTS / _W2_WEIGHTS: a weight per mirror root for each span of a two-span row
+  // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights: a weight per mirror root for each span of a two-span row
   // (empty: the mirror's shares). The tier hands them to its readers (RamTier::enable_cpu_experts).
   std::vector<double> span_weights[2];
 };
@@ -529,7 +530,7 @@ class BasicCpuExpertEngine {
     // A kernel built before ForwardCall::stage_two would run Down on rows still landing: refuse its output.
     if (job.staged && !stage_called_)
       fail_stop(prefix_ + "kernel " + config_.kernel->name() + " never waited for row " + std::to_string(job.row) +
-                "'s second stage (rebuild it with SGLANG_DSV41_CPU_TWO_STAGE's ForwardCall)");
+                "'s second stage (rebuild it with SGLANG_EXPERT_STREAM_CPU_TWO_STAGE's ForwardCall)");
     const int64_t end = now_ns();
     add(compute_ns_, end - start);
     add(jobs_done_, 1);

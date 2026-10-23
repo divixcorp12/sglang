@@ -1,11 +1,11 @@
-"""Per-job cost of SGLANG_DSV41_CPU_EXPERTS_STORE_OUT: the split calibration's CPU cells, real EXL3 kernel.
+"""Per-job cost of SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: the split calibration's CPU cells, real EXL3 kernel.
 
 The calibration times per-token jobs of a verify's 6 tokens through the CPU expert engine's run_job (each lane routed
 by about 1.25 tokens, the served jobs' shape), so cpu[k] is the job the flag changes: with it off the engine zeroes 6
 token rows of 5120 fp32 and the forward accumulates; with it on the kernel stores. Arms alternate in one process, a
 fresh host per round. Prints the mean ms of cpu[1..lanes] per arm and round, and the per-k difference.
 
-Needs SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1, the bw tier and a quiet box. Run on divix01, e.g.
+Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1, the bw tier and a quiet box. Run on divix01, e.g.
   numactl --cpunodebind=0 --membind=0 python test/manual/dsv41/bench_cpu_store_out.py --cores 6-15 --rounds 6
 """
 

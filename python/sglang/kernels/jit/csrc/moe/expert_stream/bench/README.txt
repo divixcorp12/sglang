@@ -75,7 +75,7 @@ CPU placement:
   for isolated timings. 52-55,108-111 are kept free for NVMe interrupts.
   --smt (bare and full-stack benches) appends each selected worker CPU's SMT
   sibling after them, so --workers=10 --smt runs 20 workers on 10 physical
-  cores: the bench form of SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT.
+  cores: the bench form of SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT.
 
 Memory placement:
   No process-wide NUMA memory policy is imposed. The process inherits its launch
@@ -112,17 +112,19 @@ equal-team comparison append --workers=16. The existing isolation must include
 all active CPUs. The script writes binary hashes, affinity/cgroup context, logs
 and Google JSON results to a new directory and refuses to reuse an existing one.
 
-ISA tier: the scripts (run.sh, ab.sh, run_full_stack.sh) leave EXL3_MOE_CPU_MAX_ISA
-unset, so both kernels run the host's tier (vnni on divix01). A caller's
-EXL3_MOE_CPU_MAX_ISA (scalar|avx2|bw|vnni|vbmi, case-insensitive) passes through
-unchanged: EXL3_MOE_CPU_MAX_ISA=bw bash run.sh ... measures the old bw path. The
-kernels cap but never raise the tier and ignore an unrecognized value, an empty
-one included (the scripts unset an empty one). Every process prints "isa tier
-<tier>" at startup and puts isa_tier in its Google JSON context; each results
-directory's isa.txt gathers the lines and the requested cap, and environment.txt
-records the cap too. Read the tier from there, not from the variable.
+ISA tier: by default the scripts (run.sh, ab.sh, run_full_stack.sh) run the
+host's tier (vnni on divix01). A caller's EXL3_BENCH_MAX_ISA (scalar|avx2|bw|vnni|
+vbmi, case-insensitive) caps it: EXL3_BENCH_MAX_ISA=bw bash run.sh ... measures
+the old bw path. The scripts pass it to the optimized and full-stack binaries as
+--max-isa (the server's SGLANG_EXPERT_STREAM_CPU_MAX_ISA), and to the vendored
+baseline as its own EXL3_MOE_CPU_MAX_ISA, which it reads at load. The kernels cap
+but never raise the tier and ignore an unrecognized value. Every process prints
+"isa tier <tier>" at startup and puts isa_tier in its Google JSON context; each
+results directory's isa.txt gathers the lines and the requested cap, and
+environment.txt records the cap too. Read the tier from there, not from the
+variable.
 
-Single-process examples (the tier is the host's; add EXL3_MOE_CPU_MAX_ISA=bw to cap it):
+Single-process examples (the tier is the host's; add --max-isa=bw to cap it):
   export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
   export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
   "$build/exl3_cpu_optimized" --validate-only

@@ -2,8 +2,9 @@
 # Plan 2026-09-28-iopoll-read-cuts Task 7: the IOPOLL wait fix and read-cut decode arms. One worktree, one commit, arms
 # in this order: A (master default: cuts off, MODE=default), B (READ_CUTS=1, MODE=default), C (READ_CUTS=1,
 # MODE=iopoll, whose WAIT_MODE=block the wait fix turns into the reap loop), D (READ_CUTS=1, MODE=sqpoll_iopoll,
-# SQ_THREAD_CPU=20, the 10 s idle default) and A2 (as A: drift control). All ten SGLANG_EXPERT_STREAM_URING_* knobs are
-# passed explicitly in every arm as run_arm.sh KEY=VAL overrides. ARMS="A B" (space-separated) runs a subset, e.g. the
+# SQ_THREAD_CPU=20, the 10 s idle default) and A2 (as A: drift control). All ten io_uring knobs (nine keys of
+# SGLANG_EXPERT_STREAM_URING plus the `sq=` core of SGLANG_EXPERT_STREAM_NUMA_CORES) are passed explicitly in every arm
+# as run_arm.sh KEY=VAL overrides. ARMS="A B" (space-separated) runs a subset, e.g. the
 # confirmation pass.
 # Rule: an arm is promoted only if it beats mean(A, A2) by >= 1.5 ms/token pooled with byte-identical output.
 # Template: analysis/dsv41-drive/uring-reg/drive_uring_reg_arms.sh (changes: five arms; check_modes reads the
@@ -25,25 +26,27 @@ PROD_PORT=7867
 DRIVER_VERSION=615.71.09
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
-URING_A=(
-    SGLANG_EXPERT_STREAM_URING_MODE=default SGLANG_EXPERT_STREAM_URING_READ_CUTS=0
-    SGLANG_EXPERT_STREAM_URING_WAIT_MODE=block SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=0
-    SGLANG_EXPERT_STREAM_URING_FIXED_FILES=0 SGLANG_EXPERT_STREAM_URING_READ_MODE=normal
-    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_IDLE_MS=10000 SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=-1
-    SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=0 SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS=1
+# The io_uring options are the group env SGLANG_EXPERT_STREAM_URING (a JSON object) and the SQPOLL core an `sq=` entry of
+# SGLANG_EXPERT_STREAM_NUMA_CORES; uring_overrides.py turns key=value words (UringConfig fields, plus sq_thread_cpu)
+# into those KEY=VAL overrides, one per line.
+URING_HELPER=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/uring_overrides.py
+uring_overrides() { "$PY" "$URING_HELPER" "$HERE" "$@"; }
+URING_A_WORDS=(
+    mode=default read_cuts=0 wait_mode=block queue_depth=0 fixed_files=0 read_mode=normal
+    sq_thread_idle_ms=10000 sq_thread_cpu=-1 slab_arena=0 diagnostics=1
 )
-with_() {  # URING_A with the given KEY=VAL entries replaced
+with_() {  # URING_A_WORDS with the given key=value entries replaced
     local out=() kv o
-    for kv in "${URING_A[@]}"; do
+    for kv in "${URING_A_WORDS[@]}"; do
         for o in "$@"; do [ "${o%%=*}" = "${kv%%=*}" ] && kv=$o; done
         out+=("$kv")
     done
     echo "${out[@]}"
 }
-URING_B=($(with_ SGLANG_EXPERT_STREAM_URING_READ_CUTS=1))
-URING_C=($(with_ SGLANG_EXPERT_STREAM_URING_READ_CUTS=1 SGLANG_EXPERT_STREAM_URING_MODE=iopoll))
-URING_D=($(with_ SGLANG_EXPERT_STREAM_URING_READ_CUTS=1 SGLANG_EXPERT_STREAM_URING_MODE=sqpoll_iopoll \
-                 SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=20))
+mapfile -t URING_A < <(uring_overrides "${URING_A_WORDS[@]}")
+mapfile -t URING_B < <(uring_overrides $(with_ read_cuts=1))
+mapfile -t URING_C < <(uring_overrides $(with_ read_cuts=1 mode=iopoll))
+mapfile -t URING_D < <(uring_overrides $(with_ read_cuts=1 mode=sqpoll_iopoll sq_thread_cpu=20))
 read -r -a ARMS <<< "${ARMS:-A B C D A2}"
 say() { echo "$(date +%T) $*"; }
 case $OUT in /mnt/nvme1/*) ;; *) say "out dir must be under /mnt/nvme1"; exit 1 ;; esac
@@ -126,7 +129,7 @@ node0_gate() {  # <arm>: the first arm settles the tier (full, else 90g); later 
     done
 }
 tier_overrides() {
-    echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
+    echo "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
 }
 
 memory_sample() {  # <label>: node-0/node-1 MemFree and VmallocUsed/Slab (MiB) appended to $OUT/memory.jsonl

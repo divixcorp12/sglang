@@ -35,7 +35,7 @@ from typing import Iterable, Mapping, Sequence
 
 import msgspec
 
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 
 ROW_IMAGE_SUBDIR = "exl3_row_images"

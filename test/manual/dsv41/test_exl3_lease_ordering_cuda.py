@@ -117,7 +117,7 @@ def test_a_records_victim_is_never_a_slot_cws_late_sm_reads_use(tmp_path):
     Mutant: as above, the victim ignores the routes -- red on 0xAB."""
     c = Chain(tmp_path, copy_engine=True, sm_small_copies=True)
     try:
-        c.dev._module = device_module_with_hooks([f"EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS={SM_READ_DELAY_NS}"])
+        c.dev._module = device_module_with_hooks([f"EXPERT_STREAM_TEST_CW_SM_READ_DELAY_NS={SM_READ_DELAY_NS}"])
         c.plan([])
         c.chain(captured=True)  # compile and load the hooked build before the timed request
         torch.cuda.synchronize()

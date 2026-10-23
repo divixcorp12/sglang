@@ -20,7 +20,7 @@ def _launch(tmp_path, **over):
     )
     args = dict(
         out_dir="/mnt/nvme1/b0/run",
-        env={"SGLANG_DSV41_RAM_PREFETCH": "0"},
+        env={"SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "0"},
         arm="dspark-both-misscut",
         model_path=str(model),
         ps_lines=["/usr/bin/python3 capture.py", "bash"],
@@ -41,9 +41,9 @@ def test_an_output_path_outside_nvme1_is_refused(tmp_path, path):
         b0_guards.refuse_launch(**_launch(tmp_path, out_dir=path))
 
 
-@pytest.mark.parametrize("env", [{"SGLANG_DSV41_RAM_PREFETCH": "1"}, {}])
+@pytest.mark.parametrize("env", [{"SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "1"}, {}])
 def test_prefetch_not_off_is_refused(tmp_path, env):
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_RAM_PREFETCH"):
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH"):
         b0_guards.refuse_launch(**_launch(tmp_path, env=env))
 
 

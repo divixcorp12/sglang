@@ -280,7 +280,7 @@ def test_forward_missing_a_layer_field_is_dropped():
 
 def test_unset_environment_installs_nothing():
     model = _LanguageModel()
-    with patch.dict(os.environ, {"SGLANG_MOE_ROUTE_TRACE_DIR": ""}):
+    with patch.dict(os.environ, {"SGLANG_EXPERT_STREAM_TRACE": ""}):
         assert route_trace.maybe_install_moe_route_trace(model) is None
     for module in model.modules():
         assert not module._forward_hooks
@@ -762,8 +762,9 @@ def test_speculative_flag_off_installs_no_mtp_trace():
         with patch.dict(
             os.environ,
             {
-                "SGLANG_MOE_ROUTE_TRACE_DIR": directory,
-                "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE": "0",
+                "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                    {"route": {"dir": directory, "speculative": False}}
+                ),
             },
         ):
             assert route_trace.maybe_install_mtp_hidden_trace(mtp) is None
@@ -777,9 +778,9 @@ def test_speculative_flag_installs_both_traces_from_the_environment():
         with patch.dict(
             os.environ,
             {
-                "SGLANG_MOE_ROUTE_TRACE_DIR": directory,
-                "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE": "1",
-                "SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS": "2",
+                "SGLANG_EXPERT_STREAM_TRACE": json.dumps(
+                    {"route": {"dir": directory, "speculative": True, "max_tokens": 2}}
+                ),
             },
         ):
             target_trace = route_trace.maybe_install_moe_route_trace(target)

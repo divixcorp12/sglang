@@ -272,7 +272,7 @@ NON_TRACE_CLOCK_READS = {
     "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
     # The CPU job trace (job_trace.h, 636208496a): JobTrace<true> exists only in InstrBuild (JobTrace<Build::kMetrics>;
-    # JobTrace<false> is empty) and records only once SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX is set and its gate opens.
+    # JobTrace<false> is empty) and records only once the job.prefix key of SGLANG_EXPERT_STREAM_TRACE is set and its gate opens.
     # Its own clock_ns() (definition, the CLOCK_MONOTONIC/REALTIME anchors once at construction, a pending draft's
     # observation, each event), the copy thread's DMA-observation stamp (CopyEngine::observe_jobs, inside
     # `if constexpr (Build::kMetrics)`), and the draft forward's selected/payload-ready stamps (DraftExperts::serve,

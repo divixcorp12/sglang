@@ -2,7 +2,7 @@
 
 Usage: compare_arms.py NAME=DIR [NAME=DIR ...] [--json OUT]
 
-Each DIR is one smoke arm's output: ``stages.jsonl`` (SGLANG_DSV41_EXPERT_TRACE_PATH, schema 7) and
+Each DIR is one smoke arm's output: ``stages.jsonl`` (the expert_path of SGLANG_EXPERT_STREAM_TRACE, schema 7) and
 ``responses.jsonl`` (the smoke driver's greedy responses). CPU only; run under ``taskset -c 0-63``.
 
 What is measured, and from which fields (every clock is the host CLOCK_MONOTONIC):

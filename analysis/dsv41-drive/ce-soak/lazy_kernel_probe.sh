@@ -29,7 +29,7 @@ while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do 
 ss -ltn "sport = :$PORT" | grep -q LISTEN && { say "port $PORT taken"; exit 1; }
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
-e = arm_env.arm_env({'CUDA_MODULE_LOADING': 'LAZY', 'SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE': '0'})
+e = arm_env.arm_env({'CUDA_MODULE_LOADING': 'LAZY', 'SGLANG_EXPERT_STREAM_COPY_MODE': 'sm_copy'})
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 e['TMPDIR'] = '$TMPDIR'

@@ -14,6 +14,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 
@@ -29,15 +30,30 @@ if TYPE_CHECKING:
 _GROUP_SIZE = 32
 
 
-class Mxfp4FlashinferCutlassMoEMethod:
-    """FlashInfer MXFP4 MoE: W4A16/W4A8 on SM90 and W4A8 on SM120."""
+class Mxfp4FlashinferCutlassMoEMethod(FusedMoEMethodBase):
+    """FlashInfer MXFP4 MoE: W4A16/W4A8 on SM90 and W4A8 on SM120.
+
+    With expert streaming on (MiMo V2.6 Pro, SM120 only) the routed experts are not materialized: the expert engine
+    streams them into hot-cache slots and ``apply`` runs the same kernel over the slot buffers.
+    """
 
     fuse_routed_scaling_factor_in_topk = True
+    # The expert engine's registry names, used when this layer streams.
+    expert_format_name = "mxfp4"
+    expert_profile_name = "mimo_v26"
 
     def __init__(self, fp8_method, prefix: str):
         if not is_flashinfer_available():
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
+        from sglang.srt.layers.moe.expert_engine.formats.mxfp4 import streams_experts
+
+        self.streamed = streams_experts(getattr(fp8_method, "quant_config", None), prefix)
         self._use_mxfp8_act_scaling = get_platform().is_sm120
+        if self.streamed and not self._use_mxfp8_act_scaling:
+            raise ValueError(
+                f"{prefix}: streamed MXFP4 experts are supported on SM120 only (the SM90 weight interleave is a "
+                "different row layout)"
+            )
         precision = get_exec().moe.flashinfer_mxfp4_moe_precision
         # precision=fp8 is an SM90 knob (Humming W4A8); on SM120 the MXFP8
         # activation path already computes in FP8, so the flag is simply inert
@@ -71,6 +87,15 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 f"(got hidden={hidden_size}, "
                 f"intermediate={intermediate_size_per_partition})."
             )
+        if self.streamed:
+            # Routed experts stay on disk. With no parameters, MiMoV2ForCausalLM.load_weights skips them, and
+            # process_weights_after_loading attaches the expert streamer. The dims are what the row format is built from.
+            layer.mxfp4_num_experts = num_experts
+            layer.mxfp4_hidden = hidden_size
+            layer.mxfp4_inter = intermediate_size_per_partition
+            layer.mxfp4_use_swiglu_step = False
+            layer.mxfp4_streamed = True
+            return
         # Keep checkpoint scales in native E8M0 instead of staging them as FP32.
         self._fp8.create_weights(
             layer,
@@ -90,6 +115,21 @@ class Mxfp4FlashinferCutlassMoEMethod:
         # The fused func reads the layer's MoE placement off the config.
         if moe_runner_config.layer is None:
             moe_runner_config.layer = layer
+
+        if self.streamed:
+            # No per-expert side tensors of size E: the global scale and SwiGLU limit are streamed as row tensors and
+            # read from the slot buffers (formats/mxfp4.py). The clamp settings are the format's.
+            swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
+            gemm1_clamp_limit = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+            layer.mxfp4_use_swiglu_step = (
+                gemm1_clamp_limit is not None
+                and getattr(moe_runner_config, "gemm1_alpha", None) is None
+            )
+            clamp_limit = (
+                gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+            )
+            layer.mxfp4_swiglu_limit = None if clamp_limit is None else float(clamp_limit)
+            return
 
         E = layer.num_local_experts
         device = layer.w13_weight.device
@@ -125,6 +165,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.streamed:
+            # Nothing was materialized or interleaved here: the engine interleaves each expert's scales on the host
+            # as it builds the rows (Mxfp4ExpertFormat.prepare_host_rows). Bind the engine and attach the streamer.
+            from sglang.srt.layers.moe.expert_engine import quant_hook
+
+            quant_hook.attach(layer, self)
+            return
         # Preserve the base FP4 post-load handling.
         self._fp8.process_weights_after_loading(layer)
 
@@ -231,6 +278,15 @@ class Mxfp4FlashinferCutlassMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        if self.streamed:
+            # Gather the routed experts into hot-cache slots, then the same kernel over the slot buffers.
+            # TODO: call quant_hook.apply once it serves non-EXL3 formats; until then this small function does.
+            from sglang.srt.layers.moe.expert_engine.formats.mxfp4 import (
+                streamed_apply,
+            )
+
+            return streamed_apply(layer, self, dispatch_output)
+
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
             FlashInferCutlassMxfp4MoeQuantInfo,
         )

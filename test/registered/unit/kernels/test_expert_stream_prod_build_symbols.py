@@ -35,8 +35,8 @@ LANES = 8  # the default build; load_jit names the module _l<lanes>
 
 
 def _symbols(variant: str) -> str:
-    ops._host_module("exl3", variant, LANES).expert_stream_build_name()
-    path = _loaded_path(f"expert_stream_host_exl3_{variant}_l{LANES}")
+    ops._host_module(ops.EXL3_BUILD, variant, LANES).expert_stream_build_name()
+    path = _loaded_path(ops.host_jit_key(ops.EXL3_BUILD, variant, LANES))
     return subprocess.run(["nm", "-C", path], capture_output=True, text=True, check=True).stdout
 
 

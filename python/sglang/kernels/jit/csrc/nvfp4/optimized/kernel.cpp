@@ -18,7 +18,7 @@ constexpr int kChunkRows = 4;
 
 #include "forward_plan.hpp"
 
-// The detected tier (min(host, kTopIsa, NVFP4_CPU_MAX_ISA)) picks the plan: the MiMo plan when the layer is that
+// The detected tier (min(host, kTopIsa, the configured cap)) picks the plan: the MiMo plan when the layer is that
 // model's routed expert at the AVX2 tier, else the generic plan at the tier.
 int Nvfp4Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team)
 {
@@ -35,6 +35,11 @@ const ::sglang::cpu_experts::CpuExpertKernel& nvfp4_cpu_kernel()
 {
     static const ::sglang::cpu_experts::ExpertForward<Nvfp4Quant> kernel{};
     return kernel;
+}
+
+void nvfp4_cpu_configure(const std::string& max_isa, bool report_isa)
+{
+    ::sglang::cpu_experts::ExpertForward<Nvfp4Quant>::configure_isa(max_isa, report_isa);
 }
 }  // namespace sglang::nvfp4_cpu
 

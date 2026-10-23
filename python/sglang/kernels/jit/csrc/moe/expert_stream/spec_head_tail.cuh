@@ -16,7 +16,7 @@ constexpr int kHeadTailThreads = 384;  // the tail's block: one thread per exper
 constexpr int kHeadMaxTokens = 8;      // live tokens per record (the learned heads' MAX_WIDTH is 6)
 constexpr int kBlockFeatures = 10;     // r1_aggregator.N_BLOCK_FEATURES
 constexpr int kAggHidden = 32;         // the aggregator MLP's hidden width
-constexpr int kHeadMaxPicks = 3;       // reads per record; SGLANG_DSV41_RAM_PREFETCH_PER_LAYER's range with a head
+constexpr int kHeadMaxPicks = 3;       // reads per record; SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER's range with a head
 
 static_assert(kHeadTailThreads % 32 == 0 && kHeadMaxExperts <= kHeadTailThreads, "one thread per expert");
 

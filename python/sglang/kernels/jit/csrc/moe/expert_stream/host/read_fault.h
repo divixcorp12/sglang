@@ -35,7 +35,7 @@ namespace expert_stream {
 // Per-extent faults hit the first completion of an extent of part `part` (-1: any part), or of root `root` (-1: any
 // root), whichever row it is in and however the kernel orders completions; at least one of the two must be set. The
 // part is the descriptor's part slot; the root is the drive the sub-read actually reads (file % parts), which differs
-// from the part slot once SGLANG_MOE_EXPERT_MIRROR_DYNAMIC has moved it. part_error replaces its result with -errno;
+// from the part slot once SGLANG_EXPERT_STREAM_MIRROR dynamic has moved it. part_error replaces its result with -errno;
 // part_short makes it report at most that many bytes (a block multiple). They are narrowed by:
 //   - ordinal: the row with that index in the request (-1: any);
 //   - sub: the sub-read with that index within its part, piece streaming only (-1: any; without piece streaming every

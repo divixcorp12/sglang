@@ -4,6 +4,7 @@ small slabs register as many row-aligned chunks; fault word `leg` aims the exist
 leg of a fanned-out read. The real >1 GiB slab is the manual test of Task 8."""
 
 import errno
+import json
 import os
 
 import pytest
@@ -16,21 +17,33 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes, spaw
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
-PREFIX = "SGLANG_EXPERT_STREAM_URING_"
 EXPERTS = [10, 3, 7, 0, 11, 5, 1, 8, 2, 9, 4]
 SLOTS = [7, 0, 11, 3, 9, 1, 5, 10, 2, 8, 4]
 CAP = 64 * 1024
 
 
+URING_ENV = "SGLANG_EXPERT_STREAM_URING"
+URING_BOOLEANS = ("fixed_files", "diagnostics")
+
+
+def _uring_json(members):
+    """SGLANG_EXPERT_STREAM_URING's JSON object for members given by their old suffix (READ_MODE, FIXED_FILES=1 ...)."""
+    out = {}
+    for key, value in members.items():
+        name = key.lower()
+        out[name] = bool(int(value)) if name in URING_BOOLEANS else int(value) if name == "queue_depth" else value
+    return json.dumps(out)
+
+
 @pytest.fixture
 def uring_env(monkeypatch):
-    for key in list(os.environ):
-        if key.startswith(PREFIX):
-            monkeypatch.delenv(key)
+    monkeypatch.delenv(URING_ENV, raising=False)
+    members = {}
 
     def set_(**values):
-        for key, value in values.items():
-            monkeypatch.setenv(PREFIX + key, str(value))
+        members.update(values)
+        # The module in use takes the options of the config the env resolves to (_host_module installs them).
+        monkeypatch.setenv(URING_ENV, _uring_json(members))
 
     return set_
 
@@ -208,7 +221,7 @@ def test_registration_refusal_is_a_clear_error_not_a_fallback(tmp_path, uring_en
         pytest.skip("root has CAP_IPC_LOCK: the memlock limit does not bind")
     child = spawn_child(
         _MEMLOCK_CHILD, tmp_path / "child", timeout_s=120, variant=CHILD_VARIANT,
-        env=dict(os.environ, **{PREFIX + "READ_MODE": "readv_fixed"}))
+        env=dict(os.environ, **{URING_ENV: _uring_json({"READ_MODE": "readv_fixed"})}))
     assert child.returncode == 0, child.stdout + child.stderr
     assert "REFUSED" in child.stdout and "RLIMIT_MEMLOCK" in child.stdout, child.stdout
 

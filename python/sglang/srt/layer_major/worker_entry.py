@@ -43,8 +43,8 @@ def layer_major_runtime(model_runner) -> LayerMajorRuntime | None:
     if model_runner.expert_prediction_runtime is not None:
         raise ValueError(
             "layer-major prefill cannot be combined with MoE expert-prediction shadow mode yet "
-            "(SGLANG_MOE_EXPERT_PREDICTOR, SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR or "
-            "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR is set)"
+            "(prefetch.shadow.predictors, prefetch.shadow.predictor or "
+            "trace.predictor_capture.dir is set)"
         )
     if _capture_enabled():
         raise ValueError("layer-major prefill cannot be combined with routed-experts/indexer top-k capture yet")

@@ -244,7 +244,7 @@ class TestPinnedTierCuda(unittest.TestCase):
         layer.gpu_rows = torch.nn.Parameter(torch.rand(experts, 5, device="cuda"), requires_grad=False)
         layer._nvfp4_file_source_bytes_per_expert = 3000
         streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
-        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(True):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER.override(True):
             cache = ExpertPinnedHostCache(streamer, experts)
         cache.row_fills = _LazyFills(cache, layer.host_rows.data)
         cache.ensure_rows(torch.tensor([20], device="cuda"))

@@ -130,6 +130,7 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
     backend = (
         SimpleNamespace(
             name="exl3_ram_miss",
+            leased=True,
             delivered_count=torch.tensor([delivered], dtype=torch.int32, device="cuda"),
             keep=torch.tensor([keep], dtype=torch.float32, device="cuda"),
             cpu_experts=cpu_lanes is not None,
@@ -138,7 +139,7 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
             ),
         )
         if leased
-        else SimpleNamespace(name="in_graph")
+        else SimpleNamespace(name="in_graph", leased=False)
     )
     return SimpleNamespace(
         _graph_miss_count=torch.tensor([miss_count], dtype=torch.int32, device="cuda"),

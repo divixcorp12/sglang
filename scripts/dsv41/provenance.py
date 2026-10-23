@@ -25,7 +25,7 @@ SCHEMA = 1
 ENV_PREFIXES = ("SGLANG_", "SGL_")
 # Not SGLANG_*, but they change what a run measures (placement, thread counts, module lookup).
 OTHER_ENV = ("PYTHONPATH", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
-# Anchored at the end of the name: a bare substring test redacted SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS
+# Anchored at the end of the name: a bare substring test redacted SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS
 # (a steering knob) and 34 other counts and flags whose names merely contain TOKEN.
 _SECRET_NAME = re.compile(r"(API_?KEY|SECRET(_?KEY)?|PASSWORD|CREDENTIALS?|(AUTH|ACCESS|API|HF|BEARER)_TOKEN)$", re.I)
 REDACTED = "<redacted>"

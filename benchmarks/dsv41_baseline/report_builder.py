@@ -29,7 +29,7 @@ STEP_LATENCY_UNAVAILABLE = {
 # `check_arm` reads these from the top level of `provenance` as facts about the process that ran
 # the arm. `provenance.capture()` samples them in the harness, which has none of the server's
 # SGLANG_* vars, so leaving them there had the verdict judge the wrong process: it reported the
-# reader as 'mmap' and SGLANG_MOE_EXPERT_MIRROR_DIRS as unset for a server whose /proc/<pid>/environ
+# reader as 'mmap' and SGLANG_EXPERT_STREAM_MIRROR (key dirs) as unset for a server whose /proc/<pid>/environ
 # had both set, and whose per-drive read counters showed the mirrors carrying the whole arm.
 HARNESS_PROCESS_FIELDS = ("sglang_env", "sglang_env_at_exec", "sglang_env_resolved", "sglang_file")
 

@@ -1,6 +1,6 @@
 """Verify that mirror copies of an EXL3 checkpoint hold the source's bytes.
 
-The mirror row source (``SGLANG_MOE_EXPERT_MIRROR_DIRS``) trusts each root to
+The mirror row source (the ``dirs`` of ``SGLANG_EXPERT_STREAM_MIRROR``) trusts each root to
 hold a byte-identical copy of the checkpoint. Its own guards are O(1): a size
 check. A copy of the right size that is only partly filled (an interrupted or
 preallocated copy, a sparse hole) passes them and reads back zeros. This tool
@@ -24,7 +24,7 @@ What is compared, for every root separately:
 
 "Verified" therefore means every byte the runtime reads matches, not that the
 files are identical. That is safe while the layout (offsets, headers, the
-index) is built from the source directory. If ``SGLANG_DSV41_EXPERT_DIR`` is
+index) is built from the source directory. If ``SGLANG_EXPERT_STREAM_EXPERT_DIR`` is
 ever pointed at a mirror, the layout would be built from headers and an index
 this tool never compared: verify with a whole-file comparison first.
 
@@ -43,6 +43,7 @@ usage or configuration error.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import re
@@ -54,7 +55,7 @@ from typing import Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import (
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
     Exl3ExpertFormat,
     parse_mirror_roots,
 )
@@ -419,7 +420,7 @@ def verify_mirror(
     roots = list(roots)
     if not roots:
         raise ValueError(
-            "no mirror roots given: pass --roots or set SGLANG_MOE_EXPERT_MIRROR_DIRS"
+            "no mirror roots given: pass --roots or set the dirs of SGLANG_EXPERT_STREAM_MIRROR"
         )
     source = os.path.realpath(source_dir)
     real = [os.path.realpath(root) for root in roots]
@@ -742,7 +743,7 @@ def render(result: VerifyResult, header: bool = True) -> str:
             "  It does NOT mean the files are identical: the mul1 scalars, safetensors "
             "headers, alignment padding, the index and files outside the layout were "
             "not compared.\n"
-            "  If SGLANG_DSV41_EXPERT_DIR is ever pointed at a mirror, the layout would "
+            "  If SGLANG_EXPERT_STREAM_EXPERT_DIR is ever pointed at a mirror, the layout would "
             "be built from headers and an index this tool never checked."
         )
     elif not result.full:
@@ -778,13 +779,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--source",
         default=None,
-        help="the source checkpoint directory (default: SGLANG_DSV41_EXPERT_DIR)",
+        help="the source checkpoint directory (default: SGLANG_EXPERT_STREAM_EXPERT_DIR)",
     )
     parser.add_argument(
         "--roots",
         nargs="+",
         default=None,
-        help="the mirror roots (default: SGLANG_MOE_EXPERT_MIRROR_DIRS)",
+        help="the mirror roots (default: the dirs of SGLANG_EXPERT_STREAM_MIRROR)",
     )
     parser.add_argument(
         "--layers",
@@ -817,14 +818,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        source = args.source or envs.SGLANG_DSV41_EXPERT_DIR.get()
+        source = args.source or envs.SGLANG_EXPERT_STREAM_EXPERT_DIR.get()
         if not source:
             raise ValueError(
-                "no source given: pass --source or set SGLANG_DSV41_EXPERT_DIR"
+                "no source given: pass --source or set SGLANG_EXPERT_STREAM_EXPERT_DIR"
             )
         roots = args.roots
         if roots is None:
-            dirs = envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get()
+            dirs = json.loads(envs.SGLANG_EXPERT_STREAM_MIRROR.get() or "{}").get("dirs", "")
             roots = list(parse_mirror_roots(dirs)) if dirs else []
         layers = parse_layers(args.layers)
         result = verify_mirror(

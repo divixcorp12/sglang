@@ -16,7 +16,7 @@
 
 #include "aligned.h"
 #include "device_sim.h"
-#include "exl3/exl3_row_layout.h"
+#include "formats/exl3/row_layout.h"
 #include "expert_stream/host/build_policy.h"
 #include "expert_stream/host/core_topology.h"
 #include "expert_stream/host/ram_thread.h"
@@ -38,8 +38,8 @@ namespace es = ::sglang::expert_stream;
 using BenchBuild = std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>;
 static_assert(kNames == static_cast<int>(::sglang::exl3::Exl3RowLayout::kNames.size()));
 
-// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3/exl3_ram_miss_host.cpp and
-// exl3_ram_miss_host_instr.cpp, minus the instrumented build's FaultyReader.
+// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/expert_stream/engine_host.cpp, minus the
+// instrumented build's FaultyReader.
 template <class Build>
 struct ReaderFor;
 template <>
@@ -109,7 +109,7 @@ struct StackConfig {
   int64_t out_stride = 0;  // bytes; two parts of `hidden` floats per group per row, group g's at [2 g, 2 g + 2) parts
   int64_t hidden = 0;
   int copy_cpu = -1;
-  int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)
+  int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS)
   int64_t fatal_wait_ns = 30'000'000'000;   // the watchdog's hung-request deadline
   size_t trace_capacity = 0;  // InstrBuild: the stage trace's ring, 0 off
 };
@@ -148,7 +148,7 @@ class Stack {
         /*hot_page=*/nullptr,
         0,
         group_ranges(),
-        std::vector<int>(es::Wire::kNodes, -2));  // -2: the ring's SQPOLL core stays the uring env's, as before NUMA groups
+        std::vector<int>(es::Wire::kNodes, -2));  // -2: the ring's SQPOLL core stays the uring options', as before NUMA groups
     if (!tier_->open()) throw std::runtime_error("the tier's reader did not open (its error is on stderr)");
     tier_->reserve_staging(config_.staging);
     // The copy engine's thread and RamThread's watchdog inherit this thread's affinity: the copy CPU.

@@ -15,17 +15,9 @@ import time
 import generations
 import run_locks
 
-DIAGNOSTIC_PREFIXES = (
-    "SGLANG_DSV41_EXPERT_JOB_", "SGLANG_DSV41_EXPERT_TRACE_",
-    "SGLANG_EXL3_CPU_WORKER_TRACE_", "SGLANG_EXL3_CPU_SCRATCH_TRACE_",
-    "SGLANG_DRAFT_PENDING_TRIGGER_",
-    "SGLANG_DRAFT_ARRIVAL_TRIGGER_", "SGLANG_DRAFT_FORWARD_TRIGGER_",
-    "SGLANG_DRAFT_DELAY_TRIGGER_",
-)
-
 def diagnostic_key(key):
-    return key.startswith(DIAGNOSTIC_PREFIXES) or key in (
-        "SGLANG_MOE_HOT_METRICS_FILE", "SGLANG_TEST_DSV41_RAM_MISS_FAULT")
+    # Every trace/diagnostic member lives in the one SGLANG_EXPERT_STREAM_TRACE group env now.
+    return key in ("SGLANG_EXPERT_STREAM_TRACE", "SGLANG_TEST_DSV41_RAM_MISS_FAULT")
 
 
 def main():
@@ -66,26 +58,30 @@ def main():
         env.update(NSYS_TRACE="0", NSYS_GPU_METRICS="0", NSYS_SYSTEM_CPU="0")
     if args.no_instrumentation:
         env = {k: v for k, v in env.items() if not diagnostic_key(k)}
+    env.pop("SGLANG_EXPERT_STREAM_TRACE", None)  # re-merged below and passed as one override
     prefix = str(args.output / "events")
     overrides = [arg for arg in reference["command"][4:]
                  if not diagnostic_key(arg.split("=", 1)[0])]
+    # One group env carries every trace member (merged here, since they are one JSON object).
+    # The caller (run_omp_serving_capture.py) seeds the gate path and scratch prefix through the same env.
+    seed = json.loads(os.environ.get("SGLANG_EXPERT_STREAM_TRACE") or "{}")
+    trace = ({k: v for k, v in seed.items() if k == "gate_path"} if args.no_instrumentation else dict(seed))
+    trace["draft_trigger"] = {"arrival_us": args.draft_arrival_trigger_us,
+                              "pending_us": args.draft_pending_trigger_us,
+                              "forward_us": args.draft_forward_trigger_us}
     if args.no_instrumentation:
-        overrides += ["SGLANG_DRAFT_DELAY_TRIGGER_ONLY=1",
-                      "SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX=" + str(args.output / "trigger-only"),
-                      "SGLANG_EXL3_BUILD_DIR=" + str(args.output / "exl3-build")]
+        trace["draft_trigger"]["trigger_only"] = True
+        trace["draft_trigger"]["report_prefix"] = str(args.output / "trigger-only")
+        overrides += ["SGLANG_EXL3_BUILD_DIR=" + str(args.output / "exl3-build")]
     else:
-        overrides += ["SGLANG_MOE_HOT_METRICS_FILE=" + str(args.output / "metrics.jsonl"),
-                  "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + prefix,
-                  "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1",
-                  "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=" + str(args.job_capacity)]
-    overrides += ["SGLANG_DRAFT_ARRIVAL_TRIGGER_US=" + str(args.draft_arrival_trigger_us),
-                  "SGLANG_DRAFT_PENDING_TRIGGER_US=" + str(args.draft_pending_trigger_us),
-                  "SGLANG_DRAFT_FORWARD_TRIGGER_US=" + str(args.draft_forward_trigger_us)]
+        trace["hot_metrics_file"] = str(args.output / "metrics.jsonl")
+        trace["job"] = {"prefix": prefix, "resources": True, "capacity": args.job_capacity}
     if args.worker_phases:
-        overrides += ["SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=" + str(args.output / "worker-phases"),
-                      "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US=" + str(args.worker_min_us),
-                      "SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY=" + str(args.worker_capacity),
-                      "SGLANG_EXL3_BUILD_DIR=" + str(args.output / "exl3-build")]
+        trace.setdefault("cpu_worker", {}).update(prefix=str(args.output / "worker-phases"),
+                                                  min_us=args.worker_min_us,
+                                                  capacity=args.worker_capacity)
+        overrides += ["SGLANG_EXL3_BUILD_DIR=" + str(args.output / "exl3-build")]
+    overrides += ["SGLANG_EXPERT_STREAM_TRACE=" + json.dumps(trace)]
     command = ["bash", str(root / "benchmarks/dsv41_baseline/run_arm.sh"), "stall-cpu-s2",
                str(args.port), *overrides]
     imported = subprocess.check_output([sys.executable, "-c", "import sglang; print(sglang.__file__)"],

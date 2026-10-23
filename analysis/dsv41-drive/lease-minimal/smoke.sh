@@ -35,13 +35,13 @@ import arm_env
 e = arm_env.arm_env({})
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
-e['EXL3_MOE_CPU_PIN'] = '0'
+e['SGLANG_EXL3_MOE_CPU_PIN'] = '0'
 for k, v in e.items(): print(f'{k}={v}')
 ")
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
-for want in SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1 SGLANG_DSV41_ENABLE_LEASE_PDL=1 \
-    SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES=1 CUDA_MODULE_LOADING=EAGER; do
+for want in SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL=1 \
+    SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES=1 CUDA_MODULE_LOADING=EAGER; do
   grep -qx "$want" $OUT/env.txt || { say "recipe lacks $want; refusing"; exit 1; }
 done
 mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "

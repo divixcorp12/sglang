@@ -53,8 +53,8 @@ HITS = (HIT_COPY, HIT_SM, HIT_CPU, HIT_SCRATCH)
 SPILL = 256
 NODES = 2
 VICTIM_LANES = 8
-MISS_CUT, MISS_CUT_MAX = 1, 3  # SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX of the -fixedsplit arms
-# SGLANG_DSV41_CPU_EXPERTS_SPLIT of breakdown-20261015/run.sh: CPU lanes per n eligible lanes of a node.
+MISS_CUT, MISS_CUT_MAX = 1, 3  # miss_cut / miss_cut_max of SGLANG_EXPERT_STREAM_CPU_SPLIT in the -fixedsplit arms
+# The table of SGLANG_EXPERT_STREAM_CPU_SPLIT in breakdown-20261015/run.sh: CPU lanes per n eligible lanes of a node.
 SPLIT = [int(x) for x in "0,1,2,2,3,3,4,5,5,6,7,7,8,9,9,10,11,11,12,13,13,14,15,15,16,17,17,18,19,19,20,21,21,22,23,23,"
          "24,24,25,26,26".split(",")]
 CATS = ("vram", "drip", "sm", "dma", "pool", "nvme_gpu", "cpu_ram", "cpu_pool", "cpu_nvme")

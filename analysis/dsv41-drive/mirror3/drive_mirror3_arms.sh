@@ -16,8 +16,8 @@
 # At the end it prints the mirror3_report.py command for the two runs.
 #
 # Pinned tier (fix round 2, the user's option c): both arms run a tier 4096 MiB smaller on node 0 than arm_env's
-# recipe (102400 = 0:61440,1:40960), passed as identical KEY=VAL overrides: SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:40960
-# and SGLANG_MOE_PINNED_HOST_MB=98304. Reason: the ZFS ARC holds node-0 memory that host_numa.check_capacity does not
+# recipe (102400 = 0:61440,1:40960), passed as identical KEY=VAL overrides: SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:57344,1:40960
+# and SGLANG_EXPERT_STREAM_PINNED_HOST_MB=98304. Reason: the ZFS ARC holds node-0 memory that host_numa.check_capacity does not
 # count as reclaimable, and the recipe's 0:61440 was refused 1463 MiB short. Before the reference arm the driver
 # checks node 0 the way check_capacity does (MemFree + Active(file) + Inactive(file) from node0/meminfo) against the
 # node-0 share + 4096 MiB headroom + the server's observed pre-check node-0 footprint (check_capacity runs after the
@@ -86,7 +86,7 @@ node0_gate() {  # <arm>: settle (reference, may cut once) or re-check (3-root, n
     done
 }
 tier_overrides() {
-    echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
+    echo "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
 }
 mkdir -p "$OUT"
 # The whole namespace (nvme0n1), not the partition findmnt names (nvme0n1p1): the split is per drive.
@@ -205,7 +205,7 @@ run_one() {  # <arm> [KEY=VAL ...]
 }
 
 run_one mirror2-ref || { say "reference arm failed; not running the 3-root arm (see $OUT/mirror2-ref-run_arm.log)"; exit 1; }
-run_one mirror3 "SGLANG_MOE_EXPERT_MIRROR_DIRS=$ROOTS3"
+run_one mirror3 "SGLANG_EXPERT_STREAM_MIRROR={\"dirs\":\"$ROOTS3\"}"
 rc=$?
 ref=$(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/mirror2-ref-run_arm.log" | head -1)
 new=$(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/mirror3-run_arm.log" | head -1)

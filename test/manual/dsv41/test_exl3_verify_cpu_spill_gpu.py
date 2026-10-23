@@ -9,7 +9,7 @@ Plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 13. A lane per route (36 on a
     the live misses stage, the forced ones are read into RAM victims and computed there, and stay cached.
 Run on divix01 from the pushed worktree, holding rowimg-disk.lock then cc-gpu.lock, on the recipe's server cores (the
 CPU expert team derives node 0's 6-15):
-  CUDA_MODULE_LOADING=EAGER SGLANG_DSV41_CPU_EXPERTS=1 EXL3_MOE_CPU_PIN=0 SGLANG_EXL3_SRC=... SGLANG_EXL3_CPU_CXX=...
+  CUDA_MODULE_LOADING=EAGER SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 SGLANG_EXL3_MOE_CPU_PIN=0 SGLANG_EXL3_SRC=... SGLANG_EXL3_CPU_CXX=...
   taskset -c 0-5,56-61 python -m pytest -q test/manual/dsv41/test_exl3_verify_cpu_spill_gpu.py
 """
 
@@ -23,8 +23,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_exl3_ram_miss_graph_gpu import HIDDEN, INTER, _reference, _rel, _source_rows  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and os.environ.get("SGLANG_EXL3_SRC") and os.environ.get("SGLANG_DSV41_CPU_EXPERTS") == "1"),
-    reason="needs a GPU, SGLANG_EXL3_SRC and SGLANG_DSV41_CPU_EXPERTS=1 (the optimized CPU build)",
+    not (torch.cuda.is_available() and os.environ.get("SGLANG_EXL3_SRC") and os.environ.get("SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS") == "1"),
+    reason="needs a GPU, SGLANG_EXL3_SRC and SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 (the optimized CPU build)",
 )
 
 ACT_LIMIT = 10.0
@@ -42,33 +42,33 @@ def _distinct(experts):
 
 def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_once_armed(tmp_path):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.moe import exl3_ram_miss as service_module
-    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_engine import service as service_module
+    from sglang.srt.layers.moe.expert_engine.formats.exl3 import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.moe.ram_slot_map import LaneKind
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import dsv41_exl3_pairing, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     source = _source_rows(tmp_path, num_experts=EXPERTS)
     source_cuda = {name: rows.cuda() for name, rows in source.items()}
     layout = build_exl3_expert_layout(str(tmp_path))
-    service_module.Exl3RamMissService._instance = None
-    service = service_module.Exl3RamMissService.get()
+    service_module.ExpertEngineService._instance = None
+    service = service_module.ExpertEngineService.bind(**dsv41_exl3_pairing())
     try:
         with (
             service_row_images(tmp_path),
-            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
-            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(True),
+            envs.SGLANG_EXPERT_STREAM_ROW_SOURCE.override("shards"),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
+            envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'),
+            envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(True),
             envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True),
-            envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.override(True),
-            envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.override(False),
-            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(VICTIMS),
+            envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"),
+            envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"calibration": false}'),
+            envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(VICTIMS),
         ):
             model, layer = torch.nn.Module(), torch.nn.Module()
             layer.layer_id, layer.top_k = 0, TOP_K

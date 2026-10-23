@@ -12,24 +12,23 @@ from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.srt.environ import envs
-
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_engine.config import Dsv41ProfileConfig
     from sglang.srt.layers.moe.ram_prefetch_learned_head import LearnedHeadFile
 
 # The host's bounds: host/gate_scorer.h GateScorer::kDepth and kMaxPerLayer, host/ram_prefetch.h SpecPool::kMaxShare.
 MAX_PER_TOKEN = 12
 MAX_PER_LAYER = 8
 MAX_SPEC_SHARE = 4
-# SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US's bound: a read that waits for an idle drive keeps its pool entry reading
+# prefetch.ram.idle_deadline_us's bound: a read that waits for an idle drive keeps its pool entry reading
 # and, when promoted, a forced miss waiting; 100 ms is far past any useful wait and far under the watchdog's 30 s.
 MAX_IDLE_DEADLINE_US = 100_000
-# SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES's bound: host/ram_prefetch.h RamPrefetchConfig::kMaxIdlePieces.
+# prefetch.ram.idle_pieces's bound: host/ram_prefetch.h RamPrefetchConfig::kMaxIdlePieces.
 MAX_IDLE_PIECES = 4
-# SGLANG_DSV41_RAM_PREFETCH_HORIZON's bound: residency_capture_ref.HORIZONS, the deepest lookahead measured offline.
+# prefetch.ram.horizon's bound: residency_capture_ref.HORIZONS, the deepest lookahead measured offline.
 MAX_HORIZON = 4
 
-# SGLANG_DSV41_RAM_PREFETCH_SCORER's values.
+# prefetch.ram.scorer's values.
 SCORERS = ("cpu", "gpu")
 # The GPU scorer's margin floors when SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS is unset (the file says what it was fit on).
 MARGIN_FLOORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ram_prefetch_margin_floors.json")
@@ -163,7 +162,7 @@ def prefetch_tables(
 
 @dataclass(frozen=True)
 class SpecScoreRow:
-    """One source row's GPU scoring (SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu): its target row's live router gate and VRAM
+    """One source row's GPU scoring (prefetch.ram.scorer "gpu"): its target row's live router gate and VRAM
     hot slots, which the scoring kernels' captured parameters point at."""
 
     weight: torch.Tensor  # [experts, hidden], bf16 or fp32 (router_fp32): the router's own parameter
@@ -220,10 +219,14 @@ def read_margin_floors(path: str) -> dict[int, float]:
     return floors
 
 
-def margin_floors_path(scorer: str) -> Optional[str]:
+def margin_floors_path(scorer: str, *, dsv41: Optional[Dsv41ProfileConfig] = None) -> Optional[str]:
     """The floors file ``scorer`` runs with: ``SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS`` when set (empty: none), else
-    the packaged table for the GPU scorer and none for the CPU scorer."""
-    floors = envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.get()
+    the packaged table for the GPU scorer and none for the CPU scorer. ``dsv41`` defaults to the process's
+    ``resolved_config().dsv41``."""
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
+
+    dsv41 = resolved_config().dsv41 if dsv41 is None else dsv41
+    floors = dsv41.ram_prefetch.margin_floors_path
     if floors is None:
         return MARGIN_FLOORS if scorer == "gpu" else None
     return floors or None

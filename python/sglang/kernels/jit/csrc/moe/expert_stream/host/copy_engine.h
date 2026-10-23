@@ -60,7 +60,7 @@ struct CopyEntry {
   uint64_t src = 0;
   uint64_t dst = 0;
   int64_t bytes = 0;
-  bool sm = false;  // copied by the copy wait's SM reads, not the DMA (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES)
+  bool sm = false;  // copied by the copy wait's SM reads, not the DMA (SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES)
 };
 
 /// The copy primitive the copy thread drives: issue copies in order, mark the point after them, and ask whether a

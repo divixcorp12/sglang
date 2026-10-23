@@ -87,27 +87,33 @@ def test_the_module_is_loaded_once_and_kept(tmp_path):
 
 
 def test_the_scalar_cap_runs_the_scalar_tier(tmp_path):
-    """NVFP4_CPU_MAX_ISA=scalar must select the scalar tier in a library that also holds the AVX2 one."""
+    """nvfp4_cpu_configure("scalar", ...) (what SGLANG_EXPERT_STREAM_CPU_MAX_ISA=scalar passes it) must select the scalar
+    tier in a library that also holds the AVX2 one. The kernel reads no env: the harness's --max-isa and --report-isa
+    flags call the configure function."""
     exe = _build_module().build(
         tmp_path / "ab", cxx=CXX, main=REPO / "test/manual/dsv41/nvfp4_cpu_forward_ab.cpp"
     )
     cores = sorted(os.sched_getaffinity(0))[:1]
+    env = {k: v for k, v in os.environ.items() if k not in ("SGLANG_EXPERT_STREAM_CPU_MAX_ISA", "SGLANG_EXPERT_STREAM_CPU_REPORT_ISA")}
     capped = subprocess.run(
-        [str(exe), str(tmp_path / "scalar.bin"), str(cores[0])],
-        env={**os.environ, "NVFP4_CPU_MAX_ISA": "scalar", "NVFP4_CPU_REPORT_ISA": "1"},
-        capture_output=True, text=True, timeout=900,
+        [str(exe), "--max-isa=scalar", "--report-isa", str(tmp_path / "scalar.bin"), str(cores[0])],
+        env=env, capture_output=True, text=True, timeout=900,
     )
     assert capped.returncode == 0, capped.stdout + capped.stderr
     assert "nvfp4 isa scalar" in capped.stderr
 
     # The report prints when the tier is detected, before dispatch reads it: the dumps prove dispatch ran that tier. The
     # AVX2 tier's FMA accumulation rounds differently from the scalar loop, so on an AVX2 host the uncapped dump differs.
-    env = {k: v for k, v in os.environ.items() if k != "NVFP4_CPU_MAX_ISA"}
     uncapped = subprocess.run(
-        [str(exe), str(tmp_path / "default.bin"), str(cores[0])],
-        env={**env, "NVFP4_CPU_REPORT_ISA": "1"},
-        capture_output=True, text=True, timeout=900,
+        [str(exe), "--report-isa", str(tmp_path / "default.bin"), str(cores[0])],
+        env=env, capture_output=True, text=True, timeout=900,
     )
+    # The env names alone configure nothing: the kernel reads none (a set MAX_ISA must not cap the tier).
+    ignored = subprocess.run(
+        [str(exe), "--report-isa", str(tmp_path / "ignored.bin"), str(cores[0])],
+        env={**env, "SGLANG_EXPERT_STREAM_CPU_MAX_ISA": "scalar"}, capture_output=True, text=True, timeout=900,
+    )
+    assert ignored.returncode == 0 and ignored.stderr == uncapped.stderr
     assert uncapped.returncode == 0, uncapped.stdout + uncapped.stderr
     if "nvfp4 isa scalar" in uncapped.stderr:
         pytest.skip("this host runs the scalar tier uncapped, so there is no second tier to tell apart")
@@ -185,8 +191,8 @@ def test_the_native_harness_passes(tmp_path, harness, flags, cap):
     exe = _build_module().build(
         tmp_path / Path(harness).stem, cxx=CXX, main=REPO / "test/registered/unit/kernels" / harness, extra_flags=flags
     )
-    env = {k: v for k, v in os.environ.items() if k != "NVFP4_CPU_MAX_ISA"}
+    env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_CPU_MAX_ISA"}
     if cap:
-        env["NVFP4_CPU_MAX_ISA"] = cap
+        env["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = cap
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=900, env=env)
     assert result.returncode == 0, result.stdout + result.stderr

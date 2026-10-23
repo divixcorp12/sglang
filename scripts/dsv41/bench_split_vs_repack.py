@@ -54,7 +54,7 @@ import torch
 
 from bench_expert_reads import drop_superset_ranges, superset_file_bytes
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import (  # noqa: F401 (EXL3_STREAMED_NAMES: tests)
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import (  # noqa: F401 (EXL3_STREAMED_NAMES: tests)
     EXL3_STREAMED_NAMES,
     Exl3ExpertFormat,
 )

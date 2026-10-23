@@ -139,8 +139,8 @@ def test_reset_drops_graph_capture_warmup_counts_without_reallocating_state():
 def test_calibration_collection_is_disabled_unless_explicitly_requested():
     """Timed arms must not accidentally pay for profiling-only observation."""
     with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION", None)
-        assert envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get() is False
+        os.environ.pop("SGLANG_EXPERT_STREAM_SHADOW_PREFETCH", None)
+        assert not envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.get()  # the group is unset: calibration is off
 
 
 def test_extended_summarizer_keeps_roles_fixed_and_bootstraps_paired_sessions():

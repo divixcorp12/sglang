@@ -291,10 +291,10 @@ def test_serving_rids_exclude_warm_up_and_health_check_requests():
 
 
 def test_the_copy_engine_state_reads_the_ram_miss_service_without_importing_it(monkeypatch):
-    name = "sglang.srt.layers.moe.exl3_ram_miss"
+    name = "sglang.srt.layers.moe.expert_engine.service"
 
     def with_service(service):
-        module = SimpleNamespace(Exl3RamMissService=SimpleNamespace(_instance=service))
+        module = SimpleNamespace(ExpertEngineService=SimpleNamespace(_instance=service))
         monkeypatch.setitem(sys.modules, name, module)
         return ram_miss_copy_engine_state()
 

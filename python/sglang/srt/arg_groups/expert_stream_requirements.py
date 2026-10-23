@@ -1,9 +1,10 @@
 """Server-argument requirements of MoE expert caching, per expert format.
 
 ``handle_offload_compatibility`` runs while server arguments are processed, before
-any model is loaded. Once ``SGLANG_MOE_HOT_GPU_MB`` or
-``SGLANG_MOE_PINNED_HOST_MB`` is nonzero, it looks up the requirements of the
-launch's expert format here and runs their check.
+any model is loaded. Once ``SGLANG_EXPERT_STREAM_HOT_GPU_MB`` or
+``SGLANG_EXPERT_STREAM_PINNED_HOST_MB`` is nonzero, it looks up the requirements of the
+launch's expert format here and runs their check. The checks read the engine settings
+from the process's resolved config (``layers/moe/expert_engine/config.py``).
 
 The format is identified by its quantization method (:func:`expert_quant_method`).
 Each method that can stream experts maps to one :class:`ExpertStreamRequirements`;
@@ -11,8 +12,8 @@ this module registers NVFP4's. Another format registers its own by calling
 :func:`register_expert_stream_requirements` at import time of a module named
 ``sglang.srt.arg_groups.expert_stream_requirements_<method>``. The gate imports that
 module on the method's first use. Such a module runs during server-args processing,
-so it must import only this module, ``sglang.srt.environ`` and the standard library:
-no quantization, model or torch-heavy code.
+so it must import only this module, ``sglang.srt.environ``, the engine config and the
+standard library: no quantization, model or torch-heavy code.
 
 A launch whose method cannot be determined yet (no ``--quantization``, no model
 configuration built, no local ``config.json`` naming a method) keeps the NVFP4
@@ -34,7 +35,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 
 PLUGIN_MODULE_PREFIX = "sglang.srt.arg_groups.expert_stream_requirements_"
@@ -57,9 +57,8 @@ NVFP4_QUANT_METHODS = (
 class ExpertCacheBudgets:
     """The expert cache settings the gate has already read and range-checked.
 
-    ``hot_budget_mb`` and ``pinned_budget_mb`` are ``SGLANG_MOE_HOT_GPU_MB`` and
-    ``SGLANG_MOE_PINNED_HOST_MB``; ``graph_gather`` is
-    ``SGLANG_MOE_EXPERT_GRAPH_GATHER``.
+    ``hot_budget_mb`` and ``pinned_budget_mb`` are ``hot_cache.gpu_mb`` and
+    ``tiers.pinned_host_mb``; ``graph_gather`` is ``copy.graph_gather``.
     """
 
     hot_budget_mb: int
@@ -74,7 +73,7 @@ class ExpertStreamRequirements:
     ``label`` names the format in error messages. ``check(cfg, budgets)`` raises
     ``ValueError`` for an unsupported launch; ``cfg`` is the resolving view of the
     server arguments. ``graph_gather_host_source`` is where graph gathers read host
-    rows: ``"arena"`` (``SGLANG_MOE_EXPERT_HOST_ARENA``, indexed by expert id) or
+    rows: ``"arena"`` (``SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA``, indexed by expert id) or
     ``"pinned_tier"`` (the format's pinned host tier).
     """
 
@@ -194,7 +193,7 @@ def expert_stream_requirements_for(
         requirements = _REGISTRY.get(method)
     if requirements is None:
         raise ValueError(
-            "MoE expert caching (SGLANG_MOE_HOT_GPU_MB, SGLANG_MOE_PINNED_HOST_MB) "
+            "MoE expert caching (SGLANG_EXPERT_STREAM_HOT_GPU_MB, SGLANG_EXPERT_STREAM_PINNED_HOST_MB) "
             f"does not support quantization method {method!r}; supported methods: "
             f"{sorted(_REGISTRY)}. A format declares its launch requirements in "
             f"{PLUGIN_MODULE_PREFIX}<method>"
@@ -202,43 +201,49 @@ def expert_stream_requirements_for(
     return requirements
 
 
+def stream_settings():
+    """The process's ExpertStreamConfig, imported on use so a plugin's import stays light."""
+    from sglang.srt.layers.moe.expert_engine.config import stream_config
+
+    return stream_config()
+
+
 def validate_hot_cache_policy() -> None:
     """Check the hot cache's residency-policy knobs.
 
     Any format with a hot budget runs this. Raises ``ValueError`` for an
-    out-of-range ``SGLANG_MOE_HOT_*`` value.
+    out-of-range ``SGLANG_EXPERT_STREAM_HOT_*`` value.
     """
-    if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
-        raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
-    if envs.SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS.get() < 0:
-        raise ValueError("SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS must be nonnegative")
-    if envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get() < 0:
-        raise ValueError("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS must be nonnegative")
-    if envs.SGLANG_MOE_HOT_DECAY_TOKENS.get() < 0:
-        raise ValueError("SGLANG_MOE_HOT_DECAY_TOKENS must be nonnegative")
-    sigmas = envs.SGLANG_MOE_HOT_PROMOTION_SIGMAS.get()
+    stream = stream_settings()
+    residency = stream.residency
+    if residency.update_prefill_tokens < 1:
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS must be positive")
+    if residency.update_decode_forwards < 0:
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS must be nonnegative")
+    if residency.min_residence_forwards < 0:
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS must be nonnegative")
+    if residency.decay_tokens < 0:
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_DECAY_TOKENS must be nonnegative")
+    sigmas = residency.promotion_sigmas
     if not math.isfinite(sigmas) or sigmas < 0:
         raise ValueError(
-            "SGLANG_MOE_HOT_PROMOTION_SIGMAS must be finite and nonnegative"
+            "SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS must be finite and nonnegative"
         )
-    ratio = envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get()
+    ratio = residency.benefit_ratio
     if not math.isfinite(ratio) or ratio < 0:
-        raise ValueError("SGLANG_MOE_HOT_BENEFIT_RATIO must be finite and nonnegative")
-    if envs.SGLANG_MOE_HOT_LOG_INTERVAL.get() < 1:
-        raise ValueError("SGLANG_MOE_HOT_LOG_INTERVAL must be positive")
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO must be finite and nonnegative")
+    if stream.hot_cache.log_interval < 1:
+        raise ValueError("SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL must be positive")
 
 
 def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
-    """The NVFP4 launch requirements: one request at a time, no parallelism or overlap.
-
-    ``SGLANG_MOE_EXPERT_STREAM`` is read raw from the environment, as it always was.
-    """
+    """The NVFP4 launch requirements: one request at a time, no parallelism or overlap."""
     hot_budget_mb = budgets.hot_budget_mb
     pinned_budget_mb = budgets.pinned_budget_mb
     graph_gather = budgets.graph_gather
-    streaming = os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
-    if not streaming:
-        raise ValueError("NVFP4 hot caching requires SGLANG_MOE_EXPERT_STREAM=1")
+    stream = stream_settings()
+    if not stream.enabled:
+        raise ValueError("NVFP4 hot caching requires SGLANG_EXPERT_STREAM_ENABLE=1")
     if cfg.moe_runner_backend != "flashinfer_cutlass":
         raise ValueError(
             "NVFP4 hot caching requires --moe-runner-backend flashinfer_cutlass"
@@ -254,11 +259,11 @@ def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
     # Graph gather with GPU residency keeps route accounting and slot changes on the
     # forward stream, so result processing may trail the next launch.
     if not cfg.disable_overlap_schedule and not (
-        graph_gather and envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
+        graph_gather and stream.residency.gpu_update
     ):
         raise ValueError(
             "NVFP4 hot caching requires --disable-overlap-schedule unless "
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER=1 and SGLANG_MOE_GPU_RESIDENCY_UPDATE=1"
+            "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1 and SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1"
         )
     if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
         raise ValueError("NVFP4 hot caching requires both batch overlap modes disabled")
@@ -280,7 +285,7 @@ def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
         raise ValueError("NVFP4 hot caching does not support EPLB")
     if hot_budget_mb:
         recorder = cfg.expert_distribution_recorder_mode
-        if envs.SGLANG_MOE_HOT_DYNAMIC.get() and recorder not in ("stat", "per_pass"):
+        if stream.residency.dynamic and recorder not in ("stat", "per_pass"):
             raise ValueError(
                 "Dynamic NVFP4 hot caching requires --expert-distribution-recorder-mode "
                 "stat or per_pass"
@@ -342,28 +347,26 @@ def eager_expert_stream_requirements(
     def check(cfg: Any, budgets: ExpertCacheBudgets) -> None:
         if not enabled():
             raise ValueError(f"{label} expert caching requires {enable_hint}")
+        stream = stream_settings()
         if budgets.graph_gather:
             raise ValueError(
                 f"{label} expert caching does not support "
-                "SGLANG_MOE_EXPERT_GRAPH_GATHER; set it to 0"
+                "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER; set it to 0"
             )
-        if envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
+        if stream.tiers.host_arena:
             raise ValueError(
                 f"{label} expert caching does not support "
-                "SGLANG_MOE_EXPERT_HOST_ARENA; set it to 0"
+                "SGLANG_EXPERT_STREAM_ENABLE_HOST_ARENA; set it to 0"
             )
-        if envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get() > 0:
+        if stream.prefetch.legacy_max_candidates > 0:
             raise ValueError(
                 f"{label} expert caching does not support expert prefetch; "
-                "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
+                "set SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES to 0"
             )
-        if (
-            envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
-            and not allow_gpu_residency_update()
-        ):
+        if stream.residency.gpu_update and not allow_gpu_residency_update():
             raise ValueError(
                 f"{label} expert caching does not support "
-                "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"
+                "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE; set it to 0"
             )
         graph_config = cfg.cuda_graph_config
         if graph_config is not None and (
@@ -377,7 +380,7 @@ def eager_expert_stream_requirements(
             )
         if budgets.hot_budget_mb:
             recorder = cfg.expert_distribution_recorder_mode
-            if envs.SGLANG_MOE_HOT_DYNAMIC.get() and recorder not in (
+            if stream.residency.dynamic and recorder not in (
                 "stat",
                 "per_pass",
             ):

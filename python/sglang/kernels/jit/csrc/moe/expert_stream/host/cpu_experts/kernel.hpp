@@ -68,13 +68,13 @@ struct ForwardCall {
   float* out = nullptr;
   bool accumulate = false;
   std::span<const int> cores;
-  // A two-stage CPU miss (SGLANG_DSV41_CPU_TWO_STAGE): worker 0 calls stage_two(stage_two_ctx) once the gate/up GEMVs
+  // A two-stage CPU miss (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): worker 0 calls stage_two(stage_two_ctx) once the gate/up GEMVs
   // are done and before anything reads the second-stage slabs (w2), the rest of the team waiting until it returns. A
   // kernel that cannot split its forward calls it first. Null: one stage.
   void (*stage_two)(void*) = nullptr;
   void* stage_two_ctx = nullptr;
   // An overwrite (accumulate false) may store each row's first sum and zero only the rows no route writes, instead of
-  // zeroing every row and then adding (SGLANG_DSV41_CPU_EXPERTS_STORE_OUT). The bits are the same either way; a kernel
+  // zeroing every row and then adding (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT). The bits are the same either way; a kernel
   // that ignores it overwrites as before. Last, so a kernel built before it reads a call it knows.
   bool store_first = false;
 };

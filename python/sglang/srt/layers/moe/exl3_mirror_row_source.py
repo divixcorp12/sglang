@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Sequence
 
-from sglang.srt.layers.moe.exl3_expert_format import RowSegment
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader

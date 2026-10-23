@@ -1,4 +1,4 @@
-"""The served prefill-share A/B (SGLANG_DSV41_ENABLE_PREFILL_SHARE) against lane_eval.py's predictions: per run, the
+"""The served prefill-share A/B (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE) against lane_eval.py's predictions: per run, the
 decode tier and cost per verify and per prompt's prefill, from the job trace and the route log.
 
 Per run (clean serving prompts by serve_compare's flags, or the pair's with --pair):

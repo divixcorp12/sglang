@@ -62,7 +62,18 @@ def main():
             errors[type(error).__name__] += 1
             return ""
 
-    wanted = ("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + args.prefix).encode()
+    def carries_prefix(environ):
+        # SGLANG_EXPERT_STREAM_TRACE is a JSON object; the job trace prefix is its "job.prefix" key.
+        for entry in environ.split(b"\0"):
+            if entry.startswith(b"SGLANG_EXPERT_STREAM_TRACE="):
+                try:
+                    group = json.loads(entry.split(b"=", 1)[1])
+                    if group["job"]["prefix"] == args.prefix:
+                        return True
+                except (ValueError, KeyError, TypeError):
+                    pass
+        return False
+
     selected = None
     started = time.monotonic()
     discovery_at = memory_at = 0
@@ -91,7 +102,7 @@ def main():
                         # retains the exact unique prefix; inspect ancestors without dumping their environments.
                         ancestor = directory
                         for _ in range(4):
-                            if wanted in ancestor.joinpath("environ").read_bytes().split(b"\0"):
+                            if carries_prefix(ancestor.joinpath("environ").read_bytes()):
                                 selected = directory
                                 break
                             parent = ancestor.joinpath("stat").read_text().rsplit(")", 1)[1].split()[1]

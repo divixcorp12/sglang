@@ -139,7 +139,7 @@ node0_gate() {  # <arm>: the first arm settles the tier (full, else 90g); later 
     done
 }
 tier_overrides() {
-    echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
+    echo "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
 }
 
 memory_sample() {  # <label>: node-0/node-1 MemFree and VmallocUsed/Slab (MiB) appended to $OUT/memory.jsonl

@@ -16,8 +16,10 @@ python python/sglang/srt/layers/quantization/nvfp4/build.py \
 `sglang.srt.layers.quantization.nvfp4.ext.nvfp4_cpu_module()` builds the library on first use with `$CXX`
 and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags and compiler. The build targets
 baseline x86-64 and holds both ISA tiers: at the first forward the library picks AVX2 on an AVX2/FMA host, else the
-scalar loop. `NVFP4_CPU_MAX_ISA=scalar` caps the tier (it never raises it) and `NVFP4_CPU_REPORT_ISA=1` prints the
-tier chosen (`nvfp4 isa avx2`) to stderr. The arithmetic needs `-ffp-contract=off` and must never be built with
+scalar loop. `SGLANG_EXPERT_STREAM_CPU_MAX_ISA=scalar` caps the tier (it never raises it) and
+`SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1` prints the tier chosen (`nvfp4 isa avx2`) to stderr; Python passes both to the
+library's `nvfp4_cpu_configure` export before the first forward, and a native harness calls `nvfp4_cpu_configure`
+(kernel.h) itself. The arithmetic needs `-ffp-contract=off` and must never be built with
 `-Ofast`.
 
 The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under

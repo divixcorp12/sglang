@@ -52,7 +52,7 @@ def _kernel():
     from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
-        pytest.skip("the kernel under test is the optimized one: set SGLANG_DSV41_CPU_EXPERTS=1")
+        pytest.skip("the kernel under test is the optimized one: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1")
     if len(CORES) < 4:
         pytest.skip("needs 4 cores in the affinity mask")
     return Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT), CORES[:4]
@@ -159,7 +159,7 @@ def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slot
     from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, _ = _kernel()
     if len(CORES) < threads:
         pytest.skip(f"needs {threads} cores in the affinity mask")
@@ -202,7 +202,7 @@ def test_two_core_groups_at_once_match_one_group_bit_for_bit(monkeypatch):
     affinity test below; a shared static scratch, or a forward lock returning 3 -- red here."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     a, b = cores[:2], cores[2:4]
     layer = _layer(trait, 20261003)
@@ -230,7 +230,7 @@ def test_each_groups_workers_run_on_its_own_cores(monkeypatch):
     cores. Mutant: pin every worker from one core list -- red."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     layer = _layer(trait, 20261005)
     x, slots, weights = _inputs()[0]
@@ -269,7 +269,7 @@ def test_the_kernel_refuses_what_it_cannot_run(monkeypatch):
     thread stays unpinned, so it runs here)."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     layer = _layer(trait, 1)
     x, slots, weights = _inputs()[0]
@@ -302,9 +302,9 @@ def test_two_full_teams_run_at_once_at_a_thread_limit_of_their_sum(monkeypatch):
     """Review Focus 3: OMP_THREAD_LIMIT equal to the two core groups' workers (2 + 2) leaves neither team short: the
     teams are the engine's own threads (team.hpp), which no OpenMP limit counts. libgomp reads the limit at load, so
     this runs in a child."""
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     _kernel()  # skips here, not in the child
-    env = dict(os.environ, OMP_THREAD_LIMIT="4", EXL3_MOE_CPU_PIN="0")
+    env = dict(os.environ, OMP_THREAD_LIMIT="4", SGLANG_EXL3_MOE_CPU_PIN="0")
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_LIMIT_SCRIPT), os.path.dirname(__file__)],
         env=env, capture_output=True, text=True, timeout=1800,
@@ -319,7 +319,7 @@ def test_a_multi_row_forward_on_prod_matches_one_row_forwards(monkeypatch):
     the rows' routes by expert, so this pins that grouping to the one-row results bit for bit, at m = 1..6."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(20261005, HIDDEN, INTER), CAP),
                             variant="prod")

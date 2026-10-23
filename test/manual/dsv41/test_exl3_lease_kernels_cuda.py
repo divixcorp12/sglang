@@ -1,6 +1,6 @@
 """The slot-map chain's kernels on a real GPU against the real C++ service (LEASE_PROTOCOL.md).
 
-Every gather is the production ``Exl3RamMissRowBackend.post`` (lease_chain_rig.Chain): post -> C1 -> S -> CW -> stream
+Every gather is the production ``ExpertEngineRowBackend.post`` (lease_chain_rig.Chain): post -> C1 -> S -> CW -> stream
 wait -> CC. Every byte check reads a snapshot taken on the gather's stream before anything synchronizes, so a chain
 that ended before its copies landed would show as stale bytes.
 
@@ -281,7 +281,7 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
     zeros_u8 = torch.zeros(1, dtype=torch.uint8, device="cuda")
     no_i64 = torch.empty(0, dtype=torch.int64, device="cuda")
     no_i32 = torch.empty(0, dtype=torch.int32, device="cuda")
-    ops._device_module("exl3", lanes).expert_stream_post(
+    ops._device_module(ops.EXL3_BUILD, lanes).expert_stream_post(
         page, state, planned, torch.tensor([count], dtype=torch.int32, device="cuda"), planned.clone(), 0, experts,
         int(block.data_ptr()), 5_000_000_000, 0, 0, no_i64, 0, dst, 0, ram_slot,
         torch.full((1, w.lanes), -1, dtype=torch.int32, device="cuda"),
@@ -311,7 +311,7 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
 
 @pytest.mark.parametrize("lanes, nodes", [(8, 1), (8, 2), (16, 2)])
 def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
-    assert int(ops._device_module("exl3", lanes, nodes).expert_stream_wire_nodes()) == nodes
+    assert int(ops._device_module(ops.EXL3_BUILD, lanes, nodes).expert_stream_wire_nodes()) == nodes
 
 
 
@@ -321,7 +321,7 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
               split_model=None):
     """One post of the node-aware device build over one row: ``ram`` its slot map, ``staging`` node-major, ``split``
     node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes.
-    ``row_split``: the row's own node-major table (SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS), else -1 (the block's).
+    ``row_split``: the row's own node-major table (SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables), else -1 (the block's).
     ``scratch_words``: the GPU drip's scratch table (u64 per slot), written to the block and read by the post as that
     many slots; ``scratch_out`` (a list) then receives C1s's compacted (rows, dst slots, count).
     ``copy_ce``: the copy engine may take hits (hit_copy ce, the row's copy table set, w.lanes destination rows);
@@ -369,7 +369,7 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
     if split_model is not None:
         model = torch.tensor(list(split_model) + [0] * (1 + 2 * nodes), dtype=torch.int64, **cuda)
     count_t = torch.tensor([count], dtype=torch.int32, **cuda)
-    ops._device_module("exl3", lanes, nodes).expert_stream_post(
+    ops._device_module(ops.EXL3_BUILD, lanes, nodes).expert_stream_post(
         page, torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, **cuda), planned_t, count_t,
         planned_t.clone() if routes is None else torch.tensor(routes, dtype=torch.int64, **cuda), 0, experts,
         int(block.data_ptr()), 5_000_000_000, 0, 0, no_i64, 0,
@@ -435,7 +435,7 @@ def test_the_split_is_per_node_and_a_zero_split_keeps_a_node_off_the_cpu():
 
 
 def test_a_row_split_replaces_the_lease_split_for_its_row_only():
-    """SGLANG_DSV41_CPU_EXPERTS_SPLIT_LAYERS: a row with its own table types its lanes by it on every node, whatever
+    """SGLANG_EXPERT_STREAM_CPU_SPLIT layer_tables: a row with its own table types its lanes by it on every node, whatever
     the lease's tables say (what calibration and the retune write); -1 at its first word keeps the lease's. Mutations:
     the post ignoring row_split, or reading it for every row -- red on one of the two posts."""
     lanes, nodes = 8, 2
@@ -488,7 +488,7 @@ def _split_model_want(w, planned, ram, staging, split, forced_from, dst, routes,
 
 @pytest.mark.parametrize("lanes, nodes", [(8, 1), (8, 2), (16, 2), (40, 2)])
 def test_the_split_model_types_lanes_like_the_reference(lanes, nodes):
-    """Experiment (SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL): 300 random records -- hits, NVMe misses, forced lanes from a
+    """Experiment (SGLANG_EXPERT_STREAM_CPU_SPLIT model): 300 random records -- hits, NVMe misses, forced lanes from a
     spill point, destinations past the row's, routes naming experts 1-4 times, cost words on a grid that makes ties --
     type kind for kind and slot for slot as ram_slot_map.type_lanes(split_model=...), counters included; with the
     copy engine off the table and the miss cut type them. Mutations: ties broken last-lane first, a forced miss's
@@ -589,7 +589,7 @@ def test_the_calibration_pull_copies_pinned_host_ranges():
     ranges = [(0, 0, 4096), (8192, 8192, 300_000), (1, 400_001, 777)]  # (source offset, destination offset, bytes)
     table = torch.tensor([[host.data_ptr() + s, dst.data_ptr() + d, n] for s, d, n in ranges], dtype=torch.int64,
                          device="cuda")
-    ops._device_module("exl3", 8, 1).expert_stream_calibration_pull(table)
+    ops._device_module(ops.EXL3_BUILD, 8, 1).expert_stream_calibration_pull(table)
     torch.cuda.synchronize()
     for s, d, n in ranges:
         assert torch.equal(dst[d : d + n].cpu(), host[s : s + n]), (s, d, n)
@@ -688,7 +688,7 @@ def test_the_copy_wait_flags_the_cpu_part_of_each_lanes_node(kinds, nodes_of, pa
     state[ops.STATE_WORDS["pending"]] = 1
     ce_mask = torch.full((3,), -1, dtype=torch.int32, **cuda)
     cpu_lanes = torch.full((2,), -1, dtype=torch.int32, **cuda)
-    ops._device_module("exl3", lanes, nodes).expert_stream_lease_copy_wait(
+    ops._device_module(ops.EXL3_BUILD, lanes, nodes).expert_stream_lease_copy_wait(
         state, torch.tensor([count], dtype=torch.int32, **cuda), int(block.data_ptr()), lane_kind,
         torch.arange(w.lanes, dtype=torch.int32, **cuda), lane_node, torch.arange(w.lanes, dtype=torch.int32, **cuda),
         0, 0, ce_mask, cpu_lanes, 0,

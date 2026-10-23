@@ -35,6 +35,7 @@ later-turn prompts differ from the pre-2026-10-16 runs: don't compare across the
 
 from __future__ import annotations
 
+import json
 import os
 
 import msgspec
@@ -122,7 +123,7 @@ SERVER_CORES = "0-5,56-61"
 # fewer: not comparable to earlier cells. 26 is what ThreadingConfig derives anyway (the highest physical core below the
 # copy thread's 27); naming it keeps node 0's CPU experts contiguous (6-21), with the driver above them (22-25).
 SPIN_CORE = 26
-# CPU expert workers per NUMA node (SGLANG_DSV41_CPU_EXPERTS_THREADS): node 0 gets 6-21, node 1 28-43. 16 since
+# CPU expert workers per NUMA node (SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS): node 0 gets 6-21, node 1 28-43. 16 since
 # 2026-10-22 (10 before): one-token CPU forwards run 17-21% faster at 16 than at 10 (DSV_OPTIMIZATION.md 3.14); past 16
 # they are bound by node memory bandwidth. Arms from here on are not comparable to earlier cells.
 CPU_EXPERTS_THREADS = 16
@@ -130,7 +131,7 @@ CPU_EXPERTS_THREADS = 16
 # whose cores are the NVMe-side experts'. It moved from 18-21 when the experts grew to 16 threads.
 DRIVER_CORES = "22-25"
 # The capture helpers (memsample, nvidia-smi, prelaunch_evict): the driver cores' SMT siblings, the last node-0 CPUs no
-# server, expert (or, with SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT, expert sibling 62-77), RAM or copy thread holds.
+# server, expert (or, with SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT, expert sibling 62-77), RAM or copy thread holds.
 HELPER_CORES = "78-81"
 # Never touched: the top four physical cores of node 1 (the NVMe node) and their siblings, for NVMe completion
 # interrupts. Nothing pins the interrupts there yet (irqbalance spreads them over node 1 and node 0's siblings 57-83); a
@@ -154,7 +155,7 @@ GPU_JOB_CORES = "0-27,56-83"
 # comparable to the 2.741 / 2.102 cells, which were measured at 71680 MiB; a valid A/B
 # needs both of its arms run at the same value.
 #
-# Since 2026-09-24 the tier is 100 GiB, bound explicitly with SGLANG_MOE_PINNED_HOST_NUMA_MB
+# Since 2026-09-24 the tier is 100 GiB, bound explicitly with SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB
 # rather than placed by first touch: 60 GiB on node 0, the most that fits beside the
 # weights with 4 GiB of headroom, and 40 GiB on node 1. That node's share comes from reclaiming
 # co-tenants' page cache (DSV41_REFERENCE.md section 24.6). Startup refuses a node that
@@ -220,13 +221,13 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB": "128",
         "SGLANG_DSV41_ENGRAM_RAM_GIB": "5",
         "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "1",
-        "SGLANG_DSV41_EXPERT_STREAM": "1",
-        "SGLANG_DSV41_EXPERT_DIR": EXPERT_DIR,
-        "SGLANG_MOE_EXPERT_ROW_SOURCE": "shards",
-        "SGLANG_MOE_EXPERT_MIRROR_DIRS": EXPERT_MIRROR_DIRS,
-        "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
-        "SGLANG_MOE_PINNED_HOST_MB": PINNED_HOST_MB,
-        "SGLANG_MOE_PINNED_HOST_NUMA_MB": PINNED_HOST_NUMA_MB,
+        "SGLANG_EXPERT_STREAM_ENABLE": "1",
+        "SGLANG_EXPERT_STREAM_EXPERT_DIR": EXPERT_DIR,
+        "SGLANG_EXPERT_STREAM_ROW_SOURCE": "shards",
+        "SGLANG_EXPERT_STREAM_MIRROR": json.dumps({"dirs": EXPERT_MIRROR_DIRS}),
+        "SGLANG_EXPERT_STREAM_FILE_READER": "uring_direct",
+        "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": PINNED_HOST_MB,
+        "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": PINNED_HOST_NUMA_MB,
         # 14336 + 3072 on the indexer cap's freed VRAM: 110.1 -> 103.0 ms/token, byte-identical (27.7). Counts against
         # MEM_FRACTION_STATIC. Cut to 16100 for 4096-token prefill chunks and a 262144 context (27.17); the decode cost
         # of the cut is not measured (27.7's slope suggests ~2-3 ms/token). Cut to 15400 on 2026-09-29 for driver
@@ -234,28 +235,28 @@ def base_env() -> dict[str, str]:
         # 15080 since 2026-09-29, with MEM_FRACTION_STATIC 0.875: its ~320 MiB goes to prefill headroom.
         # 16080 since 2026-09-29: --language-model-only frees the ~0.97 GB vision tower (no weights in the
         # checkpoint) and the 0.10 GB multimodal reservation; 1000 MiB of that goes here.
-        "SGLANG_MOE_HOT_GPU_MB": "16080",
-        "SGLANG_MOE_HOT_DYNAMIC": "1",
-        "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
-        "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
-        "SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS": "8",
-        "SGLANG_MOE_HOT_ASYNC_PROMOTIONS": "0",
-        "SGLANG_MOE_ASYNC_RESIDENCY_SCORES": "0",
-        "SGLANG_MOE_HOT_LOG_INTERVAL": "64",
-        "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "1",
-        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "2",
-        "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
-        "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
-        "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
-        "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
-        "SGLANG_DSV41_RAM_MISS_SPIN_CORE": str(SPIN_CORE),
+        "SGLANG_EXPERT_STREAM_HOT_GPU_MB": "16080",
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_DYNAMIC": "1",
+        "SGLANG_EXPERT_STREAM_HOT_UPDATE_PREFILL_TOKENS": "256",
+        "SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS": "1",
+        "SGLANG_EXPERT_STREAM_HOT_MIN_RESIDENCE_FORWARDS": "8",
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_ASYNC_PROMOTIONS": "0",
+        "SGLANG_EXPERT_STREAM_ENABLE_ASYNC_RESIDENCY_SCORES": "0",
+        "SGLANG_EXPERT_STREAM_HOT_LOG_INTERVAL": "64",
+        "SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE": "1",
+        "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": "2",
+        "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES": "0",
+        "SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN": "1",
+        "SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS": "2000",
+        # The RAM thread's core, as node 0's plan (the node is derived from SPIN_CORE).
+        "SGLANG_EXPERT_STREAM_NUMA_CORES": f"{node_of_cpu(SPIN_CORE)}:ram={SPIN_CORE}",
         # CPU experts on both NUMA nodes' pinned tiers (ThreadingConfig derives each node's cores; see SERVER_CORES).
-        # EXL3_MOE_CPU_PIN=0: the engine pins its own workers; the kernel's default would pin them to the first cores.
-        "SGLANG_DSV41_CPU_EXPERTS": "1",
-        "SGLANG_DSV41_CPU_EXPERTS_THREADS": str(CPU_EXPERTS_THREADS),
-        "EXL3_MOE_CPU_PIN": "0",
-        # The lease chain's W1 budget (the chain is two-phase with piece streaming, DSV41_REFERENCE.md section 24).
-        "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
+        # SGLANG_EXL3_MOE_CPU_PIN=0: the engine pins its own workers; the kernel's default would pin them to the first
+        # cores.
+        "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": "1",
+        "SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS": str(CPU_EXPERTS_THREADS),
+        "SGLANG_EXL3_MOE_CPU_PIN": "0",
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
         # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
         "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
@@ -266,7 +267,7 @@ def base_env() -> dict[str, str]:
         # (docs/superpowers/plans/2026-09-25-dsv41-final-arms.md). Needs the device wait above (no graph host nodes).
         # A kernel module first loaded mid-step after arming can still fail-stop the server (LEASE_PROTOCOL.md, "Copy engine"),
         # and graph-mode nsys must not be used with it on.
-        "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "1",
+        "SGLANG_EXPERT_STREAM_COPY_MODE": "copy_engine",
         # The copy engine requires it and the server refuses to start without it: a kernel loaded lazily after the
         # copy engine arms fail-stopped the soak deterministically, never under EAGER
         # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). Costs ~1 GiB, hence MEM_FRACTION_STATIC.
@@ -275,29 +276,29 @@ def base_env() -> dict[str, str]:
         # issued up front: TTFT 21.06/17.79 -> 12.05/11.14 s, decode unchanged, byte-identical (DSV41_REFERENCE.md 27.6).
         # Reads the row images the RAM-miss service always reads (built on every mirror root by
         # scripts/dsv41/build_row_images.py; startup refuses a root without a matching set).
-        "SGLANG_DSV41_ENABLE_PREFILL_FILLS": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS": "1",
         # A prefill's pinned-tier admissions own at most 64 rows per layer, then evict their own LRU row instead of
         # decode's. Served A/B 2026-10-16 (DSpark -mergechunk-expseg arm, one pair): -3.46 ms/token, 95% CI
         # -4.91..-1.55, TTFT -0.48 s; 56-59% of decode's NVMe-cold GPU lanes had been evicted by a prefill
         # (DSV_OPTIMIZATION.md 3.8, /mnt/nvme1/share64-ab-20261016). Needs --expert-distribution-recorder-mode
         # (passed below); the service refuses to start without it. On by the owner's decision, 2026-10-16.
-        "SGLANG_DSV41_ENABLE_PREFILL_SHARE": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE": "1",
         # Fewer fp16/bf16 casts around the EXL3 gemvs at BS1 decode: 358 fewer kernels per step, bit-identical,
         # 112.4 -> 111.8 ms/token (within noise; DSV41_REFERENCE.md 27.8).
         "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION": "1",
         # The eager streamed MoE queues each chunk's compute behind its gather instead of waiting for it: TTFT
         # 12.6 -> 9.9 s on a 260-token prompt, outputs identical (DSV41_REFERENCE.md 27.11).
-        "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN": "1",
         # A prefill chunk copies its rows already in the pinned tier before waiting for its fills: TTFT 9.9 -> 8.6 s,
         # outputs identical (DSV41_REFERENCE.md 27.12).
-        "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER": "1",
         # CW reads each RAM-hit row's four small tensors itself, so the copy engine sends 2 copies per row, not 6:
         # outputs identical, ~1 ms/step in a node-mode trace, within noise untraced (DSV41_REFERENCE.md 27.14).
         # Needs the copy engine above.
-        "SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES": "1",
         # The lease chain's kernels launch with PDL: at most ~1 us/layer, outputs identical
         # (analysis/dsv41-drive/chain-pdl/results.md, on expert-stream-transfer-measurement). Needs the leases above.
-        "SGLANG_DSV41_ENABLE_LEASE_PDL": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL": "1",
         # Suffixes of 8192+ uncached tokens prefill layer-major: token 0 identical to chunked at 8k-33k
         # (DSV41_REFERENCE.md 27.19, 27.20). Not yet measured at 128k+. An arm sets "0" to force chunked.
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
@@ -328,7 +329,7 @@ PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
 # Since 2026-10-22 production's pinned tier holds every routed expert row (owner, after the 128 GB RAM upgrade; the request
 # was +90 GiB, the useful maximum is this). The pin01 arms' tier (both_cpu_ab.PIN01_BUDGET) was layers 0 and 1 whole plus
 # the old tier's rows elsewhere: 111,530 MiB, 0:59656,1:51874. Now every layer is a full layer
-# (SGLANG_MOE_PINNED_HOST_FULL_LAYERS 0-39), because a layer outside the list loses its staging and prefetch-pool slots
+# (SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS 0-39), because a layer outside the list loses its staging and prefetch-pool slots
 # to the RAM-miss table and so cannot map all 384 experts. A full layer buys, per NUMA group (expert % 2 homes it): its
 # 384 / 2 = 192 homed experts, the slots its table holds back and 2 seam slots (expert_stream.full_layer_group_rows).
 # With every streamed layer full the model is fully pinned (expert_stream.model_fully_pinned): no expert can miss, so the
@@ -418,22 +419,22 @@ def dspark_env() -> dict[str, str]:
     return {
         # The verify in the breakable decode graph with a lane per route (MISS_LANES unset: 36 lanes, a 40-lane wire),
         # the first 8 VRAM victims; the rest are CPU lanes, a miss among them read into a RAM victim (Owner decision 3).
-        "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "8",
+        "SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES": "8",
         "SGLANG_RAGGED_VERIFY_MODE": "static",
         # Layer-major prefill off for the arms: under speculative decoding it needs SGLANG_ENABLE_LAYER_MAJOR_PREFILL_DSPARK
         # as well (layer_major/gate.py refuses the launch otherwise). Production turns both on in prod_dspark_env().
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
         # The draft's CPU experts as a second job source of node 0's CPU expert team (one team per node), on the
         # optimized build (its gate names both defines).
-        "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": "1",
-        "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
+        "SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS": "1",
+        "SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
         "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
         "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
         # Stated off: the row-weighted B arms (analysis/dsv41-drive/dspark/both_cpu_ab.py) override it, and a captured
         # shell must not carry one into an A.
         "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "",
         # Budget A, with DSPARK_MEM_FRACTION_STATIC (reasons and the owner's option-C TODO at DSPARK_MEM_FRACTION_STATIC).
-        "SGLANG_MOE_HOT_GPU_MB": DSPARK_HOT_GPU_MB,
+        "SGLANG_EXPERT_STREAM_HOT_GPU_MB": DSPARK_HOT_GPU_MB,
         # FlashInfer for every arm and production (owner, 2026-10-20: full FlashInfer everywhere). Every DSpark text
         # result before it ran triton attention (§33.2, §33.8, §33.9). Served pair on the 32k prompt
         # (/mnt/nvme1/fi-prefill/serve-20261019-0300 and -control): TTFT 63.8 s vs triton 81.4 / 80.5 s, accept len 2.36
@@ -456,30 +457,34 @@ def prod_dspark_env() -> dict[str, str]:
         **PROD_DSPARK_CUT_ENV,
         # Whole layers 0 and 1 in the pinned tier, in a tier grown to hold them: 70.5 vs 76.2 ms/token, layers 0+1
         # 20.5 -> 13.0 ms a verify (DO 3.1; the OFF run was stall-flagged).
-        "SGLANG_MOE_PINNED_HOST_FULL_LAYERS": PROD_DSPARK_PINNED_FULL_LAYERS,
-        "SGLANG_MOE_PINNED_HOST_MB": PROD_DSPARK_PINNED_HOST_MB,
-        "SGLANG_MOE_PINNED_HOST_NUMA_MB": PROD_DSPARK_PINNED_HOST_NUMA_MB,
+        "SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS": PROD_DSPARK_PINNED_FULL_LAYERS,
+        "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": PROD_DSPARK_PINNED_HOST_MB,
+        "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": PROD_DSPARK_PINNED_HOST_NUMA_MB,
         # The DIRECT insert score without eager (prefill) routes, and a longer decay (0.98 -> 0.999): +15.6 hits a verify
         # at 1010 slots (385.1 vs 369.5, 42.0 -> 43.8%), every trace +12..+17, in the offline replay (branch
         # hot-cache-replay-1022's hot_policy_replay.py; divix01 hot-replay-1022/today-1010). With prefill counted,
         # every decay above 0.98 lost hits. Owner, 2026-10-22: shipped before its served A/B.
-        "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS": "0",
-        "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY": "0.999",
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS": "0",
+        "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY": "0.999",
         # A DIRECT newcomer is the next victim until a later forward routes it again. Owner, 2026-10-22: production
         # without an A/B or a replay.
-        "SGLANG_ENABLE_HOT_INSERT_PROBATION": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_PROBATION": "1",
         # Each record's CPU/copy split from a cost model: 65.9 vs 67.9 ms/token, wait -9.4 ms a verify (DO 3.2, a pair).
         # Its costs are measured at startup whenever it is on (split_model_calibration.py; on failure the table types
         # the lanes), never refined live (owner rule: values calculated at startup; refinement had no gain, DO 3.4).
-        "SGLANG_DSV41_ENABLE_CPU_SPLIT_MODEL": "1",
-        "SGLANG_DSV41_CPU_SPLIT_MODEL_COSTS": "",
-        "SGLANG_DSV41_CPU_SPLIT_MODEL_REFINE_BATCHES": "0",
         # The split table calibrated at startup (the library default, stated): the arms ran it off (-fixedsplit) only to
         # hold the table fixed between A and B (REF 33.36). With the model on, it types lanes only if the model is off.
-        "SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": "1",
         # The miss cut at its library default, stated: what the split model replaces when it is on.
-        "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "1",
-        "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3",
+        "SGLANG_EXPERT_STREAM_CPU_SPLIT": json.dumps(
+            {
+                "model": True,
+                "model_costs": "",
+                "model_refine_batches": 0,
+                "calibration": True,
+                "miss_cut": 1,
+                "miss_cut_max": 3,
+            }
+        ),
         # mlockall in the scheduler: the CPU expert teams' major faults 11,877 -> 20-250 a run (DO 3.4).
         "SGLANG_ENABLE_SCHEDULER_MLOCK": "1",
         # HiCache host pools on node 1: node 0's load-time swap 11.6 GiB -> 5 MB, throughput unchanged (DO 3.4).
@@ -491,7 +496,7 @@ def prod_dspark_env() -> dict[str, str]:
         # The caching allocator on expandable segments: ~1.5 GB of stranded reserve recovered at no cost (-0.26
         # ms/token, CI -0.39..-0.02), spent on 1,035 hot slots: -1.79 ms/token, CI -4.51..-0.64 (DO 3.7, expseg2).
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "SGLANG_MOE_HOT_GPU_MB": PROD_DSPARK_HOT_GPU_MB,
+        "SGLANG_EXPERT_STREAM_HOT_GPU_MB": PROD_DSPARK_HOT_GPU_MB,
         # The hot cache sized at every launch from measured free memory (trial capture, warm-up replay, grow or trim
         # from PROD_DSPARK_HOT_GPU_MB): owner rule. Served pair neutral, +0.62 ms/token, CI -1.88..+2.60, margin held
         # under serving (DO 3.7). A failed calibration keeps the configured size. Without the A1/A2 cuts it was served
@@ -508,22 +513,23 @@ def prod_dspark_env() -> dict[str, str]:
         # could not be resolved (LANE_TIER_REPLAY_HANDOFF.md): owner decision, 2026-10-16. Its 2 pool slots a group
         # are in the usable rows the prefill share is sized from (64 = 64/187 x 187 on this layout). Production only, not
         # base_env(): it was never measured without DSpark, and every DSpark arm states its prefetch keys itself.
-        "SGLANG_DSV41_RAM_PREFETCH": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_SCORER": "gpu",
-        "SGLANG_DSV41_RAM_PREFETCH_HORIZON": "2",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "gpu",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON": "2",
         "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": PROD_RAM_PREFETCH_LEARNED_HEAD,
-        "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "2",
-        "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
-        "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "2",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE": "2",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_TOP_K_ONLY": "0",
         "SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS": "",
-        "SGLANG_DSV41_RAM_PREFETCH_IDLE_DRIVE": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_IDLE_PIECES": "2",
-        "SGLANG_DSV41_RAM_PREFETCH_IDLE_SPREAD": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
-        "SGLANG_DSV41_RAM_PREFETCH_PROMOTE": "1",
-        "SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE": "1",
-        "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",  # the older GPU-side expert prefetch stays off (base_env's, stated)
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_DRIVE": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_PIECES": "2",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_IDLE_SPREAD": "1",
+        "SGLANG_EXPERT_STREAM_RAM_PREFETCH_IDLE_DEADLINE_US": "4000",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE": "1",
+        "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE": "1",
+        # The older GPU-side expert prefetch stays off (base_env's, stated).
+        "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES": "0",
         # Layer-major prefill under DSpark: every uncached suffix of 8192+ tokens is prefilled layer by layer, as
         # base_env() does for the non-DSpark recipe (token 0 identical to chunked at 8k-33k, DSV41_REFERENCE.md 27.19,
         # 27.20). Owner decision 2026-10-17, with no served A/B first (both_cpu_ab's -prod-layermajor is that arm).
@@ -568,6 +574,29 @@ def prod_env() -> dict[str, str]:
     """Production's env: the base recipe, with the DSpark mode and production's DSpark settings once PROD_DSPARK is
     set."""
     return arm_env({**dspark_env(), **prod_dspark_env()}) if PROD_DSPARK else base_env()
+
+
+def node_of_cpu(cpu: int) -> int:
+    """The NUMA node of a divix01 cpu (the core layout above: node 0 is 0-27 and 56-83, node 1 the rest)."""
+    return 0 if cpu % 56 < 28 else 1
+
+
+def new_names_env(env: dict[str, str]) -> dict[str, str]:
+    """An env written with the removed names (a stale script, an arm's overrides) as the same settings under the F145
+    names. The recipes above already use the new names; this is for translating a recipe saved before the rename.
+
+    The translation is expert_engine/removed_env.translate_env: group members become one JSON object per group, the
+    stream switches and copy mechanisms merge, SPIN_CORE becomes a NUMA_CORES entry, and the retired HIT_WAIT_US is
+    dropped.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "python/sglang/srt/layers/moe/expert_engine/removed_env.py"
+    spec = importlib.util.spec_from_file_location("expert_engine_removed_env", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.translate_env(env, node_of_cpu)
 
 
 class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):

@@ -90,7 +90,7 @@ class HeldBackSlots(Protocol):
     """A slot table whose owner keeps some slots of every NUMA group out of ``assign`` (staging, a prefetch pool).
 
     ``held_back_per_group`` bounds that count from above before the owner starts; a tier that must map every expert
-    (``SGLANG_MOE_PINNED_HOST_FULL_LAYERS``) is sized past it.
+    (``tiers.pinned_host_full_layers``) is sized past it.
     """
 
     def held_back_per_group(self) -> int: ...
@@ -99,7 +99,7 @@ class HeldBackSlots(Protocol):
 class PinnedRowFills(Protocol):
     """Asynchronous reads of a layer's missing rows into its pinned slots.
 
-    Enabled by ``SGLANG_DSV41_ENABLE_PREFILL_FILLS``. Driven by
+    Enabled by ``copy.prefill.fills``. Driven by
     ``ExpertPinnedHostCache`` inside one host use.
 
     * ``fill_begin`` claims slots for ``experts`` in order, until one has no victim
