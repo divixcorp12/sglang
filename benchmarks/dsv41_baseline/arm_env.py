@@ -388,15 +388,16 @@ PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4",
 # file is there with this SHA256 (check_prod_assets).
 PROD_RAM_PREFETCH_LEARNED_HEAD = "/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors"
 PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309"
-# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the cut arm
-# only (both_cpu_ab's -prod-confcut); production stays off and loads neither. Fitted 2026-10-16 from the -prod-stscollect
-# arm's long-prompt capture (/mnt/nvme1/sts-collect-20261016, 2,048 verifies): temperatures 0.89/0.79/1.26/0.89/0.63,
-# ECE 2.9-3.8% -> 2.1-3.0%. Read-only copy, 0444.
+# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the
+# both_cpu_ab cut arms only. Fitted 2026-10-16 on the pre-1017 checkpoint from the -prod-stscollect arm's long-prompt
+# capture (/mnt/nvme1/sts-collect-20261016, 2,048 verifies): temperatures 0.89/0.79/1.26/0.89/0.63, ECE 2.9-3.8% ->
+# 2.1-3.0%. Read-only copy, 0444. Production runs the cut at T=1 (owner, 2026-10-23): replaying that capture through
+# the cut, the file moved tokens/ms by 0.3% over T=1 (divix01:/mnt/nvme1/sts-replay-20261023/report.json).
 PROD_DSPARK_STS_PATH = "/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json"
 PROD_DSPARK_STS_SHA256 = "a0f2fc7c6acd4ca06dca213d68954b3f46e0fef2a5e6ed4ab460feda7538bcd5"
 # The confidence cut as production runs it since 2026-10-18 (owner), which is both_cpu_ab's -prod-confcut-sampled arm: the
 # cut for sampled requests (production is sampled traffic), the draft's time priced into T(w), no online refit (one
-# sample cannot judge it), on the greedy STS file above (ServerArgs.prod passes it). The draft stays sampled
+# sample cannot judge it), at T=1 since 2026-10-23 (no STS file, see above). The draft stays sampled
 # (SGLANG_DSPARK_USE_GREEDY_DRAFT off) and block verification stays off. DSV_OPTIMIZATION.md 3.12: 60-360 s ms/token
 # 73.14 -> 61.60 / 66.3 (two cut runs), ms per verify 186.2 -> 130.4 / 138.2.
 PROD_DSPARK_CUT_ENV = {
@@ -552,17 +553,14 @@ def prod_dspark_env() -> dict[str, str]:
 
 
 def check_prod_assets(head: str = PROD_RAM_PREFETCH_LEARNED_HEAD,
-                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256,
-                      sts: str = PROD_DSPARK_STS_PATH,
-                      sts_sha256: str = PROD_DSPARK_STS_SHA256) -> str:
-    """launch_prod.sh's asset check: the prefetch head production loads and the confidence cut's STS file each exist and
-    hash to their pinned SHA256. Returns a line for each saying so; raises SystemExit with the reason otherwise."""
+                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) -> str:
+    """launch_prod.sh's asset check: the RAM prefetch head exists and hashes to its pinned SHA256. Returns a line saying
+    so; raises SystemExit with the reason otherwise."""
     import hashlib
 
     lines = []
     for what, path, pinned, constant, verified in (
         ("RAM prefetch head", head, sha256, "PROD_RAM_PREFETCH_LEARNED_HEAD", "prefetch head verified"),
-        ("DSpark confidence STS file", sts, sts_sha256, "PROD_DSPARK_STS_PATH", "confidence STS file verified"),
     ):
         if not os.path.isfile(path):
             raise SystemExit(f"not starting production: the {what} {path} is missing "
@@ -626,7 +624,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     drop_cache_after_load: bool = False
     # Production's warm-up also runs dsv41_decode_paths (~35 s); the arms keep the prefill-only one they measured with.
     decode_warmup: bool = False
-    # The confidence cut's STS file (PROD_DSPARK_STS_PATH for production); the arms append theirs through
+    # The confidence cut's STS file; production passes none (T=1), the arms append theirs through
     # both_cpu_ab.ARM_SPEC_FLAGS.
     dspark_sts_path: str | None = None
 
@@ -642,7 +640,6 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
             drop_cache_after_load=True,
             decode_warmup=True,
-            dspark_sts_path=PROD_DSPARK_STS_PATH,
         )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:

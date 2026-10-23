@@ -1018,7 +1018,6 @@ def test_prod_server_args_serve_the_prod_mode_on_port_7867_on_all_interfaces():
         max_total_tokens=arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS,
         drop_cache_after_load=True,
         decode_warmup=True,
-        dspark_sts_path=arm_env.PROD_DSPARK_STS_PATH,
     ).argv()
     assert prod[prod.index("--host") + 1] == "0.0.0.0"
     assert prod[prod.index("--port") + 1] == "7867"
