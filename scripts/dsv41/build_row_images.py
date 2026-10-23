@@ -337,8 +337,10 @@ def _build_chunk(job: _LayerJob, first: int, count: int, src_fds: dict[str, int]
         _read_at_least(src_fds[record.path], raw[:length], start, lead + record.nbytes)
         image = ri.image_of_row(image_layout, raw[lead : lead + record.nbytes])
         job.digests[first + i] = ri.row_digest(image)
-        # The padding after each image in ``out`` is never written, so it stays the zeros mmap gave it.
         out[i * stride : i * stride + image_bytes] = image
+        # Zeroed on every row: the thread's buffer last held another layer's chunk, whose larger images
+        # (a mixed-K checkpoint) would otherwise leave their bytes in this layer's padding.
+        out[i * stride + image_bytes : (i + 1) * stride] = bytes(stride - image_bytes)
     for fd in job.fds.values():
         _write_all(fd, out[: count * stride], first * stride)
     if job.chunk_done():
