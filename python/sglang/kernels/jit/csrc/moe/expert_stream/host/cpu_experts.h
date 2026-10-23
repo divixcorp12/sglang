@@ -146,7 +146,7 @@ struct CpuExpertConfig {
 /// The CPU expert thread, its job ring and its done word.
 ///
 /// A CPU lane is a RAM-tier expert the device typed with kLeaseTagCpu: the engine runs it from its host slot through
-/// the format's CpuExpertKernel and writes the result into the row's pinned output, which the device folds into its
+/// the format's kernel (Build::CpuKernel) and writes the result into the row's pinned output, which the device folds into its
 /// fused MoE. A failed forward fails stop.
 ///
 /// The tier's owner (the service thread) is the only client: it claims sequences with claim() and submits jobs with

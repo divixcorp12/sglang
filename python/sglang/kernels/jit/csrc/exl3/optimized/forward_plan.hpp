@@ -840,13 +840,13 @@ SglangExl3CpuPlanInfo plan_info()
     return info;
 }
 
-// Every compiled plan, the generic plan first; sglang_exl3_cpu::plans lists these.
+// Every compiled plan, the generic plan first; the host's cpu_kernel_plans lists these.
 std::vector<SglangExl3CpuPlanInfo> plan_infos() { return {plan_info<GenericShape>(), plan_info<Dsv41Shape>()}; }
 
 const char* plan_rejects(const ExpertLayer& l, const SglangExl3CpuParams& p)
 {
     if (p.plan == GenericShape::kPlan) return nullptr;
-    if (p.plan != Dsv41Shape::kPlan) return "plan is not a compiled plan id (sglang_exl3_cpu::plans)";
+    if (p.plan != Dsv41Shape::kPlan) return "plan is not a compiled plan id (cpu_kernel_plans)";
     if (!Dsv41Shape::kBuilt)
         return "plan dsv41 is not built: it needs residual activations in 128-wide blocks (ACT_ROWS 2, act block 128)";
     if (kPlanIsa < Dsv41Shape::kMinIsa)

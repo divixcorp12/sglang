@@ -20,7 +20,7 @@ struct Chunk
     unsigned first = 0;  // bit r: row r is token[r]'s first write of the call (ForwardCtx::store_first)
 };
 
-// Each Shape is one plan's facts, which sglang_exl3_cpu::plans lists and registration checks (plan_rejects): its id
+// Each Shape is one plan's facts, which the host's cpu_kernel_plans lists and registration checks (plan_rejects): its id
 // and name, the lowest ISA tier it runs at, and whether this build compiles what it needs (kBuilt).
 struct GenericShape
 {
