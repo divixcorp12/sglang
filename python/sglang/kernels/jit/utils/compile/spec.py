@@ -50,6 +50,8 @@ class BuildSpec(msgspec.Struct, frozen=True):
     ldflags: Tuple[str, ...]
     include_paths: Tuple[str, ...]
     header_only: bool
+    # (absolute source, flags) pairs sorted by source; the flags replace `cflags` for that one file.
+    source_cflags: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     @property
     def module_name(self) -> str:

@@ -484,6 +484,75 @@ def test_non_header_only_module_compiles_its_sources_in_place(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Per-source flags (load_jit's source_cflags)
+# --------------------------------------------------------------------------
+
+
+def _two_sources(**overrides) -> BuildSpec:
+    return _spec(
+        cpp_files=("/src/host.cpp", "/src/nvfp4.c"),
+        cpp_wrappers=(),
+        header_only=False,
+        **overrides,
+    )
+
+
+def _compile_flags(text: str) -> dict:
+    """Each object's cxxflags: its own `cxxflags` binding when it has one, else the module's."""
+    module = next(
+        line.split(" = ", 1)[1] for line in text.splitlines() if line.startswith("cxxflags = ")
+    )
+    flags, current = {}, None
+    for line in text.splitlines():
+        if line.startswith("build ") and ".o:" in line:
+            current = line.split(":")[0].removeprefix("build ")
+            flags[current] = module
+        elif current and line.startswith("  cxxflags = "):
+            flags[current] = line.removeprefix("  cxxflags = ")
+        elif not line.startswith("  "):
+            current = None
+    return flags
+
+
+def test_source_cflags_replace_the_module_flags_for_that_file_only():
+    """A C file gets `-x c -std=c11` and none of the module's `-std=c++20 -O3`; the other file and the toolchain's
+    own flags are untouched."""
+    spec = _two_sources(source_cflags=(("/src/nvfp4.c", ("-x", "c", "-std=c11", "-Ofast")),))
+    flags = _compile_flags(ninja.generate(spec))
+    host, c_file = flags["host_0.o"].split(), flags["nvfp4_1.o"].split()
+    assert "-std=c++20" in host and "-x" not in host
+    assert c_file[c_file.index("-x") : c_file.index("-x") + 4] == ["-x", "c", "-std=c11", "-Ofast"]
+    assert "-std=c++20" not in c_file and "-O3" not in c_file
+    assert "-fPIC" in c_file
+
+
+def test_source_cflags_reach_the_build_key():
+    plain = _build_key(cpp_files=("/src/host.cpp", "/src/nvfp4.c"), cpp_wrappers=(), header_only=False)
+    keys = {
+        plain,
+        *(
+            cache.compute_build_key(spec, build_file=ninja.generate(spec))
+            for spec in (
+                _two_sources(source_cflags=(("/src/nvfp4.c", ("-Ofast",)),)),
+                _two_sources(source_cflags=(("/src/nvfp4.c", ("-Ofast", "-DX=1")),)),
+                _two_sources(source_cflags=(("/src/host.cpp", ("-Ofast",)),)),
+            )
+        ),
+    }
+    assert len(keys) == 4
+
+
+def test_source_cflags_are_refused_where_they_cannot_apply():
+    from sglang.kernels.jit.utils.compile.loader import _resolved_source_cflags
+
+    flags = {"a.cpp": ["-O2"]}
+    with pytest.raises(ValueError, match="header_only=False"):
+        _resolved_source_cflags(flags, cpp_files=["a.cpp"], header_only=True)
+    with pytest.raises(ValueError, match="not in cpp_files"):
+        _resolved_source_cflags(flags, cpp_files=["b.cpp"], header_only=False)
+
+
+# --------------------------------------------------------------------------
 # Compiler launcher (SGLANG_JIT_COMPILER_LAUNCHER)
 # --------------------------------------------------------------------------
 
