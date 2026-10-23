@@ -23,15 +23,19 @@ using namespace ::sglang::cpu_experts;
 // The pinned tier's slabs, in exl3_expert_format.EXL3_STREAMED_NAMES order: one row per expert slot.
 enum SlabName { kW13Trellis, kW13Suh, kW13Svh, kW2Trellis, kW2Suh, kW2Svh, kSlabNames };
 
-// The fewest bytes one slot's row of each slab holds. w13 rows hold gate (part 0) then up (part 1); w2 rows hold
-// down. A trellis is [k/16][n/16][16 * bits] uint16, i.e. k * n * bits / 8 bytes; sign vectors are fp16.
-// Registration refuses a smaller stride; at exactly these strides every address equals the packed layout's.
-constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediate, int bits)
+// The fewest bytes one slot's row of each slab holds. w13 rows hold gate (part 0) then up (part 1), each at bits_w13;
+// w2 rows hold down at bits_w2. A trellis is [k/16][n/16][16 * bits] uint16, i.e. k * n * bits / 8 bytes; sign
+// vectors are fp16. Registration refuses a smaller stride; at exactly these strides every address equals the packed
+// layout's.
+constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediate, int bits_w13, int bits_w2)
 {
-    const uint64_t trellis = uint64_t(hidden) * uint64_t(intermediate) * uint64_t(bits) / 8;
-    return {2 * trellis, 2 * 2 * uint64_t(hidden), 2 * 2 * uint64_t(intermediate),
-            trellis, 2 * uint64_t(intermediate), 2 * uint64_t(hidden)};
+    const uint64_t weights = uint64_t(hidden) * uint64_t(intermediate);
+    return {2 * (weights * uint64_t(bits_w13) / 8), 2 * 2 * uint64_t(hidden), 2 * 2 * uint64_t(intermediate),
+            weights * uint64_t(bits_w2) / 8, 2 * uint64_t(intermediate), 2 * uint64_t(hidden)};
 }
+
+// Why the plan p.plan names cannot run layer l (nullptr: it can). Defined in forward_plan.hpp, beside the plans.
+const char* plan_rejects(const ExpertLayer& l, const SglangExl3CpuParams& p);
 
 // One projection's matrix over a slot's trellis and sign vectors (k inputs, n outputs).
 inline Exl3Projection exl3_projection(
@@ -64,24 +68,23 @@ struct Exl3Quant
 
     static std::array<uint64_t, kSlabs> row_bytes(const ExpertLayer& l, const Params& p)
     {
-        return ::sglang::exl3_cpu::row_bytes(l.hidden, l.intermediate, p.bits);
+        return ::sglang::exl3_cpu::row_bytes(l.hidden, l.intermediate, p.bits_w13, p.bits_w2);
     }
 
     // The layer's shape and the parameters (ExpertForward checks the slabs against row_bytes): make_matrix's limits,
-    // 128-element blocks and k <= 8192 for the int32 accumulators, and gated SiLU. Normalizes swizzled to the layout
-    // the slabs hold: 8-bit trellises are never swizzled.
+    // 128-element blocks and k <= 8192 for the int32 accumulators, gated SiLU, and a plan that accepts the layer.
     static const char* validate(const ExpertLayer& l, Params& p)
     {
-        if (p.bits < 1 || p.bits > 8 || (p.swizzled != 0 && p.swizzled != 1))
-            return "bits must be in [1, 8] and swizzled 0 or 1";
+        if (p.bits_w13 < 1 || p.bits_w13 > 8 || p.bits_w2 < 1 || p.bits_w2 > 8)
+            return "bits_w13 and bits_w2 must be in [1, 8]";
+        if (p.swizzled != 0 && p.swizzled != 1) return "swizzled must be 0 or 1";
         if (p.row_weighted != 0 && p.row_weighted != 1) return "row_weighted must be 0 or 1";
         if (l.hidden < 128 || l.intermediate < 128 || l.hidden % 128 || l.intermediate % 128 || l.hidden > 8192
             || l.intermediate > 8192)
             return "hidden and intermediate must be multiples of 128 in [128, 8192]";
         if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0.0f)
             return "the activation must be gated SiLU with a finite, non-negative act_limit";
-        if (p.bits == 8) p.swizzled = 0;
-        return nullptr;
+        return plan_rejects(l, p);
     }
 
     static bool usable(const ExpertLayer&, const Params&, int) { return true; }
@@ -101,25 +104,33 @@ struct Experts
 
     int H() const { if constexpr (Shape::kFixed) return Shape::kHidden; else return layer->hidden; }
     int I() const { if constexpr (Shape::kFixed) return Shape::kIntermediate; else return layer->intermediate; }
-    int B() const { if constexpr (Shape::kFixed) return Shape::kBits; else return params.bits; }
+    int B13() const { if constexpr (Shape::kFixed) return Shape::kBitsW13; else return params.bits_w13; }
+    int B2() const { if constexpr (Shape::kFixed) return Shape::kBitsW2; else return params.bits_w2; }
 
     Exl3Projection gate(int e) const { return w13(e, 0); }
     Exl3Projection up(int e) const { return w13(e, 1); }
     Exl3Projection down(int e) const
     {
         const ExpertRow r = (*layer)[e];
-        return exl3_projection(r.slab[kW2Trellis], r.slab[kW2Suh], r.slab[kW2Svh], I(), H(), B(), params.swizzled);
+        return exl3_projection(r.slab[kW2Trellis], r.slab[kW2Suh], r.slab[kW2Svh], I(), H(), B2(), swz(B2()));
     }
 
 private:
+    // A fixed Shape's plan accepted the layer's layout as it is; otherwise an 8-bit trellis is never swizzled.
+    int swz(int bits) const
+    {
+        if constexpr (Shape::kFixed) return params.swizzled;
+        else return bits == 8 ? 0 : params.swizzled;
+    }
+
     // Part 0 (gate) or 1 (up) of the slot's w13 rows.
     Exl3Projection w13(int e, int part) const
     {
         const ExpertRow r = (*layer)[e];
-        const std::array<uint64_t, kSlabNames> row = row_bytes(H(), I(), B());
+        const std::array<uint64_t, kSlabNames> row = row_bytes(H(), I(), B13(), B2());
         return exl3_projection(r.slab[kW13Trellis] + part * (row[kW13Trellis] / 2),
                            r.slab[kW13Suh] + part * (row[kW13Suh] / 2), r.slab[kW13Svh] + part * (row[kW13Svh] / 2),
-                           H(), I(), B(), params.swizzled);
+                           H(), I(), B13(), swz(B13()));
     }
 };
 

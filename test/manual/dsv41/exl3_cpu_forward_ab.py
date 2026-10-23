@@ -150,15 +150,20 @@ def run_two_core_groups(torch, handle, hidden, cases, halves):
 
 
 def dump(args):
-    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = args.isa  # read once, at the kernel's first use
+    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = args.isa  # the resolved config's cap, which configure passes
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 
     import sglang
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
     print(f"sglang {sglang.__file__}")
     ext = exl3_ext()
+    # The kernel takes its ISA cap from configure (kernel_address passes it), not the environment: before the first
+    # tier query below fixes the tier.
+    Exl3CpuQuantTrait(ext, act_limit=None).kernel_address()
     tier = (
         bool(ext.exl3_moe_cpu_has_avx2()),
         bool(ext.exl3_moe_cpu_has_avx512_bw()),

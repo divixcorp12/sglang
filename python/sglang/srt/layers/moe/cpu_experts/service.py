@@ -276,6 +276,8 @@ class CpuExpertService:
             return
         spec = self.trait.layer_spec({name: slabs[name] for name in self.trait.slab_names}, capacity)
         self.host.set_cpu_layer(row, spec)
+        if spec.plan:
+            logger.info("CPU experts group %d: layer row %d runs %s", self.group, row, spec.plan)
         self.layers[row] = spec
         if getattr(self, "device_side", None) is not None:
             self.device_side.set_row_cpu(row)

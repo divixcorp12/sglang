@@ -57,7 +57,8 @@ accessor exl3_cpu_kernel() (kernel.h, hidden: never interposed across libraries)
 optimized extension's torch op sglang_exl3_cpu::kernel_address (torch_ops.cpp), and the expert-stream host makes each
 streamed layer with the kernel's make_layer (ExpertStreamHost.set_cpu_layer) from a CpuExpertLayerSpec
 (Exl3CpuQuantTrait.layer_spec): the pinned tier's six slab base pointers and per-slot strides, with SglangExl3CpuParams
-(bits, swizzled, row_weighted; kernel.h) as its params bytes, packed by the torch op sglang_exl3_cpu::params. A layer (ExpertLayer,
+(bits_w13, bits_w2, swizzled, row_weighted, plan; kernel.h) as its params bytes, packed by the torch op
+sglang_exl3_cpu::params. A layer (ExpertLayer,
 kernel.hpp) is a value of views with its params stored in it: the caller keeps the slabs alive. Every forward and
 keep-warm carries its worker cores (distinct, in [0, CPU_SETSIZE)); a core that cannot be pinned fails the call. A
 refused call throws std::invalid_argument and a failed one another std::exception, leaving out untouched.
@@ -95,11 +96,14 @@ math.hpp holds the arithmetic every tier shares (state decode, Hadamard, activat
 math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; forward_plan.hpp holds the tier
 dispatch, the forward driver and the plans; kernel.cpp holds the public API. Registration, validation, the ISA
 tier, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp).
-The tier is min(host, SGLANG_EXPERT_STREAM_CPU_MAX_ISA), fixed at the first forward or tier query;
+The tier is min(host, SGLANG_EXPERT_STREAM_CPU_MAX_ISA), fixed at the first forward, tier query, plan listing or
+make_layer;
 SGLANG_EXPERT_STREAM_CPU_REPORT_ISA=1 prints "exl3 isa <tier>" to stderr then. Python passes both through the torch op
 sglang_exl3_cpu::configure before it takes the kernel's address; a native harness calls exl3_cpu_configure (kernel.h). A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
-picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
-an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. On a VNNI host (tier Vnni or Vbmi) the same
+picked once per layer, at registration: the layer's params name a plan id (ForwardPlan<Dsv41Shape, Isa::Bw> or
+ForwardPlan<GenericShape, I> for the host's tier), Python choosing it from the list sglang_exl3_cpu::plans returns (each
+plan's facts, ISA floor and availability) by the layer's facts, and make_layer refusing a plan that does not accept the
+layer (plan_rejects, forward_plan.hpp). Exl3Quant::dispatch then runs p.plan with no per-call check. On a VNNI host (tier Vnni or Vbmi) the same
 plan runs with its Vnni flag set: its register kernels (register_kernels.hpp, included once as reg_bw and once as
 reg_vnni by math_avx512.hpp) accumulate with vpdpwssd instead of vpmaddwd + vpaddd, bit-identically (the 16-bit byte sums
 and activation pairs are unchanged; both forms wrap mod 2^32). SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw runs the reg_bw copy, as before
@@ -108,7 +112,8 @@ specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal
 MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile tables (kTiles) and the
 register dispatch (register_tiles_for) are generated from it. A plan reads every layer fact
 through its Shape (shapes.hpp): GenericShape from the ExpertLayer, Dsv41Shape as compile-time constants (5120/2304,
-3-bit unswizzled, activation limit 10; a layer with any other value takes the generic plan). Every layer is gated SiLU.
+3-bit gate/up and down, unswizzled, activation limit 10; a layer with any other value takes the generic plan). The
+generic plan decodes gate/up at bits_w13 and down at bits_w2. Every layer is gated SiLU.
 Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and down, each an Exl3Projection over the
 slot's ExpertRow. Exl3Quant::dispatch groups the call's routes by expert itself (a sort of the call's live routes), which
 fixes the accumulation order.

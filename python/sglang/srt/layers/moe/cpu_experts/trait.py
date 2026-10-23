@@ -19,7 +19,8 @@ class CpuExpertLayerSpec:
 
     ``slabs`` holds one ``(address, slot bytes)`` pair per slab in the quant's order, ``(0, 0)`` for an absent optional
     slab; slot ``s`` of slab ``i`` starts at ``address + s * slot_bytes``. ``keep`` holds the tensors those addresses
-    point into: whoever registers the spec keeps them alive for as long as the host may read them.
+    point into: whoever registers the spec keeps them alive for as long as the host may read them. ``plan`` describes
+    the kernel specialization the params chose, for the registration log ("" when the quant has one).
     """
 
     capacity: int
@@ -30,6 +31,7 @@ class CpuExpertLayerSpec:
     params: bytes
     keep: tuple = ()
     activation: int = 0
+    plan: str = ""
 
 
 class CpuExpertQuantTrait(Protocol):
