@@ -1164,7 +1164,7 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     topology = _divix01_topology(tc, tmp_path)
     config = tc.ThreadingConfig.resolve(
         nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES),
-        topology=topology, settings=tc.CoreSettings(spin_core=arm_env.SPIN_CORE),
+        topology=topology, settings=tc.CoreSettings(numa_cores=arm_env.base_env()["SGLANG_EXPERT_STREAM_NUMA_CORES"]),
     )
     assert config.plans[0].ram == arm_env.SPIN_CORE and config.plans[0].busy_poll
     taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES)
@@ -1187,7 +1187,9 @@ def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_serv
     topology = _divix01_topology(tc, tmp_path)
     config = tc.ThreadingConfig.resolve(
         nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES), topology=topology,
-        settings=tc.CoreSettings(cpu_experts=True, threads=threads, spin_core=arm_env.SPIN_CORE),
+        settings=tc.CoreSettings(
+            cpu_experts=True, threads=threads, numa_cores=env["SGLANG_EXPERT_STREAM_NUMA_CORES"]
+        ),
     )
     assert [plan.threads for plan in config.plans] == [threads] * len(_recipe_nodes())
     busy = {c for plan in config.plans for c in plan.cores()} | set(config.copy_cpus)
@@ -1213,7 +1215,8 @@ def test_the_recipes_expert_pools_with_or_without_siblings_leave_the_driver_help
     config = tc.ThreadingConfig.resolve(
         nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES), topology=topology,
         settings=tc.CoreSettings(
-            cpu_experts=True, threads=arm_env.CPU_EXPERTS_THREADS, smt=smt, spin_core=arm_env.SPIN_CORE
+            cpu_experts=True, threads=arm_env.CPU_EXPERTS_THREADS, smt=smt,
+            numa_cores=arm_env.base_env()["SGLANG_EXPERT_STREAM_NUMA_CORES"],
         ),
     )
     assert [plan.threads for plan in config.plans] == [arm_env.CPU_EXPERTS_THREADS * (2 if smt else 1)] * 2
