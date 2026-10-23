@@ -79,9 +79,9 @@ thread_local int tl_swz_tiles_k = 0;
 
 #if defined(__GNUC__) && defined(__linux__)
 #define M1_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
-#define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
-#define M1_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
-#define M1_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
+#define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma,f16c")))
+#define M1_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,fma,f16c")))
+#define M1_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,avx512vbmi,fma,f16c")))
 #define M1_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
 #define M1_TARGET_AVX2
