@@ -428,6 +428,9 @@ class Envs:
     # decay still advances by their tokens. A prefill small enough for the graph gather is still counted. Needs
     # SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.
     SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS = EnvBool(True)
+    # Put each slot a DIRECT gather inserted into on probation: it ranks first for eviction until a later forward
+    # routes it again. Needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2.
+    SGLANG_ENABLE_HOT_INSERT_PROBATION = EnvBool(False)
     # Run stage 1's boundary insert copies through the fused masked Triton
     # kernel instead of index_select + index_copy_. Byte-identical output; one
     # pass instead of two, and idle lanes move no bytes. Off by default until a

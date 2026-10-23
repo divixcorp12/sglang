@@ -465,6 +465,9 @@ def prod_dspark_env() -> dict[str, str]:
         # every decay above 0.98 lost hits. Owner, 2026-10-22: shipped before its served A/B.
         "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS": "0",
         "SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY": "0.999",
+        # A DIRECT newcomer is the next victim until a later forward routes it again. Owner, 2026-10-22: production
+        # without an A/B or a replay.
+        "SGLANG_ENABLE_HOT_INSERT_PROBATION": "1",
         # Each record's CPU/copy split from a cost model: 65.9 vs 67.9 ms/token, wait -9.4 ms a verify (DO 3.2, a pair).
         # Its costs are measured at startup whenever it is on (split_model_calibration.py; on failure the table types
         # the lanes), never refined live (owner rule: values calculated at startup; refinement had no gain, DO 3.4).

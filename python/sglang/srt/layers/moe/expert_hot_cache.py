@@ -1599,6 +1599,7 @@ class ExpertHotCacheManager:
                 insert_on_miss_decay=float(insert_on_miss_decay),
                 fused_insert=fused_insert,
                 insert_eager_counts=envs.SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS.get(),
+                insert_probation=envs.SGLANG_ENABLE_HOT_INSERT_PROBATION.get(),
             )
         devices = {cache.device for cache in manager.caches.values()}
         manager.lane_head = None

@@ -1779,6 +1779,61 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertEqual(int(cache.expert_to_slot[second]), -1)
         assert_slot_rows(self, manager, self.model, "routed victim")
 
+    def test_probation_evicts_an_unrerouted_newcomer_before_any_settled_resident(self):
+        """SGLANG_ENABLE_HOT_INSERT_PROBATION: the miss a forward inserted is the next victim unless a later forward
+        routes it again, however its score compares. Without probation its own miss route protects it for one forward
+        and the lowest-scored settled resident goes. Routing it again releases it. Mutant: rank probation slots like
+        any other (drop the offset), and the first case evicts the low resident."""
+        from sglang.srt.environ import envs
+
+        for probation in (False, True):
+            self.model = _model()
+            with envs.SGLANG_ENABLE_HOT_INSERT_PROBATION.override(probation):
+                manager = _manager(self.model, gpu=True, **DIRECT)
+            updater = manager.gpu_residency
+            graph, static, outputs = self.capture(manager)
+            cache = manager.caches[0]
+            others = [[[0, 1]] for _ in range(LAYERS - 1)]
+            mapping = cache.expert_to_slot.tolist()
+            residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
+            outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+            self.assertEqual(len(residents), cache.capacity, "a free slot would take the miss first")
+            self.assertGreaterEqual(len(outsiders), 2)
+            keep, newcomer, second = residents[2], outsiders[0], outsiders[1]
+            self.step(manager, graph, static, outputs, [[[keep, residents[3]]]] + others, "warm")
+            self.step(manager, graph, static, outputs, [[[newcomer, keep]]] + others, "insert")
+            newcomer_slot = int(cache.expert_to_slot[newcomer])
+            self.assertGreaterEqual(newcomer_slot, 0)
+            settled = [e for e, s in enumerate(cache.expert_to_slot.tolist()) if s >= 0 and e not in (newcomer, keep)]
+            low = settled[0]
+            low_slot = int(cache.expert_to_slot[low])
+            scores = torch.full((EXPERTS,), 100.0)
+            scores[low], scores[newcomer] = 1.0, 1000.0
+            updater.insert_scores[0].copy_(scores)
+            torch.cuda.synchronize()
+            self.step(manager, graph, static, outputs, [[[keep, second]]] + others, f"probation={probation}")
+            if probation:
+                self.assertEqual(int(cache.expert_to_slot[second]), newcomer_slot, "the newcomer is the victim")
+                self.assertEqual(int(cache.expert_to_slot[newcomer]), -1)
+                self.assertTrue(bool(updater.probation[0, newcomer_slot]), "the next newcomer is on probation")
+                # The newcomer routed again by the forward after its insert leaves probation at the next boundary.
+                self.step(manager, graph, static, outputs, [[[second, keep]]] + others, "rerouted")
+                self.step(manager, graph, static, outputs, [[[keep, residents[3]]]] + others, "released")
+                self.assertFalse(bool(updater.probation[0, newcomer_slot]), "a rerouted newcomer leaves probation")
+                self.assertEqual(int(cache.expert_to_slot[second]), newcomer_slot)
+            else:
+                self.assertIsNone(updater.probation)
+                self.assertEqual(int(cache.expert_to_slot[second]), low_slot, "the low settled resident is the victim")
+                self.assertEqual(int(cache.expert_to_slot[newcomer]), newcomer_slot)
+            assert_slot_rows(self, manager, self.model, f"probation={probation}")
+
+    def test_probation_needs_direct(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_ENABLE_HOT_INSERT_PROBATION.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_HOT_INSERT_PROBATION"):
+                _manager(_model(), gpu=True, **IOM)
+
     def test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one(self):
         """`gather_destinations` takes a miss lane's rank from ``remap - scratch_base``, its expert
         from ``_graph_source_rows[rank]`` and its liveness from ``_graph_miss_count``. Under

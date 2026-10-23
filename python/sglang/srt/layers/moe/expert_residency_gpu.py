@@ -46,6 +46,9 @@ _STAGE_DIRECT = 2
 # Above every residency_rank_keys key of a nonnegative score: sign-bit-0 float32 bits
 # shifted left by 16 stay below 2**47. Adding it ranks a routed expert after all others.
 _ROUTED_RANK_OFFSET = 1 << 48
+# Above every key, routed or not (< 2**49). Probation adds it to the residents off probation, so a slot on probation
+# ranks before all of them and after the free slots' negative keys.
+_SETTLED_RANK_OFFSET = 1 << 50
 
 
 class GpuResidencyUpdater:
@@ -81,7 +84,9 @@ class GpuResidencyUpdater:
     * Stage 2 (DIRECT): the boundary only ranks a victim shortlist. The next
       forward's gather sends its miss copies straight into the shortlisted slots and
       commits residency in the same graph (:meth:`_init_insert_direct` states the
-      capacity guarantee).
+      capacity guarantee). With ``insert_probation`` a slot a gather inserted into
+      stays on probation, ranked ahead of every other resident for eviction, until a
+      later window routes it again (:meth:`_update_probation`).
 
     Device-to-device row copies were measured on the RTX 5090 over a 4.9 GiB working
     set, which is the size the production loop runs in (48 layers x 6 tensors per
@@ -101,6 +106,7 @@ class GpuResidencyUpdater:
         insert_on_miss_decay: float = 0.98,
         fused_insert: bool = False,
         insert_eager_counts: bool = True,
+        insert_probation: bool = False,
     ) -> None:
         layer_ids = [
             layer_id
@@ -239,9 +245,19 @@ class GpuResidencyUpdater:
                 "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0 shapes the insert-on-miss score; "
                 "it needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"
             )
+        self.insert_probation = bool(insert_probation)
+        if self.insert_probation and not self.insert_direct:
+            raise ValueError(
+                "SGLANG_ENABLE_HOT_INSERT_PROBATION ranks DIRECT's victims; "
+                f"it needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE={_STAGE_DIRECT}"
+            )
         # SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS=0: the eager (record_routes) share of route_counts since each layer's
         # last boundary, which the insert score leaves out.
         self.eager_counts = None
+        # SGLANG_ENABLE_HOT_INSERT_PROBATION: per slot, whether it is on probation, and the slot_to_expert the last
+        # boundary saw, whose difference names the slots this window's gathers inserted into.
+        self.probation = None
+        self.boundary_slot_expert = None
         self.insert_scores = None
         self.insert_tensors = None
         self.insert_active = None
@@ -434,6 +450,9 @@ class GpuResidencyUpdater:
             (layers, width), dtype=torch.bool, device=device
         )
         self.victims_fresh = False
+        if self.insert_probation:
+            self.probation = torch.zeros_like(self.slot_to_expert, dtype=torch.bool)
+            self.boundary_slot_expert = self.slot_to_expert.clone()
         self.gather_lanes = torch.arange(width, dtype=torch.long, device=device)
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.gather_evictions = torch.zeros(layers, dtype=torch.long, device=device)
@@ -617,6 +636,10 @@ class GpuResidencyUpdater:
             self.gather_evictions.zero_()
             if self.eager_counts is not None:
                 self.eager_counts.zero_()
+            if self.probation is not None:
+                # The capture's dummy inserts are not newcomers demand chose.
+                self.probation.zero_()
+                self.boundary_slot_expert.copy_(self.slot_to_expert)
             # Rank a shortlist eagerly: the first replay reads it before any boundary
             # runs, and a capture-time shortlist would name pre-warm-up slots.
             self._rank_victims(self.route_counts > 0)
@@ -698,6 +721,8 @@ class GpuResidencyUpdater:
                 )
             )
         routed = insert_counts > 0 if self.insert_on_miss else None
+        if self.probation is not None:
+            self._update_probation(gate, routed, inserting)
         decay = self.decay_table.index_select(
             0, self.tokens.clamp(max=self.decay_table_tokens)
         )
@@ -901,11 +926,28 @@ class GpuResidencyUpdater:
         )
         self.plans_fresh.masked_fill_(gate, False)
 
+    def _update_probation(self, gate: torch.Tensor, routed: torch.Tensor, inserting: bool) -> None:
+        """Put the slots this window's gathers inserted into on probation; release those routed again.
+
+        A slot whose expert changed since the last boundary was inserted into during this window. Its own miss
+        routed it, so that route does not release it: a later window's route does. Only a decode boundary's
+        gathers insert; a slot another boundary rewrote (a prefill promotion) leaves probation.
+        """
+        slot_experts = self.slot_to_expert
+        changed = slot_experts != self.boundary_slot_expert
+        slot_routed = routed.gather(1, slot_experts.clamp(min=0)) & (slot_experts >= 0)
+        kept = self.probation & ~slot_routed & ~changed
+        if inserting:
+            kept = kept | (changed & (slot_experts >= 0))
+        self.probation.copy_(torch.where(gate, kept, self.probation))
+        self.boundary_slot_expert.copy_(torch.where(gate, slot_experts, self.boundary_slot_expert))
+
     def _rank_victims(self, routed: torch.Tensor) -> None:
         """Propose each layer's next ``miss_rows`` victim slots.
 
         Free slots come first, then the lowest-scored residents, those this window did
-        not route ahead of those it did.
+        not route ahead of those it did. With probation, the residents on probation
+        come before all others, in the same order among themselves.
 
         This is only a proposal. It is ranked before the next forward's routing is
         known, so it may name a slot that forward reads; the gather that commits
@@ -922,6 +964,8 @@ class GpuResidencyUpdater:
         )
         expert_keys = self._expert_rank_keys(routed)
         rank = expert_keys.gather(1, slot_experts)
+        if self.probation is not None:
+            rank = torch.where(self.probation, rank, rank + _SETTLED_RANK_OFFSET)
         never = torch.iinfo(torch.int64).max
         keys = torch.full(
             (self.num_layers, self.victim_columns),
