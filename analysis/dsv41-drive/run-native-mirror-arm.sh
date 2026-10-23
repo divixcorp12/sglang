@@ -62,14 +62,14 @@ run_arm() {
   idle_check
 
   local mirror_env=()
-  [ -n "$mirror" ] && mirror_env=(SGLANG_MOE_EXPERT_MIRROR_DIRS="$mirror")
+  [ -n "$mirror" ] && mirror_env=(SGLANG_EXPERT_STREAM_MIRROR="{\"dirs\": \"$mirror\"}")
 
   local before after t0 t1
   before=$(snap_reads)
   t0=$(date +%s.%N)
   $ANA/gpu-run.sh env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
-    SGLANG_MOE_EXPERT_GRAPH_GATHER=1 \
-    SGLANG_DSV41_EXPERT_TRACE_PATH="$OUTDIR/$name.trace" \
+    SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1 \
+    SGLANG_EXPERT_STREAM_TRACE="{\"expert_path\": \"$OUTDIR/$name.trace\"}" \
     "${mirror_env[@]}" \
     "$PY" scripts/dsv41/trace_corpus.py \
     --model "$FULL" \

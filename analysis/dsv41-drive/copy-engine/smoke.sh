@@ -5,14 +5,14 @@
 # analysis/dsv41-drive/copy-overlap/smoke.sh.
 #
 # Usage: smoke.sh <off|on> <tag> <worktree> [nsys-node|long]
-#   off  arm_env defaults with SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=0
-#   on   arm_env defaults with SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1
+#   off  arm_env defaults with SGLANG_EXPERT_STREAM_COPY_MODE=sm_copy (the SM kernel; the copy engine was a separate switch =0)
+#   on   arm_env defaults with SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine
 #   nsys-node  wrap the server in a node-mode nsys capture (trace.nsys-rep next to the logs). Graph mode is refused:
 #              graph-mode CUPTI tracing deadlocks the copy wait (LEASE_PROTOCOL.md 7.6).
 #   long       instead of the six requests: one ~8k-token prompt (chunked prefill), then prompt 0
 #
 # Optional environment: SMOKE_OUT_ROOT (default /data/models/slang/nvfp4-work/copy-engine/smoke) holds <tag>-<arm>;
-# SMOKE_ENV_OVERRIDES adds arm_env overrides as Python dict items, e.g. "'SGLANG_DSV41_RAM_MISS_TIMEOUT_MS': '60000'".
+# SMOKE_ENV_OVERRIDES adds arm_env overrides as Python dict items, e.g. "'SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS': '60000'".
 # SMOKE_EXTRA_ARGS appends server flags; SMOKE_STACK_SECONDS and SMOKE_CUDA_GDB=1 sample stacks and resident kernels.
 #
 # Takes cc-gpu.lock and rowimg-disk.lock. Refuses when production (port 7867) is up. Never starts production.
@@ -38,11 +38,11 @@ say() { echo "$(date +%T) $*" | tee -a $OUT/driver.log; }
 
 [ -d "$WT/python/sglang" ] || { say "no sglang tree under $WT"; exit 2; }
 case $ARM in
-  off) FLAG=0 ;;
-  on)  FLAG=1 ;;
+  off) FLAG=sm_copy ;;
+  on)  FLAG=copy_engine ;;
   *) echo "arm must be off|on"; exit 2 ;;
 esac
-OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE': '$FLAG', ${SMOKE_ENV_OVERRIDES:-}}"
+OVR="{'SGLANG_EXPERT_STREAM_COPY_MODE': '$FLAG', ${SMOKE_ENV_OVERRIDES:-}}"
 
 # Disk lock, then GPU lock: the order every driver on divix01 uses (.claude/rules/divix01-run-protocol.md).
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
@@ -59,16 +59,16 @@ ROOT_FREE=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
 
 rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
-import arm_env
+import json, arm_env
 e = arm_env.arm_env($OVR)
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+e['SGLANG_EXPERT_STREAM_TRACE'] = json.dumps({'expert_path': '$OUT/stages.jsonl'})
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')
 ")
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
-grep -q "^SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=$FLAG$" $OUT/env.txt || { say "flag missing from env; refusing"; exit 1; }
+grep -q "^SGLANG_EXPERT_STREAM_COPY_MODE=$FLAG$" $OUT/env.txt || { say "flag missing from env; refusing"; exit 1; }
 mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 print(*arm_env.ServerArgs(port=$PORT).argv(), sep='\n')

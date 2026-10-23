@@ -68,7 +68,7 @@ def load_events(d: str) -> dict:
                         e["team"] = team
                     by[e["event"]].append(e)
     if dropped:
-        raise ValueError(f"{dropped} job-trace events dropped (raise SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY)")
+        raise ValueError(f"{dropped} job-trace events dropped (raise job.capacity of SGLANG_EXPERT_STREAM_TRACE)")
     if not by["svc_routed"]:
         raise ValueError("no svc_routed events: the capture predates the lane_kind / svc_routed instrumentation")
     return by

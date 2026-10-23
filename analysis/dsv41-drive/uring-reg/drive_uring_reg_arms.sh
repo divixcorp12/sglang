@@ -2,7 +2,7 @@
 # Plan 2026-09-28-reader-crtp-uring-registration Task 9: the registration decode arms. One worktree, one commit, two
 # arms in this order: R0 (the S0 io_uring defaults) and R3 (SLAB_ARENA=1 READ_MODE=readv_fixed FIXED_FILES=1: the slab
 # arena, row-aligned <=1 GiB registered-buffer chunks with parallel fan-out, and registered files). All nine
-# SGLANG_EXPERT_STREAM_URING_* knobs are passed explicitly in both arms as run_arm.sh KEY=VAL overrides.
+# SGLANG_EXPERT_STREAM_URING keys are passed explicitly in both arms as run_arm.sh KEY=VAL overrides.
 # Rule: R3 goes to a confirmation plan only if it beats R0 by >= 1.5 ms/token pooled with byte-identical output.
 # Template: analysis/dsv41-drive/reader-crtp/drive_reader_crtp_pair.sh (changes: one worktree; the arms differ only in
 # their io_uring overrides; tier full-else-90g with node-0 and node-1 gates; a 300 s registration stop rule; startup memory/vmstat/stack samplers; memory samples
@@ -47,20 +47,15 @@ PROD_PORT=7867
 DRIVER_VERSION=615.71.09
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
-URING_R0=(
-    SGLANG_EXPERT_STREAM_URING_MODE=default SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=0
-    SGLANG_EXPERT_STREAM_URING_FIXED_FILES=0 SGLANG_EXPERT_STREAM_URING_READ_MODE=normal
-    SGLANG_EXPERT_STREAM_URING_WAIT_MODE=block SGLANG_EXPERT_STREAM_URING_SQ_THREAD_IDLE_MS=1000
-    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=-1 SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=0
-    SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS=1
-)
-URING_R3=(
-    SGLANG_EXPERT_STREAM_URING_MODE=default SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=0
-    SGLANG_EXPERT_STREAM_URING_FIXED_FILES=1 SGLANG_EXPERT_STREAM_URING_READ_MODE=readv_fixed
-    SGLANG_EXPERT_STREAM_URING_WAIT_MODE=block SGLANG_EXPERT_STREAM_URING_SQ_THREAD_IDLE_MS=1000
-    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=-1 SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=1
-    SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS=1
-)
+# The io_uring knobs are the group env SGLANG_EXPERT_STREAM_URING (a JSON object; SQ_THREAD_CPU=-1 sets no `sq=` core in
+# SGLANG_EXPERT_STREAM_NUMA_CORES); uring_overrides.py turns the key=value words into the KEY=VAL overrides.
+URING_HELPER=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/uring_overrides.py
+mapfile -t URING_R0 < <("$PY" "$URING_HELPER" "$HERE" \
+    mode=default queue_depth=0 fixed_files=0 read_mode=normal wait_mode=block sq_thread_idle_ms=1000 \
+    sq_thread_cpu=-1 slab_arena=0 diagnostics=1)
+mapfile -t URING_R3 < <("$PY" "$URING_HELPER" "$HERE" \
+    mode=default queue_depth=0 fixed_files=1 read_mode=readv_fixed wait_mode=block sq_thread_idle_ms=1000 \
+    sq_thread_cpu=-1 slab_arena=1 diagnostics=1)
 say() { echo "$(date +%T) $*"; }
 case $OUT in /mnt/nvme1/*) ;; *) say "out dir must be under /mnt/nvme1"; exit 1 ;; esac
 check_worktree() {  # <worktree> <sha>: at the commit, clean, sglang imported from it, python/ tree registered
@@ -142,7 +137,7 @@ node0_gate() {  # <arm>: R0 settles the tier (full, else 90g); R3 re-checks the 
     done
 }
 tier_overrides() {
-    echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
+    echo "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
 }
 
 memory_sample() {  # <label>: node-0/node-1 MemFree and VmallocUsed/Slab (MiB) appended to $OUT/memory.jsonl

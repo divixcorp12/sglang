@@ -26,7 +26,7 @@ LOG=$OUT/server.log
 say() { echo "$(date +%T) $*" | tee -a $OUT/driver.log; }
 
 [ -d "$WT/python/sglang" ] || { say "no sglang tree under $WT"; exit 2; }
-OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_RAM_MISS_HIT_WAIT_US': '100', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_MOE_PINNED_HOST_MB': '102400', 'SGLANG_MOE_PINNED_HOST_NUMA_MB': '0:61440,1:40960', 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1'}"
+OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_EXPERT_STREAM_PINNED_HOST_MB': '102400', 'SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB': '0:61440,1:40960', 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1'}"
 
 # Disk lock, then GPU lock: the order every driver on divix01 uses (.claude/rules/divix01-run-protocol.md).
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
@@ -41,18 +41,19 @@ ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exi
 
 rm -f $OUT/stages.jsonl $OUT/router.json $OUT/router.x.bin $OUT/router.w.bin $OUT/router.seq.bin
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
-import arm_env
+import json, arm_env
 e = arm_env.arm_env($OVR)
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+trace = {'expert_path': '$OUT/stages.jsonl'}
 if '$ROUTER' == '1':
-    e['SGLANG_DSV41_ROUTER_CAPTURE_PATH'] = '$OUT/router'
+    trace['router_capture_path'] = '$OUT/router'
+e['SGLANG_EXPERT_STREAM_TRACE'] = json.dumps(trace)
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')
 ")
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
-MIRRORS=$(grep '^SGLANG_MOE_EXPERT_MIRROR_DIRS=' $OUT/env.txt | cut -d= -f2)
+MIRRORS=$(grep '^SGLANG_EXPERT_STREAM_MIRROR=' $OUT/env.txt | cut -d= -f2- | $PY -c 'import json, sys; print(json.loads(sys.stdin.read()).get("dirs", ""))')
 [ -n "$MIRRORS" ] || { say "no mirror dirs; refusing"; exit 1; }
 for root in ${MIRRORS//:/ }; do
   [ -f $root/exl3_row_images/manifest.json ] || { say "no row-image manifest under $root; refusing"; exit 1; }

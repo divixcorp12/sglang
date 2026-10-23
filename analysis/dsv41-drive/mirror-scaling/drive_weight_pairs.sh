@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Decode A/B: does down-weighting the SPCC mirror (/mnt/nvme4, the middle root) improve decode ms/token?
-# Arms: W = SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=1:0.9:1, U = 1:1:1 (parse_mirror_weights maps unset to exactly (1.0,)*3,
+# Arms: W = the `weights` key of SGLANG_EXPERT_STREAM_MIRROR 1:0.9:1, U = 1:1:1 (parse_mirror_weights maps unset to exactly (1.0,)*3,
 # so 1:1:1 is the default, set explicitly so both arms' env differs in that one value only). Everything else is the
 # standard recipe (arm_env.base_env: 3 mirrors, default block wait, untraced).
 # Order: a discarded warm-up arm X0 (U weights; cold page cache after a reboot), then alternating pairs, balanced:
@@ -25,8 +25,9 @@ PROD_PORT=7867
 DRIVER_VERSION=615.71.09
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
-# The mirror roots' drives, in SGLANG_MOE_EXPERT_MIRROR_DIRS order (/mnt/nvme0, /mnt/nvme4 = SPCC, /mnt/nvme2), resolved
-# from the mounts: /dev names move across reboots.
+# The mirror roots' drives, in the `dirs` order of SGLANG_EXPERT_STREAM_MIRROR (/mnt/nvme0, /mnt/nvme4 = SPCC, /mnt/nvme2),
+# resolved from the mounts: /dev names move across reboots.
+MIRROR_DIRS=$(PYTHONPATH=$HERE $PY -c "import arm_env; print(arm_env.EXPERT_MIRROR_DIRS)")
 DEVS=$(for m in /mnt/nvme0 /mnt/nvme4 /mnt/nvme2; do basename "$(findmnt -no SOURCE "$m")" | sed 's/p[0-9]*$//'; done | tr '\n' ' ')
 W_WEIGHTS=1:0.9:1
 U_WEIGHTS=1:1:1
@@ -183,8 +184,9 @@ attempt() {  # <arm> <pair> <weights>: one locked attempt. rc 0 ok, 75 retry lat
     exl3_gate "$arm" || { exec 8>&-; return 1; }
     tier=$(choose_tier "$arm" "$pair") || { say "$arm: memory short; releasing locks"; exec 8>&-; return 75; }
     n0=$(tier_n0 "$tier")
-    set -- SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=$weights \
-        SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${n0},1:${N1_MIB} SGLANG_MOE_PINNED_HOST_MB=$((n0 + N1_MIB))
+    # The mirror settings are one group env, so the override carries the recipe's roots too (it replaces the whole object).
+    set -- "SGLANG_EXPERT_STREAM_MIRROR={\"dirs\":\"$MIRROR_DIRS\",\"weights\":\"$weights\"}" \
+        SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:${n0},1:${N1_MIB} SGLANG_EXPERT_STREAM_PINNED_HOST_MB=$((n0 + N1_MIB))
     say "arm $arm pair $pair tier $tier at $SHA overrides: $*"
     echo "{\"arm\": \"$arm\", \"pair\": \"$pair\", \"tier\": \"$tier\", \"weights\": \"$weights\", \"utc\": \"$(date -u +%FT%TZ)\"}" >> "$OUT/arms.jsonl"
     : > "$done_log"; rm -f "$OUT/$arm-diskstats.jsonl"

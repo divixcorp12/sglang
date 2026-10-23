@@ -5,7 +5,7 @@ Routing comes from a trace with the graph route log (tier_sim.load_forwards). Ea
 - n = RAM-tier hits: routed experts that miss VRAM and hit the pinned tier;
 - m = NVMe misses: routed experts that miss both.
 
-VRAM is tier_sim.DirectInsertReplay (the running recipe, SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2). The pinned tier is
+VRAM is tier_sim.DirectInsertReplay (the running recipe, SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2). The pinned tier is
 the RamTier replay of analysis/dsv41-drive/prefill-evict/ram_replay.py (base policy: validated 11.33 against 11.26
 measured RAM misses per token), whose victims spare the VRAM-hot set. A decode forward classifies against the tier
 as it stood before the forward touched it.
@@ -821,8 +821,8 @@ def main() -> None:
     p.add_argument(
         "--promote-bases", nargs="*", default=["cpu_by_score", "insert_all"], help="policies the sweep adds promotion to"
     )
-    p.add_argument("--promotion-margin", type=float, default=1.0, help="SGLANG_MOE_HOT_BENEFIT_RATIO (default 1.0)")
-    p.add_argument("--promotion-sigmas", type=float, default=0.0, help="SGLANG_MOE_HOT_PROMOTION_SIGMAS (default 0)")
+    p.add_argument("--promotion-margin", type=float, default=1.0, help="SGLANG_EXPERT_STREAM_HOT_BENEFIT_RATIO (default 1.0)")
+    p.add_argument("--promotion-sigmas", type=float, default=0.0, help="SGLANG_EXPERT_STREAM_HOT_PROMOTION_SIGMAS (default 0)")
     p.add_argument("--out")
     args = p.parse_args()
 

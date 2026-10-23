@@ -31,11 +31,9 @@ raise SystemExit(0 if label == 'EXL3' else 'gate resolved ' + repr(label))" || {
 cores=$(PYTHONPATH=$BENCH $PY -c "import arm_env; print(arm_env.SERVER_CORES)")
 env_argv=()
 while IFS='=' read -r k v; do [ -n "$k" ] && env_argv+=("$k=$v"); done < <(PYTHONPATH=$BENCH $PY -c "
-import arm_env
-for k, v in arm_env.arm_env({'SGLANG_EXPERT_STREAM_URING_FIXED_FILES': '1',
-                             'SGLANG_EXPERT_STREAM_URING_READ_MODE': 'readv_fixed',
-                             'SGLANG_EXPERT_STREAM_URING_SLAB_ARENA': '1',
-                             'SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS': '1'}).items():
+import json, arm_env
+uring = {'fixed_files': True, 'read_mode': 'readv_fixed', 'slab_arena': True, 'diagnostics': True}
+for k, v in arm_env.arm_env({'SGLANG_EXPERT_STREAM_URING': json.dumps(uring)}).items():
     print(f'{k}={v}')")
 grep -E 'MemFree|AnonHuge' <(numastat -m) | tee -a "$OUT/$LABEL/driver.log"
 grep Normal /proc/buddyinfo | tee -a "$OUT/$LABEL/driver.log"

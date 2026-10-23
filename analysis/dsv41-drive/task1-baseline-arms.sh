@@ -8,8 +8,8 @@
 # REFERENCE is REQUIRED and every arm's python/ tree must be in its "generations" (see generation_gate); else exit 5 before any arm.
 # Exit 6 before any arm if wt-task1-new is not clean at EXPECT_NEW or the runtime copies of this script and the verdict differ from their blobs there (harness_gate).
 #   code   old | new     old = wt-task1-old (pre two-bank reader), new = wt-task1-new
-#   mirror on | off      SGLANG_MOE_EXPERT_MIRROR_DIRS set / unset
-#   trace  T | U         SGLANG_DSV41_EXPERT_TRACE_PATH set (traced) / unset (untraced)
+#   mirror on | off      the `dirs` of SGLANG_EXPERT_STREAM_MIRROR set / unset
+#   trace  T | U         the `expert_path` of SGLANG_EXPERT_STREAM_TRACE set (traced) / unset (untraced)
 # Arms run in the order given; interleave them (ABBA) on the command line.
 #
 # The harness (trace_corpus.py, provenance.py) always comes from the NEW worktree, so an OLD arm
@@ -136,9 +136,9 @@ for spec in "${specs[@]}"; do
   case "$trace" in T|U) ;; *) echo "bad trace in $spec"; exit 2 ;; esac
   name="$LABEL-$idx-$code-$mirror-$trace"; idx=$((idx + 1))
   build=$CC/exl3-build-task1-$code
-  env_args=(OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH="$wt/python" SGLANG_EXL3_BUILD_DIR="$build" SGLANG_MOE_EXPERT_GRAPH_GATHER=1)
-  [ "$mirror" = on ] && env_args+=(SGLANG_MOE_EXPERT_MIRROR_DIRS="$MIRRORS")
-  [ "$trace" = T ] && env_args+=(SGLANG_DSV41_EXPERT_TRACE_PATH="$OUTDIR/$name.trace")
+  env_args=(OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH="$wt/python" SGLANG_EXL3_BUILD_DIR="$build" SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1)
+  [ "$mirror" = on ] && env_args+=(SGLANG_EXPERT_STREAM_MIRROR="{\"dirs\": \"$MIRRORS\"}")
+  [ "$trace" = T ] && env_args+=(SGLANG_EXPERT_STREAM_TRACE="{\"expert_path\": \"$OUTDIR/$name.trace\"}")
   cmd=("$PY" scripts/dsv41/trace_corpus.py --model "$FULL" --sessions "$SESSIONS" --skip 0 --n 4
        --prompt-tokens 256 --new-tokens 128 --graphs --residency-dirs "$RESIDENCY_DIRS" --out "$OUTDIR/$name.json")
 

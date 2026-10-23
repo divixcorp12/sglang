@@ -4,7 +4,7 @@ Same Engine, prompts and settings as scripts/dsv41/trace_corpus.py without --gra
 but every session is bracketed by ``time.monotonic()`` and per-drive /proc/diskstats
 sector counts, so the scheduler's trace lines and cache-counter snapshots (which carry
 the same monotonic clock) can be cut at exact session boundaries. The caller sets the
-streaming environment and SGLANG_DSV41_EXPERT_TRACE_PATH.
+streaming environment and the ``expert_path`` of SGLANG_EXPERT_STREAM_TRACE.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def main() -> None:
     report = {
         "arm": args.arm,
         "provenance": prov,
-        "mirror_dirs": os.environ.get("SGLANG_MOE_EXPERT_MIRROR_DIRS", ""),
+        "mirror_dirs": json.loads(os.environ.get("SGLANG_EXPERT_STREAM_MIRROR") or "{}").get("dirs", ""),
         "boot_t": boot_t,
         "ready_t": ready_t,
         "startup_disk_bytes": {

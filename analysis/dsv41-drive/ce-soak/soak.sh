@@ -16,7 +16,7 @@
 #
 # Optional environment: SOAK_OUT_ROOT (default /mnt/nvme1/ce-soak), SOAK_PORT (30021), SOAK_MINUTES (115),
 # SOAK_REQUESTS (320), SOAK_DRIVER_ARGS (extra driver flags, e.g. "--only-kinds sampled"), SOAK_ENV_OVERRIDES (arm_env
-# overrides as Python dict items, e.g. "'SGLANG_DSV41_RAM_MISS_TIMEOUT_MS': '60000'"), SOAK_EXTRA_ARGS (server flags
+# overrides as Python dict items, e.g. "'SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS': '60000'"), SOAK_EXTRA_ARGS (server flags
 # appended to the recipe's, diagnosis only), SOAK_STACK_SECONDS (sample
 # the scheduler's native stacks once a second for this long after arming; diagnosis only, it perturbs timing).
 #
@@ -54,9 +54,9 @@ ss -ltn "sport = :$PORT" | grep -q LISTEN && { say "port $PORT taken; refusing";
 
 rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
-import arm_env
+import json, arm_env
 e = arm_env.arm_env({${SOAK_ENV_OVERRIDES:-}})
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+e['SGLANG_EXPERT_STREAM_TRACE'] = json.dumps({'expert_path': '$OUT/stages.jsonl'})
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 e['TMPDIR'] = '$TMPDIR'
@@ -64,7 +64,7 @@ for k, v in e.items(): print(f'{k}={v}')
 ")
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
-grep -q "^SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1$" $OUT/env.txt || { say "copy engine not on in the recipe; refusing"; exit 1; }
+grep -q "^SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine$" $OUT/env.txt || { say "copy engine not on in the recipe; refusing"; exit 1; }
 mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 print(*arm_env.ServerArgs(port=$PORT).argv(), sep='\n')

@@ -33,7 +33,7 @@ case $ARM in
   rowimg) EXTRA=", 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1'" ;;
   *) echo "arm must be base|rowimg"; exit 2 ;;
 esac
-OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_RAM_MISS_HIT_WAIT_US': '100', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_MOE_PINNED_HOST_MB': '102400', 'SGLANG_MOE_PINNED_HOST_NUMA_MB': '0:61440,1:40960'$EXTRA}"
+OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_EXPERT_STREAM_PINNED_HOST_MB': '102400', 'SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB': '0:61440,1:40960'$EXTRA}"
 
 # Disk lock, then GPU lock: the order every driver on divix01 uses (.claude/rules/divix01-run-protocol.md).
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
@@ -50,7 +50,7 @@ rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 e = arm_env.arm_env($OVR)
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+e['SGLANG_EXPERT_STREAM_TRACE'] = '{\"expert_path\": \"$OUT/stages.jsonl\"}'
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')
@@ -58,7 +58,7 @@ for k, v in e.items(): print(f'{k}={v}')
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
 if [ $ARM = rowimg ]; then
-  MIRRORS=$(grep '^SGLANG_MOE_EXPERT_MIRROR_DIRS=' $OUT/env.txt | cut -d= -f2)
+  MIRRORS=$(grep '^SGLANG_EXPERT_STREAM_MIRROR=' $OUT/env.txt | cut -d= -f2- | $PY -c 'import json, sys; print(json.loads(sys.stdin.read()).get("dirs", ""))')
   [ -n "$MIRRORS" ] || { say "rowimg arm without mirror dirs; refusing"; exit 1; }
   for root in ${MIRRORS//:/ }; do
     [ -f $root/exl3_row_images/manifest.json ] || { say "no row-image manifest under $root; refusing"; exit 1; }

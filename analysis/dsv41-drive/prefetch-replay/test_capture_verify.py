@@ -23,10 +23,12 @@ def test_the_sessions_file_skips_the_suite_and_the_warmup_row(tmp_path):
 
 def test_the_server_env_names_the_trace_and_router_capture_under_the_out_dir(tmp_path):
     env = cv.server_env(str(tmp_path))
-    assert env["SGLANG_DSV41_EXPERT_TRACE_PATH"] == str(tmp_path / "trace.jsonl")
-    assert env["SGLANG_DSV41_ROUTER_CAPTURE_PATH"] == str(tmp_path / "router")
-    assert env["SGLANG_MOE_HOT_METRICS_FILE"] == str(tmp_path / "metrics.jsonl")
-    assert env["SGLANG_DSV41_CPU_EXPERTS"] == "1" and env["SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"] == "1"
+    trace = json.loads(env["SGLANG_EXPERT_STREAM_TRACE"])
+    assert trace["expert_path"] == str(tmp_path / "trace.jsonl")
+    assert trace["router_capture_path"] == str(tmp_path / "router")
+    assert trace["hot_metrics_file"] == str(tmp_path / "metrics.jsonl")
+    assert env["SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"] == "1"
+    assert env["SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS"] == "1"
 
 
 def test_the_driver_refuses_a_capture_with_dropped_forwards(tmp_path):

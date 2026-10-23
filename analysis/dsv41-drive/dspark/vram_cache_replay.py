@@ -16,7 +16,7 @@ Policies, each replayed per layer over the verify sequence with capacity C:
 * ``actual``: the capture's own hit count, ``|unique(routes) & hot|``; no simulation.
 * ``score-k``: today's rule, simulated. Victims are the residents not routed by this forward, those the previous
   forward did not route first, then lowest ``(insert score, -expert)``; the insert score decays by
-  ``decay ** forward_tokens`` per forward and adds the forward's route counts (SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY,
+  ``decay ** forward_tokens`` per forward and adds the forward's route counts (SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY,
   GpuResidencyUpdater._apply). Only the k highest-keyed misses are inserted (the fused plan sorts miss lanes by key,
   highest first, and the CPU takes the tail), k being the number the capture itself inserted at that (layer, forward).
   Variants change the order (``cur``: score plus this forward's token count, known at the gather; ``conf``: score plus

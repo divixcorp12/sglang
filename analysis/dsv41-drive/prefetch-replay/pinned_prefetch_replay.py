@@ -211,7 +211,7 @@ class Replay:
         tier = self.tiers[layer]
         slot = gone = -1
         # --spec-share N: once a layer holds N unused prefetched rows, a prefetch evicts the LRU of those
-        # (as SGLANG_DSV41_ENABLE_PREFILL_SHARE bounds prefill), so a wrong prefetch displaces no demand row.
+        # (as SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE bounds prefill), so a wrong prefetch displaces no demand row.
         owned = {i for i, r in enumerate(tier.spec) if r is not None and not r["used"]}
         if kind == "spec" and self.a.spec_share and len(owned) >= self.a.spec_share:
             try:

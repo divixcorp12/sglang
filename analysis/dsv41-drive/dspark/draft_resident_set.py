@@ -1,8 +1,8 @@
 """Make a DSpark draft resident-set file from a routes probe: each stage's N most-routed experts stay on the GPU.
 
   python analysis/dsv41-drive/dspark/draft_resident_set.py ROUTES.jsonl N OUT.json
-ROUTES.jsonl is SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH's output (ab_cpu_draft.py's "routes" arm). The server reads
-OUT.json through SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.
+ROUTES.jsonl is the output of the draft_routes_path of SGLANG_EXPERT_STREAM_TRACE (ab_cpu_draft.py's "routes" arm). The
+server reads OUT.json through SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH.
 """
 
 import sys

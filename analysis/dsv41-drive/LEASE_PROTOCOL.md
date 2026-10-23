@@ -80,18 +80,18 @@ call sits inside the draft's decode graph as one post, one gate wait and one com
   CPU expert service, `set_row_cpu`).
 - **Service thread** (`host/ram_tier.h`, `host/ram_thread.h`). The tier's single owner. It handles records in
   sequence, chooses victims, publishes deltas and reads misses. Idle, it spins with PAUSE, or, with
-  `SGLANG_DSV41_RAM_MISS_SPIN_CORE` (busy_poll), with no PAUSE on that core, for `SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`
+  the `ram=` core of `SGLANG_EXPERT_STREAM_NUMA_CORES` (busy_poll), with no PAUSE on that core, for `SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US`
   (default 5 ms), then sleeps 50 us between polls (20 us between checks while parked); -1 never sleeps.
   `start_thread` refuses busy_poll unless no SMT sibling of the core is in the server's affinity or among the CPU
   experts' cores.
 - **Copy thread** (`host/copy_engine.h`). Copies a record's copy-engine hits with `cuMemcpyAsync`, runs its CPU jobs
   through the CPU expert thread, and publishes CopyDone. Idle, it spins with PAUSE on a core of its own
-  (`ThreadingConfig.copy_cpus`) for `SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US` (default 5 ms), then sleeps on a futex
+  (`ThreadingConfig.copy_cpus`) for `SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US` (default 5 ms), then sleeps on a futex
   doorbell that every submit and `stop()` ring (a syscall only while it sleeps); -1 never sleeps.
 - **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. Its team
   (`host/cpu_experts/team.hpp`) is its own for its lifetime: `threads - 1` pinned workers that never sleep, the thread
   itself worker 0. Between jobs every worker runs the kernel's register work for
-  `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then PAUSE, until the next job; the thread polls the submit word, the draft
+  `SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US`, then PAUSE, until the next job; the thread polls the submit word, the draft
   head, stop and detach the same way. No OpenMP runtime is on the path.
 - **Watchdog** (`host/ram_thread.h`, `watch`). Samples every 20 ms; aborts on a busy episode held past `fatal_wait` or
   a gate held closed past the copy-wait timeout.
@@ -154,9 +154,9 @@ unmaps. Sixteen entries are an insert and an eviction per lane. The post reads t
    2. It **types the lanes** (`type_lanes`, transcribed from `python/sglang/srt/layers/moe/ram_slot_map.py`). A mapped
       expert is a hit at its RAM slot; the m-th unmapped expert is a miss into the m-th staging slot. A lane is
       CPU-eligible when the post is captured, the copy engine is armed (`kCopyArmed`), CPU experts are on and the
-      row is registered with them (`cpu_ok`), and it is a hit, or a miss with `SGLANG_DSV41_CPU_EXPERTS_MISSES`. The CPU takes the last `split[n]` eligible
+      row is registered with them (`cpu_ok`), and it is a hit, or a miss with `SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES`. The CPU takes the last `split[n]` eligible
       lanes in plan order: the fused plan sorts lanes by residency key, highest first, so those are the coldest. Other
-      hits are `HIT_COPY` when copy is allowed (captured, armed, `SGLANG_DSV41_RAM_HIT_COPY=ce`, the row's copy table
+      hits are `HIT_COPY` when copy is allowed (captured, armed, `SGLANG_EXPERT_STREAM_RAM_HIT_COPY=ce`, the row's copy table
       registered, and the lane's destination below the row's `dst_rows`), else `HIT_SM`; other misses are `MISS_GPU`.
       It traps on a plan wider than 8 or than its buffers, an expert out of range, a repeated expert, a hit slot past
       the row's capacity, a miss with no staging slot, or a split entry above n.
@@ -222,7 +222,7 @@ lane 31 is bit 31.
    has, possibly none.
 4. **Read the misses** into their staging slots, publishing each piece's PieceMask bit as it lands.
 
-   **Pool serve (`SGLANG_DSV41_RAM_PREFETCH_POOL_SERVE=1`).** At step 3, a `MISS_GPU` lane whose row already landed in
+   **Pool serve (`SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_POOL_SERVE=1`).** At step 3, a `MISS_GPU` lane whose row already landed in
    its group's pool is not read: the host writes the pool slot into the lane's `PieceSource`, then every PieceMask bit
    in one release. With a victim the pool slot becomes the expert's RAM slot in the delta and the victim takes its place
    in the pool (swapped until the delta is written, as a forced swap's); the lane's staging slot stays staging. With no
@@ -239,7 +239,7 @@ lane 31 is bit 31.
 A record with no lanes only stamps recency. A record with lanes reads its hot sidecar: if the sidecar
 was lapped, an all-`HIT_SM` record is counted as an overrun and skipped, and any other record fails stop.
 
-**Deferred publication (`SGLANG_DSV41_RAM_PREFETCH_PROMOTE=1`).** With the flag off, step 3 publishes the delta as
+**Deferred publication (`SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH_PROMOTE=1`).** With the flag off, step 3 publishes the delta as
 above and nothing here applies. With it on, rows that some source row targets (`RamPrefetchConfig::target`; row 0 and
 untargeted rows publish immediately) change step 3:
 
@@ -272,8 +272,8 @@ untargeted rows publish immediately) change step 3:
 
 ## The GPU drip
 
-`SGLANG_DSV41_GPU_DRIP_SLOTS` (default 0, off; `host/gpu_drip.h`). The copy thread copies experts the GPU scorer
-predicts for its target layer (`SGLANG_DSV41_RAM_PREFETCH_HORIZON` ahead) from their pinned RAM rows into a few VRAM
+`SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS` (default 0, off; `host/gpu_drip.h`). The copy thread copies experts the GPU scorer
+predicts for its target layer (`SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON` ahead) from their pinned RAM rows into a few VRAM
 scratch slots while the link carries no demand transfer. A landed slot's word in the scratch table (device memory,
 `Wire::kScratchSlots` u64 words: 0, or `tag << 32 | row << 16 | expert`) makes the target's post type that lane
 `HIT_SCRATCH` (6), and C1s, a
@@ -281,7 +281,7 @@ second launch of C1's kernel from the scratch tensors to the row's destinations,
 The lane takes no staging slot and is not eligible, so its node's split reads one lane fewer.
 
 - **Picks.** After the scorer's kernels, the drip select kernel (`spec_score.cuh`) publishes the target row's
-  `SGLANG_DSV41_GPU_DRIP_PICKS` best experts that are mapped in the device map and not VRAM-hot (native scorer: best
+  `SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS` best experts that are mapped in the device map and not VRAM-hot (native scorer: best
   gate score over the record's tokens; learned head: its block score) after the record's candidates, under a seq word
   of its own (`SpecCandidates::kCandDripSeq`). The copy thread reads every posted record's row (a seqlock read of its
   first words) and, for a source row, that slot. A pick is admitted only if its expert is still mapped in the host
@@ -292,7 +292,7 @@ The lane takes no staging slot and is not eligible, so its node's split reads on
   (`RamTier::publish_mirror`). The drip reads the generation, then the mapping, at admission, re-checks both before its
   first chunk, and publishes only if the generation is unchanged after its last chunk completed: a RAM slot is
   rewritten only after its expert is unmapped, so an unchanged generation proves the copy read the expert's bytes.
-- **Priority.** One drip mark (a chunk of at most `SGLANG_DSV41_GPU_DRIP_CHUNK_KB`, or one table store) is in flight
+- **Priority.** One drip mark (a chunk of at most `SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB`, or one table store) is in flight
   at a time. A chunk is issued only while no demand job is queued, the last demand job's DMA has completed, and no
   device pull may be running: a posted record with a `HIT_SM` or `MISS_GPU` lane opens a pull window (C1 and S read
   host memory over the link), which closes when the copy gate names that record (CW closes it only after S completed,
@@ -392,7 +392,7 @@ count, a mask of the tokens that route the lane's expert, and each such token's 
 CPU job runs one forward of the record's tokens from it, and each token's partial is its own `[hidden]` row of the part,
 which the route tables add to that token. The record's summed lane weight still serves one-token rows.
 
-**Spill.** With `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` (V) below the lanes, DIRECT gives VRAM victims and
+**Spill.** With `SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES` (V) below the lanes, DIRECT gives VRAM victims and
 staging slots to the first V lanes only and marks the rest with destination slot -1. The post makes each marked lane a
 CPU lane, outside the split: a RAM hit runs from its RAM slot, and an NVMe miss gets slot -1. The host reads each such
 miss into a RAM victim of its node's range, taken before the staging misses take theirs. The CPU computes it there,
@@ -426,7 +426,7 @@ Every failure ends the process; the protocol carries no error state.
 
 ## PDL
 
-With `SGLANG_DSV41_ENABLE_LEASE_PDL`, post, S and CW launch with PDL; C1 and CC are plain launches. Each PDL kernel's
+With `SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL`, post, S and CW launch with PDL; C1 and CC are plain launches. Each PDL kernel's
 first action is `griddepcontrol.wait`, which returns only after its primary completed and flushed its memory, so
 completion is transitive: when CW runs, C1 and S have completed. The early `launch_dependents` only lets the
 secondary be scheduled.

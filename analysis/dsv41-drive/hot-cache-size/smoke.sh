@@ -6,7 +6,7 @@
 # size and memory-fraction overrides, the VRAM sampler, phase markers and the long-prompt request.
 #
 # Usage: smoke.sh <tag> <worktree> <hot_gpu_mb> <mem_fraction_static> [long_tokens]
-#   hot_gpu_mb           SGLANG_MOE_HOT_GPU_MB (default recipe: 14336)
+#   hot_gpu_mb           SGLANG_EXPERT_STREAM_HOT_GPU_MB (default recipe: 14336)
 #   mem_fraction_static  replaces --mem-fraction-static in arm_env.ServerArgs.argv() (default recipe: 0.80)
 #   long_tokens          prompt length of the long request (default 30000; 0 skips it)
 #
@@ -36,7 +36,7 @@ phase() { echo "$(date '+%Y/%m/%d %H:%M:%S.%3N') $1" >> $OUT/phases.txt; }
 [ -d "$WT/python/sglang" ] || { say "no sglang tree under $WT"; exit 2; }
 [[ $HOT_MB =~ ^[0-9]+$ ]] || { say "hot_gpu_mb must be an integer"; exit 2; }
 [[ $MFS =~ ^0\.[0-9]+$ ]] || { say "mem_fraction_static must be 0.x"; exit 2; }
-OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_RAM_MISS_HIT_WAIT_US': '100', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_MOE_PINNED_HOST_MB': '102400', 'SGLANG_MOE_PINNED_HOST_NUMA_MB': '0:61440,1:40960', 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1', 'SGLANG_MOE_HOT_GPU_MB': '$HOT_MB'}"
+OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_EXPERT_STREAM_PINNED_HOST_MB': '102400', 'SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB': '0:61440,1:40960', 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1', 'SGLANG_EXPERT_STREAM_HOT_GPU_MB': '$HOT_MB'}"
 
 # Disk lock, then GPU lock: the order every driver on divix01 uses (.claude/rules/divix01-run-protocol.md).
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
@@ -53,16 +53,16 @@ rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 e = arm_env.arm_env($OVR)
-e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+e['SGLANG_EXPERT_STREAM_TRACE'] = '{\"expert_path\": \"$OUT/stages.jsonl\"}'
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')
 ")
 [ ${#ENV[@]} -gt 0 ] || { say "arm_env failed"; exit 1; }
 printf '%s\n' "${ENV[@]}" > $OUT/env.txt
-grep -q "^SGLANG_MOE_HOT_GPU_MB=$HOT_MB\$" $OUT/env.txt || { say "hot size missing from env; refusing"; exit 1; }
+grep -q "^SGLANG_EXPERT_STREAM_HOT_GPU_MB=$HOT_MB\$" $OUT/env.txt || { say "hot size missing from env; refusing"; exit 1; }
 grep -q '^SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1$' $OUT/env.txt || { say "row images off in env; refusing"; exit 1; }
-MIRRORS=$(grep '^SGLANG_MOE_EXPERT_MIRROR_DIRS=' $OUT/env.txt | cut -d= -f2)
+MIRRORS=$(grep '^SGLANG_EXPERT_STREAM_MIRROR=' $OUT/env.txt | cut -d= -f2- | $PY -c 'import json, sys; print(json.loads(sys.stdin.read()).get("dirs", ""))')
 [ -n "$MIRRORS" ] || { say "no mirror dirs; refusing"; exit 1; }
 for root in ${MIRRORS//:/ }; do
   [ -f $root/exl3_row_images/manifest.json ] || { say "no row-image manifest under $root; refusing"; exit 1; }

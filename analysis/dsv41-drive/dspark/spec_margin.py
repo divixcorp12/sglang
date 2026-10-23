@@ -1,6 +1,6 @@
 """Hit rate of the RAM prefetch's speculative reads by the gate rank and margin of each pick.
 
-Reads the InstrBuild job-trace files of a served prefetch run (``SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX``) and joins
+Reads the InstrBuild job-trace files of a served prefetch run (the ``job.prefix`` of ``SGLANG_EXPERT_STREAM_TRACE``) and joins
 each ``spec_submit`` (row = target row, seq = source record seq, a = expert, gen = the pick's rank << 32 | its
 margin's float bits) to its ``spec_land`` (same key) and ``spec_use`` (row = target row, a = expert, c = the
 entry's source seq). A read is used when a forced CPU miss swapped it in.

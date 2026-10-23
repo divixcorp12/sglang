@@ -9,7 +9,7 @@ set -u
 WT=/data/models/slang/nvfp4-work/wt-payoff
 SHA=$1
 MODE=${2:-all}
-FLAGS="SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB=128 SGLANG_MOE_HOT_GPU_MB=17408"
+FLAGS="SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB=128 SGLANG_EXPERT_STREAM_HOT_GPU_MB=17408"
 export DSV41_MEM_FRACTION_STATIC=0.925
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 say() { echo "$(date +%T) $*"; }
@@ -32,7 +32,7 @@ if [ "$MODE" = traced ] || [ "$MODE" = all ]; then
     wait_gpu; say "arm payoff traced"
     NSYS_TMPDIR=/mnt/nvme1/nsys-tmp NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node NSYS_GPU_METRICS=1 EXPECT_SHA=$SHA \
         bash benchmarks/dsv41_baseline/run_arm.sh indexer-payoff-node 30024 $FLAGS \
-        SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:45056; say "payoff traced rc=$?"
+        SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:57344,1:45056; say "payoff traced rc=$?"
     sudo -n /usr/local/sbin/nsys-profile sessions list 2>&1 | awk '/dsv41-pcie-/ {print $NF}' | while read -r name; do
         say "shutting down orphan PCIe session $name"; sudo -n /usr/local/sbin/nsys-profile shutdown --session="$name"
     done

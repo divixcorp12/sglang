@@ -89,10 +89,10 @@ def _cpu_kernel() -> dict[str, str]:
     """The optimized EXL3 CPU kernel library's one-word keep-warm loops and forward entry point: objdump per function,
     addresses, raw bytes, rip-relative displacements and nop padding stripped, operand addresses reduced to the
     symbols they name. Needs SGLANG_EXL3_SRC and a GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel
-    (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
+    (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1, set here)."""
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
-    os.environ["SGLANG_DSV41_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
+    os.environ["SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
     so = exl3_ext().__file__
     text = subprocess.run(["objdump", "-d", "-C", "--no-show-raw-insn", so], capture_output=True, text=True,
                           check=True).stdout
@@ -124,7 +124,7 @@ def collect(keep_cache: str | None = None, reuse_cache: str | None = None) -> di
     if not reuse_cache:
         shutil.rmtree(cache, ignore_errors=True)
         # The BS1 suites build the 8-lane one-token modules; the CPU-experts switch would put the copy engine under them.
-        env = {k: v for k, v in os.environ.items() if k != "SGLANG_DSV41_CPU_EXPERTS"}
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"}
         env |= {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
         rc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *SUITES], env=env,
                             cwd=REPO).returncode

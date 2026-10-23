@@ -6,7 +6,7 @@ set -u
 WT=/data/models/slang/nvfp4-work/wt-route-plan-arms
 SHA=$1
 MODE=${2:-all}
-FLAG=SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN=1
+FLAG=SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN=1
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 say() { echo "$(date +%T) $*"; }
 wait_gpu() { while ! flock -n $GPU_LOCK true; do say "cc-gpu.lock held; waiting"; sleep 60; done; }

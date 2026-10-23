@@ -68,19 +68,20 @@ _COMPLETENESS_ERRORS = (RuntimeError, OSError, ValueError, KeyError)
 def recipe_env() -> dict:
     """The arm's overrides plus the residency switch: the part of the server env that is the same for every session."""
     overrides, _ = both_cpu_ab.ARMS[ARM]
-    return {**overrides, "SGLANG_DSV41_RESIDENCY_CAPTURE": "1"}
+    return {**overrides, both_cpu_ab.member(both_cpu_ab.TRACE, "residency_capture"): True}
 
 
 def server_env(block_dir: str) -> dict:
     """The recipe with the trace, router capture, accept log and metrics written under ``block_dir``."""
-    return arm_env.arm_env({
+    trace = both_cpu_ab.member
+    return arm_env.arm_env(both_cpu_ab.collapse({
         **recipe_env(),
-        "SGLANG_DSV41_EXPERT_TRACE_PATH": os.path.join(block_dir, "trace.jsonl"),
-        # The residency side files take ROUTER_CAPTURE_PATH + ".res", which is RESIDENCY_PREFIX.
-        "SGLANG_DSV41_ROUTER_CAPTURE_PATH": os.path.join(block_dir, "router"),
-        "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH": os.path.join(block_dir, "verify-accept"),
-        "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(block_dir, "metrics.jsonl"),
-    })
+        trace(both_cpu_ab.TRACE, "expert_path"): os.path.join(block_dir, "trace.jsonl"),
+        # The residency side files take router_capture_path + ".res", which is RESIDENCY_PREFIX.
+        trace(both_cpu_ab.TRACE, "router_capture_path"): os.path.join(block_dir, "router"),
+        trace(both_cpu_ab.TRACE, "verify_accept_path"): os.path.join(block_dir, "verify-accept"),
+        trace(both_cpu_ab.TRACE, "hot_metrics_file"): os.path.join(block_dir, "metrics.jsonl"),
+    }))
 
 
 def rid_map(session: dict, *, split_name: str) -> dict:
@@ -423,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.pilot:
         print(json.dumps(outcome, indent=1))
         return 0 if not outcome["failed"] else 1
-    recipe = {"arm": ARM, "env": arm_env.arm_env(recipe_env()), "seed": a.seed, "sessions": a.sessions,
+    recipe = {"arm": ARM, "env": arm_env.arm_env(both_cpu_ab.collapse(recipe_env())), "seed": a.seed, "sessions": a.sessions,
               "max_tokens": a.max_tokens, "model_path": arm_env.MODEL_PATH}
     return _finish(out_dir=out_dir, sessions=sessions, split=split, outcome=outcome, recipe=recipe)
 

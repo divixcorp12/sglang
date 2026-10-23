@@ -30,8 +30,8 @@
 # is EXL3 (benchmarks/dsv41_flash/arm_config.py check_gate is the worked example).
 #
 # Pinned tier (as drive_mirror3_arms.sh): both arms run a tier 4096 MiB smaller on node 0 than arm_env's recipe
-# (102400 = 0:61440,1:40960), passed as identical KEY=VAL overrides: SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:40960
-# and SGLANG_MOE_PINNED_HOST_MB=98304. Before the base arm the driver checks node 0 the way check_capacity does
+# (102400 = 0:61440,1:40960), passed as identical KEY=VAL overrides: SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:57344,1:40960
+# and SGLANG_EXPERT_STREAM_PINNED_HOST_MB=98304. Before the base arm the driver checks node 0 the way check_capacity does
 # (MemFree + Active(file) + Inactive(file) from node0/meminfo) against the node-0 share + 4096 MiB headroom + the
 # server's observed pre-check node-0 footprint (15360). If short, it cuts node 0 and the total by another 4096 MiB
 # once, for both arms. Before the split arm it re-checks the SAME values and stops if short, rather than run mismatched
@@ -47,13 +47,12 @@ DRIVER_VERSION=615.71.09
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
 # The nine io_uring knobs at the 2026-09-28 campaign's S0 values, set explicitly in both arms (the base tree reads none).
-URING_S0=(
-    SGLANG_EXPERT_STREAM_URING_MODE=default SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=0
-    SGLANG_EXPERT_STREAM_URING_FIXED_FILES=0 SGLANG_EXPERT_STREAM_URING_READ_MODE=normal
-    SGLANG_EXPERT_STREAM_URING_WAIT_MODE=block SGLANG_EXPERT_STREAM_URING_SQ_THREAD_IDLE_MS=1000
-    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=-1 SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=0
-    SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS=1
-)
+# They are the group env SGLANG_EXPERT_STREAM_URING (a JSON object; SQ_THREAD_CPU=-1 sets no `sq=` core in
+# SGLANG_EXPERT_STREAM_NUMA_CORES); uring_overrides.py turns the key=value words into the KEY=VAL overrides.
+URING_HELPER=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/uring_overrides.py
+mapfile -t URING_S0 < <("$PY" "$URING_HELPER" "$HERE" \
+    mode=default queue_depth=0 fixed_files=0 read_mode=normal wait_mode=block sq_thread_idle_ms=1000 \
+    sq_thread_cpu=-1 slab_arena=0 diagnostics=1)
 say() { echo "$(date +%T) $*"; }
 case $OUT in /mnt/nvme1/*) ;; *) say "out dir must be under /mnt/nvme1"; exit 1 ;; esac
 check_worktree() {  # <worktree> <sha>: at the commit, clean, sglang imported from it, python/ tree registered
@@ -124,7 +123,7 @@ node0_gate() {  # <arm>: settle (first arm, may cut once) or re-check (second ar
     done
 }
 tier_overrides() {
-    echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
+    echo "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_EXPERT_STREAM_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
 }
 mkdir -p "$OUT"
 

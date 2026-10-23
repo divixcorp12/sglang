@@ -210,7 +210,7 @@ class DirectInsertReplay:
     forward inserts nothing; it adds its route counts, and its first layer's first gather applies a
     decode boundary still pending (after that layer recorded its counts); a prefill of at least
     ``update_prefill_tokens`` tokens is a boundary of its own. The clocks are the device mirror of
-    ResidencyBoundaryClock at SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1. Float32 throughout, as on the
+    ResidencyBoundaryClock at SGLANG_EXPERT_STREAM_HOT_UPDATE_DECODE_FORWARDS=1. Float32 throughout, as on the
     device, so ties break the same way.
     """
 

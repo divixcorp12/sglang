@@ -390,7 +390,7 @@ class NodeTier:
 
 class PoolRows:
     """The RAM prefetch's landed rows per target row and group, waiting for a claim (rule 6). ``share`` entries per
-    group and row (SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE); a landing into a full group drops its oldest entry."""
+    group and row (SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE); a landing into a full group drops its oldest entry."""
 
     def __init__(self, share: int, nodes: int = 2):
         self.share = max(1, share)
@@ -452,7 +452,7 @@ class PoolRows:
 #     the miss's own group range (ram_tier.h:2114 take_victim_locked, loop over own.lo..own.hi).
 #  2. Each group range first gives min(8, range - 1) staging slots (ram_tier.h:1044 reserve_staging, k = the victim
 #     lanes under spill, srt/layers/moe/exl3_ram_miss.py:975 plan_staging_width and :1001 staging_width,
-#     SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES=8) and then `share` speculative pool slots
+#     SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES=8) and then `share` speculative pool slots
 #     (ram_tier.h:1084 reserve_spec_pool; "RAM prefetch share 2" in the server log); neither ever holds a mapped row.
 #  3. Victim: a free slot first, else the least recently stamped READY slot whose expert is not VRAM-hot (the record's
 #     hot bitmap, ram_tier.h:594 apply_gpu_hot), not routed by the record (`wanted`) and not filling
@@ -476,8 +476,8 @@ class PoolRows:
 #     use or the next claim (PoolRows). Skipped while the read is in flight, the row's lock is busy or the delta has
 #     no room (spec_promote_* counters; the last two were 0 in the A/B). Until 2026-10-16 evening this rule promoted
 #     at landing at the run's measured rate, which matched the totals but not which rows were mapped when.
-#  7. Full layers (SGLANG_MOE_PINNED_HOST_FULL_LAYERS) map every expert and never miss.
-#  8. Prefill (SGLANG_DSV41_ENABLE_PREFILL_FILLS=1) admits rows from the Python side with the service paused
+#  7. Full layers (SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS) map every expert and never miss.
+#  8. Prefill (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS=1) admits rows from the Python side with the service paused
 #     (ram_tier.h:399 assign, :456 fill_begin): take_admit_slot_locked (ram_tier.h:1982) gives a free slot, else
 #     take_slot_locked's LRU READY slot that is not VRAM-hot, protected or filling (ram_tier.h:2038). With
 #     no prefill share set (the A/B sets none) nothing bounds how many decode rows one prefill displaces. These
@@ -563,7 +563,7 @@ def eager_admit(tier: list[NodeTier], line: dict, hot: set, tick: int, nodes: in
                 owned: set | None = None, cache: bool = True) -> tuple[int, int, int, int]:
     """Rule 10 on one eager line. Returns (next tick, prefetch claims, demand reads, VRAM misses).
 
-    ``share`` > 0 is SGLANG_DSV41_ENABLE_PREFILL_SHARE at that size (take_admit_slot_locked, ram_tier.h:1982-2017):
+    ``share`` > 0 is SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE at that size (take_admit_slot_locked, ram_tier.h:1982-2017):
     every admission makes its row prefill-owned (``owned``, the layer's set); once the layer owns ``share`` rows and
     the home range has no free slot, the victim is the LRU owned row of the range; with none, the prefetch stops
     (stop_at_share) and a demand admission falls back to the decode LRU. ``cache`` False is staging without admission:
