@@ -20,11 +20,11 @@ def _all_miss(ids):
     return torch.full_like(ids, -1), torch.zeros_like(ids, dtype=torch.bool)
 
 
-def _streamer(layer_id=0):
+def _streamer(layer_id=0, width=4):
     """A streamer whose hot cache misses everything and whose source copies are recorded."""
     layer = torch.nn.Module()
     layer.layer_id = layer_id
-    layer.rows = torch.arange(EXPERTS * 4, dtype=torch.int32).reshape(EXPERTS, 4) + 1000 * layer_id
+    layer.rows = torch.arange(EXPERTS * width, dtype=torch.int32).reshape(EXPERTS, width) + 1000 * layer_id
     streamer = ExpertStreamer(layer, ("rows",))
     streamer.hot_cache = SimpleNamespace(
         lookup=_all_miss, capacity=1, expert_to_slot=torch.full((EXPERTS,), -1), device=torch.device("cpu")
@@ -187,6 +187,22 @@ class TestLayerMajorResidency(unittest.TestCase):
         self.assertIsNone(streamer1.prefill_residency)
         residency.end()
         self.assertEqual(residency.buffer.rows, 4)
+
+    def test_a_layer_whose_rows_differ_streams_without_residency(self):
+        """A mixed-K checkpoint (DSV4.1-1017: layers 18-22 at K2) failed every long prefill with 'do not fit'."""
+        _, streamer0, _ = _streamer(0)
+        _, narrow, _ = _streamer(1, width=2)
+        _, streamer2, _ = _streamer(2)
+        caches = {i: SimpleNamespace(capacity=1, streamer=s) for i, s in enumerate((streamer0, narrow, streamer2))}
+        runner = SimpleNamespace(expert_hot_cache_manager=SimpleNamespace(caches=caches))
+        residency = Exl3LayerMajorResidency(runner, rows=4)
+        residency.begin(range(0, 3))
+        residency.make_resident(0)
+        residency.make_resident(1)
+        self.assertIsNone(streamer0.prefill_residency)
+        self.assertIsNone(narrow.prefill_residency)
+        residency.make_resident(2)
+        self.assertIs(streamer2.prefill_residency, residency.buffer)
 
     def test_a_model_without_hot_caches_allocates_nothing(self):
         runner = SimpleNamespace(expert_hot_cache_manager=None)
