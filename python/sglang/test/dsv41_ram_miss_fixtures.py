@@ -16,6 +16,7 @@ from typing import Iterable, Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD
 from sglang.srt.layers.moe.expert_engine.formats import get_format
 from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES, Exl3ExpertFormat
 from sglang.srt.layers.moe.expert_engine.profiles import get_profile_by_name
@@ -263,7 +264,7 @@ def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot
 
 
 def fake_cpu_layer(hidden: int = 8):
-    """A layer for the instr build's fake CPU expert kernel (ExpertStreamHost.test_kernel_address), which reads only
+    """A layer for the FAKE_BUILD host's fake CPU expert kernel (ExpertStreamHost.fake_kernel_reset), which reads only
     its hidden size. Its capacity covers any test tier's row: the host refuses a layer smaller than the row."""
     from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 
@@ -271,28 +272,30 @@ def fake_cpu_layer(hidden: int = 8):
 
 
 def draft_cpu_host(mode: str, areas, *, cores, threads: int, keep_warm_us: int,
-                   fatal_wait_s: float, tmp_path, variant: str = "instr", ns_per_expert: int = 0):
+                   fatal_wait_s: float, tmp_path, variant: str = "instr", ns_per_expert: int = 0,
+                   layout=None):
     """A DSpark draft channel server, unstarted, with DraftCpuHost's interface, in one of the two shapes the shared CPU
     team allows (plan 2026-10-06 Task 11):
       draft_only  a draft-only engine (DraftCpuHost), as a launch with the target's CPU experts off builds;
       shared      group 0's CPU expert engine of an ExpertStreamHost whose CPU experts are on, the draft attached as its
                   second job source; .expert_host is that host and .sim its ChainSim, so a test can post target jobs to
                   the same team. stop() detaches the draft; the caller stops .expert_host.
-    Both run the fake kernel the caller installed (the module's ``expert_stream_test_kernel_address``) before this.
+    Both run the fake kernel of ``layout`` (default FAKE_BUILD), which the caller reset (``fake_kernel_reset``) before this.
     """
     from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuHost
     from sglang.kernels.ops.moe.expert_lease_block import wire_layout
     from sglang.kernels.ops.moe.expert_stream_transport import new_page
     from sglang.test.dsv41_chain_sim import ChainSim
 
+    layout = FAKE_BUILD if layout is None else layout
     if mode == "draft_only":
         return DraftCpuHost(areas, cores=cores, threads=threads, keep_warm_us=keep_warm_us,
-                            fatal_wait_s=fatal_wait_s, variant=variant)
+                            fatal_wait_s=fatal_wait_s, variant=variant, layout=layout)
     if mode != "shared":
         raise ValueError(mode)
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False, wire=wire_layout(8))
-    host = attached_host(s, page, k=3)
+    host = attached_host(s, page, k=3, layout=layout, variant=variant)
     host.enable_copy_engine(-1)
     row = 1
     dst = {n: torch.zeros((6,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[row].items()}
@@ -318,7 +321,7 @@ HOST_SCRIPT_VARIANT = "instr"
 HOST_SCRIPT_LANES = 8
 
 
-def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: int = 1) -> None:
+def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: int = 1, layout=None) -> None:
     """Load, in this process, the JIT host modules a child interpreter will load, so the child finds them built.
 
     A cold module costs 50-100 s to compile, serialized across ``pytest -n`` workers by the JIT build lock; a child
@@ -328,8 +331,11 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
     ``variant``/``lanes``/``nodes`` name the module the child constructs its ``ExpertStreamHost`` with (None: the
     child's default build). The child has no conftest, so its ``host_layout()`` also loads the default build at one
     node, whatever the parent's autouse fixture says: that one is warmed too. Cold modules are built side by side
-    (``load_in_parallel``); when all are cached no process is started."""
+    (``load_in_parallel``); when all are cached no process is started. ``layout`` (default EXL3_BUILD) is the child's
+    build key: FAKE_BUILD for a child that runs the fake CPU kernel."""
     from sglang.kernels.jit.utils.compile.warm import load_in_parallel
+
+    layout = _EXL3_BUILD if layout is None else tuple(layout)
     from sglang.kernels.ops.moe import expert_stream_transport as ops
 
     conftest_default, ops._DEFAULT_VARIANT = ops._DEFAULT_VARIANT, None
@@ -341,7 +347,7 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
         [
             # what host_layout() loads: its default lanes, one node
             (_HOST_OPS, "_host_module", (_EXL3_BUILD, child_default, 8, 1)),
-            (_HOST_OPS, "_host_module", (_EXL3_BUILD, variant or child_default, lanes, nodes)),
+            (_HOST_OPS, "_host_module", (layout, variant or child_default, lanes, nodes)),
             # A child that serves a miss reads through this module, which the host modules do not load.
             (_URING_OPS, "_uring_file_reader_type", ()),
         ]
@@ -371,7 +377,8 @@ NO_CORE_DUMP = "import resource; resource.setrlimit(resource.RLIMIT_CORE, (0, 0)
 
 
 def spawn_child(
-    script: str, *args, timeout_s: float, variant: Optional[str] = None, lanes: int = 8, nodes: int = 1, env=None
+    script: str, *args, timeout_s: float, variant: Optional[str] = None, lanes: int = 8, nodes: int = 1, env=None,
+    layout=None,
 ) -> subprocess.CompletedProcess:
     """Run ``script`` in a fresh interpreter with ``args`` as its ``sys.argv[1:]``: the one way a test starts a child
     that builds expert-stream hosts. The JIT modules it loads are warmed here first (``warm_host_modules``, arguments
@@ -380,7 +387,7 @@ def spawn_child(
 
     ``env`` must not change what picks the child's default build (``SGLANG_EXPERT_STREAM_TRACE``'s ``expert_path``,
     ``SGLANG_TEST_DSV41_RAM_MISS_FAULT``): the warm-up reads this process's."""
-    warm_host_modules(variant, lanes=lanes, nodes=nodes)
+    warm_host_modules(variant, lanes=lanes, nodes=nodes, layout=layout)
     return subprocess.run(
         [sys.executable, "-c", NO_CORE_DUMP + script, *map(str, args)],
         capture_output=True,
@@ -406,16 +413,20 @@ sim = ChainSim(host, page, s.slabs)
 
 
 def run_host_script(
-    tmp_path, body: str, *, capacity: int = 3, staging: int = 1, host_args: str = "", timeout_s: float = 60
+    tmp_path, body: str, *, capacity: int = 3, staging: int = 1, host_args: str = "", timeout_s: float = 60,
+    layout=None,
 ) -> subprocess.CompletedProcess:
     """Run ``body`` in a fresh interpreter over an instrumented host (``s``, ``page``, ``host``, ``sim`` in scope),
     each of its two rows attached with ``staging`` staging slots; ``host_args`` is extra keyword source for its
-    constructor (", hot_page=hot_page" hands it the ``hot_page`` in scope).
+    constructor (", hot_page=hot_page" hands it the ``hot_page`` in scope). ``layout`` (default EXL3_BUILD; FAKE_BUILD
+    for the fake CPU kernel) is the build key the child's host is constructed with.
 
     Every service failure is fail-stop (``std::abort``), so a test of one must watch a child process die."""
+    if layout is not None:
+        host_args = f", layout={tuple(layout)!r}" + host_args
     return spawn_child(
         _HOST_SCRIPT_HEAD % host_args + textwrap.dedent(body), tmp_path, capacity, staging,
-        timeout_s=timeout_s, variant=HOST_SCRIPT_VARIANT, lanes=HOST_SCRIPT_LANES,
+        timeout_s=timeout_s, variant=HOST_SCRIPT_VARIANT, lanes=HOST_SCRIPT_LANES, layout=layout,
     )
 
 

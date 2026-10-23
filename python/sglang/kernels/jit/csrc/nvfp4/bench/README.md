@@ -26,7 +26,8 @@ cmake --build "$build" -j4
 This builds both benchmark executables in BUILD_DIR. Google Benchmark v1.9.4 uses the same pinned commit as the EXL3
 benchmark; it is fetched if not installed. For offline builds, install its CMake package and set
 `NVFP4_FETCH_BENCHMARK=OFF`, or point `FETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK` to a local checkout of that version.
-The library itself and the correctness harnesses build from Python (`../optimized/README.md`).
+The kernel itself builds into the expert-stream host module, and the correctness harnesses build from Python
+(`../optimized/README.md`).
 
 ## Run and worker sweep
 

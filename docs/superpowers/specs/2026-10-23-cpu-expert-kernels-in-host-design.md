@@ -1,7 +1,8 @@
 # CPU expert kernels compiled into the expert-stream host
 
-Status: approved in conversation 2026-10-23 (owner). Branch `cpu-kernel-in-host`, cut from `ram-prefetch-pool-serve` at
-3157590740. Supersedes the "Decision" of `2026-10-04-cpu-expert-kernel-interface-design.md` (a virtual
+Status: approved in conversation 2026-10-23 (owner); steps 1-3 implemented (step 1 merged at 5b5a7f8b4b; steps 2-3 on
+branch `cpu-kernel-in-host-step2`, awaiting the owner's merge). Branch `cpu-kernel-in-host`, cut from
+`ram-prefetch-pool-serve` at 3157590740. Supersedes the "Decision" of `2026-10-04-cpu-expert-kernel-interface-design.md` (a virtual
 `CpuExpertKernel` crossing library boundaries).
 
 ## Why

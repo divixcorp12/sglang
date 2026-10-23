@@ -36,53 +36,53 @@ stopped. Keep-warm takes no lock, so its callers must not overlap it with a forw
 
 Build and link
 --------------
-Requires Linux, GCC 15, OpenMP and the same PyTorch installation/ABI as the
-consumer. The build is -Ofast -march=<resolved> (SGLANG_JIT_HOST_MARCH, else this machine's,
-via jit/utils/compile/toolchain.py): it targets the build machine, so rebuild on another CPU. The extension's
-module name and build directory carry the -march.
+Requires Linux, GCC 15 and OpenMP. No torch: kernel.cpp and its headers use a plain fp16 type (half.hpp; F16C when the
+-march has it, else the exact software conversion) and std exceptions. The build is -Ofast -march=<resolved>
+(SGLANG_JIT_HOST_MARCH, else this machine's, via jit/utils/compile/toolchain.py): it targets the build machine, so
+rebuild on another CPU.
 GCC 17 is deliberately not selected: it was not a consistent performance win
 and its experimental compiler changed arithmetic in the earlier comparison.
 
-Standalone CPU library on divix01 (no CUDA compilation):
+The server compiles kernel.cpp into the expert-stream host module (kernels/ops/moe/cpu_kernel_build.py): one translation
+unit with its own flags (load_jit's source_cflags) beside the host's files, which keep the host flags. The host's
+compiler (CXX) must be GCC 15 when CPU experts are on (check_kernel_compiler).
 
-  CUDA_HOME=/usr/local/cuda-13.4 /data/models/slang/.venv/bin/python \
+Standalone CPU library on divix01 (no CUDA compilation, no torch):
+
+  /data/models/slang/.venv-upstream/bin/python \
     python/sglang/srt/layers/quantization/exl3/build.py \
     --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ \
     --output /data/models/exl3_exp/clean_integration/sglang/libexl3_cpu.so
 
-Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP and use kernel.h: the kernel's make_layer over the
-experts' slabs, then check and forward (below). moe_mul1.h's upstream per-expert tensor API (exl3_moe_cpu_make_layer,
-exl3_moe_cpu_forward, exl3_moe_cpu_free_layer) is declared for upstream's bindings only and refuses when called.
+Link the consumer against libexl3_cpu.so and OpenMP and use kernel.h: the kernel's make_layer over the experts' slabs,
+then check and forward (below). The vendored per-expert kernel (../moe_mul1.cpp, which the expert-stream bench builds
+as its baseline against baseline_moe_mul1.h) is a separate thing; nothing in this directory declares upstream's API.
 
-The service side is the library's kernel, a CpuExpertKernel (expert_stream/host/cpu_experts/kernel.hpp) behind its
-accessor exl3_cpu_kernel() (kernel.h, hidden: never interposed across libraries). Python reaches it through the
-optimized extension's torch op sglang_exl3_cpu::kernel_address (torch_ops.cpp), and the expert-stream host makes each
-streamed layer with the kernel's make_layer (ExpertStreamHost.set_cpu_layer) from a CpuExpertLayerSpec
-(Exl3CpuQuantTrait.layer_spec): the pinned tier's six slab base pointers and per-slot strides, with SglangExl3CpuParams
-(bits_w13, bits_w2, swizzled, row_weighted, plan; kernel.h) as its params bytes, packed by the torch op
-sglang_exl3_cpu::params. A layer (ExpertLayer,
+The service side is the concrete kernel type Exl3CpuKernel (entry.h; binding.hpp lists what a kernel type offers), declared
+where the host sees it and defined in kernel.cpp (hidden visibility). The host calls it directly: Python passes no
+address. Python makes each streamed layer with the kernel's make_layer (ExpertStreamHost.set_cpu_layer) from a
+CpuExpertLayerSpec (Exl3CpuQuantTrait.layer_spec): the pinned tier's six slab base pointers and per-slot strides, with
+the layer's parameter list [bits_w13, bits_w2, swizzled, row_weighted, plan] as int64 values; Exl3CpuKernel::params builds
+the SglangExl3CpuParams (entry.h) from them and make_layer validates it. A layer (ExpertLayer<SglangExl3CpuParams>,
 kernel.hpp) is a value of views with its params stored in it: the caller keeps the slabs alive. Every forward and
 keep-warm carries its worker cores (distinct, in [0, CPU_SETSIZE)); a core that cannot be pinned fails the call. A
 refused call throws std::invalid_argument and a failed one another std::exception, leaving out untouched.
 
 SGLang integration
 ------------------
-quantization/exl3/ext.py selects this source for residual=1, block=128 and links OpenMP.
-With SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 it always does: the accuracy flags can be left
-unset, and a flag set to any other value is refused. The extension flavor
-resid_b128_cpu_v1 prevents reuse of an old CPU kernel cache. Registration and
-the kernel's address op (torch_ops.cpp) are compiled into one extension; the CPU
-service takes the kernel's address from it. Before starting SGLang, set:
+With SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 (or the draft's CPU experts) the host module's kernel is always the
+residual=1, block=128 flavor: the accuracy flags can be left unset, and a flag set to any other value is refused. The
+exllamav3 extension (quantization/exl3/ext.py) no longer builds this kernel: with CPU experts on it compiles upstream's
+own cpu/moe_mul1.cpp as it is. Before starting SGLang, set:
 
-  export SGLANG_EXL3_CPU_CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++
+  export CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++
   export CUDA_HOME=/usr/local/cuda-13.4
   export SGLANG_EXL3_MOE_CPU_PIN=0
   export OMP_NUM_THREADS=16 OMP_THREAD_LIMIT=16 OMP_DYNAMIC=FALSE
   export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
 
-SGLANG_EXL3_CPU_CXX is used only for this extension's build (quantization/exl3/ext.py sets
-CXX around it), so the server's other JIT builds keep their compiler; a global
-CXX would move them all to GCC 15. The dsv41_baseline recipe sets it.
+CXX moves every JIT build (host C++, and nvcc's host half through -ccbin) to GCC 15. SGLANG_EXL3_CPU_CXX, when set, must
+name the same compiler. The dsv41_baseline recipe sets both.
 
 Keep the existing EXL3 source/build and CPU-offload settings. Configure the
 service with 16 workers and cores 18 through 33 (caller 18, helpers 19..33).
@@ -96,16 +96,17 @@ Code layout
 -----------
 math.hpp holds the arithmetic every tier shares (state decode, Hadamard, activation quantization) and
 math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; forward_plan.hpp holds the tier
-dispatch, the forward driver and the plans; kernel.cpp holds the public API. Registration, validation, the ISA
-tier, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp).
+dispatch, the forward driver and the plans; kernel.cpp defines Exl3CpuKernel (entry.h). Registration, validation, the ISA
+tier, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp);
+projection.hpp holds Exl3Projection and half.hpp the fp16 type.
 The tier is compile-time: the build's -march (isa.hpp's kBuildIsa: AVX512VBMI+VNNI Vbmi, AVX512VNNI Vnni, AVX512BW Bw,
 AVX2 Avx2, else Scalar), and only that tier's plans are compiled. A lower tier is a build at a lower -march
-(SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). Python passes the worker-trace options through
-the torch op sglang_exl3_cpu::configure before it takes the kernel's address; a native harness calls exl3_cpu_configure
-(kernel.h). A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
+(SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). The host installs the worker-trace options
+(Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself. A forward is
+ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
 picked once per layer, at registration: the layer's params name a plan id (ForwardPlan<Dsv41Shape, Isa::Bw>, compiled
 from the Bw tier up, or ForwardPlan<GenericShape, I> for the build's tier), Python choosing it from the list
-sglang_exl3_cpu::plans returns (each plan's facts, ISA floor and availability) by the layer's facts, and make_layer
+the host's cpu_kernel_plans returns (each plan's facts, ISA floor and availability) by the layer's facts, and make_layer
 refusing a plan that does not accept the layer or that this build does not compile (plan_rejects, forward_plan.hpp).
 Exl3Quant::dispatch then runs p.plan with no per-call check. In a VNNI build (tier Vnni or Vbmi) the same
 plan runs with its Vnni flag set: its register kernels (register_kernels.hpp, included once as reg_bw and once as

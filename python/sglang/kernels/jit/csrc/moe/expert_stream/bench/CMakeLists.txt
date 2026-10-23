@@ -64,10 +64,12 @@ get_filename_component(QUANT "${CMAKE_CURRENT_SOURCE_DIR}/../../../exl3" ABSOLUT
 if(NOT EXISTS "${QUANT}/optimized/kernel.cpp")
   message(FATAL_ERROR "Cannot locate the CPU kernels: ${QUANT}")
 endif()
-# The vendored baseline contains no Python calls; replace its unnecessary
-# binding header in the build copy, leaving its arithmetic/threading unchanged.
+# The vendored baseline contains no Python calls; replace its unnecessary binding header in the build copy, and its
+# include of upstream's cpu/moe_mul1.h with the upstream API it needs (exl3/baseline_moe_mul1.h), leaving its
+# arithmetic/threading unchanged.
 file(READ "${QUANT}/moe_mul1.cpp" BASELINE)
 string(REPLACE "#include <torch/extension.h>" "#include <ATen/ATen.h>" BASELINE "${BASELINE}")
+string(REPLACE "#include \"moe_mul1.h\"" "#include \"baseline_moe_mul1.h\"" BASELINE "${BASELINE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${QUANT}/moe_mul1.cpp")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/baseline.cpp" CONTENT "${BASELINE}" @ONLY)
 

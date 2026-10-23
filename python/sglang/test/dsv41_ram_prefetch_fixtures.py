@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKEN_TABLE_LIVE, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    FAKE_BUILD,
     ExpertStreamHost,
     candidate_offset,
     new_candidate_page,
@@ -62,6 +63,7 @@ def prefetch_rig(
         s.tables,
         page=page,
         slot_map=torch.full((rows, experts), -1, dtype=torch.int32),
+        layout=FAKE_BUILD,
         variant="instr",
         hot_page=new_hot_page(experts, pin=False) if hot else None,
         **({"node_ranges": [[(0, 4)] * rows, [(4, 8)] * rows]} if nodes == 2 else {}),
@@ -76,7 +78,7 @@ def prefetch_rig(
         x_rows = torch.zeros((rows, tokens * x_token_bytes() + table), dtype=torch.uint8)
         shape = (rows, 2 * nodes, HIDDEN) if tokens == 1 else (rows, 2 * nodes, tokens, HIDDEN)
         out_rows = torch.zeros(shape, dtype=torch.float32)
-        host.test_kernel_address()
+        host.fake_kernel_reset()
         cores = sorted(os.sched_getaffinity(0))
         for g in range(nodes):
             host.enable_cpu_experts(

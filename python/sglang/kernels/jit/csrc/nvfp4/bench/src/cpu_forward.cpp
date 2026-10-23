@@ -35,7 +35,7 @@ std::vector<int> g_cores; // the bench's worker cores, worker 0 first, carried b
 ::sglang::cpu_experts::Team& bench_team(int workers) {
     static std::unique_ptr<::sglang::cpu_experts::Team> team;
     if (!team)
-        team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::nvfp4_cpu::nvfp4_cpu_kernel(), 0);
+        team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::nvfp4_cpu::Nvfp4CpuKernel::warm, 0);
     return *team;
 }
 constexpr uint64_t max_bytes = uint64_t(2) << 30;
@@ -131,7 +131,7 @@ struct Layer {
     std::array<std::vector<uint8_t>,7> slabs;
     std::vector<uint16_t> x;
     SglangNvfp4CpuParams params{};
-    ::sglang::cpu_experts::ExpertLayer layer;  // the kernel's, over the slabs above
+    ::sglang::nvfp4_cpu::Nvfp4CpuKernel::Layer layer;  // the kernel's, over the slabs above
 };
 struct Fixture {
     Header h;
@@ -187,15 +187,15 @@ struct Fixture {
         for (auto& layer:layers) {
             auto& params=layer->params;
             params.w13_layout=int32_t(h.layout); params.inv_input_scale13=h.inv13; params.inv_input_scale2=h.inv2;
-            ::sglang::cpu_experts::ExpertLayer d;
+            ::sglang::nvfp4_cpu::Nvfp4CpuKernel::Layer d;
+            d.params=params;
             d.capacity=h.capacity; d.hidden=h.hidden;
             d.intermediate=h.intermediate; d.act_limit=h.limit; d.slab_count=7;
             for (int i=0;i<7;++i) {
                 d.slabs[i]=layer->slabs[i].empty()?nullptr:layer->slabs[i].data(); d.slot_bytes[i]=strides[i];
             }
             try {
-                layer->layer=::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(
-                    d,std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params,1)));
+                layer->layer=::sglang::nvfp4_cpu::Nvfp4CpuKernel::make_layer(d);
             } catch (const std::exception& e) {
                 throw std::runtime_error(std::string("Registration failed: ")+e.what());
             }
@@ -332,7 +332,7 @@ struct Workload {
         call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
         call.k=experts; call.threads=o.workers; call.cores=g_cores;
         try {
-            ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().forward(f.layers[layer]->layer,call,bench_team(o.workers));
+            ::sglang::nvfp4_cpu::Nvfp4CpuKernel::forward(f.layers[layer]->layer,call,bench_team(o.workers));
         } catch (const std::exception& e) {
             throw std::runtime_error(std::string("CPU expert forward failed: ")+e.what());
         }

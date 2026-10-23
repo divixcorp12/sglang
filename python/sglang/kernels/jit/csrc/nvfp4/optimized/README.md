@@ -1,25 +1,26 @@
 # Native NVFP4 CPU expert plugin
 
-Implements a `CpuExpertKernel` (`kernels/jit/csrc/moe/expert_stream/host/cpu_experts/kernel.hpp`) for the
-CPU expert engine of `kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`, parallel to
-`csrc/exl3/optimized`. The plugin and build are native C/C++ only. The engine's job ring,
-leases, pinned activation/output rows and completion signaling are reused.
+Implements the kernel type `Nvfp4CpuKernel` (`entry.h`; `kernels/jit/csrc/moe/expert_stream/host/cpu_experts/binding.hpp`
+lists what a kernel type offers) for the CPU expert engine of
+`kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`, parallel to `csrc/exl3/optimized`. The kernel and its
+build are native C/C++ only. The engine's job ring, leases, pinned activation/output rows and completion signaling are
+reused.
 
-Build from the checkout root, on the Linux machine that will run it (GCC with OpenMP):
+Inside SGLang the kernel is compiled into the expert-stream host module (`kernels/ops/moe/cpu_kernel_build.py`):
+`kernel.cpp` and the vendored C (`../upstream/nvfp4.c`, compiled as C through `load_jit`'s `source_cflags`) join the
+host's files, each with `-Ofast -march=<resolved>` (`SGLANG_JIT_HOST_MARCH`, else this machine's); the host's own files
+keep the host flags. One ISA tier is compiled, chosen at compile time from that `-march`: AVX2 when it has AVX2/FMA/F16C,
+else the scalar loop. A lower tier is a build at a lower `-march` (`x86-64-v3` AVX2, `x86-64` scalar); the host module
+runs only on CPUs that have its `-march`. The results are not bit-identical to GGML's (FMA contraction and fast math);
+the GGML check compares at a tolerance.
+
+For the native harnesses, build from the checkout root, on the Linux machine that will run it (GCC with OpenMP), the
+kernel linked with a harness source into an executable:
 
 ```sh
 python python/sglang/srt/layers/quantization/nvfp4/build.py \
-  --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ --output /absolute/path/libsglang_nvfp4_cpu.so
+  --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ --main HARNESS.cpp --output /absolute/path/harness
 ```
-
-`--main HARNESS.cpp` links a native harness into an executable instead. Inside SGLang,
-`sglang.srt.layers.quantization.nvfp4.ext.nvfp4_cpu_module()` builds the library on first use with `$CXX`
-and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags and compiler. The build is
-`-Ofast -march=<resolved>` (`SGLANG_JIT_HOST_MARCH`, else this machine's) for the C++ and the
-vendored C, and compiles one ISA tier, chosen at compile time from that `-march`: AVX2 when it has AVX2/FMA/F16C,
-else the scalar loop. A lower tier is a build at a lower `-march` (`x86-64-v3` AVX2, `x86-64` scalar); the library
-runs only on CPUs that have its `-march`. The results are not bit-identical to GGML's (FMA contraction and fast math);
-the GGML check compares at a tolerance.
 
 The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
 `test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
@@ -31,24 +32,23 @@ See [upstream provenance and adaptation details](../upstream/README.md).
 
 ## Attach to the existing engine
 
-The library's kernel is a `CpuExpertKernel` behind its accessor `nvfp4_cpu_kernel()` (`kernel.h`, hidden: never
-interposed across libraries). Python reaches it through the library's tvm-ffi export `nvfp4_cpu_kernel_address`
-(`ffi.cpp`, on `nvfp4.ext.nvfp4_cpu_module()`), and hands that address to
-`ExpertStreamHost.enable_cpu_experts`. The host makes each layer with the kernel's `make_layer`
-(`ExpertStreamHost.set_cpu_layer`) from a `CpuExpertLayerSpec` (`Nvfp4CpuQuantTrait.layer_spec`): seven slabs and the
-shape (an `ExpertLayer`, `kernel.hpp`) and a `SglangNvfp4CpuParams` (W13 layout, inverse input scales; `kernel.h`) as
-the params bytes, packed by the library's export `nvfp4_cpu_params`. A layer is a value of views, its params stored in
-it; the registrant keeps the slabs alive while the host may read them. The optimized kernel never
-repacks or expands full weight rows. A native caller does the same through `kernel.h`:
+The kernel type `Nvfp4CpuKernel` (`entry.h`) is declared where the host sees it and defined in `kernel.cpp`, the kernel's
+own translation unit (hidden visibility); the host calls it directly and Python passes no address. The host makes each
+layer with the kernel's `make_layer` (`ExpertStreamHost.set_cpu_layer`) from a `CpuExpertLayerSpec`
+(`Nvfp4CpuQuantTrait.layer_spec`): seven slabs and the shape (an `ExpertLayer<SglangNvfp4CpuParams>`, `kernel.hpp`) and
+the layer's parameter list `[w13_layout, inv_input_scale13 bits, inv_input_scale2 bits]` (the scales as IEEE binary32
+bit patterns in int64 values), from which `Nvfp4CpuKernel::params` builds the `SglangNvfp4CpuParams` (`entry.h`) that
+`make_layer` validates. A layer is a value of views, its params stored in it; the registrant keeps the slabs alive while
+the host may read them. The optimized kernel never repacks or expands full weight rows. A native caller does the same
+through `kernel.h`:
 
 ```cpp
-const auto& kernel = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel();
-// Populate shape (an ExpertLayer) with this layer's verified slab pointers and strides, and params.
-const ExpertLayer layer =
-    kernel.make_layer(shape, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
+using Kernel = ::sglang::nvfp4_cpu::Nvfp4CpuKernel;
+Kernel::Layer shape;  // this layer's verified slab pointers and strides, its dimensions, and shape.params
+const Kernel::Layer layer = Kernel::make_layer(shape);
 ForwardCall call;  // rows, k, threads, x, slots, weights, out, accumulate
 call.cores = cores;  // worker i on cores[i]; distinct, at least call.threads of them
-kernel.forward(layer, call);  // throws std::invalid_argument on a refused call, out untouched
+::sglang::cpu_experts::forward_alone<Kernel>(layer, call);  // throws std::invalid_argument on a refused call
 ```
 
 A refused call throws `std::invalid_argument`, a failure another `std::exception`; either leaves `out` untouched.
@@ -112,13 +112,12 @@ Each forward runs on a `Team` (`expert_stream/host/cpu_experts/team.hpp`) of `th
 as worker 0, in four phases separated by the team's barriers: every token's input to Q8_0; every routed expert's
 gate/up rows and SiLU; every intermediate to Q8_0; every expert's down rows, each token's summed in its routing order
 into its row of `out`. The CPU expert engine keeps one team for its lifetime and passes it to every forward; the
-two-argument `forward(layer, call)` (tests, the bench) makes a team for the call alone, pinning worker i to
+`forward_alone<Nvfp4CpuKernel>(layer, call)` (tests, the bench) makes a team for the call alone, pinning worker i to
 `cores[i]` (no cores: unpinned). A forward may use any team size up to its cores (more is refused:
 `std::invalid_argument`); a worker that cannot be pinned fails the call and leaves `out` untouched. No OpenMP
 variable reaches the team. Forwards on any cores run at once from different threads. Between jobs the engine's team
 runs the kernel's `warm` loop, register-only work at the forward's vector width, then PAUSE. Stop/join the engine
-before freeing layers or slab storage; do not unload the library while the host holds its kernel's address. The
-kernel requires Linux.
+before freeing layers or slab storage. The kernel requires Linux.
 
 The forward takes one `ForwardCall` (`kernel.hpp`, shared with the EXL3 kernel): up to 65536 token rows of up
 to eight lanes each. It skips -1 slots, preserves each row's routing order

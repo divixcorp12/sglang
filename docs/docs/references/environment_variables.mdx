@@ -1548,7 +1548,7 @@ Decode computes a layer's RAM-tier experts on the CPU, in place over the pinned 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EXL3_CPU_CXX</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>C++ compiler for the optimized EXL3 CPU kernel build, which must be GCC 15. Empty uses <code>CXX</code>. Scoped to that build only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The optimized EXL3 CPU kernel is compiled into the expert-stream host module with <code>CXX</code>, which must be GCC 15. When set, this must name the same compiler as <code>CXX</code>; empty uses <code>CXX</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>empty</code></td>
     </tr>
   </tbody>

@@ -24,9 +24,9 @@ original native pool; the optimized kernel uses OpenMP. Separate processes keep
 one backend's idle workers from contaminating the other's measurements. The
 baseline source is the repo's csrc/exl3/moe_mul1.cpp, not a frozen snapshot.
 
-There is no Python at configure, build or runtime. The binaries link ATen/c10
-from LibTorch or the server's installed torch directory, not Python bindings or
-libtorch_python. Google Benchmark v1.9.4 is pinned and fetched at configure if
+There is no Python at configure, build or runtime. The optimized kernel uses no torch; the fixture reader and the
+vendored baseline (built against exl3/baseline_moe_mul1.h) link ATen/c10 from LibTorch or the server's installed
+torch directory, not Python bindings or libtorch_python. Google Benchmark v1.9.4 is pinned and fetched at configure if
 not installed; set EXL3_FETCH_BENCHMARK=OFF for offline dependency management.
 The kernel compiles with the validated GCC15 -Ofast -march=native options; the
 harness compiles without fast-math so its finite-output checks work.
