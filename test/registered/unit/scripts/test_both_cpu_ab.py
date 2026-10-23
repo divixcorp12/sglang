@@ -1173,7 +1173,8 @@ def test_prod_is_the_best_served_arm_with_both_startup_calibrations_and_the_chec
     # Owner, 2026-10-22, no served A/B: the DIRECT insert score without eager (prefill) routes, at decay 0.999 (offline
     # replay +15.6 hits a verify, hot-cache-replay-1022).
     hot_insert = {"SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY": ("0.98", "0.999"),
-                  "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS": (None, "0")}
+                  "SGLANG_ENABLE_HOT_INSERT_EAGER_COUNTS": (None, "0"),
+                  "SGLANG_ENABLE_HOT_INSERT_PROBATION": (None, "1")}
     calibrations = {"SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION": ("0", "1"),
                     "SGLANG_OPT_HOT_CACHE_CALIBRATE_AT_STARTUP": ("0", "1")}
     # Layer-major prefill under DSpark: production since 2026-10-17 (owner), never served on the best arm.
