@@ -337,7 +337,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
     )
     if trace_path:
         Path(trace_path).unlink(missing_ok=True)
-        env = {**env, ac.TRACE_ENV: trace_path}
+        env = {**env, ac.TRACE_ENV: ac.trace_env_value(trace_path)}
     os.environ.update(env)
 
     from counters import TraceCursor, mix, verify_lease, window
