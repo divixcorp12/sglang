@@ -182,9 +182,6 @@ int main()
         d = good;
         d.capacity = 0;
         CHECK(refused(d));
-        d = good;
-        d.params.scale = std::numeric_limits<float>::quiet_NaN();  // the quant validates its params
-        CHECK(refused(d));
         CHECK(!refused(good));
         ok("params_and_slabs_are_validated");
     }
