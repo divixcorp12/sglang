@@ -480,8 +480,6 @@ class CpuExpertsConfig(_Config):
         "misses": "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES",
         "keep_warm_us": "SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US",
         "store_out": "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT",
-        "max_isa": "SGLANG_EXPERT_STREAM_CPU_MAX_ISA",
-        "report_isa": "SGLANG_EXPERT_STREAM_CPU_REPORT_ISA",
     }
 
     enabled: bool = False
@@ -491,9 +489,6 @@ class CpuExpertsConfig(_Config):
     misses: bool = False
     keep_warm_us: int = 2000
     store_out: bool = False
-    # Caps the kernel's ISA tier (scalar, avx2, bw, vnni, vbmi); empty keeps the host's.
-    max_isa: str = ""
-    report_isa: bool = False
     split: CpuSplitConfig = msgspec.field(default_factory=CpuSplitConfig)
     two_stage: CpuTwoStageConfig = msgspec.field(default_factory=CpuTwoStageConfig)
 
