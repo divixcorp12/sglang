@@ -71,7 +71,8 @@ public:
         barrier();
     }
 
-    // Inside a job: returns once every worker has arrived here.
+    // Inside a job: returns once every worker has arrived here. It spins and never sleeps: std::barrier parks early
+    // arrivals on a futex, and a wake costs microseconds against phases tens of microseconds long.
     void barrier()
     {
         const uint32_t phase = phase_.load(std::memory_order_acquire);
