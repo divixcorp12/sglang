@@ -134,7 +134,6 @@ def arm(args):
     summary = [{"case": key[0], "reuse": key[1], "gap_s": key[2], "n": len(values),
                 "p50_ms": statistics.median(values), "p95_ms": quantile(values, .95),
                 "max_ms": max(values)} for key, values in sorted(bycase.items())]
-    metadata["plan_calls"] = options.cpu_kernel_plan_calls()
     args.output.write_text(json.dumps({"metadata": metadata, "summary": summary, "output_hashes": outputs,
                                       "jobs": jobs}, indent=2) + "\n")
     print(json.dumps({"output": str(args.output), "jobs": len(jobs), "summary": summary}), flush=True)

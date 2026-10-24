@@ -219,12 +219,12 @@ def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slot
         pytest.skip(f"needs {threads} cores in the affinity mask")
     cores = CORES[:threads]  # ten workers: a serving group's team
     weighted = _trait(row_weighted=True)
-    options = es.cpu_kernel_options(variant="prod")  # the module the layers below run on
     slabs = _random_slabs(20261008, HIDDEN, INTER)
-    layers = {
-        name: es.kernel_layer(t.layer_spec(slabs, CAP), variant="prod")
-        for name, t in [("original", trait), ("weighted", weighted)]
-    }
+    specs = {name: t.layer_spec(slabs, CAP) for name, t in [("original", trait), ("weighted", weighted)]}
+    for spec in specs.values():
+        # Python chose each layer's plan at registration: the DSV4.1 plan is the one serving runs.
+        assert spec.plan.startswith("EXL3 CPU plan dsv41 ("), spec.plan
+    layers = {name: es.kernel_layer(spec, variant="prod") for name, spec in specs.items()}
     g = torch.Generator().manual_seed(20261008)
     x = (torch.randn(len(slots), HIDDEN, generator=g) * 4.0).half()
 
@@ -238,13 +238,10 @@ def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slot
         return out
 
     def run(_):
-        before = options.cpu_kernel_plan_calls()[0]  # [dsv41, generic]
-        outs = [forward(layers["original"]), forward(layers["weighted"]), forward(layers["original"])]
-        return outs, options.cpu_kernel_plan_calls()[0] - before
+        return [forward(layers["original"]), forward(layers["weighted"]), forward(layers["original"])]
 
     try:
-        ((original, weighted_out, again), dsv41_calls),  = _on_threads(run, [None])
-        assert dsv41_calls == 3, "the DSV4.1 plan is the one serving runs"
+        (original, weighted_out, again), = _on_threads(run, [None])
         assert torch.isfinite(original).all() and torch.equal(original, again)
         assert torch.equal(weighted_out, original)
     finally:

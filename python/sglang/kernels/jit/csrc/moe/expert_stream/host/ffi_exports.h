@@ -540,18 +540,6 @@ struct HostExports {
     return {};
   }
 
-  static void cpu_kernel_plan_calls(TensorView out) {
-    using namespace host;
-    require_kernel_options("cpu_kernel_plan_calls");
-    if constexpr (kHasKernelOptions) {
-      const std::vector<int64_t> calls = CpuKernel::plan_calls();
-      auto cpu = SymbolicDevice{};
-      expert_stream::verify_named(
-          "out", TensorMatcher({static_cast<int64_t>(calls.size())}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-      std::copy(calls.begin(), calls.end(), static_cast<int64_t*>(out.data_ptr()));
-    }
-  }
-
   static int64_t cpu_kernel_chunk_m() {
     require_kernel_options("cpu_kernel_chunk_m");
     if constexpr (kHasKernelOptions) return CpuKernel::chunk_m();
@@ -1421,7 +1409,6 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_stop, Exports::draft_stop);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_stats, Exports::draft_stats);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_kernel_plans, Exports::cpu_kernel_plans);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_kernel_plan_calls, Exports::cpu_kernel_plan_calls); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_kernel_chunk_m, Exports::cpu_kernel_chunk_m);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_kernel_isa, Exports::cpu_kernel_isa);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_kernel_configure, Exports::cpu_kernel_configure);

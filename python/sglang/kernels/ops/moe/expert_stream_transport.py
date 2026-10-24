@@ -291,12 +291,6 @@ class CpuKernelOptions:
         follows the build's -march."""
         return str(self._module.expert_stream_cpu_kernel_plans())
 
-    def cpu_kernel_plan_calls(self) -> list[int]:
-        """The forwards since load by plan, ``[dsv41, generic]`` for EXL3."""
-        out = torch.zeros(2, dtype=torch.int64)
-        self._module.expert_stream_cpu_kernel_plan_calls(out)
-        return out.tolist()
-
     def cpu_kernel_chunk_m(self) -> int:
         """The most tokens a chunk holds in this build."""
         return int(self._module.expert_stream_cpu_kernel_chunk_m())

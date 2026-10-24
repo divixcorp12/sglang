@@ -18,7 +18,7 @@
 //   forward(layer, call, team)    runs a call check would pass on `team`
 //   warm(word, seen, deadline_ns) register-only work until *word != seen or the clock reaches deadline_ns (a Team's
 //                                 idle loop, so a core keeps the license the forward runs at)
-// A kernel type may also offer the format's options (plans_json, plan_calls, chunk_m, isa, configure; the host's
+// A kernel type may also offer the format's options (plans_json, chunk_m, isa, configure; the host's
 // cpu_kernel_* exports). BuildWithKernel and ExpertFormatTraits require CpuExpertKernel, so a kernel type missing one
 // of these, or declaring one with another signature, fails there with the concept's name.
 //

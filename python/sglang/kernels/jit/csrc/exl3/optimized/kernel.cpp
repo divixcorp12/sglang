@@ -61,17 +61,6 @@ int32_t Exl3CpuKernel::warm(const uint32_t* word, uint32_t seen, int64_t deadlin
 
 std::string Exl3CpuKernel::isa() { return ::sglang::cpu_experts::isa_name(Forward::isa()); }
 
-SglangExl3CpuPlanCalls exl3_cpu_plan_calls()
-{
-    return {g_plan_calls[0].load(std::memory_order_relaxed), g_plan_calls[1].load(std::memory_order_relaxed)};
-}
-
-std::vector<int64_t> Exl3CpuKernel::plan_calls()
-{
-    const SglangExl3CpuPlanCalls calls = exl3_cpu_plan_calls();
-    return {calls.dsv41, calls.generic};
-}
-
 std::vector<SglangExl3CpuPlanInfo> exl3_cpu_plans() { return plan_infos(); }
 
 std::string Exl3CpuKernel::plans_json()

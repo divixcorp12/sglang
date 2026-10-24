@@ -7,7 +7,7 @@ V4.1-shaped layer:
   - unswizzled (native), for which registration chooses the DSV4.1 plan on AVX-512BW;
   - swizzled, which that plan does not accept, so it registers on the generic plan;
   - token by token, through the native layer.
-The three must agree bit for bit. The plan counter (cpu_kernel_plan_calls) shows which plan each call took. The
+The three must agree bit for bit. The layers fixture asserts each layer's registered plan from its spec. The
 chunk-size cases are generated from the build's CHUNK_M, so a larger MAX_M widens them with no edit here.
 
 Needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier. Run it once with SGLANG_JIT_HOST_MARCH=skylake-avx512 (the bw
@@ -81,11 +81,6 @@ def _shares_an_expert(routes):
     return len(live) != len(set(live))
 
 
-def _expected_plan(routes):
-    """The plan a call on the native layer takes: the DSV4.1 plan, whose chunks hold 1..CHUNK_M tokens."""
-    return "dsv41"
-
-
 def _options():
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
@@ -136,29 +131,25 @@ def layers():
 
 
 def _forward(layer, x, slots, weights, threads=THREADS):
-    """One call, unpinned; returns (out, the plan it took) from the plan counter's step."""
+    """One call, unpinned; returns its output. The layer's plan was fixed at registration (the `layers` fixture and
+    the K2 test assert it from the spec)."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    before = _options().cpu_kernel_plan_calls()
     out = torch.full((x.shape[0], H), float("nan"))
     status, why = es.kernel_forward(layer, x, slots, weights, out, threads=threads, variant="instr")
     assert (status, why) == (0, "")
-    after = _options().cpu_kernel_plan_calls()
-    step = (after[0] - before[0], after[1] - before[1])
-    assert step in ((1, 0), (0, 1)), step
-    return out, "dsv41" if step == (1, 0) else "generic"
+    return out
 
 
 def _check(layers, name, routes):
-    """One call on both layers and token by token: the same bits everywhere, and the plan _expected_plan names."""
+    """One call on both layers and token by token: the same bits everywhere (the native layer runs the DSV4.1 plan, the swizzled one the generic)."""
     x, slots, weights = _inputs(name, routes)
-    got, plan = _forward(layers["native"], x, slots, weights)
-    want, generic = _forward(layers["swizzled"], x, slots, weights)
-    assert (plan, generic) == (_expected_plan(routes), "generic"), name
+    got = _forward(layers["native"], x, slots, weights)
+    want = _forward(layers["swizzled"], x, slots, weights)
     assert torch.isfinite(got).all(), name
     assert torch.equal(got, want), name
     singles = torch.cat(
-        [_forward(layers["native"], x[t : t + 1], slots[t : t + 1], weights[t : t + 1])[0] for t in range(len(routes))]
+        [_forward(layers["native"], x[t : t + 1], slots[t : t + 1], weights[t : t + 1]) for t in range(len(routes))]
     )
     assert torch.equal(got, singles), name
 
@@ -199,17 +190,16 @@ def test_a_k2_layer_of_the_dsv41_shape_takes_the_generic_plan(layers):
     handle = es.kernel_layer(spec, variant="instr")
     try:
         x, slots, weights = _inputs("k2", [[4, 0, 5], [0, 4, 5]])
-        out, plan = _forward(handle, x, slots, weights)
+        out = _forward(handle, x, slots, weights)
     finally:
         es.kernel_drop(handle, variant="instr")
-    assert plan == "generic" and torch.isfinite(out).all()
+    assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("threads", [1, 3, 16])
 def test_dsv41_plan_bits_do_not_depend_on_the_team(layers, threads):
     routes = dict(CASES)["draft-16x3"]
     x, slots, weights = _inputs("draft-16x3", routes)
-    want, _ = _forward(layers["swizzled"], x, slots, weights)
-    got, plan = _forward(layers["native"], x, slots, weights, threads=threads)
-    assert plan == _expected_plan(routes)
+    want = _forward(layers["swizzled"], x, slots, weights)
+    got = _forward(layers["native"], x, slots, weights, threads=threads)
     assert torch.equal(got, want)

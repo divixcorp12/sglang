@@ -208,6 +208,7 @@ struct SlabLayer {
   };
   std::array<std::unique_ptr<uint8_t, Free>, 6> slabs;
   ::sglang::exl3_cpu::Exl3CpuKernel::Layer layer;
+  int32_t plan;  // the SglangExl3CpuPlan the layer was registered on
 
   SlabLayer(const LayerFixture& f, int hidden, int slots) {
     const int experts = static_cast<int>(f.matrices[0].size());
@@ -239,9 +240,8 @@ struct SlabLayer {
       shape.slot_bytes[n] = row;
     }
     // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
-    shape.params = SglangExl3CpuParams{
-        3, 3, 0, 0,
-        ::sglang::exl3_cpu::exl3_cpu_match_plan(shape.hidden, shape.intermediate, 3, 3, 0, shape.act_limit)};
+    plan = ::sglang::exl3_cpu::exl3_cpu_match_plan(shape.hidden, shape.intermediate, 3, 3, 0, shape.act_limit);
+    shape.params = SglangExl3CpuParams{3, 3, 0, 0, plan};
     layer = ::sglang::exl3_cpu::Exl3CpuKernel::make_layer(shape);
   }
 };
@@ -311,6 +311,13 @@ struct Workload {
   size_t layer_count() const {
     return fixture.layers.size();
   }
+
+#ifndef EXL3_BENCH_BASELINE
+  // Every layer has the same facts, so the same plan.
+  int32_t plan() const {
+    return layers.front()->plan;
+  }
+#endif
 
   void label(benchmark::State& state) const {
     state.counters["experts"] = experts;
@@ -439,6 +446,10 @@ struct RoutedWorkload {
     return layers.size();
   }
 
+  int32_t plan() const {
+    return layers.front()->plan;
+  }
+
   void forward(size_t layer) {
     ::sglang::cpu_experts::ForwardCall call;
     call.rows = rows;
@@ -496,9 +507,6 @@ void full_forward(benchmark::State& state, W& workload) {
     workload.validate();
     for (int i = 0; i < workload.options.warmup; ++i)
       workload.forward(i % workload.layer_count());
-#ifndef EXL3_BENCH_BASELINE
-    const SglangExl3CpuPlanCalls before = ::sglang::exl3_cpu::exl3_cpu_plan_calls();
-#endif
     std::vector<double> samples;
     size_t layer = 0;
     for (auto _ : state) {
@@ -514,9 +522,7 @@ void full_forward(benchmark::State& state, W& workload) {
       benchmark::DoNotOptimize(workload.output.data());
     }
 #ifndef EXL3_BENCH_BASELINE
-    const SglangExl3CpuPlanCalls after = ::sglang::exl3_cpu::exl3_cpu_plan_calls();
-    state.counters["dsv41_calls"] = static_cast<double>(after.dsv41 - before.dsv41);
-    state.counters["generic_calls"] = static_cast<double>(after.generic - before.generic);
+    state.counters["plan"] = workload.plan();
 #endif
     workload.validate();
     if (!samples.empty()) {

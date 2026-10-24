@@ -278,22 +278,18 @@ private:
     }
 };
 
-// Forwards by plan since load: [0] the DSV4.1 plan, [1] the generic plan. Relaxed: counts only, read through
-// exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
-std::atomic<int64_t> g_plan_calls[2];
-
 // Runs the layer's plan (p.plan, which registration checked against the layer and this build).
 void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team)
 {
 #if defined(SGLANG_CPU_EXPERTS_AVX512)
     static_assert(Dsv41Shape::kMinIsa == Isa::Bw, "the DSV4.1 plan is compiled where SGLANG_CPU_EXPERTS_AVX512 is");
     if (p.plan == Dsv41Shape::kPlan) {
-        g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
         ForwardPlan<Dsv41Shape>::run(ctx, Experts<Dsv41Shape>{ctx.layer, p}, ar, team);
         return;
     }
 #endif
-    g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
+    // A fixed plan reaching here means its branch above was compiled out while plan_info listed it available.
+    EXL3_CHECK(p.plan == GenericShape::kPlan, "the layer's plan is not compiled into this build");
     ForwardPlan<GenericShape>::run(ctx, Experts<GenericShape>{ctx.layer, p}, ar, team);
 }
 

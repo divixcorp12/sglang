@@ -2,7 +2,7 @@
 # A/B of two builds of the bare-forward bench (exl3_cpu_optimized): BASE_BUILD and HEAD_BUILD run as separate processes,
 # alternating order each round, for EXL3_BENCH_ROUNDS rounds (default 8), each with the same flags. Writes every round's
 # Google JSON and log, and summary.tsv: per benchmark, the median over rounds of p50_us for each build, head / base, and
-# the plan each build ran (from the dsv41_calls / generic_calls counters). Refuses while a server runs: it pins 28-43. The ISA tier is each build's -march;
+# the plan each build ran (from the plan counter). Refuses while a server runs: it pins 28-43. The ISA tier is each build's -march;
 # isa.txt records the tier each run printed.
 set -euo pipefail
 if [[ $# -lt 3 ]]; then
@@ -57,7 +57,7 @@ for side in ("base", "head"):
             name = b["name"].split("/", 1)[1].removesuffix("/manual_time")
             entry = rows.setdefault(name, {}).setdefault(side, {"p50": [], "plan": set()})
             entry["p50"].append(b["p50_us"])
-            entry["plan"].add("dsv41" if b["generic_calls"] == 0 else "generic" if b["dsv41_calls"] == 0 else "mixed")
+            entry["plan"].add({0: "generic", 1: "dsv41"}[int(b["plan"])])  # kernel.h's SglangExl3CpuPlan ids
 with open(f"{results}/summary.tsv", "w") as out:
     out.write("benchmark\tbase_p50_us\thead_p50_us\thead/base\tbase_plan\thead_plan\n")
     for name, sides in rows.items():

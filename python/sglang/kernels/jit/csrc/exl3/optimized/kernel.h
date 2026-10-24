@@ -7,13 +7,6 @@
 #include <cstdint>
 #include <vector>
 
-// Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape>;
-// generic, ForwardPlan<GenericShape>. Read by tests and benches to see which plan a call took.
-struct SglangExl3CpuPlanCalls {
-    int64_t dsv41;
-    int64_t generic;
-};
-
 // The forward plans this library compiles (forward_plan.hpp's run_plan), by the id a layer's params name. The generic
 // plan runs any layer make_layer accepts; a fixed plan runs only the layer facts its Shape (shapes.hpp) fixes.
 enum SglangExl3CpuPlan : int32_t {
@@ -35,8 +28,6 @@ struct SglangExl3CpuPlanInfo {
 };
 
 namespace sglang::exl3_cpu {
-// The forwards since load by the plan they took (Exl3CpuKernel::plan_calls lists them as [dsv41, generic]).
-__attribute__((visibility("hidden"))) SglangExl3CpuPlanCalls exl3_cpu_plan_calls();
 // The compiled plans, the generic plan first; `available` follows the build's -march.
 __attribute__((visibility("hidden"))) std::vector<SglangExl3CpuPlanInfo> exl3_cpu_plans();
 // The first available fixed plan that accepts these layer facts, else the generic plan: for native harnesses (the
