@@ -27,6 +27,9 @@ struct PlanTraits
     static constexpr bool kCompactScratch = false;    // int16 compact activations instead of the int32 splats
     static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed
     static constexpr bool kWideSingleExpert = false;  // 512-wide quantization for one token through one expert
+    // GateUp and DownTiles claim tile pairs in runs of this many: the generic tile kernels start and end a range on an
+    // 8-tile group.
+    static constexpr int kTileAlign = 4;
 };
 
 // DeepSeek V4.1 from AVX-512BW up: the validated fast path.
@@ -36,16 +39,16 @@ struct PlanTraits<Dsv41Shape>
     static constexpr bool kCompactScratch = true;
     static constexpr bool kGroupedTraversal = true;  // one-token chunks (kRegisterBudget[0])
     static constexpr bool kWideSingleExpert = true;
+    // The compact register kernels take any tile pair. A coarser run leaves workers idle at the end of the
+    // memory-bound GEMVs: 144 pairs in runs of 8 put 32 tiles on the slowest of 16 workers, against 18 evenly.
+    static constexpr int kTileAlign = 1;
 };
 
 template <class Shape>
 struct ForwardPlan
 {
     using Traits = PlanTraits<Shape>;
-
-    // GateUp and DownTiles tasks are tile pairs claimed in runs of whole 8-tile groups: the generic plan's tile kernels
-    // start and end a range on one (the compact register kernels take any pair).
-    static constexpr int kTileAlign = 8;
+    static constexpr int kTileAlign = Traits::kTileAlign;
 
     // Sizes the job's scratch from its arena and points the context at it. ctx.chunks is final.
     static void prepare_scratch(ForwardJob& job)
