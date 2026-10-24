@@ -437,9 +437,6 @@ def dspark_env() -> dict[str, str]:
         "SGLANG_EXPERT_STREAM_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
         "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
         "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
-        # Stated off: the row-weighted B arms (analysis/dsv41-drive/dspark/both_cpu_ab.py) override it, and a captured
-        # shell must not carry one into an A.
-        "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "",
         # Budget A, with DSPARK_MEM_FRACTION_STATIC (reasons and the owner's option-C TODO at DSPARK_MEM_FRACTION_STATIC).
         "SGLANG_EXPERT_STREAM_HOT_GPU_MB": DSPARK_HOT_GPU_MB,
         # FlashInfer for every arm and production (owner, 2026-10-20: full FlashInfer everywhere). Every DSpark text

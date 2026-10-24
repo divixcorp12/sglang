@@ -171,7 +171,7 @@ def exl3_params(monkeypatch):
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
 def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout, bits_w13, bits_w2):
     """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape,
-    the clamp and the params list (bits_w13, bits_w2, swizzled, row_weighted, plan). Gate/up and
+    the clamp and the params list (bits_w13, bits_w2, swizzled, plan). Gate/up and
     down are read separately: a w2 whose K differs from w13's gets its own row size and K."""
     slabs = _exl3_slabs(bits_w13, bits_w2)
     if tier_layout:
@@ -742,39 +742,3 @@ def test_the_pool_and_the_c_abi_mirrors_are_gone():
     assert "kernel_address" not in dir(CpuExpertQuantTrait)
     assert not {"register_layer", "free_layer", "forward", "native_forward"} & set(dir(CpuExpertQuantTrait))
 
-
-@pytest.mark.parametrize(
-    "value, sources",
-    [("", frozenset()), ("draft", {"draft"}), ("target", {"target"}), ("both", {"draft", "target"})],
-)
-def test_row_weighted_assignment_names_the_sources_it_weights(value, sources):
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
-
-    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(value):
-        assert row_weighted_sources() == frozenset(sources)
-
-
-@pytest.mark.parametrize("value", ["1", "on", "Draft", "draft,target"])
-def test_row_weighted_assignment_refuses_any_other_value(value):
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
-
-    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(value):
-        with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT"):
-            row_weighted_sources()
-
-
-def test_the_trait_weights_only_the_source_the_option_names(caplog):
-    """The draft's and the target's traits come from one option: draft-only weights the draft's layers and logs it,
-    the target's layers keep the original assignment."""
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.cpu_experts.service import cpu_trait_for
-
-    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override("draft"):
-        with caplog.at_level("INFO", logger="sglang.srt.layers.moe.expert_engine.formats.exl3"):
-            draft, target = cpu_trait_for("exl3", source="draft"), cpu_trait_for("exl3", source="target")
-    assert (draft.row_weighted, target.row_weighted) == (True, False)
-    assert "draft" in caplog.text and "row-weighted" in caplog.text
-    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(""):
-        assert cpu_trait_for("exl3", source="draft").row_weighted is False

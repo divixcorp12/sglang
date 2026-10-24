@@ -429,7 +429,7 @@ def _expected_config(recipe: str):
     for field, old in (("src", "SGLANG_EXL3_SRC"), ("dir", "SGLANG_EXL3_BUILD_DIR"), ("cxx", "SGLANG_EXL3_CPU_CXX")):
         exl3["build"][field] = resolved[old]
     for field, old in (("act_residual", "SGLANG_EXL3_CPU_ACT_RESIDUAL"), ("act_block", "SGLANG_EXL3_CPU_ACT_BLOCK"),
-                       ("max_m", "SGLANG_EXL3_CPU_MAX_M"), ("row_weighted", "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT")):
+                       ("max_m", "SGLANG_EXL3_CPU_MAX_M")):
         exl3["cpu"][field] = resolved[old]
     exl3["cpu"]["pin"] = raw.get("EXL3_MOE_CPU_PIN")
     return flat, dsv41, exl3

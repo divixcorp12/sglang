@@ -1708,7 +1708,7 @@ workloads incl. shared5-8 and counts8-7-6-5-4-3-2-1) at 10 and 16 workers, with 
     grow (555 s for a full 16-row table vs 478 s).
   - #1: a call whose chunks differ in token count claims 8-tile groups from an atomic counter (gate/up, down); uniform
     calls keep the static split. It covers every call row weighting would change, so
-    `SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT` (#1b) now only reaches the generic plan and stays off.
+    `SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT` (#1b) now only reaches the generic plan and stays off. The variable was removed on 2026-10-24, when the job window replaced the static tile assignment.
   - #2: `arm_env.CPU_EXPERTS_THREADS` 10 -> 16 (experts 6-21 and 28-43); driver 18-21 -> 22-25, capture helpers
     22-25 -> 78-81 (`HELPER_CORES`).
   - #11: `SGLANG_DSV41_ENABLE_CPU_EXPERTS_SMT` (off) adds each expert core's SMT sibling to its pool; benches take `--smt`.

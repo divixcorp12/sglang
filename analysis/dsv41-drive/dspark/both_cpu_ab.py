@@ -101,15 +101,6 @@ ARMS = {
     "prod": ({**PREFETCH_OFF, **MISS_CUT_OFF}, False),
     "dspark-draft-only": ({**arm_env.dspark_env(), **DRAFT_ONLY, **PREFETCH_OFF, **MISS_CUT_OFF}, True),
     "dspark-both": ({**arm_env.dspark_env(), **PREFETCH_OFF, **MISS_CUT_OFF}, True),
-    # Experiment-only; retire with plan 2026-10-07-dsv41-row-weighted-serving-experiment. B arms, one source at a time.
-    "dspark-both-rw-draft": (
-        {**arm_env.dspark_env(), **PREFETCH_OFF, **MISS_CUT_OFF, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "draft"},
-        True,
-    ),
-    "dspark-both-rw-target": (
-        {**arm_env.dspark_env(), **PREFETCH_OFF, **MISS_CUT_OFF, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"},
-        True,
-    ),
     # NVMe-to-RAM prefetch (spec 2026-10-08-dsv41-ram-prefetch-design, The A/B): the replay's best arm, h=1, one
     # candidate per token, one row per layer, a pool of 2 per row and group; all pinned so a shell cannot leak.
     "dspark-both-prefetch": (
