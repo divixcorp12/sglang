@@ -1,0 +1,9 @@
+{
+  "include": [
+    "analysis/mimo-v8-source-review"
+  ],
+  "pythonVersion": "3.11",
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "typeCheckingMode": "basic"
+}
