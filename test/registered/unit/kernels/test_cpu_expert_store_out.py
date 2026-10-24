@@ -1,12 +1,13 @@
-"""SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT on the CPU expert engine (cpu_experts.h run_job): a verify's per-token job leaves
-its overwrite to the kernel instead of zeroing its token rows and then accumulating.
+"""SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT on the CPU expert engine (cpu_experts.h admit_target): a verify's
+per-token job is an overwrite the kernel does, whether the flag picks its zero-first or its store-first form; the engine
+no longer zeroes the job's token rows on its own thread and then accumulates.
 
 The kernel is the FAKE_BUILD host's fake kernel (ExpertStreamHost.fake_kernel_reset), driven by the split
 calibration's per-token jobs (every job an overwrite of part 0, each lane routed by about 1.25 of the tokens, so one
 token routes none). The fake marks an overwrite: it writes j + sum to column j of every row, where an accumulate adds
-sum to what the row held. So the rows tell which the engine did: with the flag off, zeros plus sum (the engine zeroed
-them, then accumulated); with it on, j + sum (the kernel overwrote them, the unrouted token's row too). That the real
-EXL3 kernel's overwrite gives the bits of the old zero-then-accumulate is test/manual/dsv41/test_exl3_cpu_store_out.py.
+sum to what the row held. So the rows tell which the engine did: an overwrite call and j + sum in every row, the
+unrouted token's too, with the flag off and on. That the real EXL3 kernel's overwrite gives the bits of the old
+zero-then-accumulate is test/manual/dsv41/test_exl3_cpu_store_out.py.
 """
 
 import os
@@ -71,29 +72,25 @@ def _calibrate(host, group, tokens):
 @pytest.mark.parametrize("nodes", [1, 2])
 @pytest.mark.parametrize("tokens", [1, 2, 6])
 @pytest.mark.parametrize("store_out", [False, True], ids=["zeroed", "stored"])
-def test_a_per_token_job_leaves_its_overwrite_to_the_kernel_only_with_store_out(tmp_path, nodes, tokens, store_out):
-    """Mutations: run_job ignores store_out (the stored case reads zeros + sum and accumulate calls); run_job skips the
-    zeroing without store_out (the zeroed case reads 7 + sum); the FFI drops store_out (as the first)."""
+def test_a_per_token_job_leaves_its_overwrite_to_the_kernel(tmp_path, nodes, tokens, store_out):
+    """Mutations: admit_target accumulates a per-token job (accumulate calls, rows of 7 + sum); the FFI drops store_out
+    (the two cases then differ only in the kernel's form, which the fake does not show)."""
     host, keep = _host(tmp_path, nodes=nodes, tokens=tokens, store_out=store_out)
     out_rows = keep[-1]
     try:
         for group in range(nodes):
             calls = _calibrate(host, group, tokens)
             assert calls and len(calls) % tokens == 0
-            per_token = tokens > 1
-            # A one-token row's job is an overwrite either way; a verify's is one only when the kernel owns it.
-            assert {c["accumulate"] for c in calls} == {per_token and not store_out}
+            # A one-token row's job and a verify's are overwrites either way: the kernel owns the zeroing.
+            assert {c["accumulate"] for c in calls} == {False}
             last = calls[-tokens:]  # the last job's rows, in token order; it is what part 0 holds now
             part = out_rows[ROW, 2 * group]
             rows = part.reshape(tokens, HIDDEN)
             for t, call in enumerate(last):
                 total = sum(w * (s + 1) for s, w in zip(call["slots"], call["weights"]))
-                base = [0.0] * HIDDEN if per_token and not store_out else [float(j) for j in range(HIDDEN)]
-                assert rows[t].tolist() == pytest.approx([b + total for b in base]), (group, t)
+                assert rows[t].tolist() == pytest.approx([j + total for j in range(HIDDEN)]), (group, t)
             if tokens == 6:  # of 4 lanes, lane % 6 routes tokens 0-3 and lane 3 token 4 too: token 5 routes none
-                assert all(s < 0 for s in last[5]["slots"]) and rows[5].tolist() == (
-                    [0.0] * HIDDEN if not store_out else [float(j) for j in range(HIDDEN)]
-                )
+                assert all(s < 0 for s in last[5]["slots"]) and rows[5].tolist() == [float(j) for j in range(HIDDEN)]
             other = out_rows[ROW, 2 * (1 - group)] if nodes == 2 else None
             if other is not None and group == 0:
                 assert (other == 7.0).all(), "group 0's jobs write only its own parts"

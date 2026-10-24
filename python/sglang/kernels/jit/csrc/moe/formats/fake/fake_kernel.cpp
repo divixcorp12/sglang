@@ -96,7 +96,7 @@ int64_t FakeCpuKernel::job_violations() { return g_violations.load(std::memory_o
 void FakeCpuKernel::prepare(Job& job, const Layer& layer, const ForwardCall& c)
 {
     if (const int64_t f = g_fail.load(std::memory_order_relaxed); f != 0)
-        throw std::invalid_argument("fake CPU expert prepare failed (" + std::to_string(f) + ")");
+        throw std::invalid_argument("fake CPU expert forward failed (" + std::to_string(f) + ")");
     if (c.k > 0 && c.slots[0] == kRejectSlot) throw std::invalid_argument("fake CPU expert prepare rejected the call");
     job.id = g_ordinal.fetch_add(1, std::memory_order_relaxed);
     job.rows = std::max(c.rows, 1);

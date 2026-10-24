@@ -70,7 +70,7 @@ int main(int argc, char** argv)
             shape.slabs[s] = slabs[s].data();
             shape.slot_bytes[s] = row_bytes[s];
         }
-        const int64_t values[5] = {c.bits_w13, c.bits_w2, c.swizzled, 0, 0};
+        const int64_t values[4] = {c.bits_w13, c.bits_w2, c.swizzled, 0};
         shape.params = K::params(values);
         const K::Layer layer = K::make_layer(shape);
 
