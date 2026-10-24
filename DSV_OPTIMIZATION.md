@@ -1755,8 +1755,20 @@ and `numactl --membind=1` (`/mnt/nvme1/exl3-tidy/wsweep`):
   the cores yet, and 12-15 can be given away for 0-3% on CPU jobs when one does.
 - SMT siblings add 3-6% over 8 workers and fall well short of 16 cores: the decode is port-bound (exl3/optimized/README.txt,
   execution ports), so two threads on a core share the same two vector ports.
-- Not explained: the membind-1 run is 8-20% slower than the inherited run at every count, and noisier (14 beats 16 at
-  experts 3 only). The conclusion is the same in both.
+- The two runs differ because node 1's free memory did, not the policy. The inherited run came right after a page-cache
+  drop, so its pages were local; by the membind-1 run node 1 was full of other files' page cache again (0.2-0.9 GiB free),
+  and short runs (256 iterations) pay the reclaim of each first touch inside the timed loop. With node 1 full, experts 3
+  at 16 workers and 4096 iterations (`/mnt/nvme1/exl3-tidy/mbprobe2`, `perf stat`, smaps):
+
+  | policy | pages on | huge pages | dTLB misses | IPC | p50 us |
+  |---|---|---|---|---|---|
+  | inherited | node 0, 1475 MiB | 4 MiB | 61.7 M | 0.75 | 1294 |
+  | membind 1 | node 1, 1431 MiB | 1074 MiB | 7.6 M | 1.22 | 900 |
+  | membind 0 | node 0, 1484 MiB | 1084 MiB | 7.6 M | 0.79 | 1281 |
+
+  Remote memory costs the forward ~43%; the missing huge pages (8x the TLB misses) about 1% more. Production places the
+  pinned tier per node (`SGLANG_MOE_PINNED_HOST_NUMA_MB`) after the pre-launch floor, so this is a bench hazard: the bare
+  bench inherits its memory policy, and its absolute numbers depend on how full node 1 is.
 
 ## 4. Ideas on record, not started
 
