@@ -1,14 +1,13 @@
-// The validation and dispatch every CPU expert quant shares, generic over the quant. ExpertForward<Quant> implements the
-// operations of a format's kernel type (binding.hpp): the kernel's translation unit defines the kernel's static
-// functions by calling these. It holds no layer table and takes no lock. The Quant contract:
+// The validation every CPU expert quant shares, generic over the quant. ExpertForward<Quant> implements the layer and
+// call operations of a format's kernel type (binding.hpp): the kernel's translation unit defines the kernel's static
+// functions by calling these (its job interface is its own). It holds no layer table and takes no lock. The Quant
+// contract:
 //   kName, kSlabs, kOptionalSlabs (a bit per slab that may be absent), kMaxRoutes, kMaxRows,
 //   kTopIsa                              the quant's facts and its highest ISA tier
 //   Params                               its per-layer parameters, stored in the layer
 //   row_bytes(layer, params)             the fewest bytes one slot's row of each slab holds
 //   validate(layer, params)              nullptr when the quant runs the layer, else why not; may normalize params
 //   usable(layer, params, slot)          whether a routed slot's contents can be run (check() only)
-//   dispatch(layer, params, call, isa, team)   the forward on the team: 0, 2 when the input refuses, else a failure status
-//   kStagedForward (optional)            true when dispatch itself waits on ForwardCall::stage_two between its stages
 #pragma once
 #include "isa.hpp"
 #include "keep_warm.hpp"
@@ -66,7 +65,7 @@ struct ExpertForward
 
     // Throws std::invalid_argument for a call forward may not take: rows, k or a buffer out of range, a slot outside
     // the layer's capacity or unusable, a non-finite weight (the Team checks its workers and cores when made).
-    // forward checks none of it; a caller whose calls are not built to fit (a test, a harness) calls check first.
+    // A job's prepare checks none of it; a caller whose calls are not built to fit (a test, a harness) calls check first.
     static void check(const Layer& layer, const ForwardCall& c)
     {
         if (!c.x || !c.out || c.rows < 1 || c.rows > Quant::kMaxRows || c.k < 0 || c.k > Quant::kMaxRoutes
@@ -82,20 +81,6 @@ struct ExpertForward
         }
     }
 
-    // Runs a call check would pass on `team`: every worker of the team, the caller (the team's owner) as worker 0.
-    // Throws std::invalid_argument when the input itself refuses (the quant cannot represent it), std::runtime_error
-    // for a failure; out is untouched when it throws.
-    static void forward(const Layer& layer, const ForwardCall& c, Team& team)
-    {
-        if constexpr (!kStagedForward) {
-            if (c.stage_two) c.stage_two->wait();
-        }
-        const int status = Quant::dispatch(layer, layer.params, c, isa(), team);
-
-        if (status != 0) [[unlikely]]
-            failed(status);
-    }
-
     // Register-only work at the forward's vector width (keep_warm.hpp) until *word != seen or CLOCK_MONOTONIC reaches
     // deadline_ns: a Team's idle loop, so a core keeps the license the forward runs at. Returns a value for the caller
     // to sink.
@@ -105,16 +90,6 @@ struct ExpertForward
     }
 
 private:
-    static constexpr bool kStagedForward = requires { requires Quant::kStagedForward; };
-
-    // Out of line and cold, so forward's failure path costs it one predicted branch.
-    [[noreturn, gnu::noinline, gnu::cold]] static void failed(int status)
-    {
-        if (status == 2) refuse("the forward refused its input (status 2)");
-        throw std::runtime_error(std::string(Quant::kName) + " CPU experts: forward failed (status "
-                                 + std::to_string(status) + ")");
-    }
-
     [[noreturn]] static void refuse(const std::string& why)
     {
         throw std::invalid_argument(std::string(Quant::kName) + " CPU experts: " + why);

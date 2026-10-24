@@ -124,9 +124,8 @@ Every task is claimed in runs of `ceil(count / workers)` (align 1: a task is alr
 A Down task owns whole output rows and sums each token's routes in routing order inside the task, so no reduction crosses
 tasks and the result is the same bits whichever worker runs which task. The per-task scratch of the dot products (one
 down output of every unit) is a thread-local vector of the worker that runs the task. After a Q8_0 check fails the phases
-that follow have no tasks and `status` is 2. `Nvfp4CpuKernel::forward` runs the same phases as a static split between a
-team's barriers (waiting on the stage-two gate before Down), until the engine admits jobs to a window. The CPU expert
-engine keeps one team for its lifetime; `forward_alone<Nvfp4CpuKernel>(layer, call, cores, threads)` (tests, the
+that follow have no tasks and `status` is 2. The CPU expert engine admits jobs to a window over a team it keeps for its
+lifetime (a staged job's gate holds its Down phase in the window); `forward_alone<Nvfp4CpuKernel>(layer, call, cores, threads)` (tests, the
 harnesses) runs the call as one job of a `JobRunner` on a team made for the call alone, pinning worker i to `cores[i]`
 (no cores: unpinned); the bench keeps one `JobRunner`. A team may have any size up to its cores (more is refused:
 `std::invalid_argument`); a worker that cannot be pinned fails the call and leaves `out` untouched. No OpenMP

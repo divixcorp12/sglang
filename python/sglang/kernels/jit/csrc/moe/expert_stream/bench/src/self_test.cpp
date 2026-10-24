@@ -536,8 +536,24 @@ struct FakeKernel {
     return 1;
   }
   static void check(const Layer&, const ce::ForwardCall&) {}
-  static void forward(const Layer&, const ce::ForwardCall& c, ce::Team& team) {
-    team.run([](int, int) {});
+  // The job interface: one phase of one task, which does the whole call. Its only phase is the gate phase, so a staged
+  // job is held until its second stage is open.
+  struct Job {
+    ce::ForwardCall call;
+  };
+  static constexpr int kPhases = 1;
+  static constexpr int kGatePhase = 0;
+  static void prepare(Job& job, const Layer&, const ce::ForwardCall& c) {
+    job.call = c;
+  }
+  static ce::Tasks tasks(const Job&, int) {
+    return {1, 1};
+  }
+  static int status(const Job&) {
+    return 0;
+  }
+  static void run(Job& job, int, int, int, int) {
+    const ce::ForwardCall& c = job.call;
     uint16_t x0;
     std::memcpy(&x0, c.x, 2);
     float sum = 0.0f;
@@ -549,9 +565,9 @@ struct FakeKernel {
     calls.push_back(
         {std::vector<int32_t>(c.slots, c.slots + c.k),
          std::vector<float>(c.weights, c.weights + c.k),
-         team.workers(),
+         c.team_workers,
          c.accumulate(),
-         team.cores().empty() ? -1 : team.cores().front()});
+         c.team_core});
   }
   static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
     while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < deadline_ns) _mm_pause();

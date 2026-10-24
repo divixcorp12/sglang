@@ -15,7 +15,7 @@
 namespace sglang::cpu_experts {
 
 /// \brief Runs a kernel's jobs one at a time on `team`, the caller as worker 0. The team serves the runner until it is
-/// destroyed: no run() or barrier() on it in between, and the runner dies before the team.
+/// destroyed: nothing else serves it in between, and the runner dies before the team.
 template <CpuExpertJobKernel Kernel>
 class JobRunner {
 public:
@@ -32,7 +32,7 @@ public:
     JobRunner& operator=(const JobRunner&) = delete;
 
     /// \brief Admits `call` and runs it to completion. A staged call's gate is waited on by the scheduler and its
-    /// stats land in call.stage_two as StageGate::wait records them. Throws what Kernel::prepare throws, with `out`
+    /// stats land in call.stage_two (calls, spun, called_ns, waited_ns). Throws what Kernel::prepare throws, with `out`
     /// untouched; std::invalid_argument when the job reports status 2, std::runtime_error for another status.
     void run(const Layer& layer, const ForwardCall& call)
     {
@@ -75,18 +75,14 @@ private:
 };
 
 /// \brief A forward of `Kernel` (a format's kernel type) on a team made for this call alone, `threads` workers with
-/// worker i on cores[i] (empty: unpinned): tests and other harnesses that hold no Team. A kernel with a job interface
-/// runs the call as one job of a JobRunner; the engine runs on its own.
-template <class Kernel>
+/// worker i on cores[i] (empty: unpinned): tests and other harnesses that hold no Team. The call runs as one job of a
+/// JobRunner; the engine runs on its own.
+template <CpuExpertJobKernel Kernel>
 void forward_alone(const typename Kernel::Layer& layer, const ForwardCall& call, std::span<const int> cores, int threads)
 {
     Team team(cores, threads, &Kernel::warm, 0);
-    if constexpr (CpuExpertJobKernel<Kernel>) {
-        JobRunner<Kernel> runner(team);
-        runner.run(layer, call);
-    } else {
-        Kernel::forward(layer, call, team);
-    }
+    JobRunner<Kernel> runner(team);
+    runner.run(layer, call);
 }
 
 }  // namespace sglang::cpu_experts

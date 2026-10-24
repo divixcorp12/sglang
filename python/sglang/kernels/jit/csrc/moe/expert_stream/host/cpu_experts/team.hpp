@@ -1,16 +1,12 @@
 // The team every CPU expert forward runs on: `threads` workers alive for the Team's lifetime, worker i pinned to
-// cores[i] once at creation (no cores: unpinned), the owning thread as worker 0. A job runs through run(); inside one
-// every worker may barrier(). Between jobs the workers run the kernel's register work (keep_warm.hpp) for keep_warm_ns
-// after the job, then PAUSE, until the next job: no worker sleeps or leaves the team, so a job never waits for a
-// wake-up and no OpenMP runtime policy decides when a worker spins.
-//
-// The host and a kernel's translation unit share a Team through the kernel's forward(layer, call, team), so both
-// compile this header: atomics, plain ints, a span and function pointers.
+// cores[i] once at creation (no cores: unpinned), the owning thread as worker 0. The workers run what serve() gives
+// them: a JobWindow's scheduler loop (job_window.hpp). Between tasks they run the kernel's register work
+// (keep_warm.hpp) for keep_warm_ns, then PAUSE, until the next: no worker sleeps or leaves the team, so a job never
+// waits for a wake-up and no OpenMP runtime policy decides when a worker spins.
 #pragma once
 #include "clock.hpp"
 #include "cores.hpp"
 #include "kernel.hpp"
-#include "stage_gate.hpp"
 #include <immintrin.h>
 #include <algorithm>
 #include <atomic>
@@ -57,31 +53,15 @@ public:
     int workers() const { return workers_; }
     std::span<const int> cores() const { return cores_; }
 
-    // Runs f(worker, workers) on every worker, the caller as worker 0, and returns once all have finished. One job at a
-    // time, from the owning thread. f must not throw: a worker's exception ends the process and the caller's would skip
-    // the job's end barrier.
-    template <class F>
-    void run(F&& f)
-    {
-        using G = std::remove_reference_t<F>;
-        body_ = &thunk<G>;
-        ctx_ = const_cast<void*>(static_cast<const void*>(std::addressof(f)));
-        serving_ = false;
-        generation_.fetch_add(1, std::memory_order_release);
-        body_(ctx_, 0, workers_);
-        barrier();
-    }
-
     // Starts f(worker, workers) on workers 1..n-1 and returns at once; the caller stays worker 0 and does not run f. f
     // is a loop that returns when its owner tells it to, and must outlive that return: join_serve() waits for every
-    // worker to leave it. No run() or barrier() in between, and f must not throw.
+    // worker to leave it. One at a time, from the owning thread, and f must not throw.
     template <class F>
     void serve(F&& f)
     {
         using G = std::remove_reference_t<F>;
         body_ = &thunk<G>;
         ctx_ = const_cast<void*>(static_cast<const void*>(std::addressof(f)));
-        serving_ = true;
         serving_count_.store(workers_ - 1, std::memory_order_relaxed);
         generation_.fetch_add(1, std::memory_order_release);
     }
@@ -94,21 +74,8 @@ public:
 
     int64_t keep_warm_ns() const { return keep_warm_ns_; }
 
-    // Inside a job: returns once every worker has arrived here. It spins and never sleeps: std::barrier parks early
-    // arrivals on a futex, and a wake costs microseconds against phases tens of microseconds long.
-    void barrier()
-    {
-        const uint32_t phase = phase_.load(std::memory_order_acquire);
-        if (arrived_.fetch_add(1, std::memory_order_acq_rel) + 1 == workers_) {
-            arrived_.store(0, std::memory_order_relaxed);
-            phase_.store(phase + 1, std::memory_order_release);
-        } else {
-            while (phase_.load(std::memory_order_acquire) == phase) _mm_pause();
-        }
-    }
-
     // Waits until *word != seen or the clock reaches until_ns (INT64_MAX: never): the kernel's register work until
-    // warm_until_ns, PAUSE after. The workers' idle wait, on the job word; the owner's, on a word of its own.
+    // warm_until_ns, PAUSE after. The workers' idle wait, on the window's word; the owner's, on a word of its own.
     void wait(const uint32_t* word, uint32_t seen, int64_t warm_until_ns, int64_t until_ns) const
     {
         const int64_t warm_until = std::min(warm_until_ns, until_ns);
@@ -146,8 +113,7 @@ private:
             const Body body = body_;
             if (body == nullptr) return;
             body(ctx_, w, workers_);
-            if (serving_) serving_count_.fetch_sub(1, std::memory_order_release);
-            else barrier();
+            serving_count_.fetch_sub(1, std::memory_order_release);
             warm_until = team_now_ns() + keep_warm_ns_;
         }
     }
@@ -167,14 +133,11 @@ private:
     Warm warm_;
     int64_t keep_warm_ns_;
     std::vector<std::thread> threads_;
-    // The job word: moves once per run() and once at stop; the workers' idle wait watches it.
+    // The job word: moves once per serve() and once at stop; the workers' idle wait watches it.
     alignas(64) std::atomic<uint32_t> generation_{0};
     Body body_ = nullptr;
     void* ctx_ = nullptr;
-    bool serving_ = false;  // the body is serve()'s: workers 1..n-1 only, no end barrier
     std::atomic<int> serving_count_{0};
-    alignas(64) std::atomic<int> arrived_{0};
-    alignas(64) std::atomic<uint32_t> phase_{0};
     alignas(64) std::atomic<int> started_{0};
     std::atomic<int> pin_error_{0};
     mutable std::atomic<int32_t> sink_{0};  // keeps the register work observable

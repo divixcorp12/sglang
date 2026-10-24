@@ -75,29 +75,6 @@ int32_t Exl3CpuKernel::max_routes() noexcept { return Forward::max_routes(); }
 int32_t Exl3CpuKernel::max_rows() noexcept { return Forward::max_rows(); }
 void Exl3CpuKernel::check(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call) { Forward::check(layer, call); }
 
-void Exl3CpuKernel::forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team)
-{
-    // The caller's own job, reached by the other workers through the reference (a thread_local named in the lambda would
-    // be each worker's own).
-    static thread_local Job owned;
-    Job& job = owned;
-    prepare(job, layer, call);
-    team.run([&](int worker, int workers) {
-        for (int phase = 0; phase < kPhases; ++phase) {
-            if (phase == kGatePhase && call.stage_two) {
-                if (worker == 0) call.stage_two->wait();
-                team.barrier();
-            }
-            const ::sglang::cpu_experts::Tasks t = tasks(job, phase);
-            const int units = (t.count + t.align - 1) / t.align;
-            const int t0 = std::min(units * worker / workers * t.align, t.count);
-            const int t1 = std::min(units * (worker + 1) / workers * t.align, t.count);
-            if (t0 < t1) run(job, phase, t0, t1, worker);
-            if (phase + 1 < kPhases) team.barrier();
-        }
-    });
-}
-
 int32_t Exl3CpuKernel::warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
 {
     return Forward::warm(word, seen, deadline_ns);

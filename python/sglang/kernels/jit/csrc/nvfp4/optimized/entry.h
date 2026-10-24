@@ -37,9 +37,6 @@ struct __attribute__((visibility("hidden"))) Nvfp4CpuKernel {
     static int32_t max_routes() noexcept;
     static int32_t max_rows() noexcept;
     static void check(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call);
-    // Runs the call on `team` by the job interface below with a static split of each phase and a barrier between the
-    // phases: the engine's path until it admits jobs to a JobWindow, when this goes.
-    static void forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team);
     static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns);
 
     // The job interface (cpu_experts/binding.hpp's CpuExpertJobKernel): one call as four phases of tasks (forward_plan.hpp
