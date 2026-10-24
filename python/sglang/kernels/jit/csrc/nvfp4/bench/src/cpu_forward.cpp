@@ -30,13 +30,18 @@ namespace {
 namespace fs = std::filesystem;
 std::vector<int> g_cores; // the bench's worker cores, worker 0 first, carried by every forward
 
-// The bench's one team on g_cores, made at the first forward and kept for the process: a team per call would time
-// thread creation.
-::sglang::cpu_experts::Team& bench_team(int workers) {
-    static std::unique_ptr<::sglang::cpu_experts::Team> team;
-    if (!team)
-        team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::nvfp4_cpu::Nvfp4CpuKernel::warm, 0);
-    return *team;
+// The bench's one team on g_cores and its one-job-at-a-time runner (a one-slot JobWindow over the team), made at the
+// first forward and kept for the process: a team per call would time thread creation.
+struct BenchRig {
+    ::sglang::cpu_experts::Team team;
+    ::sglang::cpu_experts::JobRunner<::sglang::nvfp4_cpu::Nvfp4CpuKernel> runner;
+    BenchRig(std::span<const int> cores, int workers)
+        : team(cores, workers, &::sglang::nvfp4_cpu::Nvfp4CpuKernel::warm, 0), runner(team) {}
+};
+::sglang::cpu_experts::JobRunner<::sglang::nvfp4_cpu::Nvfp4CpuKernel>& bench_runner(int workers) {
+    static std::unique_ptr<BenchRig> rig;
+    if (!rig) rig = std::make_unique<BenchRig>(g_cores, workers);
+    return rig->runner;
 }
 constexpr uint64_t max_bytes = uint64_t(2) << 30;
 size_t pad(size_t x, size_t n) { return (x+n-1)/n*n; }
@@ -332,7 +337,7 @@ struct Workload {
         call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
         call.k=experts;
         try {
-            ::sglang::nvfp4_cpu::Nvfp4CpuKernel::forward(f.layers[layer]->layer,call,bench_team(o.workers));
+            bench_runner(o.workers).run(f.layers[layer]->layer,call);
         } catch (const std::exception& e) {
             throw std::runtime_error(std::string("CPU expert forward failed: ")+e.what());
         }
