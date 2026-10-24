@@ -56,7 +56,7 @@ struct ToyQuant {
                     for (int i = 0; i < r.count[t]; ++i)
                         s += r.route(t, i).weight * p.scale * expert(l[r.route(t, i).slot])[h];
                     float& o = c.out[size_t(t) * l.hidden + h];
-                    o = c.accumulate ? o + s : s;
+                    o = c.accumulate() ? o + s : s;
                 }
         });
         return 0;

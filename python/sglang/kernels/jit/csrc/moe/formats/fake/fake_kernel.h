@@ -7,7 +7,7 @@
 // partial (accumulate ? out[..] : 0) when made zeroing -- and records one call per row. Its warm loop PAUSEs until its
 // word moves or its deadline passes. Over a layer of the EXL3 row's six slabs, a call also records the byte sums of its
 // live slots' first three slabs (w13) at its start and of the last three (w2) after ForwardCall::stage_two, which a
-// forward calls between the two when set: what a two-stage forward's GateUp and Down would read.
+// forward waits on between the two when set: what a two-stage forward's GateUp and Down would read.
 #pragma once
 #include "../../expert_stream/host/cpu_experts/kernel.hpp"
 #include <array>
@@ -34,7 +34,7 @@ struct __attribute__((visibility("hidden"))) FakeCpuKernel {
     std::array<int32_t, kFakeMaxLanes> slots;
     std::array<float, kFakeMaxLanes> weights;
     int32_t capacity;  // the layer's: which layer the call ran
-    int32_t staged;    // ForwardCall::stage_two was set (and called)
+    int32_t staged;    // ForwardCall::stage_two was set (and waited on)
     double w13, w2;    // the slab byte sums (six-slab layers only, else 0)
   };
 

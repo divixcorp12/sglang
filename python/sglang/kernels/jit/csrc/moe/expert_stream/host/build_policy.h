@@ -40,7 +40,7 @@ struct InstrBuild {
 };
 
 /// \brief `Base` (ProdBuild or InstrBuild) with `Kernel` as the CPU expert kernel the host classes run.
-template <class Base, class Kernel>
+template <class Base, cpu_experts::CpuExpertKernel Kernel>
 struct BuildWithKernel : Base {
   using CpuKernel = Kernel;
 };

@@ -88,21 +88,20 @@ struct Call {
     std::vector<float> weights;
     std::vector<float> out;
     std::vector<int> cores;
+    int threads;
     ForwardCall c;
 
-    Call(const Layer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
+    Call(const Layer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int team_threads = 2,
          std::vector<int> on = {})
         : layer(&l), x(size_t(rows) * kHidden), slots(std::move(s)), weights(std::move(w)),
-          out(size_t(rows) * kHidden, 7.0f), cores(std::move(on))
+          out(size_t(rows) * kHidden, 7.0f), cores(std::move(on)), threads(team_threads)
     {
         c.rows = rows;
         c.k = k;
-        c.threads = threads;
         c.x = x.data();
         c.slots = slots.data();
         c.weights = weights.data();
         c.out = out.data();
-        c.cores = cores;
     }
     Call(const Call&) = delete;
     Call& operator=(const Call&) = delete;
@@ -111,7 +110,7 @@ struct Call {
     {
         return status_of([&] {
             Toy::check(*layer, c);
-            sglang::cpu_experts::forward_alone<Toy>(*layer, c);
+            sglang::cpu_experts::forward_alone<Toy>(*layer, c, cores, threads);
         });
     }
     bool untouched() const
@@ -150,7 +149,8 @@ int main()
         // Token 0: slots 0 and 2; token 1: slot 1 and a skipped -1.
         Call call(layer, 2, 2, {0, 2, 1, -1}, {0.5f, 0.25f, 2.0f, 1.0f}, team, cores);
         for (int accumulate = 0; accumulate < 2; ++accumulate) {
-            call.c.accumulate = accumulate != 0;
+            call.c.out_mode = accumulate != 0 ? sglang::cpu_experts::OutMode::kAccumulate
+                                              : sglang::cpu_experts::OutMode::kOverwrite;
             CHECK(call.run() == 0);
             for (int hh = 0; hh < kHidden; ++hh) {
                 const float base = accumulate ? 1.0f : 0.0f;
@@ -202,7 +202,7 @@ int main()
         Call empty(layer, 1, 1, {0}, {1.0f});
         empty.c.rows = 0;
         Call no_threads(layer, 1, 1, {0}, {1.0f});
-        no_threads.c.threads = 0;
+        no_threads.threads = 0;
         Call null_slots(layer, 1, 1, {0}, {1.0f});
         null_slots.c.slots = nullptr;
         Call null_out(layer, 1, 1, {0}, {1.0f});

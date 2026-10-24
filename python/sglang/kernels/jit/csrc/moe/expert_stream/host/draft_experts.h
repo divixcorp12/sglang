@@ -79,11 +79,10 @@ class DraftExperts {
     int64_t jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns;
   };
 
-  /// `threads` and `cores` are the engine's team's; every draft forward runs on it. `trace` and `trigger`
-  /// are the engine's, written on the engine thread only.
-  DraftExperts(int threads, std::span<const int> cores, JobTrace<Build::kMetrics>& trace,
-               DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger)
-      : threads_(threads), cores_(cores), trace_(trace), trigger_(trigger) {}
+  /// Every draft forward runs on the engine's team. `trace` and `trigger` are the engine's, written on the engine
+  /// thread only.
+  DraftExperts(JobTrace<Build::kMetrics>& trace, DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger)
+      : trace_(trace), trigger_(trigger) {}
   DraftExperts(const DraftExperts&) = delete;
   DraftExperts& operator=(const DraftExperts&) = delete;
 
@@ -205,8 +204,6 @@ class DraftExperts {
     cpu_experts::ForwardCall call;
     call.rows = rows;
     call.k = k;
-    call.threads = threads_;
-    call.cores = cores_;
     call.x = d.x + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden * 2;
     call.slots = slots;
     call.weights = weights;
@@ -272,8 +269,6 @@ class DraftExperts {
     counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
   }
 
-  int threads_;
-  std::span<const int> cores_;
   JobTrace<Build::kMetrics>& trace_;
   DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger_;
   std::unique_ptr<DraftSource> owned_;         // the host's, for the engine's lifetime

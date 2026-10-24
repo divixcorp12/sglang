@@ -50,12 +50,12 @@ extern "C" int engine_measure(const int64_t* params, int param_count, const uint
                 for (int t = 0; t < rows; ++t) for (int k = 0; k < routes; ++k) slots[t * routes + k] = k;
                 // Native reference uses the same kernel arithmetic outside all measured engine jobs.
                 std::vector<float> reference(rows * hidden);
-                ce::ForwardCall call{rows, routes, workers, reinterpret_cast<const void*>(inputs[group]),
-                                     slots.data(), weights.data(), reference.data(), false, cores};
+                ce::ForwardCall call{rows, routes, reinterpret_cast<const void*>(inputs[group]),
+                                     slots.data(), weights.data(), reference.data()};
                 Kernel::check(layer, call);
                 std::exception_ptr reference_error;
                 std::thread reference_thread([&] {
-                    try { ce::forward_alone<Kernel>(layer, call); } catch (...) { reference_error = std::current_exception(); }
+                    try { ce::forward_alone<Kernel>(layer, call, cores, workers); } catch (...) { reference_error = std::current_exception(); }
                 });
                 reference_thread.join();
                 if (reference_error) std::rethrow_exception(reference_error);

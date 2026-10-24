@@ -8,7 +8,7 @@
 //   validate(layer, params)              nullptr when the quant runs the layer, else why not; may normalize params
 //   usable(layer, params, slot)          whether a routed slot's contents can be run (check() only)
 //   dispatch(layer, params, call, isa, team)   the forward on the team: 0, 2 when the input refuses, else a failure status
-//   kStagedForward (optional)            true when dispatch itself calls ForwardCall::stage_two between its stages
+//   kStagedForward (optional)            true when dispatch itself waits on ForwardCall::stage_two between its stages
 #pragma once
 #include "isa.hpp"
 #include "keep_warm.hpp"
@@ -64,18 +64,14 @@ struct ExpertForward
     static int32_t max_routes() noexcept { return Quant::kMaxRoutes; }
     static int32_t max_rows() noexcept { return Quant::kMaxRows; }
 
-    // Throws std::invalid_argument for a call forward may not take: rows, k, threads or a buffer out of range, cores
-    // out of range or repeated, or fewer cores than threads, a slot outside the layer's capacity or unusable, a
-    // non-finite weight. forward checks none of it; a caller whose calls are not built to fit (a test, a harness)
-    // calls check first.
+    // Throws std::invalid_argument for a call forward may not take: rows, k or a buffer out of range, a slot outside
+    // the layer's capacity or unusable, a non-finite weight (the Team checks its workers and cores when made).
+    // forward checks none of it; a caller whose calls are not built to fit (a test, a harness) calls check first.
     static void check(const Layer& layer, const ForwardCall& c)
     {
         if (!c.x || !c.out || c.rows < 1 || c.rows > Quant::kMaxRows || c.k < 0 || c.k > Quant::kMaxRoutes
-            || c.threads < 1 || c.threads > 4096 || (c.k && (!c.slots || !c.weights)))
-            refuse("rows, k, threads or a buffer out of range");
-        if (!c.cores.empty() && size_t(c.threads) > c.cores.size())
-            refuse(std::to_string(c.threads) + " workers on " + std::to_string(c.cores.size()) + " cores");
-        check_cores(c.cores);
+            || (c.k && (!c.slots || !c.weights)))
+            refuse("rows, k or a buffer out of range");
         const size_t n = size_t(c.rows) * size_t(c.k);
         for (size_t j = 0; j < n; ++j) {
             const int32_t slot = c.slots[j];
@@ -92,7 +88,7 @@ struct ExpertForward
     static void forward(const Layer& layer, const ForwardCall& c, Team& team)
     {
         if constexpr (!kStagedForward) {
-            if (c.stage_two) c.stage_two(c.stage_two_ctx);
+            if (c.stage_two) c.stage_two->wait();
         }
         const int status = Quant::dispatch(layer, layer.params, c, isa(), team);
 

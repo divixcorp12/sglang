@@ -391,13 +391,10 @@ class Bench {
     ::sglang::cpu_experts::ForwardCall call;
     call.rows = 1;
     call.k = static_cast<int32_t>(slots.size());
-    call.threads = static_cast<int32_t>(placement_.groups[group].workers.size());
     call.x = fixture_.x_row(row);
     call.slots = slots.data();
     call.weights = weights.data();
     call.out = out;
-    call.accumulate = false;
-    call.cores = placement_.groups[group].workers;
     try {
       ::sglang::exl3_cpu::Exl3CpuKernel::forward(
           bare_layers_.layers[static_cast<size_t>(row)], call, bare_team(group));

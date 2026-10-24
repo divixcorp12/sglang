@@ -35,8 +35,7 @@ concept ExpertFormatTraits = requires {
   typename F::CpuKernel;
   typename F::Staging;
   { F::kName } -> std::convertible_to<std::string_view>;
-  { F::CpuKernel::usable() } -> std::same_as<bool>;
-  typename F::CpuKernel::Layer;
+  requires cpu_experts::CpuExpertKernel<typename F::CpuKernel>;
   { F::Staging::kBytes } -> std::convertible_to<int>;
 } && ExpertRowLayout<typename F::Layout> &&
     (std::string_view(F::kName) == std::string_view(F::Layout::kName) || requires { requires F::kTestFormat; });

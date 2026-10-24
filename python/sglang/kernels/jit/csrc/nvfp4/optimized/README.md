@@ -46,9 +46,10 @@ through `kernel.h`:
 using Kernel = ::sglang::nvfp4_cpu::Nvfp4CpuKernel;
 Kernel::Layer shape;  // this layer's verified slab pointers and strides, its dimensions, and shape.params
 const Kernel::Layer layer = Kernel::make_layer(shape);
-ForwardCall call;  // rows, k, threads, x, slots, weights, out, accumulate
-call.cores = cores;  // worker i on cores[i]; distinct, at least call.threads of them
-::sglang::cpu_experts::forward_alone<Kernel>(layer, call);  // throws std::invalid_argument on a refused call
+ForwardCall call;  // rows, k, x, slots, weights, out, out_mode
+Kernel::check(layer, call);  // throws std::invalid_argument on a refused call
+// `threads` workers, worker i on cores[i] (distinct, at least `threads` of them); a refused team also throws
+::sglang::cpu_experts::forward_alone<Kernel>(layer, call, cores, threads);
 ```
 
 A refused call throws `std::invalid_argument`, a failure another `std::exception`; either leaves `out` untouched.
@@ -112,8 +113,8 @@ Each forward runs on a `Team` (`expert_stream/host/cpu_experts/team.hpp`) of `th
 as worker 0, in four phases separated by the team's barriers: every token's input to Q8_0; every routed expert's
 gate/up rows and SiLU; every intermediate to Q8_0; every expert's down rows, each token's summed in its routing order
 into its row of `out`. The CPU expert engine keeps one team for its lifetime and passes it to every forward; the
-`forward_alone<Nvfp4CpuKernel>(layer, call)` (tests, the bench) makes a team for the call alone, pinning worker i to
-`cores[i]` (no cores: unpinned). A forward may use any team size up to its cores (more is refused:
+`forward_alone<Nvfp4CpuKernel>(layer, call, cores, threads)` (tests, the bench) makes a team for the call alone,
+pinning worker i to `cores[i]` (no cores: unpinned). A team may have any size up to its cores (more is refused:
 `std::invalid_argument`); a worker that cannot be pinned fails the call and leaves `out` untouched. No OpenMP
 variable reaches the team. Forwards on any cores run at once from different threads. Between jobs the engine's team
 runs the kernel's `warm` loop, register-only work at the forward's vector width, then PAUSE. Stop/join the engine

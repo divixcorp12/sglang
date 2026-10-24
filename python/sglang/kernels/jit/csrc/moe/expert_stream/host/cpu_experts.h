@@ -135,7 +135,7 @@ struct CpuExpertConfig {
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
   bool two_stage = false;    // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job
                              // (CpuJob::staged)
-  // SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (ForwardCall::store_first), not a zeroing of
+  // SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (OutMode::kOverwriteByStore), not a zeroing of
   // the job's token rows on this thread followed by an accumulating forward.
   bool store_out = false;
   // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights: a weight per mirror root for each span of a two-span row
@@ -486,24 +486,22 @@ class BasicCpuExpertEngine {
     const int64_t start = now_ns();
     if constexpr (Build::kMetrics) trace_.emit("cpu_start", job.row, 0, job.seq, -1, job.part, job.k);
     if constexpr (Build::kMetrics) trace_.resources("cpu_faults_start", "cpu_switches_start", job.row, 0, job.seq);
+    using cpu_experts::OutMode;
     cpu_experts::ForwardCall call;
     call.rows = 1;
     call.k = job.k;
-    call.threads = config_.threads;
     call.x = config_.x_base + job.row * config_.x_stride;
     call.slots = job.slots;
     call.weights = job.weights;
     call.out =
         reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
-    call.accumulate = job.accumulate;
-    call.cores = config_.cores;
-    call.store_first = config_.store_out;
-    if (job.staged) {
-      call.stage_two = &BasicCpuExpertEngine::stage_two;
-      call.stage_two_ctx = this;
-      stage_job_ = &job;
-      stage_called_ = false;
-    }
+    call.out_mode = job.accumulate ? OutMode::kAccumulate
+                    : config_.store_out ? OutMode::kOverwriteByStore
+                                        : OutMode::kOverwrite;
+    // A staged job's forward waits here, once its first stage is done, until the tier opens the job's gate. The spin is
+    // the job's own time, so the watchdog still times it; stop() alone ends it early, at shutdown.
+    cpu_experts::StageGate gate{&stage_gates_[job.seq % kRing], job.seq, &stop_};
+    if (job.staged) call.stage_two = &gate;
     int64_t pairs = job.k;  // the job's (token, expert) pairs, for the split model's fit: one a lane on a one-token row
     if (job.per_token && config_.tokens > 1) {
       call.rows = static_cast<int32_t>(expand_tokens(job, static_cast<const uint8_t*>(call.x)));
@@ -517,7 +515,7 @@ class BasicCpuExpertEngine {
       // token's first sum, zeros for the rest): the same bits, without this thread zeroing every row first.
       if (!config_.store_out) {
         if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
-        call.accumulate = true;
+        call.out_mode = OutMode::kAccumulate;
       }
     }
     if constexpr (Build::kMetrics) {
@@ -535,10 +533,7 @@ class BasicCpuExpertEngine {
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
     }
-    // A kernel built before ForwardCall::stage_two would run Down on rows still landing: refuse its output.
-    if (job.staged && !stage_called_)
-      fail_stop(prefix_ + "kernel " + Kernel::name() + " never waited for row " + std::to_string(job.row) +
-                "'s second stage (rebuild it with SGLANG_EXPERT_STREAM_CPU_TWO_STAGE's ForwardCall)");
+    if (job.staged) record_stage_two(job, gate);
     const int64_t end = now_ns();
     add(compute_ns_, end - start);
     add(jobs_done_, 1);
@@ -574,26 +569,22 @@ class BasicCpuExpertEngine {
     return tokens;
   }
 
-  /// ForwardCall::stage_two of a staged job, on worker 0 between its stages: spins until the tier opens the job's gate.
-  /// The spin is the job's own time, so the watchdog still times it, and a read that never lands fails stop in the
-  /// tier; stop() alone ends it early, at shutdown.
-  static void stage_two(void* self) {
-    auto* engine = static_cast<BasicCpuExpertEngine*>(self);
-    const CpuJob& job = *engine->stage_job_;
-    engine->stage_called_ = true;
-    add(engine->staged_jobs_, 1);
-    const std::atomic<uint32_t>& gate = engine->stage_gates_[job.seq % kRing];
-    if (gate.load(std::memory_order_acquire) == job.seq) {
-      if constexpr (Build::kMetrics) engine->trace_.emit("cpu_stage_two", job.row, 0, job.seq, -1, 0, 0);
+  /// A staged job's gate after its forward: its stats and its cpu_stage_two event, stamped when the gate opened. A
+  /// forward that never waited would have run Down on rows still landing: its output is refused.
+  void record_stage_two(const CpuJob& job, const cpu_experts::StageGate& gate) {
+    if (gate.calls != 1) {
+      fail_stop(prefix_ + "kernel " + Kernel::name() + " waited " + std::to_string(gate.calls) + " times for row " +
+                std::to_string(job.row) + "'s second stage, not once");
       return;
     }
-    const int64_t start = now_ns();
-    while (gate.load(std::memory_order_acquire) != job.seq && !engine->stop_.load(std::memory_order_relaxed))
-      _mm_pause();
-    const int64_t waited = now_ns() - start;
-    add(engine->stage_two_waits_, 1);
-    add(engine->stage_two_wait_ns_, waited);
-    if constexpr (Build::kMetrics) engine->trace_.emit("cpu_stage_two", job.row, 0, job.seq, -1, waited, 1);
+    add(staged_jobs_, 1);
+    if (gate.spun) {
+      add(stage_two_waits_, 1);
+      add(stage_two_wait_ns_, gate.waited_ns);
+    }
+    if constexpr (Build::kMetrics)
+      trace_.emit_at("cpu_stage_two", gate.called_ns + gate.waited_ns, job.row, 0, job.seq, -1, gate.waited_ns,
+                     gate.spun ? 1 : 0);
   }
 
   static uint32_t load_u32(const uint8_t* p) {
@@ -684,18 +675,15 @@ class BasicCpuExpertEngine {
   // The split model's fit moments per part (fit_moments) and their seqlock version, odd while the thread updates them.
   std::array<std::array<std::atomic<int64_t>, kFitMoments>, 2> fit_{};
   std::atomic<uint32_t> fit_version_{0};
-  // Staged jobs: each one's gate, at its sequence modulo the ring (the tier owner stores, the thread reads), and the job
-  // the thread runs now with whether its kernel called stage_two (this thread only).
+  // Staged jobs: each one's gate word, at its sequence modulo the ring (the tier owner stores, the thread reads).
   std::array<std::atomic<uint32_t>, kRing> stage_gates_{};
-  const CpuJob* stage_job_ = nullptr;
-  bool stage_called_ = false;
   // A per-token job's expanded slots and weights, [tokens][k]; this thread only.
   std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_slots_{};
   std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_weights_{};
   std::atomic<bool> stop_{false};
   // The DSpark draft source and its read of the channel (attach_draft): the team's threads and cores, and the
   // engine's trace and trigger, are its.
-  DraftExperts<Build> draft_{config_.threads, config_.cores, trace_, delay_trigger_};
+  DraftExperts<Build> draft_{trace_, delay_trigger_};
   std::atomic<bool> watchdog_stop_{false};
   int64_t fatal_wait_ns_ = 0;
   std::thread watchdog_;

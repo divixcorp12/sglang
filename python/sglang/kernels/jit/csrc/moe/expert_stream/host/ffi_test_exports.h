@@ -1294,16 +1294,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
   // cores int64 [n] (empty: unpinned). The shapes are checked against the layer, so a short x or out is refused here
   // rather than read or written past its end. Returns 0, 2 for std::invalid_argument, 1 for any other exception, its
   // message in kernel_error().
-  // `store_first`: ForwardCall::store_first.
+  // `store_first`: an overwrite is OutMode::kOverwriteByStore (accumulate wins).
   static int64_t kernel_forward(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
                                 int64_t threads, TensorView cores, int64_t accumulate, int64_t store_first) {
-    return forward_layer(id, x, slots, weights, out, threads, cores, accumulate, nullptr, nullptr, store_first != 0);
+    return forward_layer(id, x, slots, weights, out, threads, cores, accumulate, nullptr, store_first != 0);
   }
 
   // Test only: kernel_forward as a two-stage CPU miss runs it, ForwardCall::stage_two set. A helper thread sleeps
   // `delay_ns`, copies each of `restore`'s rows {dst, src, bytes} (int64 [n, 3]: second-stage bytes the caller held
-  // back) and then opens the gate the forward's stage_two spins on. `info` int64 [2]: stage_two's calls and the ns it
-  // waited. Returns as kernel_forward.
+  // back) and then opens the forward's gate. `info` int64 [2]: the gate's waits and the ns it spun. Returns as
+  // kernel_forward.
   static int64_t kernel_forward_two_stage(int64_t id, TensorView x, TensorView slots, TensorView weights,
                                           TensorView out, int64_t threads, TensorView cores, int64_t accumulate,
                                           TensorView restore, int64_t delay_ns, TensorView info) {
@@ -1314,18 +1314,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       auto cpu = SymbolicDevice{};
       expert_stream::verify_named("restore", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), restore);
       expert_stream::verify_named("info", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
-      struct Gate {
-        std::atomic<int> open{0};
-        int64_t calls = 0, waited = 0;
-      } gate;
-      const auto wait = [](void* p) {
-        auto* g = static_cast<Gate*>(p);
-        ++g->calls;
-        const int64_t start = now_ns();
-        while (g->open.load(std::memory_order_acquire) == 0)
-          _mm_pause();
-        g->waited += now_ns() - start;
-      };
+      std::atomic<uint32_t> word{0};
+      cpu_experts::StageGate gate{&word, 1};
       const auto* rows = static_cast<const int64_t*>(restore.data_ptr());
       const int64_t count = restore.size(0);
       std::thread opener([&] {
@@ -1334,11 +1324,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
           std::memcpy(reinterpret_cast<void*>(static_cast<intptr_t>(rows[3 * r])),
                       reinterpret_cast<const void*>(static_cast<intptr_t>(rows[3 * r + 1])),
                       static_cast<size_t>(rows[3 * r + 2]));
-        gate.open.store(1, std::memory_order_release);
+        word.store(1, std::memory_order_release);
       });
       int64_t status = 1;
       try {
-        status = forward_layer(id, x, slots, weights, out, threads, cores, accumulate, +wait, &gate);
+        status = forward_layer(id, x, slots, weights, out, threads, cores, accumulate, &gate);
       } catch (...) {
         opener.join();
         throw;
@@ -1346,15 +1336,15 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       opener.join();
       auto* o = static_cast<int64_t*>(info.data_ptr());
       o[0] = gate.calls;
-      o[1] = gate.waited;
+      o[1] = gate.waited_ns;
       return status;
     }
   }
 
-  // kernel_forward's forward, with ForwardCall::stage_two set to `stage_two(ctx)` (null: one stage).
+  // kernel_forward's forward, with ForwardCall::stage_two set to `stage_two` (null: one stage).
   static int64_t forward_layer(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
-                               int64_t threads, TensorView cores, int64_t accumulate, void (*stage_two)(void*),
-                               void* ctx, bool store_first = false) {
+                               int64_t threads, TensorView cores, int64_t accumulate,
+                               cpu_experts::StageGate* stage_two, bool store_first = false) {
     KernelLayer entry;
     {
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
@@ -1383,20 +1373,18 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     cpu_experts::ForwardCall call;
     call.rows = static_cast<int32_t>(slots.size(0));
     call.k = static_cast<int32_t>(slots.size(1));
-    call.threads = static_cast<int32_t>(threads);
     call.x = x.data_ptr();
     call.slots = static_cast<const int32_t*>(slots.data_ptr());
     call.weights = static_cast<const float*>(weights.data_ptr());
     call.out = static_cast<float*>(out.data_ptr());
-    call.accumulate = accumulate != 0;
-    call.cores = on;
+    call.out_mode = accumulate != 0 ? cpu_experts::OutMode::kAccumulate
+                    : store_first   ? cpu_experts::OutMode::kOverwriteByStore
+                                    : cpu_experts::OutMode::kOverwrite;
     call.stage_two = stage_two;
-    call.stage_two_ctx = ctx;
-    call.store_first = store_first;
     kernel_error_text().clear();
     try {
       CpuKernel::check(layer, call);
-      cpu_experts::forward_alone<CpuKernel>(layer, call);
+      cpu_experts::forward_alone<CpuKernel>(layer, call, on, static_cast<int>(threads));
       return 0;
     } catch (const std::invalid_argument& e) {
       kernel_error_text() = e.what();

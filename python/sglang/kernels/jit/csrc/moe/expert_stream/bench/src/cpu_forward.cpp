@@ -325,12 +325,10 @@ struct Workload {
     ::sglang::cpu_experts::ForwardCall call;
     call.rows = 1;
     call.k = experts;
-    call.threads = options.workers;
     call.x = fixture.layers[layer].input.data_ptr();
     call.slots = slots.data();
     call.weights = weights.data();
     call.out = output.data();
-    call.cores = g_cores;
     ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
 #endif
   }
@@ -445,12 +443,10 @@ struct RoutedWorkload {
     ::sglang::cpu_experts::ForwardCall call;
     call.rows = rows;
     call.k = k;
-    call.threads = options.workers;
     call.x = inputs[layer].data();
     call.slots = slots.data();
     call.weights = weights.data();
     call.out = output.data();
-    call.cores = g_cores;
     ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
   }
 

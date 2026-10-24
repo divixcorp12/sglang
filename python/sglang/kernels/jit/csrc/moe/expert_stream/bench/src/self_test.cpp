@@ -544,14 +544,14 @@ struct FakeKernel {
     for (int32_t i = 0; i < c.k; ++i)
       sum += c.weights[i] * static_cast<float>(c.slots[i] + 1);
     for (int64_t h = 0; h < kSelfHidden; ++h)
-      c.out[h] = (c.accumulate ? c.out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
+      c.out[h] = (c.accumulate() ? c.out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
     std::lock_guard<std::mutex> guard(mutex);
     calls.push_back(
         {std::vector<int32_t>(c.slots, c.slots + c.k),
          std::vector<float>(c.weights, c.weights + c.k),
-         c.threads,
-         c.accumulate,
-         c.cores.empty() ? -1 : c.cores.front()});
+         team.workers(),
+         c.accumulate(),
+         team.cores().empty() ? -1 : team.cores().front()});
   }
   static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
     while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < deadline_ns) _mm_pause();

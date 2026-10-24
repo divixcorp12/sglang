@@ -73,10 +73,10 @@ void FakeCpuKernel::forward(const Layer& layer, const ForwardCall& c, ::sglang::
     std::vector<double> w13(static_cast<size_t>(std::max(c.rows, 1))), w2(w13.size());
     for (size_t t = 0; t < w13.size(); ++t)
         w13[t] = slab_sum(layer, c, static_cast<int32_t>(t), 0, 3);
-    if (c.stage_two) c.stage_two(c.stage_two_ctx);
+    if (c.stage_two) c.stage_two->wait();
     for (size_t t = 0; t < w2.size(); ++t)
         w2[t] = slab_sum(layer, c, static_cast<int32_t>(t), 3, 6);
-    const int32_t core = c.cores.empty() ? -1 : c.cores.front();
+    const int32_t core = team.cores().empty() ? -1 : team.cores().front();
     const int64_t until = team_now_ns() + c.k * g_ns.load(std::memory_order_relaxed);
     while (team_now_ns() < until)
         _mm_pause();
@@ -94,7 +94,7 @@ void FakeCpuKernel::forward(const Layer& layer, const ForwardCall& c, ::sglang::
         for (int32_t i = 0; i < c.k; ++i)
             sum += static_cast<double>(weights[i]) * (slots[i] + 1);
         for (int32_t j = 0; j < hidden; ++j) {
-            const double base = c.accumulate ? static_cast<double>(out[j]) : (zero ? 0.0 : static_cast<double>(j));
+            const double base = c.accumulate() ? static_cast<double>(out[j]) : (zero ? 0.0 : static_cast<double>(j));
             out[j] = static_cast<float>(zero ? base : base + sum);
         }
     }
@@ -106,7 +106,7 @@ void FakeCpuKernel::forward(const Layer& layer, const ForwardCall& c, ::sglang::
             if (CPU_ISSET(cpu, &mask)) affinity = cpu;
     std::lock_guard<std::mutex> lock(g_mutex);
     for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
-        Call call{core, affinity, c.threads, c.accumulate ? 1 : 0, std::min<int32_t>(c.k, kFakeMaxLanes), {}, {},
+        Call call{core, affinity, team.workers(), c.accumulate() ? 1 : 0, std::min<int32_t>(c.k, kFakeMaxLanes), {}, {},
                   layer.capacity, c.stage_two != nullptr ? 1 : 0, w13[t], w2[t]};
         for (int32_t i = 0; i < call.k; ++i) {
             call.slots[i] = c.slots[static_cast<int64_t>(t) * c.k + i];

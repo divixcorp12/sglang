@@ -64,7 +64,7 @@ struct Exl3Quant
     static constexpr int kMaxRows = 65536;    // the forward's rows limit
     // The library compiles one tier, the build's (isa.hpp's kBuildIsa).
     static constexpr Isa kTopIsa = Isa::Vbmi;
-    // dispatch calls ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh, so it waits there.
+    // dispatch waits on ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh.
     static constexpr bool kStagedForward = true;
     using Params = SglangExl3CpuParams;
 

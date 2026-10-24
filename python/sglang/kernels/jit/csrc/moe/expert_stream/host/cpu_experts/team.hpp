@@ -62,16 +62,17 @@ public:
     // The kernel's idle register work (its warm function).
     using Warm = int32_t (*)(const uint32_t* word, uint32_t seen, int64_t deadline_ns);
 
-    // Starts the workers and pins the caller to cores[0]. Throws std::invalid_argument for threads < 1 or more threads
-    // than `cores`, std::runtime_error when the caller or a worker cannot be pinned (the workers started are stopped
-    // first). `cores` must outlive the Team. `warm` is the idle register work (null: PAUSE only). `name` (may
-    // be null) names the worker threads as the owner's thread is named, so tooling that selects the owner's threads by
-    // name finds its workers.
+    // Starts the workers and pins the caller to cores[0]. Throws std::invalid_argument for threads outside [1, 4096],
+    // more threads than `cores`, or a core check_cores refuses; std::runtime_error when the caller or a worker cannot
+    // be pinned (the workers started are stopped first). `cores` must outlive the Team. `warm` is the idle register
+    // work (null: PAUSE only). `name` (may be null) names the worker threads as the owner's thread is named, so
+    // tooling that selects the owner's threads by name finds its workers.
     Team(std::span<const int> cores, int threads, Warm warm, int64_t keep_warm_ns, const char* name = nullptr)
         : cores_(cores), workers_(threads), warm_(warm), keep_warm_ns_(keep_warm_ns)
     {
-        if (threads < 1 || (!cores.empty() && size_t(threads) > cores.size()))
+        if (threads < 1 || threads > 4096 || (!cores.empty() && size_t(threads) > cores.size()))
             throw std::invalid_argument("CPU expert team needs a worker and no more workers than its cores");
+        check_cores(cores);
         if (!cores.empty() && !pin_thread(cores[0])) throw std::runtime_error("cannot pin CPU expert worker to its core");
         threads_.reserve(size_t(threads - 1));
         for (int w = 1; w < threads; ++w) threads_.emplace_back([this, w, name] { worker_main(w, name); });
@@ -185,12 +186,12 @@ private:
     mutable std::atomic<int32_t> sink_{0};  // keeps the register work observable
 };
 
-// A forward of `Kernel` (a format's kernel type) on a team made for this call alone (call.threads workers on
-// call.cores): tests, the bench and other harnesses that hold no Team. The engine runs on its own.
+// A forward of `Kernel` (a format's kernel type) on a team made for this call alone, `threads` workers with worker i
+// on cores[i] (empty: unpinned): tests, the bench and other harnesses that hold no Team. The engine runs on its own.
 template <class Kernel>
-void forward_alone(const typename Kernel::Layer& layer, const ForwardCall& call)
+void forward_alone(const typename Kernel::Layer& layer, const ForwardCall& call, std::span<const int> cores, int threads)
 {
-    Team team(call.cores, call.threads, &Kernel::warm, 0);
+    Team team(cores, threads, &Kernel::warm, 0);
     Kernel::forward(layer, call, team);
 }
 

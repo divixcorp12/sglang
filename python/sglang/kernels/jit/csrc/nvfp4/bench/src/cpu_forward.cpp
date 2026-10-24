@@ -330,7 +330,7 @@ struct Workload {
         ::sglang::cpu_experts::ForwardCall call;
         call.rows=o.rows; call.x=xs[layer].data();
         call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
-        call.k=experts; call.threads=o.workers; call.cores=g_cores;
+        call.k=experts;
         try {
             ::sglang::nvfp4_cpu::Nvfp4CpuKernel::forward(f.layers[layer]->layer,call,bench_team(o.workers));
         } catch (const std::exception& e) {

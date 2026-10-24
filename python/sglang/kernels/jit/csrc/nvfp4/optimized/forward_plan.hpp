@@ -123,7 +123,7 @@ struct ForwardPlan
         ctx.x = static_cast<const uint8_t*>(c.x);
         ctx.out = c.out;
         ctx.rows = c.rows;
-        ctx.accumulate = c.accumulate != 0;
+        ctx.accumulate = c.accumulate();
         ctx.routes = r;
         bind_routes(ctx, l, ar);
         prepare_scratch(ctx, ar, team.workers());

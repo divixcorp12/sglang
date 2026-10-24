@@ -585,7 +585,7 @@ struct HostExports {
   // `two_stage` (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE) sends each CPU miss once its first stage landed (CpuJob::staged), its
   // row's w13 and w2 divided over the mirror roots by `w13_weights` and `w2_weights` (float64 [roots], or [0]: the
   // mirror's shares). `store_out` (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT) leaves a job's overwrite to the kernel
-  // (ForwardCall::store_first) instead of zeroing the job's token rows first.
+  // (OutMode::kOverwriteByStore) instead of zeroing the job's token rows first.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,

@@ -201,13 +201,12 @@ struct ForwardCtx
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
-    // Overwrite by store (ForwardCall::store_first): no zeroing up front; Accumulate stores each token's first sum
+    // Overwrite by store (OutMode::kOverwriteByStore): no zeroing up front; Accumulate stores each token's first sum
     // (Chunk::first) and zeroes the `unrouted` tokens' rows, each worker its own columns.
     bool store_first;
     const int* unrouted;
     int n_unrouted;
-    void (*stage_two)(void*);  // ForwardCall::stage_two: worker 0 calls it between GateUp and Middle (null: never)
-    void* stage_two_ctx;
+    StageGate* stage_two;  // ForwardCall::stage_two: worker 0 waits on it between GateUp and Middle (null: never)
     std::vector<Chunk> chunks;
 
     // workspace, per chunk (pointers into the persistent per-thread arena below: fresh
@@ -553,7 +552,7 @@ private:
             step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             if (ctx.stage_two) {
-                if (worker == 0) ctx.stage_two(ctx.stage_two_ctx);
+                if (worker == 0) ctx.stage_two->wait();
                 team.barrier();
             }
             step<Phase::Middle>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
@@ -753,9 +752,8 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     ctx.x = static_cast<const Fp16*>(c.x);
     ctx.out = c.out;
     ctx.m_total = c.rows;
-    ctx.zero_out = !c.accumulate;
+    ctx.zero_out = !c.accumulate();
     ctx.stage_two = c.stage_two;
-    ctx.stage_two_ctx = c.stage_two_ctx;
 
     ForwardArena& ar = ForwardArena::get();
     ctx.chunks = std::move(ar.chunks);
@@ -788,7 +786,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         ctx.chunks.push_back(ch);
     }
     // A token's first write is the first of its rows in Accumulate's order (chunk, then row); the rest add to it.
-    ctx.store_first = ctx.zero_out && c.store_first;
+    ctx.store_first = c.store_first();
     ctx.unrouted = nullptr;
     ctx.n_unrouted = 0;
     if (ctx.store_first) {
@@ -807,7 +805,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         ctx.n_unrouted = static_cast<int>(ar.unrouted.size());
     }
     if (ctx.chunks.empty()) {
-        if (ctx.stage_two) ctx.stage_two(ctx.stage_two_ctx);
+        if (ctx.stage_two) ctx.stage_two->wait();
         if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * l.hidden * sizeof(float));
     } else {
         run_plan(ctx, p, ar, team);

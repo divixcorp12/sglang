@@ -113,11 +113,11 @@ int forward(const Layer& layer, const void* x, const int32_t* slots, const float
             int32_t threads, int32_t accumulate, int32_t rows = 1) {
     ::sglang::cpu_experts::ForwardCall call;
     call.rows = rows; call.x = x; call.slots = slots; call.weights = weights;
-    call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate != 0;
-    call.cores = g_cores;
+    call.out = out; call.k = k;
+    call.out_mode = accumulate != 0 ? ::sglang::cpu_experts::OutMode::kAccumulate : ::sglang::cpu_experts::OutMode::kOverwrite;
     return status_of([&] {
         Kernel::check(layer, call);
-        ::sglang::cpu_experts::forward_alone<Kernel>(layer, call);
+        ::sglang::cpu_experts::forward_alone<Kernel>(layer, call, g_cores, threads);
     });
 }
 
