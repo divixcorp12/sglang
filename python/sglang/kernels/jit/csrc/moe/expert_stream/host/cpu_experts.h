@@ -4,6 +4,7 @@
 
 #include "../cpu_token_table.h"
 #include "../lease_layout.h"
+#include "cpu_experts/job_window.hpp"
 #include "cpu_experts/kernel.hpp"
 #include "cpu_experts/team.hpp"
 #include "draft_experts.h"
@@ -101,7 +102,8 @@ inline void check_cpu_expert_team(const std::string& prefix, const std::vector<i
 /// table gives each token its own slots and weights, `lanes` naming each job lane's column there.
 ///
 /// A staged job (CpuExpertConfig::two_stage) is a CPU miss job sent once its rows' first stage (w13) has landed: its
-/// forward runs the gate/up GEMVs, then waits until the tier calls open_stage_two(seq), once every row is whole.
+/// gate/up phases run, then the window holds the rest of the job until the tier calls open_stage_two(seq), once every
+/// row is whole; other jobs run meanwhile.
 struct CpuJob {
   int64_t row = 0;
   int32_t part = 0;
@@ -130,13 +132,13 @@ struct CpuExpertConfig {
   int64_t x_token_bytes = 0;  // bytes between two tokens' staged inputs
   int threads = 1;
   std::vector<int> cores;  // worker i runs on cores[i]; the engine's own thread on cores[0]
-  int64_t keep_warm_ns = 0;  // how long after each job the idle team runs register work instead of PAUSE
-  bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
+  int64_t keep_warm_ns = 0;  // how long after its last task the idle team runs register work instead of PAUSE
+  bool check_calls = false;  // run the kernel's check() before admitting every job (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
   bool two_stage = false;    // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE: the tier sends each CPU miss as a staged job
                              // (CpuJob::staged)
-  // SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's (OutMode::kOverwriteByStore), not a zeroing of
-  // the job's token rows on this thread followed by an accumulating forward.
+  // SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_STORE_OUT: a job's overwrite is the kernel's store-first overwrite
+  // (OutMode::kOverwriteByStore) rather than its zero-first one (OutMode::kOverwrite).
   bool store_out = false;
   // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights: a weight per mirror root for each span of a two-span row
   // (empty: the mirror's shares). The tier hands them to its readers (RamTier::enable_cpu_experts).
@@ -150,20 +152,23 @@ struct CpuExpertConfig {
 /// fused MoE. A failed forward fails stop.
 ///
 /// The tier's owner (the service thread) is the only client: it claims sequences with claim() and submits jobs with
-/// submit(), a record's CPU hits before its copy job and each CPU miss once its row has landed. Jobs run in sequence
-/// order and done_ only increases, so done(seq) is a single compare any thread may make. The copy thread reads only
+/// submit(), a record's CPU hits before its copy job and each CPU miss once its row has landed. Jobs are admitted in
+/// sequence order and done_ only increases, so done(seq) is a single compare any thread may make: it passes a sequence
+/// only once every job admitted before it has finished, whatever order they finish in. The copy thread reads only
 /// done(), so CopyDone and the copy wait's gate keep their single publisher.
 ///
-/// The team (cpu_experts/team.hpp) is the thread's own for its lifetime: threads - 1 workers pinned to cores[1..],
-/// itself worker 0 on cores[0]. Nothing here sleeps. Between jobs the workers run the kernel's register work for
-/// keep_warm_ns after each job and then PAUSE, watching the team's job word; the thread does the same on the submit
-/// word, a quantum (kIdleQuantumNs) at a time, re-reading the draft head, stop() and detach_draft() between quanta,
-/// since no host thread can ring those. So a job never waits for a worker to wake, and no state read before a wait
-/// can go stale across it.
+/// The jobs run in a window (cpu_experts/job_window.hpp) of kWindowSlots slots over the team (cpu_experts/team.hpp),
+/// the thread's own for its lifetime: threads - 1 workers pinned to cores[1..], itself worker 0 on cores[0] and the
+/// window's only admitter. Between claims of tasks the thread pops the ring, then the draft channel, does the job's
+/// serial setup into a free slot and admits it at once (no batching delay); a full window stops admission and the
+/// thread runs tasks. Nothing here sleeps. Between tasks the workers run the kernel's register work for keep_warm_ns
+/// and then PAUSE, watching the window's word; the thread does the same, a quantum (kIdleQuantumNs) at a time, re-reading
+/// the submit word, the draft head, stop() and detach_draft() between quanta, since no host thread can ring those. So
+/// a job never waits for a worker to wake, and no state read before a wait can go stale across it.
 ///
-/// With a DSpark draft source (attach_draft, draft_experts.h) the thread serves the draft channel too, one job at a
-/// time with the target's, the target's ring first. A draft-only engine (CpuExpertConfig::draft_only) has only that
-/// source.
+/// With a DSpark draft source (attach_draft, draft_experts.h) the thread serves the draft channel too, the target's
+/// ring first (a counter records the admissions that found both pending). A draft-only engine
+/// (CpuExpertConfig::draft_only) has only that source.
 // The int64 moments per output part of the engine's live fit (BasicCpuExpertEngine::fit_moments).
 constexpr int kCpuFitMoments = 9;
 
@@ -293,22 +298,39 @@ class BasicCpuExpertEngine {
 
   /// For the copy-wait abort, on the watchdog's thread: why job `seq` is not done. Whether the tier owner submitted it
   /// (an unsubmitted one is a CPU miss whose row has not landed, since a record's hit job is submitted before its copy
-  /// job), what the thread runs now and for how long, and the last job done. Reads the clock once.
+  /// job), the job `seq` is, if it is in the window (its row, the phase it is in and its age), else the oldest job in
+  /// the window, how many jobs the window holds, and the last job done. Reads the clock once.
   std::string stall_state(uint32_t seq) const {
     const bool submitted = static_cast<int32_t>(submitted_.load(std::memory_order_relaxed) - seq) >= 0;
     std::string out = submitted ? " (submitted; the engine is "
                                 : " (not submitted: a CPU miss whose row has not landed; the engine is ";
-    const int64_t started = job_started_ns_.load(std::memory_order_acquire);
-    if (started == 0) {
+    const Window* window = live_.load(std::memory_order_acquire);
+    const WindowSlot* mine = nullptr;
+    const WindowSlot* oldest = nullptr;
+    int held = 0;
+    if (window != nullptr) {
+      for (int i = 0; i < kWindowSlots; ++i) {
+        const WindowSlot& s = window->slot(i);
+        if (!s.active()) continue;
+        ++held;
+        if (oldest == nullptr || s.admit_ns() < oldest->admit_ns()) oldest = &s;
+        if (s.kind() == kTargetJob && s.seq() == seq) mine = &s;
+      }
+    }
+    const WindowSlot* shown = mine != nullptr ? mine : oldest;
+    if (shown == nullptr) {
       out += "idle";
     } else {
+      const int64_t started = shown->admit_ns();
       char ms[32];
       std::snprintf(ms, sizeof(ms), "%.1f", static_cast<double>(now_ns() - started) / 1e6);
       out += std::string("running ") +
-             (job_kind_.load(std::memory_order_relaxed) == kDraftJob ? "a draft job (record " : "a target job (row ") +
-             std::to_string(job_id_.load(std::memory_order_relaxed)) + ") for " + ms + " ms";
+             (shown->kind() == kDraftJob ? "a draft job (record " : "a target job (row ") +
+             std::to_string(shown->id()) + ") for " + ms + " ms, in phase " + std::to_string(shown->phase()) + " of " +
+             std::to_string(Kernel::kPhases) + (mine != nullptr ? "" : "; job " + std::to_string(seq) + " is not in the window");
     }
-    return out + ", done through job " + std::to_string(done_.load(std::memory_order_acquire)) + ")";
+    return out + ", the window holds " + std::to_string(held) + " of " + std::to_string(kWindowSlots) +
+           ", done through job " + std::to_string(done_.load(std::memory_order_acquire)) + ")";
   }
 
   /// True once the job with sequence `seq`, or a later one, has finished. The acquire pairs with the release after the
@@ -343,6 +365,12 @@ class BasicCpuExpertEngine {
   }
   int64_t stage_two_wait_ns() const {
     return stage_two_wait_ns_.load(std::memory_order_relaxed);
+  }
+  /// The window's always-on counters: jobs admitted, spells with work pending and no free slot, and admissions that
+  /// found the target ring and the draft channel both pending (the target's went first). Zeros before start().
+  cpu_experts::WindowCounters window_counters() const {
+    const Window* window = live_.load(std::memory_order_acquire);
+    return window != nullptr ? window->counters() : cpu_experts::WindowCounters{};
   }
 
   /// The split model's live fit (split_model_calibration.py, SplitModelRefiner): per output part (0 hit jobs, 1 miss
@@ -391,14 +419,18 @@ class BasicCpuExpertEngine {
     return draft_.stats();
   }
 
-  /// Stops and joins the thread, then the watchdog (a hung forward still fail-stops meanwhile), then opens a draft gate
-  /// a wait still holds closed; idempotent.
+  /// Stops and joins the thread, which admits nothing more and drains the window (a gate still shut opens), then the
+  /// watchdog (a hung job still fail-stops meanwhile), then the window and the team, and opens a draft gate a wait still
+  /// holds closed; idempotent.
   void stop() {
     if (!thread_.joinable()) return;
     stop_.store(true, std::memory_order_release);
     thread_.join();
     watchdog_stop_.store(true, std::memory_order_seq_cst);
     if (watchdog_.joinable()) watchdog_.join();
+    live_.store(nullptr, std::memory_order_release);
+    window_.reset();
+    team_.reset();
     draft_.open_gate();
   }
 
@@ -438,9 +470,42 @@ class BasicCpuExpertEngine {
     return sched_setaffinity(0, sizeof(set), &set) == 0 ? "" : "cannot pin the CPU expert thread to its caller core";
   }
 
-  /// How long one idle wait on the submit word lasts before the thread re-reads the draft head, stop() and
-  /// detach_draft(), which no host thread rings: the bound on noticing any of them. Short against a forward (0.5 ms
-  /// and up), long against the clock read that ends it.
+  /// Jobs in the window (the design's D7): a ring job's wait for a second, overlapping one is bounded by the oldest
+  /// job's remaining phases, and a wider window only holds more jobs between whose phases the workers split.
+  static constexpr int kWindowSlots = 4;
+  static constexpr int32_t kTargetJob = 1, kDraftJob = 2;
+
+  /// The window's hooks: the engine's completion and, in the instr build, the per-run trace.
+  struct Hooks {
+    BasicCpuExpertEngine* engine;
+    template <class S>
+    void on_complete(S& s) noexcept {
+      engine->complete(s);
+    }
+    template <class S>
+    void on_run(S& s, int phase, int t0, int t1, int worker, uint64_t cycles) noexcept
+      requires(Build::kMetrics)
+    {
+      engine->ran(s, phase, t0, t1, worker, cycles);
+    }
+  };
+  using Window = cpu_experts::JobWindow<Kernel, kWindowSlots, Hooks>;
+  using WindowSlot = typename Window::Slot;
+
+  /// The storage one window slot's job reads while it runs, and what its completion needs; indexed by the slot.
+  struct SlotAux {
+    CpuJob job;           // a ring job: the call's slots and weights for a one-token row point into it
+    bool draft_job = false;
+    int64_t pairs = 0;    // the ring job's (token, expert) pairs
+    // A per-token job's expanded slots and weights, [tokens][k].
+    std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> slots{};
+    std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> weights{};
+    typename DraftExperts<Build>::Prepared draft;  // a draft record's call and what its completion needs
+  };
+
+  /// How long one idle wait lasts before the thread re-reads the submit word, the draft head, stop() and
+  /// detach_draft(), which no host thread rings (or, with jobs in the window, rings the window's word): the bound on
+  /// noticing any of them. Short against a job (0.5 ms and up), long against the clock read that ends it.
   static constexpr int64_t kIdleQuantumNs = 2'000;
 
   void run() {
@@ -448,42 +513,96 @@ class BasicCpuExpertEngine {
     if (error.empty()) {
       try {
         team_.emplace(config_.cores, config_.threads, &Kernel::warm, config_.keep_warm_ns, thread_name_.c_str());
+        window_.emplace(*team_, Hooks{this});
+        window_->publish_done_to(&done_, kTargetJob);
+        tsc_ns_ = cpu_experts::tsc_ns_per_cycle();
       } catch (const std::exception& e) {
         error = std::string("CPU expert team: ") + e.what();
       }
     }
     started_.set_value(error);
     if (!error.empty()) return;
-    int64_t warm_until = 0;  // the register-work window after the last job; 0 before the first
+    live_.store(&*window_, std::memory_order_release);
+    window_->start();
+    int64_t warm_until = 0;  // the register-work window after the last task; 0 before the first
+    bool was_running = false;
     while (!stop_.load(std::memory_order_acquire)) {
+      drain_ended();
       DraftSource* draft = draft_.source();
-      // Read before the pop: a submit after it moves the word the idle wait watches.
+      // Read before the pops and the step: a submit or a phase change after it moves the word the idle wait watches.
       const uint32_t kick = kick_.load(std::memory_order_acquire);
+      const uint32_t seen = window_->word();
       const uint32_t record = draft != nullptr ? draft_.pending(*draft) : 0u;
-      CpuJob job;
-      if (jobs_.pop(&job)) {
-        busy(kTargetJob, job.row);
-        warm_until = run_job(job) + config_.keep_warm_ns;
-        idle();
+      const bool admitted = admit_pending(draft, record);
+      const cpu_experts::WindowStep step = window_->step(0);
+      if (admitted || step == cpu_experts::WindowStep::kRan) {
+        was_running = true;
         continue;
       }
-      if (record != 0) {
-        busy(kDraftJob, record);
-        warm_until = draft_.serve(*draft, record, *team_) + config_.keep_warm_ns;
-        idle();
-        continue;
+      if (was_running) {
+        warm_until = cpu_experts::team_now_ns() + config_.keep_warm_ns;
+        was_running = false;
       }
-      // Idle, as the workers are on their job word: register work until warm_until, then PAUSE, on the submit word,
-      // one quantum at a time.
-      team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);
+      // Idle, as the workers are on the window's word: register work until warm_until, then PAUSE, one quantum at a
+      // time. With jobs in the window it is their word, which their phases move; empty, the submit word.
+      if (window_->any_active())
+        window_->idle_wait(seen, true, warm_until);
+      else
+        team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);
     }
+    window_->close();
+    window_->drain();
+    window_->join();
+    drain_ended();
     draft_.leave();
-    team_.reset();
   }
 
-  /// Runs one forward and publishes it in done_; returns the clock at its end.
-  int64_t run_job(const CpuJob& job) {
-    const int64_t start = now_ns();
+  /// Admits one job into a free slot: the target ring's oldest, else the draft channel's record. True when it did.
+  bool admit_pending(DraftSource* draft, uint32_t record) {
+    const int slot = window_->reserve();
+    if (slot < 0) {
+      // One count per spell, not per spin of the loop.
+      if (!full_noted_ && (!jobs_.empty() || record != 0)) {
+        window_->note_full();
+        full_noted_ = true;
+      }
+      return false;
+    }
+    full_noted_ = false;
+    CpuJob job;
+    if (jobs_.pop(&job)) {
+      if (record != 0) window_->note_both_pending();
+      admit_target(slot, job);
+      return true;
+    }
+    if (record == 0) return false;
+    admit_draft(slot, *draft, record);
+    return true;
+  }
+
+  /// Snapshots the faults and switches of jobs that have finished, on this thread: they are its own counters. Before a
+  /// slot's storage is reused, and the loop's top: a slot is Free only after its job's bit is set.
+  void drain_ended() {
+    if constexpr (Build::kMetrics) {
+      uint32_t ended = ended_.exchange(0, std::memory_order_acquire);
+      for (; ended != 0; ended &= ended - 1) {
+        const SlotAux& a = aux_[static_cast<size_t>(std::countr_zero(ended))];
+        if (a.draft_job) {
+          draft_.resources_end(a.draft);
+        } else {
+          trace_.resources("cpu_faults_end", "cpu_switches_end", a.job.row, 0, a.job.seq);
+        }
+      }
+    }
+  }
+
+  /// Builds a ring job's call in its slot's storage and admits it: the token expansion, the instr build's check and
+  /// the kernel's prepare. A job the kernel refuses fails stop.
+  void admit_target(int slot, const CpuJob& job) {
+    drain_ended();
+    SlotAux& a = aux_[static_cast<size_t>(slot)];
+    a.job = job;
+    a.draft_job = false;
     if constexpr (Build::kMetrics) trace_.emit("cpu_start", job.row, 0, job.seq, -1, job.part, job.k);
     if constexpr (Build::kMetrics) trace_.resources("cpu_faults_start", "cpu_switches_start", job.row, 0, job.seq);
     using cpu_experts::OutMode;
@@ -491,33 +610,26 @@ class BasicCpuExpertEngine {
     call.rows = 1;
     call.k = job.k;
     call.x = config_.x_base + job.row * config_.x_stride;
-    call.slots = job.slots;
-    call.weights = job.weights;
+    call.slots = a.job.slots;
+    call.weights = a.job.weights;
     call.out =
         reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
     call.out_mode = job.accumulate ? OutMode::kAccumulate
                     : config_.store_out ? OutMode::kOverwriteByStore
                                         : OutMode::kOverwrite;
-    // A staged job's forward waits here, once its first stage is done, until the tier opens the job's gate. The spin is
-    // the job's own time, so the watchdog still times it; stop() alone ends it early, at shutdown.
+    // A staged job's gate phase waits, once its first stage is done, until the tier opens the job's gate; the window
+    // holds the job meanwhile and runs the others. The wait is the job's own time, so the watchdog still times it;
+    // stop() alone ends it early, at shutdown.
     cpu_experts::StageGate gate{&stage_gates_[job.seq % kRing], job.seq, &stop_};
     if constexpr (Build::kMetrics) gate.timed = true;
-    if (job.staged) call.stage_two = &gate;
-    int64_t pairs = job.k;  // the job's (token, expert) pairs, for the split model's fit: one a lane on a one-token row
+    a.pairs = job.k;  // the job's (token, expert) pairs, for the split model's fit: one a lane on a one-token row
     if (job.per_token && config_.tokens > 1) {
-      call.rows = static_cast<int32_t>(expand_tokens(job, static_cast<const uint8_t*>(call.x)));
-      call.slots = token_slots_.data();
-      call.weights = token_weights_.data();
-      pairs = 0;
+      call.rows = static_cast<int32_t>(expand_tokens(job, static_cast<const uint8_t*>(call.x), a));
+      call.slots = a.slots.data();
+      call.weights = a.weights.data();
+      a.pairs = 0;
       for (int i = 0; i < call.rows * call.k; ++i)
-        pairs += call.slots[i] >= 0;
-      // A token that routes none of the lanes must read 0, whatever an earlier record left: zero the rows here rather
-      // than trust the kernel's overwrite, then accumulate. With store_out the kernel's overwrite does it (a store per
-      // token's first sum, zeros for the rest): the same bits, without this thread zeroing every row first.
-      if (!config_.store_out) {
-        if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
-        call.out_mode = OutMode::kAccumulate;
-      }
+        a.pairs += call.slots[i] >= 0;
     }
     if constexpr (Build::kMetrics) {
       if (trace_.enabled()) {
@@ -530,27 +642,87 @@ class BasicCpuExpertEngine {
       const Layer* layer = config_.layers->get(job.row);
       if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
       if (config_.check_calls) Kernel::check(*layer, call);
-      Kernel::forward(*layer, call, *team_);
+      // A job writes (row, part); one still in the window on the same output goes first (an accumulating miss job adds
+      // to what the one before it left).
+      const uint64_t out_key = static_cast<uint64_t>(job.row) * 2 + static_cast<uint64_t>(job.part != 0);
+      if (!window_->admit_at(slot, job.seq, kTargetJob, *layer, call, out_key, job.staged ? &gate : nullptr, job.row))
+        throw std::logic_error("the window refused the job");
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
     }
-    if (job.staged) record_stage_two(job, gate);
-    const int64_t end = now_ns();
-    add(compute_ns_, end - start);
-    add(jobs_done_, 1);
-    add(lanes_done_, job.k);
-    // A staged job's time includes its wait for the second stage's read: not a forward's cost.
-    if (!job.staged) record_fit(job.part == 0 ? 0 : 1, job.k, pairs, end - start);
-    if constexpr (Build::kMetrics) trace_.resources("cpu_faults_end", "cpu_switches_end", job.row, 0, job.seq);
-    if constexpr (Build::kMetrics) trace_.emit("cpu_end", job.row, 0, job.seq, -1, job.part, job.k);
-    done_.store(job.seq, std::memory_order_release);
-    return end;
+  }
+
+  /// Builds the draft record's call in its slot's storage and admits it.
+  void admit_draft(int slot, const DraftSource& d, uint32_t record) {
+    drain_ended();
+    SlotAux& a = aux_[static_cast<size_t>(slot)];
+    a.draft_job = true;
+    draft_.prepare(d, record, a.draft);
+    draft_.admitting(a.draft);
+    try {
+      if (!window_->admit_at(slot, record, kDraftJob, *a.draft.layer, a.draft.call, cpu_experts::kNoOutKey, nullptr,
+                             record))
+        throw std::logic_error("the window refused the record");
+    } catch (const std::exception& e) {
+      fail_stop(std::string(kDraftPrefix) + "forward of record " + std::to_string(record) + " (stage " +
+                std::to_string(a.draft.stage) + ") failed: " + e.what());
+    }
+  }
+
+  struct SpinGuard {
+    explicit SpinGuard(std::atomic_flag& flag) : flag_(flag) {
+      while (flag_.test_and_set(std::memory_order_acquire)) _mm_pause();
+    }
+    ~SpinGuard() { flag_.clear(std::memory_order_release); }
+    std::atomic_flag& flag_;
+  };
+
+  /// The window's completion hook: a job has run all its phases, on whichever worker finished it, before done_ can
+  /// pass it. Completions run one at a time (their counters and the fit's seqlock have a single writer at once). A
+  /// job the kernel refused (status 2) or failed fails stop, naming its row.
+  void complete(const WindowSlot& s) noexcept {
+    SpinGuard guard(complete_lock_);
+    const SlotAux& a = aux_[static_cast<size_t>(s.index())];
+    const int status = s.status();
+    const int64_t elapsed = cpu_experts::team_now_ns() - s.admit_ns();
+    if (s.kind() == kDraftJob) {
+      if (status != 0)
+        fail_stop(std::string(kDraftPrefix) + "forward of record " + std::to_string(s.id()) + " (stage " +
+                  std::to_string(a.draft.stage) + ") failed: " + status_text(status));
+      draft_.finish(a.draft, elapsed);
+    } else {
+      const CpuJob& job = a.job;
+      if (status != 0)
+        fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + status_text(status));
+      if (job.staged) record_stage_two(job, s);
+      add(compute_ns_, elapsed);
+      add(jobs_done_, 1);
+      add(lanes_done_, job.k);
+      // A staged job's time includes its wait for the second stage's read: not a job's cost. The rest is the
+      // workers' time on its runs, over the team: what it would take with the team to itself.
+      if (!job.staged) {
+        const int64_t worker_ns = static_cast<int64_t>(static_cast<double>(s.worker_tsc()) * tsc_ns_);
+        record_fit(job.part == 0 ? 0 : 1, job.k, a.pairs, worker_ns / window_->workers());
+      }
+      if constexpr (Build::kMetrics) trace_.emit("cpu_end", job.row, 0, job.seq, -1, job.part, job.k);
+    }
+    if constexpr (Build::kMetrics) ended_.fetch_or(1u << s.index(), std::memory_order_release);
+  }
+
+  /// Instr builds, per run of tasks: which slot ran which phase on which worker, for how many TSC cycles.
+  void ran(const WindowSlot& s, int phase, int t0, int t1, int worker, uint64_t cycles) noexcept {
+    trace_.emit("cpu_run", s.id(), static_cast<uint64_t>(s.index()), s.seq(), worker, phase, t1 - t0,
+                static_cast<int64_t>(cycles));
+  }
+
+  static const char* status_text(int status) {
+    return status == 2 ? "the job refused its input (status 2)" : "the job failed";
   }
 
   /// A record's job on a multi-token row: each token's slots and weights from the row's token table
   /// (cpu_token_table.h), -1 where the token does not route the lane's expert (the kernel skips only slot -1, never a
-  /// zero weight). Returns the record's tokens; fails stop on a count the row cannot hold.
-  uint32_t expand_tokens(const CpuJob& job, const uint8_t* x) {
+  /// zero weight), into the slot's table. Returns the record's tokens; fails stop on a count the row cannot hold.
+  uint32_t expand_tokens(const CpuJob& job, const uint8_t* x, SlotAux& a) {
     constexpr int64_t kLanes = wire::Wire::kLanes;
     const uint8_t* table = x + config_.tokens * config_.x_token_bytes;
     const uint32_t tokens = load_u32(table);
@@ -564,28 +736,29 @@ class BasicCpuExpertEngine {
         const int32_t lane = job.lanes[i];
         const bool routed = (load_u32(table + CpuTokenTable::kHeaderBytes + 4 * lane) >> t & 1u) != 0;
         const uint32_t bits = load_u32(table + CpuTokenTable::kHeaderBytes + 4 * kLanes + 4 * (t * kLanes + lane));
-        token_slots_[t * job.k + i] = routed ? job.slots[i] : -1;
-        token_weights_[t * job.k + i] = routed ? std::bit_cast<float>(bits) : 0.0f;
+        a.slots[t * job.k + i] = routed ? job.slots[i] : -1;
+        a.weights[t * job.k + i] = routed ? std::bit_cast<float>(bits) : 0.0f;
       }
     return tokens;
   }
 
-  /// A staged job's gate after its forward: its stats and its cpu_stage_two event, stamped when the gate opened. A
-  /// forward that never waited would have run Down on rows still landing: its output is refused.
-  void record_stage_two(const CpuJob& job, const cpu_experts::StageGate& gate) {
-    if (gate.calls != 1) {
-      fail_stop(prefix_ + "kernel " + Kernel::name() + " waited " + std::to_string(gate.calls) + " times for row " +
+  /// A staged job's gate after its last phase: the window's stats for it and the cpu_stage_two event, stamped when the
+  /// gate opened. A kernel with no gate phase never waited, and would have run Down on rows still landing: its output
+  /// is refused.
+  void record_stage_two(const CpuJob& job, const WindowSlot& gate) {
+    if (gate.gate_calls != 1) {
+      fail_stop(prefix_ + "kernel " + Kernel::name() + " waited " + std::to_string(gate.gate_calls) + " times for row " +
                 std::to_string(job.row) + "'s second stage, not once");
       return;
     }
     add(staged_jobs_, 1);
-    if (gate.spun) {
+    if (gate.gate_spun) {
       add(stage_two_waits_, 1);
-      add(stage_two_wait_ns_, gate.waited_ns);
+      add(stage_two_wait_ns_, gate.gate_waited_ns);
     }
     if constexpr (Build::kMetrics)
-      trace_.emit_at("cpu_stage_two", gate.called_ns + gate.waited_ns, job.row, 0, job.seq, -1, gate.waited_ns,
-                     gate.spun ? 1 : 0);
+      trace_.emit_at("cpu_stage_two", gate.gate_called_ns + gate.gate_waited_ns, job.row, 0, job.seq, -1,
+                     gate.gate_waited_ns, gate.gate_spun ? 1 : 0);
   }
 
   static uint32_t load_u32(const uint8_t* p) {
@@ -594,21 +767,8 @@ class BasicCpuExpertEngine {
     return v;
   }
 
-  static constexpr int32_t kTargetJob = 1, kDraftJob = 2;
-
-  /// Marks the job the thread starts now for the watchdog: its kind and its id (a target job's row, a draft record's
-  /// sequence). The release orders the id and kind before the start time the watchdog reads first.
-  void busy(int32_t kind, int64_t id) {
-    job_kind_.store(kind, std::memory_order_relaxed);
-    job_id_.store(id, std::memory_order_relaxed);
-    job_started_ns_.store(now_ns(), std::memory_order_release);
-  }
-  void idle() {
-    job_started_ns_.store(0, std::memory_order_release);
-  }
-
-  /// Every 20 ms, once a draft source is attached: fail-stops a job of either kind that has run for fatal_wait_ns, and
-  /// a posted draft record that has stood unserved that long.
+  /// Every 20 ms, once a draft source is attached: fail-stops a job of either kind in the window that has been there
+  /// for fatal_wait_ns, and a posted draft record that has stood unserved that long.
   void watch() {
     uint32_t watched = 0;
     int64_t since = 0;
@@ -617,13 +777,19 @@ class BasicCpuExpertEngine {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       if (watchdog_stop_.load(std::memory_order_acquire)) return;
       const int64_t now = now_ns();
-      const int64_t started = job_started_ns_.load(std::memory_order_acquire);
-      if (started != 0 && now - started >= fatal_wait_ns_) {
-        const int64_t id = job_id_.load(std::memory_order_relaxed);
-        if (job_kind_.load(std::memory_order_relaxed) == kDraftJob)
-          fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(id) + " incomplete after " + wait +
+      if (const Window* window = live_.load(std::memory_order_acquire); window != nullptr) {
+        for (int i = 0; i < kWindowSlots; ++i) {
+          const WindowSlot& s = window->slot(i);
+          // The state first: an Active slot's admit time is its job's or a later one's, never an earlier one's.
+          if (!s.active()) continue;
+          const int64_t started = s.admit_ns();
+          if (now - started < fatal_wait_ns_) continue;
+          if (s.kind() == kDraftJob)
+            fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(s.id()) + " incomplete after " + wait +
+                      " s (fatal wait)");
+          fail_stop(prefix_ + "the CPU job of row " + std::to_string(s.id()) + " incomplete after " + wait +
                     " s (fatal wait)");
-        fail_stop(prefix_ + "the CPU job of row " + std::to_string(id) + " incomplete after " + wait + " s (fatal wait)");
+        }
       }
       const uint32_t head = draft_.unserved_head();
       if (head == 0) {
@@ -640,7 +806,7 @@ class BasicCpuExpertEngine {
     }
   }
 
-  /// A counter only this thread writes: no locked add needed.
+  /// A counter only one thread writes at a time (the completion lock's holder): no locked add needed.
   static void add(std::atomic<int64_t>& counter, int64_t n) {
     counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
   }
@@ -665,7 +831,16 @@ class BasicCpuExpertEngine {
   std::promise<std::string> started_;  // the thread's pin result, for start()
   SpscRing<CpuJob, kRing> jobs_;
   alignas(64) std::atomic<uint32_t> kick_{0};  // moved by every submit; the thread's idle wait watches it
-  std::optional<cpu_experts::Team> team_;      // the run thread's, from its start to its exit
+  // The run thread's team and window, made at its start and kept until stop(): the watchdog and stall_state() read the
+  // window after the thread exits, through live_. The window is declared after the team, so it goes first.
+  std::optional<cpu_experts::Team> team_;
+  std::optional<Window> window_;
+  std::atomic<const Window*> live_{nullptr};
+  double tsc_ns_ = 0;                          // ns per TSC cycle, for the workers' time in a job's fit
+  std::atomic_flag complete_lock_;             // one completion at a time
+  std::atomic<uint32_t> ended_{0};             // instr build: slots whose job finished, for the thread's end snapshots
+  bool full_noted_ = false;                    // this thread: the window's full spell is counted
+  std::array<SlotAux, kWindowSlots> aux_{};
   uint32_t claimed_ = 0;  // tier owner only
   std::atomic<uint32_t> submitted_{0};  // the last job submitted (the tier owner writes), for stall_state()
   std::atomic<uint32_t> done_{0};
@@ -678,9 +853,6 @@ class BasicCpuExpertEngine {
   std::atomic<uint32_t> fit_version_{0};
   // Staged jobs: each one's gate word, at its sequence modulo the ring (the tier owner stores, the thread reads).
   std::array<std::atomic<uint32_t>, kRing> stage_gates_{};
-  // A per-token job's expanded slots and weights, [tokens][k]; this thread only.
-  std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_slots_{};
-  std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_weights_{};
   std::atomic<bool> stop_{false};
   // The DSpark draft source and its read of the channel (attach_draft): the team's threads and cores, and the
   // engine's trace and trigger, are its.
@@ -688,9 +860,6 @@ class BasicCpuExpertEngine {
   std::atomic<bool> watchdog_stop_{false};
   int64_t fatal_wait_ns_ = 0;
   std::thread watchdog_;
-  // The job running now, for the watchdog (busy(), idle()): its start (0: none), kind and id.
-  std::atomic<int64_t> job_started_ns_{0}, job_id_{0};
-  std::atomic<int32_t> job_kind_{0};
 };
 
 }  // namespace sglang::expert_stream

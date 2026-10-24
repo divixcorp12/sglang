@@ -1,5 +1,6 @@
 // The DSpark draft channel as a CPU expert engine's second job source (cpu_experts.h): the source the host attaches to
-// a running engine, the engine thread's poll and serve of the channel, and the draft's counters.
+// a running engine, the engine thread's poll and preparation of the channel's records, their completion, and the
+// draft's counters.
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "The second client: the DSpark draft".
 #pragma once
 
@@ -64,23 +65,25 @@ struct DraftSourceOf {
 };
 
 /// A CPU expert engine's draft source and its read of the channel. Two threads use it: the host's (attach, detach,
-/// open_gate, stats, unserved_head) and the engine's (source, pending, serve, leave), which meet on one word,
-/// `source_`: null (none, or detached), the attached source, or the detach sentinel while a detach waits for the engine
-/// thread to let go of the source. The engine thread reads the word once per idle quantum and never keeps a source
-/// across one, so a detach returns within a quantum plus the job in progress.
+/// open_gate, stats, unserved_head) and the engine's (source, pending, prepare, leave; finish runs on whichever worker
+/// finishes the record's job), which meet on one word, `source_`: null (none, or detached), the attached source, or the
+/// detach sentinel while a detach waits for the engine thread to let go of the source. The engine thread reads the word
+/// once per idle quantum and keeps a source across one only while a record is in the window, so a detach returns within
+/// a quantum plus the job in progress.
 template <BuildPolicy Build>
 class DraftExperts {
  public:
   using Kernel = typename Build::CpuKernel;
-  using DraftSource = DraftSourceOf<typename Kernel::Layer>;
+  using Layer = typename Kernel::Layer;
+  using DraftSource = DraftSourceOf<Layer>;
   static constexpr const char* kPrefix = "DSpark draft CPU experts: ";
 
   struct Stats {
     int64_t jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns;
   };
 
-  /// Every draft forward runs on the engine's team. `trace` and `trigger` are the engine's, written on the engine
-  /// thread only.
+  /// Every draft job runs in the engine's window. `trace` and `trigger` are the engine's, written by the engine thread
+  /// and, in finish(), by the one thread that finishes the record in flight.
   DraftExperts(JobTrace<Build::kMetrics>& trace, DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger)
       : trace_(trace), trigger_(trigger) {}
   DraftExperts(const DraftExperts&) = delete;
@@ -143,6 +146,8 @@ class DraftExperts {
   DraftSource* source() {
     DraftSource* d = source_.load(std::memory_order_acquire);
     if (d == detaching()) {
+      // A record in the window finishes first: its completion still writes the channel the detach then closes.
+      if (in_flight_.load(std::memory_order_acquire)) return nullptr;
       source_.store(nullptr, std::memory_order_release);
       return nullptr;
     }
@@ -152,9 +157,10 @@ class DraftExperts {
     return d;
   }
 
-  /// Engine thread: the record posted and not yet served, 0 when there is none. A record past the one expected
-  /// fail-stops: the device posts one record per wait.
+  /// Engine thread: the record posted and not yet served, 0 when there is none or one is in the window (its completion
+  /// moves next_, and the device posts one record per wait). A record past the one expected fail-stops.
   uint32_t pending(const DraftSource& d) {
+    if (in_flight_.load(std::memory_order_acquire)) return 0;
     const uint32_t head = channel::head<DraftChannel>(d.channel);
     if (head == 0 || !channel::reached(head, next_)) return 0;
     if constexpr (Build::kMetrics) trace_.draft_observe(&d, head);
@@ -164,9 +170,21 @@ class DraftExperts {
     return next_;
   }
 
-  /// Engine thread: reads record `seq` (pending()'s), runs its forward on `team`, completes it through the channel;
-  /// returns the forward's end. A torn or malformed record, or a refused forward, fail-stops.
-  int64_t serve(const DraftSource& d, uint32_t seq, cpu_experts::Team& team) {
+  /// One record's call as prepare() builds it, in storage the window's job reads while it runs: the record's slots and
+  /// weights compacted to [rows, k], and what finish() needs.
+  struct Prepared {
+    cpu_experts::ForwardCall call;
+    const Layer* layer = nullptr;
+    const DraftSource* source = nullptr;
+    uint32_t seq = 0, epoch = 0;
+    int stage = 0, rows = 0, k = 0, shared = 0;
+    int32_t slots[draft::kMaxRows * draft::kMaxK];
+    float weights[draft::kMaxRows * draft::kMaxK];
+  };
+
+  /// Engine thread: reads record `seq` (pending()'s) into `p`, the call a window admits; the record is in flight until
+  /// finish(). A torn or malformed record fail-stops.
+  void prepare(const DraftSource& d, uint32_t seq, Prepared& p) {
     int64_t selected = 0;
     if constexpr (Build::kMetrics) selected = now_ns();
     alignas(64) uint8_t raw[DraftChannel::kRecordBytes];
@@ -190,8 +208,8 @@ class DraftExperts {
       trace_.draft_arrival(stage, epoch, seq, gpu_ns, offset_high);
     }
     // The slot and weight areas are kMaxK wide per token; the kernel reads [rows, k] contiguous, so compact them.
-    int32_t slots[draft::kMaxRows * draft::kMaxK];
-    float weights[draft::kMaxRows * draft::kMaxK];
+    int32_t* const slots = p.slots;
+    float* const weights = p.weights;
     const int32_t* s = d.slots + static_cast<int64_t>(stage) * draft::kMaxRows * draft::kMaxK;
     const float* w = d.weights + static_cast<int64_t>(stage) * draft::kMaxRows * draft::kMaxK;
     for (int t = 0; t < rows; ++t)
@@ -200,8 +218,16 @@ class DraftExperts {
         weights[t * k + i] = w[t * draft::kMaxK + i];
       }
     const int shared = draft::count_shared_routes(slots, rows * k);
-    const auto& layer = d.layers[stage];
-    cpu_experts::ForwardCall call;
+    p.layer = &d.layers[stage];
+    p.source = &d;
+    p.seq = seq;
+    p.epoch = epoch;
+    p.stage = stage;
+    p.rows = rows;
+    p.k = k;
+    p.shared = shared;
+    cpu_experts::ForwardCall& call = p.call;
+    call = {};
     call.rows = rows;
     call.k = k;
     call.x = d.x + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden * 2;
@@ -223,32 +249,41 @@ class DraftExperts {
       }
       trace_.emit("draft_shape", stage, epoch, seq, -1, live, distinct, rows);
     }
-    const int64_t start = now_ns();
-    if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
-    if constexpr (Build::kMetrics) trace_.resources("draft_faults_start", "draft_switches_start", stage, epoch, seq);
-    try {
-      Kernel::forward(layer, call, team);
-    } catch (const std::exception& e) {
-      fail_stop(std::string(kPrefix) + "forward of record " + std::to_string(seq) + " (stage " + std::to_string(stage) +
-                ") failed: " + e.what());
-    }
-    const int64_t end = now_ns();
-    add(forward_ns_, end - start);
+    in_flight_.store(true, std::memory_order_release);
+  }
+
+  /// Engine thread, just before the record's job is admitted: its start events.
+  void admitting(const Prepared& p) {
+    if constexpr (Build::kMetrics) trace_.emit("draft_start", p.stage, p.epoch, p.seq, -1, p.rows, p.k, p.shared);
+    if constexpr (Build::kMetrics)
+      trace_.resources("draft_faults_start", "draft_switches_start", p.stage, p.epoch, p.seq);
+  }
+
+  /// The thread that finishes the record's job (any worker; one record is in flight at a time): its counters, its
+  /// completion through the channel, its trace, and the engine's next record. `elapsed` is the job's admission to its
+  /// end, in ns.
+  void finish(const Prepared& p, int64_t elapsed) {
+    add(forward_ns_, elapsed);
     add(jobs_, 1);
-    add(rows_, rows);
-    if (shared > 0) {
+    add(rows_, p.rows);
+    if (p.shared > 0) {
       add(collided_jobs_, 1);
-      add(shared_routes_, shared);
-      add(collided_forward_ns_, end - start);
+      add(shared_routes_, p.shared);
+      add(collided_forward_ns_, elapsed);
     }
-    if constexpr (Build::kMetrics) trace_.resources("draft_faults_end", "draft_switches_end", stage, epoch, seq);
-    if constexpr (Build::kMetrics) trace_.emit("draft_end", stage, epoch, seq, -1, rows, k, shared);
-    channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
-    completed_.store(seq, std::memory_order_release);
-    if constexpr (Build::kMetrics) trace_.draft_finished(end - start, stage, epoch, seq);
-    trigger_.finished(seq, end - start);
-    next_ = channel::skip_zero(seq + 1u);
-    return end;
+    if constexpr (Build::kMetrics) trace_.emit("draft_end", p.stage, p.epoch, p.seq, -1, p.rows, p.k, p.shared);
+    channel::complete<DraftChannel>(p.source->channel, p.seq, static_cast<uint64_t>(p.epoch) << 32 | p.seq);
+    completed_.store(p.seq, std::memory_order_release);
+    if constexpr (Build::kMetrics) trace_.draft_finished(elapsed, p.stage, p.epoch, p.seq);
+    trigger_.finished(p.seq, elapsed);
+    next_ = channel::skip_zero(p.seq + 1u);
+    in_flight_.store(false, std::memory_order_release);
+  }
+
+  /// Engine thread, after finish(): the record's end snapshot of the thread's faults and switches.
+  void resources_end(const Prepared& p) {
+    if constexpr (Build::kMetrics)
+      trace_.resources("draft_faults_end", "draft_switches_end", p.stage, p.epoch, p.seq);
   }
 
   /// Engine thread, on exit: lets go of the source, so a detach in flight returns and a later one has nothing to wait
@@ -273,7 +308,8 @@ class DraftExperts {
   DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics>& trigger_;
   std::unique_ptr<DraftSource> owned_;         // the host's, for the engine's lifetime
   std::atomic<DraftSource*> source_{nullptr};  // the word the two threads meet on (the class comment)
-  uint32_t next_ = 0;                          // the engine thread's: the record it serves next
+  uint32_t next_ = 0;                          // the record served next: the engine thread's, moved by finish()
+  std::atomic<bool> in_flight_{false};         // a record is in the window, from prepare() to finish()
   std::atomic<uint32_t> completed_{0};
   std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, collided_jobs_{0}, shared_routes_{0},
       collided_forward_ns_{0};
