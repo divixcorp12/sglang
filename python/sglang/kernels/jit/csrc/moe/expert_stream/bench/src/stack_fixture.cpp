@@ -160,9 +160,9 @@ void StackFixture::write_x(int64_t row) const {
 ::sglang::exl3_cpu::Exl3CpuKernel::Layer StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
   ::sglang::exl3_cpu::Exl3CpuKernel::Layer d;
-  // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
+  // 3-bit gate/up and down, unswizzled, on the plan that accepts the layer.
   d.params = SglangExl3CpuParams{
-      3, 3, 0, 0,
+      3, 3, 0,
       ::sglang::exl3_cpu::exl3_cpu_match_plan(
           static_cast<int32_t>(f.hidden), static_cast<int32_t>(f.intermediate), 3, 3, 0, 10.0f)};
   d.capacity = static_cast<int32_t>(capacity());

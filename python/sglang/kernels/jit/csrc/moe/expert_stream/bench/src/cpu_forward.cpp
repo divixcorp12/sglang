@@ -243,9 +243,9 @@ struct SlabLayer {
       shape.slabs[n] = slabs[n].get();
       shape.slot_bytes[n] = row;
     }
-    // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
+    // 3-bit gate/up and down, unswizzled, on the plan that accepts the layer.
     plan = ::sglang::exl3_cpu::exl3_cpu_match_plan(shape.hidden, shape.intermediate, 3, 3, 0, shape.act_limit);
-    shape.params = SglangExl3CpuParams{3, 3, 0, 0, plan};
+    shape.params = SglangExl3CpuParams{3, 3, 0, plan};
     layer = ::sglang::exl3_cpu::Exl3CpuKernel::make_layer(shape);
   }
 };
