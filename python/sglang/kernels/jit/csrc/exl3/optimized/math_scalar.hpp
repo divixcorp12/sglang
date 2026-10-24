@@ -13,12 +13,13 @@ namespace {
 template <>
 struct Tiles<Isa::Scalar>
 {
+    template <bool Accumulate = false>
     static void run(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
     {
-        with_count<8>(mat.bits, [&]<int bits>() { tiles<bits>(mat, in, tout, m, tn0, tn1); });
+        with_count<8>(mat.bits, [&]<int bits>() { tiles<bits, Accumulate>(mat, in, tout, m, tn0, tn1); });
     }
 
-    template <int bits>
+    template <int bits, bool Accumulate>
     static void tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
     {
         const int tiles_k = mat.k / 16;
@@ -38,8 +39,14 @@ struct Tiles<Isa::Scalar>
                         for (int c = 0; c < 16; ++c) acc[i][c] += x[r] * tile[r * 16 + c];
                 }
             }
-            for (int i = 0; i < m; ++i)
-                std::memcpy(tout + size_t(i) * mat.n + tile_n * 16, acc[i], 16 * sizeof(float));
+            for (int i = 0; i < m; ++i) {
+                float* out = tout + size_t(i) * mat.n + tile_n * 16;
+                if constexpr (Accumulate) {
+                    for (int c = 0; c < 16; ++c) out[c] += acc[i][c];
+                } else {
+                    std::memcpy(out, acc[i], 16 * sizeof(float));
+                }
+            }
         }
     }
 };

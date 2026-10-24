@@ -21,9 +21,10 @@ struct Tiles<Isa::Avx2>
 {
     using Acc = __m256i[GENERIC_MAX_M][2];
 
+    template <bool Accumulate = false>
     static void run(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
     {
-        with_count<8>(mat.bits, [&]<int bits>() { tiles<bits>(mat, in, tout, m, tn0, tn1); });
+        with_count<8>(mat.bits, [&]<int bits>() { tiles<bits, Accumulate>(mat, in, tout, m, tn0, tn1); });
     }
 
     // Which lanes of half `half` of row `row`'s gather come from register Reg.
@@ -123,7 +124,7 @@ struct Tiles<Isa::Avx2>
         }
     }
 
-    template <int bits>
+    template <int bits, bool Accumulate>
     static void tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
     {
         const int tiles_k = mat.k / 16;
@@ -155,8 +156,14 @@ struct Tiles<Isa::Avx2>
                 const float scale = mul1_k_inv() * in.q[i];
                 const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
                 float* out = tout + size_t(i) * mat.n + tile_n * 16;
-                _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr));
-                _mm256_storeu_ps(out + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][1]), _mm256_set1_ps(scale), corr));
+                __m256 lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr);
+                __m256 hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][1]), _mm256_set1_ps(scale), corr);
+                if constexpr (Accumulate) {
+                    lo = _mm256_add_ps(_mm256_loadu_ps(out), lo);
+                    hi = _mm256_add_ps(_mm256_loadu_ps(out + 8), hi);
+                }
+                _mm256_storeu_ps(out, lo);
+                _mm256_storeu_ps(out + 8, hi);
             }
         }
     }

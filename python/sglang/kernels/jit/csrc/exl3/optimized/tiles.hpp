@@ -1,6 +1,7 @@
 // run_tiles: one chunk's GEMV over output tiles [tn0, tn1), on the build's tier. The register kernels take the DSV4.1
 // plan's compact input (and, on the Bw tier, the generic plan's one-token 3-bit chunks); every other call runs the
-// tier's Tiles over each 128-input block's view, summing the blocks and then each residual row onto its token row.
+// tier's Tiles over each 128-input block's view (block 0 stores, later blocks add onto tout in their epilogue), then
+// each residual row onto its token row.
 // Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
 // see ../LICENSE.exllamav3.
 #pragma once
@@ -10,7 +11,6 @@
 #include "math_avx2.hpp"
 #include "math_scalar.hpp"
 #include <cstddef>
-#include <vector>
 
 namespace sglang::exl3_cpu {
 namespace {
@@ -27,7 +27,7 @@ void run_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     }
 #endif
     if constexpr (kIsa == Isa::Scalar) {
-        Tiles<kIsa>::run(mat, in, tout, m, tn0, tn1);
+        Tiles<kIsa>::run<false>(mat, in, tout, m, tn0, tn1);
         return;
     }
     const int rows = kActRows * m;
@@ -35,8 +35,6 @@ void run_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
     const int c0 = tn0 * 16, c1 = tn1 * 16;
     constexpr int block_tiles = kActBlock / 16;
     const size_t packed_size = size_t(16) * mat.bits;
-    thread_local std::vector<float> part;
-    if (mat.k > kActBlock && part.size() < size_t(rows) * n) part.resize(size_t(rows) * n);
     for (int b = 0; b < mat.k / kActBlock; ++b) {
         // The block's view: native k-tile rows are tiles_n tiles apart; consecutive k-tiles of a swizzled 8-tile group
         // are 8 apart, the group stride staying the whole matrix's (group_tiles_k).
@@ -50,14 +48,8 @@ void run_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int
             sub_in.q[i] = in.bq[b * MAX_M + i];
             sub_in.sum_x8[i] = in.bsum[b * MAX_M + i];
         }
-        float* dst = b ? part.data() : tout;
-        Tiles<kIsa>::run(sub, sub_in, dst, rows, tn0, tn1);
-        if (b)
-            for (int i = 0; i < rows; ++i) {
-                float* t = tout + size_t(i) * n;
-                const float* q = part.data() + size_t(i) * n;
-                for (int c = c0; c < c1; ++c) t[c] += q[c];
-            }
+        if (b) Tiles<kIsa>::run<true>(sub, sub_in, tout, rows, tn0, tn1);
+        else Tiles<kIsa>::run<false>(sub, sub_in, tout, rows, tn0, tn1);
     }
     for (int r = m; r < rows; ++r) {
         float* t = tout + size_t(r - m) * n;

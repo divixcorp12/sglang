@@ -341,8 +341,8 @@ constexpr __mmask16 word_load_mask(int n)
 }
 
 // Output tiles [n0, n0 + band) of `rows` quantized rows: each k-tile's band of tiles is loaded and decoded into the
-// band's accumulators (Rows::accumulate), then each tile is scaled once.
-template <class Rows, int bits, int rows, int band>
+// band's accumulators (Rows::accumulate), then each tile is scaled once and stored (Accumulate: added onto tout).
+template <class Rows, int bits, int rows, int band, bool Accumulate>
 void band_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n0)
 {
     const int tiles_k = mat.k / 16;
@@ -398,8 +398,10 @@ void band_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, in
         for (int i = 0; i < rows; ++i) {
             const float scale = mul1_k_inv() * in.q[i];
             const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
-            const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]), _mm512_set1_ps(scale), corr);
-            _mm512_storeu_ps(tout + size_t(i) * mat.n + (n0 + b) * 16, out);
+            __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]), _mm512_set1_ps(scale), corr);
+            float* dst = tout + size_t(i) * mat.n + (n0 + b) * 16;
+            if constexpr (Accumulate) out = _mm512_add_ps(_mm512_loadu_ps(dst), out);
+            _mm512_storeu_ps(dst, out);
         }
 }
 
@@ -407,21 +409,22 @@ template <Isa I>
     requires(kAvx512<I>)
 struct Tiles<I>
 {
+    template <bool Accumulate = false>
     static void run(const Exl3Projection& mat, const PreparedIn& in, float* tout, int rows, int tn0, int tn1)
     {
         with_count<8>(mat.bits, [&]<int bits>() {
-            with_count<GENERIC_MAX_M>(rows, [&]<int R>() { tiles<bits, R>(mat, in, tout, tn0, tn1); });
+            with_count<GENERIC_MAX_M>(rows, [&]<int R>() { tiles<bits, R, Accumulate>(mat, in, tout, tn0, tn1); });
         });
     }
 
-    template <int bits, int rows>
+    template <int bits, int rows, bool Accumulate>
     static void tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
     {
         using Rows = BandRows<(I == Isa::Vbmi && bits == 8) ? Isa::Vnni : I>;
         const int max_band = Rows::template max_band<bits, rows>(mat.swz != 0);
         for (int n0 = tn0; n0 < tn1;) {
             const int band = std::min(tn1 - n0, max_band);
-            with_count<8>(band, [&]<int B>() { band_tiles<Rows, bits, rows, B>(mat, in, tout, n0); });
+            with_count<8>(band, [&]<int B>() { band_tiles<Rows, bits, rows, B, Accumulate>(mat, in, tout, n0); });
             n0 += band;
         }
     }

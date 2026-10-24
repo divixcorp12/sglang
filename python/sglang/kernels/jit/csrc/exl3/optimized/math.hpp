@@ -106,7 +106,8 @@ EXL3_ALWAYS_INLINE inline void with_count(int n, F&& f)
     do { if (!(cond)) [[unlikely]] check_failed(message); } while (0)
 
 // The GEMV tiles of one tier (math_scalar.hpp, math_avx2.hpp, math_avx512.hpp): run(mat, in, tout, rows, tn0, tn1)
-// writes output tiles [tn0, tn1) of `rows` quantized rows (the scalar tier: token rows of in.tin).
+// writes output tiles [tn0, tn1) of `rows` quantized rows (the scalar tier: token rows of in.tin). run<true> adds each
+// result onto tout's old value instead of storing it.
 template <Isa I>
 struct Tiles;
 
