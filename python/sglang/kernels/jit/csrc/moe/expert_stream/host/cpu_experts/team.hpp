@@ -7,69 +7,26 @@
 // The host and a kernel's translation unit share a Team through the kernel's forward(layer, call, team), so both
 // compile this header: atomics, plain ints, a span and function pointers.
 #pragma once
+#include "clock.hpp"
+#include "cores.hpp"
 #include "kernel.hpp"
+#include "stage_gate.hpp"
 #include <immintrin.h>
-#include <pthread.h>
-#include <sched.h>
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <stdexcept>
-#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
 
 namespace sglang::cpu_experts {
 
-// Throws std::invalid_argument unless every core is in [0, CPU_SETSIZE) and none repeats. Not checked against the
-// caller's affinity: the owner may run under a mask that excludes the expert cores, and the workers pin themselves
-// outside it; a core that cannot be pinned fails the Team's construction (std::runtime_error).
-inline void check_cores(std::span<const int> cores)
-{
-    for (size_t i = 0; i < cores.size(); ++i) {
-        if (cores[i] < 0 || cores[i] >= CPU_SETSIZE)
-            throw std::invalid_argument("CPU expert core " + std::to_string(cores[i]) + " is outside [0, CPU_SETSIZE)");
-        for (size_t j = 0; j < i; ++j)
-            if (cores[j] == cores[i])
-                throw std::invalid_argument("CPU expert core " + std::to_string(cores[i]) + " repeats");
-    }
-}
-
-// Pins the calling thread to `core`; false when it cannot.
-inline bool pin_thread(int core)
-{
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(core, &set);
-    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
-}
-
-// CLOCK_MONOTONIC in ns, the clock of every deadline here (libstdc++'s steady_clock reads it).
-inline int64_t team_now_ns()
-{
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-inline void StageGate::wait() noexcept
-{
-    ++calls;
-    if (timed) called_ns = team_now_ns();
-    if (word->load(std::memory_order_acquire) == open) return;
-    spun = true;
-    while (word->load(std::memory_order_acquire) != open && !(stop && stop->load(std::memory_order_relaxed)))
-        _mm_pause();
-    if (timed) waited_ns = team_now_ns() - called_ns;
-}
-
 class Team {
 public:
-    using Body = void (*)(void* ctx, int worker, int workers);
     // The kernel's idle register work (its warm function).
     using Warm = int32_t (*)(const uint32_t* word, uint32_t seen, int64_t deadline_ns);
 
@@ -100,22 +57,18 @@ public:
     int workers() const { return workers_; }
     std::span<const int> cores() const { return cores_; }
 
-    // Runs body(ctx, worker, workers) on every worker, the caller as worker 0, and returns once all have finished. One
-    // job at a time, from the owning thread. The body must not throw: a worker's exception ends the process and the
-    // caller's would skip the job's end barrier.
-    void run(Body body, void* ctx)
-    {
-        body_ = body;
-        ctx_ = ctx;
-        generation_.fetch_add(1, std::memory_order_release);
-        body(ctx, 0, workers_);
-        barrier();
-    }
+    // Runs f(worker, workers) on every worker, the caller as worker 0, and returns once all have finished. One job at a
+    // time, from the owning thread. f must not throw: a worker's exception ends the process and the caller's would skip
+    // the job's end barrier.
     template <class F>
     void run(F&& f)
     {
         using G = std::remove_reference_t<F>;
-        run(&thunk<G>, const_cast<void*>(static_cast<const void*>(std::addressof(f))));
+        body_ = &thunk<G>;
+        ctx_ = const_cast<void*>(static_cast<const void*>(std::addressof(f)));
+        generation_.fetch_add(1, std::memory_order_release);
+        body_(ctx_, 0, workers_);
+        barrier();
     }
 
     // Inside a job: returns once every worker has arrived here.
@@ -147,6 +100,8 @@ private:
     static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
                   "the warm loop reads the job word as a plain uint32_t");
 
+    using Body = void (*)(void* ctx, int worker, int workers);
+
     template <class F>
     static void thunk(void* ctx, int worker, int workers)
     {
@@ -172,6 +127,7 @@ private:
         }
     }
 
+    // A null body_ with a generation bump tells the workers to return.
     void stop_workers()
     {
         if (threads_.empty()) return;
