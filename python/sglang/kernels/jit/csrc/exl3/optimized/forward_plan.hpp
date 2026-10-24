@@ -74,6 +74,7 @@ struct ForwardPlan
             }
             step<Phase::Middle>(ctx, E, team, worker, n, grouped, wide, trace);
             step<Phase::Down>(ctx, E, team, worker, n, grouped, wide, trace);
+            step<Phase::Accumulate>(ctx, E, team, worker, n, grouped, wide, trace);
             trace.worker_end(worker);
         });
         trace.finish();
@@ -150,19 +151,25 @@ private:
                 }
             }
         }
+        if constexpr (Traits::kSplitTiles < 8) {
+            const size_t blocks = nc * (H / 128);
+            grow(ar.down_tiles_done, blocks, "ar.down_tiles_done");
+            std::fill_n(ar.down_tiles_done.data(), blocks, 0);
+            ctx.down_tiles_done = ar.down_tiles_done.data();
+        }
         ctx.claims = nullptr;
         if constexpr (Traits::kClaimMixedChunks) {
             const bool mixed = std::any_of(ctx.chunks.begin(), ctx.chunks.end(),
                                            [&](const Chunk& ch) { return ch.m != ctx.chunks.front().m; });
             if (mixed) {
-                grow(ar.claims, 1, "ar.claims");
-                ar.claims[0] = 0;
+                grow(ar.claims, 32, "ar.claims");
+                std::fill_n(ar.claims.data(), 32, 0);
                 ctx.claims = ar.claims.data();
             }
         }
     }
 
-    // One phase of the team's sequence: run it, then wait for the whole team unless it is Down, the last.
+    // One phase of the team's sequence: run it, then wait for the whole team unless it is the last.
     template <Phase P>
     static void step(ForwardCtx& ctx, const Experts<Shape>& E, Team& team, int worker, int n, bool grouped, bool wide,
                      Capture& trace)
@@ -170,7 +177,7 @@ private:
         trace.begin(worker, static_cast<int>(P));
         phase<P>(ctx, E, worker, n, grouped, wide, trace);
         trace.work_end(worker, static_cast<int>(P));
-        if constexpr (P != Phase::Down) team.barrier();
+        if constexpr (P != Phase::Accumulate) team.barrier();
         trace.end(worker, static_cast<int>(P));
     }
 
@@ -211,39 +218,63 @@ private:
 #else
             middle_scalar(c, E, worker, num_workers);
 #endif
-        } else {
-            static_assert(P == Phase::Down);
-            // This worker owns whole 128-output blocks [b0, b1) for every chunk, so it is the only writer of those
-            // columns of tout_d and out: per chunk, the down GEMV and output transform, then out[token] (+)= weight *
-            // down row, with no barrier before the add. Chunks ascend, so each out element sums in chunk order.
-            const auto [b0, b1] = worker_share(H / 128, worker, num_workers);
-            const int c0 = b0 * 128, c1 = b1 * 128;
-            for (int j = 0; j < nc && b0 < b1; ++j) {
+        } else if constexpr (P == Phase::Down) {
+            // Down GEMVs (split or claimed as gate/up's are), each with its output transform.
+            const auto gemv = [&](int j, int t0, int t1) {
                 const Chunk& ch = c.chunks[j];
                 const Exl3Projection down = E.down(ch.expert);
                 float* tout = c.tout_d + size_t(j) * MAX_M * H;
-                trace.add_work(worker, static_cast<int>(P), int64_t(b1 - b0) * 8 * ch.m);
-                run_tiles(down, c.prep_d[j], tout, ch.m, b0 * 8, b1 * 8, grouped);
-                transform_owned_blocks(down, tout, ch.m, b0 * 8, b1 * 8);
-                for (int r = 0; r < ch.m; ++r) {
-                    float* dst = c.out + size_t(ch.token[r]) * H;
-                    const float* src = tout + size_t(r) * H;
-                    const float w = ch.weight[r];
-                    if (c.store_first && (ch.first >> r & 1u)) {
-                        // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler cannot
-                        // see keeps the add (and its contraction) under -Ofast, so the bits match.
-                        float zero = 0.0f;
-                        asm("" : "+x"(zero));
-                        for (int col = c0; col < c1; ++col) dst[col] = w * src[col] + zero;
-                    } else {
-                        for (int col = c0; col < c1; ++col) dst[col] += w * src[col];
+                trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
+                run_tiles(down, c.prep_d[j], tout, ch.m, t0, t1, grouped);
+                if constexpr (Traits::kSplitTiles == 8) {
+                    transform_owned_blocks(down, tout, ch.m, t0, t1);
+                } else {
+                    // A block's tiles may come from several workers: the one that completes it transforms it. The
+                    // acq_rel count makes the other workers' tile stores visible to that worker.
+                    for (int b = t0 / 8; b * 8 < t1; ++b) {
+                        const int done = std::min(t1, b * 8 + 8) - std::max(t0, b * 8);
+                        std::atomic_ref<int> count(c.down_tiles_done[size_t(j) * (H / 128) + b]);
+                        if (count.fetch_add(done, std::memory_order_acq_rel) + done == 8)
+                            transform_owned_blocks(down, tout, ch.m, b * 8, b * 8 + 8);
                     }
                 }
-            }
-            if (c.store_first)
-                for (int i = 0; i < c.n_unrouted; ++i)
-                    std::fill(c.out + size_t(c.unrouted[i]) * H + c0, c.out + size_t(c.unrouted[i]) * H + c1, 0.0f);
+            };
+            if (c.claims) claim_groups(c.claims[16], nc, H / 16, gemv);
+            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
+                                                        [&](int j) { return c.chunks[j].m; }, gemv,
+                                                        E.params.row_weighted != 0);
+        } else {
+            static_assert(P == Phase::Accumulate);
+            accumulate(c, H, worker, num_workers);
         }
+    }
+
+    // out[token] (+)= weight * down row, each worker over its own columns.
+    static void accumulate(ForwardCtx& c, int H, int worker, int num_workers)
+    {
+        const int c0 = ((H / 16) * worker / num_workers) * 16;
+        const int c1 = ((H / 16) * (worker + 1) / num_workers) * 16;
+        for (size_t j = 0; j < c.chunks.size(); ++j) {
+            const Chunk& ch = c.chunks[j];
+            const float* d = c.tout_d + j * MAX_M * H;
+            for (int r = 0; r < ch.m; ++r) {
+                float* dst = c.out + size_t(ch.token[r]) * H;
+                const float* src = d + size_t(r) * H;
+                const float w = ch.weight[r];
+                if (c.store_first && (ch.first >> r & 1u)) {
+                    // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler cannot see
+                    // keeps the add (and its contraction) under -Ofast, so the bits match.
+                    float zero = 0.0f;
+                    asm("" : "+x"(zero));
+                    for (int col = c0; col < c1; ++col) dst[col] = w * src[col] + zero;
+                } else {
+                    for (int col = c0; col < c1; ++col) dst[col] += w * src[col];
+                }
+            }
+        }
+        if (c.store_first)
+            for (int i = 0; i < c.n_unrouted; ++i)
+                std::fill(c.out + size_t(c.unrouted[i]) * H + c0, c.out + size_t(c.unrouted[i]) * H + c1, 0.0f);
     }
 };
 
@@ -308,7 +339,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         }
         ctx.chunks.push_back(ch);
     }
-    // A token's first write is the first of its rows in Down's order (chunk, then row); the rest add to it.
+    // A token's first write is the first of its rows in Accumulate's order (chunk, then row); the rest add to it.
     ctx.store_first = c.store_first();
     ctx.unrouted = nullptr;
     ctx.n_unrouted = 0;

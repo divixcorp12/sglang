@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
     sglang::cpu_experts::Team team({}, 4, nullptr, 0);
     team.run([&](int w, int) {
       capture.worker_start(w);
-      for (int p : {0,1,2,3}) {
+      for (int p : {0,1,2,3,5}) {
         capture.begin(w,p);
         if (p==0 && w==3) usleep(20000);
         if (p==1 && w==2) {
@@ -90,7 +90,7 @@ def run(probes, tmp_path, gate_path=None, **worker):
 
 def test_workers_distinguish_sleep_from_compute(probes, tmp_path):
     records = run(probes, tmp_path)
-    assert len(records[1:-1]) == 32 and records[-1]["dropped_forwards"] == 0
+    assert len(records[1:-1]) == 40 and records[-1]["dropped_forwards"] == 0
     assert records[-1]["forwards_retained"] == 2
     first = [r for r in records[1:-1] if r["forward"] == 1]
     sleeper = next(r for r in first if r["worker"] == 3 and r["phase"] == 0)
@@ -101,7 +101,7 @@ def test_workers_distinguish_sleep_from_compute(probes, tmp_path):
     assert other["end"] - other["work_end"] >= 10_000_000
     busy = next(r for r in first if r["worker"] == 2 and r["phase"] == 1)
     assert busy["cpu_work_end"] - busy["cpu_begin"] >= 3_000_000
-    assert {r["phase"] for r in first} == {0, 1, 2, 3}
+    assert {r["phase"] for r in first} == {0, 1, 2, 3, 5}
     assert len({r["tid"] for r in first}) == 4
     assert all(r["units"] == r["worker"] + 1 for r in first)
     assert all(r["begin"] <= r["work_end"] <= r["end"] for r in first)
@@ -110,7 +110,7 @@ def test_workers_distinguish_sleep_from_compute(probes, tmp_path):
 
 def test_capacity_admits_only_complete_forwards(probes, tmp_path):
     records = run(probes, tmp_path, capacity=25)
-    assert len(records[1:-1]) == 16
+    assert len(records[1:-1]) == 20
     assert records[-1]["forwards_retained"] == records[-1]["dropped_forwards"] == 1
 
 

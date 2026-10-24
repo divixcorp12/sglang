@@ -28,8 +28,7 @@ measured performance claim. Every chunk size is bit-identical to the generic pla
 Existing scalar, AVX2 and other ISA/bit-width fallbacks are retained.
 
 Both selections include the register decoder, hoisted coefficients, register Hadamard, parallel 128-element
-preparation/middle stages, a fused Down phase (each worker owns whole 128-output blocks across all chunks: GEMV, output transform and the
-routing-weighted add into out, no barrier or counters between them), cache-line output ownership, compact activation scratch,
+preparation/middle stages, fused down output transform, cache-line output ownership, compact activation scratch,
 decoder unrolling and T0 prefetching. Experiment selectors, alternate persistent weight layouts and benchmark
 instrumentation have been removed. Scratch is reused per calling thread. Workers are individually pinned; a stable
 assignment avoids repeating affinity syscalls on every forward. The caller is worker zero. Each call carries its
