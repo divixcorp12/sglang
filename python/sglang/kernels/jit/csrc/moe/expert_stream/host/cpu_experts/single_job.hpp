@@ -39,10 +39,13 @@ public:
         gate_ = call.stage_two;
         if (!window_.admit(++seq_, 0, layer, call, kNoOutKey, call.stage_two))
             throw std::logic_error("CPU experts: the single-job window refused a job");
-        while (window_.any_active()) {
+        for (;;) {
             const uint32_t seen = window_.word();
             const WindowStep r = window_.step(0);
-            if (r != WindowStep::kRan) window_.idle_wait(seen, r == WindowStep::kGated, 0);
+            if (r == WindowStep::kRan) continue;
+            // After `seen`: a job another worker completed before it moved the word already, and would never wake us.
+            if (!window_.any_active()) break;
+            window_.idle_wait(seen, r == WindowStep::kGated, 0);
         }
         const int status = window_.slot(0).status();
         if (status == 2) throw std::invalid_argument("CPU experts: the job refused its input (status 2)");

@@ -290,10 +290,13 @@ public:
     /// \brief Worker 0 after close(): steps until every admitted job has completed.
     void drain() noexcept
     {
-        while (any_active()) {
+        for (;;) {
             const uint32_t seen = word();
             const WindowStep r = step(0);
-            if (r != WindowStep::kRan) idle_wait(seen, r == WindowStep::kGated, 0);
+            if (r == WindowStep::kRan) continue;
+            // After `seen`: a job another worker completed before it moved the word already, and would never wake us.
+            if (!any_active()) return;
+            idle_wait(seen, r == WindowStep::kGated, 0);
         }
     }
 
