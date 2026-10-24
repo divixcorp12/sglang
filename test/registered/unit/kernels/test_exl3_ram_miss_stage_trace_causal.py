@@ -244,10 +244,9 @@ NON_TRACE_CLOCK_READS = {
     # on the service or copy thread. The native test kernel's warm loop (test only) spins on its deadline there too.
     "team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);": 1,
     "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)": 1,
-    # busy() (cpu_experts.h): the start of each job, on the CPU expert thread, for the engine's watchdog. And
-    # stall_state(), its age in the copy-wait abort's line, once, on the RAM thread's watchdog as it aborts.
+    # stall_state() (cpu_experts.h): the age of a window slot in the copy-wait abort's line, once, on the RAM thread's
+    # watchdog as it aborts. A job's admission stamp for the engine's watchdog is the window's (team_now_ns).
     "std::snprintf(ms, sizeof(ms), \"%.1f\", static_cast<double>(now_ns() - started) / 1e6);": 1,
-    "job_started_ns_.store(now_ns(), std::memory_order_release);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread. The CPU expert engine's
     # watchdog (cpu_experts.h, with a draft source) times a running job or an unserved draft record the same way. And
     # an idle-drive speculative read's wait for an idle drive (ReaderCore::gate_root, IdleRoots only), on the
@@ -285,19 +284,20 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t before = now_ns();": 1,
     "if constexpr (Build::kMetrics) selected = now_ns();": 1,
     "if constexpr (Build::kMetrics) trace_.draft_prepared(now_ns(), stage, epoch, seq);": 1,
-    # CpuExpertEngine (cpu_experts.h): one pair per CPU forward, a job of 0.5 ms or more on the CPU expert thread, off
-    # the service thread; ProdBuild keeps it because the split's re-tune (cpu_stats' forward ns) reads it in serving.
+    # CpuExpertEngine (cpu_experts.h): one pair per CPU job, at admission and completion (team_now_ns in the window and
+    # complete()), a job of 0.5 ms or more on the CPU expert thread and the workers, off the service thread; ProdBuild
+    # keeps it because the split's re-tune (cpu_stats' forward ns) reads it in serving. The same for the engine's pair
+    # per draft job (draft_forward_ns).
     # ... and pause_ns, test only (refused on ProdBuild): one PAUSE probe on the caller's thread.
     # ... and the startup split calibration (split_calibration.h): once, on the calibrating caller's thread with the
     # service paused and the copy engine not armed, each run's start, its two completion stamps and its timeout.
-    # ... and the engine's pair per draft forward (draft_forward_ns), on the CPU expert thread.
     # ... and a wait that already spins, its start and its "waited" line (2258a586b8): the GPU scorer's candidate-slot
     # poll (RamTier::await_candidates, kCandWaitNs), on the speculative thread or spec_pump's caller, never the service or
-    # copy thread. A two-stage CPU miss's gate reads the clock in cpu_experts/team.hpp (StageGate::wait, team_now_ns),
-    # only when timed: the engine sets that on InstrBuild alone.
-    "const int64_t start = now_ns();": 7,
+    # copy thread. A two-stage CPU miss's gate reads the clock in cpu_experts/job_window.hpp (arrive and gate_open,
+    # team_now_ns), only when timed: the engine sets that on InstrBuild alone.
+    "const int64_t start = now_ns();": 5,
     "const int64_t waited = now_ns() - start;": 1,
-    "const int64_t end = now_ns();": 2,
+    "const int64_t end = now_ns();": 1,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     "end = std::max(end, now_ns());": 2,
     "if (now_ns() - start > s.timeout_ns)": 1,
