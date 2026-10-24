@@ -63,11 +63,14 @@ struct StageGate {
   const std::atomic<uint32_t>* word = nullptr;
   uint32_t open = 0;
   const std::atomic<bool>* stop = nullptr;  // null: no early exit
+  // Read the clock (called_ns, waited_ns): the engine sets it under Build::kMetrics, so a prod forward reads none.
+  // A field, not a template parameter: wait() runs in the kernel's translation unit, which does not see Build.
+  bool timed = false;
 
   int32_t calls = 0;      // wait()'s calls: one per staged forward
-  int64_t called_ns = 0;  // CLOCK_MONOTONIC at the last call
+  int64_t called_ns = 0;  // CLOCK_MONOTONIC at the last call (timed only)
   bool spun = false;      // the gate was shut on arrival
-  int64_t waited_ns = 0;  // how long it spun (0 when it was open on arrival)
+  int64_t waited_ns = 0;  // how long it spun (timed only; 0 when it was open on arrival)
 
   // Defined in team.hpp, which every caller includes; this header stays free of <immintrin.h> because the device
   // translation units reach it through format.h.

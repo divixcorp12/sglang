@@ -1316,6 +1316,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       expert_stream::verify_named("info", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
       std::atomic<uint32_t> word{0};
       cpu_experts::StageGate gate{&word, 1};
+      gate.timed = true;
       const auto* rows = static_cast<const int64_t*>(restore.data_ptr());
       const int64_t count = restore.size(0);
       std::thread opener([&] {

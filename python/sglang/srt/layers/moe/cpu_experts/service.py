@@ -301,12 +301,14 @@ class CpuExpertService:
             self.split,
         )
         if self.two_stage:
+            # Only the instr build times the wait; a prod host reports 0 ns, which is no measurement.
+            waited = stats["stage_two_wait_ns"]
             logger.info(
-                "CPU experts group %d two-stage: %d staged jobs, %d waited for w2 after gate/up, %.3f ms waiting",
+                "CPU experts group %d two-stage: %d staged jobs, %d waited for w2 after gate/up%s",
                 self.group,
                 stats["staged_jobs"],
                 stats["stage_two_waits"],
-                stats["stage_two_wait_ns"] / 1e6,
+                f", {waited / 1e6:.3f} ms waiting" if waited else "",
             )
         return stats
 

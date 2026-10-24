@@ -334,7 +334,7 @@ class BasicCpuExpertEngine {
     return compute_ns_.load(std::memory_order_relaxed);
   }
   /// Staged jobs run, those whose second stage had not landed when their gate/up GEMVs were done, and the ns they
-  /// waited for it: how much of the GEMVs' time the second stage's read hid.
+  /// waited for it (the instr build only; a prod gate reads no clock, so its wait ns stay 0).
   int64_t staged_jobs() const {
     return staged_jobs_.load(std::memory_order_relaxed);
   }
@@ -501,6 +501,7 @@ class BasicCpuExpertEngine {
     // A staged job's forward waits here, once its first stage is done, until the tier opens the job's gate. The spin is
     // the job's own time, so the watchdog still times it; stop() alone ends it early, at shutdown.
     cpu_experts::StageGate gate{&stage_gates_[job.seq % kRing], job.seq, &stop_};
+    if constexpr (Build::kMetrics) gate.timed = true;
     if (job.staged) call.stage_two = &gate;
     int64_t pairs = job.k;  // the job's (token, expert) pairs, for the split model's fit: one a lane on a one-token row
     if (job.per_token && config_.tokens > 1) {

@@ -59,12 +59,12 @@ inline int64_t team_now_ns()
 inline void StageGate::wait() noexcept
 {
     ++calls;
-    called_ns = team_now_ns();
+    if (timed) called_ns = team_now_ns();
     if (word->load(std::memory_order_acquire) == open) return;
     spun = true;
     while (word->load(std::memory_order_acquire) != open && !(stop && stop->load(std::memory_order_relaxed)))
         _mm_pause();
-    waited_ns = team_now_ns() - called_ns;
+    if (timed) waited_ns = team_now_ns() - called_ns;
 }
 
 class Team {

@@ -2849,7 +2849,7 @@ class ExpertStreamHost:
         """Return the jobs and lanes group ``group``'s CPU expert thread computed, and its forward ns.
 
         With two-stage CPU misses, also its staged jobs, those whose w2 had not landed when their gate/up GEMVs were
-        done, and the ns they waited for it.
+        done, and the ns they waited for it (instr build only: prod reads no clock there, so its wait ns stay 0).
         """
         out = torch.zeros(6, dtype=torch.int64)
         self._module.expert_stream_cpu_stats(self.handle, int(group), out)
