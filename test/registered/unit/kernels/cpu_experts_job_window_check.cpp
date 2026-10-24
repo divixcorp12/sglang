@@ -57,6 +57,10 @@ struct Hooks {
     {
         const uint32_t q = s.seq();
         Log& l = *log;
+        if (q >= kMaxJobs) {  // the stress case: only the count is kept
+            l.completions.fetch_add(1);
+            return;
+        }
         l.status[q] = s.status();
         l.done_at[q] = l.done->load(std::memory_order_acquire);
         l.gate_calls[q] = s.gate_calls;
@@ -245,6 +249,14 @@ int64_t delay_slow_first_job(int32_t job, int32_t, int32_t) { return job == 0 ? 
 
 int32_t count_none(int32_t, int32_t, int32_t) { return 0; }
 int32_t count_job1_no_gate_tasks(int32_t job, int32_t phase, int32_t) { return job == 1 && phase == 1 ? 0 : -1; }
+
+// 0-19 us from a hash of the task, so consecutive jobs finish out of order.
+int64_t delay_random(int32_t job, int32_t phase, int32_t task)
+{
+    uint32_t h = uint32_t(job) * 2654435761u ^ uint32_t(phase) * 40503u ^ uint32_t(task) * 97u;
+    h ^= h >> 15, h *= 2246822519u, h ^= h >> 13;
+    return int64_t(h % 20) * 1000;
+}
 
 int64_t delay_1ms(int32_t, int32_t, int32_t) { return 1000000; }
 
@@ -552,6 +564,27 @@ void phases_with_no_tasks_complete_at_once_or_wait_for_their_gate()
     ok("phases_with_no_tasks_complete_at_once_or_wait_for_their_gate");
 }
 
+// Thousands of jobs through a four-slot window on eight threads with random task durations: the done word must reach
+// the last sequence (a lost advance stalls it and fills the window). Env::wait fails the run after 30 s, never hangs.
+void the_done_word_reaches_the_last_sequence_under_out_of_order_completions()
+{
+    reset({nullptr, delay_random, {1, 1, 1}});
+    constexpr int kJobs = 4000;
+    std::vector<std::unique_ptr<TJob>> jobs;
+    for (int i = 0; i < kJobs; ++i) jobs.push_back(std::make_unique<TJob>(2, 2, i));
+    {
+        Env e(8);
+        for (int i = 0; i < kJobs; ++i) e.admit_wait(uint32_t(i + 1), *jobs[size_t(i)], uint64_t(i));
+        e.wait_done(kJobs);
+        CHECK(e.done.load() == kJobs);
+        CHECK(e.win.counters().admissions == kJobs);
+        CHECK(e.log.completions.load() == kJobs);
+    }
+    CHECK(K::job_violations() == 0);
+    for (auto& j : jobs) check_out(*j, j->init);
+    ok("the_done_word_reaches_the_last_sequence_under_out_of_order_completions");
+}
+
 }  // namespace
 
 int main()
@@ -566,6 +599,7 @@ int main()
     status_2_is_surfaced_at_completion();
     a_throwing_prepare_surfaces_to_the_admitter();
     phases_with_no_tasks_complete_at_once_or_wait_for_their_gate();
+    the_done_word_reaches_the_last_sequence_under_out_of_order_completions();
     std::printf("all ok\n");
     return 0;
 }

@@ -35,6 +35,7 @@ CHECKS = (
     "status_2_is_surfaced_at_completion",
     "a_throwing_prepare_surfaces_to_the_admitter",
     "phases_with_no_tasks_complete_at_once_or_wait_for_their_gate",
+    "the_done_word_reaches_the_last_sequence_under_out_of_order_completions",
 )
 
 pytestmark = pytest.mark.skipif(

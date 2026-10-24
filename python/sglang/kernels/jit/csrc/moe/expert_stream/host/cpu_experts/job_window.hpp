@@ -198,7 +198,7 @@ public:
         for (int p = 0; p < kPhases; ++p) {
             s->cursor_[p].v.store(pack(gen, 0), std::memory_order_relaxed);
             s->done_[p].v.store(0, std::memory_order_relaxed);
-            s->count_[p].store(0, std::memory_order_relaxed);
+            s->count_[p].store(0, std::memory_order_release);  // after the cursor: see step()
             s->align_[p].store(1, std::memory_order_relaxed);
         }
         s->ready_.store(pack(gen, 0), std::memory_order_relaxed);
@@ -237,8 +237,9 @@ public:
                     gated = true;
                 continue;
             }
-            // Read before the cursor: a recycled slot shows the new generation there, which fails the claim.
-            const int count = s.count_[ph].load(std::memory_order_relaxed);
+            // Acquire pairs with the release stores of count_ (admit and advance), which follow the new job's cursor
+            // reset: a count read from a recycled slot's new job makes the cursor load below show its generation.
+            const int count = s.count_[ph].load(std::memory_order_acquire);
             if (count == 0) {
                 uint64_t expect = r;
                 if (s.ready_.compare_exchange_strong(expect, pack(gen, 0), std::memory_order_acq_rel,
@@ -439,7 +440,7 @@ private:
                 return;
             }
             const Tasks t = Kernel::tasks(s.job, ph);
-            s.count_[ph].store(t.count, std::memory_order_relaxed);
+            s.count_[ph].store(t.count, std::memory_order_release);
             s.align_[ph].store(std::max(t.align, 1), std::memory_order_relaxed);
             if (ph == kGatePhase && s.gate_word_.load(std::memory_order_relaxed) != nullptr) arrive(s);
             if (t.count == 0 && deps_ok(s, ph)) continue;
@@ -455,7 +456,9 @@ private:
         s.ready_.store(pack(gen, 0), std::memory_order_relaxed);
         if constexpr (requires { hooks_.on_complete(s); }) hooks_.on_complete(s);
         if (done_word_ != nullptr && s.kind() == done_kind_) {
-            s.state_.store(kComplete, std::memory_order_release);
+            // seq_cst: two finishers each store Complete and then look at the other's slot and the done word (store
+            // then load on both sides); without a total order both can miss the other and the word stops.
+            s.state_.store(kComplete, std::memory_order_seq_cst);
             publish_done();
         } else {
             s.state_.store(kFree, std::memory_order_release);
@@ -468,17 +471,17 @@ private:
     void publish_done() noexcept
     {
         for (;;) {
-            uint32_t p = done_word_->load(std::memory_order_acquire);
+            uint32_t p = done_word_->load(std::memory_order_seq_cst);  // seq_cst: see complete()
             Slot* hit = nullptr;
             for (Slot& s : slots_)
-                if (s.state_.load(std::memory_order_acquire) == kComplete && s.kind() == done_kind_
+                if (s.state_.load(std::memory_order_seq_cst) == kComplete && s.kind() == done_kind_
                     && s.seq() == p + 1) {
                     hit = &s;
                     break;
                 }
             if (hit == nullptr) return;
             // Release: the engine that reads the word sees the job's outputs and its on_complete bookkeeping.
-            if (done_word_->compare_exchange_strong(p, p + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+            if (done_word_->compare_exchange_strong(p, p + 1, std::memory_order_seq_cst, std::memory_order_seq_cst))
                 hit->state_.store(kFree, std::memory_order_release);
         }
     }
