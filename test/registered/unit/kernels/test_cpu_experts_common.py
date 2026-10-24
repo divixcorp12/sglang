@@ -31,7 +31,6 @@ CHECKS = (
     "each_calls_team_runs_on_its_own_cores",
     "a_failed_pin_throws_runtime_error_and_leaves_out_untouched",
     "warm_returns_when_the_word_moves",
-    "a_team_barrier_orders_its_phases",
 )
 
 pytestmark = pytest.mark.skipif(

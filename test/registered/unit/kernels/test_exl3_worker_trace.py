@@ -20,6 +20,8 @@ def probes(tmp_path_factory):
 #include "worker_trace.hpp"
 #include "moe/expert_stream/host/cpu_experts/team.hpp"
 #include <omp.h>
+#include <barrier>
+#include <thread>
 #include <vector>
 using namespace sglang::exl3_cpu::worker_trace;
 // The kernel reads no environment: install the trace options as the library's configure op does, from argv: prefix,
@@ -33,8 +35,8 @@ int main(int argc, char** argv) {
     capture.grow(scratch, 1048576, "probe");
     if (scratch.size()!=1048576 || scratch.back()!=0) return 3;
     capture.team_start();
-    sglang::cpu_experts::Team team({}, 4, nullptr, 0);
-    team.run([&](int w, int) {
+    std::barrier<> team(4);
+    auto work = [&](int w) {
       capture.worker_start(w);
       for (int p : {0,1,2,3,5}) {
         capture.begin(w,p);
@@ -45,11 +47,15 @@ int main(int argc, char** argv) {
         }
         capture.add_work(w,p,w+1);
         capture.work_end(w,p);
-        team.barrier();
+        team.arrive_and_wait();
         capture.end(w,p);
       }
       capture.worker_end(w);
-    });
+    };
+    std::vector<std::thread> others;
+    for (int w = 1; w < 4; ++w) others.emplace_back(work, w);
+    work(0);
+    for (std::thread& t : others) t.join();
     capture.finish();
   }
 }
@@ -64,7 +70,7 @@ static_assert(std::is_empty_v<Capture<false>>);
 int main() { Capture<false> c(4,6,3); std::vector<int> v; c.grow(v,8,"production");
  if(v.size()!=8 || v.back()!=0) return 3; c.team_start(); c.worker_start(0);
  c.begin(0,0); c.add_work(0,0,3); c.work_end(0,0); c.end(0,0); c.worker_end(0); c.finish();
- sglang::cpu_experts::Team t({}, 1, nullptr, 0); t.run([](int, int) {}); }
+ sglang::cpu_experts::Team t({}, 1, nullptr, 0); }
 ''')
     outputs = []
     for name, src, flags in [("probe", source, ["-DON=true"]), ("production", production, [])]:

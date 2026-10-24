@@ -1,7 +1,7 @@
 // Standalone harness for the NVFP4 CPU kernel's job interface (nvfp4/optimized/entry.h): random layers and calls, each
-// run three ways that must agree bit for bit -- one job through a JobRunner on a one-worker team, the same on a team of
-// several workers (dynamic runs, whichever worker is free), and Kernel::forward on a team (a static split of each phase
-// between barriers). A call whose input Q8_0 cannot represent must be refused by all three with `out` untouched. Built by
+// run two ways that must agree bit for bit -- one job through a JobRunner on a one-worker team, and the same on a team of
+// several workers (dynamic runs, whichever worker is free). A call whose input Q8_0 cannot represent must be refused by
+// both with `out` untouched. Built by
 // test_nvfp4_cpu_job_interface.py with kernel.cpp at the tier under test.
 #include "../../../../python/sglang/kernels/jit/csrc/nvfp4/optimized/kernel.h"
 #include <atomic>
@@ -99,7 +99,7 @@ int main(int argc, char** argv)
         shape.params.inv_input_scale2 = 0.75f;
         const K::Layer layer = K::make_layer(shape);
 
-        Team one({}, 1, &K::warm, 0), many({}, workers, &K::warm, 0), barrier_team({}, workers, &K::warm, 0);
+        Team one({}, 1, &K::warm, 0), many({}, workers, &K::warm, 0);
         JobRunner<K> single(one), dynamic(many);
         for (int iter = 0; iter < c.iterations; ++iter) {
             const int rows = 1 + rnd(9), k = 1 + rnd(8);
@@ -132,18 +132,15 @@ int main(int argc, char** argv)
             call.out = start.data();
             K::check(layer, call);
 
-            std::vector<float> a = start, b = start, d = start;
+            std::vector<float> a = start, b = start;
             if (bad_input) {
                 call.out = a.data();
                 CHECK(refused([&] { single.run(layer, call); }));
                 call.out = b.data();
                 CHECK(refused([&] { dynamic.run(layer, call); }));
-                call.out = d.data();
-                CHECK(refused([&] { K::forward(layer, call, barrier_team); }));
                 CHECK(std::memcmp(a.data(), start.data(), a.size() * sizeof(float)) == 0);
                 CHECK(std::memcmp(b.data(), start.data(), a.size() * sizeof(float)) == 0);
-                CHECK(std::memcmp(d.data(), start.data(), a.size() * sizeof(float)) == 0);
-                if (call.stage_two) CHECK(gate.calls == 3);
+                if (call.stage_two) CHECK(gate.calls == 2);
                 ++refusals;
                 continue;
             }
@@ -151,16 +148,13 @@ int main(int argc, char** argv)
             single.run(layer, call);
             call.out = b.data();
             dynamic.run(layer, call);
-            call.out = d.data();
-            K::forward(layer, call, barrier_team);
             for (const float v : a) CHECK(std::isfinite(v));
             CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
-            CHECK(std::memcmp(a.data(), d.data(), a.size() * sizeof(float)) == 0);
-            if (call.stage_two) CHECK(gate.calls == 3);
+            if (call.stage_two) CHECK(gate.calls == 2);
             ++calls;
         }
     }
-    std::printf("ok %ld calls bit-identical across one worker, %d workers and the static split; %ld refused inputs\n",
+    std::printf("ok %ld calls bit-identical across one worker and %d workers; %ld refused inputs\n",
                 calls, workers, refusals);
     return 0;
 }

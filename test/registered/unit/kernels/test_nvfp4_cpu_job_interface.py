@@ -1,8 +1,8 @@
 """The NVFP4 CPU kernel's job interface (nvfp4/optimized/entry.h) gives the same bits however its tasks are split (Linux, GCC, x86).
 
 ``nvfp4_cpu_job_check.cpp`` runs random calls (overwrite and accumulate, staged and not, generic and MiMo V2.6 Pro
-plans, and inputs Q8_0 cannot represent) through a one-worker JobRunner, a several-worker JobRunner (dynamic runs) and
-``Kernel::forward`` (a static split between barriers), and requires identical outputs. The kernel is built at the
+plans, and inputs Q8_0 cannot represent) through a one-worker JobRunner and a several-worker JobRunner (dynamic runs),
+and requires identical outputs. The kernel is built at the
 scalar tier (``-march=x86-64``) and, where the CPU runs it, the AVX2 tier (``-march=x86-64-v3``). The AVX2 and scalar
 dumps against another revision are checked on divix01 (``test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh``).
 """

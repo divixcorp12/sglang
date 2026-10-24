@@ -1,8 +1,7 @@
 """The EXL3 CPU kernel's job interface (exl3/optimized/entry.h) gives the same bits however its tasks are split (Linux, GCC, x86).
 
 ``exl3_cpu_job_check.cpp`` runs random generic-plan calls (overwrite, accumulate and overwrite-by-store, staged and not)
-through a one-worker JobRunner, a several-worker JobRunner (dynamic runs) and ``Kernel::forward`` (a static split between
-barriers), and requires identical outputs. The kernel is built at the scalar tier (``-march=x86-64``) and, where the CPU
+through a one-worker JobRunner and a several-worker JobRunner (dynamic runs), and requires identical outputs. The kernel is built at the scalar tier (``-march=x86-64``) and, where the CPU
 runs it, the AVX2 tier (``-march=x86-64-v3``). The DSV4.1 plan and the AVX-512 tiers are checked on divix01
 (``test/manual/dsv41/run_exl3_cpu_forward_checks.sh``).
 """

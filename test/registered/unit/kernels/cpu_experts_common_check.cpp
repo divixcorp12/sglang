@@ -382,24 +382,6 @@ int main()
         ok("warm_returns_when_the_word_moves");
     }
 
-    {
-        // A team's barrier orders its phases: what every worker wrote before it, every worker reads after it, job
-        // after job on the one team.
-        sglang::cpu_experts::Team t(cores, team, &Toy::warm, 0);
-        std::vector<int> seen(size_t(team), -1), sum(size_t(team), 0);
-        for (int rep = 0; rep < 1000; ++rep) {
-            t.run([&](int w, int n) {
-                seen[size_t(w)] = rep;
-                t.barrier();
-                int s = 0;
-                for (int i = 0; i < n; ++i) s += seen[size_t(i)];
-                sum[size_t(w)] = s;
-            });
-            for (int w = 0; w < team; ++w) CHECK(sum[size_t(w)] == rep * team);
-        }
-        ok("a_team_barrier_orders_its_phases");
-    }
-
     std::printf("all ok\n");
     return 0;
 }

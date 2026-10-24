@@ -1,7 +1,6 @@
 // Standalone harness for the EXL3 CPU kernel's job interface (exl3/optimized/entry.h): random generic-plan layers and calls,
-// each run three ways that must agree bit for bit -- one job through a JobRunner on a one-worker team, the same on a team
-// of several workers (dynamic runs, whichever worker is free), and Kernel::forward on a team (a static split of each phase
-// between barriers). Built by test_exl3_cpu_job_interface.py with kernel.cpp at the tier under test.
+// each run two ways that must agree bit for bit -- one job through a JobRunner on a one-worker team, and the same on a
+// team of several workers (dynamic runs, whichever worker is free). Built by test_exl3_cpu_job_interface.py with kernel.cpp at the tier under test.
 #include "../../../../python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h"
 #include <atomic>
 #include <cmath>
@@ -75,7 +74,7 @@ int main(int argc, char** argv)
         shape.params = K::params(values);
         const K::Layer layer = K::make_layer(shape);
 
-        Team one({}, 1, &K::warm, 0), many({}, workers, &K::warm, 0), barrier_team({}, workers, &K::warm, 0);
+        Team one({}, 1, &K::warm, 0), many({}, workers, &K::warm, 0);
         JobRunner<K> single(one), dynamic(many);
         for (int iter = 0; iter < 45; ++iter) {
             const int rows = 1 + rnd(7), k = 1 + rnd(5);
@@ -108,20 +107,17 @@ int main(int argc, char** argv)
             call.out = start.data();
             K::check(layer, call);
 
-            std::vector<float> a = start, b = start, d = start;
+            std::vector<float> a = start, b = start;
             call.out = a.data();
             single.run(layer, call);
             call.out = b.data();
             dynamic.run(layer, call);
-            call.out = d.data();
-            K::forward(layer, call, barrier_team);
             for (const float v : a) CHECK(std::isfinite(v));
             CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
-            CHECK(std::memcmp(a.data(), d.data(), a.size() * sizeof(float)) == 0);
-            if (call.stage_two) CHECK(gate.calls == 3);
+            if (call.stage_two) CHECK(gate.calls == 2);
             ++calls;
         }
     }
-    std::printf("ok %ld calls bit-identical across one worker, %d workers and the static split\n", calls, workers);
+    std::printf("ok %ld calls bit-identical across one worker and %d workers\n", calls, workers);
     return 0;
 }
