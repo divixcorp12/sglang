@@ -1010,12 +1010,12 @@ struct HostExports {
     find(handle)->set_cpu_split(static_cast<int>(group), static_cast<const int64_t*>(split.data_ptr()), split.size(0));
   }
 
-  // Group `group`'s CPU experts' metrics: out int64 [6] = {jobs, lanes, forward ns, staged jobs, stage-two waits,
-  // stage-two wait ns}.
+  // Group `group`'s CPU experts' metrics: out int64 [9] = {jobs, lanes, forward ns, staged jobs, stage-two waits,
+  // stage-two wait ns, window admissions, window-full spells, admissions with the ring and the draft both pending}.
   static void cpu_stats(int64_t handle, int64_t group, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("out", TensorMatcher({6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("out", TensorMatcher({9}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     find(handle)->cpu_stats(static_cast<int>(group), static_cast<int64_t*>(out.data_ptr()));
   }
 

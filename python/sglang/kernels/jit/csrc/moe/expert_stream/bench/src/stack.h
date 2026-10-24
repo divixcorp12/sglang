@@ -240,9 +240,9 @@ class Stack {
       tier_->set_cpu_split(g, split.data(), static_cast<int64_t>(split.size()));
   }
 
-  // Group g's CPU expert engine's totals: {jobs, lanes, forward ns}.
-  std::array<int64_t, 3> cpu_stats(int g = 0) const {
-    std::array<int64_t, 3> out{};
+  // Group g's CPU expert engine's totals: {jobs, lanes, forward ns, ...} (the tier's cpu_stats).
+  std::array<int64_t, 9> cpu_stats(int g = 0) const {
+    std::array<int64_t, 9> out{};
     tier_->cpu_stats(g, out.data());
     return out;
   }

@@ -425,7 +425,8 @@
     store_split(g, split, count);
   }
 
-  // Group g's CPU expert thread's metrics, {jobs, lanes, forward ns, staged jobs, stage-two waits, stage-two wait ns};
+  // Group g's CPU expert thread's metrics, {jobs, lanes, forward ns, staged jobs, stage-two waits, stage-two wait ns,
+  // window admissions, window-full spells, admissions that found the target ring and the draft channel both pending};
   // zeros when its CPU experts are off.
   void cpu_stats(int g, int64_t* out) const {
     const CpuExpertEngine* cpu = cpu_engine(g);
@@ -435,6 +436,10 @@
     out[3] = cpu != nullptr ? cpu->staged_jobs() : 0;
     out[4] = cpu != nullptr ? cpu->stage_two_waits() : 0;
     out[5] = cpu != nullptr ? cpu->stage_two_wait_ns() : 0;
+    const cpu_experts::WindowCounters window = cpu != nullptr ? cpu->window_counters() : cpu_experts::WindowCounters{};
+    out[6] = static_cast<int64_t>(window.admissions);
+    out[7] = static_cast<int64_t>(window.admissions_full);
+    out[8] = static_cast<int64_t>(window.both_pending);
   }
 
   // Group g's CPU fit moments (CpuExpertEngine::fit_moments), 2 * kFitMoments int64; zeros when its CPU experts are off.

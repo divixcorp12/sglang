@@ -2844,13 +2844,17 @@ class ExpertStreamHost:
 
         With two-stage CPU misses, also its staged jobs, those whose w2 had not landed when their gate/up GEMVs were
         done, and the ns they waited for it (instr build only: prod reads no clock there, so its wait ns stay 0).
+
+        The window's always-on counters follow: jobs admitted, spells with work pending and no free slot, and admissions
+        that found the target ring and the draft channel both pending (the target's went first).
         """
-        out = torch.zeros(6, dtype=torch.int64)
+        out = torch.zeros(9, dtype=torch.int64)
         self._module.expert_stream_cpu_stats(self.handle, int(group), out)
-        jobs, lanes, ns, staged, waits, wait_ns = out.tolist()
+        jobs, lanes, ns, staged, waits, wait_ns, admitted, full, both_pending = out.tolist()
         return {
             "jobs": jobs, "lanes": lanes, "forward_ns": ns, "staged_jobs": staged, "stage_two_waits": waits,
-            "stage_two_wait_ns": wait_ns,
+            "stage_two_wait_ns": wait_ns, "window_admissions": admitted, "window_full_spells": full,
+            "window_both_pending": both_pending,
         }
 
     def copy_expert_bytes(self, row: int) -> int:
