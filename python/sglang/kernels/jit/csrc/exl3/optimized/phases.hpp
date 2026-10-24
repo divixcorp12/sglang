@@ -18,14 +18,14 @@ namespace sglang::exl3_cpu {
 namespace {
 
 // The forward's phases, in team order; a barrier separates each from the next. The values are the worker trace's phase
-// ids (worker_trace.hpp): 4, an old whole-row down transform now fused into Down, is unused.
+// ids (worker_trace.hpp): 4 and 5, an old whole-row down transform and the routing-weighted accumulate, are fused into
+// Down and unused.
 enum class Phase : int
 {
     PrepareGateUp = 0,  // quantize gate/up inputs
     GateUp = 1,         // gate/up GEMVs
     Middle = 2,         // gate/up output transform, activation, down input
-    Down = 3,           // down GEMVs with their output transform
-    Accumulate = 5,     // routing-weighted sum into out
+    Down = 3,           // per worker's 128-output blocks: down GEMVs, output transform, routing-weighted sum into out
 };
 
 struct ForwardCtx
@@ -35,7 +35,7 @@ struct ForwardCtx
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
-    // Overwrite by store (OutMode::kOverwriteByStore): no zeroing up front; Accumulate stores each token's first sum
+    // Overwrite by store (OutMode::kOverwriteByStore): no zeroing up front; Down stores each token's first sum
     // (Chunk::first) and zeroes the `unrouted` tokens' rows, each worker its own columns.
     bool store_first;
     const int* unrouted;
@@ -49,11 +49,8 @@ struct ForwardCtx
     float* tout_u;
     float* tout_d;  // [chunks][MAX_M][H]
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
-    // Down tiles finished per (chunk, 128-output block), when a plan splits the down GEMVs finer than a block: the
-    // worker that finishes a block's eighth tile applies its output transform.
-    int* down_tiles_done;
-    // PlanTraits::kClaimMixedChunks on a call of differing chunk sizes: the next unclaimed group of gate/up ([0]) and
-    // of down ([16], its own cache line); null: the static split.
+    // PlanTraits::kClaimMixedChunks on a call of differing chunk sizes: the next unclaimed gate/up group; null: the
+    // static split.
     int* claims = nullptr;
 };
 
@@ -68,7 +65,6 @@ struct ForwardArena
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
-    std::vector<int> down_tiles_done;
     std::vector<int> claims;                          // ForwardCtx::claims
     std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
     std::vector<uint8_t> written;                     // store_first: per token, whether a chunk row writes it
