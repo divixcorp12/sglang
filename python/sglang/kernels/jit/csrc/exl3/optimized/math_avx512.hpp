@@ -132,7 +132,7 @@ struct BandRows<Isa::Bw>
         const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(kMul1Mult));
         const __m512i ones = _mm512_set1_epi32(0x01010101);
         if constexpr (dword_pair_wins<bits>()) {
-            unroll<8>([&]<int P>() EXL3_ALWAYS_INLINE {
+            Unroll<8>{}([&](auto P) EXL3_ALWAYS_INLINE {
                 constexpr int R = 2 * P;
                 __m512i code0, code1;
                 dword_row_pair<bits, R>(p0, p1, p2, p3, code0, code1);
@@ -146,7 +146,7 @@ struct BandRows<Isa::Bw>
                 }
             });
         } else {
-            unroll<16>([&]<int R>() EXL3_ALWAYS_INLINE {
+            Unroll<16>{}([&](auto R) EXL3_ALWAYS_INLINE {
                 const __m512i code = extract_row<bits, R>(p0, p1, p2, p3);
                 const __m512i ps = _mm512_maddubs_epi16(_mm512_mullo_epi32(code, mult), ones);
                 for (int i = 0; i < rows; ++i)
@@ -173,7 +173,7 @@ struct BandRows<Isa::Vnni>
     {
         const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(kMul1Mult));
         if constexpr (dword_pair_wins<bits>()) {
-            unroll<8>([&]<int P>() EXL3_ALWAYS_INLINE {
+            Unroll<8>{}([&](auto P) EXL3_ALWAYS_INLINE {
                 constexpr int R = 2 * P;
                 __m512i code0, code1;
                 dword_row_pair<bits, R>(p0, p1, p2, p3, code0, code1);
@@ -185,7 +185,7 @@ struct BandRows<Isa::Vnni>
                 }
             });
         } else {
-            unroll<16>([&]<int R>() EXL3_ALWAYS_INLINE {
+            Unroll<16>{}([&](auto R) EXL3_ALWAYS_INLINE {
                 const __m512i code = extract_row<bits, R>(p0, p1, p2, p3);
                 const __m512i prod = _mm512_mullo_epi32(code, mult);
                 for (int i = 0; i < rows; ++i)
@@ -309,7 +309,7 @@ struct BandRows<Isa::Vbmi>
                                               const int32_t* splat, int k, __m512i (&acc)[band][GENERIC_MAX_M])
     {
         const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(kMul1Mult));
-        unroll<8>([&]<int P>() EXL3_ALWAYS_INLINE {
+        Unroll<8>{}([&](auto P) EXL3_ALWAYS_INLINE {
             constexpr int R = P * 2;
             __m512i c0, c1;
             if constexpr (byte_pair_ok<bits, R>()) {

@@ -216,7 +216,7 @@ template <int Pairs, bool Compact, int M>
 EXL3_ALWAYS_INLINE inline void register_rows(const TilePair& t, const std::conditional_t<Compact, int16_t, int32_t>* splat,
                                              __m512i (&acc)[Pairs][2][2 * M], int band)
 {
-    unroll<16>([&]<int J>() EXL3_ALWAYS_INLINE {
+    Unroll<16>{}([&](auto J) EXL3_ALWAYS_INLINE {
         const __m512i state = register_state<J>(t);
         constexpr int row = state_row<J>, half = state_half<J>;
         if constexpr (kBytePath<Compact, M>) {
@@ -321,7 +321,7 @@ template <int Pairs, int M, int Half>
 EXL3_ALWAYS_INLINE inline void register_rows_half(const TilePair& t, const int16_t* splat, __m512i (&acc)[Pairs][2 * M],
                                                   int band)
 {
-    unroll<16>([&]<int J>() EXL3_ALWAYS_INLINE {
+    Unroll<16>{}([&](auto J) EXL3_ALWAYS_INLINE {
         if constexpr (state_half<J> == Half) {
             const __m512i sum = register_bytesum(register_state<J>(t));
             constexpr int row = state_row<J>;
@@ -495,7 +495,7 @@ EXL3_ALWAYS_INLINE inline void bw3_rows(__m512i p0, __m512i p1, const int32_t* s
     // Prefetch a future tile while decoding this one's register data.
     _mm_prefetch(future_weight, _MM_HINT_T0);
     _mm_prefetch(future_weight + 64, _MM_HINT_T0);
-    unroll<8>([&]<int P>() EXL3_ALWAYS_INLINE {
+    Unroll<8>{}([&](auto P) EXL3_ALWAYS_INLINE {
         constexpr int R = 2 * P;
         alignas(64) static constexpr auto il = bw3_word_indices<R, false>();
         alignas(64) static constexpr auto ih = bw3_word_indices<R, true>();

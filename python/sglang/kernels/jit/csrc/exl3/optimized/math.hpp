@@ -68,14 +68,18 @@ constexpr float kMul1KInv = 0x1.bb8p-8f;
 
 #define EXL3_ALWAYS_INLINE __attribute__((always_inline))
 
-// f.template operator()<I>() for I = 0 .. N - 1 in order: a loop the compiler sees fully unrolled.
-template <int N, class F>
-EXL3_ALWAYS_INLINE inline void unroll(F&& f)
-{
-    [&]<int... I>(std::integer_sequence<int, I...>) EXL3_ALWAYS_INLINE {
-        (f.template operator()<I>(), ...);
-    }(std::make_integer_sequence<int, N>{});
-}
+// Unroll<N>{}(f, args...) calls f(std::integral_constant<int, I>{}, args...) for I = 0 .. N - 1 in order (nothing for
+// N == 0): a loop the compiler sees fully unrolled.
+template <int N>
+struct Unroll {
+    template <class F, class... Args>
+    EXL3_ALWAYS_INLINE void operator()(F&& f, Args&&... args) const
+    {
+        [&]<int... I>(std::integer_sequence<int, I...>) EXL3_ALWAYS_INLINE {
+            (f(std::integral_constant<int, I>{}, args...), ...);
+        }(std::make_integer_sequence<int, N>{});
+    }
+};
 
 // f.template operator()<n>() for a run-time n in [1, Max] (nothing for any other n): one direct call per value.
 template <int Max, class F>

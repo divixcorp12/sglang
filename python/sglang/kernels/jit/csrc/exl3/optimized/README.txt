@@ -97,7 +97,7 @@ teams and other simultaneous consumers of the same cores.
 
 Code layout
 -----------
-  math.hpp              build constants (kIsa, MAX_M, kActRows, kActBlock), unroll/with_count, the format tables and
+  math.hpp              build constants (kIsa, MAX_M, kActRows, kActBlock), Unroll/with_count, the format tables and
                         scalar decode, the Hadamard transform, PreparedIn and the activation quantization
   math_scalar.hpp       Tiles<Scalar>
   math_avx2.hpp         Tiles<Avx2>

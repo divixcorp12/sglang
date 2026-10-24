@@ -54,7 +54,7 @@ struct Tiles<Isa::Avx2>
         constexpr auto li = lane_idx<bits, row, second_word, half>();
         const __m256i lane_idx_v = _mm256_setr_epi32(li[0], li[1], li[2], li[3], li[4], li[5], li[6], li[7]);
         __m256i out = _mm256_permutevar8x32_epi32(preg[bits - 1], lane_idx_v);
-        unroll<bits - 1>([&]<int I>() EXL3_ALWAYS_INLINE {
+        Unroll<bits - 1>{}([&](auto I) EXL3_ALWAYS_INLINE {
             constexpr int Reg = bits - 2 - I;
             constexpr uint8_t mask = reg_mask<bits, row, second_word, half, Reg>();
             if constexpr (mask != 0) out = _mm256_blend_epi32(out, _mm256_permutevar8x32_epi32(preg[Reg], lane_idx_v), mask);
@@ -81,7 +81,7 @@ struct Tiles<Isa::Avx2>
         const __m256i ones32 = _mm256_set1_epi32(0x01010101);
         const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
         const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
-        unroll<GENERIC_MAX_M>([&]<int I>() EXL3_ALWAYS_INLINE {
+        Unroll<GENERIC_MAX_M>{}([&](auto I) EXL3_ALWAYS_INLINE {
             if (I < m) {
                 const __m256i xs = _mm256_set1_epi32(splat_dup[size_t(I) * k + row]);
                 acc[I][0] = _mm256_add_epi32(acc[I][0], _mm256_madd_epi16(p_lo, xs));
@@ -97,7 +97,7 @@ struct Tiles<Isa::Avx2>
                                                    Acc& acc)
     {
         if constexpr (bits == 8) {
-            unroll<8>([&]<int P>() EXL3_ALWAYS_INLINE {
+            Unroll<8>{}([&](auto P) EXL3_ALWAYS_INLINE {
                 constexpr int row = 2 * P;
                 static_assert(word_pair_ok<bits, row>(), "K8 pairs are fully eligible by layout");
                 const __m256i a_lo = gather_half<bits, row, false, 0>(preg);
@@ -111,7 +111,7 @@ struct Tiles<Isa::Avx2>
                 accumulate_row(merge<s0 - bits>(a_lo, b_lo), merge<s1 - bits>(a_hi, b_hi), splat_dup, k, m, acc, row + 1);
             });
         } else {
-            unroll<16>([&]<int row>() EXL3_ALWAYS_INLINE {
+            Unroll<16>{}([&](auto row) EXL3_ALWAYS_INLINE {
                 const __m256i a_lo = gather_half<bits, row, false, 0>(preg);
                 const __m256i b_lo = gather_half<bits, row, true, 0>(preg);
                 const __m256i a_hi = gather_half<bits, row, false, 1>(preg);
