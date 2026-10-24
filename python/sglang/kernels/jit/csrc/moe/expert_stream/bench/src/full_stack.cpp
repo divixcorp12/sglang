@@ -13,6 +13,7 @@
 #include <benchmark/benchmark.h>
 
 #include "device_sim.h"
+#include "job_stream.h"
 #include "kernel.h"
 #include "placement.h"
 #include "self_test.h"
@@ -59,6 +60,9 @@ struct Options {
   int wait_timeout_ms = 2000;
   bool validate_only = false;
   bool self_test = false;
+  // BM_jobstream (job_stream.h): records per timed iteration, and the shape of a record
+  int js_records = 32;
+  JobStreamShape js;
 };
 
 // Consumes this bench's flags and leaves the rest (Google Benchmark's) in argv. Throws on an invalid value.
@@ -94,6 +98,16 @@ Options parse_options(int& argc, char** argv) {
       opt.keep_warm_us = number(value("--keep-warm-us="));
     else if (arg == "--smt")
       opt.smt = true;
+    else if (arg.starts_with("--js-records="))
+      opt.js_records = number(value("--js-records="));
+    else if (arg.starts_with("--js-land-us="))
+      opt.js.land_us = number(value("--js-land-us="));
+    else if (arg.starts_with("--js-gate-us="))
+      opt.js.gate_us = number(value("--js-gate-us="));
+    else if (arg.starts_with("--js-per-lane="))
+      opt.js.per_lane = number(value("--js-per-lane="));
+    else if (arg == "--js-store-out")
+      opt.js.store_out = true;
     else if (arg.starts_with("--wait-timeout-ms="))
       opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
     else if (arg == "--validate-only")
@@ -113,6 +127,8 @@ Options parse_options(int& argc, char** argv) {
              "--keep-warm-us: register work after each job, before the held CPU team falls back to PAUSE\n"
              "  (0: PAUSE only)\n"
              "--smt: each group's --cpus also run on their SMT siblings, after them (twice the workers)\n"
+             "--js-records=32 --js-land-us=200 --js-gate-us=100 --js-per-lane=6 --js-store-out: BM_jobstream's records "
+             "per iteration, miss-row landing interval, staged gate delay, tokens a lane routes, store-first overwrite\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
              "--cpus=3 (two groups: --copy-cpu=1 --service-cpu=2,3 --cpus=4/5)\n"
              "Google Benchmark flags are also accepted.\n";
@@ -339,6 +355,24 @@ class Bench {
       stack_->set_cpu_layer(row, fixture_.make_layer(row));
       sim_->set_row_cpu(row);
     }
+  }
+
+  // A CPU expert engine of its own over the fixture's layers and the first group's workers, for BM_jobstream: it takes
+  // the place of the bare phase's Teams and of the stack, whose threads would share worker 0's core with it. Throws once
+  // the stack exists. Joins the bare Teams first.
+  std::unique_ptr<JobStreamRig<BenchBuild>> make_job_stream_rig(int tokens) {
+    if (stack_ || kGroups != 1)
+      throw std::runtime_error("the job-stream bench runs at one NUMA group, before the stack exists");
+    for (auto& rig : bare_rigs_) rig.reset();
+    const std::vector<int32_t>& workers = placement_.groups[0].workers;
+    PinScope first_touch(workers.front());  // the buffers on the workers' node; the engine thread inherits the core
+    return std::make_unique<JobStreamRig<BenchBuild>>(
+        fixture_,
+        bare_layers_.layers,
+        std::vector<int>(workers.begin(), workers.end()),
+        tokens,
+        options_.js,
+        static_cast<int64_t>(options_.keep_warm_us) * 1000);
   }
 
   // The device's part of one request: x store, record, copy wait. [t0, t1] is the timed interval. Throws if the wait
@@ -677,6 +711,81 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
   }
 }
 
+// The cases BM_jobstream runs: records in flight at one token a row, and at 32 tokens (a full verify).
+const std::vector<JobStreamCase> kJobStreamCases = {{1, 1}, {2, 1}, {4, 1}, {1, 32}, {2, 32}};
+
+// Records a stream of this case runs: a 32-token record is long, so fewer.
+int job_stream_records(const Options& options, const JobStreamCase& c) {
+  return std::max(c.tokens > 1 ? options.js_records / 4 : options.js_records, 2 * c.in_flight);
+}
+
+// The same records run one job at a time are the reference; a stream with `c.in_flight` records in flight must leave
+// every record's output row (both parts, every token) equal to it bit for bit. Returns the reference to re-check against.
+std::vector<std::vector<uint8_t>> job_stream_reference(JobStreamRig<BenchBuild>& rig, int records) {
+  rig.restart();
+  return rig.run_serial(records).outputs;
+}
+
+void check_job_stream(
+    JobStreamRig<BenchBuild>& rig, const JobStreamCase& c, int records, const std::vector<std::vector<uint8_t>>& reference) {
+  rig.restart();
+  const JobStreamRun run = rig.run_stream(records, c.in_flight, /*keep_outputs=*/true);
+  if (run.outputs.size() != reference.size())
+    throw std::runtime_error("the job stream completed " + std::to_string(run.outputs.size()) + " records, not " + std::to_string(reference.size()));
+  for (size_t r = 0; r < reference.size(); ++r)
+    if (run.outputs[r] != reference[r])
+      throw std::runtime_error(
+          "record " + std::to_string(r) + " (" + std::to_string(c.in_flight) + " in flight, " + std::to_string(c.tokens) +
+          " tokens): the stream's output differs from the same jobs run one at a time");
+}
+
+// 12 records cover the three record shapes and reuse rows 0-3, which every case's flight keeps apart.
+constexpr int kJobStreamCheckRecords = 12;
+
+void validate_job_stream(Bench& bench, const JobStreamCase& c) {
+  const auto rig = bench.make_job_stream_rig(c.tokens);
+  check_job_stream(*rig, c, kJobStreamCheckRecords, job_stream_reference(*rig, kJobStreamCheckRecords));
+}
+
+// BM_jobstream/in_flight:R/tokens:T: records of a hit job then 1-expert miss jobs as their rows land (staged ones gated on
+// a timer), R records in flight, through a CPU expert engine of its own. One iteration is a stream of
+// job_stream_records(); its manual time is the stream's wall time. Counters: p50/p95/p99_us of a record's completion
+// (first submit to done() passing its last job) over every record, and records_per_s.
+void bm_job_stream(benchmark::State& state, Bench& bench, JobStreamCase c) {
+  if (skip_after_failure(state)) return;
+  try {
+    const auto rig = bench.make_job_stream_rig(c.tokens);
+    const auto reference = job_stream_reference(*rig, kJobStreamCheckRecords);
+    check_job_stream(*rig, c, kJobStreamCheckRecords, reference);
+    const int records = job_stream_records(bench.options(), c);
+    rig->restart();
+    rig->run_stream(records, c.in_flight, false);  // warm-up: the engine's first jobs, page faults, ring
+    std::vector<double> completion;
+    double wall = 0;
+    for (auto _ : state) {
+      rig->restart();
+      const JobStreamRun run = rig->run_stream(records, c.in_flight, false);
+      state.SetIterationTime(run.wall_seconds);
+      wall += run.wall_seconds;
+      completion.insert(completion.end(), run.record_seconds.begin(), run.record_seconds.end());
+    }
+    check_job_stream(*rig, c, kJobStreamCheckRecords, reference);
+    if (!completion.empty()) {
+      state.counters["p50_us"] = quantile_us(completion, 0.50);
+      state.counters["p95_us"] = quantile_us(completion, 0.95);
+      state.counters["p99_us"] = quantile_us(completion, 0.99);
+      state.counters["records_per_s"] = static_cast<double>(completion.size()) / wall;
+    }
+    state.counters["in_flight"] = c.in_flight;
+    state.counters["tokens"] = c.tokens;
+    state.counters["records"] = records;
+    state.counters["workers"] = static_cast<double>(bench.placement().groups[0].workers.size());
+  } catch (const std::exception& error) {
+    benchmark_failed = true;
+    state.SkipWithError(error.what());
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -719,12 +828,15 @@ int main(int argc, char** argv) {
         for (int k : {1, 3, 5})
           bench.validate(k, /*via_stack=*/false);
         bench.check_threads();
+        for (const JobStreamCase& c : kJobStreamCases)
+          validate_job_stream(bench, c);  // before the stack: its engine would share worker 0's core
       }
       for (int k : {1, 3, 5})
         bench.validate(k, /*via_stack=*/true);  // the first builds the stack
       bench.check_threads();
       if (kGroups == 1)
-        std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
+        std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare) and " << kJobStreamCases.size()
+                  << " job-stream cases (each record equal to the same jobs one at a time); threads pinned to {"
                   << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
                   << " build)\n";
       else
@@ -761,6 +873,14 @@ int main(int argc, char** argv) {
       for (int k : {1, 3, 5})
         benchmark::RegisterBenchmark(
             "BM_bare/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })
+            ->UseManualTime()
+            ->Unit(benchmark::kMicrosecond);
+    // Between them: the job-stream engine has the workers' cores to itself, and the stack is not built yet.
+    if (kGroups == 1)
+      for (const JobStreamCase& c : kJobStreamCases)
+        benchmark::RegisterBenchmark(
+            "BM_jobstream/in_flight:" + std::to_string(c.in_flight) + "/tokens:" + std::to_string(c.tokens),
+            [&bench, c](benchmark::State& state) { bm_job_stream(state, bench, c); })
             ->UseManualTime()
             ->Unit(benchmark::kMicrosecond);
     for (int k : {1, 3, 5})
