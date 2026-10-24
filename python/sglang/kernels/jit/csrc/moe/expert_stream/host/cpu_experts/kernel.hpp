@@ -72,7 +72,7 @@ struct StageGate {
   bool spun = false;      // the gate was shut on arrival
   int64_t waited_ns = 0;  // how long it spun (timed only; 0 when it was open on arrival)
 
-  // Defined in team.hpp, which every caller includes; this header stays free of <immintrin.h> because the device
+  // Defined in stage_gate.hpp (team.hpp includes it); this header stays free of <immintrin.h> because the device
   // translation units reach it through format.h.
   inline void wait() noexcept;
 };
