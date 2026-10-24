@@ -413,8 +413,9 @@ void scenario_gate()
     const es::CpuJob staged = e.job(0, 0, true);
     const es::CpuJob plain = e.job(1, 0, false);
     CHECK(e.engine->submit(staged) && e.engine->submit(plain));
-    // The plain job finishes (its row is written) while the staged one holds at its gate.
-    CHECK(wait_until([&] { return e.out0(1, 0) != -1.0f; }, 10));
+    // The plain job finishes (the fake publishes its rows when it has run) while the staged one holds at its gate.
+    CHECK(wait_until([&] { return !Fake::calls().empty(); }, 10));
+    CHECK(e.out0(1, 0) != -1.0f);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     CHECK(!e.engine->done(staged.seq));
     CHECK(!e.engine->done(plain.seq));  // done never passes the unfinished one before it
