@@ -174,4 +174,20 @@ These were untimed NUMA0 checks to avoid the reserved NUMA1 benchmark cores.
 The combined CUDA extension has not been rebuilt and clean-library latency has
 not yet been remeasured. See clean_integration/record.json for final test status.
 
+Execution ports (2026-10-24, divix01, Xeon Platinum 8280, vnni build of 922aa59be8, MAX_M 16). Per forward of the
+bare bench, from ../../moe/expert_stream/bench/port_counters.sh (two runs of 256 and 4352 iterations, differenced, so
+setup cancels) and port_counters.py; user-space counts, uops dispatched per core cycle:
+  bench        workers  port 0  port 1  port 5  mem stall  all stalls  cycles/ref  AVX-512 heavy license
+  experts:1       1      0.89    0.03    0.77     0.01        0.02        1.31          100%
+  experts:5       1      0.86    0.03    0.75     0.06        0.05        1.30          100%
+  rows:6/k:6      1      0.79    0.03    0.69     0.07        0.09        1.29          100%
+  experts:1      16      0.67    0.02    0.59     0.13        0.24        1.00          100%
+  experts:5      16      0.64    0.02    0.56     0.09        0.27        1.00          100%
+  rows:6/k:6     16      0.63    0.03    0.56     0.13        0.25        1.01          100%
+On one core the decode is port-0 bound (vpdpwssd/vpdpbusd, 512-bit multiplies and shifts), port 1 is fused away at 512
+bits, and memory stalls are small. At 16 workers the clock drops to the reference frequency, a quarter of the cycles
+stall (9-13% on memory) and a forward costs 34% more summed cycles than on one core. A 256-bit VNNI tier would bring
+port 1 back and the lighter frequency license, but doubles every operation and port 5 is already at 0.75-0.77, so it
+would likely bind on port 5: not built; estimated a small gain at best. Raw data: divix01:/mnt/nvme1/exl3-tidy/perf1.
+
 License: ../LICENSE.exllamav3 (MIT, original exllamav3 authors).
