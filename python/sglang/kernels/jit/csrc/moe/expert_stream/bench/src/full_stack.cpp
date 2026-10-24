@@ -572,7 +572,7 @@ void bm_bare(benchmark::State& state, Bench& bench, int k) {
 }
 
 // Every group's CPU expert engine totals, {jobs, lanes, forward ns} each.
-using CpuTotals = std::array<std::array<int64_t, 3>, kGroups>;
+using CpuTotals = std::array<std::array<int64_t, 9>, kGroups>;
 CpuTotals cpu_totals(const Stack<BenchBuild>& stack) {
   CpuTotals totals;
   for (int g = 0; g < kGroups; ++g)
