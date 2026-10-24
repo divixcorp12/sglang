@@ -9,6 +9,7 @@ scenarios also run under AddressSanitizer and ThreadSanitizer where the compiler
 
 import os
 import platform
+import resource
 import shutil
 import signal
 import subprocess
@@ -90,8 +91,15 @@ def _build(tmp_path, name, defines, kernel, flags, kernel_flags=()):
     return exe
 
 
+def _no_core_dump():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
 def _run(exe, scenario, timeout=600):
-    return subprocess.run([str(exe), scenario], capture_output=True, text=True, timeout=timeout)
+    # The fail-stop scenarios abort on purpose: no core dump for each.
+    return subprocess.run(
+        [str(exe), scenario], capture_output=True, text=True, timeout=timeout, preexec_fn=_no_core_dump
+    )
 
 
 @pytest.fixture(scope="module", params=["o2", "asan-ubsan", "tsan"])
