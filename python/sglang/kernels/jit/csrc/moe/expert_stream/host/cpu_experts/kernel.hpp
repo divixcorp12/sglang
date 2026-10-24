@@ -7,12 +7,9 @@
 // the bytes through its own typed view (EXL3's Exl3Projection, NVFP4's Projection), made from an ExpertRow's pointers
 // and its Params.
 #pragma once
-#include <immintrin.h>
-
 #include <array>
 #include <atomic>
 #include <bit>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -72,21 +69,9 @@ struct StageGate {
   bool spun = false;      // the gate was shut on arrival
   int64_t waited_ns = 0;  // how long it spun (0 when it was open on arrival)
 
-  void wait() noexcept {
-    ++calls;
-    called_ns = now();
-    if (word->load(std::memory_order_acquire) == open) return;
-    spun = true;
-    while (word->load(std::memory_order_acquire) != open && !(stop && stop->load(std::memory_order_relaxed)))
-      _mm_pause();
-    waited_ns = now() - called_ns;
-  }
-
- private:
-  static int64_t now() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-  }
+  // Defined in team.hpp, which every caller includes; this header stays free of <immintrin.h> because the device
+  // translation units reach it through format.h.
+  inline void wait() noexcept;
 };
 
 // One forward: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped, written to
