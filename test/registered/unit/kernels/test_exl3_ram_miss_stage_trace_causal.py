@@ -241,9 +241,8 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t t0 = now_ns();": 1,
     "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
     # CpuExpertEngine's idle wait (cpu_experts.h): one read per quantum on the CPU expert thread between jobs, never
-    # on the service or copy thread. The native test kernel's warm loop (test only) spins on its deadline there too.
+    # on the service or copy thread.
     "team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);": 1,
-    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)": 1,
     # stall_state() (cpu_experts.h): the age of a window slot in the copy-wait abort's line, once, on the RAM thread's
     # watchdog as it aborts. A job's admission stamp for the engine's watchdog is the window's (team_now_ns).
     "std::snprintf(ms, sizeof(ms), \"%.1f\", static_cast<double>(now_ns() - started) / 1e6);": 1,
@@ -300,10 +299,16 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t end = now_ns();": 1,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     "end = std::max(end, now_ns());": 2,
-    "if (now_ns() - start > s.timeout_ns)": 1,
-    # The native test forward (ffi_test_exports.h, test only, refused on ProdBuild): its spin, on the CPU expert thread.
-    "const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);": 1,
-    "while (now_ns() < until)": 1,
+    "if (now_ns() - start > s.timeout_ns)": 2,
+    # ... and its two run durations: the CPU job's (split_calibration.h, `return now_ns() - start;`) and a calibration
+    # read's (ram_tier_fill_copy_cpu.inc.h, the `land` lambda, `const int64_t ns = now_ns() - start;`).
+    "return now_ns() - start;": 1,
+    "const int64_t ns = now_ns() - start;": 1,
+    # The service timer (RamTier::SvcTimer) and handle_record's svc_start: read only when Build::kMetrics (InstrBuild);
+    # ProdBuild reads no clock.
+    "explicit SvcTimer(int64_t& t) : total(&t), start(Build::kMetrics ? now_ns() : 0) {}": 1,
+    "if constexpr (Build::kMetrics) *total += now_ns() - start;": 1,
+    "svc_start = now_ns();": 1,
     # The read faults (reader_core.h, `requires(Build::kFaults)`, 17e4287be8): suffix_delay_ns's hold and release.
     "if (faults_.held.empty()) faults_.held_since = now_ns();": 1,
     "for (int64_t now = now_ns(); now < until; now = now_ns())": 1,
