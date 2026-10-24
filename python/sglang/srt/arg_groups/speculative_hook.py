@@ -288,15 +288,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # stash on that instead.
             algo.handle_server_args(server_args)
 
-    _check_dspark_confidence_cut(
-        speculative_algorithm=cfg.speculative_algorithm,
-        sts_path=cfg.speculative_dspark_confidence_sts_path,
-    )
+    _check_dspark_confidence_cut(speculative_algorithm=cfg.speculative_algorithm)
 
 
-def _check_dspark_confidence_cut(
-    *, speculative_algorithm: Optional[str], sts_path: Optional[str]
-) -> None:
+def _check_dspark_confidence_cut(*, speculative_algorithm: Optional[str]) -> None:
     """Refuse a launch SGLANG_DSPARK_CONFIDENCE_CUT cannot serve; off, nothing is checked."""
     if not envs.SGLANG_DSPARK_CONFIDENCE_CUT.get():
         return
@@ -315,13 +310,8 @@ def _check_dspark_confidence_cut(
             "SGLANG_DSPARK_CONFIDENCE_CUT and SGLANG_DSPARK_TOP_PROB_GATE are both on, but a verify "
             "has one cut source; set SGLANG_DSPARK_TOP_PROB_GATE=0 or unset the confidence cut."
         )
-    # Collect mode (STS collect path, no table) builds the head only to record raw scores; the cut stays off.
-    if not sts_path and not envs.SGLANG_DSPARK_STS_COLLECT_PATH.get():
-        raise ValueError(
-            "SGLANG_DSPARK_CONFIDENCE_CUT needs calibrated confidences; pass "
-            "--speculative-dspark-confidence-sts-path with the fitted STS file "
-            "(or set SGLANG_DSPARK_STS_COLLECT_PATH to collect them)."
-        )
+    # No STS file is a valid cut: the head's temperatures stay 1. The 2026-10-23 replay put a fitted table within
+    # 0.3% of T=1 (sts-replay-20261023), so production cuts at T=1.
     ragged_mode = read_ragged_verify_mode()
     if ragged_mode is not RaggedVerifyMode.STATIC:
         raise ValueError(
