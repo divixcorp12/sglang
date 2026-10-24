@@ -128,8 +128,9 @@ SERVER_CORES = "0-5,56-61"
 # copy thread's 27); naming it keeps node 0's CPU experts contiguous (6-21), with the driver above them (22-25).
 SPIN_CORE = 26
 # CPU expert workers per NUMA node (SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS): node 0 gets 6-21, node 1 28-43. 16 since
-# 2026-10-22 (10 before): one-token CPU forwards run 17-21% faster at 16 than at 10 (DSV_OPTIMIZATION.md 3.14); past 16
-# they are bound by node memory bandwidth. Arms from here on are not comparable to earlier cells.
+# 2026-10-22 (10 before), when one-token forwards ran 15-16% faster at 16 than at 10 (DSV_OPTIMIZATION.md 3.15). With the
+# job-window kernel (2026-10-24, 3.17) 12 matches 16 within 0-3% and 10 is 2-6% slower: 12-15 are free to give another
+# role if one needs them. Arms from here on are not comparable to earlier cells.
 CPU_EXPERTS_THREADS = 16
 # Node 0 (the GPU's), clear of the CPU experts (6-21), RAM thread (26) and copy thread (27): the client stays off node 1,
 # whose cores are the NVMe-side experts'. It moved from 18-21 when the experts grew to 16 threads.

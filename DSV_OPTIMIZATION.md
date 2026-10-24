@@ -1739,6 +1739,25 @@ workloads incl. shared5-8 and counts8-7-6-5-4-3-2-1) at 10 and 16 workers, with 
   beyond arm A's 48 GiB is `--pinned-extra-gib`), node-0 warn 117.94 GiB. `_size_prefill_share` returns 0 when no layer
   admits (it raised, which would have refused the start). No served A/B yet; startup now reads every row from NVMe.
 
+### 3.17 EXL3 CPU expert worker count, re-measured on the job-window kernel (2026-10-24)
+
+Bare bench (`exl3_cpu_optimized`, vnni, master `d02409913c` build), N workers on cpus 28..27+N, 6 rounds with the arm
+order rotated, p50 us medians, under `cc-gpu.lock`. Two runs: memory policy inherited (`/mnt/nvme1/exl3-tidy/wsweep-nomembind`)
+and `numactl --membind=1` (`/mnt/nvme1/exl3-tidy/wsweep`):
+
+| workers | 8 | 10 | 12 | 14 | 16 | 8 + SMT siblings |
+|---|---|---|---|---|---|---|
+| experts 1 / 3 / 5, inherited | 367 / 1106 / 1828 | 315 / 985 / 1638 | 305 / 964 / 1568 | 322 / 925 / 1551 | 308 / 934 / 1543 | 354 / 1083 / 1769 |
+| experts 1 / 3 / 5, membind 1 | 402 / 1238 / 2097 | 360 / 1194 / 2074 | 335 / 1125 / 1947 | 341 / 1055 / 1982 | 348 / 1149 / 1990 | 388 / 1310 / 2144 |
+
+- 12 workers match 16 within 0-3% in both runs (at membind 1, 12 is the fastest arm); 16 over 10 gains 2-6%, against
+  15-16% at 3.15 (static split and team barriers). Production stays at 16 (`arm_env.CPU_EXPERTS_THREADS`): no role needs
+  the cores yet, and 12-15 can be given away for 0-3% on CPU jobs when one does.
+- SMT siblings add 3-6% over 8 workers and fall well short of 16 cores: the decode is port-bound (exl3/optimized/README.txt,
+  execution ports), so two threads on a core share the same two vector ports.
+- Not explained: the membind-1 run is 8-20% slower than the inherited run at every count, and noisier (14 beats 16 at
+  experts 3 only). The conclusion is the same in both.
+
 ## 4. Ideas on record, not started
 
 - Predict layer 0/1 experts; aim RAM prefetch at CPU misses.
