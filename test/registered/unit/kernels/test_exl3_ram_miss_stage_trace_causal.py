@@ -291,14 +291,12 @@ NON_TRACE_CLOCK_READS = {
     # ... and the startup split calibration (split_calibration.h): once, on the calibrating caller's thread with the
     # service paused and the copy engine not armed, each run's start, its two completion stamps and its timeout.
     # ... and the engine's pair per draft forward (draft_forward_ns), on the CPU expert thread.
-    # ... and two waits that already spin, each the start and the "waited" line (17e4287be8, 2258a586b8): a two-stage CPU
-    # miss's stage_two (cpu_experts.h), only when its second-stage gate is still closed, on the CPU expert thread (its
-    # stage_two_wait_ns stat); and the GPU scorer's candidate-slot poll (RamTier::await_candidates, kCandWaitNs), on the
-    # speculative thread or spec_pump's caller, never the service or copy thread.
-    # ... and the two-stage test forward's gate (kernel_forward_two_stage, test only, refused on ProdBuild).
+    # ... and a wait that already spins, its start and its "waited" line (2258a586b8): the GPU scorer's candidate-slot
+    # poll (RamTier::await_candidates, kCandWaitNs), on the speculative thread or spec_pump's caller, never the service or
+    # copy thread. A two-stage CPU miss's gate reads the clock in cpu_experts/team.hpp (StageGate::wait, team_now_ns),
+    # only when timed: the engine sets that on InstrBuild alone.
     "const int64_t start = now_ns();": 7,
-    "const int64_t waited = now_ns() - start;": 2,
-    "g->waited += now_ns() - start;": 1,
+    "const int64_t waited = now_ns() - start;": 1,
     "const int64_t end = now_ns();": 2,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     "end = std::max(end, now_ns());": 2,
