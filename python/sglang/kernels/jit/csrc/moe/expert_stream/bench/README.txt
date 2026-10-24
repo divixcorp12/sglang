@@ -306,6 +306,47 @@ Fidelity: the writer's stores reach the service by coherence between two node-0
 cores, not by PCIe/DDIO, so pickup is a lower bound on the GPU path's. The prod
 build's numbers are the headline; the instr build's carry the trace's cost.
 
+Job-stream bench
+----------------
+BM_jobstream/in_flight:R/tokens:T runs the trace's record pattern through a CPU expert engine of its own (the real
+BasicCpuExpertEngine over the fixture's layers, the same 16 pinned workers on 28-43, the driver on the writer CPU), with
+no tier, reader or device in between. The driver is the tier owner: it claims a record's sequences, submits the jobs in
+sequence order at their landing times, opens staged gates by a timer, and watches done(seq). It uses only claim / submit /
+open_stage_two / done, so one source builds against the engine before and after the job window (job_stream.h).
+
+A record (a pure function of its index, rows rotating over the 8 layers):
+  hit job     part 0, k = 3, 4, 5 lanes (cycling), submitted at 0
+  miss jobs   part 1, 6 - k of them (3, 2, 1), one lane each, the i-th submitted at (i + 1) * 200 us; the first
+              overwrites the part, the rest accumulate into it; every second one is staged and its gate opens 100 us
+              after the job goes in
+  in flight   the next record's hit job goes in as soon as the previous record's last job has, while fewer than R
+              records are incomplete; R = 1 waits for the previous record to finish
+Cases: R = 1, 2, 4 at 1 token a row, and R = 1, 2 at 32 tokens a row (a full verify: the token table routes each lane to
+6 consecutive tokens, --js-per-lane). A stream is 32 records (8 at 32 tokens, --js-records); one iteration is a stream.
+Counters: p50_us, p95_us, p99_us of a record's completion time (its first submit to done() passing its last job, over
+every record of every iteration) and records_per_s (records over the summed stream wall time).
+
+Why these values (the production trace, 2026-10-18, in the job-window design): a miss job's wait behind its record's hit
+job is what 98% of the trace's busy-engine submits are, with a median of 1.4-1.5 ms, so the misses must land while the
+hit job (3-5 lanes, about 1 ms on 16 workers) still runs: 200 us apart puts all of a record's misses inside it. The
+landing interval and the 100 us gate delay are assumptions of that order, not measured row-read times; --js-land-us and
+--js-gate-us change them. The fixture holds 5 experts (slots 0-4), so a record's six lanes reuse them.
+
+Every benchmark first checks every record of a 12-record stream (rows reused, so all three record shapes) against the
+same jobs run one at a time through the same engine, bit for bit, and again after the timed iterations; --validate-only
+does it for all cases before the stack is built. A failure skips the benchmark.
+
+  bash "$bench/ab_job_stream.sh" BASE_BUILD HEAD_BUILD RESULTS_DIR
+
+alternates the two builds' exl3_full_stack_prod per round (EXL3_BENCH_ROUNDS, default 8), holding cc-gpu.lock, and writes
+summary.tsv: per case, the median over rounds of p50, p95 and records/s for each build and head / base. Against the base
+(61c5e9399e), check out four files from the head commit in a private worktree of the base and build there:
+  git worktree add --detach WT 61c5e9399e
+  git -C WT checkout HEAD_COMMIT -- $bench/src/full_stack.cpp $bench/src/job_stream.h \
+    $bench/src/cpu_forward.cpp $bench/src/stack_fixture.cpp
+The last two are 55f1e94736's fix (the base's own do not build: they pass the removed row_weighted field). The base's
+stack.h and self_test.cpp stay: the head's use the window's interface. Never commit that checkout.
+
 Running
 -------
 From a login shell on the reference machine (no production server running;

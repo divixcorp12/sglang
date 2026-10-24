@@ -605,8 +605,9 @@ void bm_bare(benchmark::State& state, Bench& bench, int k) {
   }
 }
 
-// Every group's CPU expert engine totals, {jobs, lanes, forward ns} each.
-using CpuTotals = std::array<std::array<int64_t, 9>, kGroups>;
+// Every group's CPU expert engine totals, {jobs, lanes, forward ns, ...} each, as wide as the stack's cpu_stats (the
+// engine before the job window reports three, after it nine).
+using CpuTotals = std::array<decltype(std::declval<const Stack<BenchBuild>&>().cpu_stats(0)), kGroups>;
 CpuTotals cpu_totals(const Stack<BenchBuild>& stack) {
   CpuTotals totals;
   for (int g = 0; g < kGroups; ++g)
