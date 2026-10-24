@@ -119,7 +119,7 @@ nothing in a -DEXL3_MOE_CPU_WORKER_TRACE=1 build until the engine's window feeds
 interface): prepare_job at admission, then five phases of tasks any worker may run, ForwardPlan<Shape> at the build's
 tier, picked once per layer, at registration:
   PrepareGateUp  (chunk, gate | up, 128-input block): transform and quantize          80 tasks for one DSV4.1 expert
-  GateUp         (chunk, gate | up, tile pair), claimed in runs of 8                  144
+  GateUp         (chunk, gate | up, tile pair), runs aligned to PlanTraits::kTileAlign  144
   Middle         (chunk, 128-intermediate block): SiLU and the down input             18   (kGatePhase)
   DownTiles      (chunk, tile pair) of the down GEMV, into tout_d; the worker that
                  finishes a 128-output block's last tile transforms it                160

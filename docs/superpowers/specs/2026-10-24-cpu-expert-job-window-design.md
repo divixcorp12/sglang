@@ -35,8 +35,10 @@ another.
   job interface; `Team` keeps the pinned workers, their names and the keep-warm idle wait.
 - D4. Admission is target ring first, then the draft channel. An always-on counter records admissions that found both
   sources pending; oldest-first across sources is the change to make if it ever counts.
-- D5. EXL3's Down is two phases again: DownTiles (tile pairs, any owner) and DownOut (one 128-output block over every
-  chunk, in chunk order). The fused Down was 4-6% slower (40 blocks over 16 workers) and was reverted.
+- D5. EXL3's Down is two phases again, with the base's split: DownTiles (tile pairs, any owner; the worker that
+  finishes a (chunk, 128-output block) transforms it) and DownOut (the weighted sum, 16-output units over every chunk
+  in chunk order). The fused Down was 4-6% slower (40 blocks over 16 workers) and was reverted; a DownOut of 128-output
+  blocks that also transformed measured the same way (experts:1 1.045x) and was replaced (2026-10-24).
 - D6. The split model's fit records worker time: each claimed run adds its TSC duration to its slot, and the fit takes
   the sum divided by the workers.
 - D7. Window size W = 4.
@@ -106,21 +108,25 @@ EXL3 (one expert, DSV4.1 counts):
 | # | phase | one task | count |
 |---|---|---|---|
 | 0 | PrepareGateUp | (chunk, gate or up, 128-input block): transform and quantize | 80 |
-| 1 | GateUp | (gate/up GEMV, tile pair), align 8 | 128 |
-| 2 | Middle (`kGatePhase`) | (chunk, 128-block): SiLU and quantize | 8 |
-| 3 | DownTiles | (chunk, tile pair) of the down GEMV, into `tout_d` | 160 |
-| 4 | DownOut | 128-output block: per chunk in order, output transform, weighted add into `out` | 40 |
+| 1 | GateUp | (gate/up GEMV, tile pair), align `PlanTraits::kTileAlign` (DSV4.1 1, generic 4) | 144 |
+| 2 | Middle (`kGatePhase`) | (chunk, 128-block): SiLU and quantize | 18 |
+| 3 | DownTiles | (chunk, tile pair) of the down GEMV, into `tout_d`; a block's last tile transforms it | 160 |
+| 4 | DownOut | 16-output unit: per chunk in order, weighted add into `out` | 320 |
 
 - DownOut zeroes its own columns first for `kOverwrite`, replacing worker 0's memset at job start, with the same
-  bits. `kOverwriteByStore` keeps its first-write store and unrouted-row zeroing, per block.
+  bits. `kOverwriteByStore` keeps its first-write store and unrouted-row zeroing, per unit.
+- Align 8 pairs (16 tiles) on DSV4.1 measured experts:1 at 1.57x the static split: 18 runs of GateUp's 144 pairs over
+  16 workers. The DSV4.1 compact kernels take any pair; the generic tile kernels need 8-tile groups.
 - `assign_gemvs`, `assign_row_weighted_gemvs`, `claim_groups`, `PlanTraits::kSplitTiles`/`kClaimMixedChunks` and the
   `row_weighted` param are removed. The grouped multi-band traversal stays, inside a claimed run.
 
 NVFP4: PrepareInput (32-value blocks), GateUp (16-row units), Middle (blocks), Down (16-row units). `partial` is per
 slot, `[workers][stride]`, indexed by `worker`. After `invalid` is set, Middle and Down report 0 tasks.
 
-Claiming: a run is `max(align, remaining / (2 * workers))` tasks, rounded to `align`: large runs while a phase is
-fresh, single tasks at its end.
+Claiming: a run is `ceil(count / workers)` tasks rounded up to `align`, at most what remains: the static split's
+share as one contiguous range, which a worker that finishes early follows with the next. Runs of
+`max(align, remaining / (2 * workers))` shrank toward single tasks and starved EXL3's band traversal (experts:3 at
+1.15x the static split, 54% of its time in single-band kernels against the base's 73% in `traversal_kblock`).
 
 ### 3. Scheduling and dependencies
 
