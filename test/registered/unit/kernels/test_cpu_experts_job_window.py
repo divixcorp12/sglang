@@ -29,6 +29,7 @@ CHECKS = (
     "same_output_out_phases_run_in_sequence_order_while_other_outputs_interleave",
     "a_job_with_no_out_tasks_keeps_the_chain_ordered",
     "done_never_passes_an_unfinished_sequence",
+    "the_done_word_skips_sequences_nobody_admitted",
     "a_staged_gate_holds_only_its_job",
     "a_full_window_stops_admission",
     "stop_drains",

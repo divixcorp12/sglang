@@ -365,6 +365,37 @@ void done_never_passes_an_unfinished_sequence()
     ok("done_never_passes_an_unfinished_sequence");
 }
 
+// The engine's sequences are not consecutive (a record claims one per possible job, and a skipped one is covered by the
+// next job's done): the word moves to the lowest finished sequence above it once no admitted job below it is unfinished.
+void the_done_word_skips_sequences_nobody_admitted()
+{
+    reset({nullptr, delay_slow_first_job, {1, 1, 1}});
+    TJob j0(2, 2, 0), j1(2, 2, 1), j2(2, 2, 2);
+    Env e;
+    e.admit_wait(3, j0, 1);
+    e.admit_wait(7, j1, 2);
+    e.admit_wait(9, j2, 3);
+    uint32_t last = 0;
+    e.wait([&] {
+        const uint32_t d = e.done.load(std::memory_order_acquire);
+        CHECK(d >= last);
+        CHECK(d == 0 || d == 3 || d == 7 || d == 9);
+        last = d;
+        for (uint32_t q : {3u, 7u, 9u})
+            if (d >= q) CHECK(e.log.completed[q] == 1);
+        return d >= 9;
+    });
+    // The later jobs finished first, and the word waited for the first admitted.
+    CHECK(e.log.order[2] == 3);
+    CHECK(e.log.done_at[3] == 0 && e.log.done_at[7] == 0 && e.log.done_at[9] == 0);
+    // A job admitted after the word passed a gap continues from there.
+    TJob j3(2, 2, 3);
+    e.admit_wait(20, j3, 4);
+    e.wait_done(20);
+    CHECK(e.done.load() == 20);
+    ok("the_done_word_skips_sequences_nobody_admitted");
+}
+
 void a_staged_gate_holds_only_its_job()
 {
     reset();
@@ -640,6 +671,7 @@ int main()
     same_output_out_phases_run_in_sequence_order_while_other_outputs_interleave();
     a_job_with_no_out_tasks_keeps_the_chain_ordered();
     done_never_passes_an_unfinished_sequence();
+    the_done_word_skips_sequences_nobody_admitted();
     a_staged_gate_holds_only_its_job();
     a_full_window_stops_admission();
     stop_drains();
