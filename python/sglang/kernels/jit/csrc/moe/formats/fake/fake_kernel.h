@@ -11,6 +11,7 @@
 #pragma once
 #include "../../expert_stream/host/cpu_experts/kernel.hpp"
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -47,6 +48,54 @@ struct __attribute__((visibility("hidden"))) FakeCpuKernel {
   static void check(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call);
   static void forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team);
   static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns);
+
+  // The job interface (cpu_experts/binding.hpp's CpuExpertJobKernel), for the scheduler tests: three phases over a
+  // call's rows. Phase 0 sums each row's w13 slabs, phase 1 (kGatePhase, the one a staged job's gate holds) its w2
+  // slabs, phase 2 (kOutPhase) writes the rows as forward does: task t of a phase with C tasks takes rows t, t + C, ...
+  // Tasks of a phase default to one per row (max(rows, 1)). Each task can spin first, and every run is recorded.
+  // A job whose first slot is kRefuseSlot reports status 2; one whose first slot is kRejectSlot, or any prepare after
+  // reset(..., fail != 0), throws std::invalid_argument.
+  static constexpr int kPhases = 3;
+  static constexpr int kGatePhase = 1;
+  static constexpr int kOutPhase = 2;
+  static constexpr int32_t kRefuseSlot = -7;
+  static constexpr int32_t kRejectSlot = -9;
+
+  struct Job {
+    int32_t id = 0;  // prepare's ordinal since job_reset, which events and the test hooks name the job by
+    int32_t rows = 0;
+    int32_t status = 0;
+    const Layer* layer = nullptr;
+    const ::sglang::cpu_experts::ForwardCall* call = nullptr;
+    std::array<int32_t, kPhases> count{};
+    std::array<std::atomic<int32_t>, kPhases> executed{};  // tasks done per phase
+    std::vector<double> w13, w2;  // phase 0 and 1's per-row results, stored as sum + 1; phase 1 and 2 read the earlier
+  };
+
+  /// One run of a phase's tasks as the fake records it.
+  struct JobEvent {
+    int32_t job, phase, t0, t1, worker;
+    uint64_t tsc0, tsc1;  // rdtsc before and after the run
+  };
+  /// The test's controls: tasks per (job, phase, rows) (null or a negative result: one per row), ns each task spins
+  /// first (null: none), and the phases' claim alignment.
+  struct JobTest {
+    int32_t (*count)(int32_t job, int32_t phase, int32_t rows) = nullptr;
+    int64_t (*delay_ns)(int32_t job, int32_t phase, int32_t task) = nullptr;
+    std::array<int32_t, kPhases> align{1, 1, 1};
+  };
+
+  static void prepare(Job& job, const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call);
+  static ::sglang::cpu_experts::Tasks tasks(const Job& job, int phase);
+  static void run(Job& job, int phase, int t0, int t1, int worker);
+  static int status(const Job& job);
+
+  /// Clears the job events, the ordinal and the violation count, and sets the controls. Not while a job is in flight.
+  static void job_reset(const JobTest& test);
+  /// Every run recorded since job_reset, in no order (read once the jobs are done).
+  static std::vector<JobEvent> job_events();
+  /// How many times a phase started before the previous one had finished, or read a result it never got.
+  static int64_t job_violations();
 
   /// Resets the recorded calls and the controls; forwards then spin k * ns_per_expert, fail when `fail` is nonzero, and
   /// write a zero partial when `zero`.

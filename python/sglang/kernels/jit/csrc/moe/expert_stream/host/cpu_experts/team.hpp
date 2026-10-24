@@ -66,10 +66,33 @@ public:
         using G = std::remove_reference_t<F>;
         body_ = &thunk<G>;
         ctx_ = const_cast<void*>(static_cast<const void*>(std::addressof(f)));
+        serving_ = false;
         generation_.fetch_add(1, std::memory_order_release);
         body_(ctx_, 0, workers_);
         barrier();
     }
+
+    // Starts f(worker, workers) on workers 1..n-1 and returns at once; the caller stays worker 0 and does not run f. f
+    // is a loop that returns when its owner tells it to, and must outlive that return: join_serve() waits for every
+    // worker to leave it. No run() or barrier() in between, and f must not throw.
+    template <class F>
+    void serve(F&& f)
+    {
+        using G = std::remove_reference_t<F>;
+        body_ = &thunk<G>;
+        ctx_ = const_cast<void*>(static_cast<const void*>(std::addressof(f)));
+        serving_ = true;
+        serving_count_.store(workers_ - 1, std::memory_order_relaxed);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
+    // Returns once every worker serve() started has left its loop.
+    void join_serve() const
+    {
+        while (serving_count_.load(std::memory_order_acquire) != 0) _mm_pause();
+    }
+
+    int64_t keep_warm_ns() const { return keep_warm_ns_; }
 
     // Inside a job: returns once every worker has arrived here. It spins and never sleeps: std::barrier parks early
     // arrivals on a futex, and a wake costs microseconds against phases tens of microseconds long.
@@ -123,7 +146,8 @@ private:
             const Body body = body_;
             if (body == nullptr) return;
             body(ctx_, w, workers_);
-            barrier();
+            if (serving_) serving_count_.fetch_sub(1, std::memory_order_release);
+            else barrier();
             warm_until = team_now_ns() + keep_warm_ns_;
         }
     }
@@ -147,6 +171,8 @@ private:
     alignas(64) std::atomic<uint32_t> generation_{0};
     Body body_ = nullptr;
     void* ctx_ = nullptr;
+    bool serving_ = false;  // the body is serve()'s: workers 1..n-1 only, no end barrier
+    std::atomic<int> serving_count_{0};
     alignas(64) std::atomic<int> arrived_{0};
     alignas(64) std::atomic<uint32_t> phase_{0};
     alignas(64) std::atomic<int> started_{0};

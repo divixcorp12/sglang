@@ -58,6 +58,28 @@ concept CpuExpertKernel = requires(
   { K::warm(word, seen, deadline_ns) } -> std::same_as<int32_t>;
 };
 
+/// \brief A kernel type's job interface (job_window.hpp): one call as phases of tasks that any worker may run.
+///
+/// Job is one slot's state, default-constructible and reused across jobs. kGatePhase is the first phase that reads
+/// stage-two rows (-1: none). kOutPhase, the phase that writes `out`, is optional and defaults to kPhases - 1; only it
+/// waits for the previous job on the same output. prepare runs serially at admission and may throw
+/// std::invalid_argument; tasks is read when a phase becomes ready, so a phase may report 0 tasks; run takes tasks
+/// [t0, t1) of a phase, with `worker` indexing per-worker scratch only, and does not throw; status is 0, or 2 when the
+/// input was refused.
+template <class K>
+concept CpuExpertJobKernel = requires(
+    typename K::Job& job, const typename K::Job& cjob, const typename K::Layer& layer, const ForwardCall& call,
+    int phase, int t0, int t1, int worker) {
+  typename K::Job;
+  requires std::default_initializable<typename K::Job>;
+  requires(K::kPhases >= 1);
+  requires(K::kGatePhase >= -1 && K::kGatePhase < K::kPhases);
+  { K::prepare(job, layer, call) } -> std::same_as<void>;
+  { K::tasks(cjob, phase) } -> std::same_as<Tasks>;
+  { K::run(job, phase, t0, t1, worker) } -> std::same_as<void>;
+  { K::status(cjob) } -> std::same_as<int>;
+};
+
 /// \brief The parameters of a format with no kernel.
 struct NoParams {};
 
@@ -84,6 +106,15 @@ struct UnsupportedCpuKernel {
   static void forward(const Layer&, const ForwardCall&, Team&) { unsupported("forward"); }
   static int32_t warm(const uint32_t*, uint32_t, int64_t) { unsupported("warm"); }
 
+  struct Job {};
+  static constexpr int kPhases = 1;
+  static constexpr int kGatePhase = -1;
+  static constexpr int kOutPhase = 0;
+  static void prepare(Job&, const Layer&, const ForwardCall&) { unsupported("prepare"); }
+  static Tasks tasks(const Job&, int) { unsupported("tasks"); }
+  static void run(Job&, int, int, int, int) { unsupported("run"); }
+  static int status(const Job&) { unsupported("status"); }
+
  private:
   [[noreturn]] static void unsupported(const char* call) noexcept {
     std::fprintf(
@@ -94,5 +125,6 @@ struct UnsupportedCpuKernel {
   }
 };
 static_assert(CpuExpertKernel<UnsupportedCpuKernel<UnnamedFormat>>);
+static_assert(CpuExpertJobKernel<UnsupportedCpuKernel<UnnamedFormat>>);
 
 }  // namespace sglang::cpu_experts

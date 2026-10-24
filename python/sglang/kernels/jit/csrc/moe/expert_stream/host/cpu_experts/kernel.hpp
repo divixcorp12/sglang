@@ -77,6 +77,13 @@ struct StageGate {
   inline void wait() noexcept;
 };
 
+// A job phase's tasks as the scheduler reads them (job_window.hpp): `count` tasks, claimed in runs of a multiple of
+// `align` (the last run of a phase may be shorter).
+struct Tasks {
+  int count = 0;
+  int align = 1;
+};
+
 // One forward: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped, written to
 // out as out_mode says. Its workers and their cores are the Team's (team.hpp), the forward's own argument.
 struct ForwardCall {
