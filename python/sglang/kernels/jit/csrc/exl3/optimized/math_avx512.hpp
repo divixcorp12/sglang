@@ -396,7 +396,7 @@ void band_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, in
     }
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i) {
-            const float scale = kMul1KInv * in.q[i];
+            const float scale = mul1_k_inv() * in.q[i];
             const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
             const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]), _mm512_set1_ps(scale), corr);
             _mm512_storeu_ps(tout + size_t(i) * mat.n + (n0 + b) * 16, out);
