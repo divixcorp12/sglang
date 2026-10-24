@@ -3,8 +3,10 @@
 // fake_kernel.cpp.
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/job_window.hpp"
 #include "../../../../python/sglang/kernels/jit/csrc/moe/formats/fake/fake_kernel.h"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include <x86intrin.h>
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -587,6 +589,51 @@ void the_done_word_reaches_the_last_sequence_under_out_of_order_completions()
 
 }  // namespace
 
+// A helper worker that completes the job before worker 0 reads the window word leaves worker 0 nothing to wake it: the
+// runner and drain() must see the job is done instead of idling. Many back-to-back tiny jobs on many workers make that
+// the common case. The stress runs on its own thread so a lost wakeup fails on a deadline instead of hanging.
+// One task in the first phases and two, of equal length, in the last: worker 0 takes one and a helper the other, and
+// whoever ends second completes the job just as worker 0 comes round to look.
+int32_t count_two_out(int32_t, int32_t phase, int32_t) { return phase == 2 ? 2 : 1; }
+int64_t delay_out_2us(int32_t, int32_t phase, int32_t) { return phase == 2 ? 2000 : 0; }
+
+void no_lost_wakeup_when_a_helper_completes_the_job()
+{
+    std::atomic<int> stage{0};
+    std::thread stress([&] {
+        reset({.count = count_two_out, .delay_ns = delay_out_2us});
+        // Up to 8 workers, but no more than the CPUs: a helper must be running, not descheduled, to finish a job in time.
+        const int workers = std::clamp(int(std::thread::hardware_concurrency()), 2, 8);
+        Team team(std::span<const int>{}, workers, &K::warm, 0);
+        {
+            JobRunner<K> runner(team);
+            TJob j(1, 1, 0);
+            for (int i = 0; i < 50000; ++i) runner.run(g_fx.layer, j.call);
+        }
+        stage.store(1);
+        for (int i = 0; i < 400000; ++i) {
+            JobWindow<K, 4> win(team);
+            win.start();
+            TJob j(1, 1, i);
+            CHECK(win.admit(1, kTarget, g_fx.layer, j.call, kNoOutKey, nullptr));
+            win.close();
+            win.drain();
+            win.join();
+        }
+        stage.store(2);
+    });
+    const int64_t start = team_now_ns();
+    while (stage.load() != 2) {
+        if (team_now_ns() - start > 120LL * 1000000000) {
+            std::fprintf(stderr, "FAIL lost wakeup: stuck in %s\n", stage.load() == 0 ? "JobRunner::run" : "drain");
+            std::_Exit(1);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    stress.join();
+    ok("no_lost_wakeup_when_a_helper_completes_the_job");
+}
+
 int main()
 {
     every_task_runs_once_and_phases_run_in_order();
@@ -600,6 +647,7 @@ int main()
     a_throwing_prepare_surfaces_to_the_admitter();
     phases_with_no_tasks_complete_at_once_or_wait_for_their_gate();
     the_done_word_reaches_the_last_sequence_under_out_of_order_completions();
+    no_lost_wakeup_when_a_helper_completes_the_job();
     std::printf("all ok\n");
     return 0;
 }

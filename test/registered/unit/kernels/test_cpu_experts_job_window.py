@@ -36,6 +36,7 @@ CHECKS = (
     "a_throwing_prepare_surfaces_to_the_admitter",
     "phases_with_no_tasks_complete_at_once_or_wait_for_their_gate",
     "the_done_word_reaches_the_last_sequence_under_out_of_order_completions",
+    "no_lost_wakeup_when_a_helper_completes_the_job",
 )
 
 pytestmark = pytest.mark.skipif(
