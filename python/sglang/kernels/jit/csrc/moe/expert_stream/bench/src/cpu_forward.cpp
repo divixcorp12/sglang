@@ -19,9 +19,8 @@
 #ifdef EXL3_BENCH_BASELINE
 #include "baseline_moe_mul1.h"
 #endif
-#include "../../moe/expert_stream/host/cpu_experts/team.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include "../../moe/expert_stream/host/core_topology.h"
-#include "tile_assignment.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -56,13 +55,18 @@ namespace {
 namespace fs = std::filesystem;
 std::vector<int> g_cores;  // the bench's worker cores, worker 0 first
 
-// The bench's one team on g_cores, made at the first forward and kept for the process: a team per call would time
-// thread creation.
-::sglang::cpu_experts::Team& bench_team(int workers) {
-  static std::unique_ptr<::sglang::cpu_experts::Team> team;
-  if (!team)
-    team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0);
-  return *team;
+// The bench's one team on g_cores and its one-job-at-a-time runner (a one-slot JobWindow over the team), made at the
+// first forward and kept for the process: a team per call would time thread creation.
+struct BenchRig {
+  ::sglang::cpu_experts::Team team;
+  ::sglang::cpu_experts::JobRunner<::sglang::exl3_cpu::Exl3CpuKernel> runner;
+  BenchRig(std::span<const int> cores, int workers)
+      : team(cores, workers, &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0), runner(team) {}
+};
+::sglang::cpu_experts::JobRunner<::sglang::exl3_cpu::Exl3CpuKernel>& bench_runner(int workers) {
+  static std::unique_ptr<BenchRig> rig;
+  if (!rig) rig = std::make_unique<BenchRig>(g_cores, workers);
+  return rig->runner;
 }
 bool benchmark_failed = false;
 // The command line; the defaults are the reference machine's.
@@ -336,7 +340,7 @@ struct Workload {
     call.slots = slots.data();
     call.weights = weights.data();
     call.out = output.data();
-    ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
+    bench_runner(options.workers).run(layers[layer]->layer, call);
 #endif
   }
 
@@ -458,7 +462,7 @@ struct RoutedWorkload {
     call.slots = slots.data();
     call.weights = weights.data();
     call.out = output.data();
-    ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
+    bench_runner(options.workers).run(layers[layer]->layer, call);
   }
 
   void validate() {
@@ -642,7 +646,6 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("memory_policy", "inherited; no benchmark membind");
       benchmark::AddCustomContext("compiler", __VERSION__);
 #ifndef EXL3_BENCH_BASELINE
-      benchmark::AddCustomContext("row_weighted_assignment", std::to_string(EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT));
       benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::Exl3CpuKernel::chunk_m()));
 #endif
       for (auto& workload : workloads) {

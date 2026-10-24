@@ -193,8 +193,7 @@ def _seeded_routes(seed, rows, k):
     return slots, weights
 
 
-# Shapes whose chunks hold different row counts: the ones on which row weighting moves tiles between workers
-# (test_exl3_row_weighted_assignment). Six rows as a verify, five as a draft block; experts repeated across rows as
+# Shapes whose chunks hold different row counts. Six rows as a verify, five as a draft block; experts repeated across rows as
 # the DSpark calls repeat them, plus seeded random routing.
 MIXED_ROUTES = [
     ([[0], [0], [1], [2], [3], [4]], [[1.0]] * 6),
@@ -208,9 +207,9 @@ MIXED_ROUTES = [
 @pytest.mark.parametrize("slots, weights", MIXED_ROUTES)
 @pytest.mark.parametrize("threads", [2, 4, 10])
 def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slots, weights, threads):
-    """Row weighting changes which worker owns an output tile (tile_assignment.hpp), never a tile's arithmetic: on
-    the production build, a layer made with row_weighted gives the original layer's output bit for bit, through the
-    DSV4.1 plan the serving kernel runs."""
+    """The kernel ignores a layer's row_weighted flag (tasks go to whichever worker is free, and no worker owns a
+    tile's arithmetic): on the production build, a layer made with it gives the original layer's output bit for bit,
+    through the DSV4.1 plan the serving kernel runs."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")

@@ -42,8 +42,6 @@ set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (eve
 
 set(EXL3_MARCH "native" CACHE STRING "-march of the optimized kernel, which fixes its ISA tier (skylake-avx512 bw, x86-64-v3 avx2, x86-64 scalar)")
 
-option(EXL3_ROW_WEIGHTED_ASSIGNMENT "Experimental row-weighted matrix assignment" OFF)
-
 option(EXL3_FETCH_BENCHMARK "Download pinned Google Benchmark when not installed" ON)
 find_package(benchmark 1.9 QUIET CONFIG)
 if(NOT benchmark_FOUND)
@@ -92,9 +90,6 @@ foreach(BACKEND baseline optimized)
     EXL3_BENCH_BACKEND="${BACKEND}" EXL3_BENCH_DEFAULT_WORKERS=${DEFAULT_WORKERS} ${BASELINE_DEFINE})
   if(EXL3_MAX_M AND NOT BACKEND STREQUAL "baseline")
     target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})
-  endif()
-  if(EXL3_ROW_WEIGHTED_ASSIGNMENT AND NOT BACKEND STREQUAL "baseline")
-    target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT=1)
   endif()
   # Kernel flags match the selected study. Keep the harness's NaN/error checks
   # outside fast-math; kernel and harness are distinct translation units. The optimized kernel's ISA tier is its

@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -231,7 +232,7 @@ struct StackCall {
 //
 // Bare phase: the slots hold expert e in slot_of(e) (StackFixture::preload_slots) and no stack exists, so no CPU expert
 // thread spins on worker 0's core, where the kernel puts every caller. Each group's bare forwards run on one Team made
-// at its first forward and kept for the phase (bare_team): a kernel forward without a Team builds and joins one per
+// at its first forward and kept for the phase (bare_runner): a forward without a Team builds and joins one per
 // call, which would time thread creation and leave no helper for the census. Stack phase (enter_stack_phase): the bare
 // Teams are joined, the Stack is built, every expert is loaded through the tier's reader, and the layers are
 // registered. A bare forward after that fails: it would share worker 0's core with the CPU expert thread and run a
@@ -304,7 +305,7 @@ class Bench {
       // ran no forward and has no Team.
       std::vector<int> expected;
       for (int g = 0; g < kGroups; ++g) {
-        if (!bare_teams_[g]) continue;
+        if (!bare_rigs_[g]) continue;
         const auto& workers = placement_.groups[g].workers;
         expected.insert(expected.end(), workers.begin() + 1, workers.end());
       }
@@ -317,7 +318,7 @@ class Bench {
   // used. Throws if the tier picks different slots. Idempotent.
   void enter_stack_phase() {
     if (stack_) return;
-    for (auto& team : bare_teams_) team.reset();  // joins the helpers
+    for (auto& rig : bare_rigs_) rig.reset();  // joins the helpers
     stack_ = std::make_unique<Stack<BenchBuild>>(stack_config(fixture_, placement_, options_));
     sim_ = std::make_unique<DeviceSim>(stack_->page(), stack_->lease(), rows(), fixture_.experts());
     const int64_t timeout_ns = int64_t{options_.wait_timeout_ms} * 1'000'000;
@@ -358,17 +359,19 @@ class Bench {
     return call;
   }
 
-  // The group's bare Team: its workers on the group's cores, worker 0 the calling thread. Idle workers PAUSE-spin
-  // (keep-warm 0, as the kernel's own throwaway Team and cpu_forward.cpp's bench team), so a bare forward never waits for
-  // a wake-up.
-  ::sglang::cpu_experts::Team& bare_team(int group) {
-    auto& team = bare_teams_.at(static_cast<size_t>(group));
-    if (!team) {
-      const std::vector<int32_t>& workers = placement_.groups[group].workers;
-      team = std::make_unique<::sglang::cpu_experts::Team>(
-          workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0);
-    }
-    return *team;
+  // The group's bare Team and its one-job-at-a-time runner: its workers on the group's cores, worker 0 the calling thread.
+  // Idle workers PAUSE-spin (keep-warm 0, as forward_alone's throwaway Team and cpu_forward.cpp's bench team), so a bare
+  // forward never waits for a wake-up.
+  struct BareRig {
+    ::sglang::cpu_experts::Team team;
+    ::sglang::cpu_experts::JobRunner<::sglang::exl3_cpu::Exl3CpuKernel> runner;
+    BareRig(std::span<const int32_t> workers)
+        : team(workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0), runner(team) {}
+  };
+  ::sglang::cpu_experts::JobRunner<::sglang::exl3_cpu::Exl3CpuKernel>& bare_runner(int group) {
+    auto& rig = bare_rigs_.at(static_cast<size_t>(group));
+    if (!rig) rig = std::make_unique<BareRig>(placement_.groups[group].workers);
+    return rig->runner;
   }
 
   // The kernel's forward on the row's bare layer (the same slabs), slots and x as the stack, from the calling thread, over
@@ -396,8 +399,7 @@ class Bench {
     call.weights = weights.data();
     call.out = out;
     try {
-      ::sglang::exl3_cpu::Exl3CpuKernel::forward(
-          bare_layers_.layers[static_cast<size_t>(row)], call, bare_team(group));
+      bare_runner(group).run(bare_layers_.layers[static_cast<size_t>(row)], call);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("the bare CPU forward failed: ") + e.what());
     }
@@ -497,10 +499,9 @@ class Bench {
   StackFixture& fixture_;
   const BareLayers& bare_layers_;  // main's, which outlives this
   std::set<int> before_;          // the process's threads before setup
-  // The bare phase's Team per group, made at its first bare forward (bare_team), on the group's workers; the helpers
-  // pin themselves, and the Team pins the calling thread to worker 0's core. Emptied by enter_stack_phase.
-  std::vector<std::unique_ptr<::sglang::cpu_experts::Team>> bare_teams_ =
-      std::vector<std::unique_ptr<::sglang::cpu_experts::Team>>(kGroups);
+  // The bare phase's Team and runner per group, made at its first bare forward (bare_runner), on the group's workers; the
+  // helpers pin themselves, and the Team pins the calling thread to worker 0's core. Emptied by enter_stack_phase.
+  std::vector<std::unique_ptr<BareRig>> bare_rigs_ = std::vector<std::unique_ptr<BareRig>>(kGroups);
   bool bare_census_ = false;
   bool stack_census_ = false;
   int64_t deadline_ns_;
