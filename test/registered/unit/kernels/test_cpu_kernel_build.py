@@ -14,11 +14,11 @@ def _flags(build, source):
     return dict(build.source_cflags)[source]
 
 
-def test_the_exl3_kernel_takes_fast_math_openmp_and_the_residual_128_options():
+def test_the_exl3_kernel_takes_fast_math_and_openmp():
     build = ckb.cpu_kernel_build("exl3", ExpertStreamConfig())
     assert build.cpp_files == ("exl3/optimized/kernel.cpp",)
     flags = _flags(build, "exl3/optimized/kernel.cpp")
-    assert {"-Ofast", "-fopenmp", "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"} <= set(flags)
+    assert {"-Ofast", "-fopenmp"} <= set(flags)
     assert "-fno-finite-math-only" not in flags  # it changes EXL3's bits
     assert build.ldflags == ("-fopenmp",)
 

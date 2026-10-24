@@ -7,8 +7,8 @@
 #include <cstdint>
 #include <vector>
 
-// Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape, Bw>;
-// generic, ForwardPlan<GenericShape, *>. Read by tests and benches to see which plan a call took.
+// Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape>;
+// generic, ForwardPlan<GenericShape>. Read by tests and benches to see which plan a call took.
 struct SglangExl3CpuPlanCalls {
     int64_t dsv41;
     int64_t generic;
@@ -17,14 +17,13 @@ struct SglangExl3CpuPlanCalls {
 // The forward plans this library compiles (forward_plan.hpp's run_plan), by the id a layer's params name. The generic
 // plan runs any layer make_layer accepts; a fixed plan runs only the layer facts its Shape (shapes.hpp) fixes.
 enum SglangExl3CpuPlan : int32_t {
-    kSglangExl3CpuPlanGeneric = 0,  // ForwardPlan<GenericShape, *>
-    kSglangExl3CpuPlanDsv41 = 1,    // ForwardPlan<Dsv41Shape, Bw>
+    kSglangExl3CpuPlanGeneric = 0,  // ForwardPlan<GenericShape>
+    kSglangExl3CpuPlanDsv41 = 1,    // ForwardPlan<Dsv41Shape>
 };
 
 // One compiled plan as exl3_cpu_plans lists it (and the host export expert_stream_cpu_kernel_plans as JSON). A fixed
-// plan accepts exactly the layer facts below; the generic plan (fixed false, facts 0) accepts any layer. available: the
-// build conditions hold (the activation layout the plan's kernels assume) and min_isa is within the kernel's tier;
-// make_layer refuses an unavailable plan.
+// plan accepts exactly the layer facts below; the generic plan (fixed false, facts 0) accepts any layer. available:
+// min_isa is within the build's tier; make_layer refuses an unavailable plan.
 struct SglangExl3CpuPlanInfo {
     int32_t id;
     const char* name;

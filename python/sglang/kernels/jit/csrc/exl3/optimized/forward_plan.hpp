@@ -1,429 +1,43 @@
-// EXL3's forward: the tier dispatch of the GEMV tiles (run_tiles), the phase helpers, the plans and the plan entry
-// (Exl3Quant::dispatch). Included by kernel.cpp.
+// EXL3's forward: the plans (ForwardPlan<Shape>), the plan entry (Exl3Quant::dispatch) and the plan registry.
+// Included by kernel.cpp.
 //
-// One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is
-// the ISA tier. The primary template is the generic plan. PlanTraits<Dsv41Shape, Isa::Bw> turns on the fast path that
-// was measured and validated bit-exact on AVX-512BW (csrc/exl3/optimized/README.txt); every other (Shape, I) pair runs
-// the generic plan. ForwardPlan<Shape, I, true> also times each phase and prints one line per forward.
+// One forward = ForwardPlan<Shape>::run, at the build's tier (kIsa). Shape (shapes.hpp) fixes what the plan may assume
+// about the layer; PlanTraits<Shape> what it turns on. The primary traits are the generic plan; PlanTraits<Dsv41Shape>
+// is the fast path measured and validated bit-exact for DeepSeek V4.1 from AVX-512BW up (README.txt).
 // Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
 // see ../LICENSE.exllamav3.
 #pragma once
-// The math headers in this order: the definition order the kernels were validated in (bit-exact per tier); another
-// order changes what GCC inlines and clones.
-#include "math_avx512.hpp"
-#include "math_avx2.hpp"
-#include "math_scalar.hpp"
-#include "shapes.hpp"
-#include "worker_trace.hpp"
+#include "phases.hpp"
 #include "tile_assignment.hpp"
+#include "worker_trace.hpp"
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <limits>
-#include <ratio>
 #include <utility>
 #include <vector>
 
 namespace sglang::exl3_cpu {
 namespace {
 
-// -------------------------------------------------------------------------------------------
-//   Dispatch
-// -------------------------------------------------------------------------------------------
-
-using TilesFn = void (*)(const Exl3Projection&, const PreparedIn&, float*, int, int);
-
-// One AVX-512 tier's GEMV tiles for `bits` and `rows` quantized rows. VBMI at 8 bits runs the VNNI tiles: byte pairing
-// is impossible there (shift % 8 == 0) and the byte windows straddle the register pairs, measured slower than the
-// dword scheme.
-template <Isa I, int bits, int rows>
-void tiles_for(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
-{
-    if constexpr (I == Isa::Vbmi && bits != 8) vbmi_tiles<bits, rows>(mat, in, tout, tn0, tn1);
-    else if constexpr (I == Isa::Vbmi || I == Isa::Vnni) vnni_tiles<bits, rows>(mat, in, tout, tn0, tn1);
-    else bw_tiles<bits, rows>(mat, in, tout, tn0, tn1);
-}
-
-template <Isa I, int bits, int... R>
-constexpr std::array<TilesFn, sizeof...(R)> tiles_rows(std::integer_sequence<int, R...>)
-{
-    return {&tiles_for<I, bits, R + 1>...};
-}
-
-template <Isa I, int... B>
-constexpr std::array<std::array<TilesFn, GENERIC_MAX_M>, sizeof...(B)> tiles_table(std::integer_sequence<int, B...>)
-{
-    return {tiles_rows<I, B + 1>(std::make_integer_sequence<int, GENERIC_MAX_M>{})...};
-}
-
-// [bits - 1][rows - 1] for bits 1..8 and rows 1..GENERIC_MAX_M (the generic plan's chunks), generated from it: a
-// larger GENERIC_MAX_M instantiates its rows here with no hand-written case.
-template <Isa I>
-constexpr auto kTiles = tiles_table<I>(std::make_integer_sequence<int, 8>{});
-
-template <Isa I>
-void run_tiles_raw(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
-{
-    if (tn0 >= tn1) return;
-    if constexpr (I == Isa::Vbmi || I == Isa::Vnni || I == Isa::Bw)
-    {
-        kTiles<I>[mat.bits - 1][m - 1](mat, in, tout, tn0, tn1);
-    }
-    else if constexpr (I == Isa::Avx2)
-    {
-        switch (mat.bits)
-        {
-            case 1: avx2_tiles<1>(mat, in, tout, m, tn0, tn1); return;
-            case 2: avx2_tiles<2>(mat, in, tout, m, tn0, tn1); return;
-            case 3: avx2_tiles<3>(mat, in, tout, m, tn0, tn1); return;
-            case 4: avx2_tiles<4>(mat, in, tout, m, tn0, tn1); return;
-            case 5: avx2_tiles<5>(mat, in, tout, m, tn0, tn1); return;
-            case 6: avx2_tiles<6>(mat, in, tout, m, tn0, tn1); return;
-            case 7: avx2_tiles<7>(mat, in, tout, m, tn0, tn1); return;
-            default: avx2_tiles<8>(mat, in, tout, m, tn0, tn1); return;
-        }
-    }
-    else
-    {
-        switch (mat.bits)
-        {
-            case 1: scalar_tiles<1>(mat, in, tout, m, tn0, tn1); return;
-            case 2: scalar_tiles<2>(mat, in, tout, m, tn0, tn1); return;
-            case 3: scalar_tiles<3>(mat, in, tout, m, tn0, tn1); return;
-            case 4: scalar_tiles<4>(mat, in, tout, m, tn0, tn1); return;
-            case 5: scalar_tiles<5>(mat, in, tout, m, tn0, tn1); return;
-            case 6: scalar_tiles<6>(mat, in, tout, m, tn0, tn1); return;
-            case 7: scalar_tiles<7>(mat, in, tout, m, tn0, tn1); return;
-            default: scalar_tiles<8>(mat, in, tout, m, tn0, tn1); return;
-        }
-    }
-}
-
-// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M. Vnni picks the vpdpwssd copy of
-// the register kernels (reg_vnni), else today's (reg_bw).
-template <bool Vnni, int... Ms>
-M1_ALWAYS_INLINE void register_tiles_for(std::integer_sequence<int, Ms...>, const Exl3Projection& mat,
-                                         const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped)
-{
-    if constexpr (Vnni)
-        (void)((m == Ms + 1 && (reg_vnni::register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
-    else
-        (void)((m == Ms + 1 && (reg_bw::register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
-}
-
-// m token rows through the quantized kernels under the accuracy options (quantize_act's layout): per
-// k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
-// worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
-template <Isa I, bool Vnni = false>
-void run_tiles(
-    const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped = false)
-{
-    if (tn0 >= tn1) return;
-    if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)
-    {
-        // One token from either plan; several only as the DSV4.1 plan's compact input (PlanTraits::kCompactScratch).
-        if ((m == 1 || in.compact) && mat.bits == 3 && act_blocked(mat.k))
-        {
-            register_tiles_for<Vnni>(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
-            return;
-        }
-    }
-    if (I == Isa::Scalar || (ACT_ROWS == 1 && !act_blocked(mat.k)))
-    {
-        run_tiles_raw<I>(mat, in, tout, m, tn0, tn1);
-        return;
-    }
-    const int rows = ACT_ROWS * m;
-    const int n = mat.n;
-    const int c0 = tn0 * 16, c1 = tn1 * 16;
-    if (!act_blocked(mat.k))
-    {
-        run_tiles_raw<I>(mat, in, tout, rows, tn0, tn1);
-    }
-    else
-    {
-        const int B = EXL3_MOE_CPU_ACT_BLOCK;
-        const int block_tiles = B / 16;
-        const size_t packed_size = static_cast<size_t>(16) * mat.bits;
-        thread_local std::vector<float> part;
-        if (part.size() < static_cast<size_t>(rows) * n) part.resize(static_cast<size_t>(rows) * n);
-        tl_swz_tiles_k = mat.k / 16;
-        for (int b = 0; b < mat.k / B; ++b)
-        {
-            Exl3Projection sub = mat;
-            sub.k = B;
-            // Native: k-tile rows are tiles_n tiles apart. Swizzled: consecutive k-tiles of an 8-tile
-            // group are 8 tiles apart, with the group stride from tl_swz_tiles_k
-            sub.trellis = mat.trellis + static_cast<size_t>(b) * block_tiles
-                                        * (mat.swz ? 8 : n / 16) * packed_size;
-            PreparedIn sub_in = in;
-            sub_in.splat32 = in.splat32 + static_cast<size_t>(b) * rows * B;
-            sub_in.splat_dup = in.splat_dup ? in.splat_dup + static_cast<size_t>(b) * rows * B : nullptr;
-            for (int i = 0; i < rows; ++i)
-            {
-                sub_in.q[i] = in.bq[b * MAX_M + i];
-                sub_in.sum_x8[i] = in.bsum[b * MAX_M + i];
-            }
-            float* dst = b ? part.data() : tout;
-            run_tiles_raw<I>(sub, sub_in, dst, rows, tn0, tn1);
-            if (b)
-                for (int i = 0; i < rows; ++i)
-                {
-                    float* t = tout + static_cast<size_t>(i) * n;
-                    const float* q = part.data() + static_cast<size_t>(i) * n;
-                    for (int c = c0; c < c1; ++c) t[c] += q[c];
-                }
-        }
-        tl_swz_tiles_k = 0;
-    }
-    for (int r = m; r < rows; ++r)
-    {
-        float* t = tout + static_cast<size_t>(r - m) * n;
-        const float* q = tout + static_cast<size_t>(r) * n;
-        for (int c = c0; c < c1; ++c) t[c] += q[c];
-    }
-}
-
-// -------------------------------------------------------------------------------------------
-//   Forward driver
-// -------------------------------------------------------------------------------------------
-
-struct ForwardCtx
-{
-    const ExpertLayer* layer;
-    const Fp16* x;
-    float* out;
-    int m_total;
-    bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
-    // Overwrite by store (OutMode::kOverwriteByStore): no zeroing up front; Accumulate stores each token's first sum
-    // (Chunk::first) and zeroes the `unrouted` tokens' rows, each worker its own columns.
-    bool store_first;
-    const int* unrouted;
-    int n_unrouted;
-    StageGate* stage_two;  // ForwardCall::stage_two: worker 0 waits on it between GateUp and Middle (null: never)
-    std::vector<Chunk> chunks;
-
-    // workspace, per chunk (pointers into the persistent per-thread arena below: fresh
-    // allocations per call cost more in first-touch page faults than the small phases do work)
-    float* tout_g;       // chunks x m x I (quant space, then transformed in place)
-    float* tout_u;
-    float* tout_d;       // chunks x m x H
-    std::vector<PreparedIn> prep_g, prep_u, prep_d;
-    // Down tiles finished per (chunk, 128-output block), when a plan splits the down GEMVs finer than a block: the
-    // worker that finishes a block's eighth tile applies its output transform.
-    int* down_tiles_done;
-    // PlanTraits::kClaimMixedChunks on a call of differing chunk sizes: the next unclaimed group of gate/up ([0]) and
-    // of down ([16], its own cache line); null: the static split.
-    int* claims = nullptr;
-};
-
-template <Isa I>
-M1_TARGET_AVX2
-void transform_out_avx2(const Exl3Projection& mat, float* tout, int m)
-{
-    const __m256 hs = _mm256_set1_ps(HAD_SCALE);
-    for (int r = 0; r < m; ++r)
-        for (int block = 0; block < mat.n; block += 128)
-        {
-            float* v = tout + static_cast<size_t>(r) * mat.n + block;
-            hadamard_128_avx2<I>(v);
-            for (int i = 0; i < 128; i += 8)
-            {
-                const __m256 s = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(
-                    reinterpret_cast<const uint16_t*>(mat.svh) + block + i)));
-                __m256 x = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(v + i), hs), s);
-                if (mat.bias)
-                    x = _mm256_add_ps(x, _mm256_cvtph_ps(_mm_loadu_si128(
-                        reinterpret_cast<const __m128i*>(
-                            reinterpret_cast<const uint16_t*>(mat.bias) + block + i))));
-                _mm256_storeu_ps(v + i, x);
-            }
-        }
-}
-
-template <Isa I>
-__attribute__((noipa)) void transform_out(const Exl3Projection& mat, float* tout, int m)
-{
-    if constexpr (I != Isa::Scalar) { transform_out_avx2<I>(mat, tout, m); return; }
-    else
-    {
-        for (int r = 0; r < m; ++r)
-            for (int block = 0; block < mat.n; block += 128)
-            {
-                float* v = tout + static_cast<size_t>(r) * mat.n + block;
-                hadamard_128<I>(v);
-                if (mat.bias)
-                    for (int i = 0; i < 128; ++i)
-                        v[i] = v[i] * HAD_SCALE * half_to_float(mat.svh[block + i])
-                               + half_to_float(mat.bias[block + i]);
-                else
-                    for (int i = 0; i < 128; ++i)
-                        v[i] *= HAD_SCALE * half_to_float(mat.svh[block + i]);
-            }
-    }
-}
-
-
-// The gated SiLU, into g: act(g) * u. A nonzero act_limit clamps the up path symmetrically and the activated gate from
-// above, BEFORE the multiply (matching the GPU act_mul kernels). DS4 ships swiglu_limit = 10 with plain silu: hidden
-// states deep into a long context push |u| into the thousands, and skipping the clamp here made offloaded experts
-// diverge arbitrarily far from their GPU-resident twins.
-inline void silu_mul(float* g, const float* u, size_t count, float act_limit)
-{
-    const float lim = act_limit != 0.0f ? act_limit : std::numeric_limits<float>::infinity();
-    for (size_t i = 0; i < count; ++i) {
-        const float gv = g[i];
-        const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
-        g[i] = av * std::clamp(u[i], -lim, lim);
-    }
-}
-
-// Same scalar/vector operations and block scale ordering as the original phase 2.
-// Blocks are independent: only their own gate/up outputs and prepared input slices are written.
-template<class Shape, Isa I, bool Wide = false>
-void middle_blocks(ForwardCtx& c,const Experts<Shape>& E,int worker,int num_workers) {
-    const int I_=Shape::intermediate(*c.layer), nb=I_/128, nc=int(c.chunks.size());
-    const int first=nc*nb*worker/num_workers,last=nc*nb*(worker+1)/num_workers;
-    for (int task=first;task<last;++task) {
-        const int j=task/nb,b=task%nb,block=b*128;
-        const auto& ch=c.chunks[j];
-        for (int r=0;r<ch.m;++r) {
-            float* g=c.tout_g+size_t(j)*MAX_M*I_+size_t(r)*I_+block;
-            float* u=c.tout_u+size_t(j)*MAX_M*I_+size_t(r)*I_+block;
-            auto gate=E.gate(ch.expert);gate.n=128;gate.svh+=block;if(gate.bias)gate.bias+=block;
-            transform_out<I>(gate,g,1);
-            auto up=E.up(ch.expert);up.n=128;up.svh+=block;if(up.bias)up.bias+=block;
-            transform_out<I>(up,u,1);
-            silu_mul(g,u,128,Shape::act_limit(*c.layer));
-
-            auto& p=c.prep_d[j];
-            float* dst=p.tin+size_t(r)*I_+block;
-            prepare_block_avx2<I>(g,false,E.down(ch.expert).suh+block,dst,128);
-            if(p.compact){compact_quantize_block<Wide>(p,r,ch.m,I_,b,dst);continue;}
-            float* residual=p.tin+size_t(r+ch.m)*I_+block;
-            for (int pass=0;pass<ACT_ROWS;++pass) {
-                const int row=r+pass*ch.m;
-                const size_t offset=size_t(b)*ACT_ROWS*ch.m*128+row*128;
-                int32_t* splat=p.splat32+offset;
-                float q;int32_t sum;
-                const float* v=pass?residual:dst;
-                quantize_row_avx2(v,splat,p.splat_dup+offset,128,q,sum);
-                p.bq[b*MAX_M+row]=q;p.bsum[b*MAX_M+row]=sum;
-                if(pass+1<ACT_ROWS) for(int i=0;i<128;++i)
-                    residual[i]=v[i]-q*float(static_cast<int8_t>(splat[i]&0xff));
-            }
-        }
-    }
-}
-
-
-template<class Shape, Isa I, bool Wide = false>
-void prepare_gu_blocks(ForwardCtx& c,const Experts<Shape>& E,int worker,int num_workers) {
-    const int K=Shape::hidden(*c.layer),nb=K/128,nc=int(c.chunks.size()),gu=2;
-    const int first=nc*gu*nb*worker/num_workers,last=nc*gu*nb*(worker+1)/num_workers;
-    for(int task=first;task<last;++task) {
-        const int j=task/nb,b=task%nb;
-        const auto& ch=c.chunks[j/gu];
-        const bool up=j%gu;
-        const Exl3Projection& mat=up?E.up(ch.expert):E.gate(ch.expert);
-        auto& p=(up?c.prep_u:c.prep_g)[j/gu];
-        for(int r=0;r<ch.m;++r) {
-            float* dst=p.tin+size_t(r)*K+b*128;
-            prepare_block_avx2<I>(c.x+size_t(ch.token[r])*K+b*128,true,mat.suh+b*128,dst,128);
-            if(p.compact){compact_quantize_block<Wide>(p,r,ch.m,K,b,dst);continue;}
-            float* residual=p.tin+size_t(r+ch.m)*K+b*128;
-            for(int pass=0;pass<ACT_ROWS;++pass) {
-                const int row=r+pass*ch.m;
-                const size_t off=size_t(b)*ACT_ROWS*ch.m*128+row*128;
-                float q;int32_t sum;const float* v=pass?residual:dst;
-                int32_t* splat=p.splat32+off;
-                quantize_row_avx2(v,splat,p.splat_dup+off,128,q,sum);
-                p.bq[b*MAX_M+row]=q;p.bsum[b*MAX_M+row]=sum;
-                if(pass+1<ACT_ROWS) for(int i=0;i<128;++i)
-                    residual[i]=v[i]-q*float(static_cast<int8_t>(splat[i]&0xff));
-            }
-        }
-    }
-}
-
-
-template <Isa I>
-void transform_owned_blocks(const Exl3Projection& mat,float* out,int m,int t0,int t1) {
-    for(int r=0;r<m;++r) for(int block=t0*16;block<t1*16;block+=128) {
-        auto sub=mat;sub.n=128;sub.svh+=block;if(sub.bias)sub.bias+=block;
-        transform_out<I>(sub,out+size_t(r)*mat.n+block,1);
-    }
-}
-
-// Coarse readiness is per expert: all gate/up outputs must exist before middle,
-// and all middle blocks must be prepared before any down output band can run.
-// The forward's phases, in team order; a barrier separates each from the next. The values index the profiling line
-// ("moe_cpu phases(us)"): 4, the old whole-row down transform, is gone (Down's owned blocks include it) and prints 0.
-// A chunk's down input row r is its gate output row r: the identity over MAX_M rows (prepare_rows' token_idx).
-constexpr std::array<int, MAX_M> kRowIndex = [] {
-    std::array<int, MAX_M> rows{};
-    for (int i = 0; i < MAX_M; ++i) rows[i] = i;
-    return rows;
-}();
-
-enum class Phase : int
-{
-    PrepareGateUp = 0,  // quantize gate/up inputs
-    GateUp = 1,         // gate/up GEMVs
-    Middle = 2,         // gate/up output transform, activation, down input
-    Down = 3,           // down GEMVs with their output transform
-    Accumulate = 5,     // routing-weighted sum into out
-};
-
-// The calling thread's scratch for every forward it runs: a plan sizes its share of it per call (prepare_scratch).
-struct ForwardArena
-{
-    std::vector<float> tin_g, tin_u, tin_d;
-    std::vector<int32_t> splat_g, splat_u, splat_d;
-    std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
-    std::vector<int16_t> compact_g, compact_u, compact_d;
-    std::vector<float> tout_g, tout_u, tout_d;
-    std::vector<PreparedIn> prep_g, prep_u, prep_d;
-    std::vector<float> bq_g, bq_u, bq_d;
-    std::vector<int32_t> bsum_g, bsum_u, bsum_d;
-    std::vector<int> down_tiles_done;
-    std::vector<int> claims;  // ForwardCtx::claims
-    std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
-    std::vector<uint8_t> written;                      // store_first: per token, whether a chunk row writes it
-    std::vector<int> unrouted;                         // store_first: the tokens no chunk row writes
-    // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
-    std::vector<Chunk> chunks;
-
-    static ForwardArena& get()
-    {
-        static thread_local ForwardArena arena;
-        return arena;
-    }
-};
-
-// What a (Shape, ISA) plan turns on. The primary template is the generic plan.
-template <class Shape, Isa I>
+// What a plan turns on. The primary template is the generic plan.
+template <class Shape>
 struct PlanTraits
 {
     static constexpr bool kCompactScratch = false;    // int16 compact activations instead of the int32 splats
-    static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed (one-token chunks: kRegisterBudget[0])
+    static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed
     static constexpr bool kWideSingleExpert = false;  // 512-wide quantization for one token through one expert
     static constexpr int kSplitTiles = 8;             // GEMV split unit in tiles (assign_gemvs)
     static constexpr bool kClaimMixedChunks = false;  // chunks of differing token counts claim groups (claim_groups)
 };
 
-// DeepSeek V4.1 on AVX-512BW: the validated fast path.
+// DeepSeek V4.1 from AVX-512BW up: the validated fast path.
 template <>
-struct PlanTraits<Dsv41Shape, Isa::Bw>
+struct PlanTraits<Dsv41Shape>
 {
     static constexpr bool kCompactScratch = true;
-    static constexpr bool kGroupedTraversal = true;
+    static constexpr bool kGroupedTraversal = true;  // one-token chunks (kRegisterBudget[0])
     static constexpr bool kWideSingleExpert = true;
     static constexpr int kSplitTiles = 2;  // compact unswizzled kernels take any tile pair (register_tiles)
     // A call whose chunks differ in token count claims 8-tile groups instead of a static split, which neither evenly
@@ -432,278 +46,235 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
     static constexpr bool kClaimMixedChunks = true;
 };
 
-// Profile: time each phase (its barrier included) on worker 0 and print "moe_cpu phases(us)" after the forward. Off,
-// the plan holds no timing code at all.
-template <class Shape, Isa I, bool Profile = false, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0, bool Vnni = false>
+template <class Shape, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0>
 struct ForwardPlan
 {
-    using Traits = PlanTraits<Shape, I>;
+    using Traits = PlanTraits<Shape>;
+    using Capture = worker_trace::Capture<Trace>;
 
     // Sizes this call's scratch from the arena, runs the team, and returns. ctx.chunks must be non-empty.
     static void run(ForwardCtx& ctx, const Experts<Shape>& E, ForwardArena& ar, Team& team)
     {
-        worker_trace::Capture<Trace> trace(team.workers(), ctx.m_total, int(ctx.chunks.size()));
+        Capture trace(team.workers(), ctx.m_total, int(ctx.chunks.size()));
         prepare_scratch(ctx, ar, trace);
-        const int nc = static_cast<int>(ctx.chunks.size());
+        const int nc = int(ctx.chunks.size());
         const bool grouped = Traits::kGroupedTraversal && nc == 1;
         const bool wide = Traits::kWideSingleExpert && ctx.m_total == 1 && nc == 1;
         trace.team_start();
-        run_team(ctx, E, team, grouped, wide, trace);
+        // The phases on the engine's team (team.hpp), every worker in step, the team's owner as worker 0.
+        team.run([&](int worker, int n) {
+            trace.worker_start(worker);
+            if (ctx.zero_out && !ctx.store_first && worker == 0)
+                std::memset(ctx.out, 0, size_t(ctx.m_total) * ctx.layer->hidden * sizeof(float));
+            step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, trace);
+            step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, trace);
+            if (ctx.stage_two) {
+                if (worker == 0) ctx.stage_two->wait();
+                team.barrier();
+            }
+            step<Phase::Middle>(ctx, E, team, worker, n, grouped, wide, trace);
+            step<Phase::Down>(ctx, E, team, worker, n, grouped, wide, trace);
+            step<Phase::Accumulate>(ctx, E, team, worker, n, grouped, wide, trace);
+            trace.worker_end(worker);
+        });
         trace.finish();
     }
 
 private:
-    static void prepare_scratch(ForwardCtx& ctx, ForwardArena& ar, worker_trace::Capture<Trace>& trace)
+    static void prepare_scratch(ForwardCtx& ctx, ForwardArena& ar, Capture& trace)
     {
         constexpr bool compact = Traits::kCompactScratch;
-        const int nc = static_cast<int>(ctx.chunks.size());
-        const int H = Shape::hidden(*ctx.layer);
-        const int I_ = Shape::intermediate(*ctx.layer);
+        const int nc = int(ctx.chunks.size());
+        const size_t H = Shape::hidden(*ctx.layer);
+        const size_t I_ = Shape::intermediate(*ctx.layer);
         auto grow = [&](auto& v, size_t n, const char* name) { trace.grow(v, n, name); };
-        grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H, "ar.tin_g");
-        grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H, "ar.tin_u");
-        grow(ar.tin_d, static_cast<size_t>(nc) * MAX_M * I_, "ar.tin_d");
-
-        if(!compact) {
-            grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_g");
-            grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_u");
-            grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I_, "ar.splat_d");
-            grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_dup_g");
-            grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_dup_u");
-            grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I_, "ar.splat_dup_d");
-        } else {
-            // Compact: each chunk's ACT_ROWS * m rows follow the previous chunk's (a call of one-token chunks keeps chunk
-            // j at j * ACT_ROWS rows).
-            size_t rows = 0;
-            for (const Chunk& ch : ctx.chunks) rows += size_t(ACT_ROWS) * ch.m;
-            grow(ar.compact_g, rows*H, "ar.compact_g");
-            grow(ar.compact_u, rows*H, "ar.compact_u");
-            grow(ar.compact_d, rows*I_, "ar.compact_d");
-        }
-        grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I_, "ar.tout_g");
-        grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I_, "ar.tout_u");
-        grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H, "ar.tout_d");
-        grow(ctx.prep_g, nc, "ctx.prep_g"); grow(ctx.prep_u, nc, "ctx.prep_u"); grow(ctx.prep_d, nc, "ctx.prep_d");
+        grow(ar.tin_g, nc * MAX_M * H, "ar.tin_g");
+        grow(ar.tin_u, nc * MAX_M * H, "ar.tin_u");
+        grow(ar.tin_d, nc * MAX_M * I_, "ar.tin_d");
+        grow(ar.tout_g, nc * MAX_M * I_, "ar.tout_g");
+        grow(ar.tout_u, nc * MAX_M * I_, "ar.tout_u");
+        grow(ar.tout_d, nc * MAX_M * H, "ar.tout_d");
+        grow(ctx.prep_g, nc, "ctx.prep_g");
+        grow(ctx.prep_u, nc, "ctx.prep_u");
+        grow(ctx.prep_d, nc, "ctx.prep_d");
         ctx.tout_g = ar.tout_g.data();
         ctx.tout_u = ar.tout_u.data();
         ctx.tout_d = ar.tout_d.data();
-        size_t row0 = 0;
-        for (int j = 0; j < nc; ++j)
-        {
-            ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
-                              compact?nullptr:(ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H),
-                              compact?nullptr:(ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_M * H), {}, {} };
-            ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_M * H,
-                              compact?nullptr:(ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H),
-                              compact?nullptr:(ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_M * H), {}, {} };
-            ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_M * I_,
-                              compact?nullptr:(ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I_),
-                              compact?nullptr:(ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I_), {}, {} };
-            if(compact) {
-                ctx.prep_g[j].compact=ar.compact_g.data()+row0*H;
-                ctx.prep_u[j].compact=ar.compact_u.data()+row0*H;
-                ctx.prep_d[j].compact=ar.compact_d.data()+row0*I_;
-                row0+=size_t(ACT_ROWS)*ctx.chunks[j].m;
+        if constexpr (compact) {
+            // Each chunk's kActRows * m rows follow the previous chunk's (a call of one-token chunks keeps chunk j at
+            // j * kActRows rows).
+            size_t rows = 0;
+            for (const Chunk& ch : ctx.chunks) rows += size_t(kActRows) * ch.m;
+            grow(ar.compact_g, rows * H, "ar.compact_g");
+            grow(ar.compact_u, rows * H, "ar.compact_u");
+            grow(ar.compact_d, rows * I_, "ar.compact_d");
+        } else {
+            grow(ar.splat_g, nc * MAX_M * H, "ar.splat_g");
+            grow(ar.splat_u, nc * MAX_M * H, "ar.splat_u");
+            grow(ar.splat_d, nc * MAX_M * I_, "ar.splat_d");
+            if constexpr (kSplatDup) {
+                grow(ar.splat_dup_g, nc * MAX_M * H, "ar.splat_dup_g");
+                grow(ar.splat_dup_u, nc * MAX_M * H, "ar.splat_dup_u");
+                grow(ar.splat_dup_d, nc * MAX_M * I_, "ar.splat_dup_d");
             }
         }
-        if constexpr (Traits::kSplitTiles < 8)
-        {
-            const size_t blocks = static_cast<size_t>(nc) * (H / 128);
+        // One scale and sum per (128-input block, quantized row).
+        const size_t sh = MAX_M * (H / kActBlock), si = MAX_M * (I_ / kActBlock);
+        grow(ar.bq_g, nc * sh, "ar.bq_g");
+        grow(ar.bq_u, nc * sh, "ar.bq_u");
+        grow(ar.bq_d, nc * si, "ar.bq_d");
+        grow(ar.bsum_g, nc * sh, "ar.bsum_g");
+        grow(ar.bsum_u, nc * sh, "ar.bsum_u");
+        grow(ar.bsum_d, nc * si, "ar.bsum_d");
+        size_t row0 = 0;
+        for (int j = 0; j < nc; ++j) {
+            const size_t g = j * MAX_M * H, d = j * MAX_M * I_;
+            PreparedIn& pg = ctx.prep_g[j];
+            PreparedIn& pu = ctx.prep_u[j];
+            PreparedIn& pd = ctx.prep_d[j];
+            pg = {ar.tin_g.data() + g, nullptr, nullptr, nullptr, ar.bq_g.data() + j * sh, ar.bsum_g.data() + j * sh, {}, {}};
+            pu = {ar.tin_u.data() + g, nullptr, nullptr, nullptr, ar.bq_u.data() + j * sh, ar.bsum_u.data() + j * sh, {}, {}};
+            pd = {ar.tin_d.data() + d, nullptr, nullptr, nullptr, ar.bq_d.data() + j * si, ar.bsum_d.data() + j * si, {}, {}};
+            if constexpr (compact) {
+                pg.compact = ar.compact_g.data() + row0 * H;
+                pu.compact = ar.compact_u.data() + row0 * H;
+                pd.compact = ar.compact_d.data() + row0 * I_;
+                row0 += size_t(kActRows) * ctx.chunks[j].m;
+            } else {
+                pg.splat32 = ar.splat_g.data() + g;
+                pu.splat32 = ar.splat_u.data() + g;
+                pd.splat32 = ar.splat_d.data() + d;
+                if constexpr (kSplatDup) {
+                    pg.splat_dup = ar.splat_dup_g.data() + g;
+                    pu.splat_dup = ar.splat_dup_u.data() + g;
+                    pd.splat_dup = ar.splat_dup_d.data() + d;
+                }
+            }
+        }
+        if constexpr (Traits::kSplitTiles < 8) {
+            const size_t blocks = nc * (H / 128);
             grow(ar.down_tiles_done, blocks, "ar.down_tiles_done");
             std::fill_n(ar.down_tiles_done.data(), blocks, 0);
             ctx.down_tiles_done = ar.down_tiles_done.data();
         }
         ctx.claims = nullptr;
-        if constexpr (Traits::kClaimMixedChunks)
-        {
+        if constexpr (Traits::kClaimMixedChunks) {
             const bool mixed = std::any_of(ctx.chunks.begin(), ctx.chunks.end(),
                                            [&](const Chunk& ch) { return ch.m != ctx.chunks.front().m; });
-            if (mixed)
-            {
+            if (mixed) {
                 grow(ar.claims, 32, "ar.claims");
                 std::fill_n(ar.claims.data(), 32, 0);
                 ctx.claims = ar.claims.data();
             }
         }
-        if (EXL3_MOE_CPU_ACT_BLOCK)
-        {
-            // Sized for one block per 16 inputs, the smallest B allows; only k / B entries are used
-            const size_t sh = static_cast<size_t>(MAX_M) * (H / 16), si = static_cast<size_t>(MAX_M) * (I_ / 16);
-            grow(ar.bq_g, nc * sh, "ar.bq_g"); grow(ar.bq_u, nc * sh, "ar.bq_u"); grow(ar.bq_d, nc * si, "ar.bq_d");
-            grow(ar.bsum_g, nc * sh, "ar.bsum_g"); grow(ar.bsum_u, nc * sh, "ar.bsum_u"); grow(ar.bsum_d, nc * si, "ar.bsum_d");
-            for (int j = 0; j < nc; ++j)
-            {
-                ctx.prep_g[j].bq = ar.bq_g.data() + j * sh; ctx.prep_g[j].bsum = ar.bsum_g.data() + j * sh;
-                ctx.prep_u[j].bq = ar.bq_u.data() + j * sh; ctx.prep_u[j].bsum = ar.bsum_u.data() + j * sh;
-                ctx.prep_d[j].bq = ar.bq_d.data() + j * si; ctx.prep_d[j].bsum = ar.bsum_d.data() + j * si;
-            }
-        }
     }
 
-    // The phases on the engine's team (team.hpp), every worker in step, the team's owner as worker 0.
-    static void run_team(ForwardCtx& ctx, const Experts<Shape>& E, Team& team, bool grouped, bool wide,
-                         worker_trace::Capture<Trace>& trace)
-    {
-        [[maybe_unused]] double phase_us[6]{};
-        team.run([&](int worker, int n) {
-            trace.worker_start(worker);
-            if (ctx.zero_out && !ctx.store_first && worker == 0)
-                std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
-            step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
-            if (ctx.stage_two) {
-                if (worker == 0) ctx.stage_two->wait();
-                team.barrier();
-            }
-            step<Phase::Middle>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::Down>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::Accumulate>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
-            trace.worker_end(worker);
-        });
-        if constexpr (Profile)
-            printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",
-                   phase_us[0], phase_us[1], phase_us[2], phase_us[3], phase_us[4], phase_us[5]);
-    }
-
-    // One phase of the team's sequence: run it, then wait for the whole team unless it is the last. Profile: phase_us
-    // is indexed by the phase's value; otherwise it is untouched.
+    // One phase of the team's sequence: run it, then wait for the whole team unless it is the last.
     template <Phase P>
     static void step(ForwardCtx& ctx, const Experts<Shape>& E, Team& team, int worker, int n, bool grouped, bool wide,
-                     [[maybe_unused]] double* phase_us, worker_trace::Capture<Trace>& trace)
+                     Capture& trace)
     {
-        using Clock = std::chrono::steady_clock;
-        [[maybe_unused]] Clock::time_point begin;
-        if constexpr (Profile) begin = Clock::now();
         trace.begin(worker, static_cast<int>(P));
         phase<P>(ctx, E, worker, n, grouped, wide, trace);
         trace.work_end(worker, static_cast<int>(P));
         if constexpr (P != Phase::Accumulate) team.barrier();
         trace.end(worker, static_cast<int>(P));
-        if constexpr (Profile) {
-            if (worker == 0)
-                phase_us[static_cast<int>(P)] = std::chrono::duration<double, std::micro>(Clock::now() - begin).count();
-        }
     }
 
     // One phase for this worker; P picks the phase at compile time, so each instantiation holds one phase's code.
     template <Phase P>
     static void phase(ForwardCtx& c, const Experts<Shape>& E, int worker, int num_workers, bool grouped, bool wide,
-                      worker_trace::Capture<Trace>& trace)
+                      Capture& trace)
     {
-        [[maybe_unused]] const int nc = static_cast<int>(c.chunks.size());
+        [[maybe_unused]] const int nc = int(c.chunks.size());
         [[maybe_unused]] const int H = Shape::hidden(*c.layer);
         [[maybe_unused]] const int I_ = Shape::intermediate(*c.layer);
 
-        if constexpr (P == Phase::PrepareGateUp)
-        {
-            if (EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && I==Isa::Bw) {
-                if (wide) prepare_gu_blocks<Shape, I, true>(c,E,worker,num_workers);
-                else prepare_gu_blocks<Shape, I, false>(c,E,worker,num_workers);
-                return;
-            }
-            // Prepare gate and up inputs, distributed over (chunk, gate/up)
-            const int gu = 2;
-            for (int j = worker; j < nc * gu; j += num_workers)
-            {
-                const Chunk& ch = c.chunks[j / gu];
-                const bool up = j % gu;
-                const Exl3Projection& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
-                PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
-            }
-        }
-        else if constexpr (P == Phase::GateUp)
-        {
-            // Gate + up GEMVs (see assign_gemvs; claim_groups for a call of differing chunk sizes)
-            const int gu = 2;
-            const auto gemv = [&](int j, int t0, int t1)
-            {
-                const Chunk& ch = c.chunks[j / gu];
-                const bool up = j % gu;
-                const Exl3Projection& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
-                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
+        if constexpr (P == Phase::PrepareGateUp) {
+#if defined(SGLANG_CPU_EXPERTS_AVX2)
+            if (wide) prepare_gate_up_blocks<Shape, true>(c, E, worker, num_workers);
+            else prepare_gate_up_blocks<Shape, false>(c, E, worker, num_workers);
+#else
+            prepare_gate_up_scalar(c, E, worker, num_workers);
+#endif
+        } else if constexpr (P == Phase::GateUp) {
+            // Gate + up GEMVs (assign_gemvs; claim_groups for a call of differing chunk sizes).
+            const auto gemv = [&](int j, int t0, int t1) {
+                const Chunk& ch = c.chunks[j / 2];
+                const bool up = j % 2;
+                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / 2];
+                float* tout = (up ? c.tout_u : c.tout_g) + size_t(j / 2) * MAX_M * I_;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
-                run_tiles<I, Vnni>(mat, p, tout, ch.m, t0, t1, grouped);
+                run_tiles(up ? E.up(ch.expert) : E.gate(ch.expert), p, tout, ch.m, t0, t1, grouped);
             };
-            if (c.claims) claim_groups(c.claims[0], nc * gu, I_ / 16, gemv);
-            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16,
-                [&](int j) { return c.chunks[j / gu].m; }, gemv, E.params.row_weighted != 0);
-        }
-        else if constexpr (P == Phase::Middle)
-        {
-            if (EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I_) && I!=Isa::Scalar) {
-                if (wide) middle_blocks<Shape, I, true>(c,E,worker,num_workers);
-                else middle_blocks<Shape, I, false>(c,E,worker,num_workers);
-                return;
-            }
-            // Output transform for gate/up, the gated SiLU into g, prepare down input; per chunk.
-            for (int j = worker; j < nc; j += num_workers) {
+            if (c.claims) claim_groups(c.claims[0], nc * 2, I_ / 16, gemv);
+            else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * 2, I_ / 16,
+                                                        [&](int j) { return c.chunks[j / 2].m; }, gemv,
+                                                        E.params.row_weighted != 0);
+        } else if constexpr (P == Phase::Middle) {
+#if defined(SGLANG_CPU_EXPERTS_AVX2)
+            if (wide) middle_blocks<Shape, true>(c, E, worker, num_workers);
+            else middle_blocks<Shape, false>(c, E, worker, num_workers);
+#else
+            middle_scalar(c, E, worker, num_workers);
+#endif
+        } else if constexpr (P == Phase::Down) {
+            // Down GEMVs (split or claimed as gate/up's are), each with its output transform.
+            const auto gemv = [&](int j, int t0, int t1) {
                 const Chunk& ch = c.chunks[j];
-                float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
-                float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I_;
-                transform_out<I>(E.gate(ch.expert), g, ch.m);
-                transform_out<I>(E.up(ch.expert), u, ch.m);
-                silu_mul(g, u, static_cast<size_t>(ch.m) * I_, Shape::act_limit(*c.layer));
-                prepare_rows<I>(E.down(ch.expert), nullptr, g, I_, kRowIndex.data(), ch.m, c.prep_d[j]);
-            }
-        }
-        else if constexpr (P == Phase::Down)
-        {
-            // Down GEMVs (claimed as gate/up's are)
-            const auto gemv = [&](int j, int t0, int t1)
-            {
-                const Chunk& ch = c.chunks[j];
-                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                const Exl3Projection down = E.down(ch.expert);
+                float* tout = c.tout_d + size_t(j) * MAX_M * H;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
-                run_tiles<I, Vnni>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
+                run_tiles(down, c.prep_d[j], tout, ch.m, t0, t1, grouped);
                 if constexpr (Traits::kSplitTiles == 8) {
-                    transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
+                    transform_owned_blocks(down, tout, ch.m, t0, t1);
                 } else {
                     // A block's tiles may come from several workers: the one that completes it transforms it. The
                     // acq_rel count makes the other workers' tile stores visible to that worker.
                     for (int b = t0 / 8; b * 8 < t1; ++b) {
                         const int done = std::min(t1, b * 8 + 8) - std::max(t0, b * 8);
-                        std::atomic_ref<int> count(c.down_tiles_done[static_cast<size_t>(j) * (H / 128) + b]);
+                        std::atomic_ref<int> count(c.down_tiles_done[size_t(j) * (H / 128) + b]);
                         if (count.fetch_add(done, std::memory_order_acq_rel) + done == 8)
-                            transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,b*8,b*8+8);
+                            transform_owned_blocks(down, tout, ch.m, b * 8, b * 8 + 8);
                     }
                 }
             };
             if (c.claims) claim_groups(c.claims[16], nc, H / 16, gemv);
             else assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
-                [&](int j) { return c.chunks[j].m; }, gemv, E.params.row_weighted != 0);
-        }
-        else
-        {
+                                                        [&](int j) { return c.chunks[j].m; }, gemv,
+                                                        E.params.row_weighted != 0);
+        } else {
             static_assert(P == Phase::Accumulate);
-            const int c0 = ((H/16) * worker / num_workers)*16;
-            const int c1 = ((H/16) * (worker+1) / num_workers)*16;
-            for (int j = 0; j < nc; ++j) {
-                const Chunk& ch = c.chunks[j];
-                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                for (int r = 0; r < ch.m; ++r) {
-                    float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
-                    const float* src = d + static_cast<size_t>(r) * H;
-                    const float w = ch.weight[r];
-                    if (c.store_first && (ch.first >> r & 1u)) {
-                        // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler
-                        // cannot see keeps the add (and its contraction) under -Ofast, so the bits match.
-                        float zero = 0.0f;
-                        asm("" : "+x"(zero));
-                        for (int col = c0; col < c1; ++col)
-                            dst[col] = w * src[col] + zero;
-                    } else {
-                        for (int col = c0; col < c1; ++col)
-                            dst[col] += w * src[col];
-                    }
+            accumulate(c, H, worker, num_workers);
+        }
+    }
+
+    // out[token] (+)= weight * down row, each worker over its own columns.
+    static void accumulate(ForwardCtx& c, int H, int worker, int num_workers)
+    {
+        const int c0 = ((H / 16) * worker / num_workers) * 16;
+        const int c1 = ((H / 16) * (worker + 1) / num_workers) * 16;
+        for (size_t j = 0; j < c.chunks.size(); ++j) {
+            const Chunk& ch = c.chunks[j];
+            const float* d = c.tout_d + j * MAX_M * H;
+            for (int r = 0; r < ch.m; ++r) {
+                float* dst = c.out + size_t(ch.token[r]) * H;
+                const float* src = d + size_t(r) * H;
+                const float w = ch.weight[r];
+                if (c.store_first && (ch.first >> r & 1u)) {
+                    // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler cannot see
+                    // keeps the add (and its contraction) under -Ofast, so the bits match.
+                    float zero = 0.0f;
+                    asm("" : "+x"(zero));
+                    for (int col = c0; col < c1; ++col) dst[col] = w * src[col] + zero;
+                } else {
+                    for (int col = c0; col < c1; ++col) dst[col] += w * src[col];
                 }
             }
-            if (c.store_first)
-                for (int i = 0; i < c.n_unrouted; ++i)
-                    std::fill(c.out + static_cast<size_t>(c.unrouted[i]) * H + c0,
-                              c.out + static_cast<size_t>(c.unrouted[i]) * H + c1, 0.0f);
         }
+        if (c.store_first)
+            for (int i = 0; i < c.n_unrouted; ++i)
+                std::fill(c.out + size_t(c.unrouted[i]) * H + c0, c.out + size_t(c.unrouted[i]) * H + c1, 0.0f);
     }
 };
 
@@ -711,40 +282,26 @@ private:
 // exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
 std::atomic<int64_t> g_plan_calls[2];
 
-// The tier this build compiles (the build's, ExpertForward::isa); every plan below is instantiated at it alone.
-constexpr Isa kPlanIsa = ExpertForward<Exl3Quant>::isa();
-
-// A template on the tier so a plan the tier lacks is never instantiated.
-template <Isa K>
-void run_plan_at(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team)
-{
-    const ExpertLayer& l = *ctx.layer;
-    if constexpr (K >= Dsv41Shape::kMinIsa) {
-        if (p.plan == Dsv41Shape::kPlan) {
-            g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
-            // The plan is written for AVX-512BW. A VNNI build (Vnni, Vbmi) runs it with the vpdpwssd register kernels.
-            const Experts<Dsv41Shape> E{&l, p};
-            if constexpr (K == Isa::Bw) ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, team);
-            else ForwardPlan<Dsv41Shape, Isa::Bw, false, EXL3_MOE_CPU_WORKER_TRACE != 0, true>::run(ctx, E, ar, team);
-            return;
-        }
-    }
-    g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
-    const Experts<GenericShape> E{&l, p};
-    ForwardPlan<GenericShape, K>::run(ctx, E, ar, team);
-}
-
-// Runs the layer's plan (p.plan, which registration checked against the layer and this build) at kPlanIsa.
+// Runs the layer's plan (p.plan, which registration checked against the layer and this build).
 void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team)
 {
-    run_plan_at<kPlanIsa>(ctx, p, ar, team);
+#if defined(SGLANG_CPU_EXPERTS_AVX512)
+    static_assert(Dsv41Shape::kMinIsa == Isa::Bw, "the DSV4.1 plan is compiled where SGLANG_CPU_EXPERTS_AVX512 is");
+    if (p.plan == Dsv41Shape::kPlan) {
+        g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
+        ForwardPlan<Dsv41Shape>::run(ctx, Experts<Dsv41Shape>{ctx.layer, p}, ar, team);
+        return;
+    }
+#endif
+    g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
+    ForwardPlan<GenericShape>::run(ctx, Experts<GenericShape>{ctx.layer, p}, ar, team);
 }
 
 // The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M tokens (GENERIC_CHUNK_M for the
-// generic plan). This grouping, not the
-// framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then token, then route), so it reads the
-// call's slots as given and runs zero-weight routes. Each weight is rounded to FP16, the registered kernel's
-// convention. ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range).
+// generic plan). This grouping, not the framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then
+// token, then route), so it reads the call's slots as given and runs zero-weight routes. Each weight is rounded to
+// FP16, the registered kernel's convention. ExpertForward has validated the call (every slot in [-1, capacity), finite
+// weights, rows and k in range).
 int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa, Team& team)
 {
     ForwardCtx ctx;
@@ -758,10 +315,14 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     ForwardArena& ar = ForwardArena::get();
     ctx.chunks = std::move(ar.chunks);
     ctx.chunks.clear();
-    ctx.prep_g = std::move(ar.prep_g); ctx.prep_u = std::move(ar.prep_u); ctx.prep_d = std::move(ar.prep_d);
+    ctx.prep_g = std::move(ar.prep_g);
+    ctx.prep_u = std::move(ar.prep_u);
+    ctx.prep_d = std::move(ar.prep_d);
     const auto give_back = [&] {
         ar.chunks = std::move(ctx.chunks);
-        ar.prep_g = std::move(ctx.prep_g); ar.prep_u = std::move(ctx.prep_u); ar.prep_d = std::move(ctx.prep_d);
+        ar.prep_g = std::move(ctx.prep_g);
+        ar.prep_u = std::move(ctx.prep_u);
+        ar.prep_d = std::move(ctx.prep_d);
     };
 
     // The live routes as (slot, route index t * k + j), sorted: each expert's routes in token, then route, order.
@@ -771,17 +332,14 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     for (int i = 0; i < n; ++i)
         if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
     std::sort(routes.begin(), routes.end());
-    // The DSV4.1 plan takes chunks of up to CHUNK_M tokens, the generic plan up to GENERIC_CHUNK_M (math.hpp).
     const int chunk_m = p.plan == Dsv41Shape::kPlan ? CHUNK_M : GENERIC_CHUNK_M;
-    for (size_t i = 0; i < routes.size();)
-    {
+    for (size_t i = 0; i < routes.size();) {
         Chunk ch;
         ch.expert = routes[i].first;
         ch.m = 0;
-        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < chunk_m; ++i, ++ch.m)
-        {
+        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < chunk_m; ++i, ++ch.m) {
             ch.token[ch.m] = routes[i].second / c.k;
-            ch.weight[ch.m] = half_to_float(float_to_fp16(c.weights[routes[i].second]));
+            ch.weight[ch.m] = fp16_to_float(float_to_fp16(c.weights[routes[i].second]));
         }
         ctx.chunks.push_back(ch);
     }
@@ -791,7 +349,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     ctx.n_unrouted = 0;
     if (ctx.store_first) {
         auto& written = ar.written;
-        written.assign(static_cast<size_t>(c.rows), 0);
+        written.assign(size_t(c.rows), 0);
         for (Chunk& ch : ctx.chunks)
             for (int r = 0; r < ch.m; ++r)
                 if (!written[ch.token[r]]) {
@@ -802,11 +360,11 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         for (int t = 0; t < c.rows; ++t)
             if (!written[t]) ar.unrouted.push_back(t);
         ctx.unrouted = ar.unrouted.data();
-        ctx.n_unrouted = static_cast<int>(ar.unrouted.size());
+        ctx.n_unrouted = int(ar.unrouted.size());
     }
     if (ctx.chunks.empty()) {
         if (ctx.stage_two) ctx.stage_two->wait();
-        if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * l.hidden * sizeof(float));
+        if (ctx.zero_out) std::memset(ctx.out, 0, size_t(ctx.m_total) * l.hidden * sizeof(float));
     } else {
         run_plan(ctx, p, ar, team);
     }
@@ -834,7 +392,7 @@ SglangExl3CpuPlanInfo plan_info()
         info.act_limit = Shape::kActLimit;
     }
     info.min_isa = isa_name(Shape::kMinIsa);
-    info.available = Shape::kBuilt && kPlanIsa >= Shape::kMinIsa;
+    info.available = kIsa >= Shape::kMinIsa;
     return info;
 }
 
@@ -845,9 +403,7 @@ const char* plan_rejects(const ExpertLayer& l, const SglangExl3CpuParams& p)
 {
     if (p.plan == GenericShape::kPlan) return nullptr;
     if (p.plan != Dsv41Shape::kPlan) return "plan is not a compiled plan id (cpu_kernel_plans)";
-    if (!Dsv41Shape::kBuilt)
-        return "plan dsv41 is not built: it needs residual activations in 128-wide blocks (ACT_ROWS 2, act block 128)";
-    if (kPlanIsa < Dsv41Shape::kMinIsa)
+    if (kIsa < Dsv41Shape::kMinIsa)
         return "plan dsv41 is not built: it needs AVX-512BW, above this build's -march (SGLANG_JIT_HOST_MARCH)";
     if (!Dsv41Shape::matches(l, p))
         return "plan dsv41 does not accept the layer: it runs hidden 5120, intermediate 2304, act_limit 10, 3-bit "

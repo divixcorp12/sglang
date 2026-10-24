@@ -3,9 +3,10 @@
 // Optimized residual/block-128 path: original packed weights, register decode,
 // compact activations, parallel preparation/middle stages, fused down transforms,
 // and cache-line output partitioning. See README.txt for measured provenance.
-// The arithmetic is math.hpp and each tier's math_scalar.hpp, math_avx2.hpp and math_avx512.hpp; the forward is
-// forward_plan.hpp (with shapes.hpp). This file defines the kernel type Exl3CpuKernel (entry.h): the quant's
-// operations (ExpertForward<Exl3Quant>), its params, plans and options.
+// The arithmetic is math.hpp and each tier's math_scalar.hpp, math_avx2.hpp and math_avx512.hpp (with the register
+// kernels, register_kernels.hpp); the forward is forward_plan.hpp (with tiles.hpp, phases.hpp and shapes.hpp). This
+// file defines the kernel type Exl3CpuKernel (entry.h): the quant's operations (ExpertForward<Exl3Quant>), its params,
+// plans and options.
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
@@ -19,8 +20,6 @@
 #include <string>
 #include <vector>
 
-// Last: the definition order the kernels were validated in (bit-exact per tier); another order changes what GCC
-// inlines and clones.
 #include "forward_plan.hpp"
 
 namespace sglang::exl3_cpu {

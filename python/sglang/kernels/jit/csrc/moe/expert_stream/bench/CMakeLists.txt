@@ -77,7 +77,8 @@ foreach(BACKEND baseline optimized)
   if(BACKEND STREQUAL "baseline")
     set(KERNEL "${CMAKE_CURRENT_BINARY_DIR}/baseline.cpp")
     set(DEFAULT_WORKERS 12)
-    set(BASELINE_DEFINE EXL3_BENCH_BASELINE=1)
+    # The vendored kernel's accuracy options: the optimized kernel's residual activations in 128-element blocks.
+    set(BASELINE_DEFINE EXL3_BENCH_BASELINE=1 EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128)
   else()
     set(KERNEL "${QUANT}/optimized/kernel.cpp")
     set(DEFAULT_WORKERS 16)
@@ -88,7 +89,6 @@ foreach(BACKEND baseline optimized)
   target_include_directories(exl3_cpu_${BACKEND} PRIVATE "${QUANT}/optimized" "${QUANT}")
   target_include_directories(exl3_cpu_${BACKEND} SYSTEM PRIVATE "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
   target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
-    EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128
     EXL3_BENCH_BACKEND="${BACKEND}" EXL3_BENCH_DEFAULT_WORKERS=${DEFAULT_WORKERS} ${BASELINE_DEFINE})
   if(EXL3_MAX_M AND NOT BACKEND STREQUAL "baseline")
     target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})
@@ -138,7 +138,6 @@ if(EXL3_TVM_FFI_ROOT)
     target_include_directories(${TARGET} SYSTEM PRIVATE "${TVM_FFI_INCLUDE}" "${DLPACK_INCLUDE}"
       "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
     target_compile_definitions(${TARGET} PRIVATE
-      EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128
       EXL3_FULL_STACK_INSTR=${INSTR} EXL3_BENCH_BACKEND="full-stack-${VARIANT}")
     if(EXL3_MAX_M)
       target_compile_definitions(${TARGET} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})

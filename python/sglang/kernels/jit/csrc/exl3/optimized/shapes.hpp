@@ -21,14 +21,13 @@ struct Chunk
 };
 
 // Each Shape is one plan's facts, which the host's cpu_kernel_plans lists and registration checks (plan_rejects): its id
-// and name, the lowest ISA tier it runs at, and whether this build compiles what it needs (kBuilt).
+// and name and the lowest ISA tier it runs at.
 struct GenericShape
 {
     static constexpr bool kFixed = false;
     static constexpr int32_t kPlan = kSglangExl3CpuPlanGeneric;
     static constexpr const char* kName = "generic";
     static constexpr Isa kMinIsa = Isa::Scalar;
-    static constexpr bool kBuilt = true;
     static int hidden(const ExpertLayer& l) { return l.hidden; }
     static int intermediate(const ExpertLayer& l) { return l.intermediate; }
     static float act_limit(const ExpertLayer& l) { return l.act_limit; }
@@ -39,11 +38,9 @@ struct Dsv41Shape
     static constexpr bool kFixed = true;
     static constexpr int32_t kPlan = kSglangExl3CpuPlanDsv41;
     static constexpr const char* kName = "dsv41";
-    // The plan is written for AVX-512BW; a VNNI host runs it with the vpdpwssd register kernels (run_plan).
-    static constexpr Isa kMinIsa = Isa::Bw;
-    // Its kernels read residual (two-row) activations in 128-wide blocks, and its chunks hold 1..CHUNK_M tokens
+    // Its register kernels need AVX-512BW (a VNNI build accumulates with vpdpwssd); its chunks hold 1..CHUNK_M tokens
     // (register_tiles<M>, kRegisterBudget), which Exl3Quant::dispatch makes for this plan.
-    static constexpr bool kBuilt = ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128;
+    static constexpr Isa kMinIsa = Isa::Bw;
     static constexpr int kHidden = 5120, kIntermediate = 2304, kBitsW13 = 3, kBitsW2 = 3, kSwizzled = 0;
     static constexpr float kActLimit = 10.0f;
     static constexpr int hidden(const ExpertLayer&) { return kHidden; }

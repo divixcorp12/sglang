@@ -24,9 +24,6 @@ _KERNEL_CXX = ("-std=c++20", "-Ofast", "-pthread", "-fopenmp", *_HIDDEN)
 # The vendored GGML subset relies on C's implicit void* conversions.
 _KERNEL_C = ("-x", "c", "-std=c11", "-Ofast", "-fvisibility=hidden")
 
-# The EXL3 kernel's accuracy options: residual activation quantization in 128-element blocks.
-OPTIMIZED_CPU_DEFINES = ("-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128")
-
 
 class CpuKernelBuild(msgspec.Struct, frozen=True):
     """One format's kernel as the host module builds it: its sources, the flags each takes in place of the module's,
@@ -102,7 +99,7 @@ def _exl3(config: ExpertStreamConfig) -> CpuKernelBuild:
     if config.cpu_experts.enabled or config.draft.cpu_experts:
         check_optimized_act_options()
         check_kernel_compiler()
-    defines = (*OPTIMIZED_CPU_DEFINES, *max_m_defines(), *worker_trace_defines(config))
+    defines = (*max_m_defines(), *worker_trace_defines(config))
     return CpuKernelBuild(
         cpp_files=("exl3/optimized/kernel.cpp",),
         source_cflags=(("exl3/optimized/kernel.cpp", (*_KERNEL_CXX, *defines)),),

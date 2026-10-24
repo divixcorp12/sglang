@@ -43,16 +43,8 @@ const char* plan_rejects(const ExpertLayer& l, const SglangExl3CpuParams& p);
 inline Exl3Projection exl3_projection(
     const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits, int swz)
 {
-    Exl3Projection m;
-    m.trellis = reinterpret_cast<const uint16_t*>(trellis);
-    m.suh = reinterpret_cast<const Fp16*>(suh);
-    m.svh = reinterpret_cast<const Fp16*>(svh);
-    m.bias = nullptr;
-    m.k = k;
-    m.n = n;
-    m.bits = bits;
-    m.swz = swz;
-    return m;
+    return {reinterpret_cast<const uint16_t*>(trellis), reinterpret_cast<const Fp16*>(suh),
+            reinterpret_cast<const Fp16*>(svh), nullptr, k, n, bits, swz, k / 16};
 }
 
 struct Exl3Quant

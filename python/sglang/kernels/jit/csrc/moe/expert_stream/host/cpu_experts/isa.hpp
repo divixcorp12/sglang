@@ -7,6 +7,21 @@
 #error "the CPU experts framework needs GCC or Clang on x86-64 Linux"
 #endif
 
+// The build's tiers as preprocessor flags, for code that holds a tier's instructions and so must not be compiled
+// below it. Each tier needs every feature its code is written for, fma and f16c included; kBuildIsa is the same test.
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#define SGLANG_CPU_EXPERTS_AVX2 1
+#endif
+#if defined(SGLANG_CPU_EXPERTS_AVX2) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+#define SGLANG_CPU_EXPERTS_AVX512 1
+#if defined(__AVX512VNNI__)
+#define SGLANG_CPU_EXPERTS_VNNI 1
+#if defined(__AVX512VBMI__)
+#define SGLANG_CPU_EXPERTS_VBMI 1
+#endif
+#endif
+#endif
+
 // For code that must compile its tier's instructions whatever the build's -march (keep_warm.hpp's loops).
 #define SGLANG_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
 #define SGLANG_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
@@ -20,17 +35,14 @@ namespace {
 enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
 template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I == Isa::Vbmi;
 
-// Each tier needs every feature its code is written for, fma and f16c included.
 constexpr Isa kBuildIsa =
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__FMA__) && defined(__F16C__)
-#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+#if defined(SGLANG_CPU_EXPERTS_VBMI)
     Isa::Vbmi;
-#elif defined(__AVX512VNNI__)
+#elif defined(SGLANG_CPU_EXPERTS_VNNI)
     Isa::Vnni;
-#else
+#elif defined(SGLANG_CPU_EXPERTS_AVX512)
     Isa::Bw;
-#endif
-#elif defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#elif defined(SGLANG_CPU_EXPERTS_AVX2)
     Isa::Avx2;
 #else
     Isa::Scalar;

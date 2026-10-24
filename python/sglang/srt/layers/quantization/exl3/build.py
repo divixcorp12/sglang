@@ -26,7 +26,6 @@ def main():
 
     os.environ["CXX"] = args.cxx  # host_arch_flags resolves -march with $CXX
     cmd = [args.cxx, "-Ofast", *host_arch_flags(), "-std=c++20", "-fPIC", "-shared", "-pthread", "-fopenmp",
-           "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128",
            "-I" + str(src), str(src / "kernel.cpp"), "-o", str(output)]
     subprocess.run(cmd, check=True)
     print(output)

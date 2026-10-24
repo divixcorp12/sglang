@@ -48,7 +48,7 @@ struct __attribute__((visibility("hidden"))) Exl3CpuKernel {
     static std::string plans_json();
     // The forwards since load by the plan they took: [dsv41, generic].
     static std::vector<int64_t> plan_calls();
-    // The most tokens a chunk holds in this build (math.hpp's CHUNK_M = MAX_M / ACT_ROWS).
+    // The most tokens a chunk holds in this build (math.hpp's CHUNK_M = MAX_M / kActRows).
     static int64_t chunk_m();
     // The kernel's options from Python's config, before its first forward: the worker trace (SGLANG_EXPERT_STREAM_TRACE's
     // cpu_worker and gate_path; worker_trace.hpp), which only a -DEXL3_MOE_CPU_WORKER_TRACE=1 build records.
