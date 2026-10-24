@@ -180,13 +180,4 @@ private:
     mutable std::atomic<int32_t> sink_{0};  // keeps the register work observable
 };
 
-// A forward of `Kernel` (a format's kernel type) on a team made for this call alone, `threads` workers with worker i
-// on cores[i] (empty: unpinned): tests, the bench and other harnesses that hold no Team. The engine runs on its own.
-template <class Kernel>
-void forward_alone(const typename Kernel::Layer& layer, const ForwardCall& call, std::span<const int> cores, int threads)
-{
-    Team team(cores, threads, &Kernel::warm, 0);
-    Kernel::forward(layer, call, team);
-}
-
 }  // namespace sglang::cpu_experts

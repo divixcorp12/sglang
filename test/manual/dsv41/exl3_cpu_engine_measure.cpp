@@ -2,6 +2,7 @@
 // linked into this library (the driver builds exl3/optimized/kernel.cpp with it, as the host module does).
 #include "exl3/optimized/entry.h"
 #include "moe/expert_stream/host/cpu_experts.h"
+#include "moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include <barrier>
 #include <cstdio>
 #include <exception>

@@ -3,6 +3,7 @@
 #pragma once
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp"
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/routes.hpp"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include <atomic>
 #include <cmath>
 #include <thread>

@@ -28,6 +28,7 @@
 // python/sglang/kernels/ops/moe/expert_stream_transport.py.
 #pragma once
 
+#include "cpu_experts/single_job.hpp"
 #include "ffi_exports.h"
 #include "gate_scorer.h"
 #include <algorithm>
