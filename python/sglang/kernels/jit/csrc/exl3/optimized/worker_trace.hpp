@@ -61,8 +61,8 @@ inline Options installed_options() {
     return state.options;
 }
 }  // namespace
-// Keep the plan's phase IDs: 0,1,2,3,5 (4 is an old, now-fused output-transform phase).
-inline constexpr int kWorkers = 64, kPhases = 6, kActivePhases = 5;
+// Keep the plan's phase IDs: 0,1,2,3 (4 and 5, an old output-transform phase and the accumulate, are fused into Down).
+inline constexpr int kWorkers = 64, kPhases = 6, kActivePhases = 4;
 struct PhaseStamp {
     int64_t begin = 0, work_end = 0, end = 0;
     int64_t cpu_begin = 0, cpu_work_end = 0, cpu_end = 0, units = 0;
@@ -266,7 +266,7 @@ template<> struct Capture<true> {
                 growths, initialized_bytes, capacity_added_bytes, rows, chunks};
         }
         for (int w = 0; w < n; ++w) for (int p = 0; p < kPhases; ++p) {
-            if (p == 4) continue;
+            if (p >= kActivePhases) continue;
             const auto& s = workers[w];
             b.events[b.used++] = Record{s.phase[p], forward_begin, stop, team_begin, stop, serial,
                 s.minflt, s.majflt, s.nvcsw, s.nivcsw, w, p, s.tid, s.cpu, n, rows, chunks, s.enter, s.ready};
