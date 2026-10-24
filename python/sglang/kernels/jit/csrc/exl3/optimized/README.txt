@@ -7,9 +7,11 @@ There is no persistent weight repacking or increase in expert weight storage.
 
 Selection
 ---------
+Every build quantizes activations the same way: each token row to int8 in 128-input blocks, one scale per block, plus
+its residual as a second row (math.hpp's kActRows and kActBlock; there is no other flavor).
 For a call whose chunks each hold 1..CHUNK_M tokens (CHUNK_M = MAX_M / 2; MAX_M is
-EXL3_MOE_CPU_MAX_M: 4 in the source, 16 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304, residual activation rows,
-128-element quantization blocks, 3-bit unswizzled matrices and AVX512BW:
+EXL3_MOE_CPU_MAX_M: 4 in the source, 16 in the server's build via SGLANG_EXL3_CPU_MAX_M), with H=5120, I=2304,
+3-bit unswizzled matrices and AVX512BW:
   one expert, one token: range3_unroll (range-aware neighboring-band traversal);
   other one-token chunks: unroll_small (one-band traversal);
   chunks of M > 1 tokens: register_tiles<M>, all M tokens sharing each decoded tile,
@@ -18,7 +20,7 @@ EXL3_MOE_CPU_MAX_M: 4 in the source, 16 in the server's build via SGLANG_EXL3_CP
 On a VNNI host one-token chunks accumulate the decoded product bytes with vpdpbusd (no byte sum)
 and larger chunks with vpdpwssd; on AVX-512BW alone, vpmaddwd + vpaddd. The generic plan splits
 calls into chunks of at most 4 tokens (GENERIC_CHUNK_M) whatever MAX_M.
-kRegisterBudget (math_avx512.hpp) holds one entry per M and a static_assert keeps each
+kRegisterBudget (register_kernels.hpp) holds one entry per M and a static_assert keeps each
 within 32 zmm; raising MAX_M needs an entry per new M. The measured multiple-expert
 counts are 3 and 5; counts 2, 4 and above 5 use the same default but have no
 measured performance claim. Every chunk size is bit-identical to the generic plan
@@ -70,8 +72,9 @@ refused call throws std::invalid_argument and a failed one another std::exceptio
 
 SGLang integration
 ------------------
-With SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 (or the draft's CPU experts) the host module's kernel is always the
-residual=1, block=128 flavor: the accuracy flags can be left unset, and a flag set to any other value is refused. The
+With SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 (or the draft's CPU experts) the vendored kernel's accuracy flags
+(SGLANG_EXL3_CPU_ACT_RESIDUAL, SGLANG_EXL3_CPU_ACT_BLOCK) can be left unset, and a value other than this kernel's
+(residual, 128) is refused. The
 exllamav3 extension (quantization/exl3/ext.py) no longer builds this kernel: with CPU experts on it compiles upstream's
 own cpu/moe_mul1.cpp as it is. Before starting SGLang, set:
 
@@ -94,28 +97,35 @@ teams and other simultaneous consumers of the same cores.
 
 Code layout
 -----------
-math.hpp holds the arithmetic every tier shares (state decode, Hadamard, activation quantization) and
-math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; forward_plan.hpp holds the tier
-dispatch, the forward driver and the plans; kernel.cpp defines Exl3CpuKernel (entry.h). Registration, validation, the ISA
-tier, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp);
-projection.hpp holds Exl3Projection and half.hpp the fp16 type.
+  math.hpp              build constants (kIsa, MAX_M, kActRows, kActBlock), unroll/with_count, the format tables and
+                        scalar decode, the Hadamard transform, PreparedIn and the activation quantization
+  math_scalar.hpp       Tiles<Scalar>
+  math_avx2.hpp         Tiles<Avx2>
+  math_avx512.hpp       Tiles<Bw | Vnni | Vbmi>: one band driver (band_tiles) over BandRows<Isa>, each tier's decode and
+                        integer accumulate
+  register_kernels.hpp  the 3-bit register kernels (register_tiles<M>, kRegisterBudget): the DSV4.1 plan's GEMVs
+  tiles.hpp             run_tiles: a chunk's GEMV on the build's tier (register kernels, or Tiles per 128-input block)
+  phases.hpp            ForwardCtx, ForwardArena and the phases' work besides the GEMVs (prepare, transform, SiLU)
+  forward_plan.hpp      PlanTraits, ForwardPlan<Shape>, Exl3Quant::dispatch and the plan registry
+  shapes.hpp            the plans' Shapes and Chunk; quant.hpp Exl3Quant and Experts<Shape>; projection.hpp
+                        Exl3Projection; half.hpp the fp16 type; kernel.cpp Exl3CpuKernel (entry.h)
+Registration, validation, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant>.
 The tier is compile-time: the build's -march (isa.hpp's kBuildIsa: AVX512VBMI+VNNI Vbmi, AVX512VNNI Vnni, AVX512BW Bw,
-AVX2 Avx2, else Scalar), and only that tier's plans are compiled. A lower tier is a build at a lower -march
-(SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). The host installs the worker-trace options
-(Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself. A forward is
-ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
-picked once per layer, at registration: the layer's params name a plan id (ForwardPlan<Dsv41Shape, Isa::Bw>, compiled
-from the Bw tier up, or ForwardPlan<GenericShape, I> for the build's tier), Python choosing it from the list
-the host's cpu_kernel_plans returns (each plan's facts, ISA floor and availability) by the layer's facts, and make_layer
-refusing a plan that does not accept the layer or that this build does not compile (plan_rejects, forward_plan.hpp).
-Exl3Quant::dispatch then runs p.plan with no per-call check. In a VNNI build (tier Vnni or Vbmi) the same
-plan runs with its Vnni flag set: its register kernels (register_kernels.hpp, included once as reg_bw and once as
-reg_vnni by math_avx512.hpp) accumulate with vpdpwssd instead of vpmaddwd + vpaddd, bit-identically (the 16-bit byte sums
-and activation pairs are unchanged; both forms wrap mod 2^32). A Bw build runs the reg_bw copy.
-PlanTraits<Dsv41Shape, Isa::Bw> is the one
-specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and wide single-expert quantization (one token).
-MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile tables (kTiles) and the
-register dispatch (register_tiles_for) are generated from it. A plan reads every layer fact
+AVX2 Avx2, else Scalar), and only that tier is compiled: code holding a tier's instructions sits under isa.hpp's
+SGLANG_CPU_EXPERTS_{AVX2,AVX512,VNNI,VBMI} flags, not per-function target attributes. A lower tier is a build at a lower
+-march (SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). The host installs the worker-trace
+options (Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself. A forward is
+ForwardPlan<Shape>::run (forward_plan.hpp) at the build's tier, picked once per layer, at registration: the layer's
+params name a plan id (ForwardPlan<Dsv41Shape>, compiled from the Bw tier up, or ForwardPlan<GenericShape>), Python
+choosing it from the list the host's cpu_kernel_plans returns (each plan's facts, ISA floor and availability) by the
+layer's facts, and make_layer refusing a plan that does not accept the layer or that this build does not compile
+(plan_rejects, forward_plan.hpp). Exl3Quant::dispatch then runs p.plan with no per-call check. The register kernels
+accumulate with the build's instructions: vpdpwssd on a VNNI tier, vpmaddwd + vpaddd on Bw, bit-identically (the 16-bit
+byte sums and activation pairs are unchanged; both forms wrap mod 2^32).
+PlanTraits<Dsv41Shape> is the one specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and
+wide single-expert quantization (one token).
+MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiles' row counts and the register
+dispatch (with_count<CHUNK_M>) are generated from it. A plan reads every layer fact
 through its Shape (shapes.hpp): GenericShape from the ExpertLayer, Dsv41Shape as compile-time constants (5120/2304,
 3-bit gate/up and down, unswizzled, activation limit 10; a layer with any other value takes the generic plan). The
 generic plan decodes gate/up at bits_w13 and down at bits_w2. Every layer is gated SiLU.
