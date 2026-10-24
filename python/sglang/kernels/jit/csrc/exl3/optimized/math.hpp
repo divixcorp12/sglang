@@ -63,8 +63,8 @@ constexpr int GENERIC_CHUNK_M = GENERIC_MAX_M / kActRows;
 
 constexpr uint32_t kMul1Mult = 0x83DCD12Du;
 constexpr float kHadScale = 0.088388347648f;
-// k_inv, fp16 0x1eee, as the register kernels spell it. mul1_k_inv() is the same value converted at run time, which
-// the other tiers' epilogues read: each spelling is the one its kernels were validated bit-exact with.
+// k_inv, fp16 0x1eee, as the register kernels spell it. mul1_k_inv() is the same value, opaque to the compiler: as a
+// constant, -Ofast reassociates the scalar tier's decode multiply and changes its bits (all 72 gate outputs, 2026-10-24).
 constexpr float kMul1KInv = 0x1.bb8p-8f;
 
 inline float mul1_k_inv()
