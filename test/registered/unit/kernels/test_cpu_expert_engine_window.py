@@ -63,6 +63,15 @@ def _runs_avx2() -> bool:
     return {"avx2", "fma", "f16c", "bmi1", "bmi2"} <= _cpu_flags()
 
 
+def _tvm_includes() -> list[str]:
+    """The engine's headers name tvm-ffi's tensor type (reader_base.h); the harness uses none of it."""
+    try:
+        from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
+    except ImportError:
+        pytest.skip("tvm_ffi is not installed")
+    return [f"-I{path}" for path in dict.fromkeys([find_include_path(), find_dlpack_include_path()])]
+
+
 def _build(tmp_path, name, defines, kernel, flags, kernel_flags=()):
     exe = tmp_path / name
     objects = []
@@ -74,7 +83,8 @@ def _build(tmp_path, name, defines, kernel, flags, kernel_flags=()):
     else:
         objects = [str(kernel)]
     subprocess.run(
-        [CXX, *CXX_FLAGS, *defines, *flags, "-march=x86-64", str(HARNESS), *objects, "-fopenmp", "-o", str(exe)],
+        [CXX, *CXX_FLAGS, *defines, *flags, *_tvm_includes(), "-march=x86-64", str(HARNESS), *objects, "-fopenmp",
+         "-o", str(exe)],
         check=True,
     )
     return exe

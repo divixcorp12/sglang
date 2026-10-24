@@ -114,8 +114,9 @@ The tier is compile-time: the build's -march (isa.hpp's kBuildIsa: AVX512VBMI+VN
 AVX2 Avx2, else Scalar), and only that tier is compiled: code holding a tier's instructions sits under isa.hpp's
 SGLANG_CPU_EXPERTS_{AVX2,AVX512,VNNI,VBMI} flags, not per-function target attributes. A lower tier is a build at a lower
 -march (SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). The host installs the worker-trace
-options (Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself (the worker trace records
-nothing in a -DEXL3_MOE_CPU_WORKER_TRACE=1 build until the engine's window feeds it). A call is one job (entry.h's job
+options (Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself (the worker trace is fed by
+no job: a job's phases are not one team forward. The instr engine's job trace, SGLANG_EXPERT_STREAM_TRACE's job.prefix,
+holds a `cpu_run` event per run of tasks -- slot, phase, worker, tasks and TSC cycles -- from the window). A call is one job (entry.h's job
 interface): prepare_job at admission, then five phases of tasks any worker may run, ForwardPlan<Shape> at the build's
 tier, picked once per layer, at registration:
   PrepareGateUp  (chunk, gate | up, 128-input block): transform and quantize          80 tasks for one DSV4.1 expert
