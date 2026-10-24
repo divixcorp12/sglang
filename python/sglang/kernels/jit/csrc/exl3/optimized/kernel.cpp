@@ -57,17 +57,17 @@ const char* Exl3CpuKernel::name() noexcept { return Forward::name(); }
 
 Exl3CpuKernel::Params Exl3CpuKernel::params(std::span<const int64_t> values)
 {
-    if (values.size() != 5)
-        throw std::invalid_argument("EXL3 CPU params are [bits_w13, bits_w2, swizzled, row_weighted, plan], got "
+    if (values.size() != 4)
+        throw std::invalid_argument("EXL3 CPU params are [bits_w13, bits_w2, swizzled, plan], got "
                                     + std::to_string(values.size()) + " values");
     // Refused here rather than narrowed into a value make_layer would accept.
-    for (size_t i = 0; i < 4; ++i)
+    for (size_t i = 0; i < 3; ++i)
         if (values[i] < INT16_MIN || values[i] > INT16_MAX)
             throw std::invalid_argument("EXL3 CPU params: " + std::to_string(values[i]) + " does not fit int16");
-    if (values[4] < INT32_MIN || values[4] > INT32_MAX)
-        throw std::invalid_argument("EXL3 CPU params: plan " + std::to_string(values[4]) + " does not fit int32");
+    if (values[3] < INT32_MIN || values[3] > INT32_MAX)
+        throw std::invalid_argument("EXL3 CPU params: plan " + std::to_string(values[3]) + " does not fit int32");
     return {static_cast<int16_t>(values[0]), static_cast<int16_t>(values[1]), static_cast<int16_t>(values[2]),
-            static_cast<int16_t>(values[3]), static_cast<int32_t>(values[4])};
+            static_cast<int32_t>(values[3])};
 }
 
 Exl3CpuKernel::Layer Exl3CpuKernel::make_layer(const Layer& shape) { return Forward::make_layer(shape); }

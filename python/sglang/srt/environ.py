@@ -1426,14 +1426,6 @@ class Envs:
     # keeps chunks of at most 4 tokens. 0 keeps the kernel source's default (4). A nonzero value builds into its own
     # extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
     SGLANG_EXL3_CPU_MAX_M = EnvInt(16)
-    # Experiment-only; retire with plan 2026-10-07-dsv41-row-weighted-serving-experiment. Whose EXL3 CPU expert layers
-    # split their gate/up and down output tiles by chunk row count instead of evenly
-    # (csrc/exl3/optimized/tile_assignment.hpp): "draft", "target" or "both"; empty keeps the original assignment
-    # everywhere. Per layer at run time, not a build flavor: the same arithmetic in another worker's hands. The launch
-    # gate requires the named source's CPU experts. The DSV4.1 plan claims 8-tile groups dynamically whenever a call's
-    # chunks differ in token count (PlanTraits::kClaimMixedChunks), the only calls row weighting changes, so there the
-    # setting has no effect: it still weights the generic plan's layers.
-    SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT = EnvStr("")
     # The optimized EXL3 CPU kernel is compiled into the expert-stream host module, with CXX, which must be GCC 15
     # (kernels/ops/moe/cpu_kernel_build.py check_kernel_compiler). When set it must name the same compiler as CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
@@ -2561,6 +2553,11 @@ _LEASES_ALWAYS_ON_NOTE = (
     "Unset this env."
 )
 
+_ROW_WEIGHTED_REMOVED_NOTE = (
+    "Row-weighted tile assignment was removed on 2026-10-24: EXL3 CPU tasks go to whichever worker is free. A set "
+    "value is ignored. Unset this env."
+)
+
 
 # The single registry for deprecated environment variables, processed once at
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
@@ -2654,6 +2651,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         )
     },
     "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": _DeprecatedEnv(note=_HIT_WAIT_GONE_NOTE),
+    "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": _DeprecatedEnv(note=_ROW_WEIGHTED_REMOVED_NOTE),
 }
 
 

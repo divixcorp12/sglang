@@ -64,7 +64,7 @@ The service side is the concrete kernel type Exl3CpuKernel (entry.h; binding.hpp
 where the host sees it and defined in kernel.cpp (hidden visibility). The host calls it directly: Python passes no
 address. Python makes each streamed layer with the kernel's make_layer (ExpertStreamHost.set_cpu_layer) from a
 CpuExpertLayerSpec (Exl3CpuQuantTrait.layer_spec): the pinned tier's six slab base pointers and per-slot strides, with
-the layer's parameter list [bits_w13, bits_w2, swizzled, row_weighted, plan] as int64 values; Exl3CpuKernel::params builds
+the layer's parameter list [bits_w13, bits_w2, swizzled, plan] as int64 values; Exl3CpuKernel::params builds
 the SglangExl3CpuParams (entry.h) from them and make_layer validates it. A layer (ExpertLayer<SglangExl3CpuParams>,
 kernel.hpp) is a value of views with its params stored in it: the caller keeps the slabs alive. Every forward and
 keep-warm carries its worker cores (distinct, in [0, CPU_SETSIZE)); a core that cannot be pinned fails the call. A

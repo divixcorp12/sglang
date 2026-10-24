@@ -82,8 +82,7 @@ class Exl3CpuQuantTrait:
 
     ``act_limit`` is the SwiGLU clamp the layers run with; the RAM-miss service fills it in at the first registration when it is
     ``None``. ``swizzled`` selects the band-contiguous weight layout, which is
-    bit-identical to the native one. ``row_weighted`` splits the layers' output tiles among the workers by chunk row
-    count (tile_assignment.hpp), bit-identical too. ``config`` is the process's resolved config (default
+    bit-identical to the native one. ``config`` is the process's resolved config (default
     ``resolved_config()`` when first needed). The plan list comes from the host module the layers run on
     (:meth:`attach_host`).
     """
@@ -98,12 +97,10 @@ class Exl3CpuQuantTrait:
         self,
         act_limit: Optional[float],
         swizzled: bool = False,
-        row_weighted: bool = False,
         config: Optional[ResolvedConfig] = None,
     ):
         self.act_limit = act_limit
         self.swizzled = swizzled
-        self.row_weighted = row_weighted
         self._config = config
         self._host: Any = None
         self._plan_list: Optional[tuple[Exl3CpuPlan, ...]] = None
@@ -189,7 +186,7 @@ class Exl3CpuQuantTrait:
     def _params(self, facts: Exl3LayerFacts, plan: int) -> tuple[int, ...]:
         """The kernel's parameter list (kernel.h's ``SglangExl3CpuParams`` fields in order); the host builds and
         validates the struct."""
-        return (facts.bits_w13, facts.bits_w2, facts.swizzled, int(self.row_weighted), plan)
+        return (facts.bits_w13, facts.bits_w2, facts.swizzled, plan)
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
         """The layer's six slabs by base pointer and row size, and the kernel's parameter list, naming the plan

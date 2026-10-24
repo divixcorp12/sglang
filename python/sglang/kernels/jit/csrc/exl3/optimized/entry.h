@@ -12,7 +12,7 @@
 #include <vector>
 
 // A layer's params: the host builds this struct from the int64 list Python passes ([bits_w13, bits_w2, swizzled,
-// row_weighted, plan]; Exl3CpuKernel::params), so Python never restates its layout. slabs: w13_trellis, w13_suh,
+// plan]; Exl3CpuKernel::params), so Python never restates its layout. slabs: w13_trellis, w13_suh,
 // w13_svh, w2_trellis, w2_suh, w2_svh (exl3_expert_format.EXL3_STREAMED_NAMES order); slot s of each starts s *
 // slot_bytes[i] in, w13 rows holding gate then up. hidden and intermediate are multiples of 128 in [128, 8192];
 // activation 0 (gated SiLU, clamped at act_limit when it is nonzero). A layer stores views.
@@ -20,8 +20,6 @@ struct SglangExl3CpuParams {
     int16_t bits_w13;      // gate and up trellis bits per weight, 1..8
     int16_t bits_w2;       // down trellis bits per weight, 1..8
     int16_t swizzled;      // 0 or 1: band-contiguous trellis layout; an 8-bit projection is never swizzled
-    int16_t row_weighted;  // 0 or 1, and ignored: tasks are claimed by whichever worker is free (job interface), so no
-                           // layer splits its tiles by chunk row count any more
     int32_t plan;          // a SglangExl3CpuPlan (kernel.h); make_layer refuses one that does not accept the layer
 };
 

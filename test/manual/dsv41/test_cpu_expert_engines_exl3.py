@@ -121,16 +121,14 @@ def _facts(bits_w13, bits_w2, swizzled=0):
     )
 
 
-# The kernel's parameter list (Exl3CpuKernel::params): bits_w13, bits_w2, swizzled, row_weighted, plan.
+# The kernel's parameter list (Exl3CpuKernel::params): bits_w13, bits_w2, swizzled, plan.
 GENERIC, DSV41 = 0, 1  # kernel.h's SglangExl3CpuPlan
 
 
 def test_the_trait_lists_the_params_make_layer_reads():
     trait, _ = _kernel()
-    weighted = _trait(row_weighted=True)
-    assert trait._params(_facts(3, 3), DSV41) == (3, 3, 0, 0, DSV41)
-    assert trait._params(_facts(4, 2, swizzled=1), GENERIC) == (4, 2, 1, 0, GENERIC)
-    assert weighted._params(_facts(3, 5), GENERIC) == (3, 5, 0, 1, GENERIC)
+    assert trait._params(_facts(3, 3), DSV41) == (3, 3, 0, DSV41)
+    assert trait._params(_facts(4, 2, swizzled=1), GENERIC) == (4, 2, 1, GENERIC)
 
 
 def test_the_host_lists_the_kernels_plans_generic_first():
@@ -158,12 +156,6 @@ def _refused(trait, slabs, params):
     return str(refused.value)
 
 
-def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
-    trait, _ = _kernel()
-    why = _refused(trait, _random_slabs(20261008, HIDDEN, INTER), (3, 3, 0, 2, GENERIC))
-    assert "row_weighted must be 0 or 1" in why
-
-
 @pytest.mark.parametrize(
     "bits_w13, bits_w2, swizzled, limit, plan, why",
     [
@@ -183,69 +175,7 @@ def test_registration_refuses_a_plan_that_does_not_accept_the_layer(bits_w13, bi
         pytest.skip("the DSV4.1 plan needs AVX-512BW")
     trait = _trait(act_limit=limit)
     slabs = _random_slabs(20261008, HIDDEN, INTER, bits_w13=bits_w13, bits_w2=bits_w2)
-    assert why in _refused(trait, slabs, (bits_w13, bits_w2, swizzled, 0, plan))
-
-
-def _seeded_routes(seed, rows, k):
-    g = torch.Generator().manual_seed(seed)
-    slots = [sorted(torch.randperm(CAP, generator=g)[:k].tolist()) for _ in range(rows)]
-    weights = [torch.softmax(torch.randn(k, generator=g), 0).tolist() for _ in range(rows)]
-    return slots, weights
-
-
-# Shapes whose chunks hold different row counts. Six rows as a verify, five as a draft block; experts repeated across rows as
-# the DSpark calls repeat them, plus seeded random routing.
-MIXED_ROUTES = [
-    ([[0], [0], [1], [2], [3], [4]], [[1.0]] * 6),
-    ([[0, 1, 2], [0, 3, 4], [1, 2, 5], [3, 4, 5], [1, 3, 0], [2, 4, 5]], [[0.5, 0.3, 0.2]] * 6),
-    ([[0, 1, 2], [0, 3, 4], [1, 2, 5], [3, 4, 5], [0, 1, 2]], [[0.5, 0.3, 0.2]] * 5),
-    _seeded_routes(20261008, 5, 3),
-    _seeded_routes(20261009, 6, 4),
-]
-
-
-@pytest.mark.parametrize("slots, weights", MIXED_ROUTES)
-@pytest.mark.parametrize("threads", [2, 4, 10])
-def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slots, weights, threads):
-    """The kernel ignores a layer's row_weighted flag (tasks go to whichever worker is free, and no worker owns a
-    tile's arithmetic): on the production build, a layer made with it gives the original layer's output bit for bit,
-    through the DSV4.1 plan the serving kernel runs."""
-    from sglang.kernels.ops.moe import expert_stream_transport as es
-
-    monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
-    trait, _ = _kernel()
-    if len(CORES) < threads:
-        pytest.skip(f"needs {threads} cores in the affinity mask")
-    cores = CORES[:threads]  # ten workers: a serving group's team
-    weighted = _trait(row_weighted=True)
-    slabs = _random_slabs(20261008, HIDDEN, INTER)
-    specs = {name: t.layer_spec(slabs, CAP) for name, t in [("original", trait), ("weighted", weighted)]}
-    for spec in specs.values():
-        # Python chose each layer's plan at registration: the DSV4.1 plan is the one serving runs.
-        assert spec.plan.startswith("EXL3 CPU plan dsv41 ("), spec.plan
-    layers = {name: es.kernel_layer(spec, variant="prod") for name, spec in specs.items()}
-    g = torch.Generator().manual_seed(20261008)
-    x = (torch.randn(len(slots), HIDDEN, generator=g) * 4.0).half()
-
-    def forward(layer):
-        out = torch.full((len(slots), HIDDEN), float("nan"))
-        status, why = es.kernel_forward(
-            layer, x, torch.tensor(slots, dtype=torch.int32), torch.tensor(weights, dtype=torch.float32), out,
-            threads=threads, cores=cores[:threads], variant="prod",
-        )
-        assert (status, why) == (0, "")
-        return out
-
-    def run(_):
-        return [forward(layers["original"]), forward(layers["weighted"]), forward(layers["original"])]
-
-    try:
-        (original, weighted_out, again), = _on_threads(run, [None])
-        assert torch.isfinite(original).all() and torch.equal(original, again)
-        assert torch.equal(weighted_out, original)
-    finally:
-        for layer in layers.values():
-            es.kernel_drop(layer, variant="prod")
+    assert why in _refused(trait, slabs, (bits_w13, bits_w2, swizzled, plan))
 
 
 def test_two_core_groups_at_once_match_one_group_bit_for_bit(monkeypatch):

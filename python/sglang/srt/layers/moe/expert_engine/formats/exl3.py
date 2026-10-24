@@ -410,20 +410,10 @@ class Exl3ExpertFormat:
 
     @staticmethod
     def cpu_trait(*, source: str):
-        """The EXL3 CPU kernel's quant trait for ``source``'s layers ("draft" or "target").
-
-        Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice.
-        """
-        from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
+        """The EXL3 CPU kernel's quant trait for ``source``'s layers ("draft" or "target"); both run the same one."""
         from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-        row_weighted = source in row_weighted_sources()
-        logger.info(
-            "CPU experts: the %s's EXL3 layers use %s tile assignment",
-            source,
-            "row-weighted" if row_weighted else "even",
-        )
-        return Exl3CpuQuantTrait(act_limit=None, row_weighted=row_weighted)
+        return Exl3CpuQuantTrait(act_limit=None)
 
     def prepare_host_rows(
         self, layer: torch.nn.Module, name: str, tensor: torch.Tensor

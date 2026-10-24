@@ -659,7 +659,6 @@ class Exl3CpuConfig(_Config):
         "act_residual": "SGLANG_EXL3_CPU_ACT_RESIDUAL",
         "act_block": "SGLANG_EXL3_CPU_ACT_BLOCK",
         "max_m": "SGLANG_EXL3_CPU_MAX_M",
-        "row_weighted": "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT",
         "pin": "SGLANG_EXL3_MOE_CPU_PIN",
         "small_workers": "SGLANG_EXL3_MOE_CPU_SMALL_WORKERS",
     }
@@ -667,8 +666,6 @@ class Exl3CpuConfig(_Config):
     act_residual: bool = False
     act_block: int = 0
     max_m: int = 16
-    # "", "draft", "target" or "both".
-    row_weighted: str = ""
     # None leaves the vendored kernel's own default, which pins workers to the first cores; the engine needs "0".
     pin: Optional[str] = None
     small_workers: int = 0

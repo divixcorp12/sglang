@@ -35,7 +35,6 @@ from sglang.srt.arg_groups.expert_stream_requirements import (
     register_expert_stream_requirements,
 )
 from sglang.srt.environ import InsertOnMissStage, envs
-from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
 from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
 from sglang.srt.layers.moe.cpu_experts.threading_config import (
     check_not_reserved,
@@ -144,22 +143,6 @@ def check_dspark_cpu_experts(cfg) -> None:
 _EAGER_VERIFY_REMEDY = "or pass --cuda-graph-backend-decode disabled to run the DSpark verify eagerly"
 # The target's CPU experts compute in the captured graph's copy wait, so its verify cannot go eager.
 _CPU_EXPERTS_VERIFY_REMEDY = "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS serves the DSpark verify only in the decode graph"
-
-
-def _check_row_weighted_assignment() -> None:
-    """A named source's CPU experts must be on: the option would otherwise log a change no kernel runs."""
-    resolved = resolved_config()
-    needs = {
-        "draft": ("SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS", resolved.stream.draft.cpu_experts),
-        "target": ("SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS", resolved.stream.cpu_experts.enabled),
-    }
-    for source in sorted(row_weighted_sources(resolved.exl3.cpu)):
-        name, on = needs[source]
-        if not on:
-            raise ValueError(
-                f"SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT={resolved.exl3.cpu.row_weighted} needs "
-                f"{name}=1: it weights the {source}'s EXL3 CPU expert layers"
-            )
 
 
 def _check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY) -> None:
@@ -295,7 +278,6 @@ def _check(cfg, budgets) -> None:
         return
     if stream.draft.cpu_experts:
         check_dspark_cpu_experts(cfg)
-    _check_row_weighted_assignment()
     _check_ram_prefetch()
     _check_mirror_caps()
     cpu_experts = stream.cpu_experts.enabled
