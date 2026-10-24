@@ -363,12 +363,17 @@ private:
         return nullptr;
     }
 
-    // Takes a run of tasks of phase `ph`: max(align, remaining / 2n) rounded up to align, at most what remains. A CAS
-    // and not a fetch_add: a stale view of a recycled slot must be able to fail without moving the new job's cursor.
-    // Relaxed: the phase's inputs came with the acquire of ready_, and the cursor orders nothing else.
+    // Takes a run of tasks of phase `ph`: count / n rounded up to align, at most what remains. That is the static
+    // split's share: a run is one contiguous range, which the EXL3 band traversal needs long (shrinking runs of
+    // remaining / 2n put half its time in single-band kernels, experts:3 at 1.15x), and a worker that finishes early
+    // still takes the next. A CAS and not a fetch_add: a stale view of a recycled slot must be able to fail without
+    // moving the new job's cursor. Relaxed: the phase's inputs came with the acquire of ready_, and the cursor orders
+    // nothing else.
     bool claim(Slot& s, uint32_t gen, int ph, int count, int& t0, int& t1)
     {
         const int align = std::max(s.align_[ph].load(std::memory_order_relaxed), 1);
+        const int n = team_.workers();
+        const int share = ((count + n - 1) / n + align - 1) / align * align;
         std::atomic<uint64_t>& cursor = s.cursor_[ph].v;
         uint64_t v = cursor.load(std::memory_order_relaxed);
         for (;;) {
@@ -376,8 +381,7 @@ private:
             const int next = int(uint32_t(v));
             const int remaining = count - next;
             if (remaining <= 0) return false;
-            int run = std::max(align, remaining / (2 * team_.workers()));
-            run = std::min((run + align - 1) / align * align, remaining);
+            const int run = std::min(share, remaining);
             if (cursor.compare_exchange_weak(v, v + uint64_t(run), std::memory_order_relaxed)) {
                 t0 = next, t1 = next + run;
                 return true;
