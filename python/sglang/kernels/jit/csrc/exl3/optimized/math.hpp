@@ -63,15 +63,8 @@ constexpr int GENERIC_CHUNK_M = GENERIC_MAX_M / kActRows;
 
 constexpr uint32_t kMul1Mult = 0x83DCD12Du;
 constexpr float kHadScale = 0.088388347648f;
-// k_inv, fp16 0x1eee, as the register kernels spell it. mul1_k_inv() is the same value converted at run time, which
-// the other tiers' epilogues read: each spelling is the one its kernels were validated bit-exact with.
+// 1/K of the mul1 decode: the fp16 0x1eee.
 constexpr float kMul1KInv = 0x1.bb8p-8f;
-
-inline float mul1_k_inv()
-{
-    static const float v = fp16_to_float(Fp16{uint16_t(0x1eee)});
-    return v;
-}
 
 #define EXL3_ALWAYS_INLINE __attribute__((always_inline))
 
@@ -212,7 +205,7 @@ inline float decode_mul1_scalar(uint16_t state)
 {
     const uint32_t x = static_cast<uint32_t>(state) * kMul1Mult;
     const int sum = (x & 0xff) + ((x >> 8) & 0xff) + ((x >> 16) & 0xff) + (x >> 24);
-    return (static_cast<float>(sum) - 510.0f) * mul1_k_inv();
+    return (static_cast<float>(sum) - 510.0f) * kMul1KInv;
 }
 
 // -------------------------------------------------------------------------------------------

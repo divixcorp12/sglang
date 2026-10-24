@@ -152,7 +152,7 @@ struct Tiles<Isa::Avx2>
                 accumulate_tile<bits>(preg, in.splat_dup + tile_k * 16, mat.k, m, acc);
             }
             for (int i = 0; i < m; ++i) {
-                const float scale = mul1_k_inv() * in.q[i];
+                const float scale = kMul1KInv * in.q[i];
                 const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
                 float* out = tout + size_t(i) * mat.n + tile_n * 16;
                 _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr));

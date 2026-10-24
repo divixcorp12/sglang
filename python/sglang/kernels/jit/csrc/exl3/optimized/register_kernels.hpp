@@ -541,7 +541,7 @@ void bw3_blocked_tile(const Exl3Projection& mat, const PreparedIn& in, float* to
             bw3_rows(p0, p1, splat, B, acc, pf);
         }
         for (int i = 0; i < 2; ++i) {
-            const float scale = mul1_k_inv() * in.bq[kb * MAX_M + i];
+            const float scale = kMul1KInv * in.bq[kb * MAX_M + i];
             const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.bsum[kb * MAX_M + i]) * scale);
             const __m512 v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[i]), _mm512_set1_ps(scale), corr);
             if (kb == 0) sums[i] = v;
