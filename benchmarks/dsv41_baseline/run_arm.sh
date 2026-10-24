@@ -77,7 +77,7 @@ max_tokens=128
 warmup_session_id='fb-financebench_id_04209'
 health_timeout_s=${DSV41_HEALTH_TIMEOUT_S:-900}  # a DSpark arm starts in ~15+ min; both_cpu_ab.py sets more for it
 max_warmup_rounds=12  # a live trace run showed decode tok/s still climbing at round 5
-expert_shard_dir=/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw
+expert_shard_dir=/mnt/nvme0/dsv41-1071/dsv41-1017  # arm_env.EXPERT_DIR
 
 abort() { echo "ABORT: $*" >&2; exit 1; }
 pyrun() { PYTHONPATH="$here:$worktree/python:$worktree/scripts/dsv41" "$py" "$@"; }

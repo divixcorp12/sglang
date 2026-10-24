@@ -1,0 +1,26 @@
+{
+  "stage": "Task-mechanism scope review only; selected full histories still require action/result/final review",
+  "score_inputs_read_for_selection": false,
+  "categories": {
+    "tool_persistence_indexer": {
+      "admit_prefixes": ["143ece2570ac", "dcf088033647", "14418c52473d", "a77b32d92af4", "477ef18e9ad4", "b0665ad373b3", "88c3e91d5ee6", "f5e2acf3ca50", "e97e1b91a515", "ef89f58b4dbd", "1ce980cdf3f3", "496d064419d8", "fc934db95632", "1f09a151c816"],
+      "reason": "Database encoding, ORM/schema codegen, deletion/cascade behavior, persistent-object teardown, SQL projection rendering, persisted-query resolution, DB driver wrapping, cache invalidation, SQL grants, graph ingestion, asynchronous persisted startup status, revision tracking, complete bundle migration or configuration persistence."
+    },
+    "tool_typed_api": {
+      "admit_prefixes": ["035eb4adf7e6", "71e26f9091e9", "176687fb80e9", "087007ae85c3", "c945918522b1", "c4a462c2c723", "51ea0b3a8738", "f0bb4f234bfd", "034a618cf87d", "86d5789a9d4d", "87fa27096e34", "1c508a40da1a", "8a5c923828f8"],
+      "reason": "OpenAPI/schema integration, route parameter typing, request/response deserialization, enum/UUID/null handling, URL composition, identity-provider parameters, SDK retries, malformed HTTP requests, duration annotations, instrumentation attributes, streamed event parsing or typed prompt APIs."
+    },
+    "tool_statistical_evidence": {
+      "admit_prefixes": ["647f30ad9a57", "294b8ad963fc", "26fcec7c91be", "ff184d51680b", "2861e15c5a60", "3f4fbe001f22", "af9bbe5c5dab"],
+      "reason": "Causal-method evidence, Bayesian estimation/annotation/cognition, statistical evidence assessment and empirical group-difference study design. Reserve keyword riddles and broad social summaries without a statistical-method objective."
+    },
+    "finance_risk_methods": {
+      "admit_prefixes": ["55c7ed36db99", "d48022038cd9", "938765831317", "47c8403a299d", "281ecd98145c"],
+      "reason": "Financial-data privacy, portfolio constraint optimization and econometric/ML early-warning modeling for corporate misconduct. Reserve company-news summaries and unrelated portfolio-journal keyword matches."
+    },
+    "finance_empirical_methods": {
+      "admit_prefixes": ["55c7ed36db99", "f58571596a8a", "47c8403a299d", "281ecd98145c", "723af22433e0", "b25037321e00", "938765831317"],
+      "reason": "Empirical demand estimation after shocks, financial-data privacy and financial-report/governance fraud modeling. Reserve market-direction predictions, nonquantitative company comparisons and health-system cost summaries."
+    }
+  }
+}

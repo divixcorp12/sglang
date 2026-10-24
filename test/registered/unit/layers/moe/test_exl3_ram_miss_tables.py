@@ -25,9 +25,7 @@ class _Checkpoint:
         self.s = ram_miss_setup(tmp_path, capacity=2, layers=LAYERS, experts=EXPERTS, mirror_weights=weights)
         self.source = str(tmp_path)
         self.weights = (1.0,) if weights is None else tuple(weights)
-        self.images = ri.open_row_images(
-            self.s.roots, self.s.layout, self.s.fmt.segment_map(), self.source, range(LAYERS)
-        )
+        self.images = ri.open_row_images(self.s.roots, self.s.layout, self.source, range(LAYERS))
         self.image = self.images.layout
 
     @property
@@ -35,7 +33,7 @@ class _Checkpoint:
         return self.s.tables
 
     def build(self, **kwargs):
-        return exl3_ram_miss_tables(self.s.layout, self.s.fmt.segment_map(), self.s.slabs, **kwargs)
+        return exl3_ram_miss_tables(self.s.layout, self.s.slabs, **kwargs)
 
     def clipped(self, policy):
         split = policy.plan(self.image.row_stride)
@@ -115,6 +113,36 @@ def test_the_policy_is_planned_once(tmp_path):
 
     ck.build(roots=ck.s.roots, policy=Counting((1.0, 1.0)), row_images=ck.images)
     assert calls == [ck.image.row_stride]
+
+
+def test_a_mixed_k_checkpoint_gets_each_layers_own_extents_sizes_and_segments(tmp_path):
+    """Derived property: each layer's extents, file size, segments and slab row sizes come from its own image layout
+    (layer 1 is K2, its rows smaller than layer 0's K3), and the slot is the largest layer's image. One image layout
+    applied to every layer would read past a K2 layer's file and scatter its bytes at K3 offsets."""
+    s = ram_miss_setup(tmp_path, capacity=2, layers=LAYERS, experts=EXPERTS, layer_bits={1: (2, 2)})
+    images = ri.open_row_images(s.roots, s.layout, str(tmp_path), range(LAYERS))
+    t = s.tables
+    small, large = images.layouts[1], images.layouts[0]
+    assert small.image_bytes < large.image_bytes and t.slot_bytes == large.image_bytes
+    for row, image in enumerate((large, small)):
+        assert t.extents[row, :, 0].tolist() == [
+            [row, expert * image.row_stride, image.image_bytes, 0] for expert in range(EXPERTS)
+        ]
+        assert int(t.file_sizes[row]) == os.path.getsize(t.paths[row]) == EXPERTS * image.row_stride
+        assert t.row_bytes[row].tolist() == list(image.row_bytes)
+        assert t.segments[row].tolist() == [
+            [n, 0, image.name_offsets[n], image.row_bytes[n]] for n in range(len(image.row_bytes))
+        ]
+
+
+def test_a_slab_sized_for_another_layer_is_refused(tmp_path):
+    """Negative branch of the per-layer slab check: a K2 layer handed K3-sized slabs (one layer's row sizes taken for
+    every layer) is refused, naming the layer, before the native reader could write K2 rows at K3 strides."""
+    s = ram_miss_setup(tmp_path, capacity=2, layers=LAYERS, experts=EXPERTS, layer_bits={1: (2, 2)})
+    images = ri.open_row_images(s.roots, s.layout, str(tmp_path), range(LAYERS))
+    wrong = {0: s.slabs[0], 1: s.slabs[0]}
+    with pytest.raises(ValueError, match="layer 1 .*slab rows hold"):
+        exl3_ram_miss_tables(s.layout, wrong, roots=s.roots, policy=StaticSplitPolicy((1.0,)), row_images=images)
 
 
 def test_tables_without_row_images_are_refused_naming_the_converter(tmp_path):

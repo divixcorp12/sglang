@@ -1018,7 +1018,6 @@ def test_prod_server_args_serve_the_prod_mode_on_port_7867_on_all_interfaces():
         max_total_tokens=arm_env.PROD_DSPARK_MAX_TOTAL_TOKENS,
         drop_cache_after_load=True,
         decode_warmup=True,
-        dspark_sts_path=arm_env.PROD_DSPARK_STS_PATH,
     ).argv()
     assert prod[prod.index("--host") + 1] == "0.0.0.0"
     assert prod[prod.index("--port") + 1] == "7867"
@@ -1230,8 +1229,8 @@ def test_the_recipes_expert_pools_with_or_without_siblings_leave_the_driver_help
 
 
 def test_every_jit_build_and_the_exl3_cpu_kernel_use_gcc_15():
-    # The optimized EXL3 CPU kernel is validated on GCC 15 (ext.py check_cpu_compiler). CXX moves sglang's JIT builds
-    # (host C++, and nvcc's host half through -ccbin) to the same compiler.
+    # The optimized EXL3 CPU kernel is validated on GCC 15 (cpu_kernel_build.py check_kernel_compiler) and built into the
+    # host module with CXX, which moves sglang's JIT builds (host C++, and nvcc's host half through -ccbin) to it.
     env = arm_env.base_env()
     assert env["SGLANG_EXL3_CPU_CXX"] == "/opt/rh/gcc-toolset-15/root/usr/bin/g++"
     assert env["CXX"] == arm_env.EXL3_CPU_CXX

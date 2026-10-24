@@ -24,9 +24,9 @@ original native pool; the optimized kernel uses OpenMP. Separate processes keep
 one backend's idle workers from contaminating the other's measurements. The
 baseline source is the repo's csrc/exl3/moe_mul1.cpp, not a frozen snapshot.
 
-There is no Python at configure, build or runtime. The binaries link ATen/c10
-from LibTorch or the server's installed torch directory, not Python bindings or
-libtorch_python. Google Benchmark v1.9.4 is pinned and fetched at configure if
+There is no Python at configure, build or runtime. The optimized kernel uses no torch; the fixture reader and the
+vendored baseline (built against exl3/baseline_moe_mul1.h) link ATen/c10 from LibTorch or the server's installed
+torch directory, not Python bindings or libtorch_python. Google Benchmark v1.9.4 is pinned and fetched at configure if
 not installed; set EXL3_FETCH_BENCHMARK=OFF for offline dependency management.
 The kernel compiles with the validated GCC15 -Ofast -march=native options; the
 harness compiles without fast-math so its finite-output checks work.
@@ -112,19 +112,15 @@ equal-team comparison append --workers=16. The existing isolation must include
 all active CPUs. The script writes binary hashes, affinity/cgroup context, logs
 and Google JSON results to a new directory and refuses to reuse an existing one.
 
-ISA tier: by default the scripts (run.sh, ab.sh, run_full_stack.sh) run the
-host's tier (vnni on divix01). A caller's EXL3_BENCH_MAX_ISA (scalar|avx2|bw|vnni|
-vbmi, case-insensitive) caps it: EXL3_BENCH_MAX_ISA=bw bash run.sh ... measures
-the old bw path. The scripts pass it to the optimized and full-stack binaries as
---max-isa (the server's SGLANG_EXPERT_STREAM_CPU_MAX_ISA), and to the vendored
-baseline as its own EXL3_MOE_CPU_MAX_ISA, which it reads at load. The kernels cap
-but never raise the tier and ignore an unrecognized value. Every process prints
-"isa tier <tier>" at startup and puts isa_tier in its Google JSON context; each
-results directory's isa.txt gathers the lines and the requested cap, and
-environment.txt records the cap too. Read the tier from there, not from the
-variable.
+ISA tier: the optimized and full-stack binaries run the tier of their build's
+-march (cmake -DEXL3_MARCH=..., default native: vnni on divix01; skylake-avx512
+builds bw, x86-64-v3 avx2, x86-64 scalar, though these benches need AVX-512BW). The
+vendored baseline detects the host's tier at load; run.sh's EXL3_BENCH_MAX_ISA
+(scalar|avx2|bw|vnni|vbmi) caps it as its own EXL3_MOE_CPU_MAX_ISA. Every process
+prints "isa tier <tier>" at startup and puts isa_tier in its Google JSON context;
+each results directory's isa.txt gathers the lines. Read the tier from there.
 
-Single-process examples (the tier is the host's; add --max-isa=bw to cap it):
+Single-process examples (the tier is the build's -march):
   export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
   export OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
   "$build/exl3_cpu_optimized" --validate-only

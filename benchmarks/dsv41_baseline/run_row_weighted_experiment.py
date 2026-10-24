@@ -47,7 +47,7 @@ def main():
         parser.error("At least two rounds and sixteen iterations are required")
     args.output.mkdir(parents=True, exist_ok=False)
     references = args.output / "routed-references"
-    env = dict(os.environ, OMP_NUM_THREADS="10", OMP_DYNAMIC="FALSE", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", SGLANG_EXPERT_STREAM_CPU_MAX_ISA="bw")
+    env = dict(os.environ, OMP_NUM_THREADS="10", OMP_DYNAMIC="FALSE", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", SGLANG_JIT_HOST_MARCH="skylake-avx512")
     for key in list(env):
         if "TRACE" in key and (key.startswith("EXL3_") or key.startswith("SGLANG_")):
             del env[key]

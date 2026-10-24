@@ -23,6 +23,25 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     assert env["SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS"] == "1"  # the recipe's, kept
 
 
+def test_the_pinned_row_sizes_are_the_served_checkpoints():
+    """arm_env records each layer's pinned row so the launch floor is known before the server starts; the server sizes
+    its slabs from the checkpoint itself. A new export (other bit widths) must update the record, or the floor misjudges
+    the tier. Runs where the checkpoint is (divix01)."""
+    import os
+
+    import pytest
+
+    if not os.path.isdir(arm_env.EXPERT_DIR):
+        pytest.skip(f"{arm_env.EXPERT_DIR} is not on this machine")
+    from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+    from sglang.srt.layers.moe.exl3_row_image import row_image_layouts
+
+    layout = build_exl3_expert_layout(arm_env.EXPERT_DIR)
+    images = row_image_layouts(layout, range(layout.num_layers))
+    assert layout.num_layers == arm_env.PROD_PINNED_LAYERS
+    assert tuple(images[layer].image_bytes for layer in range(layout.num_layers)) == arm_env.PROD_PINNED_ROW_BYTES_BY_LAYER
+
+
 def test_prod_serves_the_dspark_mode_with_its_own_settings():
     assert arm_env.PROD_DSPARK is True
     assert arm_env.prod_env() == arm_env.arm_env({**arm_env.dspark_env(), **arm_env.prod_dspark_env()})
@@ -33,8 +52,9 @@ def test_prod_serves_the_dspark_mode_with_its_own_settings():
 # MERGE_PLAN_1016.md: production is the best served arm, RAM prefetch included, with both startup calibrations on.
 PROD_DSPARK_SETTINGS = {
     "SGLANG_EXPERT_STREAM_PINNED_HOST_FULL_LAYERS": ",".join(str(layer) for layer in range(40)),
-    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "197086",
-    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:98543,1:98543",
+    # The 1017 checkpoint (2026-10-23): K2 layers 18-22 hold smaller rows (arm_env.PROD_PINNED_ROW_BYTES_BY_LAYER).
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_MB": "188900",
+    "SGLANG_EXPERT_STREAM_PINNED_HOST_NUMA_MB": "0:94450,1:94450",
     # Master, 2026-10-22: the DIRECT insert score without eager routes, decay 0.999, newcomer probation.
     "SGLANG_EXPERT_STREAM_ENABLE_HOT_INSERT_EAGER_COUNTS": "0",
     "SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_DECAY": "0.999",
@@ -103,8 +123,9 @@ def test_prod_leaves_the_pending_and_held_flags_off():
 
 def test_prod_runs_the_sampled_confidence_cut_without_block_verification_or_the_greedy_draft():
     # DSV_OPTIMIZATION.md 3.12, owner 2026-10-18: the cut for sampled requests with the draft's time in T(w) and no
-    # online refit, on the fitted STS file. Block verification and the greedy draft stay off; STS collection is off.
+    # online refit. Block verification and the greedy draft stay off; STS collection is off.
     # Owner, 2026-10-20: T(w) is refit live every 32 timed cut verifies (DSV_OPTIMIZATION.md 3.12).
+    # Owner, 2026-10-23: no STS file, the cut reads the head at T=1 (arm_env.PROD_DSPARK_STS_PATH's comment).
     env = arm_env.prod_env()
     assert {k: env[k] for k in arm_env.PROD_DSPARK_CUT_ENV} == {
         "SGLANG_DSPARK_CONFIDENCE_CUT": "1",
@@ -115,12 +136,12 @@ def test_prod_runs_the_sampled_confidence_cut_without_block_verification_or_the_
     }
     assert "SGLANG_DSPARK_STS_COLLECT_PATH" not in env and env.get("SGLANG_DSPARK_USE_GREEDY_DRAFT", "0") == "0"
     argv = arm_env.ServerArgs.prod().argv()
-    assert argv[argv.index("--speculative-dspark-confidence-sts-path") + 1] == arm_env.PROD_DSPARK_STS_PATH
+    assert "--speculative-dspark-confidence-sts-path" not in argv
     assert "--speculative-use-block-verification" not in argv
     # The arms build on dspark_env(), which states none of it.
     assert not any("DSPARK_STS" in k or "CONFIDENCE_CUT" in k for k in arm_env.dspark_env())
     assert "--speculative-dspark-confidence-sts-path" not in arm_env.ServerArgs(port=1, dspark=True).argv()
-    # The fitted STS file: a production asset path with its digest pinned.
+    # The fitted STS file the cut arms load: a production asset path with its digest pinned.
     assert arm_env.PROD_DSPARK_STS_PATH.startswith("/data/models/slang/prod-assets/dspark-sts/")
     assert len(arm_env.PROD_DSPARK_STS_SHA256) == 64
 
@@ -153,14 +174,14 @@ PREFETCH_PREFIXES = (
 )
 
 
-def test_prod_serves_the_best_arms_prefetch_with_the_checksummed_head():
+def test_prod_serves_the_best_arms_prefetch_with_the_head_off_until_refit():
     env = arm_env.prod_env()
     prefetch = {k: v for k, v in env.items() if k.startswith(PREFETCH_PREFIXES)}
     head = prefetch.pop("SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD")
     legacy = "SGLANG_EXPERT_STREAM_LEGACY_PREFETCH_MAX_CANDIDATES"
     assert {**prefetch, legacy: env[legacy]} == SERVED_PREFETCH
-    assert head == arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD
-    assert head.startswith("/data/models/slang/prod-assets/") and len(arm_env.PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) == 64
+    # The head was trained on the pre-1017 model's routes; "" is the native candidate select.
+    assert head == ""
     # The arms keep their own: dspark_env() states no prefetch.
     assert not any(k.startswith(PREFETCH_PREFIXES) for k in arm_env.dspark_env())
 
@@ -173,21 +194,11 @@ def test_check_prod_assets_accepts_the_pinned_digest_and_refuses_any_other(tmp_p
     head = tmp_path / "head.safetensors"
     head.write_bytes(b"weights")
     sha = hashlib.sha256(b"weights").hexdigest()
-    sts = tmp_path / "sts.json"
-    sts.write_bytes(b"temperatures")
-    sts_sha = hashlib.sha256(b"temperatures").hexdigest()
-    assert arm_env.check_prod_assets(str(head), sha, str(sts), sts_sha) == (
-        f"prefetch head verified: {head} sha256 {sha}\nconfidence STS file verified: {sts} sha256 {sts_sha}"
-    )
+    assert arm_env.check_prod_assets(str(head), sha) == f"prefetch head verified: {head} sha256 {sha}"
     with pytest.raises(SystemExit, match="not the pinned"):
-        arm_env.check_prod_assets(str(head), "0" * 64, str(sts), sts_sha)
+        arm_env.check_prod_assets(str(head), "0" * 64)
     with pytest.raises(SystemExit, match="is missing"):
-        arm_env.check_prod_assets(str(tmp_path / "none"), sha, str(sts), sts_sha)
-    # The cut's STS file is checked the same way: a wrong digest or a missing file refuses the launch.
-    with pytest.raises(SystemExit, match="STS file .* has sha256 .*, not the pinned " + "0" * 64):
-        arm_env.check_prod_assets(str(head), sha, str(sts), "0" * 64)
-    with pytest.raises(SystemExit, match="STS file .*none.* is missing"):
-        arm_env.check_prod_assets(str(head), sha, str(tmp_path / "none"), sts_sha)
+        arm_env.check_prod_assets(str(tmp_path / "none"), sha)
 
 
 def test_prod_argv_carries_its_memory_and_the_arms_keep_theirs():

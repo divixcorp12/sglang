@@ -8,7 +8,7 @@ zeroed rows and the new one into rows full of NaN (whatever an earlier record le
 (store_first off, the memset inside the team), and compares the bits (int32 views, so a -0 against +0 fails). A
 second, accumulating job on the same rows (a record's later CPU misses into part 1) must then agree too.
 
-Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and the bw tier (SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw on a host above it). Run on
+Needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier (SGLANG_JIT_HOST_MARCH=skylake-avx512 builds the bw tier on a host above it). Run on
 divix01 under taskset -c 0-51,56-107.
 """
 
@@ -21,8 +21,6 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from test_exl3_cpu_dsv41_plan_multitoken import CAP, H, _slabs  # noqa: E402
-
-pytestmark = pytest.mark.skipif(not os.environ.get("SGLANG_EXL3_SRC"), reason="needs SGLANG_EXL3_SRC")
 
 LIMIT = 10.0
 
@@ -47,14 +45,14 @@ ZERO_WEIGHT = {"6-tokens-dead-route": (0, 0)}
 def layer():
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     from sglang.kernels.ops.moe import expert_stream_transport as es
-    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-    if not optimized_cpu(cpu_act_defines()):
+    if not resolved_config().stream.cpu_experts.enabled:
         pytest.skip("the kernel under test is the optimized one: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1")
-    ext = exl3_ext()
-    trait = Exl3CpuQuantTrait(ext, act_limit=LIMIT)
-    handle = es.kernel_layer(trait.kernel_address(), trait.layer_spec(_slabs(20261015), CAP), variant="instr")
+    trait = Exl3CpuQuantTrait(act_limit=LIMIT)
+    trait.attach_host(es.cpu_kernel_options(variant="instr"))
+    handle = es.kernel_layer(trait.layer_spec(_slabs(20261015), CAP), variant="instr")
     yield handle
     es.kernel_drop(handle, variant="instr")
 

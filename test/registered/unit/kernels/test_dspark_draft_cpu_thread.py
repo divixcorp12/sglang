@@ -29,7 +29,7 @@ CAPACITY = 1 << 20  # stage s's layer has capacity CAPACITY + s, which the fake 
 
 
 def _module():
-    return ops._host_module(ops.EXL3_BUILD, VARIANT)
+    return ops._host_module(ops.FAKE_BUILD, VARIANT)
 
 
 def _u32(t: torch.Tensor, off: int) -> int:
@@ -44,9 +44,9 @@ def _done(areas, seq: int) -> int:
 def _calls() -> list[dict]:
     m = _module()
     width = 9 + 2 * LANES
-    count = int(m.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+    count = int(m.expert_stream_fake_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
     out = torch.zeros((count, width), dtype=torch.float64)
-    m.expert_stream_test_kernel_calls(out)
+    m.expert_stream_fake_kernel_calls(out)
     return [
         {"core": int(r[0]), "k": int(r[4]), "slots": [int(s) for s in r[5 : 5 + int(r[4])]],
          "capacity": int(r[5 + 2 * LANES])}
@@ -93,11 +93,11 @@ def _host(request, mode, *, keep_warm_us=0, fatal_wait_s=30.0, ns_per_expert=0):
     from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 
     areas = DraftCpuAreas(STAGES, H, pin=False)
-    kernel = int(_module().expert_stream_test_kernel_address(ns_per_expert, 0, 0))
-    host = draft_cpu_host(mode, areas, kernel, cores=_cores(), threads=2, keep_warm_us=keep_warm_us,
+    _module().expert_stream_fake_kernel_reset(ns_per_expert, 0, 0)
+    host = draft_cpu_host(mode, areas, cores=_cores(), threads=2, keep_warm_us=keep_warm_us,
                           fatal_wait_s=fatal_wait_s, tmp_path=request.getfixturevalue("tmp_path"))
     for stage in range(STAGES):
-        host.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
+        host.set_layer(stage, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
     host.start()
     if mode == "shared":
         request.addfinalizer(host.expert_host.stop)
@@ -250,19 +250,19 @@ from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
-m = ops._host_module(ops.EXL3_BUILD, "instr")
+m = ops._host_module(ops.FAKE_BUILD, "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
-kernel = int(m.expert_stream_test_kernel_address(0, 1 if case == "fail" else 0, 0))
+m.expert_stream_fake_kernel_reset(0, 1 if case == "fail" else 0, 0)
 cores = sorted(os.sched_getaffinity(0))[:2]
 import tempfile
 mode = sys.argv[2]
-host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, keep_warm_us=0, fatal_wait_s=0.5,
+host = draft_cpu_host(mode, areas, cores=cores, threads=2, keep_warm_us=0, fatal_wait_s=0.5,
                       tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
-    host.set_layer(stage, kernel, fake_cpu_layer(64))
+    host.set_layer(stage, fake_cpu_layer(64))
 host.start()
 if case == "hold":
-    m.expert_stream_test_kernel_hold(cores[0], 1)
+    m.expert_stream_fake_kernel_hold(cores[0], 1)
 if case == "tear":
     m.expert_stream_draft_test_tear(areas.channel.data_ptr(), 1)
 else:
@@ -281,7 +281,7 @@ print("survived", flush=True)
      ("hold", ["DSpark draft CPU experts", "record 1", "0.5"])],
 )
 def test_a_failure_fail_stops(case, says, mode):
-    result = spawn_child(_CHILD, case, mode, timeout_s=60, variant=VARIANT)
+    result = spawn_child(_CHILD, case, mode, timeout_s=60, variant=VARIANT, layout=ops.FAKE_BUILD)
     assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])
     assert result.returncode != 0
     for text in says:
@@ -298,22 +298,22 @@ from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
 mode = sys.argv[2]
-m = ops._host_module(ops.EXL3_BUILD, "instr")
+m = ops._host_module(ops.FAKE_BUILD, "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
-kernel = int(m.expert_stream_test_kernel_address(0, 0, 0))
+m.expert_stream_fake_kernel_reset(0, 0, 0)
 cores = sorted(os.sched_getaffinity(0))[:2]
 polling = case == "poll"
-host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, keep_warm_us=0,
+host = draft_cpu_host(mode, areas, cores=cores, threads=2, keep_warm_us=0,
                       fatal_wait_s=30.0 if polling else 0.5,
                       tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
-    host.set_layer(stage, kernel, fake_cpu_layer(64))
+    host.set_layer(stage, fake_cpu_layer(64))
 host.start()
 if polling:
     m.expert_stream_draft_test_poll_pause(300_000)  # the poll path sleeps between its stop and head loads
     time.sleep(0.05)
 else:
-    m.expert_stream_test_kernel_hold(cores[0], 1)
+    m.expert_stream_fake_kernel_hold(cores[0], 1)
     m.expert_stream_draft_test_post(areas.channel.data_ptr(), 2, 3, 2, 1, 0)
     time.sleep(0.1)
 host.stop()
@@ -325,7 +325,7 @@ print("stopped" if polling else "late", flush=True)
 def test_a_stop_between_the_poll_loads_is_not_a_torn_record(mode):
     # stop() lands after the run loop read stop_ (false) and before it reads the head: the head word it bumped must
     # not be read as a posted record.
-    result = spawn_child(_STOP_CHILD, "poll", mode, timeout_s=60, variant=VARIANT)
+    result = spawn_child(_STOP_CHILD, "poll", mode, timeout_s=60, variant=VARIANT, layout=ops.FAKE_BUILD)
     assert result.returncode == 0, result.stderr[-2000:]
     assert "stopped" in result.stdout
     assert "FATAL" not in result.stderr and "torn" not in result.stderr, result.stderr[-2000:]
@@ -336,7 +336,7 @@ def test_a_stop_during_a_hung_forward_still_fail_stops(mode):
     # The watchdog outlives stop(): a forward that never returns aborts within the fatal wait instead of hanging
     # the join.
     try:
-        result = spawn_child(_STOP_CHILD, "hung", mode, timeout_s=20, variant=VARIANT)
+        result = spawn_child(_STOP_CHILD, "hung", mode, timeout_s=20, variant=VARIANT, layout=ops.FAKE_BUILD)
     except subprocess.TimeoutExpired:
         pytest.fail("stop() hung behind a forward that never returned: the watchdog had stopped")
     assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])

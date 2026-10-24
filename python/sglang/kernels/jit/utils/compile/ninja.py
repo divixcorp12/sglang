@@ -128,10 +128,16 @@ def generate(spec: BuildSpec) -> str:
     ]
 
     objects: List[str] = []
+    own_flags = dict(spec.source_cflags)
     for index, unit in enumerate(units):
         obj = f"{unit.stem}_{index}.o"
         rule = "compile_cuda" if unit.is_cuda else "compile_cxx"
         lines.append(f"build {obj}: {rule} {_escape(unit.filename)}")
+        if unit.filename in own_flags:
+            flags = _quote_path_flags(
+                toolchain.base_cxx_flags() + list(own_flags[unit.filename]) + include_flags
+            )
+            lines.append(f"  cxxflags = {' '.join(flags)}")
         objects.append(obj)
 
     lines += [

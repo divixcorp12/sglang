@@ -1,0 +1,24 @@
+{
+  "date": "2026-10-18",
+  "protocol_revision": 2,
+  "hx_used": false,
+  "native_probe_prepared": true,
+  "native_probe_executed": false,
+  "pilot_ready": false,
+  "training_or_capture_started": false,
+  "production_changed": false,
+  "local_cpu_tests": 31,
+  "remote_cpu_tests": 31,
+  "local_torch": "2.14.1",
+  "remote_torch": "2.13.0",
+  "remote_stage": "/tmp/ncm-head-setup-20261018.MHdoQR",
+  "source_commit": "d82ae69d0368478b5018d4cbfa92ab4643a43f54",
+  "remaining": [
+    "native weight/gradient and real-row forward parity",
+    "native capture driver integration and committed-feature alignment",
+    "real grouped corpus and native captures",
+    "complete checkpoint/artifact hashes and measured resource estimate"
+  ],
+  "native_probe_dry_run_checked": true,
+  "pinned_native_source_staged": true
+}

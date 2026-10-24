@@ -51,8 +51,9 @@ def _arm(trait, slabs, cores, *, store_out, lanes, reps, tmp):
         x_rows = torch.zeros((ROWS, lease.cpu_row_bytes(H, TOKENS, host.wire.lanes)), dtype=torch.uint8).pin_memory()
         x_rows.view(torch.float16)[:, : TOKENS * H].normal_()  # the staged inputs; the token table follows them
         out_rows = torch.zeros((ROWS, 2, TOKENS, H), dtype=torch.float32).pin_memory()
+        trait.attach_host(host)
         host.enable_cpu_experts(
-            trait.kernel_address(), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=len(cores),
+            [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=len(cores),
             keep_warm_us=2000, store_out=store_out,
         )
         host.set_cpu_layer(ROW, trait.layer_spec(slabs, CAP))
@@ -71,13 +72,12 @@ def main():
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument("--lanes", type=int, default=4)
     args = ap.parse_args()
-    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     import sglang
 
     print("sglang", sglang.__file__)
-    trait = Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT)
+    trait = Exl3CpuQuantTrait(act_limit=LIMIT)
     slabs = {n: t.pin_memory() for n, t in _slabs(20261015).items()}  # CAP=12 slots: extended below
     slabs = {n: torch.cat([t, t[: CAP - t.shape[0]]]).pin_memory() for n, t in slabs.items()}
     cores = _cores(args.cores)

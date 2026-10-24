@@ -15,13 +15,13 @@
 //              drip_hold, drip_view
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
-//   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
+//   misc       fake_kernel_reset, fake_kernel_calls, fake_kernel_hold, fake_kernel_max_rows (the fake format only),
 //              pause_ns
 //   prefetch   score_gate: the RAM prefetch's gate scorer on given tensors, in both builds;
 //              router_score: a router's host score (router.h) on given dots and biases
 //   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host;
 //              draft_test_poll_pause: the draft source's poll path sleeps between its stop and head loads
-//   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
+//   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: the format's kernel's make_layer and forward, by layer id;
 //              in both builds, as the DSpark draft's CPU experts call them (cpu_experts/draft.py)
 //
 // Arguments are validated by the Python wrappers in
@@ -51,6 +51,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
   using Base::check_table_tensors;
   using Base::find;
   using typename Base::Source;
+  using CpuLayer = typename Base::CpuLayer;
+  // The format's kernel is the fake (formats/fake/fake_kernel.h).
+  static constexpr bool kFakeKernel = requires { CpuKernel::reset(int64_t{}, int64_t{}, false); };
 
   // Copies a slots tensor into a vector.
   static std::vector<int64_t> slots_of(TensorView slots) {
@@ -85,10 +88,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     return out;
   }
 
-  // The layout's second-stage start in `t` (ReaderCore::second_stage_); 0 for a layout without one.
-  static int64_t second_stage_of(const Tables& t) {
+  // The layout's second-stage start in streamed row `row`'s row shape (ReaderCore::second_stages_); 0 for a layout
+  // without one.
+  static int64_t second_stage_of(const Tables& t, int64_t row) {
     if constexpr (requires { Layout::kSecondStageMask; }) {
-      return second_stage_start(t, Layout::kSecondStageMask);
+      return second_stage_start(t.shape(row), Layout::kSecondStageMask);
     } else {
       return 0;
     }
@@ -736,7 +740,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       const std::vector<int32_t> ids = ids_of(experts);
       const std::vector<int64_t> dest = slots_of(slots);
       const std::vector<uint8_t> spans = two_span_of(f, ids.size());
-      const int64_t split = second_stage_of(t);
+      const int64_t split = second_stage_of(t, row);
+      const RowShape& shape = t.shape(row);
       const auto* ref_table = static_cast<const int64_t*>(reference.data_ptr());
       const auto* ref_slot = static_cast<const int64_t*>(ref_slots.data_ptr());
       Source reader(Tables(t), direct != 0);
@@ -753,12 +758,12 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       prefix.reserve(ids.size());
       const auto first_stage_same = [&](size_t o) {
         bool same = true;
-        for (const Segment& s : t.segments) {
+        for (const Segment& s : shape.segments) {
           if (s.src + s.bytes > split) continue;
-          const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst;
+          const uint8_t* got = t.slabs[row][s.name] + dest[o] * shape.row_bytes[s.name] + s.dst;
           const auto* ref_base = reinterpret_cast<const uint8_t*>(
               static_cast<intptr_t>(ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
-          same = same && std::memcmp(got, ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst, static_cast<size_t>(s.bytes)) == 0;
+          same = same && std::memcmp(got, ref_base + ref_slot[o] * shape.row_bytes[s.name] + s.dst, static_cast<size_t>(s.bytes)) == 0;
         }
         return same;
       };
@@ -885,7 +890,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       verify_named("reference", TensorMatcher({-1, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), reference);
       verify_named("ref_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), ref_slots);
     }
-    const size_t count = t.segments.size();
+    const RowShape& shape = t.shape(row);
+    const size_t count = shape.segments.size();
     std::vector<PieceRun> runs(ids.size() * kPieces * count);
     const auto* ref_table = checking ? static_cast<const int64_t*>(reference.data_ptr()) : nullptr;
     const auto* ref_slot = checking ? static_cast<const int64_t*>(ref_slots.data_ptr()) : nullptr;
@@ -894,7 +900,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
         RowGeometry g;
         const size_t index = static_cast<size_t>(row * t.experts + ids[o]);
         PieceRun* at = &runs[o * kPieces * count];
-        const int64_t split = second_stage_of(t);
+        const int64_t split = second_stage_of(t, row);
         if (!(f[32] >> o & 1 && split > 0 ? row_geometry_two_span(t, index, split, g, at) : row_geometry(t, index, g, at))) {
           throw std::runtime_error(error_prefix<Layout>() + "the checker cannot cut a row");
         }
@@ -911,13 +917,13 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
           if ((fresh >> j & 1u) == 0) continue;
           bool same = true;
           for (size_t i = 0; i < count; ++i) {
-            const Segment& s = t.segments[i];
+            const Segment& s = shape.segments[i];
             const PieceRun& run = runs[(o * kPieces + static_cast<size_t>(j)) * count + i];
             if (run.lo >= run.hi) continue;
-            const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst + run.lo;
+            const uint8_t* got = t.slabs[row][s.name] + dest[o] * shape.row_bytes[s.name] + s.dst + run.lo;
             const auto* ref_base = reinterpret_cast<const uint8_t*>(
                 static_cast<intptr_t>(ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
-            const uint8_t* want = ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst + run.lo;
+            const uint8_t* want = ref_base + ref_slot[o] * shape.row_bytes[s.name] + s.dst + run.lo;
             same = same && std::memcmp(got, want, static_cast<size_t>(run.hi - run.lo)) == 0;
           }
           ++checked;
@@ -1009,7 +1015,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
         source_paths,
         slot_bytes,
         row_images);
-    const size_t count = t.segments.size();
+    const RowShape& shape = t.shape(row);
+    const size_t count = shape.segments.size();
     verify_named(
         "pieces",
         TensorMatcher({kPieces, 1 + 2 * static_cast<int64_t>(count)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
@@ -1017,7 +1024,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     RowGeometry g;
     std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
     const size_t index = static_cast<size_t>(row * t.experts + expert);
-    const int64_t split = second_stage_of(t);
+    const int64_t split = second_stage_of(t, row);
     const SpanWeights w = span_weights_of(span_weights, t.parts);
     if (!(two_span != 0 && split > 0 ? row_geometry_two_span(t, index, split, g, runs.data(), w.ptrs)
                                      : row_geometry(t, index, g, runs.data())))
@@ -1034,8 +1041,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
       line[0] = g.deps[j];
       for (size_t i = 0; i < count; ++i) {
         const PieceRun& run = runs[static_cast<size_t>(j) * count + i];
-        line[1 + 2 * i] = t.segments[i].dst + run.lo;
-        line[2 + 2 * i] = t.segments[i].dst + run.hi;
+        line[1 + 2 * i] = shape.segments[i].dst + run.lo;
+        line[2 + 2 * i] = shape.segments[i].dst + run.hi;
       }
     }
     return g.subs | static_cast<int64_t>(g.prefix) << 8;
@@ -1110,203 +1117,77 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
   }
 
-  // Test only: the CPU expert kernel tests enable in place of a format's (test_kernel_address). Its layers read only
-  // their hidden (and capacity, which a call records). A forward spins k * ns_per_expert, waits while its worker-0 core
-  // is held (test_kernel_hold), throws when made failing, else for each row t < max(rows, 1) writes out[t * hidden + j]
-  // for j < max(hidden, 1) -- (accumulate ? out[..] : j) + sum_i weights[t * k + i] * (slots[t * k + i] + 1), or a zero
-  // partial (accumulate ? out[..] : 0) when made zeroing -- and records one call per row. Its warm loop PAUSEs until
-  // its word moves or its deadline passes. Over a layer of the EXL3 row's six slabs, a call also records the byte sums
-  // of its live slots' first three slabs (w13) at its start and of the last three (w2) after ForwardCall::stage_two,
-  // which a forward calls between the two when set: what a two-stage forward's GateUp and Down would read.
-  class FakeKernel final : public cpu_experts::CpuExpertKernel {
-   public:
-    struct Call {
-      int32_t core, affinity, threads, accumulate, k;
-      std::array<int32_t, Wire::kLanes> slots;
-      std::array<float, Wire::kLanes> weights;
-      int32_t capacity;  // the layer's: which layer the call ran
-      int32_t staged;    // ForwardCall::stage_two was set (and called)
-      double w13, w2;    // the slab byte sums (six-slab layers only, else 0)
-    };
+  // Test only, on the `fake` format (formats/fake/fake_kernel.h): the fake CPU expert kernel the CPU expert tests run.
+  // Any other format's build refuses these four exports.
+  static void require_fake(const char* what) {
+    if constexpr (!kFakeKernel) {
+      throw std::runtime_error(std::string(what) + " needs the fake format's host build (FAKE_BUILD)");
+    }
+  }
 
-    void reset(int64_t ns_per_expert, int64_t fail, bool zero) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      calls_.clear();
-      ns_.store(ns_per_expert, std::memory_order_relaxed);
-      fail_.store(fail, std::memory_order_relaxed);
-      zero_.store(zero, std::memory_order_relaxed);
-      held_core_.store(-1, std::memory_order_release);
-      max_rows_.store(1 << 16, std::memory_order_relaxed);
+  // Resets the fake's calls; its forwards then spin k * ns_per_expert, `fail` nonzero makes every forward throw, `zero`
+  // makes it write a zero partial.
+  static void fake_kernel_reset(int64_t ns_per_expert, int64_t fail, int64_t zero) {
+    if constexpr (!Build::kFaults) {
+      test_only("fake_kernel_reset");
+    } else {
+      require_fake("fake_kernel_reset");
+      if constexpr (kFakeKernel) CpuKernel::reset(ns_per_expert, fail, zero != 0);
     }
-
-    const char* name() const noexcept override {
-      return "fake";
-    }
-    cpu_experts::ExpertLayer make_layer(
-        const cpu_experts::ExpertLayer& shape, std::span<const std::byte>) const override {
-      cpu_experts::ExpertLayer layer = shape;
-      layer.kernel = this;
-      return layer;
-    }
-    int32_t max_routes() const noexcept override {
-      return Wire::kLanes;
-    }
-    int32_t max_rows() const noexcept override {
-      return max_rows_.load(std::memory_order_relaxed);
-    }
-    void set_max_rows(int32_t rows) {
-      max_rows_.store(rows, std::memory_order_relaxed);
-    }
-    void check(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall&) const override {
-      if (layer.kernel != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
-    }
-    using cpu_experts::CpuExpertKernel::forward;
-    // The bytes of the live slots of call row t in slabs [first, last) of a six-slab layer, summed; 0 otherwise.
-    static double slab_sum(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c, int32_t t,
-                           int first, int last) {
-      if (layer.slab_count != 6) return 0;
-      double sum = 0;
-      for (int32_t i = 0; i < c.k; ++i) {
-        const int32_t slot = c.slots[static_cast<int64_t>(t) * c.k + i];
-        if (slot < 0) continue;
-        const cpu_experts::ExpertRow row = layer[slot];
-        for (int name = first; name < last; ++name)
-          for (uint64_t b = 0; b < layer.slot_bytes[name]; ++b)
-            sum += row.slab[name][b];
-      }
-      return sum;
-    }
-    void forward(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c,
-                 cpu_experts::Team& team) const override {
-      team.run([](int, int) {});  // one job through the team's dispatch and end barrier, as a real forward
-      std::vector<double> w13(static_cast<size_t>(std::max(c.rows, 1))), w2(w13.size());
-      for (size_t t = 0; t < w13.size(); ++t)
-        w13[t] = slab_sum(layer, c, static_cast<int32_t>(t), 0, 3);
-      if (c.stage_two) c.stage_two(c.stage_two_ctx);
-      for (size_t t = 0; t < w2.size(); ++t)
-        w2[t] = slab_sum(layer, c, static_cast<int32_t>(t), 3, 6);
-      const int32_t core = c.cores.empty() ? -1 : c.cores.front();
-      const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);
-      while (now_ns() < until)
-        _mm_pause();
-      while (core >= 0 && held_core_.load(std::memory_order_acquire) == core)
-        _mm_pause();
-      if (const int64_t f = fail_.load(std::memory_order_relaxed); f != 0)
-        throw std::runtime_error("fake CPU expert forward failed (" + std::to_string(f) + ")");
-      const int32_t hidden = std::max(layer.hidden, 1);
-      const bool zero = zero_.load(std::memory_order_relaxed);
-      for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
-        const int32_t* slots = c.slots + static_cast<int64_t>(t) * c.k;
-        const float* weights = c.weights + static_cast<int64_t>(t) * c.k;
-        float* out = c.out + static_cast<int64_t>(t) * hidden;
-        double sum = 0;
-        for (int32_t i = 0; i < c.k; ++i)
-          sum += static_cast<double>(weights[i]) * (slots[i] + 1);
-        for (int32_t j = 0; j < hidden; ++j) {
-          const double base = c.accumulate ? static_cast<double>(out[j]) : (zero ? 0.0 : static_cast<double>(j));
-          out[j] = static_cast<float>(zero ? base : base + sum);
+  }
+  // The fake's calls since fake_kernel_reset, one per row, as float64 rows {core, affinity, threads, accumulate, k,
+  // slots[kLanes], weights[kLanes], capacity, staged, w13, w2} into `out` (as many as fit); returns how many there are.
+  static int64_t fake_kernel_calls(TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("fake_kernel_calls");
+    } else {
+      require_fake("fake_kernel_calls");
+      if constexpr (kFakeKernel) {
+        using namespace host;
+        auto cpu = SymbolicDevice{};
+        expert_stream::verify_named(
+            "out", TensorMatcher({-1, 9 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
+        const std::vector<typename CpuKernel::Call> calls = CpuKernel::calls();
+        auto* o = static_cast<double*>(out.data_ptr());
+        const int64_t width = 9 + 2 * Wire::kLanes;
+        for (int64_t r = 0; r < std::min<int64_t>(out.size(0), static_cast<int64_t>(calls.size())); ++r) {
+          const typename CpuKernel::Call& c = calls[r];
+          double* row = o + r * width;
+          row[0] = c.core;
+          row[1] = c.affinity;
+          row[2] = c.threads;
+          row[3] = c.accumulate;
+          row[4] = c.k;
+          for (int i = 0; i < Wire::kLanes; ++i) {
+            row[5 + i] = c.slots[i];
+            row[5 + Wire::kLanes + i] = c.weights[i];
+          }
+          row[5 + 2 * Wire::kLanes] = c.capacity;
+          row[6 + 2 * Wire::kLanes] = c.staged;
+          row[7 + 2 * Wire::kLanes] = c.w13;
+          row[8 + 2 * Wire::kLanes] = c.w2;
         }
+        return static_cast<int64_t>(calls.size());
       }
-      cpu_set_t mask;
-      CPU_ZERO(&mask);
-      int32_t affinity = -1;
-      if (sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) == 1)
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-          if (CPU_ISSET(cpu, &mask)) affinity = cpu;
-      std::lock_guard<std::mutex> lock(mutex_);
-      for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
-        Call call{core, affinity, c.threads, c.accumulate ? 1 : 0, std::min<int32_t>(c.k, Wire::kLanes), {}, {},
-                  layer.capacity, c.stage_two != nullptr ? 1 : 0, w13[t], w2[t]};
-        for (int32_t i = 0; i < call.k; ++i) {
-          call.slots[i] = c.slots[static_cast<int64_t>(t) * c.k + i];
-          call.weights[i] = c.weights[static_cast<int64_t>(t) * c.k + i];
-        }
-        calls_.push_back(call);
-      }
-    }
-    int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override {
-      while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)
-        _mm_pause();
       return 0;
     }
-
-    std::vector<Call> calls() const {
-      std::lock_guard<std::mutex> lock(mutex_);
-      return calls_;
-    }
-    void hold(int64_t core, bool on) {
-      held_core_.store(on ? core : -1, std::memory_order_release);
-    }
-   private:
-    mutable std::mutex mutex_;
-    mutable std::vector<Call> calls_;
-    std::atomic<int64_t> ns_{0}, fail_{0}, held_core_{-1};
-    std::atomic<bool> zero_{false};
-    std::atomic<int32_t> max_rows_{1 << 16};
-  };
-  static FakeKernel& fake_kernel() {
-    static FakeKernel kernel;
-    return kernel;
   }
-
-  // Test only: the fake kernel's address, its calls reset; `fail` nonzero makes every forward
-  // throw, `zero` makes it write a zero partial.
-  static int64_t test_kernel_address(int64_t ns_per_expert, int64_t fail, int64_t zero) {
+  // While on, a fake forward whose worker-0 core is `core` waits (one held core at a time).
+  static void fake_kernel_hold(int64_t core, int64_t on) {
     if constexpr (!Build::kFaults) {
-      test_only("test_kernel_address");
+      test_only("fake_kernel_hold");
     } else {
-      fake_kernel().reset(ns_per_expert, fail, zero != 0);
-      return static_cast<int64_t>(reinterpret_cast<intptr_t>(&fake_kernel()));
+      require_fake("fake_kernel_hold");
+      if constexpr (kFakeKernel) CpuKernel::hold(core, on != 0);
     }
   }
-  // Test only: the fake's calls since test_kernel_address, one per row, as float64 rows {core, affinity, threads,
-  // accumulate, k, slots[kLanes], weights[kLanes], capacity, staged, w13, w2} into `out` (as many as fit); returns how
-  // many there are.
-  static int64_t test_kernel_calls(TensorView out) {
+  // The fake's max_rows (a real kernel's kMaxRows is 65536), set after fake_kernel_reset, which restores it.
+  static void fake_kernel_max_rows(int64_t rows) {
     if constexpr (!Build::kFaults) {
-      test_only("test_kernel_calls");
+      test_only("fake_kernel_max_rows");
     } else {
-      using namespace host;
-      auto cpu = SymbolicDevice{};
-      expert_stream::verify_named(
-          "out", TensorMatcher({-1, 9 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
-      const std::vector<typename FakeKernel::Call> calls = fake_kernel().calls();
-      auto* o = static_cast<double*>(out.data_ptr());
-      const int64_t width = 9 + 2 * Wire::kLanes;
-      for (int64_t r = 0; r < std::min<int64_t>(out.size(0), static_cast<int64_t>(calls.size())); ++r) {
-        const typename FakeKernel::Call& c = calls[r];
-        double* row = o + r * width;
-        row[0] = c.core;
-        row[1] = c.affinity;
-        row[2] = c.threads;
-        row[3] = c.accumulate;
-        row[4] = c.k;
-        for (int i = 0; i < Wire::kLanes; ++i) {
-          row[5 + i] = c.slots[i];
-          row[5 + Wire::kLanes + i] = c.weights[i];
-        }
-        row[5 + 2 * Wire::kLanes] = c.capacity;
-        row[6 + 2 * Wire::kLanes] = c.staged;
-        row[7 + 2 * Wire::kLanes] = c.w13;
-        row[8 + 2 * Wire::kLanes] = c.w2;
-      }
-      return static_cast<int64_t>(calls.size());
-    }
-  }
-  // Test only: while on, a fake forward whose worker-0 core is `core` waits (one held core at a time).
-  static void test_kernel_hold(int64_t core, int64_t on) {
-    if constexpr (!Build::kFaults) {
-      test_only("test_kernel_hold");
-    } else {
-      fake_kernel().hold(core, on != 0);
-    }
-  }
-  // Test only: the fake's max_rows (a real kernel's kMaxRows is 65536), set after test_kernel_address, which restores it.
-  static void test_kernel_max_rows(int64_t rows) {
-    if constexpr (!Build::kFaults) {
-      test_only("test_kernel_max_rows");
-    } else {
-      fake_kernel().set_max_rows(static_cast<int32_t>(rows));
+      require_fake("fake_kernel_max_rows");
+      if constexpr (kFakeKernel) CpuKernel::set_max_rows(static_cast<int32_t>(rows));
     }
   }
   // Test only: the draft channel's device half on the host (draft_kernels.cuh), at the pinned channel's address.
@@ -1383,7 +1264,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
   }
   // A test layer and the hidden size it was made with, which bounds kernel_forward's x and out.
   struct KernelLayer {
-    cpu_experts::ExpertLayer layer;  // kernel null: dropped
+    CpuLayer layer;
+    bool live = false;  // false once dropped
     int64_t hidden = 0;
   };
   static std::vector<KernelLayer>& kernel_layers() {
@@ -1395,20 +1277,19 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     return text;
   }
 
-  // Kernel `kernel`'s make_layer over a slab table as set_cpu_layer takes it; returns the layer's id. The
-  // kernel's std::invalid_argument propagates.
-  static int64_t kernel_layer(int64_t kernel, TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate,
+  // The format's kernel's make_layer over a slab table as set_cpu_layer takes it; returns the layer's id. The kernel's
+  // std::invalid_argument propagates.
+  static int64_t kernel_layer(TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate,
                               int64_t activation, double act_limit, TensorView params) {
-    const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
-    cpu_experts::ExpertLayer layer =
-        k->make_layer(Base::layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit),
-                      Base::params_bytes(params));
+    Base::require_cpu_kernel("kernel_layer");
+    CpuLayer layer = CpuKernel::make_layer(
+        Base::layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit, params));
     std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-    kernel_layers().push_back({layer, hidden});
+    kernel_layers().push_back({layer, true, hidden});
     return static_cast<int64_t>(kernel_layers().size() - 1);
   }
 
-  // One forward of layer `id` with its own kernel: x fp16 [rows, hidden] (every format's input today),
+  // One forward of layer `id` on the format's kernel: x fp16 [rows, hidden] (every format's input today),
   // slots int32 and weights float32 [rows, k], out float32 [rows, hidden], hidden the layer's, all contiguous CPU;
   // cores int64 [n] (empty: unpinned). The shapes are checked against the layer, so a short x or out is refused here
   // rather than read or written past its end. Returns 0, 2 for std::invalid_argument, 1 for any other exception, its
@@ -1477,7 +1358,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     KernelLayer entry;
     {
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-      if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].layer.kernel)
+      if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].live)
         throw std::runtime_error("kernel_forward: no layer " + std::to_string(id));
       entry = kernel_layers()[id];
     }
@@ -1494,7 +1375,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     expert_stream::verify_named("weights", TensorMatcher({rows, k}).with_dtype<float>().with_device<kDLCPU>(cpu), weights);
     expert_stream::verify_named("out", TensorMatcher({rows, hidden}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
     expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
-    const cpu_experts::ExpertLayer& layer = entry.layer;
+    const CpuLayer& layer = entry.layer;
     std::vector<int> on;
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
@@ -1514,8 +1395,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
     call.store_first = store_first;
     kernel_error_text().clear();
     try {
-      layer.kernel->check(layer, call);
-      layer.kernel->forward(layer, call);
+      CpuKernel::check(layer, call);
+      cpu_experts::forward_alone<CpuKernel>(layer, call);
       return 0;
     } catch (const std::invalid_argument& e) {
       kernel_error_text() = e.what();
@@ -1928,10 +1809,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build, CpuKernel>> : HostExpo
 #define EXPERT_STREAM_HOST_TEST_EXPORTS(Exports) \
   EXPERT_STREAM_HOST_TEST_EXPORTS_OF(::sglang::expert_stream::HostTestExports<Exports>)
 #define EXPERT_STREAM_HOST_TEST_EXPORTS_OF(Exports)                                                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_address, Exports::test_kernel_address);   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_calls, Exports::test_kernel_calls);       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_hold, Exports::test_kernel_hold);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_max_rows, Exports::test_kernel_max_rows);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fake_kernel_reset, Exports::fake_kernel_reset);       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fake_kernel_calls, Exports::fake_kernel_calls);       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fake_kernel_hold, Exports::fake_kernel_hold);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fake_kernel_max_rows, Exports::fake_kernel_max_rows); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_post, Exports::draft_test_post);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_tear, Exports::draft_test_tear);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_finish_close, Exports::draft_test_finish_close); \

@@ -5,7 +5,7 @@
 // (and tvm-ffi's) never include ATen. cpu_forward.cpp's kernel runtime is configured through the helpers at the end.
 #pragma once
 
-#include "expert_stream/host/cpu_experts/kernel.hpp"
+#include "entry.h"
 #include "expert_stream/lease_layout.h"
 #include "row_images.h"
 #include <cstdint>
@@ -53,8 +53,8 @@ class StackFixture {
   float* out_row(int64_t row) const;
   int64_t out_stride() const;         // bytes
   void write_x(int64_t row) const;    // the post's x store: the layer's fixture input into the row's x
-  // The row's layer over its capacity() slot views, made by the EXL3 kernel (exl3_cpu_kernel).
-  ::sglang::cpu_experts::ExpertLayer make_layer(int64_t row) const;
+  // The row's layer over its capacity() slot views, made by the EXL3 kernel (Exl3CpuKernel).
+  ::sglang::exl3_cpu::Exl3CpuKernel::Layer make_layer(int64_t row) const;
   // Fills slot_of(e) of the row's slabs with expert e from the row's image file: the slot the tier's reader would pick
   // (see slot_of). For the bare forwards, which run before the stack exists.
   void preload_slots(int64_t row) const;
@@ -64,12 +64,12 @@ class StackFixture {
   std::unique_ptr<Impl> impl_;
 };
 
-// The tier the kernel settled on (min(host, the --max-isa cap)): "bw", "vnni" or "vbmi". Needs AVX512BW.
+// The tier the kernel was built at (CMake EXL3_MARCH): "bw", "vnni" or "vbmi". Needs AVX512BW.
 const char* kernel_isa_tier();
 
-// Configures cpu_forward.cpp's kernel runtime: an AVX-512 tier (the host's, or `max_isa`'s cap; empty for none),
-// single-threaded ATen, no dynamic OpenMP. Prints "isa tier <tier>" to stderr. Throws if the host has no AVX512BW.
-void configure_cpu_kernel_runtime(const std::string& max_isa);
+// Configures cpu_forward.cpp's kernel runtime: an AVX-512 build tier, single-threaded ATen, no dynamic OpenMP. Prints
+// "isa tier <tier>" to stderr. Throws if the kernel was built below AVX512BW.
+void configure_cpu_kernel_runtime();
 
 // Bit-exact comparison against a reference file (fixture.h's compare_reference); throws naming the file.
 void check_reference(const std::filesystem::path& path, const std::vector<float>& actual);

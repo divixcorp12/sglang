@@ -55,7 +55,6 @@ struct Options {
   int keep_warm_us = 0;
   // --smt: each group's workers' SMT siblings join it, after them (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT)
   bool smt = false;
-  std::string max_isa;  // --max-isa=TIER: the kernel's ISA cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA); empty, the host's
   int wait_timeout_ms = 2000;
   bool validate_only = false;
   bool self_test = false;
@@ -94,8 +93,6 @@ Options parse_options(int& argc, char** argv) {
       opt.keep_warm_us = number(value("--keep-warm-us="));
     else if (arg == "--smt")
       opt.smt = true;
-    else if (arg.starts_with("--max-isa="))
-      opt.max_isa = value("--max-isa=");
     else if (arg.starts_with("--wait-timeout-ms="))
       opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
     else if (arg == "--validate-only")
@@ -115,7 +112,6 @@ Options parse_options(int& argc, char** argv) {
              "--keep-warm-us: register work after each job, before the held CPU team falls back to PAUSE\n"
              "  (0: PAUSE only)\n"
              "--smt: each group's --cpus also run on their SMT siblings, after them (twice the workers)\n"
-             "--max-isa=scalar|avx2|bw|vnni|vbmi caps the kernel's tier (default: the host's)\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
              "--cpus=3 (two groups: --copy-cpu=1 --service-cpu=2,3 --cpus=4/5)\n"
              "Google Benchmark flags are also accepted.\n";
@@ -198,7 +194,6 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   StackConfig c;
   c.rows = f.row_set();
   c.staging = StackFixture::kStaging;
-  c.kernel = &::sglang::exl3_cpu::exl3_cpu_kernel();
   c.keep_warm_ns = static_cast<int64_t>(o.keep_warm_us) * 1000;
   c.x_base = f.x_row(0);
   c.x_stride = f.x_stride();
@@ -222,7 +217,7 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
 
 // The bare forwards' layers, made before the stack exists (BM_bare runs first); the stack gets its own per row.
 struct BareLayers {
-  std::vector<::sglang::cpu_experts::ExpertLayer> layers;
+  std::vector<::sglang::exl3_cpu::Exl3CpuKernel::Layer> layers;
 };
 
 // One timed request: t0 is taken before the x store, t1 when CopyDone is seen.
@@ -371,7 +366,7 @@ class Bench {
     if (!team) {
       const std::vector<int32_t>& workers = placement_.groups[group].workers;
       team = std::make_unique<::sglang::cpu_experts::Team>(
-          workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::exl3_cpu_kernel(), 0);
+          workers, static_cast<int>(workers.size()), &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0);
     }
     return *team;
   }
@@ -404,7 +399,7 @@ class Bench {
     call.accumulate = false;
     call.cores = placement_.groups[group].workers;
     try {
-      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(
+      ::sglang::exl3_cpu::Exl3CpuKernel::forward(
           bare_layers_.layers[static_cast<size_t>(row)], call, bare_team(group));
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("the bare CPU forward failed: ") + e.what());
@@ -695,7 +690,7 @@ int main(int argc, char** argv) {
     validate_placement(placement, system_topology(), !options.self_test);
     if (options.self_test) return run_self_test(placement, options.image_dir) == 0 ? 0 : 1;
 
-    configure_cpu_kernel_runtime(options.max_isa);
+    configure_cpu_kernel_runtime();
     std::vector<int> group_nodes;
     for (int g = 0; g < kGroups; ++g)
       group_nodes.push_back(placement.groups[g].node);

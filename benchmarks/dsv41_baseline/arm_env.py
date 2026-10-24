@@ -43,9 +43,13 @@ import msgspec
 NVFP4_WORK = "/data/models/slang/nvfp4-work"
 CC = f"{NVFP4_WORK}/cc-expert-prediction"
 
-MODEL_PATH = f"{CC}/dsv41-full40"
-ENGRAM_TABLE_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash"
-EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
+# DeepSeek-V4.1-Flash-1017 (EXL3 1.6.2, avg 2.9 bpw, mixed K) since 2026-10-23 (owner; the 3.0 bpw export was deleted).
+# MODEL_PATH is the target only: the export's config with num_nextn_predict_layers 0 and its index without mtp.*,
+# symlinking the shards; the draft's mtp.* layers are DSPARK_DRAFT. Row images: the mirrors' exl3_row_images, built
+# from EXPERT_DIR (their manifest fingerprints it), DSV41_1017_MIXED_K_PLAN.md.
+MODEL_PATH = f"{CC}/dsv41-1017-target"
+ENGRAM_TABLE_DIR = "/mnt/nvme0/dsv41-1071/engram"
+EXPERT_DIR = "/mnt/nvme0/dsv41-1071/dsv41-1017"
 # Expert-row mirrors, on by default since 2026-09-22. Mirroring is a property of the
 # box's storage, not of any one arm, so an arm that forgets it measures a drive layout
 # nobody runs. Override to the empty string to measure the unmirrored drive.
@@ -187,7 +191,7 @@ PROD_HOST = "0.0.0.0"
 # On since 2026-10-07, on the owner's go ("Merge + flip prod to DSpark") after DSV41_REFERENCE.md §33.11: all six
 # bars pass; the median decode is 7.6% above the non-DSpark recipe (95.05 vs 88.30 ms/token, the addendum's A/B).
 PROD_DSPARK = True
-DSPARK_DRAFT = f"{CC}/dsv41-dspark-draft"
+DSPARK_DRAFT = f"{CC}/dsv41-1017-dspark-draft"
 # Each stage's top-32 draft experts stay on the GPU, the other 96 on the CPU (§33.4).
 DSPARK_RESIDENT = f"{CC}/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"
 # gamma = 5 draft tokens, a 6-token verify (speculative_hook.py).
@@ -334,14 +338,16 @@ PROD_DSPARK_MAX_TOTAL_TOKENS = 381184
 # 384 / 2 = 192 homed experts, the slots its table holds back and 2 seam slots (expert_stream.full_layer_group_rows).
 # With every streamed layer full the model is fully pinned (expert_stream.model_fully_pinned): no expert can miss, so the
 # table holds back nothing, neither staging (it was min(victim lanes 8, MAX_LANES)) nor a RAM prefetch pool (it was the
-# spec share 2): 194 rows a group, 388 a layer, 15,520 in all (it was 204, 408, 16,320 and 207,244 MiB). A row is
-# 13,315,584 B, the pinned host row (the six streamed tensors; the 2026-10-17 startup log: 8,782 rows =
-# 116,937,458,688 B; the 13,315,596 used until 2026-10-22 was the on-disk row, three mul1 scalars more). So a node holds
-# 40 x 194 x 13,315,584 = 103,328,931,840 B, rounded up to 98,543 MiB, and the tier 197,086 MiB. No served A/B yet.
+# spec share 2): 194 rows a group, 388 a layer, 15,520 in all (it was 204, 408, 16,320 and 207,244 MiB). A pinned host
+# row is the six streamed tensors (the on-disk row less its three mul1 scalars), and its size is the layer's: the 1017
+# checkpoint's K3 layers hold 13,315,584 B, its K2 layers (18-22) 8,891,904 B. So a node holds
+# 194 x (35 x 13,315,584 + 5 x 8,891,904) = 99,037,962,240 B, rounded up to 94,450 MiB, and the tier 188,900 MiB (the
+# all-K3 3.0 bpw export took 98,543 and 197,086). test_both_cpu_ab checks the row sizes against the checkpoint's headers
+# where it exists. No served A/B yet.
 PROD_PINNED_LAYERS = 40
-PROD_PINNED_ROW_BYTES = 13_315_584
+PROD_PINNED_ROW_BYTES_BY_LAYER = tuple(8_891_904 if 18 <= layer <= 22 else 13_315_584 for layer in range(PROD_PINNED_LAYERS))
 PROD_PINNED_ROWS_PER_NODE_PER_LAYER = 384 // 2 + 2
-PROD_DSPARK_PINNED_NODE_MB = -(-PROD_PINNED_LAYERS * PROD_PINNED_ROWS_PER_NODE_PER_LAYER * PROD_PINNED_ROW_BYTES // 2**20)
+PROD_DSPARK_PINNED_NODE_MB = -(-PROD_PINNED_ROWS_PER_NODE_PER_LAYER * sum(PROD_PINNED_ROW_BYTES_BY_LAYER) // 2**20)
 PROD_DSPARK_PINNED_HOST_MB = str(2 * PROD_DSPARK_PINNED_NODE_MB)
 PROD_DSPARK_PINNED_HOST_NUMA_MB = f"0:{PROD_DSPARK_PINNED_NODE_MB},1:{PROD_DSPARK_PINNED_NODE_MB}"
 PROD_DSPARK_PINNED_FULL_LAYERS = ",".join(str(layer) for layer in range(PROD_PINNED_LAYERS))
@@ -351,9 +357,9 @@ PROD_DSPARK_PINNED_FULL_LAYERS = ",".join(str(layer) for layer in range(PROD_PIN
 # prefills layer-major (layer_major_state_gib, 5.00 GiB: 69.91 GiB for production), plus the pinned tier's node-1 share
 # beyond arm A's. Arm A's rest was measured with its tier, 48 GiB on node 1 (PINNED_HOST_NUMA_MB "1:49152"), so that is
 # the baseline; the 51,874 MiB production ran until 2026-10-22 was never counted (2.66 GiB). Node 1 then wants
-# 69.91 + (98,543 - 49,152 MiB = 48.23) = 118.14 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more,
+# 69.91 + (94,450 - 49,152 MiB = 44.24) = 114.15 GiB. Every served -mem arm started with node 0 at 75.4 GiB free or more,
 # against production's old 59,656 MiB node-0 share; below the warn level the start only warns, and the level rises with
-# the node-0 share (+37.98 GiB: 112.98). The wait is bounded so a refusal comes in minutes.
+# the node-0 share (+33.98 GiB: 108.98). The wait is bounded so a refusal comes in minutes.
 PROD_NODE1_HICACHE_GIB = 12.67
 PROD_NODE1_MARGIN_GIB = 1.0
 ARM_A_NODE1_PINNED_MB = 49152
@@ -382,15 +388,16 @@ PROD_PAGE_CACHE_ROOTS = ("/mnt/nvme0", "/mnt/nvme1", "/mnt/nvme2", "/mnt/nvme4",
 # file is there with this SHA256 (check_prod_assets).
 PROD_RAM_PREFETCH_LEARNED_HEAD = "/data/models/slang/prod-assets/ram-prefetch/t3-f109-calib-b075.f0d7a1b1.safetensors"
 PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256 = "f0d7a1b10e029480bcb9687437d7880135d756ea57f186d9a9cd41729fbd5309"
-# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the cut arm
-# only (both_cpu_ab's -prod-confcut); production stays off and loads neither. Fitted 2026-10-16 from the -prod-stscollect
-# arm's long-prompt capture (/mnt/nvme1/sts-collect-20261016, 2,048 verifies): temperatures 0.89/0.79/1.26/0.89/0.63,
-# ECE 2.9-3.8% -> 2.1-3.0%. Read-only copy, 0444.
+# The DSpark confidence-head verify cut's fitted STS temperatures (docs/hx/compact-verify-exl3.draft.md), for the
+# both_cpu_ab cut arms only. Fitted 2026-10-16 on the pre-1017 checkpoint from the -prod-stscollect arm's long-prompt
+# capture (/mnt/nvme1/sts-collect-20261016, 2,048 verifies): temperatures 0.89/0.79/1.26/0.89/0.63, ECE 2.9-3.8% ->
+# 2.1-3.0%. Read-only copy, 0444. Production runs the cut at T=1 (owner, 2026-10-23): replaying that capture through
+# the cut, the file moved tokens/ms by 0.3% over T=1 (divix01:/mnt/nvme1/sts-replay-20261023/report.json).
 PROD_DSPARK_STS_PATH = "/data/models/slang/prod-assets/dspark-sts/dsv41-dspark-sts.json"
 PROD_DSPARK_STS_SHA256 = "a0f2fc7c6acd4ca06dca213d68954b3f46e0fef2a5e6ed4ab460feda7538bcd5"
 # The confidence cut as production runs it since 2026-10-18 (owner), which is both_cpu_ab's -prod-confcut-sampled arm: the
 # cut for sampled requests (production is sampled traffic), the draft's time priced into T(w), no online refit (one
-# sample cannot judge it), on the greedy STS file above (ServerArgs.prod passes it). The draft stays sampled
+# sample cannot judge it), at T=1 since 2026-10-23 (no STS file, see above). The draft stays sampled
 # (SGLANG_DSPARK_USE_GREEDY_DRAFT off) and block verification stays off. DSV_OPTIMIZATION.md 3.12: 60-360 s ms/token
 # 73.14 -> 61.60 / 66.3 (two cut runs), ms per verify 186.2 -> 130.4 / 138.2.
 PROD_DSPARK_CUT_ENV = {
@@ -516,7 +523,9 @@ def prod_dspark_env() -> dict[str, str]:
         "SGLANG_EXPERT_STREAM_ENABLE_RAM_PREFETCH": "1",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SCORER": "gpu",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_HORIZON": "2",
-        "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": PROD_RAM_PREFETCH_LEARNED_HEAD,
+        # Off (native candidate select) since the 1017 checkpoint: the head was trained on the old model's routes.
+        # Owner, 2026-10-23; restore PROD_RAM_PREFETCH_LEARNED_HEAD once a head is refit on 1017.
+        "SGLANG_DSV41_RAM_PREFETCH_LEARNED_HEAD": "",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_LAYER": "2",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_PER_TOKEN": "1",
         "SGLANG_EXPERT_STREAM_RAM_PREFETCH_SPEC_SHARE": "2",
@@ -544,17 +553,14 @@ def prod_dspark_env() -> dict[str, str]:
 
 
 def check_prod_assets(head: str = PROD_RAM_PREFETCH_LEARNED_HEAD,
-                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256,
-                      sts: str = PROD_DSPARK_STS_PATH,
-                      sts_sha256: str = PROD_DSPARK_STS_SHA256) -> str:
-    """launch_prod.sh's asset check: the prefetch head production loads and the confidence cut's STS file each exist and
-    hash to their pinned SHA256. Returns a line for each saying so; raises SystemExit with the reason otherwise."""
+                      sha256: str = PROD_RAM_PREFETCH_LEARNED_HEAD_SHA256) -> str:
+    """launch_prod.sh's asset check: the RAM prefetch head exists and hashes to its pinned SHA256. Returns a line saying
+    so; raises SystemExit with the reason otherwise."""
     import hashlib
 
     lines = []
     for what, path, pinned, constant, verified in (
         ("RAM prefetch head", head, sha256, "PROD_RAM_PREFETCH_LEARNED_HEAD", "prefetch head verified"),
-        ("DSpark confidence STS file", sts, sts_sha256, "PROD_DSPARK_STS_PATH", "confidence STS file verified"),
     ):
         if not os.path.isfile(path):
             raise SystemExit(f"not starting production: the {what} {path} is missing "
@@ -618,7 +624,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     drop_cache_after_load: bool = False
     # Production's warm-up also runs dsv41_decode_paths (~35 s); the arms keep the prefill-only one they measured with.
     decode_warmup: bool = False
-    # The confidence cut's STS file (PROD_DSPARK_STS_PATH for production); the arms append theirs through
+    # The confidence cut's STS file; production passes none (T=1), the arms append theirs through
     # both_cpu_ab.ARM_SPEC_FLAGS.
     dspark_sts_path: str | None = None
 
@@ -634,7 +640,6 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             max_total_tokens=PROD_DSPARK_MAX_TOTAL_TOKENS,
             drop_cache_after_load=True,
             decode_warmup=True,
-            dspark_sts_path=PROD_DSPARK_STS_PATH,
         )
 
     def argv(self, *, python: str = PYTHON) -> list[str]:

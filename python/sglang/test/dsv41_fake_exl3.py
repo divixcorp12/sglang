@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+from typing import Mapping, Optional
 
 import numpy as np
 
@@ -17,15 +18,17 @@ INTER = 128
 BITS = 3
 
 
-def expert_spec(hidden: int = HIDDEN, inter: int = INTER, bits: int = BITS):
-    """[(suffix, dtype, shape, nbytes)] in on-disk order, as in the real export."""
+def expert_spec(hidden: int = HIDDEN, inter: int = INTER, bits: int = BITS, down_bits: Optional[int] = None):
+    """[(suffix, dtype, shape, nbytes)] in on-disk order, as in the real export. ``bits`` is the K of w1 and w3,
+    ``down_bits`` w2's (``bits`` when None)."""
     spec = []
     for w, (d_in, d_out) in (("w1", (hidden, inter)), ("w2", (inter, hidden)), ("w3", (hidden, inter))):
+        k = bits if w != "w2" or down_bits is None else down_bits
         spec += [
             (f"{w}.suh", "F16", (d_in,), 2 * d_in),
             (f"{w}.svh", "F16", (d_out,), 2 * d_out),
             (f"{w}.mul1", "I32", (), 4),
-            (f"{w}.trellis", "I16", (d_in // 16, d_out // 16, 16 * bits), d_in * d_out * bits // 8),
+            (f"{w}.trellis", "I16", (d_in // 16, d_out // 16, 16 * k), d_in * d_out * k // 8),
         ]
     return spec
 
@@ -78,20 +81,27 @@ def write_fake_exl3(
     hidden: int = HIDDEN,
     inter: int = INTER,
     finite: bool = False,
+    layer_bits: Optional[Mapping[int, tuple[int, int]]] = None,
 ) -> dict[tuple[int, int], bytes]:
     """Write shards plus model.safetensors.index.json; return each expert's raw row.
 
     ``finite`` writes rows the EXL3 kernels can run (see ``finite_expert_bytes``);
-    otherwise every byte is random.
+    otherwise every byte is random. ``layer_bits[layer]`` is that layer's (K of w1/w3,
+    K of w2), a mixed-K checkpoint; a layer it omits is ``BITS`` throughout.
     """
-    spec = expert_spec(hidden, inter)
-    row_bytes = sum(nbytes for *_, nbytes in spec)
+    layer_bits = layer_bits or {}
+    specs = {
+        layer: expert_spec(hidden, inter, *layer_bits.get(layer, (BITS, BITS)))
+        for layer in range(num_layers)
+    }
     keys = [(layer, expert) for layer in range(num_layers) for expert in range(num_experts)]
     rows, weight_map = {}, {}
     for shard_index, first in enumerate(range(0, len(keys), experts_per_shard)):
         filename = f"model-{shard_index + 1:05d}.safetensors"
         tensors = [(f"layers.{keys[first][0]}.attn.norm{shard_index}.weight", "BF16", (3,), b"\x01" * 6)]
         for layer, expert in keys[first : first + experts_per_shard]:
+            spec = specs[layer]
+            row_bytes = sum(nbytes for *_, nbytes in spec)
             row = (
                 finite_expert_bytes(layer, expert, spec)
                 if finite

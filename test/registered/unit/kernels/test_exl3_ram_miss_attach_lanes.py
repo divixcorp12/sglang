@@ -529,7 +529,7 @@ def test_cpu_rows_hold_the_verify_tokens():
         host = SimpleNamespace(
             wire=lease.wire_layout(40), nodes=1, enable_cpu_experts=lambda *a, **k: None, cpu_stats=lambda group: {},
         )
-        trait = SimpleNamespace(check_environment=lambda: None, kernel_address=lambda: 1, name="t")
+        trait = SimpleNamespace(check_environment=lambda: None, attach_host=lambda host: None, name="t")
         service = CpuExpertService(
             host, trait, {0: {}, 1: {}}, hidden=64, cores=cores, threads=2, split=[0] * 41, pin=False, tokens=tokens,
         )

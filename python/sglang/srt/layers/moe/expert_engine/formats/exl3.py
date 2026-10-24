@@ -20,7 +20,6 @@ See DSV41_REFERENCE.md section 9.1 for the pinned-tier budget these formats use.
 from __future__ import annotations
 
 import functools
-import hashlib
 import logging
 import math
 import os
@@ -31,6 +30,7 @@ import torch
 
 from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
+    Exl3RowGeometry,
     build_exl3_expert_layout,
 )
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
@@ -74,15 +74,15 @@ class RowSegment:
 
 
 def _row_schema(
-    layout: Exl3ExpertLayout,
+    geometry: Exl3RowGeometry,
 ) -> tuple[tuple[ExpertTensorSpec, ...], tuple[RowSegment, ...]]:
-    """Validate ``layout`` and derive the streamed specs and the byte map.
+    """Validate one layer's row ``geometry`` and derive the streamed specs and the byte map.
 
     Returns the six specs in ``EXL3_STREAMED_NAMES`` order and the segments sorted
     by on-disk offset. Raises ``ValueError`` if the row is not the expected 12
-    tensors or w1 and w3 disagree.
+    tensors or w1 and w3 disagree (they share the w13 slabs); w2's K may differ.
     """
-    spans = {span.name: span for span in layout.tensors}
+    spans = {span.name: span for span in geometry.tensors}
     expected = {f"{w}.{kind}" for w in _PARTS for kind in _KINDS + ("mul1",)}
     if set(spans) != expected:
         raise ValueError(
@@ -122,6 +122,11 @@ def _row_schema(
         tuple(specs[name] for name in EXL3_STREAMED_NAMES),
         tuple(sorted(segments, key=lambda segment: segment.src_offset)),
     )
+
+
+def layer_segments(layout: Exl3ExpertLayout, layer: int) -> tuple[RowSegment, ...]:
+    """Layer ``layer``'s segment map: where each streamed byte of its on-disk row sits."""
+    return _row_schema(layout.geometry(layer))[1]
 
 
 class Exl3ExpertFormat:
@@ -174,7 +179,7 @@ class Exl3ExpertFormat:
         self.layer_id = layer_id
         self.direct = direct
         self.source_root = source_root
-        self._specs, self._segments = _row_schema(layout)
+        self._specs, self._segments = _row_schema(layout.geometry(layer_id))
 
     def tensor_specs(self, layer: torch.nn.Module) -> tuple[ExpertTensorSpec, ...]:
         return self._specs
@@ -387,15 +392,12 @@ class Exl3ExpertFormat:
         direct = self._resolve_direct()
         return exl3_ram_miss_tables(
             self.layout,
-            self.segment_map(),
             {
                 layer_id: s.pinned_host_cache.tensors
                 for layer_id, s in streamers.items()
             },
             **mirrors,
-            row_images=open_service_row_images(
-                self.layout, self.segment_map(), mirrors, direct, streamers
-            ),
+            row_images=open_service_row_images(self.layout, mirrors, direct, streamers),
         )
 
     @staticmethod
@@ -407,27 +409,21 @@ class Exl3ExpertFormat:
         return build_exl3_expert_streamer(layer)
 
     @staticmethod
-    def cpu_trait(*, source: str, ext=None):
+    def cpu_trait(*, source: str):
         """The EXL3 CPU kernel's quant trait for ``source``'s layers ("draft" or "target").
 
         Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice.
         """
         from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
-        from sglang.srt.layers.quantization.exl3.ext import exl3_ext
         from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-        if ext is None:
-            ext = exl3_ext()
         row_weighted = source in row_weighted_sources()
-        path = getattr(ext, "__file__", None)
         logger.info(
-            "CPU experts: the %s's EXL3 layers use %s tile assignment (extension %s, sha256 %s)",
+            "CPU experts: the %s's EXL3 layers use %s tile assignment",
             source,
             "row-weighted" if row_weighted else "even",
-            path,
-            _short_sha256(path),
         )
-        return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
+        return Exl3CpuQuantTrait(act_limit=None, row_weighted=row_weighted)
 
     def prepare_host_rows(
         self, layer: torch.nn.Module, name: str, tensor: torch.Tensor
@@ -592,17 +588,6 @@ def exl3_mirror_config(
 
 logger = logging.getLogger(__name__)
 _WARNED_WITHOUT_PINNED_TIER = False
-
-
-def _short_sha256(path: Optional[str]) -> str:
-    """First 12 hex digits of the file's sha256, so a log line names the exact shared object that served an arm."""
-    if not path:
-        return "?"
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:12]
-    except OSError:
-        return "?"
 
 
 @functools.lru_cache(maxsize=4)

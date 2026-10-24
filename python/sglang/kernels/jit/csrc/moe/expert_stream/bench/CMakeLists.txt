@@ -40,6 +40,8 @@ endif()
 add_compile_definitions(SGLANG_EXPERT_STREAM_NODES=${EXPERT_STREAM_NODES})
 set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (even, 2..16; the server builds 16); empty: the source default")
 
+set(EXL3_MARCH "native" CACHE STRING "-march of the optimized kernel, which fixes its ISA tier (skylake-avx512 bw, x86-64-v3 avx2, x86-64 scalar)")
+
 option(EXL3_ROW_WEIGHTED_ASSIGNMENT "Experimental row-weighted matrix assignment" OFF)
 
 option(EXL3_FETCH_BENCHMARK "Download pinned Google Benchmark when not installed" ON)
@@ -62,10 +64,12 @@ get_filename_component(QUANT "${CMAKE_CURRENT_SOURCE_DIR}/../../../exl3" ABSOLUT
 if(NOT EXISTS "${QUANT}/optimized/kernel.cpp")
   message(FATAL_ERROR "Cannot locate the CPU kernels: ${QUANT}")
 endif()
-# The vendored baseline contains no Python calls; replace its unnecessary
-# binding header in the build copy, leaving its arithmetic/threading unchanged.
+# The vendored baseline contains no Python calls; replace its unnecessary binding header in the build copy, and its
+# include of upstream's cpu/moe_mul1.h with the upstream API it needs (exl3/baseline_moe_mul1.h), leaving its
+# arithmetic/threading unchanged.
 file(READ "${QUANT}/moe_mul1.cpp" BASELINE)
 string(REPLACE "#include <torch/extension.h>" "#include <ATen/ATen.h>" BASELINE "${BASELINE}")
+string(REPLACE "#include \"moe_mul1.h\"" "#include \"baseline_moe_mul1.h\"" BASELINE "${BASELINE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${QUANT}/moe_mul1.cpp")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/baseline.cpp" CONTENT "${BASELINE}" @ONLY)
 
@@ -93,8 +97,14 @@ foreach(BACKEND baseline optimized)
     target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT=1)
   endif()
   # Kernel flags match the selected study. Keep the harness's NaN/error checks
-  # outside fast-math; kernel and harness are distinct translation units.
-  set_source_files_properties("${KERNEL}" PROPERTIES COMPILE_OPTIONS "-Ofast;-march=native")
+  # outside fast-math; kernel and harness are distinct translation units. The optimized kernel's ISA tier is its
+  # -march (EXL3_MARCH); the vendored baseline detects its tier at run time.
+  if(BACKEND STREQUAL "baseline")
+    set(KERNEL_FLAGS "-Ofast;-march=native")
+  else()
+    set(KERNEL_FLAGS "-Ofast;-march=${EXL3_MARCH}")
+  endif()
+  set_source_files_properties("${KERNEL}" PROPERTIES COMPILE_OPTIONS "${KERNEL_FLAGS}")
   target_compile_options(exl3_cpu_${BACKEND} PRIVATE -O3 -g)
   target_link_libraries(exl3_cpu_${BACKEND} PRIVATE benchmark::benchmark OpenMP::OpenMP_CXX Threads::Threads "${TORCH_CPU}" "${C10}")
   set_target_properties(exl3_cpu_${BACKEND} PROPERTIES BUILD_RPATH "${EXL3_TORCH_ROOT}/lib")

@@ -89,7 +89,7 @@ def test_defaults_equal_the_base_commits_envs_defaults():
     config = _builtin(cfg.ExpertStreamConfig())
     checked = 0
     for old, value in FIXTURE["defaults"].items():
-        if old in SPECIAL_OLD or old not in rem.REMOVED_ENV:
+        if old in SPECIAL_OLD or old not in rem.REMOVED_ENV or not rem.REMOVED_ENV[old].field:
             continue
         field = rem.REMOVED_ENV[old].field
         if field.startswith("exl3."):
@@ -363,6 +363,9 @@ def _resolves(field: str) -> bool:
 
 def test_every_replacement_is_a_real_env_and_config_field():
     for old, target in rem.REMOVED_ENV.items():
+        if target.env == rem.NO_REPLACEMENT:
+            assert not target.field and target.note, old
+            continue
         assert target.env in Envs.__dict__ and isinstance(Envs.__dict__[target.env], EnvField), old
         assert _resolves(target.field), old
         assert target.env.startswith(NEW_PREFIXES), old
@@ -393,7 +396,7 @@ def _expected_config(recipe: str):
         tree[parts[-1]] = value
 
     for old, value in resolved.items():
-        if old in SPECIAL_OLD or old not in rem.REMOVED_ENV:
+        if old in SPECIAL_OLD or old not in rem.REMOVED_ENV or not rem.REMOVED_ENV[old].field:
             continue
         field = rem.REMOVED_ENV[old].field
         if field.startswith("exl3."):

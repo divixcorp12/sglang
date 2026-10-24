@@ -35,7 +35,7 @@ std::vector<int> g_cores; // the bench's worker cores, worker 0 first, carried b
 ::sglang::cpu_experts::Team& bench_team(int workers) {
     static std::unique_ptr<::sglang::cpu_experts::Team> team;
     if (!team)
-        team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::nvfp4_cpu::nvfp4_cpu_kernel(), 0);
+        team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::nvfp4_cpu::Nvfp4CpuKernel::warm, 0);
     return *team;
 }
 constexpr uint64_t max_bytes = uint64_t(2) << 30;
@@ -62,7 +62,6 @@ std::vector<int32_t> list(const std::string& s, bool ranges) {
 }
 struct Options {
     std::string cpus = "18-33", experts = "1,3,5", fixture, write_fixture;
-    std::string max_isa;  // --max-isa: the tier's cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA in a server); empty, the host's
     int workers = 16, node = 1, warmup = 128, gap_us = 0, rows = 1;
     int hidden = 5120, intermediate = 2304, capacity = 5, layers = 1, layout = 0;
     int seed = 20261002;
@@ -90,13 +89,12 @@ Options parse(int& argc, char** argv) {
         else if (key == "--layers") o.layers=number(value);
         else if (key == "--w13-layout") o.layout=number(value);
         else if (key == "--seed") o.seed=number(value);
-        else if (key == "--max-isa") o.max_isa=value;
         else if (arg == "--validate-only") o.validate_only=true;
         else if (arg == "--help") {
             std::cout << "NVFP4 CPU forward (" NVFP4_BENCH_BACKEND ")\n"
                 "--cpus=18-33 --workers=16 --numa-node=1 --experts=1,3,5\n"
                 "--fixture=FILE or synthetic --hidden=5120 --intermediate=2304\n"
-                "--capacity=5 --layers=1 --w13-layout=0|1|2 --seed=20261002 --max-isa=scalar|avx2\n"
+                "--capacity=5 --layers=1 --w13-layout=0|1|2 --seed=20261002\n"
                 "--write-fixture=NEW_FILE --validate-only --warmup-forwards=128 --gap-us=0\n"
                 "--rows=1 (token rows per forward: the layer's x repeated, every row on the same experts)\n"
                 "Memory policy is inherited; Google Benchmark flags also accepted.\n";
@@ -133,7 +131,7 @@ struct Layer {
     std::array<std::vector<uint8_t>,7> slabs;
     std::vector<uint16_t> x;
     SglangNvfp4CpuParams params{};
-    ::sglang::cpu_experts::ExpertLayer layer;  // the kernel's, over the slabs above
+    ::sglang::nvfp4_cpu::Nvfp4CpuKernel::Layer layer;  // the kernel's, over the slabs above
 };
 struct Fixture {
     Header h;
@@ -189,15 +187,15 @@ struct Fixture {
         for (auto& layer:layers) {
             auto& params=layer->params;
             params.w13_layout=int32_t(h.layout); params.inv_input_scale13=h.inv13; params.inv_input_scale2=h.inv2;
-            ::sglang::cpu_experts::ExpertLayer d;
+            ::sglang::nvfp4_cpu::Nvfp4CpuKernel::Layer d;
+            d.params=params;
             d.capacity=h.capacity; d.hidden=h.hidden;
             d.intermediate=h.intermediate; d.act_limit=h.limit; d.slab_count=7;
             for (int i=0;i<7;++i) {
                 d.slabs[i]=layer->slabs[i].empty()?nullptr:layer->slabs[i].data(); d.slot_bytes[i]=strides[i];
             }
             try {
-                layer->layer=::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(
-                    d,std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params,1)));
+                layer->layer=::sglang::nvfp4_cpu::Nvfp4CpuKernel::make_layer(d);
             } catch (const std::exception& e) {
                 throw std::runtime_error(std::string("Registration failed: ")+e.what());
             }
@@ -334,7 +332,7 @@ struct Workload {
         call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
         call.k=experts; call.threads=o.workers; call.cores=g_cores;
         try {
-            ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().forward(f.layers[layer]->layer,call,bench_team(o.workers));
+            ::sglang::nvfp4_cpu::Nvfp4CpuKernel::forward(f.layers[layer]->layer,call,bench_team(o.workers));
         } catch (const std::exception& e) {
             throw std::runtime_error(std::string("CPU expert forward failed: ")+e.what());
         }
@@ -394,7 +392,6 @@ void run(benchmark::State& state,Workload& w) {
 int main(int argc,char** argv) {
     try {
         const auto o=parse(argc,argv); benchmark::Initialize(&argc,argv);
-        ::sglang::nvfp4_cpu::nvfp4_cpu_configure(o.max_isa, false);  // before the first forward fixes the tier
         benchmark::AddCustomContext("ggml_commit","889edf43ddae0cfe9a4564a882764dc879759870");
         if (benchmark::ReportUnrecognizedArguments(argc,argv)) return 1;
         auto cores=list(o.cpus,true), counts=list(o.experts,false);

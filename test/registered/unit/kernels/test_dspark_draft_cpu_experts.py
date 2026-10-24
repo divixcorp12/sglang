@@ -16,13 +16,13 @@ E, H = 6, 8  # 5 routed experts plus a fused shared one (id 5); experts 1 and 5 
 
 
 class _Kernel:
-    """A DraftKernel: an address and a layer spec per stage."""
+    """A DraftKernel: the host attach and a layer spec per stage."""
 
     def __init__(self, act_limit=None):
         self.act_limit = act_limit
 
-    def address(self):
-        return 0
+    def attach_host(self, host):
+        pass
 
     def spec(self, slabs, capacity):
         return ("spec", capacity)
@@ -37,7 +37,7 @@ class _Host:
         self.areas, self.kw, self.layers, self.started, self.stopped = areas, kw, {}, 0, 0
         _Host.built.append(self)
 
-    def set_layer(self, stage, kernel, spec):
+    def set_layer(self, stage, spec):
         self.layers[stage] = spec
 
     def start(self):

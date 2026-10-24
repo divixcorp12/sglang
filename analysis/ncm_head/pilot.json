@@ -1,0 +1,101 @@
+{
+  "protocol_version": 2,
+  "scope": "feasibility_training_diagnostics_variance_only",
+  "seed": 20261018,
+  "gamma": 5,
+  "width": 128,
+  "checkpoint_rule": "fixed_final",
+  "producer_arms": [
+    "C",
+    "F"
+  ],
+  "arms": [
+    "B0",
+    "C",
+    "F"
+  ],
+  "attribution_arms": [
+    "C",
+    "P",
+    "PM",
+    "PH",
+    "F",
+    "F-noaux",
+    "F-flat",
+    "F-flat-aux"
+  ],
+  "cutoff_enabled": false,
+  "updates": {
+    "warmstart": 256,
+    "refine1": 128,
+    "refine2": 128
+  },
+  "effective_batch": 32,
+  "learning_rates": {
+    "new": 0.0001,
+    "dependency": 1e-05
+  },
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "weight_decay": 0.01,
+  "gradient_clip": 1.0,
+  "auxiliary_weight": 0.1,
+  "producer_blocks_per_round_per_arm": 256,
+  "evaluation_paths_per_anchor": 2,
+  "split_counts": {
+    "train": 128,
+    "select": 32,
+    "screen": 64,
+    "calibrate": 48,
+    "threshold": 48,
+    "test": 128
+  },
+  "target_sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 0,
+    "greedy": false
+  },
+  "proposal_sampling": {
+    "temperature": 0.6,
+    "top_p": 1.0,
+    "top_k": 0,
+    "greedy": false
+  },
+  "reference_sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "greedy": false
+  },
+  "host": "divix01",
+  "target_path": "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-full40",
+  "draft_path": "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-dspark-draft",
+  "native_python": "/data/models/slang/.venv/bin/python",
+  "expected_native": {
+    "context_width": 5120,
+    "draft_width": 5120,
+    "vocabulary": 129280,
+    "rank": 256,
+    "norm_eps": 1e-20,
+    "eos_id": 1
+  },
+  "native_config_sha256": {
+    "target": "f39e9a3c50697fbcb30e7afd1f2454f542eaeb148c95e47dad70e83f6d3f7431",
+    "draft": "48035b699f5c6e5ef09768442d4956f060760b0a7cf76230a955e195dfec63e3"
+  },
+  "launch_enabled": false,
+  "proposal_sampling_basis": "local sample_draft_block: temperature-scaled unfiltered softmax; verify runtime manifest before capture",
+  "flat_hidden_by_arm": {
+    "C": 1200,
+    "F-flat": 384,
+    "F-flat-aux": 384
+  },
+  "source_commit": "d82ae69d0368478b5018d4cbfa92ab4643a43f54",
+  "native_source_hashes": {
+    "srt/layers/quantization/exl3/ops.py": "a406154a75cf7d8f1576d4328cccafb065ce6a5ba5550ede04515df8878eb5c9",
+    "srt/models/deepseek_v4_dspark.py": "ef1f46d3d19c1f29f55c18df2e6aa3dfccb539d163cf796c8f46989f184923ea"
+  }
+}

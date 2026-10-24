@@ -1,5 +1,7 @@
 # CPU expert kernel interface: replace the C ABI with a C++ virtual interface
 
+Superseded by `2026-10-23-cpu-expert-kernels-in-host-design.md`: the kernels are compiled into the host module and are concrete types, with no virtual interface.
+
 Status: approved in conversation 2026-10-04. Branch `cpu-kernel-iface`, cut from `numa-p2` at 53963aa379 (Phase 2 of
 the NUMA node distributor plus the GCC 15 / resolved `-march` JIT change).
 

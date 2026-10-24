@@ -25,7 +25,7 @@ from sglang.test.expert_stream_sources import MOE
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-KEYS = [ops.EXL3_BUILD, ops.NVFP4_BUILD, ops.NVFP4_MIMO_BUILD, ops.MXFP4_BUILD]
+KEYS = [ops.EXL3_BUILD, ops.NVFP4_BUILD, ops.NVFP4_MIMO_BUILD, ops.MXFP4_BUILD, ops.FAKE_BUILD]
 UNREGISTERED = ("mxfp4", "sqrt_softplus")  # a real format with a router it is not built for
 
 
@@ -35,6 +35,7 @@ def test_the_builds_are_registered_as_format_router_pairs():
         ("nvfp4", "sqrt_softplus"),
         ("nvfp4", "sigmoid"),
         ("mxfp4", "sigmoid"),
+        ("fake", "sqrt_softplus"),
     }
     assert ops.NVFP4_MIMO_BUILD == ("nvfp4", "sigmoid")
 
@@ -188,13 +189,13 @@ def test_unsupported_cpu_kernel_is_not_usable_and_aborts_naming_its_format(tmp_p
         #include <cstring>
         using namespace sglang;
         int main(int argc, char** argv) {
-          static_assert(!formats::mxfp4::Format::CpuKernel::usable());
+          using Stub = formats::mxfp4::Format::CpuKernel;
+          static_assert(!Stub::usable());
           static_assert(formats::exl3::Format::CpuKernel::usable());
-          const cpu_experts::CpuExpertKernel* stub = formats::mxfp4::Format::CpuKernel::kernel();
-          if (std::strcmp(stub->name(), "mxfp4") != 0 || stub->max_routes() != 0) return 3;
-          cpu_experts::ExpertLayer layer;
-          if (argc > 1 && !std::strcmp(argv[1], "make_layer")) stub->make_layer(layer, {});
-          if (argc > 1 && !std::strcmp(argv[1], "check")) stub->check(layer, cpu_experts::ForwardCall{});
+          if (std::strcmp(Stub::name(), "mxfp4") != 0 || Stub::max_routes() != 0) return 3;
+          Stub::Layer layer;
+          if (argc > 1 && !std::strcmp(argv[1], "make_layer")) Stub::make_layer(layer);
+          if (argc > 1 && !std::strcmp(argv[1], "check")) Stub::check(layer, cpu_experts::ForwardCall{});
           return 0;
         }
         """,

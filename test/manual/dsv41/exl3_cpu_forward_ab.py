@@ -1,13 +1,13 @@
 """Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (csrc/exl3/optimized/kernel.cpp).
 
-``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds, on slab layers made by its kernel's
-make_layer as the RAM-miss service makes them, and saves every output; ``compare`` checks two dumps for bitwise
+``dump`` runs a fixed set of forwards through the kernel compiled into the expert-stream host module, on slab layers
+made by its make_layer as the RAM-miss service makes them, and saves every output; ``compare`` checks two dumps for bitwise
 equality. (Revisions before 2026-10-05 also took ``--registration table``, upstream's per-expert tensor layers, which
 run the same plans: a ``table`` dump there equals its ``slabs`` dump.) ``--registration cores`` (``engines`` is accepted
 as an alias) runs the host's ``kernel_forward`` on two core groups at once (the first and second half of ``--cores``),
 exits 1 naming the case when they differ, and saves the first group's outputs. A dump made at the merge-base is the
-reference a kernel refactor must reproduce exactly, on every ISA tier the host can run. The kernel reads
-SGLANG_EXPERT_STREAM_CPU_MAX_ISA once, at its first forward or tier query, so each tier is its own process.
+reference a kernel refactor must reproduce exactly, on every ISA tier the host can run. A tier is a build at its
+-march (MARCH below), so each tier is its own process.
 
 Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build environment.
 """
@@ -44,9 +44,11 @@ ROUTES = {
 }
 WEIGHTS = (0.5, 0.3, 0.2, 0.15, 0.1)
 SCALES = (1.0, 8.0)
-# (avx2, avx512bw, avx512vnni) the kernel reports at each SGLANG_EXPERT_STREAM_CPU_MAX_ISA; vnni needs a VNNI host (no VBMI is used)
-TIERS = {"scalar": (False, False, False), "avx2": (True, False, False), "bw": (True, True, False),
-         "vnni": (True, True, True)}
+# The tiers the kernel names itself (cpu_kernel_isa); vnni needs a VNNI host (no VBMI is used)
+TIERS = ("scalar", "avx2", "bw", "vnni")
+# The -march each tier is built at (SGLANG_JIT_HOST_MARCH); vnni keeps the host's own, which is VNNI without VBMI on a
+# Xeon 8280.
+MARCH = {"scalar": "x86-64", "avx2": "x86-64-v3", "bw": "skylake-avx512", "vnni": None}
 
 
 def random_slabs(torch, hidden, inter, seed):
@@ -69,15 +71,16 @@ def random_slabs(torch, hidden, inter, seed):
     }
 
 
-def register_slabs(ext, s, limit):
+def register_slabs(s, limit):
     """The kernel's make_layer over the same tensors, as the RAM-miss service makes it: six base pointers, slot s at
     base + s rows. Returns the layer handle (freed by ``kernel_drop``) and the trait."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-    trait = Exl3CpuQuantTrait(ext, act_limit=limit)
+    trait = Exl3CpuQuantTrait(act_limit=limit)
+    trait.attach_host(es.cpu_kernel_options(variant="instr"))
     try:
-        return es.kernel_layer(trait.kernel_address(), trait.layer_spec(s, CAP), variant="instr"), trait
+        return es.kernel_layer(trait.layer_spec(s, CAP), variant="instr"), trait
     except RuntimeError as error:
         sys.exit(f"kernel_layer refused the slabs: {error}")
 
@@ -150,22 +153,18 @@ def run_two_core_groups(torch, handle, hidden, cases, halves):
 
 
 def dump(args):
-    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = args.isa  # read once, at the kernel's first use
+    if MARCH[args.isa]:
+        os.environ["SGLANG_JIT_HOST_MARCH"] = MARCH[args.isa]  # the tier is the build's -march
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 
     import sglang
-    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    from sglang.kernels.ops.moe import expert_stream_transport as es
 
     print(f"sglang {sglang.__file__}")
-    ext = exl3_ext()
-    tier = (
-        bool(ext.exl3_moe_cpu_has_avx2()),
-        bool(ext.exl3_moe_cpu_has_avx512_bw()),
-        bool(ext.exl3_moe_cpu_has_avx512_vnni()),
-    )
-    if tier != TIERS[args.isa]:
-        sys.exit(f"asked for {args.isa}, the kernel reports avx2={tier[0]} bw={tier[1]} vnni={tier[2]}")
+    tier = es.cpu_kernel_options(variant="instr").cpu_kernel_isa()
+    if tier != args.isa:
+        sys.exit(f"asked for {args.isa}, the kernel reports {tier}")
     torch.set_num_threads(1)
     halves = None
     if args.registration == "cores":
@@ -176,7 +175,7 @@ def dump(args):
     outputs = {}
     for (name, hidden, inter), limit in itertools.product(SHAPES, LIMITS):
         slabs = random_slabs(torch, hidden, inter, seed=hidden)
-        handle, _ = register_slabs(ext, slabs, limit)
+        handle, _ = register_slabs(slabs, limit)
         try:
             cases = list(cases_for(torch, name, hidden, limit))
             if halves is not None:
@@ -217,7 +216,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("dump")
-    d.add_argument("--isa", choices=sorted(TIERS), required=True)
+    d.add_argument("--isa", choices=TIERS, required=True)
     d.add_argument("--registration", choices=("slabs", "cores", "engines"), default="slabs")
     d.add_argument("--cores", help="cores: a taskset list of 2 * THREADS cores, one core group on each half")
     d.add_argument("--out", required=True)

@@ -130,9 +130,8 @@ def check_dspark_cpu_experts(cfg) -> None:
             "SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS needs SGLANG_EXL3_MOE_CPU_PIN=0: the kernel would otherwise "
             "pin its workers to the first cores"
         )
-    # Only the optimized build exports a CpuExpertKernel. SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS also selects it, but
-    # a draft-only launch has it off, so these two defines are the way in. The recipe sets them in either case
-    # (exl3/ext.py, cpu_act_defines and optimized_cpu).
+    # The kernel is the optimized residual/128 build. The recipe sets these two in either case, and
+    # kernels/ops/moe/cpu_kernel_build.py refuses any other value.
     if not (exl3_cpu.act_residual and exl3_cpu.act_block == 128):
         raise ValueError(
             "SGLANG_EXPERT_STREAM_ENABLE_DRAFT_CPU_EXPERTS runs the optimized EXL3 CPU kernel: set "

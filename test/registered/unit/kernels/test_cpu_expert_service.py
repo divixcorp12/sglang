@@ -3,6 +3,7 @@
 import itertools
 import json
 
+import msgspec
 import pytest
 import torch
 
@@ -93,22 +94,14 @@ def _fake_slabs(capacity=CAP):
     )
 
 
-class FakeExt:
-    def __init__(self):
-        self.freed = []
-
-    def exl3_moe_cpu_free_layer(self, handle):
-        self.freed.append(handle)
-
-
-def _exl3_slabs():
+def _exl3_slabs(bits_w13=3, bits_w2=3):
     i16, f16 = torch.int16, torch.float16
-    n = CAP * 2 * (H // 16) * (INTER // 16) * 48
+    n = CAP * 2 * (H // 16) * (INTER // 16) * 16 * bits_w13
     return {
-        "w13_trellis": torch.arange(n, dtype=i16).view(CAP, 2, H // 16, INTER // 16, 48),
+        "w13_trellis": torch.arange(n, dtype=i16).view(CAP, 2, H // 16, INTER // 16, 16 * bits_w13),
         "w13_suh": torch.zeros(CAP, 2, H, dtype=f16),
         "w13_svh": torch.zeros(CAP, 2, INTER, dtype=f16),
-        "w2_trellis": torch.zeros(CAP, INTER // 16, H // 16, 48, dtype=i16),
+        "w2_trellis": torch.zeros(CAP, INTER // 16, H // 16, 16 * bits_w2, dtype=i16),
         "w2_suh": torch.zeros(CAP, INTER, dtype=f16),
         "w2_svh": torch.zeros(CAP, H, dtype=f16),
     }
@@ -122,7 +115,7 @@ def test_exl3_trait_reads_a_one_slot_slabs_row_size_not_its_stride():
         one = t[:1].clone()
         slabs[name] = one.as_strided(one.shape, (1,) + one.stride()[1:])
         assert slabs[name].is_contiguous() and slabs[name].stride(0) == 1
-    spec = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).layer_spec(slabs, 1)
+    spec = Exl3CpuQuantTrait(act_limit=10.0).layer_spec(slabs, 1)
     trellis = H * INTER * 3 // 8
     assert [row_bytes for _, row_bytes in spec.slabs] == [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]
 
@@ -141,47 +134,88 @@ def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(name, bad):
     slabs = _exl3_slabs()
     slabs[name] = bad(slabs[name])
     with pytest.raises(ValueError, match=name):
-        Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).layer_spec(slabs, CAP)
+        Exl3CpuQuantTrait(act_limit=10.0).layer_spec(slabs, CAP)
 
 
 def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch):
     # A trait resolves the config at first use and keeps it, so each environment gets its own trait.
     monkeypatch.delenv("SGLANG_EXL3_MOE_CPU_PIN", raising=False)
     with pytest.raises(ValueError, match="SGLANG_EXL3_MOE_CPU_PIN=0"):
-        Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).check_environment()
+        Exl3CpuQuantTrait(act_limit=10.0).check_environment()
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
-    Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).check_environment()
+    Exl3CpuQuantTrait(act_limit=10.0).check_environment()
+
+
+def _plan(id, name, fixed, **facts):
+    from sglang.srt.layers.quantization.exl3.schemes.exl3_cpu_experts import Exl3CpuPlan
+
+    zero = dict(hidden=0, intermediate=0, bits_w13=0, bits_w2=0, swizzled=0, act_limit=0.0)
+    return Exl3CpuPlan(id=id, name=name, fixed=fixed, min_isa="scalar", available=True, **{**zero, **facts})
+
+
+# A kernel's list as the host's cpu_kernel_plans gives it: the generic plan first, then a fixed plan for this file's shape.
+FAKE_PLANS = (
+    _plan(0, "generic", False),
+    _plan(7, "fixed", True, hidden=H, intermediate=INTER, bits_w13=3, bits_w2=3, act_limit=10.0),
+)
 
 
 @pytest.fixture(autouse=True)
 def exl3_params(monkeypatch):
-    """The extension packs SglangExl3CpuParams (its torch op sglang_exl3_cpu::params, which needs the optimized
-    extension: test_cpu_expert_engines_exl3.py checks its bytes); here the trait's params name what it passed."""
-    monkeypatch.setattr(
-        Exl3CpuQuantTrait, "_params", lambda self, bits: f"bits={bits} swizzled={int(self.swizzled)}".encode()
-    )
+    """The host module lists the kernel's plans (CpuKernelOptions.cpu_kernel_plans, which needs the host build:
+    test_cpu_expert_engines_exl3.py checks them); here the plans are FAKE_PLANS."""
+    monkeypatch.setattr(Exl3CpuQuantTrait, "_plans", lambda self: FAKE_PLANS)
 
 
+@pytest.mark.parametrize("bits_w13, bits_w2", [(3, 3), (3, 2), (2, 4)])
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
-def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
+def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout, bits_w13, bits_w2):
     """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape,
-    the clamp and the params the extension packs from {bits, swizzled, row_weighted}."""
-    slabs = _exl3_slabs()
+    the clamp and the params list (bits_w13, bits_w2, swizzled, row_weighted, plan). Gate/up and
+    down are read separately: a w2 whose K differs from w13's gets its own row size and K."""
+    slabs = _exl3_slabs(bits_w13, bits_w2)
     if tier_layout:
         slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
-    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0, swizzled=True)
+    trait = Exl3CpuQuantTrait(act_limit=10.0, swizzled=True)
     spec = trait.layer_spec(slabs, CAP)
     names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
-    trellis = H * INTER * 3 // 8  # bytes of one 3-bit [k/16, n/16, 48] trellis
-    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's row_bytes
+    w13, w2 = H * INTER * bits_w13 // 8, H * INTER * bits_w2 // 8  # bytes of one [k/16, n/16, 16 * K] trellis
+    row_bytes = [2 * w13, 2 * 2 * H, 2 * 2 * INTER, w2, 2 * INTER, 2 * H]  # quant.hpp's row_bytes
     assert spec.slabs == tuple(zip([slabs[n].data_ptr() for n in names], row_bytes))
     assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit, spec.activation) == (CAP, H, INTER, 10.0, 0)
-    assert spec.params == b"bits=3 swizzled=1"
+    assert spec.params == (bits_w13, bits_w2, 1, 0, 0)
     assert all(any(k is slabs[n] for k in spec.keep) for n in names)
 
 
+@pytest.mark.parametrize(
+    "bits_w13, bits_w2, swizzled, act_limit, plans, want",
+    [
+        (3, 3, False, 10.0, FAKE_PLANS, "fixed"),
+        (2, 2, False, 10.0, FAKE_PLANS, "generic"),  # a K2 layer
+        (3, 2, False, 10.0, FAKE_PLANS, "generic"),  # w2 differs from the plan's
+        (2, 3, False, 10.0, FAKE_PLANS, "generic"),  # w13 differs
+        (3, 3, True, 10.0, FAKE_PLANS, "generic"),  # the plan is unswizzled
+        (3, 3, False, 7.0, FAKE_PLANS, "generic"),  # another clamp
+        (3, 3, False, 10.0, (FAKE_PLANS[0], msgspec.structs.replace(FAKE_PLANS[1], available=False)), "generic"),
+    ],
+    ids=["match", "k2", "w2-differs", "w13-differs", "swizzled", "act-limit", "unavailable"],
+)
+def test_exl3_trait_takes_a_fixed_plan_only_for_a_layer_with_exactly_its_facts(
+    monkeypatch, bits_w13, bits_w2, swizzled, act_limit, plans, want
+):
+    """The plan is chosen once per layer from the kernel's list: the first available fixed plan whose every fact
+    equals the layer's, else the generic plan. The params name its id and the spec names it for the log."""
+    monkeypatch.setattr(Exl3CpuQuantTrait, "_plans", lambda self: plans)
+    trait = Exl3CpuQuantTrait(act_limit=act_limit, swizzled=swizzled)
+    spec = trait.layer_spec(_exl3_slabs(bits_w13, bits_w2), CAP)
+    plan_id = {"fixed": 7, "generic": 0}[want]
+    assert spec.params[-1] == plan_id
+    assert spec.plan.startswith(f"EXL3 CPU plan {want} (")
+    assert f"K w13 {bits_w13}, K w2 {bits_w2}" in spec.plan
+
+
 class FakeServiceTrait(FakeTrait):
-    """FakeTrait with the RAM-miss service's half: the lazily set activation limit, the kernel's address and the layer
+    """FakeTrait with the RAM-miss service's half: the lazily set activation limit, the host attach and the layer
     spec."""
 
     act_limit = None
@@ -193,12 +227,12 @@ class FakeServiceTrait(FakeTrait):
     def hidden_size(self, slabs):
         return int(slabs["alpha"].shape[-1])
 
-    def kernel_address(self):
-        return 0x1234
+    def attach_host(self, host):
+        pass
 
     def layer_spec(self, slabs, capacity):
         self.events.append(("register", self.act_limit))
-        return CpuExpertLayerSpec(capacity, 8, 8, self.act_limit, (), b"")
+        return CpuExpertLayerSpec(capacity, 8, 8, self.act_limit, (), ())
 
 
 class FakeHost:
@@ -228,13 +262,13 @@ class FakeHost:
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(
-        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0, two_stage=False,
+        self, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0, two_stage=False,
         two_stage_weights=None, store_out=False,
     ):
         self.two_stage_weights = two_stage_weights
         self.store_out = store_out
-        self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
-        self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
+        self.enabled = (list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
+        self.enables.append((group, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
         self.keep_warm_us = keep_warm_us
         self.two_stage = two_stage
 
@@ -262,12 +296,12 @@ def _service(host, trait, **kw):
 
 
 def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit():
-    """The kernel's address and the cores reach the host before the CPU expert thread starts; the activation limit is
-    only known at the layer's first forward and must be on the trait before layer_spec."""
+    """The trait takes the host and the cores reach the host before the CPU expert thread starts; the activation limit
+    is only known at the layer's first forward and must be on the trait before layer_spec."""
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
     # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
-    assert host.enabled == (0x1234, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0)
+    assert host.enabled == ([0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
@@ -310,7 +344,7 @@ def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
 
     host = FakeHost()
     _service(host, FakeServiceTrait())
-    assert host.enabled[0] == 0x1234 and host.keep_warm_us == 2000
+    assert host.keep_warm_us == 2000
     with envs.SGLANG_EXPERT_STREAM_CPU_EXPERTS_KEEP_WARM_US.override(0):
         host = FakeHost()
         _service(host, FakeServiceTrait())
@@ -641,7 +675,7 @@ def test_cpu_expert_groups_run_one_kernel_per_node_and_register_each_layer_once(
     ]
     split = [0] * (host.wire.lanes + 1)
     groups = CpuExpertGroups(host, trait, {r: _fake_slabs() for r in range(2)}, hidden=8, plans=plans, split=split, pin=False)
-    assert [(e[0], e[1], e[3], e[6]) for e in host.enables] == [(0, 0x1234, [8, 9], 2), (1, 0x1234, [18, 19, 20], 3)]
+    assert [(e[0], e[2], e[5]) for e in host.enables] == [(0, [8, 9], 2), (1, [18, 19, 20], 3)]
     assert tuple(groups.out_rows.shape) == (2, 4, 8), "two output parts per group"
     assert groups.services[1].out_rows is groups.services[0].out_rows
     groups.register(1, 10.0)
@@ -704,7 +738,8 @@ def test_the_pool_and_the_c_abi_mirrors_are_gone():
 
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("sglang.srt.layers.moe.cpu_experts.pool")
-    assert {"kernel_address", "layer_spec"} <= set(dir(CpuExpertQuantTrait))
+    assert {"attach_host", "layer_spec"} <= set(dir(CpuExpertQuantTrait))
+    assert "kernel_address" not in dir(CpuExpertQuantTrait)
     assert not {"register_layer", "free_layer", "forward", "native_forward"} & set(dir(CpuExpertQuantTrait))
 
 
@@ -736,11 +771,10 @@ def test_the_trait_weights_only_the_source_the_option_names(caplog):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.cpu_experts.service import cpu_trait_for
 
-    ext = type("Ext", (), {"__file__": "/build/sglang_exl3_ext.so"})()
     with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override("draft"):
         with caplog.at_level("INFO", logger="sglang.srt.layers.moe.expert_engine.formats.exl3"):
-            draft, target = cpu_trait_for("exl3", ext, source="draft"), cpu_trait_for("exl3", ext, source="target")
+            draft, target = cpu_trait_for("exl3", source="draft"), cpu_trait_for("exl3", source="target")
     assert (draft.row_weighted, target.row_weighted) == (True, False)
-    assert "draft" in caplog.text and "row-weighted" in caplog.text and "/build/sglang_exl3_ext.so" in caplog.text
+    assert "draft" in caplog.text and "row-weighted" in caplog.text
     with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(""):
-        assert cpu_trait_for("exl3", ext, source="draft").row_weighted is False
+        assert cpu_trait_for("exl3", source="draft").row_weighted is False

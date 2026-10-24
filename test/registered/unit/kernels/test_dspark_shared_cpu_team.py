@@ -1,5 +1,5 @@
 """One CPU expert team per node (plan 2026-10-06 Task 11): node 0's engine serves the target's lease records and the
-DSpark draft channel on one thread, one job at a time, on the instr build's fake kernel (CPU)."""
+DSpark draft channel on one thread, one job at a time, on the FAKE_BUILD host's fake kernel (CPU)."""
 
 import dataclasses
 import os
@@ -19,7 +19,7 @@ H, STAGES, ROW, CAPACITY = 64, 3, 1, 1 << 20
 
 
 def _m():
-    return ops._host_module(ops.EXL3_BUILD, "instr")
+    return ops._host_module(ops.FAKE_BUILD, "instr")
 
 
 def _cores():
@@ -35,11 +35,11 @@ def _until(predicate, timeout_s=5.0):
 
 def _shared(tmp_path, request, fatal_wait_s=30.0):
     areas = DraftCpuAreas(STAGES, H, pin=False)
-    kernel = int(_m().expert_stream_test_kernel_address(0, 0, 0))
-    draft = draft_cpu_host("shared", areas, kernel, cores=_cores(), threads=2, keep_warm_us=0,
+    _m().expert_stream_fake_kernel_reset(0, 0, 0)
+    draft = draft_cpu_host("shared", areas, cores=_cores(), threads=2, keep_warm_us=0,
                            fatal_wait_s=fatal_wait_s, tmp_path=tmp_path)
     for stage in range(STAGES):
-        draft.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
+        draft.set_layer(stage, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
     draft.start()
     request.addfinalizer(draft.expert_host.stop)
     request.addfinalizer(draft.stop)
@@ -70,9 +70,9 @@ def _post_target(draft):
 def _kinds():
     """The fake's calls in order: 'draft' (a stage's layer, capacity >= CAPACITY) or 'target'."""
     width = 9 + 2 * 8
-    count = int(_m().expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+    count = int(_m().expert_stream_fake_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
     out = torch.zeros((count, width), dtype=torch.float64)
-    _m().expert_stream_test_kernel_calls(out)
+    _m().expert_stream_fake_kernel_calls(out)
     return ["draft" if int(r[5 + 2 * 8]) >= CAPACITY else "target" for r in out.tolist()]
 
 
@@ -83,7 +83,7 @@ def test_one_team_runs_a_job_of_each_kind_one_after_the_other(tmp_path, request,
     second job's calls interleave with or precede the held one's."""
     areas, draft = _shared(tmp_path, request)
     core = _cores()[0]
-    _m().expert_stream_test_kernel_hold(core, 1)
+    _m().expert_stream_fake_kernel_hold(core, 1)
     if first == "draft":
         _post_draft(areas, 1)
         time.sleep(0.05)
@@ -94,7 +94,7 @@ def test_one_team_runs_a_job_of_each_kind_one_after_the_other(tmp_path, request,
         _post_draft(areas, 1)
     time.sleep(0.1)
     assert _kinds() == [], "nothing completes while the first job is held"
-    _m().expert_stream_test_kernel_hold(core, 0)
+    _m().expert_stream_fake_kernel_hold(core, 0)
     _until(lambda: _draft_done(areas, 1) and draft.expert_host.cpu_stats()["jobs"] == 1)
     second = "target" if first == "draft" else "draft"
     calls = _kinds()
@@ -109,20 +109,20 @@ from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 kind, when = sys.argv[1], sys.argv[2]   # kind: draft | target; when: run (left stuck) | stop (stop() during it)
-m = ops._host_module(ops.EXL3_BUILD, "instr")
+m = ops._host_module(ops.FAKE_BUILD, "instr")
 slow = when == "slow"
-kernel = int(m.expert_stream_test_kernel_address(200_000_000 if slow else 0, 0, 0))
+m.expert_stream_fake_kernel_reset(200_000_000 if slow else 0, 0, 0)
 areas = DraftCpuAreas(3, 64, pin=False)
 cores = sorted(os.sched_getaffinity(0))[:2]
-draft = draft_cpu_host("shared", areas, kernel, cores=cores, threads=2, keep_warm_us=0,
+draft = draft_cpu_host("shared", areas, cores=cores, threads=2, keep_warm_us=0,
                        fatal_wait_s=5.0 if slow else 0.5, tmp_path=pathlib.Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
-    draft.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(64), capacity=(1 << 20) + stage))
+    draft.set_layer(stage, dataclasses.replace(fake_cpu_layer(64), capacity=(1 << 20) + stage))
 draft.start()
 host, sim = draft.expert_host, draft.sim
 req = sim.post(1, [2]); assert host.pump() == 1 and sim.wait_served(req)
 if not slow:
-    m.expert_stream_test_kernel_hold(cores[0], 1)
+    m.expert_stream_fake_kernel_hold(cores[0], 1)
 if kind == "draft":
     areas.slots[0, :2, :2] = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
     m.expert_stream_draft_test_post(areas.channel.data_ptr(), 0, 2, 2, 1, 0)
@@ -138,9 +138,9 @@ if when in ("stop", "slow"):
             print("draft done" if done == 1 else "draft not done", flush=True)
         else:
             width = 9 + 2 * 8
-            count = int(m.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+            count = int(m.expert_stream_fake_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
             calls = torch.zeros((count, width), dtype=torch.float64)
-            m.expert_stream_test_kernel_calls(calls)
+            m.expert_stream_fake_kernel_calls(calls)
             target = [r for r in calls.tolist() if int(r[5 + 2 * 8]) < (1 << 20)]
             print("target done" if target else "target not done", flush=True)
 time.sleep(2)
@@ -153,7 +153,7 @@ print("late", flush=True)
 def test_a_stuck_job_of_either_kind_fail_stops(kind, when):
     """(b) A held forward of either kind fail-stops within the fatal wait (0.5 s), with the job's identity. (c, hung) A
     stop() during it still fail-stops: the watchdog outlives the run thread's join."""
-    result = spawn_child(_STUCK_CHILD, kind, when, timeout_s=60, variant="instr")
+    result = spawn_child(_STUCK_CHILD, kind, when, timeout_s=60, variant="instr", layout=ops.FAKE_BUILD)
     assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])
     assert result.returncode != 0
     says = ["DSpark draft CPU experts", "record 1", "incomplete"] if kind == "draft" else ["CPU job of row 1", "incomplete"]
@@ -165,7 +165,7 @@ def test_a_stuck_job_of_either_kind_fail_stops(kind, when):
 def test_stop_during_a_job_of_either_kind_lets_it_complete(kind):
     """(c) stop() while a 400 ms forward of either kind runs: stop returns after it completes, the job is done (the
     draft record's done word, or the target's CPU job count), nothing fail-stops."""
-    result = spawn_child(_STUCK_CHILD, kind, "slow", timeout_s=60, variant="instr")
+    result = spawn_child(_STUCK_CHILD, kind, "slow", timeout_s=60, variant="instr", layout=ops.FAKE_BUILD)
     assert result.returncode == 0, result.stderr[-2000:]
     assert "stopped" in result.stdout and f"{kind} done" in result.stdout, result.stdout
     assert "FATAL" not in result.stderr, result.stderr[-2000:]
@@ -176,11 +176,11 @@ def test_a_launch_without_a_draft_source_has_no_watchdog(tmp_path, request):
     from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
-    host = attached_host(s, ops.new_page(pin=False, wire=ops.expert_lease_block.wire_layout(8)), k=3)
+    host = attached_host(s, ops.new_page(pin=False, wire=ops.expert_lease_block.wire_layout(8)), k=3, layout=ops.FAKE_BUILD)
     request.addfinalizer(host.stop)
     host.enable_copy_engine(-1)
-    kernel = int(_m().expert_stream_test_kernel_address(0, 0, 0))
+    host.fake_kernel_reset()
     threads_before = len(os.listdir("/proc/self/task"))
-    host.enable_cpu_experts(kernel, [0] * (host.wire.lanes + 1), _cores(), torch.zeros((2, 16), dtype=torch.uint8),
+    host.enable_cpu_experts([0] * (host.wire.lanes + 1), _cores(), torch.zeros((2, 16), dtype=torch.uint8),
                             torch.zeros((2, 2, 8), dtype=torch.float32), threads=2, keep_warm_us=0)
     assert len(os.listdir("/proc/self/task")) - threads_before == 2, "the engine thread and its worker, no watchdog"

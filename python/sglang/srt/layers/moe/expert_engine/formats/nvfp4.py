@@ -204,9 +204,8 @@ class Nvfp4EngineCpuTrait:
     weights_dtype = torch.float32
     out_dtype = torch.float32
 
-    def __init__(self, *, w13_layout: int = 0, module=None) -> None:
+    def __init__(self, *, w13_layout: int = 0) -> None:
         self.w13_layout = w13_layout
-        self.module = module
         self._act_limit: Optional[float] = None
         self._scales: dict[int, tuple[float, float]] = {}
         self._dims: Optional[tuple[int, int]] = None
@@ -257,15 +256,10 @@ class Nvfp4EngineCpuTrait:
             w13_layout=self.w13_layout,
             inv_input_scale13=scales[0],
             inv_input_scale2=scales[1],
-            module=self.module,
         )
 
-    def kernel_address(self) -> int:
-        """The address of the library's NVFP4 CpuExpertKernel."""
-        from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_module
-
-        module = self.module if self.module is not None else nvfp4_cpu_module()
-        return int(module.nvfp4_cpu_kernel_address())
+    def attach_host(self, host) -> None:
+        """Nothing to take: the compiled-in kernel's params need no host query."""
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> "CpuExpertLayerSpec":
         """The layer's slabs under the kernel's names, with this layer's activation scales."""
@@ -445,8 +439,8 @@ class Nvfp4ExpertFormat:
     # ---- CPU experts ----
 
     @staticmethod
-    def cpu_trait(*, source: str, ext: Any = None) -> Nvfp4EngineCpuTrait:
-        """The NVFP4 CPU kernel's trait over the engine's tensor names (``source`` and ``ext`` choose nothing here)."""
+    def cpu_trait(*, source: str) -> Nvfp4EngineCpuTrait:
+        """The NVFP4 CPU kernel's trait over the engine's tensor names (``source`` chooses nothing here)."""
         return Nvfp4EngineCpuTrait()
 
     # ---- host-side preparation ----

@@ -20,6 +20,7 @@ namespace toy {
 namespace {
 using namespace sglang::cpu_experts;
 struct ToyParams { float scale; };
+using ToyLayer = ExpertLayer<ToyParams>;
 struct ToyQuant {
     static constexpr const char* kName = TOY_NAME;
     static constexpr int kSlabs = 1;
@@ -28,13 +29,13 @@ struct ToyQuant {
     static constexpr int kMaxRows = 64;
     static constexpr Isa kTopIsa = Isa::TOY_TOP_ISA;
     using Params = ToyParams;
-    static std::array<uint64_t, 1> row_bytes(const ExpertLayer& l, const Params&) { return {uint64_t(l.hidden) * 4}; }
-    static const char* validate(const ExpertLayer& l, Params& p)
+    static std::array<uint64_t, 1> row_bytes(const ToyLayer& l, const Params&) { return {uint64_t(l.hidden) * 4}; }
+    static const char* validate(const ToyLayer& l, Params& p)
     { return l.activation == 0 && std::isfinite(p.scale) ? nullptr : "the toy takes activation 0 and a finite scale"; }
-    static bool usable(const ExpertLayer&, const Params&, int) { return true; }
+    static bool usable(const ToyLayer&, const Params&, int) { return true; }
     // The toy's typed view of a slot: its row of floats.
     static const float* expert(const ExpertRow& r) { return reinterpret_cast<const float*>(r.slab[0]); }
-    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team)
+    static int dispatch(const ToyLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team)
     {
         const RouteTable r = RouteTable::build(c.slots, c.weights, c.rows, c.k);
         last_isa = isa;
@@ -70,14 +71,7 @@ struct ToyQuant {
     static inline std::atomic<bool> inside{false};
     static inline thread_local bool park_here = false;
 };
+// The toy's kernel type: ExpertForward's static functions (binding.hpp's list).
+using Toy = ExpertForward<ToyQuant>;
 }  // namespace
-}  // namespace toy
-
-#ifndef TOY_KERNEL
-#define TOY_KERNEL toy_kernel
-#endif
-namespace toy {
-// The toy kernel of this library or harness: each defines it (test_cpu_experts_common.py builds libraries with
-// distinct names, so a harness links two side by side).
-const sglang::cpu_experts::CpuExpertKernel& TOY_KERNEL();
 }  // namespace toy

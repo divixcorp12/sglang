@@ -447,7 +447,8 @@ class Exl3LayerMajorResidency:
         if self.buffer is None:
             return
         streamer = self._streamer(layer_id)
-        if streamer is None:
+        # A mixed-K checkpoint's layers differ in row shape; one whose rows are not the buffer's streams without it.
+        if streamer is None or not self.buffer.fits(streamer):
             self.buffer.deactivate()
         else:
             self.buffer.activate(streamer)

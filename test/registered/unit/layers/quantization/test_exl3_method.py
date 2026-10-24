@@ -41,6 +41,13 @@ def test_registered():
     assert Exl3Config.from_config(HF_QUANT).get_name() == "exl3"
 
 
+def test_a_mixed_k_export_with_only_avg_bits_loads():
+    """A mixed-K export (exllamav3 1.6, DeepSeek-V4.1-Flash-1017) writes `avg_bits` and no `bits`; the config used to
+    raise KeyError on it."""
+    config = {k: v for k, v in HF_QUANT.items() if k != "bits"} | {"avg_bits": 2.9, "version": "1.6.2"}
+    assert Exl3Config.from_config(config).bits == 2.9
+
+
 def test_rejects_other_codebooks():
     with pytest.raises(ValueError, match="mul1"):
         Exl3Config.from_config({**HF_QUANT, "codebook": "mcg"})

@@ -6,7 +6,6 @@
 #include "aligned.h"
 #include "fixture.h"
 #include "kernel.h"
-#include "moe_mul1.h"
 #include "placement.h"
 #include <algorithm>
 #include <array>
@@ -158,10 +157,14 @@ void StackFixture::write_x(int64_t row) const {
 // Mirrors Exl3CpuQuantTrait.layer_spec: the row's six slabs by base pointer and row stride (kNames is
 // EXL3_STREAMED_NAMES' order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit, made into a layer
 // by the EXL3 kernel. Views only: the fixture's slabs outlive it.
-::sglang::cpu_experts::ExpertLayer StackFixture::make_layer(int64_t row) const {
+::sglang::exl3_cpu::Exl3CpuKernel::Layer StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
-  const SglangExl3CpuParams params{3, 0};  // bits, swizzled, row_weighted
-  ::sglang::cpu_experts::ExpertLayer d;
+  ::sglang::exl3_cpu::Exl3CpuKernel::Layer d;
+  // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
+  d.params = SglangExl3CpuParams{
+      3, 3, 0, 0,
+      ::sglang::exl3_cpu::exl3_cpu_match_plan(
+          static_cast<int32_t>(f.hidden), static_cast<int32_t>(f.intermediate), 3, 3, 0, 10.0f)};
   d.capacity = static_cast<int32_t>(capacity());
   d.hidden = static_cast<int32_t>(f.hidden);
   d.intermediate = static_cast<int32_t>(f.intermediate);
@@ -172,7 +175,7 @@ void StackFixture::write_x(int64_t row) const {
     d.slabs[n] = f.set.slabs[row][n];
     d.slot_bytes[n] = static_cast<uint64_t>(f.set.layout.row_bytes[n]);
   }
-  return ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(d, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
+  return ::sglang::exl3_cpu::Exl3CpuKernel::make_layer(d);
 }
 
 void StackFixture::preload_slots(int64_t row) const {
@@ -195,14 +198,14 @@ void StackFixture::preload_slots(int64_t row) const {
 }
 
 const char* kernel_isa_tier() {
-  if (exl3_moe_cpu_has_avx512_vbmi()) return "vbmi";
-  return exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
+  static const std::string tier = ::sglang::exl3_cpu::Exl3CpuKernel::isa();
+  return tier.c_str();
 }
 
-void configure_cpu_kernel_runtime(const std::string& max_isa) {
-  // The kernel detects its ISA tier at the first query, here, under the cap configured just before it.
-  ::sglang::exl3_cpu::exl3_cpu_configure({.max_isa = max_isa});
-  if (!exl3_moe_cpu_has_avx512_bw())
+void configure_cpu_kernel_runtime() {
+  ::sglang::exl3_cpu::Exl3CpuKernel::configure({}, 65536, 6000, {}, {});
+  const std::string tier = kernel_isa_tier();
+  if (tier == "scalar" || tier == "avx2")
     throw std::runtime_error("This study requires AVX512BW");
   std::cerr << "isa tier " << kernel_isa_tier() << '\n';
   at::set_num_threads(1);

@@ -16,7 +16,9 @@
 
 #include "fixture.h"
 #include "kernel.h"
-#include "moe_mul1.h"
+#ifdef EXL3_BENCH_BASELINE
+#include "baseline_moe_mul1.h"
+#endif
 #include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include "../../moe/expert_stream/host/core_topology.h"
 #include "tile_assignment.hpp"
@@ -59,7 +61,7 @@ std::vector<int> g_cores;  // the bench's worker cores, worker 0 first
 ::sglang::cpu_experts::Team& bench_team(int workers) {
   static std::unique_ptr<::sglang::cpu_experts::Team> team;
   if (!team)
-    team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::exl3_cpu::exl3_cpu_kernel(), 0);
+    team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::exl3_cpu::Exl3CpuKernel::warm, 0);
   return *team;
 }
 bool benchmark_failed = false;
@@ -71,9 +73,6 @@ struct Options {
   int workers = EXL3_BENCH_DEFAULT_WORKERS;
   // --smt: the workers' SMT siblings join the team after them (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT)
   bool smt = false;
-  // --max-isa=TIER: the optimized kernel's ISA cap (SGLANG_EXPERT_STREAM_CPU_MAX_ISA in a server); empty, the host's.
-  // The baseline reads its own EXL3_MOE_CPU_MAX_ISA at load instead.
-  std::string max_isa;
   int node = 1;
   int warmup = 128;
   int gap_us = 0;
@@ -129,8 +128,6 @@ Options parse_options(int& argc, char** argv) {
       opt.workers = number(value("--workers="));
     else if (arg == "--smt")
       opt.smt = true;
-    else if (arg.starts_with("--max-isa="))
-      opt.max_isa = value("--max-isa=");
     else if (arg.starts_with("--numa-node="))
       opt.node = number(value("--numa-node="));
     else if (arg.starts_with("--warmup-forwards="))
@@ -156,8 +153,6 @@ Options parse_options(int& argc, char** argv) {
                    ")\n"
                    "--fixture=FILE --reference-dir=DIR --cpus=28-43 --workers=N\n"
                    "--smt adds each of the N workers' SMT siblings to the team, after them (2N workers)\n"
-                   "--max-isa=scalar|avx2|bw|vnni|vbmi caps the optimized kernel's tier (the baseline reads\n"
-                   "  EXL3_MOE_CPU_MAX_ISA at load)\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
                    "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
@@ -212,11 +207,11 @@ struct SlabLayer {
     }
   };
   std::array<std::unique_ptr<uint8_t, Free>, 6> slabs;
-  ::sglang::cpu_experts::ExpertLayer layer;
+  ::sglang::exl3_cpu::Exl3CpuKernel::Layer layer;
 
   SlabLayer(const LayerFixture& f, int hidden, int slots) {
     const int experts = static_cast<int>(f.matrices[0].size());
-    ::sglang::cpu_experts::ExpertLayer shape;
+    ::sglang::exl3_cpu::Exl3CpuKernel::Layer shape;
     shape.capacity = slots;
     shape.hidden = hidden;
     shape.intermediate = static_cast<int32_t>(f.matrices[0][0].size(1)) * 16;
@@ -243,9 +238,11 @@ struct SlabLayer {
       shape.slabs[n] = slabs[n].get();
       shape.slot_bytes[n] = row;
     }
-    const SglangExl3CpuParams params{3, 0};  // bits, swizzled, row_weighted
-    layer = ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(
-        shape, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
+    // 3-bit gate/up and down, unswizzled, not row-weighted, on the plan that accepts the layer.
+    shape.params = SglangExl3CpuParams{
+        3, 3, 0, 0,
+        ::sglang::exl3_cpu::exl3_cpu_match_plan(shape.hidden, shape.intermediate, 3, 3, 0, shape.act_limit)};
+    layer = ::sglang::exl3_cpu::Exl3CpuKernel::make_layer(shape);
   }
 };
 #endif
@@ -334,7 +331,7 @@ struct Workload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call, bench_team(options.workers));
+    ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
 #endif
   }
 
@@ -454,7 +451,7 @@ struct RoutedWorkload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call, bench_team(options.workers));
+    ::sglang::exl3_cpu::Exl3CpuKernel::forward(layers[layer]->layer, call, bench_team(options.workers));
   }
 
   void validate() {
@@ -567,18 +564,22 @@ int main(int argc, char** argv) {
 #ifdef EXL3_BENCH_BASELINE
     // The vendored baseline reads its own variables (moe_mul1.cpp): these two at its first forward, and
     // EXL3_MOE_CPU_MAX_ISA at load, so the scripts export that one.
-    if (!options.max_isa.empty())
-      throw std::runtime_error("--max-isa caps the optimized kernel; the baseline reads EXL3_MOE_CPU_MAX_ISA at load");
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
 #else
-    ::sglang::exl3_cpu::exl3_cpu_configure({.max_isa = options.max_isa});
+    ::sglang::exl3_cpu::Exl3CpuKernel::configure({}, 65536, 6000, {}, {});
 #endif
-    // The tier is fixed at load (baseline) or at this first query (optimized, from --max-isa).
-    // Any AVX-512 tier runs the DSV4.1 plan; no cap runs the host's, which is what the scripts do.
+    // The optimized kernel's tier is its build's -march (CMake EXL3_MARCH); the baseline detects at load.
+    // Any AVX-512 tier runs the DSV4.1 plan.
+#ifdef EXL3_BENCH_BASELINE
     if (!exl3_moe_cpu_has_avx512_bw())
       throw std::runtime_error("This study requires AVX512BW");
     const char* isa_tier = exl3_moe_cpu_has_avx512_vbmi() ? "vbmi" : exl3_moe_cpu_has_avx512_vnni() ? "vnni" : "bw";
+#else
+    const std::string isa_tier = ::sglang::exl3_cpu::Exl3CpuKernel::isa();
+    if (isa_tier == "scalar" || isa_tier == "avx2")
+      throw std::runtime_error("This study requires AVX512BW");
+#endif
     std::cerr << "isa tier " << isa_tier << '\n';
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
@@ -640,7 +641,7 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("compiler", __VERSION__);
 #ifndef EXL3_BENCH_BASELINE
       benchmark::AddCustomContext("row_weighted_assignment", std::to_string(EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT));
-      benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::exl3_cpu_chunk_m()));
+      benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::Exl3CpuKernel::chunk_m()));
 #endif
       for (auto& workload : workloads) {
         auto* w = workload.get();

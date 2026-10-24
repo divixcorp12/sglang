@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "inputs_lock_sha256": "41b12819285bb1dbf98822b40c0691888671628515391549cb1b51ad09eaab4d",
+  "additions": 46,
+  "combined_histories": 667,
+  "storage": {
+    "required_total_bytes": 55517790618,
+    "generation_tensor_bytes": {
+      "primary": 8424960000,
+      "repeat": 8603922432
+    },
+    "retained_generations_per_partition": 2,
+    "inflight_generations": 1
+  },
+  "source_weights_unchanged": true,
+  "selection_allowed": false
+}

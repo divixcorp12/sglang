@@ -16,7 +16,6 @@
 #include "shapes.hpp"
 #include "worker_trace.hpp"
 #include "tile_assignment.hpp"
-#include <c10/util/Half.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -198,7 +197,7 @@ void run_tiles(
 struct ForwardCtx
 {
     const ExpertLayer* layer;
-    const at::Half* x;
+    const Fp16* x;
     float* out;
     int m_total;
     bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
@@ -713,27 +712,33 @@ private:
 // exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
 std::atomic<int64_t> g_plan_calls[2];
 
-// Runs the call's plan at tier `isa`: the DSV4.1 plan when it accepts the call, else the generic plan at the tier.
-void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team, Isa isa)
+// The tier this build compiles (the build's, ExpertForward::isa); every plan below is instantiated at it alone.
+constexpr Isa kPlanIsa = ExpertForward<Exl3Quant>::isa();
+
+// A template on the tier so a plan the tier lacks is never instantiated.
+template <Isa K>
+void run_plan_at(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team)
 {
     const ExpertLayer& l = *ctx.layer;
-    if (isa >= Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
-        g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
-        // The plan is written for AVX-512BW. A VNNI host (Vnni, Vbmi) runs it with the vpdpwssd register kernels.
-        const Experts<Dsv41Shape> E{&l, p};
-        if (isa == Isa::Bw) ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, team);
-        else ForwardPlan<Dsv41Shape, Isa::Bw, false, EXL3_MOE_CPU_WORKER_TRACE != 0, true>::run(ctx, E, ar, team);
-        return;
+    if constexpr (K >= Dsv41Shape::kMinIsa) {
+        if (p.plan == Dsv41Shape::kPlan) {
+            g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
+            // The plan is written for AVX-512BW. A VNNI build (Vnni, Vbmi) runs it with the vpdpwssd register kernels.
+            const Experts<Dsv41Shape> E{&l, p};
+            if constexpr (K == Isa::Bw) ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, team);
+            else ForwardPlan<Dsv41Shape, Isa::Bw, false, EXL3_MOE_CPU_WORKER_TRACE != 0, true>::run(ctx, E, ar, team);
+            return;
+        }
     }
     g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
     const Experts<GenericShape> E{&l, p};
-    switch (isa) {
-        case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, team); return;
-        case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, team); return;
-        case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, team); return;
-        case Isa::Vnni:   ForwardPlan<GenericShape, Isa::Vnni>::run(ctx, E, ar, team); return;
-        case Isa::Vbmi:   ForwardPlan<GenericShape, Isa::Vbmi>::run(ctx, E, ar, team); return;
-    }
+    ForwardPlan<GenericShape, K>::run(ctx, E, ar, team);
+}
+
+// Runs the layer's plan (p.plan, which registration checked against the layer and this build) at kPlanIsa.
+void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team)
+{
+    run_plan_at<kPlanIsa>(ctx, p, ar, team);
 }
 
 // The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M tokens (GENERIC_CHUNK_M for the
@@ -741,11 +746,11 @@ void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Tea
 // framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then token, then route), so it reads the
 // call's slots as given and runs zero-weight routes. Each weight is rounded to FP16, the registered kernel's
 // convention. ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range).
-int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team)
+int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa, Team& team)
 {
     ForwardCtx ctx;
     ctx.layer = &l;
-    ctx.x = static_cast<const at::Half*>(c.x);
+    ctx.x = static_cast<const Fp16*>(c.x);
     ctx.out = c.out;
     ctx.m_total = c.rows;
     ctx.zero_out = !c.accumulate;
@@ -769,7 +774,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
     std::sort(routes.begin(), routes.end());
     // The DSV4.1 plan takes chunks of up to CHUNK_M tokens, the generic plan up to GENERIC_CHUNK_M (math.hpp).
-    const int chunk_m = isa >= Isa::Bw && Dsv41Shape::accepts_layer(l, p) ? CHUNK_M : GENERIC_CHUNK_M;
+    const int chunk_m = p.plan == Dsv41Shape::kPlan ? CHUNK_M : GENERIC_CHUNK_M;
     for (size_t i = 0; i < routes.size();)
     {
         Chunk ch;
@@ -778,7 +783,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         for (; i < routes.size() && routes[i].first == ch.expert && ch.m < chunk_m; ++i, ++ch.m)
         {
             ch.token[ch.m] = routes[i].second / c.k;
-            ch.weight[ch.m] = half_to_float(at::Half(c.weights[routes[i].second]));
+            ch.weight[ch.m] = half_to_float(float_to_fp16(c.weights[routes[i].second]));
         }
         ctx.chunks.push_back(ch);
     }
@@ -805,10 +810,51 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
         if (ctx.stage_two) ctx.stage_two(ctx.stage_two_ctx);
         if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * l.hidden * sizeof(float));
     } else {
-        run_plan(ctx, p, ar, team, isa);
+        run_plan(ctx, p, ar, team);
     }
     give_back();
     return 0;
+}
+
+// -------------------------------------------------------------------------------------------
+//   Plan registry
+// -------------------------------------------------------------------------------------------
+
+template <class Shape>
+SglangExl3CpuPlanInfo plan_info()
+{
+    SglangExl3CpuPlanInfo info{};
+    info.id = Shape::kPlan;
+    info.name = Shape::kName;
+    info.fixed = Shape::kFixed;
+    if constexpr (Shape::kFixed) {
+        info.hidden = Shape::kHidden;
+        info.intermediate = Shape::kIntermediate;
+        info.bits_w13 = Shape::kBitsW13;
+        info.bits_w2 = Shape::kBitsW2;
+        info.swizzled = Shape::kSwizzled;
+        info.act_limit = Shape::kActLimit;
+    }
+    info.min_isa = isa_name(Shape::kMinIsa);
+    info.available = Shape::kBuilt && kPlanIsa >= Shape::kMinIsa;
+    return info;
+}
+
+// Every compiled plan, the generic plan first; the host's cpu_kernel_plans lists these.
+std::vector<SglangExl3CpuPlanInfo> plan_infos() { return {plan_info<GenericShape>(), plan_info<Dsv41Shape>()}; }
+
+const char* plan_rejects(const ExpertLayer& l, const SglangExl3CpuParams& p)
+{
+    if (p.plan == GenericShape::kPlan) return nullptr;
+    if (p.plan != Dsv41Shape::kPlan) return "plan is not a compiled plan id (cpu_kernel_plans)";
+    if (!Dsv41Shape::kBuilt)
+        return "plan dsv41 is not built: it needs residual activations in 128-wide blocks (ACT_ROWS 2, act block 128)";
+    if (kPlanIsa < Dsv41Shape::kMinIsa)
+        return "plan dsv41 is not built: it needs AVX-512BW, above this build's -march (SGLANG_JIT_HOST_MARCH)";
+    if (!Dsv41Shape::matches(l, p))
+        return "plan dsv41 does not accept the layer: it runs hidden 5120, intermediate 2304, act_limit 10, 3-bit "
+               "gate/up and down, unswizzled";
+    return nullptr;
 }
 
 }  // namespace

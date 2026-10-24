@@ -4,8 +4,8 @@
 // after the job, then PAUSE, until the next job: no worker sleeps or leaves the team, so a job never waits for a
 // wake-up and no OpenMP runtime policy decides when a worker spins.
 //
-// The host and the quant libraries share a Team through CpuExpertKernel::forward's reference, so its layout is this
-// header's, compiled by both sides: atomics, plain ints, a span and function pointers (kernel.hpp's rule).
+// The host and a kernel's translation unit share a Team through the kernel's forward(layer, call, team), so both
+// compile this header: atomics, plain ints, a span and function pointers.
 #pragma once
 #include "kernel.hpp"
 #include <immintrin.h>
@@ -59,15 +59,16 @@ inline int64_t team_now_ns()
 class Team {
 public:
     using Body = void (*)(void* ctx, int worker, int workers);
+    // The kernel's idle register work (its warm function).
+    using Warm = int32_t (*)(const uint32_t* word, uint32_t seen, int64_t deadline_ns);
 
     // Starts the workers and pins the caller to cores[0]. Throws std::invalid_argument for threads < 1 or more threads
     // than `cores`, std::runtime_error when the caller or a worker cannot be pinned (the workers started are stopped
-    // first). `cores` must outlive the Team. `kernel` supplies the idle register work (null: PAUSE only). `name` (may
+    // first). `cores` must outlive the Team. `warm` is the idle register work (null: PAUSE only). `name` (may
     // be null) names the worker threads as the owner's thread is named, so tooling that selects the owner's threads by
     // name finds its workers.
-    Team(std::span<const int> cores, int threads, const CpuExpertKernel* kernel, int64_t keep_warm_ns,
-         const char* name = nullptr)
-        : cores_(cores), workers_(threads), kernel_(kernel), keep_warm_ns_(keep_warm_ns)
+    Team(std::span<const int> cores, int threads, Warm warm, int64_t keep_warm_ns, const char* name = nullptr)
+        : cores_(cores), workers_(threads), warm_(warm), keep_warm_ns_(keep_warm_ns)
     {
         if (threads < 1 || (!cores.empty() && size_t(threads) > cores.size()))
             throw std::invalid_argument("CPU expert team needs a worker and no more workers than its cores");
@@ -122,8 +123,8 @@ public:
     void wait(const uint32_t* word, uint32_t seen, int64_t warm_until_ns, int64_t until_ns) const
     {
         const int64_t warm_until = std::min(warm_until_ns, until_ns);
-        if (kernel_ != nullptr && warm_until > team_now_ns())
-            sink_.fetch_add(kernel_->warm(word, seen, warm_until), std::memory_order_relaxed);
+        if (warm_ != nullptr && warm_until > team_now_ns())
+            sink_.fetch_add(warm_(word, seen, warm_until), std::memory_order_relaxed);
         for (uint32_t tick = 0; __atomic_load_n(word, __ATOMIC_ACQUIRE) == seen; ++tick) {
             _mm_pause();
             if ((tick & 63) == 0 && until_ns != INT64_MAX && team_now_ns() >= until_ns) return;
@@ -170,7 +171,7 @@ private:
 
     std::span<const int> cores_;
     int workers_;
-    const CpuExpertKernel* kernel_;
+    Warm warm_;
     int64_t keep_warm_ns_;
     std::vector<std::thread> threads_;
     // The job word: moves once per run() and once at stop; the workers' idle wait watches it.
@@ -184,12 +185,13 @@ private:
     mutable std::atomic<int32_t> sink_{0};  // keeps the register work observable
 };
 
-// A forward on a team made for this call alone (call.threads workers on call.cores): tests, the bench and other
-// harnesses that hold no Team. The engine runs on its own.
-inline void CpuExpertKernel::forward(const ExpertLayer& layer, const ForwardCall& call) const
+// A forward of `Kernel` (a format's kernel type) on a team made for this call alone (call.threads workers on
+// call.cores): tests, the bench and other harnesses that hold no Team. The engine runs on its own.
+template <class Kernel>
+void forward_alone(const typename Kernel::Layer& layer, const ForwardCall& call)
 {
-    Team team(call.cores, call.threads, this, 0);
-    forward(layer, call, team);
+    Team team(call.cores, call.threads, &Kernel::warm, 0);
+    Kernel::forward(layer, call, team);
 }
 
 }  // namespace sglang::cpu_experts

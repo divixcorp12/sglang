@@ -56,15 +56,15 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     which loads the EXL3 module."""
     s = ram_miss_setup(tmp_path)
     t = s.tables
-    keep = t.segments[:, 0] < 2
+    keep = t.segments[0, :, 0] < 2  # every layer of the fake checkpoint shares one row shape
     # A row image is read whole, and the reader refuses a read of bytes no segment names: the one part (one root) is
     # cut to the kept names' bytes, [0, the end of the last kept segment), which the image lays out first.
-    kept = t.segments[keep]
-    assert t.parts == 1 and int(kept[:, 2].min()) == 0
+    kept = t.segments[:, keep]
+    assert t.parts == 1 and int(kept[..., 2].min()) == 0
     extents = t.extents.clone()
-    extents[..., 2] = int((kept[:, 2] + kept[:, 3]).max())
+    extents[..., 2] = int((kept[..., 2] + kept[..., 3]).max())
     tables = dataclasses.replace(
-        t, slabs=t.slabs[:, :2].contiguous(), row_bytes=t.row_bytes[:2].contiguous(),
+        t, slabs=t.slabs[:, :2].contiguous(), row_bytes=t.row_bytes[:, :2].contiguous(),
         segments=kept.contiguous(), extents=extents,
     )
     loaded = []

@@ -60,12 +60,13 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
     row, low, high = 0, 3, 7
     split = [0] * (lease.wire_layout(8).lanes + 1)
     split[2] = 1
-    c = Chain(tmp_path, copy_engine=True, start=False, cpu_misses=miss)
+    c = Chain(tmp_path, copy_engine=True, start=False, cpu_misses=miss, build=ops.FAKE_BUILD)
     try:
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), split, cores, x_rows, out_rows, threads=2)
+        c.host.fake_kernel_reset(zero=True)
+        c.host.enable_cpu_experts(split, cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
         c.dev.enable_cpu_experts(x_rows, out_rows)
         c.dev.set_row_cpu(row)
@@ -126,11 +127,11 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
         dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
         snapshot = c.snapshot(row)
-        assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
+        assert _until(lambda: len(c.host.fake_kernel_calls()) == 1)
         torch.cuda.synchronize()
 
         low_slot = int(dev.lane_slot[1]) if miss else ram_slot[low]
-        calls = [(call["slots"], call["weights"]) for call in c.host.test_kernel_calls()]
+        calls = [(call["slots"], call["weights"]) for call in c.host.fake_kernel_calls()]
         assert calls == [([low_slot], [0.25])], "the tail lane (the low key) is the CPU's"
         assert c.kinds(2) == [LaneKind.HIT_COPY, LaneKind.MISS_CPU if miss else LaneKind.HIT_CPU]
         assert dev.cpu_lanes.tolist() == [0b10, PART_MISSES if miss else PART_HITS]
@@ -179,12 +180,13 @@ def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_pla
     split = [0] * count + [cpu] + [0] * (lanes - count)
     with tempfile.TemporaryDirectory() as tmp:
         c = Chain(Path(tmp), copy_engine=True, start=False, lanes=lanes, experts=experts, top_k=lanes, dst_rows=lanes,
-                  capacity=2 * lanes, staging=lanes)
+                  capacity=2 * lanes, staging=lanes, build=ops.FAKE_BUILD)
         try:
             x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
             out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
             cores = sorted(os.sched_getaffinity(0))[:2]
-            c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), split, cores, x_rows, out_rows, threads=2)
+            c.host.fake_kernel_reset(zero=True)
+            c.host.enable_cpu_experts(split, cores, x_rows, out_rows, threads=2)
             c.host.start_thread(fatal_wait_s=60.0)
             c.dev.enable_cpu_experts(x_rows, out_rows)
             c.dev.set_row_cpu(row)
@@ -245,11 +247,11 @@ def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_pla
             dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
             dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
             snapshot = c.snapshot(row)
-            assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
+            assert _until(lambda: len(c.host.fake_kernel_calls()) == 1)
             torch.cuda.synchronize()
 
             cpu_experts = by_key[copied:]
-            (call,) = c.host.test_kernel_calls()
+            (call,) = c.host.fake_kernel_calls()
             assert sorted(call["slots"]) == sorted(ram_slot[e] for e in cpu_experts), (
                 "the four lowest-keyed lanes are the CPU's"
             )
@@ -315,7 +317,7 @@ def test_cpu_lanes_past_bit_7_reach_the_route_tables_and_the_direct_gather(miss_
     state[ops.STATE_WORDS["pending"]] = 1
     ce_mask = torch.full((3,), -1, dtype=torch.int32, device="cuda")
     cpu_lanes = torch.full((2,), -1, dtype=torch.int32, device="cuda")
-    ops._device_module(ops.EXL3_BUILD, lanes).expert_stream_lease_copy_wait(
+    ops._device_module(ops.FAKE_BUILD, lanes).expert_stream_lease_copy_wait(
         state, torch.tensor([count], dtype=torch.int32, device="cuda"), int(block.data_ptr()), lane_kind, lane_slot,
         torch.zeros(w.lanes, dtype=torch.int32, device="cuda"), dst_slots, 0, 0, ce_mask, cpu_lanes, 0,
     )
@@ -375,13 +377,13 @@ def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
 
     row, lanes, experts = 0, 40, list(range(36))
     c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=80, staging=36,
-              experts=40)  # the rig's default 16 experts would leave 36 routes past the slot map
+              experts=40, build=ops.FAKE_BUILD)  # the rig's default 16 experts would leave 36 routes past the slot map
     try:
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), list(range(lanes + 1)), cores, x_rows,
-                                  out_rows, threads=2)
+        c.host.fake_kernel_reset(zero=True)
+        c.host.enable_cpu_experts(list(range(lanes + 1)), cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
         c.dev.enable_cpu_experts(x_rows, out_rows)
         c.dev.set_row_cpu(row)
@@ -402,11 +404,11 @@ def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
         copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
         dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
-        assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
+        assert _until(lambda: len(c.host.fake_kernel_calls()) == 1)
         torch.cuda.synchronize()
         assert c.kinds(36) == [int(LaneKind.HIT_CPU)] * 36
         assert dev.cpu_lanes.tolist() == [-1, PART_HITS, 0xF]
-        (call,) = c.host.test_kernel_calls()
+        (call,) = c.host.fake_kernel_calls()
         assert sorted(call["slots"]) == sorted(ram_slot[e] for e in experts)
     finally:
         c.close()
@@ -423,13 +425,13 @@ def test_a_verify_records_cpu_lanes_run_one_forward_of_its_tokens(tmp_path, toke
 
     row, experts, tokens_max = 0, [3, 5, 7], 4
     lanes = lease.wire_layout(8).lanes
-    c = Chain(tmp_path, copy_engine=True, start=False)
+    c = Chain(tmp_path, copy_engine=True, start=False, build=ops.FAKE_BUILD)
     try:
         x_rows = torch.zeros((LAYERS, lease.cpu_row_bytes(HIDDEN, tokens_max, lanes)), dtype=torch.uint8).pin_memory()
         out_rows = torch.full((LAYERS, 2, tokens_max, HIDDEN), 7.0, dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(), list(range(lanes + 1)), cores, x_rows, out_rows,
-                                  threads=2)
+        c.host.fake_kernel_reset()
+        c.host.enable_cpu_experts(list(range(lanes + 1)), cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
         c.dev.enable_cpu_experts(x_rows, out_rows)
         c.dev.set_row_cpu(row)
@@ -454,12 +456,12 @@ def test_a_verify_records_cpu_lanes_run_one_forward_of_its_tokens(tmp_path, toke
         copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
         dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
-        assert _until(lambda: len(c.host.test_kernel_calls()) == tokens)
+        assert _until(lambda: len(c.host.fake_kernel_calls()) == tokens)
         torch.cuda.synchronize()
 
         assert c.kinds(3) == [LaneKind.HIT_CPU] * 3
         assert dev.cpu_lanes.tolist() == [0b111, PART_HITS]
-        for t, call in enumerate(c.host.test_kernel_calls()):
+        for t, call in enumerate(c.host.fake_kernel_calls()):
             want_slots = [ram_slot[e] if e in routes[t] else -1 for e in planned]
             want_weights = [float(weights[t, routes[t].index(e)]) if e in routes[t] else 0.0 for e in planned]
             assert call["slots"] == want_slots, (t, call)
@@ -481,13 +483,13 @@ def test_36_forced_cpu_misses_on_one_node_are_read_into_ram_victims(tmp_path):
 
     row, lanes, experts = 0, 40, list(range(36))
     c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=48,
-              experts=40)  # the rig's default 16 experts would leave 36 routes past the slot map
+              experts=40, build=ops.FAKE_BUILD)  # the rig's default 16 experts would leave 36 routes past the slot map
     try:
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (lanes + 1), cores, x_rows, out_rows,
-                                  threads=2)
+        c.host.fake_kernel_reset(zero=True)
+        c.host.enable_cpu_experts([0] * (lanes + 1), cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
         c.dev.enable_cpu_experts(x_rows, out_rows)
         c.dev.set_row_cpu(row)
@@ -518,7 +520,7 @@ def test_36_forced_cpu_misses_on_one_node_are_read_into_ram_victims(tmp_path):
             slot_of = {e: s for s, (state, e, _) in enumerate(info) if e >= 0}
             staging_after = [s for s, (state, e, _) in enumerate(info) if state == STAGING_STATE]
         assert staging_after == staging_before, "no staging slot was used"
-        computed = sorted(s for call in c.host.test_kernel_calls() for s in call["slots"])
+        computed = sorted(s for call in c.host.fake_kernel_calls() for s in call["slots"])
         assert computed == sorted(slot_of[e] for e in experts)
     finally:
         c.close()

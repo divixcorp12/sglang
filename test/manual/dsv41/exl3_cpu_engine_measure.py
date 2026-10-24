@@ -46,27 +46,33 @@ def runtime_probe():
 
 
 def build(args):
-    import tvm_ffi.libinfo
-    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    """Builds the engine library with the EXL3 kernel linked in: the kernel's sources and flags are the host module's
+    (cpu_kernel_build), with the worker trace compiled in as the diagnostic build has it."""
+    from sglang.kernels.jit.utils.compile.toolchain import host_arch_flags
+    from sglang.kernels.ops.moe.cpu_kernel_build import cpu_kernel_build
+    from sglang.srt.layers.moe.expert_engine.config import (
+        CpuExpertsConfig, CpuWorkerTraceConfig, ExpertStreamConfig, JobTraceConfig, TraceConfig)
     args.output.mkdir(parents=True, exist_ok=True)
-    if args.seed_build:
-        shutil.copytree(args.seed_build, args.output / "exl3-build", dirs_exist_ok=True)
-    os.environ.update(SGLANG_EXL3_BUILD_DIR=str(args.output / "exl3-build"),
-                      SGLANG_EXPERT_STREAM_TRACE=json.dumps({
-                          "job": {"prefix": str(args.output / "unused-job")},
-                          "cpu_worker": {"prefix": str(args.output / "unused-worker")}}))
-    ext = exl3_ext()
-    tvm_lib = Path(tvm_ffi.libinfo.find_libtvm_ffi())
-    command = [os.environ.get("CXX", "g++"), "-std=c++20", "-O3", "-shared", "-fPIC", "-pthread",
-               "-I" + str(ROOT / "python/sglang/kernels/jit/csrc"),
-               "-I" + tvm_ffi.libinfo.find_include_path(),
-               str(Path(__file__).with_suffix(".cpp")), str(tvm_lib),
-               "-Wl,-rpath," + str(tvm_lib.parent), "-o", str(args.output / "engine-measure.so")]
-    subprocess.run(command, check=True)
+    config = ExpertStreamConfig(
+        cpu_experts=CpuExpertsConfig(enabled=True),
+        trace=TraceConfig(job=JobTraceConfig(prefix=str(args.output / "unused-job")),
+                          cpu_worker=CpuWorkerTraceConfig(prefix=str(args.output / "unused-worker"))))
+    kernel = cpu_kernel_build("exl3", config)
+    csrc = ROOT / "python/sglang/kernels/jit/csrc"
+    cxx = os.environ.get("CXX", "g++")
+    objects, commands = [], []
+    for source in kernel.cpp_files:
+        flags = dict(kernel.source_cflags)[source]
+        objects.append(str(args.output / (Path(source).stem + ".o")))
+        commands.append([cxx, *flags, *host_arch_flags(), "-fPIC", "-c", str(csrc / source), "-o", objects[-1]])
+    commands.append([cxx, "-std=c++20", "-O3", "-shared", "-fPIC", "-pthread", "-fopenmp",
+                     "-I" + str(csrc), str(Path(__file__).with_suffix(".cpp")), *objects,
+                     "-o", str(args.output / "engine-measure.so")])
+    for command in commands:
+        subprocess.run(command, check=True)
     result = {"head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "kernel_library": ext.__file__, "engine_library": str(args.output / "engine-measure.so"),
-              "compile_command": command,
-              "kernel_sha256": hashlib.sha256(Path(ext.__file__).read_bytes()).hexdigest(),
+              "engine_library": str(args.output / "engine-measure.so"),
+              "compile_commands": commands,
               "engine_sha256": hashlib.sha256((args.output / "engine-measure.so").read_bytes()).hexdigest()}
     (args.output / "build.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
@@ -81,20 +87,21 @@ def arm(args):
     import exl3_cpu_forward_ab as fixture
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
     torch.set_num_threads(1)
+    from sglang.kernels.ops.moe import expert_stream_transport as es
     provenance = json.loads(args.build.read_text())
-    path = Path(provenance["kernel_library"])
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    ext = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ext)
     initial, addresses = runtime_probe()
     fixture.CAP = 12
     owners = []
     inputs, outputs, pointers, sizes = [], [], [], []
+    # The plan list is the host module's (the same kernel sources and -march as the engine library's).
+    host = es.cpu_kernel_options(variant="instr")
     for group, cpu in enumerate((6, 18)):
         os.sched_setaffinity(0, {cpu})
         slabs = fixture.random_slabs(torch, 5120, 2304, seed=719 + group)
-        trait = Exl3CpuQuantTrait(ext, act_limit=10.0)
+        trait = Exl3CpuQuantTrait(act_limit=10.0)
+        trait.attach_host(host)
         layer = trait.layer_spec(slabs, 12)
+        kernel_params = (ctypes.c_int64 * len(layer.params))(*layer.params)
         pointers.extend(p for p, _ in layer.slabs)
         sizes.extend(s for _, s in layer.slabs)
         x = torch.randn((6, 5120), generator=torch.Generator().manual_seed(71 + group)).half()
@@ -105,7 +112,7 @@ def arm(args):
     library = ctypes.CDLL(provenance["engine_library"])
     u64p = ctypes.POINTER(ctypes.c_uint64)
     i64p = ctypes.POINTER(ctypes.c_int64)
-    library.engine_measure.argtypes = [ctypes.c_uint64, u64p, u64p, u64p, u64p,
+    library.engine_measure.argtypes = [i64p, ctypes.c_int, u64p, u64p, u64p, u64p,
                                       *([ctypes.c_int] * 6), u64p, i64p, ctypes.c_char_p, ctypes.c_size_t]
     library.engine_measure.restype = ctypes.c_int
     as_array = lambda values: (ctypes.c_uint64 * len(values))(*values)
@@ -126,7 +133,7 @@ def arm(args):
         records = (ctypes.c_int64 * (2 * reps * 8))()
         error = ctypes.create_string_buffer(1024)
         start = time.monotonic_ns()
-        status = library.engine_measure(trait.kernel_address(), as_array(pointers), as_array(sizes),
+        status = library.engine_measure(kernel_params, len(kernel_params), as_array(pointers), as_array(sizes),
                                         as_array(inputs), as_array(outputs), rows, routes, reps, gap,
                                         2000, 1, as_array(addresses), records, error, len(error))
         end = time.monotonic_ns()
@@ -156,6 +163,7 @@ def main():
     sub = parser.add_subparsers(dest="mode", required=True)
     b = sub.add_parser("build")
     b.add_argument("--output", type=Path, required=True)
+    # Accepted and ignored: the kernel is no longer an extension build to seed.
     b.add_argument("--seed-build", type=Path)
     a = sub.add_parser("arm")
     a.add_argument("--build", type=Path, required=True)

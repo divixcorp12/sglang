@@ -210,13 +210,17 @@ class DraftCpuHost:
         )
         _LIVE.add(self)
 
-    def set_layer(self, stage: int, kernel: int, spec) -> None:
-        """Stage `stage`'s layer from `kernel`'s make_layer over `spec` (a ``CpuExpertLayerSpec``); before start."""
+    def cpu_kernel_plans(self) -> str:
+        """The module's CPU kernel plans as JSON (``expert_stream_transport.CpuKernelOptions.cpu_kernel_plans``)."""
+        return self._ops.CpuKernelOptions(self._module).cpu_kernel_plans()
+
+    def set_layer(self, stage: int, spec) -> None:
+        """Stage `stage`'s layer from the compiled-in kernel's make_layer over `spec` (a ``CpuExpertLayerSpec``);
+        before start."""
         slabs, params = self._ops._layer_tensors(spec)
         self._module.expert_stream_draft_cpu_set_layer(
             self.handle,
             int(stage),
-            int(kernel),
             slabs,
             int(spec.capacity),
             int(spec.hidden),
@@ -267,10 +271,13 @@ class SharedDraftHost:
         )
         host._draft_keep = (areas, self)  # the engine reads the areas until the host stops
 
-    def set_layer(self, stage: int, kernel: int, spec) -> None:
+    def cpu_kernel_plans(self) -> str:
+        return self.host.cpu_kernel_plans()
+
+    def set_layer(self, stage: int, spec) -> None:
         slabs, params = self._ops._layer_tensors(spec)
         self._module.expert_stream_draft_set_layer(
-            self.host.handle, self.group, int(stage), int(kernel), slabs, int(spec.capacity), int(spec.hidden),
+            self.host.handle, self.group, int(stage), slabs, int(spec.capacity), int(spec.hidden),
             int(spec.intermediate), int(spec.activation), float(spec.act_limit), params,
         )
         self._keep[int(stage)] = spec.keep

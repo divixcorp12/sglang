@@ -651,9 +651,9 @@ def test_dspark_cpu_experts_are_checked_without_an_expert_cache(model_dir, cpu_p
     "unset", [{"SGLANG_EXL3_CPU_ACT_RESIDUAL": False}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 0}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 64}]
 )
 def test_dspark_cpu_experts_need_the_optimized_cpu_kernel_build(model_dir, cpu_pin_off, unset):
-    """Only the optimized EXL3 build exports a CpuExpertKernel (sglang_exl3_cpu::kernel_address), and with the target's
-    CPU experts refused under speculation the residual/128 defines are what select it; without them the draft would
-    fail at its first step, after the model loaded."""
+    """Only the residual/128 EXL3 kernel (compiled into the host module) is built, and with the target's CPU experts
+    refused under speculation the residual/128 options are what select it; without them the draft would fail at its
+    first step, after the model loaded."""
     with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ACT_RESIDUAL=1"):
         _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**DSPARK_CPU_ENV, **unset})
 

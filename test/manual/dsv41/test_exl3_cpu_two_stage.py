@@ -1,6 +1,6 @@
 """Two-stage CPU misses on the EXL3 kernel (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE '{"enabled": true}'): the forward a staged job runs, its stage-two
-wait between GateUp and Middle, gives the one-stage forward's output bit for bit. Needs the optimized ext build
-(SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1) and 4 cores in the affinity mask.
+wait between GateUp and Middle, gives the one-stage forward's output bit for bit. Needs the optimized kernel
+(SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1) and 4 cores in the affinity mask.
 
 Each case holds the routed slots' w2 back: their w2 slabs are poisoned, and kernel_forward_two_stage's helper thread
 restores them 200 ms into the call, then opens the gate. The forward starts at once, runs PrepareGateUp and GateUp on
@@ -12,8 +12,6 @@ import sys
 
 import pytest
 import torch
-
-pytestmark = pytest.mark.skipif(not os.environ.get("SGLANG_EXL3_SRC"), reason="needs SGLANG_EXL3_SRC")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -46,7 +44,7 @@ def test_a_staged_forward_matches_the_one_stage_forward_bit_for_bit(monkeypatch,
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     slabs = _random_slabs(20261010, HIDDEN, INTER)
-    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(slabs, CAP), variant="instr")
+    layer = es.kernel_layer(trait.layer_spec(slabs, CAP), variant="instr")
     g = torch.Generator().manual_seed(20261010)
     x = (torch.randn(len(slots), HIDDEN, generator=g) * 4.0).half()
     start = torch.randn(len(slots), HIDDEN, generator=g)
@@ -90,7 +88,7 @@ def test_the_poison_reaches_a_forward_that_reads_w2_without_waiting(monkeypatch)
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     slabs = _random_slabs(20261010, HIDDEN, INTER)
-    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(slabs, CAP), variant="instr")
+    layer = es.kernel_layer(trait.layer_spec(slabs, CAP), variant="instr")
     x = torch.randn(1, HIDDEN, generator=torch.Generator().manual_seed(1)).half()
     slots, weights = torch.tensor([[2]], dtype=torch.int32), torch.tensor([[1.0]])
 

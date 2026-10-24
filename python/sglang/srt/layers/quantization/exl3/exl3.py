@@ -54,7 +54,7 @@ class Exl3Config(QuantizationConfig):
     # The EXL3 export exists for DeepSeek V4.1 only: this is the expert-engine model profile its MoE layers stream for.
     expert_profile_name = "dsv41"
 
-    def __init__(self, bits: float, head_bits: int, codebook: str, version: str):
+    def __init__(self, bits: Optional[float], head_bits: int, codebook: str, version: str):
         super().__init__()
         if codebook != "mul1":
             raise ValueError(
@@ -84,7 +84,9 @@ class Exl3Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> Exl3Config:
         return cls(
-            bits=config["bits"],
+            # Informational: every tensor's K comes from its trellis shape. A mixed-K export (exllamav3 1.6) writes
+            # only `avg_bits`.
+            bits=config.get("bits", config.get("avg_bits")),
             head_bits=config.get("head_bits", 6),
             codebook=config["codebook"],
             version=config["version"],

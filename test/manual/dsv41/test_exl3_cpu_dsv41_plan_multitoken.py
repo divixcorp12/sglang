@@ -1,17 +1,17 @@
 """The EXL3 CPU kernel's DSV4.1 plan on calls whose routes share an expert (csrc/exl3/optimized/forward_plan.hpp).
 
-Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_M tokens (sglang_exl3_cpu::chunk_m:
+Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_M tokens (cpu_kernel_chunk_m:
 MAX_M / 2, so 8 by default (SGLANG_EXL3_CPU_MAX_M=16) and 2 in a SGLANG_EXL3_CPU_MAX_M=0 build; the generic plan's
 chunks stay at most 4 tokens). Each case runs one call on a DeepSeek
 V4.1-shaped layer:
-  - unswizzled (native), which Dsv41Shape::accepts may take on AVX-512BW;
-  - swizzled, which it always refuses, so it runs the generic plan;
+  - unswizzled (native), for which registration chooses the DSV4.1 plan on AVX-512BW;
+  - swizzled, which that plan does not accept, so it registers on the generic plan;
   - token by token, through the native layer.
-The three must agree bit for bit. The plan counter (sglang_exl3_cpu::plan_calls) shows which plan each call took. The
+The three must agree bit for bit. The plan counter (cpu_kernel_plan_calls) shows which plan each call took. The
 chunk-size cases are generated from the build's CHUNK_M, so a larger MAX_M widens them with no edit here.
 
-Needs SGLANG_EXL3_SRC, SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier. Run it once with SGLANG_EXPERT_STREAM_CPU_MAX_ISA=bw and once
-with it unset (the host's tier, vnni on divix01): both must show the "dsv41" plan, which at vnni accumulates with
+Needs SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1 and an AVX-512 tier. Run it once with SGLANG_JIT_HOST_MARCH=skylake-avx512 (the bw
+tier) and once with it unset (the host's tier, vnni on divix01): both must show the "dsv41" plan, which at vnni accumulates with
 vpdpwssd and is compared bit for bit with the generic plan at that tier (the swizzled layer). Run on divix01 under
 taskset -c 0-51,56-107 (CPU jobs; the node-0 cores 0-27 or the bench's node-1 cores 28-43 are enough).
 """
@@ -33,8 +33,8 @@ def _swizzle(t):
     return t.reshape(-1, tk, tn // 8, 8, ps).permute(0, 2, 1, 3, 4).contiguous().view(t.shape)
 
 
-def _slabs(seed):
-    """The pinned tier's six slabs, CAP slots of random 3-bit codes and signs."""
+def _slabs(seed, bits=3):
+    """The pinned tier's six slabs, CAP slots of random `bits`-bit codes and signs."""
     g = torch.Generator().manual_seed(seed)
 
     def signs(*shape):
@@ -44,10 +44,10 @@ def _slabs(seed):
         return torch.randint(-32768, 32767, shape, generator=g, dtype=torch.int16)
 
     return {
-        "w13_trellis": codes(CAP, 2, H // 16, I // 16, 48),
+        "w13_trellis": codes(CAP, 2, H // 16, I // 16, 16 * bits),
         "w13_suh": signs(CAP, 2, H),
         "w13_svh": signs(CAP, 2, I),
-        "w2_trellis": codes(CAP, 1, I // 16, H // 16, 48),
+        "w2_trellis": codes(CAP, 1, I // 16, H // 16, 16 * bits),
         "w2_suh": signs(CAP, 1, I),
         "w2_svh": signs(CAP, 1, H),
     }
@@ -86,8 +86,14 @@ def _expected_plan(routes):
     return "dsv41"
 
 
+def _options():
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
+    return es.cpu_kernel_options(variant="instr")
+
+
 def _chunk_m():
-    return int(torch.ops.sglang_exl3_cpu.chunk_m())
+    return _options().cpu_kernel_chunk_m()
 
 
 def _inputs(name, routes):
@@ -105,21 +111,25 @@ def layers():
     """{"native": handle, "swizzled": handle} over the same experts."""
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     from sglang.kernels.ops.moe import expert_stream_transport as es
-    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.srt.layers.moe.expert_engine.config import resolved_config
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-    if not optimized_cpu(cpu_act_defines()):
+    if not resolved_config().stream.cpu_experts.enabled:
         pytest.skip("the kernel under test is the optimized one: set SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1")
-    ext = exl3_ext()
-    if not ext.exl3_moe_cpu_has_avx512_bw():
+    options = _options()
+    if options.cpu_kernel_isa() not in ("bw", "vnni", "vbmi"):
         pytest.skip("the DSV4.1 plan needs AVX-512BW")
     slabs = _slabs(20261006)
     handles = {}
     for layout in ("native", "swizzled"):
         swizzled = layout == "swizzled"
-        trait = Exl3CpuQuantTrait(ext, act_limit=LIMIT, swizzled=swizzled)
+        trait = Exl3CpuQuantTrait(act_limit=LIMIT, swizzled=swizzled)
+        trait.attach_host(options)
         held = {n: _swizzle(t) if swizzled and n.endswith("_trellis") else t for n, t in slabs.items()}
-        handles[layout] = es.kernel_layer(trait.kernel_address(), trait.layer_spec(held, CAP), variant="instr")
+        spec = trait.layer_spec(held, CAP)
+        # Python chose each layer's plan at registration: the K3 layer the DSV4.1 plan, the swizzled one generic.
+        assert spec.plan.startswith(f"EXL3 CPU plan {'generic' if swizzled else 'dsv41'} ("), spec.plan
+        handles[layout] = es.kernel_layer(spec, variant="instr")
     yield handles
     for handle in handles.values():
         es.kernel_drop(handle, variant="instr")
@@ -129,11 +139,11 @@ def _forward(layer, x, slots, weights, threads=THREADS):
     """One call, unpinned; returns (out, the plan it took) from the plan counter's step."""
     from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    before = torch.ops.sglang_exl3_cpu.plan_calls()
+    before = _options().cpu_kernel_plan_calls()
     out = torch.full((x.shape[0], H), float("nan"))
     status, why = es.kernel_forward(layer, x, slots, weights, out, threads=threads, variant="instr")
     assert (status, why) == (0, "")
-    after = torch.ops.sglang_exl3_cpu.plan_calls()
+    after = _options().cpu_kernel_plan_calls()
     step = (after[0] - before[0], after[1] - before[1])
     assert step in ((1, 0), (0, 1)), step
     return out, "dsv41" if step == (1, 0) else "generic"
@@ -174,6 +184,25 @@ def test_every_chunk_size_matches_the_generic_plan(layers):
         _check(layers, f"m{m}-one-expert", [[3]] * m)
         _check(layers, f"m{m}-three-experts", [[4, 0, 5]] * m)
     _check(layers, f"m{chunk_m + 1}-overflow", [[2]] * (chunk_m + 1))
+
+
+def test_a_k2_layer_of_the_dsv41_shape_takes_the_generic_plan(layers):
+    """The DSV4.1 plan is compiled for 3-bit gate/up and down: a 2-bit layer of the same shape (the mixed-K
+    checkpoint's layers 18-22) gets the generic plan at registration, and its forwards run it."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+    trait = Exl3CpuQuantTrait(act_limit=LIMIT)
+    trait.attach_host(_options())
+    spec = trait.layer_spec(_slabs(20261023, bits=2), CAP)
+    assert spec.plan.startswith("EXL3 CPU plan generic (") and "K w13 2, K w2 2" in spec.plan, spec.plan
+    handle = es.kernel_layer(spec, variant="instr")
+    try:
+        x, slots, weights = _inputs("k2", [[4, 0, 5], [0, 4, 5]])
+        out, plan = _forward(handle, x, slots, weights)
+    finally:
+        es.kernel_drop(handle, variant="instr")
+    assert plan == "generic" and torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("threads", [1, 3, 16])

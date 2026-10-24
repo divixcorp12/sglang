@@ -57,9 +57,9 @@ struct RowGeometry {
   uint8_t deps[kPieces] = {};
 };
 
-// Cuts the sub-reads in `g` (in dest order) into the row's pieces, into g.deps and `runs`, as row_geometry describes.
-// Returns false when a piece has bytes that no sub-read reads.
-inline bool cut_pieces(const Tables& t, RowGeometry& g, PieceRun* runs) {
+// Cuts the sub-reads in `g` (in dest order) into the pieces of a row of `shape`, into g.deps and `runs`, as
+// row_geometry describes. Returns false when a piece has bytes that no sub-read reads.
+inline bool cut_pieces(const RowShape& shape, RowGeometry& g, PieceRun* runs) {
   // Where piece j begins in segment `s`, as an offset local to the segment.
   const auto cut = [&](const Segment& s, int j) -> int64_t {
     if (j <= 0) return 0;
@@ -69,11 +69,11 @@ inline bool cut_pieces(const Tables& t, RowGeometry& g, PieceRun* runs) {
     if (at >= s.bytes) return s.bytes;
     return std::max<int64_t>(0, (s.dst + at) / kPieceAlign * kPieceAlign - s.dst);
   };
-  const size_t segments = t.segments.size();
+  const size_t segments = shape.segments.size();
   for (int j = 0; j < kPieces; ++j) {
     bool bytes = false;
     for (size_t i = 0; i < segments; ++i) {
-      const Segment& s = t.segments[i];
+      const Segment& s = shape.segments[i];
       const PieceRun run{cut(s, j), cut(s, j + 1)};
       runs[static_cast<size_t>(j) * segments + i] = run;
       if (run.lo >= run.hi) continue;
@@ -88,8 +88,9 @@ inline bool cut_pieces(const Tables& t, RowGeometry& g, PieceRun* runs) {
   return true;
 }
 
-// Fills `g` and `runs` (kPieces * segments entries) for the row at `row_index` of the tables. Returns false for a
-// row that cannot be cut: more reading parts than pieces, or a piece with bytes that no sub-read reads.
+// Fills `g` and `runs` (kPieces * segments entries) for the row at `row_index` of the tables, cut by its layer's row
+// shape. Returns false for a row that cannot be cut: more reading parts than pieces, or a piece with bytes that no
+// sub-read reads.
 //
 // Piece j's cuts are the row's sub-read boundaries. In every segment, piece j starts where sub-read j starts, mapped
 // into the segment's destination coordinates and rounded down to kPieceAlign there (clamped to the segment), and
@@ -121,15 +122,15 @@ inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, Piec
       ++g.subs;
     }
   }
-  return cut_pieces(t, g, runs);
+  return cut_pieces(t.shape(static_cast<int64_t>(row_index) / t.experts), g, runs);
 }
 
-// Where the second stage of a row image begins: the first byte of the first segment whose name has a bit in `second`
-// (ExpertRowLayout's kSecondStageMask), when every other segment ends at or before it. 0 when no segment is named or the
-// first stage's bytes do not all come first: the image cannot be read in two spans.
-inline int64_t second_stage_start(const Tables& t, uint32_t second) {
+// Where the second stage of a row image of `shape` begins: the first byte of the first segment whose name has a bit in
+// `second` (ExpertRowLayout's kSecondStageMask), when every other segment ends at or before it. 0 when no segment is
+// named or the first stage's bytes do not all come first: the image cannot be read in two spans.
+inline int64_t second_stage_start(const RowShape& shape, uint32_t second) {
   int64_t start = INT64_MAX, first_end = 0;
-  for (const Segment& s : t.segments) {
+  for (const Segment& s : shape.segments) {
     if ((second >> s.name & 1u) != 0) {
       start = std::min(start, s.src);
     } else {
@@ -173,12 +174,13 @@ inline bool row_geometry_two_span(
     }
     subs += reading[span];
   }
+  const RowShape& shape = t.shape(static_cast<int64_t>(row_index) / t.experts);
   const int64_t at = (split + kPage - 1) / kPage * kPage;
-  if (split <= 0 || at >= t.need_end || subs > kPieces || total[0] <= 0 || total[1] <= 0)
+  if (split <= 0 || at >= shape.need_end || subs > kPieces || total[0] <= 0 || total[1] <= 0)
     return row_geometry(t, row_index, g, runs);
   g = RowGeometry{};
   g.start = t.starts[row_index];
-  const int64_t spans[3] = {0, at, t.need_end};
+  const int64_t spans[3] = {0, at, shape.need_end};
   for (int span = 0; span < 2; ++span) {
     const int64_t lo = spans[span], hi = spans[span + 1];
     int64_t share = 0, from = lo;
@@ -197,7 +199,7 @@ inline bool row_geometry_two_span(
     }
     if (span == 0) g.prefix = g.subs;
   }
-  return cut_pieces(t, g, runs);
+  return cut_pieces(shape, g, runs);
 }
 
 // SGLANG_EXPERT_STREAM_CPU_TWO_STAGE w13_weights / w2_weights as row_geometry_two_span takes them: each weight in units of

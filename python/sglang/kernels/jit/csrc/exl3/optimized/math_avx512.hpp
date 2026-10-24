@@ -6,7 +6,6 @@
 // see ../LICENSE.exllamav3.
 #pragma once
 #include "math.hpp"
-#include <c10/util/Exception.h>
 #include <immintrin.h>
 #include <algorithm>
 #include <array>

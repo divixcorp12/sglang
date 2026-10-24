@@ -14,11 +14,12 @@ import torch
 
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
-from sglang.srt.layers.moe.exl3_row_image import RowImageSet
-from sglang.srt.layers.moe.expert_engine.formats.exl3 import (
-    EXL3_STREAMED_NAMES,
-    RowSegment,
+from sglang.srt.layers.moe.exl3_row_image import (
+    RowImageLayout,
+    RowImageSet,
+    row_image_layouts,
 )
+from sglang.srt.layers.moe.expert_engine.formats.exl3 import EXL3_STREAMED_NAMES
 
 
 @dataclass(frozen=True)
@@ -26,7 +27,7 @@ class Exl3RamMissTables:
     """The flat tables the native RAM-miss reader runs from.
 
     Dimensions: ``L`` streamed layers (ascending layer id is row order), ``E`` experts
-    per layer, ``F`` files, ``P`` parts (mirror roots) per row, ``S`` segments.
+    per layer, ``F`` files, ``P`` parts (mirror roots) per row, ``S`` segments per row.
 
     Files and extents:
 
@@ -39,19 +40,20 @@ class Exl3RamMissTables:
     - ``starts`` (int64 ``[L, E]``): where the row starts inside its aligned superset.
     - ``parts``: ``P``, mirror roots per row (1 with no roots).
 
-    Destination:
+    Destination, per layer (a mixed-K checkpoint's layers have rows of different sizes):
 
-    - ``segments`` (int64 ``[S, 4]``): name index, destination offset, source offset,
-      bytes.
+    - ``segments`` (int64 ``[L, S, 4]``): each layer's name index, destination offset,
+      source offset and bytes. ``S`` is the same for every layer.
     - ``slabs`` (int64 ``[L, 6]``): slab base addresses in ``EXL3_STREAMED_NAMES``
-      order. ``row_bytes`` (int64 ``[6]``) is each slab's row size and ``capacity``
-      (int64 ``[L]``) each layer's row count.
-    - ``slot_bytes``: bytes of one row slot, the image size.
+      order. ``row_bytes`` (int64 ``[L, 6]``) is each layer's slab row sizes and
+      ``capacity`` (int64 ``[L]``) each layer's row count.
+    - ``slot_bytes``: bytes of the largest row slot, the largest layer's image size.
 
     ``row_images`` marks the only supported source: the files are row-image layer
-    files (see ``exl3_row_image``), a row's parts tile its image (``starts`` is 0 and
-    the extents' destination is the position in the image), the segments are the six
-    identity segments, and the reader reads straight into the slabs (its direct mode).
+    files (see ``exl3_row_image``), a row's parts tile its layer's image (``starts`` is
+    0 and the extents' destination is the position in the image), each layer's segments
+    are its six identity segments, and the reader reads straight into the slabs (its
+    direct mode).
 
     ``keepalive`` holds every slab tensor whose address is in ``slabs``: the native
     reader writes through those raw addresses, so the tables must keep the slabs alive.
@@ -75,7 +77,6 @@ class Exl3RamMissTables:
 
 def exl3_ram_miss_tables(
     layout: Exl3ExpertLayout,
-    segments: Sequence[RowSegment],
     slabs_by_layer: Mapping[int, Mapping[str, torch.Tensor]],
     *,
     roots: Sequence[str] = (),
@@ -102,18 +103,18 @@ def exl3_ram_miss_tables(
             "scripts/dsv41/build_row_images.py and pass the opened set (row_images=...); shard tables were refused"
         )
     return _row_image_tables(
-        layout, segments, slabs_by_layer, row_images, roots=roots, policy=policy
+        layout, slabs_by_layer, row_images, roots=roots, policy=policy
     )
 
 
 def _slab_table(
-    layer_ids, slabs_by_layer, row_bytes, names
+    layer_ids, slabs_by_layer, row_bytes: torch.Tensor, names
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Every streamed layer's slab base addresses (int64 ``[L, 6]``) and row counts.
 
     Raises ``ValueError`` for a slab the native reader could not write through its raw
-    address: non-contiguous, not on the CPU, or with a row size other than
-    ``row_bytes``.
+    address: non-contiguous, not on the CPU, or with a row size other than its layer's
+    ``row_bytes[row]``.
     """
     slabs = torch.empty((len(layer_ids), len(EXL3_STREAMED_NAMES)), dtype=torch.int64)
     capacity = torch.empty(len(layer_ids), dtype=torch.int64)
@@ -132,9 +133,9 @@ def _slab_table(
                     f"layer {layer_id} {name}: slab must be a contiguous CPU tensor"
                 )
             per_row = slab.numel() * slab.element_size() // max(int(capacity[row]), 1)
-            if per_row != int(row_bytes[index]):
+            if per_row != int(row_bytes[row, index]):
                 raise ValueError(
-                    f"layer {layer_id} {name}: slab rows hold {per_row} B, expected {int(row_bytes[index])}"
+                    f"layer {layer_id} {name}: slab rows hold {per_row} B, expected {int(row_bytes[row, index])}"
                 )
             slabs[row, index] = slab.data_ptr()
     return slabs, capacity
@@ -142,27 +143,26 @@ def _slab_table(
 
 def _row_image_tables(
     layout: Exl3ExpertLayout,
-    segments: Sequence[RowSegment],
     slabs_by_layer: Mapping[int, Mapping[str, torch.Tensor]],
     images: RowImageSet,
     *,
     roots: Sequence[str],
     policy: Optional[SplitPolicy],
 ) -> Exl3RamMissTables:
-    """The native reader's tables over row images.
+    """The native reader's tables over row images, each layer's from its own image layout.
 
     File ``row * parts + p`` is root ``p``'s image file of streamed row ``row``. Expert
-    ``e``'s image is split across the roots as ``policy`` splits its page-rounded
+    ``e``'s image is split across the roots as ``policy`` splits its layer's page-rounded
     ``row_stride`` (the mirrors' split), each part clipped at ``image_bytes``. The last
     part ends exactly at the image's end because the padding after it is never read: a
     ``readv`` of it would run past the last slab row.
 
     Part ``p`` is ``(file, e * row_stride + start, bytes, start)``, with ``start`` its
-    position in the image. ``starts`` is 0 and the segments are the identity (name
-    ``n``'s slab row is image bytes ``[name_offsets[n], + row_bytes[n])``), so piece
-    ``j`` of the reader's geometry is exactly sub-read ``j``. Every length and offset
-    is a multiple of 512, as the image layout's names are; the reader re-checks that at
-    open against O_DIRECT's alignment.
+    position in the image. ``starts`` is 0 and each layer's segments are the identity
+    (name ``n``'s slab row is image bytes ``[name_offsets[n], + row_bytes[n])``), so
+    piece ``j`` of the reader's geometry is exactly sub-read ``j``. Every length and
+    offset is a multiple of 512, as the image layout's names are; the reader re-checks
+    that at open against O_DIRECT's alignment.
     """
     parts = len(images.roots)
     if tuple(roots) and tuple(roots) != tuple(images.roots):
@@ -175,65 +175,71 @@ def _row_image_tables(
                 "row images on several roots need the split policy the mirrors use"
             )
         policy = StaticSplitPolicy((1.0,))
-    image = images.layout
     if images.num_experts != layout.num_experts:
         raise ValueError(
             f"row images hold {images.num_experts} experts per layer, the layout {layout.num_experts}"
         )
-    if image.segments != tuple(segments):
-        raise ValueError(
-            "row images were opened for a different segment map than the tables are built from"
-        )
-    split = policy.plan(image.row_stride)
-    if len(split.part_bytes) != parts:
-        raise ValueError(
-            f"split policy plans {len(split.part_bytes)} parts for {parts} row-image roots"
-        )
-    clipped = [
-        (min(start, image.image_bytes), min(start + nbytes, image.image_bytes))
-        for start, nbytes in zip(split.starts, split.part_bytes)
-    ]
     layer_ids = sorted(slabs_by_layer)
     missing = [layer for layer in layer_ids if layer not in images.paths]
     if missing:
         raise ValueError(f"row images were not opened for streamed layers {missing}")
+    want = row_image_layouts(layout, layer_ids)
+    wrong = [layer for layer in layer_ids if images.layouts[layer] != want[layer]]
+    if wrong:
+        raise ValueError(
+            f"row images of layers {wrong} were opened for a different row geometry than the tables are built from"
+        )
+    image_of = [want[layer] for layer in layer_ids]
+    # Layers sharing an image layout share its split: planned once per distinct layout.
+    clipped_of = {}
+    for image in image_of:
+        if image not in clipped_of:
+            clipped_of[image] = _clipped_parts(image, policy, parts)
     extents = torch.empty(
         (len(layer_ids), layout.num_experts, parts, 4), dtype=torch.int64
     )
-    experts = torch.arange(layout.num_experts, dtype=torch.int64) * image.row_stride
-    for row in range(len(layer_ids)):
-        for part, (lo, hi) in enumerate(clipped):
+    experts = torch.arange(layout.num_experts, dtype=torch.int64)
+    for row, image in enumerate(image_of):
+        for part, (lo, hi) in enumerate(clipped_of[image]):
             extents[row, :, part, 0] = row * parts + part
-            extents[row, :, part, 1] = experts + lo
+            extents[row, :, part, 1] = experts * image.row_stride + lo
             extents[row, :, part, 2] = hi - lo
             extents[row, :, part, 3] = lo
     paths = [images.paths[layer][part] for layer in layer_ids for part in range(parts)]
     # Every root's file of a layer copies root 0's; the reader's open-time size check
     # names that source.
     copied = [images.paths[layer][0] for layer in layer_ids for _ in range(parts)]
-    file_bytes = layout.num_experts * image.row_stride
+    file_bytes = [
+        layout.num_experts * image.row_stride for image in image_of for _ in range(parts)
+    ]
     names = {name: index for index, name in enumerate(EXL3_STREAMED_NAMES)}
     segment_table = torch.tensor(
         [
-            [n, 0, image.name_offsets[n], image.row_bytes[n]]
-            for n in range(len(EXL3_STREAMED_NAMES))
+            [
+                [n, 0, image.name_offsets[n], image.row_bytes[n]]
+                for n in range(len(EXL3_STREAMED_NAMES))
+            ]
+            for image in image_of
         ],
         dtype=torch.int64,
-    )
-    slabs, capacity = _slab_table(layer_ids, slabs_by_layer, image.row_bytes, names)
+    ).reshape(len(layer_ids), len(EXL3_STREAMED_NAMES), 4)
+    row_bytes = torch.tensor(
+        [image.row_bytes for image in image_of], dtype=torch.int64
+    ).reshape(len(layer_ids), len(EXL3_STREAMED_NAMES))
+    slabs, capacity = _slab_table(layer_ids, slabs_by_layer, row_bytes, names)
     return Exl3RamMissTables(
         layer_ids=layer_ids,
         paths=paths,
         source_paths=copied,
-        file_sizes=torch.full((len(paths),), file_bytes, dtype=torch.int64),
+        file_sizes=torch.tensor(file_bytes, dtype=torch.int64),
         extents=extents,
         starts=torch.zeros((len(layer_ids), layout.num_experts), dtype=torch.int64),
         parts=parts,
         segments=segment_table,
         slabs=slabs,
-        row_bytes=torch.tensor(image.row_bytes, dtype=torch.int64),
+        row_bytes=row_bytes,
         capacity=capacity,
-        slot_bytes=image.image_bytes,
+        slot_bytes=max((image.image_bytes for image in image_of), default=0),
         row_images=True,
         keepalive=tuple(
             slabs_by_layer[layer_id][name]
@@ -243,8 +249,24 @@ def _row_image_tables(
     )
 
 
+def _clipped_parts(
+    image: RowImageLayout, policy: SplitPolicy, parts: int
+) -> list[tuple[int, int]]:
+    """Each root's ``[lo, hi)`` of an image of ``image``'s layout: the policy's split of its
+    ``row_stride``, clipped at ``image_bytes``."""
+    split = policy.plan(image.row_stride)
+    if len(split.part_bytes) != parts:
+        raise ValueError(
+            f"split policy plans {len(split.part_bytes)} parts for {parts} row-image roots"
+        )
+    return [
+        (min(start, image.image_bytes), min(start + nbytes, image.image_bytes))
+        for start, nbytes in zip(split.starts, split.part_bytes)
+    ]
+
+
 def open_service_row_images(
-    layout, segments, mirrors: dict, direct: bool, streamers
+    layout, mirrors: dict, direct: bool, streamers
 ) -> RowImageSet:
     """Open the row images the service reads with; they are its only row source.
 
@@ -273,5 +295,5 @@ def open_service_row_images(
     from sglang.srt.layers.moe.exl3_row_image import open_row_images
 
     return open_row_images(
-        mirrors["roots"], layout, segments, mirrors["source_root"], list(streamers)
+        mirrors["roots"], layout, mirrors["source_root"], list(streamers)
     )

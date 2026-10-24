@@ -23,21 +23,25 @@ LAYERS, EXPERTS = 3, 5
 ROWS_PER_SHARD = 8  # layer 1's experts span both shards
 PREAMBLE = 13  # bytes of a non-expert tensor ahead of the rows: every row starts at an odd offset
 # The real 12-tensor row (w1/w2/w3 x suh/svh/mul1/trellis, 4-byte mul1s), at the smallest dims whose six slab
-# rows are all multiples of 512 B, as the real checkpoint's are.
-SPEC = expert_spec(hidden=256, inter=256)
+# rows are all multiples of 512 B, as the real checkpoint's are. Mixed K, as DeepSeek-V4.1-Flash-1017: layer 1 is K2
+# throughout and layer 2 has a K2 w2 under K3 w1/w3, so each layer's file has its own image size.
+SPECS = {
+    0: expert_spec(hidden=256, inter=256),
+    1: expert_spec(hidden=256, inter=256, bits=2),
+    2: expert_spec(hidden=256, inter=256, bits=3, down_bits=2),
+}
 
 
 def _write_checkpoint(directory):
     """Two shards of unpadded expert rows at odd offsets; returns each (layer, expert)'s raw row."""
-    row_bytes = sum(nbytes for *_, nbytes in SPEC)
     keys = [(layer, e) for layer in range(LAYERS) for e in range(EXPERTS)]
-    rows = {key: os.urandom(row_bytes) for key in keys}
+    rows = {(layer, e): os.urandom(sum(nbytes for *_, nbytes in SPECS[layer])) for layer, e in keys}
     weight_map = {}
     for shard, first in enumerate(range(0, len(keys), ROWS_PER_SHARD)):
         tensors = [(f"layers.0.attn.pad{shard}", "U8", (PREAMBLE,), b"\x07" * PREAMBLE)]
         for layer, e in keys[first : first + ROWS_PER_SHARD]:
             at = 0
-            for suffix, dtype, shape, nbytes in SPEC:
+            for suffix, dtype, shape, nbytes in SPECS[layer]:
                 tensors.append((f"layers.{layer}.ffn.experts.{e}.{suffix}", dtype, shape, rows[(layer, e)][at : at + nbytes]))
                 at += nbytes
         header, offset = {}, 0
@@ -75,7 +79,7 @@ class _Case:
     def flip(self, root, layer, expert, at):
         """XOR one byte of an expert's image in a root's layer file."""
         with open(self.file(root, layer), "r+b") as f:
-            f.seek(expert * self.src.image.row_stride + at)
+            f.seek(expert * self.src.image(layer).row_stride + at)
             (byte,) = f.read(1)
             f.seek(-1, os.SEEK_CUR)
             f.write(bytes([byte ^ 0xFF]))
@@ -88,16 +92,17 @@ def test_each_row_lands_as_its_image_and_open_row_images_accepts_the_set(tmp_pat
     case = _Case(tmp_path)
     assert all(r.file_offset % 2 == 1 for r in case.src.layout.records.values())
     assert case.run() == bri.EXIT_OK
-    lay = case.src.image
+    assert len({case.src.image(layer).image_bytes for layer in range(LAYERS)}) == LAYERS
     for root in case.roots:
         for layer in range(LAYERS):
+            lay = case.src.image(layer)
             data = open(case.file(root, layer), "rb").read()
             assert len(data) == EXPERTS * lay.row_stride
             for e in range(EXPERTS):
                 at = e * lay.row_stride
                 assert data[at : at + lay.image_bytes] == ri.image_of_row(lay, case.rows[(layer, e)]), (root, layer, e)
                 assert data[at + lay.image_bytes : at + lay.row_stride] == bytes(lay.row_stride - lay.image_bytes)
-    images = ri.open_row_images(case.roots, case.src.layout, case.src.segments, case.source, range(LAYERS))
+    images = ri.open_row_images(case.roots, case.src.layout, case.source, range(LAYERS))
     assert set(images.paths) == set(range(LAYERS))
 
 
@@ -126,7 +131,7 @@ def test_resume_rereads_finished_layers_and_rebuilds_only_the_bad_one(tmp_path):
     for (root, layer), inode in inodes.items():
         rebuilt = os.stat(case.file(root, layer)).st_ino != inode
         assert rebuilt == ((root, layer) == (bad_root, 1)), (root, layer)
-    ri.open_row_images(case.roots, case.src.layout, case.src.segments, case.source, range(LAYERS))
+    ri.open_row_images(case.roots, case.src.layout, case.source, range(LAYERS))
 
 
 def test_verify_fails_on_one_corrupted_byte(tmp_path, capsys):
@@ -135,7 +140,7 @@ def test_verify_fails_on_one_corrupted_byte(tmp_path, capsys):
     assert case.run("--verify") == bri.EXIT_OK
     capsys.readouterr()
     # The last byte of the last expert's image: the tail of a partial chunk.
-    case.flip(case.roots[1], 2, EXPERTS - 1, case.src.image.image_bytes - 1)
+    case.flip(case.roots[1], 2, EXPERTS - 1, case.src.image(2).image_bytes - 1)
     assert case.run("--verify") == bri.EXIT_MISMATCH
     out = capsys.readouterr().out
     assert f"MISMATCH on {case.roots[1]}: 1 row(s)" in out and f"layer 2 expert {EXPERTS - 1}:" in out
@@ -145,7 +150,7 @@ def _foreign_manifest(case):
     """Root a holds a complete manifest of another checkpoint."""
     os.makedirs(ri.row_image_dir(case.roots[0]))
     other = dict(case.src.fingerprint, records_sha256="0" * 64)
-    ri.write_manifest(case.roots[0], ri.manifest_json(case.src.image, other, {}))
+    ri.write_manifest(case.roots[0], ri.manifest_json(case.src.images, other, {}))
 
 
 @pytest.mark.parametrize(

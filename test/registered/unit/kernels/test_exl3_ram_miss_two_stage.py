@@ -25,6 +25,7 @@ import test_exl3_ram_miss_split as split
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    FAKE_BUILD,
     new_page,
     piece_geometry,
     read_rows_sqes,
@@ -47,8 +48,8 @@ SHAPE_IDS = ["one_root", "halves", "thirds", "drive_speed", "zero_first", "zero_
 
 
 def _segments(tables):
-    """(name, dst, src, bytes) per segment."""
-    return [tuple(int(v) for v in line) for line in tables.segments.tolist()]
+    """(name, dst, src, bytes) per segment of layer row 0 (every layer of the fake checkpoint shares its row shape)."""
+    return [tuple(int(v) for v in line) for line in tables.segments[0].tolist()]
 
 
 def _split_at(tables):
@@ -412,7 +413,7 @@ def slab_layer(s, row: int) -> CpuExpertLayerSpec:
     )
     capacity = int(s.slabs[row][EXL3_STREAMED_NAMES[0]].shape[0])
     return CpuExpertLayerSpec(capacity=capacity, hidden=HIDDEN, intermediate=0, act_limit=0.0, slabs=slabs,
-                              params=b"", keep=tuple(s.slabs[row].values()))
+                              params=(), keep=tuple(s.slabs[row].values()))
 
 
 def _sums(s, expert):
@@ -424,7 +425,7 @@ def _sums(s, expert):
 def _host(tmp_path, *, two_stage, weights=(1.0, 1.0, 1.0), span_weights=None):
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=weights, hidden=256, inter=512)
     page = new_page(pin=False, wire=wire_layout(8))
-    host = attached_host(s, page, k=3)
+    host = attached_host(s, page, k=3, layout=FAKE_BUILD)
     host.enable_copy_engine(-1)
     dst = {name: torch.zeros((6,) + tuple(slab.shape[1:]), dtype=slab.dtype) for name, slab in s.slabs[ROW].items()}
     table = torch.tensor(
@@ -435,7 +436,8 @@ def _host(tmp_path, *, two_stage, weights=(1.0, 1.0, 1.0), span_weights=None):
     host.arm_copy_engine()
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
-    host.enable_cpu_experts(host.test_kernel_address(), _split(n2=2), _cores(), x_rows, out_rows, threads=2,
+    host.fake_kernel_reset()
+    host.enable_cpu_experts(_split(n2=2), _cores(), x_rows, out_rows, threads=2,
                             two_stage=two_stage, two_stage_weights=span_weights)
     host.set_cpu_layer(ROW, slab_layer(s, ROW))
     return s, host, ChainSim(host, page, s.slabs), out_rows
@@ -455,7 +457,7 @@ def _assert_sums_and_part_one(s, host, req, out_rows):
     """Each forward saw its slots' reference w13 at its start and reference w2 after its stage-two wait, and part 1
     holds both misses once."""
     expert_of = dict(zip(req.slots, [5, 4]))
-    calls = host.test_kernel_calls()
+    calls = host.fake_kernel_calls()
     assert sorted(slot for c in calls for slot in c["slots"]) == sorted(req.slots)
     for call in calls:
         want = [_sums(s, expert_of[slot]) for slot in call["slots"]]
@@ -515,7 +517,7 @@ def test_cpu_hits_are_never_staged(tmp_path):
         assert req.kinds == [LaneKind.HIT_CPU, LaneKind.HIT_CPU]
         assert host.pump() == 1
         assert _wait(lambda: sim.copy_done(req) == req.gen)
-        calls = host.test_kernel_calls()
+        calls = host.fake_kernel_calls()
         assert calls and not any(c["staged"] for c in calls)
         assert host.cpu_stats()["staged_jobs"] == 0
     finally:
@@ -536,7 +538,8 @@ _SCRIPT = """
         host.arm_copy_engine()
         x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
         out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
-        host.enable_cpu_experts(host.test_kernel_address(), _split(n1=1, n2=2), _cores(), x_rows, out_rows, threads=2,
+        host.fake_kernel_reset()
+        host.enable_cpu_experts(_split(n1=1, n2=2), _cores(), x_rows, out_rows, threads=2,
                                 two_stage=True)
         host.set_cpu_layer(ROW, slab_layer(s, ROW))
 """
@@ -544,7 +547,9 @@ _SCRIPT = """
 
 def _script(tmp_path, body, **kw):
     here = os.path.dirname(os.path.abspath(__file__))
-    return run_host_script(tmp_path, _SCRIPT.format(here=here) + body, capacity=4, staging=2, **kw)
+    return run_host_script(
+        tmp_path, _SCRIPT.format(here=here) + body, capacity=4, staging=2, layout=FAKE_BUILD, **kw
+    )
 
 
 def test_a_failed_w2_read_of_a_staged_cpu_miss_aborts_as_any_failed_read(tmp_path):
@@ -580,11 +585,12 @@ def test_span_weights_are_checked_at_enable(tmp_path):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     for bad, why in [(((1.0, 1.0), (1.0, 1.0, 1.0)), "one per mirror root"), (((1.0, 1.0, 1.0), (0.0, 0.0, 0.0)), "")]:
-        host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
+        host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3, layout=FAKE_BUILD)
         try:
             host.enable_copy_engine(-1)
             with pytest.raises(Exception, match=why or "no weight"):
-                host.enable_cpu_experts(host.test_kernel_address(), NO_SPLIT, _cores(), x_rows, out_rows, threads=2,
+                host.fake_kernel_reset()
+                host.enable_cpu_experts(NO_SPLIT, _cores(), x_rows, out_rows, threads=2,
                                         two_stage=True, two_stage_weights=bad)
         finally:
             host.stop()

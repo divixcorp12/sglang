@@ -63,16 +63,14 @@ inline int32_t scalar(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
 
 }  // namespace keep_warm_detail
 
-// The loop for tier `isa`, clamped to Top: a quant compiles no vector code above its top tier, so a Scalar quant's
-// portable build carries no AVX instructions from here. Returns when *word != seen or the clock reaches deadline_ns.
-template <Isa Top>
-int32_t keep_warm_loop(Isa isa, const uint32_t* word, uint32_t seen, int64_t deadline_ns)
+// The loop for tier Tier: a build calls it with its own tier, so a Scalar build carries no AVX instructions from here.
+// Returns when *word != seen or the clock reaches deadline_ns.
+template <Isa Tier>
+int32_t keep_warm_loop(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
 {
-    if constexpr (Top >= Isa::Bw)
-        if (isa >= Isa::Bw) return keep_warm_detail::bw(word, seen, deadline_ns);
-    if constexpr (Top >= Isa::Avx2)
-        if (isa >= Isa::Avx2) return keep_warm_detail::avx2(word, seen, deadline_ns);
-    return keep_warm_detail::scalar(word, seen, deadline_ns);
+    if constexpr (Tier >= Isa::Bw) return keep_warm_detail::bw(word, seen, deadline_ns);
+    else if constexpr (Tier >= Isa::Avx2) return keep_warm_detail::avx2(word, seen, deadline_ns);
+    else return keep_warm_detail::scalar(word, seen, deadline_ns);
 }
 
 }  // namespace

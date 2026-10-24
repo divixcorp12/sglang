@@ -1,15 +1,15 @@
 """The optimized EXL3 CPU MoE kernel (residual int8 activations, 128-wide blocks) against the scalar tier.
 
-The CPU kernel's ops (sglang_exl3_cpu::*) exist only in the optimized extension, which SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1
-builds, so each tier's child process runs with it set. Checks on random DSV4.1-shaped experts against the scalar tier
+The CPU kernel is compiled into the expert-stream host module (cpu_kernel_build) with SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS=1
+checking its compiler, so each tier's child process runs with it set. Checks on random DSV4.1-shaped experts against the scalar tier
 (fp32 activations, which ignores the options):
   - the swizzled layout gives the same bits as the native one (the k-block sub-view addresses both);
   - a 5-token batch gives each token the same bits as running it alone (chunks are capped for the residual rows);
   - the relative error against the scalar tier is under the residual kernel's bound.
 
-Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU, and builds the expert-stream host module's instrumented variant for its
+Needs an AVX2-or-better CPU, and builds the expert-stream host module's instrumented variant for its
 test exports (kernel_layer, kernel_forward; CXX the kernels' GCC 15, as run_exl3_cpu_forward_checks.sh sets it). Each
-ISA tier runs in its own process, since the tier is fixed at the first kernel call. Run on divix01 under taskset, e.g.
+ISA tier runs in its own process, built at its own -march (SGLANG_JIT_HOST_MARCH). Run on divix01 under taskset, e.g.
   taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
 """
 
@@ -68,18 +68,17 @@ def _slabs(torch, w, tr):
 
 
 def _run(tier, out_path):
-    os.environ["SGLANG_EXPERT_STREAM_CPU_MAX_ISA"] = tier
+    os.environ["SGLANG_JIT_HOST_MARCH"] = {"bw": "skylake-avx512", "scalar": "x86-64"}[tier]  # a tier is a build
     os.environ.setdefault("SGLANG_EXL3_MOE_CPU_PIN", "0")
     import torch
 
     from sglang.kernels.ops.moe import expert_stream_transport as es
-    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-    e = exl3_ext()
+    options = es.cpu_kernel_options(variant="instr")
     w, x, sel, rw = _weights(torch)
     threads = min(8, len(os.sched_getaffinity(0)))
-    res = {"bw": bool(e.exl3_moe_cpu_has_avx512_bw())}
+    res = {"bw": options.cpu_kernel_isa() in ("bw", "vnni", "vbmi")}
 
     def forward(layer, rows):
         out = torch.zeros(x[rows].shape[0], H)
@@ -89,9 +88,10 @@ def _run(tier, out_path):
 
     for layout in ("native", "swizzled") if tier != "scalar" else ("native",):
         swz = layout == "swizzled"
-        trait = Exl3CpuQuantTrait(e, act_limit=SWIGLU_LIMIT, swizzled=swz)
+        trait = Exl3CpuQuantTrait(act_limit=SWIGLU_LIMIT, swizzled=swz)
+        trait.attach_host(options)
         spec = trait.layer_spec(_slabs(torch, w, _swizzle if swz else (lambda t: t)), E)
-        layer = es.kernel_layer(trait.kernel_address(), spec, variant="instr")
+        layer = es.kernel_layer(spec, variant="instr")
         try:
             batch = forward(layer, slice(0, TOKENS))
             single = torch.cat([forward(layer, slice(t, t + 1)) for t in range(TOKENS)])

@@ -1,0 +1,26 @@
+{
+  "status": "implemented_tested_prepared",
+  "workspace": "/mnt/nvme4/mimo-reap",
+  "implementation": "incremental-production-v1/production_incremental.py",
+  "prepared_run": "incremental-calibration-v1",
+  "tests": {
+    "command": ".venv-compressor/bin/python -m pytest incremental-production-v1/test_production_incremental.py --basetemp=/mnt/nvme1/pytest_scratch/incremental-production-v1-final -q",
+    "passed": 28,
+    "elapsed_seconds": 36.23,
+    "scope": "Synthetic full-layer protocol and controller tests, adversarial validation, and reducer checked against existing real bounded GPU outputs"
+  },
+  "real_parent_partitions_validated": 2,
+  "frozen_file_pins": 1118,
+  "inputs_lock_sha256": "41b12819285bb1dbf98822b40c0691888671628515391549cb1b51ad09eaab4d",
+  "new_histories": 46,
+  "histories_per_partition": 23,
+  "combined_histories": 667,
+  "checkpoint_reserve_bytes": 55517790618,
+  "preflight_free_bytes": 202113126400,
+  "preflight_passed": true,
+  "full_calibration_launched": false,
+  "gpu_scoring_started_during_implementation": false,
+  "checkpoints_deleted": false,
+  "native_precision_verified": false,
+  "selection_allowed": false
+}

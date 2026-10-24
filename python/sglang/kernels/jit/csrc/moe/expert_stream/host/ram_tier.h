@@ -72,6 +72,9 @@ class RamTier {
  public:
   using Layout = typename Source::LayoutType;
   using CpuExpertEngine = BasicCpuExpertEngine<typename Source::BuildType>;
+  using CpuKernel = typename CpuExpertEngine::Kernel;  // the format's, from the Build (build_policy.h)
+  using CpuLayer = typename CpuKernel::Layer;
+  using DraftSource = typename CpuExpertEngine::DraftSource;
   using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
   using Engine = CopyEngine<Build, RamTier>;
   using Drip = GpuDrip<Build, RamTier>;
@@ -134,7 +137,7 @@ class RamTier {
     for (int64_t c : capacity)
       widest = std::max(widest, c);
     fill_packed_.reserve(static_cast<size_t>(widest));
-    cpu_layers_ = std::make_unique<CpuExpertLayers>(layers_);
+    cpu_layers_ = std::make_unique<typename CpuExpertEngine::Layers>(layers_);
   }
 
   // Joins the fill thread, then the copy thread, then the CPU thread. The copy thread's callbacks use the lease block
@@ -819,7 +822,7 @@ class RamTier {
   int64_t layers_;
   int64_t experts_;
   // Every row's CPU expert layer, shared by every group's engine; declared before dist_, so destroyed after the engines.
-  std::unique_ptr<CpuExpertLayers> cpu_layers_;
+  std::unique_ptr<typename CpuExpertEngine::Layers> cpu_layers_;
   CpuExpertEngine& draft_cpu(int g) {
     if (g < 0 || g >= groups() || dist_.group(g).cpu == nullptr)
       throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "group " + std::to_string(g) +
@@ -828,7 +831,7 @@ class RamTier {
   }
   std::array<std::unique_ptr<DraftSource>, Wire::kNodes> pending_draft_;
   std::array<int64_t, Wire::kNodes> draft_fatal_ns_{};
-  const cpu_experts::CpuExpertKernel* cpu_kernel_ = nullptr;  // every group's engine runs this one kernel
+  bool cpu_enabled_ = false;  // some group's CPU experts are on: every group's engine runs the format's kernel
   // The NUMA groups: each one's reader, serve state and CPU experts (when enabled, group 0's, after the copy engine and
   // before the service threads; stopped after the copy thread). Declared before tiers_: the groups' ranges are checked
   // against the capacities first.

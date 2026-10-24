@@ -1,8 +1,8 @@
 """Startup CPU/DMA split calibration's host half (CPU; spec 2026-10-01-cpu-split-calibration).
 
 The host times CPU jobs through the live CPU expert engine and the DMA through its own copy backend (the test backend
-here, device -1) into a scratch buffer, and returns the mean ms of every cell. The kernel is the instr build's fake
-CpuExpertKernel (test_kernel_address): the calibration waits inside one FFI call, so the forward must run natively.
+here, device -1) into a scratch buffer, and returns the mean ms of every cell. The kernel is the FAKE_BUILD host's fake
+kernel (fake_kernel_reset): the calibration waits inside one FFI call, so the forward must run natively.
 """
 
 import os
@@ -12,7 +12,7 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ram_miss
-from sglang.kernels.ops.moe.expert_stream_transport import new_page
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, fake_cpu_layer, ram_miss_setup
 
@@ -25,7 +25,7 @@ FORWARD_NS = 200_000  # 0.2 ms per expert
 
 def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8, tokens=1, max_rows=None):
     s = ram_miss_setup(tmp_path, capacity=capacity, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
-    host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(lanes)), k=3, lanes=lanes)
+    host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(lanes)), k=3, lanes=lanes, layout=FAKE_BUILD)
     host.enable_copy_engine(-1)
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
@@ -40,10 +40,10 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
         x_rows = torch.zeros((ROWS, lease.cpu_row_bytes(HIDDEN, tokens, host.wire.lanes)), dtype=torch.uint8)
         out_rows = torch.zeros((ROWS, 2, tokens, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    kernel = host.test_kernel_address(forward_ns)
+    host.fake_kernel_reset(forward_ns)
     if max_rows is not None:
-        host.test_kernel_max_rows(max_rows)
-    host.enable_cpu_experts(kernel, [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
+        host.fake_kernel_max_rows(max_rows)
+    host.enable_cpu_experts([0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
     if register:
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -109,7 +109,7 @@ def test_a_timed_out_calibration_reports_and_a_later_one_completes(tmp_path):
     with pytest.raises(RuntimeError, match="did not finish"):
         host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), timeout_s=0.05)
     # The engine runs jobs in order; the stale job finishes and a fresh calibration with room for it completes.
-    host.test_kernel_address(1_000)
+    host.fake_kernel_reset(1_000)
     grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), timeout_s=2.0)
     assert grid[0, 1] > 0
 
@@ -199,7 +199,7 @@ def test_the_capped_split_keeps_the_configured_entries_above_the_cap():
 def _calls_per_job(host, jobs_before, run):
     run()
     jobs = host.cpu_stats()["jobs"] - jobs_before
-    return jobs, host.test_kernel_calls()
+    return jobs, host.fake_kernel_calls()
 
 
 def test_a_one_token_calibration_runs_one_row_jobs(tmp_path):

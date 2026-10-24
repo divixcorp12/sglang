@@ -18,6 +18,7 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    FAKE_BUILD,
     CPU_FIT_MOMENTS,
     SPLIT_CELL_COPY,
     SPLIT_CELL_HIT,
@@ -363,7 +364,7 @@ FORWARD_NS = 200_000
 
 def _host(tmp_path, *, capacity=12, register=True):
     s = ram_miss_setup(tmp_path, capacity=capacity, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
-    host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(8)), k=3)
+    host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(8)), k=3, layout=FAKE_BUILD)
     host.enable_copy_engine(-1)
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
@@ -374,7 +375,8 @@ def _host(tmp_path, *, capacity=12, register=True):
     x_rows = torch.zeros((ROWS, lease.cpu_row_bytes(HIDDEN, TOKENS, host.wire.lanes)), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, TOKENS, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_kernel_address(FORWARD_NS), [0] * 9, cores, x_rows, out_rows, threads=2)
+    host.fake_kernel_reset(FORWARD_NS)
+    host.enable_cpu_experts([0] * 9, cores, x_rows, out_rows, threads=2)
     if register:
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     return s, host, (dst, x_rows, out_rows)

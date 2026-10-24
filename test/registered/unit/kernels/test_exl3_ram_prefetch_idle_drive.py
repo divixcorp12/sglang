@@ -23,7 +23,7 @@ import time
 
 import pytest
 
-from sglang.kernels.ops.moe.expert_stream_transport import read_rows_idle
+from sglang.kernels.ops.moe.expert_stream_transport import FAKE_BUILD, read_rows_idle
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes, warm_host_modules
 from sglang.test.dsv41_ram_prefetch_fixtures import LANES, LOGITS, enable, forced, load, prefetch_rig, trigger
@@ -40,7 +40,7 @@ INSTANT = ("demand_reads", "spec_reads", "demand_inflight_bytes", "spec_inflight
 def hang_guard():
     # Joins and deferral loops run in C++: dump every stack and exit instead of hanging the suite. A cold JIT build
     # takes 50-100 s, so the rig's build loads first, outside the guard.
-    warm_host_modules("instr", lanes=LANES, nodes=1)
+    warm_host_modules("instr", lanes=LANES, nodes=1, layout=FAKE_BUILD)
     faulthandler.dump_traceback_later(120, exit=True)
     yield
     faulthandler.cancel_dump_traceback_later()

@@ -346,12 +346,12 @@ M1_REG_TARGET void register_tiles(const Exl3Projection& mat,const PreparedIn& in
         if(in.compact) {
             if(mat.swz) {
                 // The swizzled layout stores a 128-output group's eight tiles together.
-                TORCH_CHECK(t0%8==0 && t1%8==0,"compact swizzled input requires whole output blocks");
+                EXL3_CHECK(t0%8==0 && t1%8==0,"compact swizzled input requires whole output blocks");
                 for(int t=t0;t<t1;t+=8)register_band<4,0,0,true>(mat,in,tout,t);
                 return;
             }
             // Unswizzled: whole groups through the traversal, a partial group at either end as tile pairs.
-            TORCH_CHECK(t0%2==0 && t1%2==0,"compact input requires whole tile pairs");
+            EXL3_CHECK(t0%2==0 && t1%2==0,"compact input requires whole tile pairs");
             const int a0=std::min(t1,(t0+7)/8*8), a1=std::max(a0,t1/8*8);
             compact_pairs(mat,in,tout,t0,a0);
             if(a1>a0)traversal_tiles(mat,in,tout,a0,a1,grouped);
@@ -371,8 +371,8 @@ M1_REG_TARGET void register_tiles(const Exl3Projection& mat,const PreparedIn& in
         }
     } else {
         static_assert(!budget.traversal,"the grouped traversal holds one token's rows (IntegerAccum)");
-        TORCH_CHECK(in.compact && !mat.swz && t0%2==0 && t1%2==0,
-                    "a chunk of several tokens needs compact, unswizzled tile pairs");
+        EXL3_CHECK(in.compact && !mat.swz && t0%2==0 && t1%2==0,
+                   "a chunk of several tokens needs compact, unswizzled tile pairs");
         if constexpr (budget.halves) {
             static_assert(budget.pairs==1,"register_band_halves runs one tile pair per call here");
             for(int n0=t0;n0<t1;n0+=2)register_band_halves<1,M>(mat,in,tout,n0);

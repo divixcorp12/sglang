@@ -1,4 +1,4 @@
-// Standalone harness for host/cpu_experts: a toy quant through ExpertForward, as a CpuExpertKernel. Built by
+// Standalone harness for host/cpu_experts: a toy quant through ExpertForward, as a kernel type (binding.hpp). Built by
 // test_cpu_experts_common.py.
 #include "cpu_experts_common_toy.hpp"
 #include <pthread.h>
@@ -25,19 +25,11 @@
         }                                                                                   \
     } while (0)
 
-namespace toy {
-const sglang::cpu_experts::CpuExpertKernel& toy_kernel()
-{
-    static const sglang::cpu_experts::ExpertForward<ToyQuant> kernel{};
-    return kernel;
-}
-}  // namespace toy
-
 namespace {
-using sglang::cpu_experts::CpuExpertKernel;
-using sglang::cpu_experts::ExpertLayer;
 using sglang::cpu_experts::ForwardCall;
 using sglang::cpu_experts::Isa;
+using toy::Toy;
+using Layer = toy::ToyLayer;
 
 constexpr int kCapacity = 3;
 constexpr int kHidden = 16;
@@ -72,26 +64,25 @@ struct Fixture {
             for (int h = 0; h < kHidden; ++h) slab[size_t(s) * kHidden + h] = float(s + h);
     }
 
-    ExpertLayer layer() const
+    Layer layer() const
     {
-        ExpertLayer d;
+        Layer d;
         d.capacity = kCapacity;
         d.hidden = kHidden;
         d.intermediate = kHidden;
         d.slab_count = 1;
         d.slabs[0] = slab.data();
         d.slot_bytes[0] = uint64_t(kHidden) * 4;
+        d.params = params;
         return d;
     }
-
-    std::span<const std::byte> params_bytes() const { return std::as_bytes(std::span<const toy::ToyParams>(&params, 1)); }
 };
 
-ExpertLayer make_toy(const Fixture& f) { return toy::toy_kernel().make_layer(f.layer(), f.params_bytes()); }
+Layer make_toy(const Fixture& f) { return Toy::make_layer(f.layer()); }
 
 // One forward's buffers; out starts at 7 so a refused call is seen to leave it untouched.
 struct Call {
-    const ExpertLayer* layer;
+    const Layer* layer;
     std::vector<uint16_t> x;
     std::vector<int32_t> slots;
     std::vector<float> weights;
@@ -99,7 +90,7 @@ struct Call {
     std::vector<int> cores;
     ForwardCall c;
 
-    Call(const ExpertLayer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
+    Call(const Layer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
          std::vector<int> on = {})
         : layer(&l), x(size_t(rows) * kHidden), slots(std::move(s)), weights(std::move(w)),
           out(size_t(rows) * kHidden, 7.0f), cores(std::move(on))
@@ -116,11 +107,11 @@ struct Call {
     Call(const Call&) = delete;
     Call& operator=(const Call&) = delete;
 
-    int run(const CpuExpertKernel& kernel = toy::toy_kernel())
+    int run()
     {
         return status_of([&] {
-            kernel.check(*layer, c);
-            kernel.forward(*layer, c);
+            Toy::check(*layer, c);
+            sglang::cpu_experts::forward_alone<Toy>(*layer, c);
         });
     }
     bool untouched() const
@@ -148,20 +139,14 @@ void ok(const char* name) { std::printf("ok %s\n", name); std::fflush(stdout); }
 
 int main()
 {
-    // isa() is computed once, at the first forward: the cap and the report switch are configured before it, as
-    // Python passes them to a library's configure export. Nothing reads the environment. The Python test reads the
-    // report ("toy isa scalar") from stderr.
-    sglang::cpu_experts::ExpertForward<toy::ToyQuant>::configure_isa("scalar", true);
     Fixture f;
-    const CpuExpertKernel& kernel = toy::toy_kernel();
-    CHECK(std::string(kernel.name()) == "toy");
+    CHECK(std::string(Toy::name()) == "toy");
     const std::vector<int> allowed = allowed_cores();
     const int team = allowed.size() >= 2 ? 2 : 1;
     const std::vector<int> cores(allowed.begin(), allowed.begin() + team);
 
     {
         const auto layer = make_toy(f);
-        CHECK(layer.kernel == &kernel);
         // Token 0: slots 0 and 2; token 1: slot 1 and a skipped -1.
         Call call(layer, 2, 2, {0, 2, 1, -1}, {0.5f, 0.25f, 2.0f, 1.0f}, team, cores);
         for (int accumulate = 0; accumulate < 2; ++accumulate) {
@@ -180,40 +165,25 @@ int main()
     }
 
     {
-        const ExpertLayer good = f.layer();
-        auto refused = [&](const ExpertLayer& d, std::span<const std::byte> p) {
-            return status_of([&] { kernel.make_layer(d, p); }) == 2;
-        };
-        ExpertLayer d = good;
+        const Layer good = f.layer();
+        auto refused = [&](const Layer& d) { return status_of([&] { Toy::make_layer(d); }) == 2; };
+        Layer d = good;
         d.slot_bytes[0] = uint64_t(kHidden) * 4 - 4;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.slabs[0] = nullptr;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.slab_count = 2;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.activation = 1;
-        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(d));
         d = good;
         d.capacity = 0;
-        CHECK(refused(d, f.params_bytes()));
-        CHECK(refused(good, {}));  // the toy needs its params
-        const std::byte wide[8]{};
-        CHECK(refused(good, wide));  // not sizeof(ToyParams)
+        CHECK(refused(d));
+        CHECK(!refused(good));
         ok("params_and_slabs_are_validated");
-    }
-
-    {
-        // A second kernel object of the same quant (another library's, in production) refuses this one's layer.
-        const sglang::cpu_experts::ExpertForward<toy::ToyQuant> other{};
-        const auto layer = make_toy(f);
-        Call call(layer, 1, 1, {0}, {1.0f});
-        CHECK(call.run(other) == 2);
-        CHECK(call.untouched());
-        CHECK(call.run() == 0);
-        ok("a_layer_of_another_kernel_is_refused");
     }
 
     {
@@ -223,6 +193,8 @@ int main()
         Call bad_slot(layer, 1, 1, {kCapacity}, {1.0f});
         Call negative_slot(layer, 1, 1, {-2}, {1.0f});
         Call nan_weight(layer, 1, 1, {0}, {nan});
+        Call inf_weight(layer, 1, 1, {0}, {std::numeric_limits<float>::infinity()});
+        Call neg_inf_weight(layer, 1, 1, {0}, {-std::numeric_limits<float>::infinity()});
         Call wide(layer, 1, max_routes + 1, std::vector<int32_t>(max_routes + 1, 0),
                   std::vector<float>(max_routes + 1, 1.0f));
         Call tall(layer, max_rows + 1, 1, std::vector<int32_t>(max_rows + 1, 0),
@@ -235,7 +207,7 @@ int main()
         null_slots.c.slots = nullptr;
         Call null_out(layer, 1, 1, {0}, {1.0f});
         null_out.c.out = nullptr;
-        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
+        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &inf_weight, &neg_inf_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
             CHECK(c->run() == 2);
             CHECK(c->untouched());
         }
@@ -277,19 +249,15 @@ int main()
     }
 
     {
-        CHECK(toy::ToyQuant::last_isa == Isa::Scalar);
-        CHECK(sglang::cpu_experts::ExpertForward<toy::ToyQuant>::isa() == Isa::Scalar);
-        const Isa hw = sglang::cpu_experts::detect_isa(Isa::Vbmi, "");
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "") <= Isa::Avx2);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Scalar, "") == Isa::Scalar);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "scalar") == Isa::Scalar);
-        // An unrecognized cap is ignored.
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "avx9000") == hw);
-        // A cap above the hardware never raises the tier.
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Vbmi, "VBMI") == hw);
-        CHECK(sglang::cpu_experts::detect_isa(Isa::Avx2, "VBMI") <= Isa::Avx2);
-        std::printf("detected %d\n", int(hw));
-        ok("isa_cap_lowers_the_tier");
+        // The quant runs at the build's tier (the compiler's -march macros), lowered to its top tier.
+        constexpr Isa expected = sglang::cpu_experts::kBuildIsa < toy::ToyQuant::kTopIsa
+                                     ? sglang::cpu_experts::kBuildIsa
+                                     : toy::ToyQuant::kTopIsa;
+        static_assert(sglang::cpu_experts::ExpertForward<toy::ToyQuant>::isa() == expected);
+        CHECK(toy::ToyQuant::last_isa == expected);
+        std::printf("build tier %s, quant top %s, runs %s\n", sglang::cpu_experts::isa_name(sglang::cpu_experts::kBuildIsa),
+                    sglang::cpu_experts::isa_name(toy::ToyQuant::kTopIsa), sglang::cpu_experts::isa_name(expected));
+        ok("isa_is_the_build_tier_lowered_to_the_quants_top");
     }
 
     if (allowed.size() >= 2) {
@@ -369,7 +337,7 @@ int main()
     {
         uint32_t word = 5;
         auto warm = [&](const uint32_t* w, uint32_t seen, int64_t deadline) {
-            return status_of([&] { kernel.warm(w, seen, deadline); });
+            return status_of([&] { Toy::warm(w, seen, deadline); });
         };
         // The register work returns when the word moves, inside its deadline.
         {
@@ -398,24 +366,26 @@ int main()
             CHECK(warm(&word, 5, start + 60LL * 1000000000) == 0);
             CHECK(now_ns() - start < 100000000);
         }
-        // Every tier's loop, as far as this CPU runs them, through the free function.
-        for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
-            if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, "")) break;
+        // Every loop up to the build's tier (a tier runs on a CPU that has the build's -march), through the free function.
+        auto each = [&](auto tier) {
             word = 5;
             std::thread mover([&] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
                 __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
             });
-            sglang::cpu_experts::keep_warm_loop<Isa::Vbmi>(tier, &word, 5, now_ns() + 60LL * 1000000000);
+            sglang::cpu_experts::keep_warm_loop<decltype(tier)::value>(&word, 5, now_ns() + 60LL * 1000000000);
             mover.join();
-        }
+        };
+        each(std::integral_constant<Isa, Isa::Scalar>{});
+        if constexpr (sglang::cpu_experts::kBuildIsa >= Isa::Avx2) each(std::integral_constant<Isa, Isa::Avx2>{});
+        if constexpr (sglang::cpu_experts::kBuildIsa >= Isa::Bw) each(std::integral_constant<Isa, Isa::Bw>{});
         ok("warm_returns_when_the_word_moves");
     }
 
     {
         // A team's barrier orders its phases: what every worker wrote before it, every worker reads after it, job
         // after job on the one team.
-        sglang::cpu_experts::Team t(cores, team, &kernel, 0);
+        sglang::cpu_experts::Team t(cores, team, &Toy::warm, 0);
         std::vector<int> seen(size_t(team), -1), sum(size_t(team), 0);
         for (int rep = 0; rep < 1000; ++rep) {
             t.run([&](int w, int n) {

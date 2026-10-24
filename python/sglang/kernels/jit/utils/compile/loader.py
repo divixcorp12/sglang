@@ -9,7 +9,7 @@ import os
 import pathlib
 import shutil
 import uuid
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import torch
 
@@ -65,6 +65,7 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
     header_only: bool = True,
+    source_cflags: Dict[str, List[str]] | None = None,
 ) -> Module:
     """Load a JIT module, compiling it if no cached build still applies.
 
@@ -86,6 +87,15 @@ def load_jit(
     :param header_only: Compile through a generated wrapper that exports the
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
+    :param source_cflags: Per-file host flags, ``{cpp_file: flags}`` with each
+                          key spelled as in `cpp_files`. The flags replace the
+                          module's (``-std=c++20 -O3`` and `extra_cflags`) for
+                          that file alone, so give the standard and optimization
+                          level too, and ``-x c -std=c11`` compiles a C file.
+                          The toolchain's own flags (``-fPIC``, ``-march``) and
+                          the include paths still apply. They are part of the
+                          build key. Needs ``header_only=False``: a header-only
+                          module compiles all its sources as one unit.
     """
     if is_hip_runtime():
         extra_cuda_cflags = [
@@ -109,6 +119,9 @@ def load_jit(
         includes += REGISTERED_DEPENDENCIES[dep]()
 
     module_args = tuple(str(arg) for arg in args)
+    per_source = _resolved_source_cflags(
+        source_cflags, cpp_files=cpp_files, header_only=header_only
+    )
     spec = BuildSpec(
         module_args=module_args,
         cpp_files=resolve_sources(cpp_files),
@@ -120,6 +133,7 @@ def load_jit(
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
         header_only=header_only,
+        source_cflags=per_source,
     )
 
     # Generated once and threaded through: the cache key is taken over this
@@ -196,6 +210,24 @@ def load_jit(
             return module
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def _resolved_source_cflags(
+    source_cflags: Dict[str, List[str]] | None,
+    *,
+    cpp_files: List[str] | None,
+    header_only: bool,
+) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """`source_cflags` keyed by resolved path and sorted; ValueError for a key that is not a C++ source."""
+    if not source_cflags:
+        return ()
+    if header_only:
+        raise ValueError("source_cflags needs header_only=False: a header-only module is one translation unit")
+    resolved = dict(zip(cpp_files or [], resolve_sources(cpp_files)))
+    unknown = sorted(set(source_cflags) - set(resolved))
+    if unknown:
+        raise ValueError(f"source_cflags names {unknown}, which are not in cpp_files")
+    return tuple(sorted((resolved[name], tuple(flags)) for name, flags in source_cflags.items()))
 
 
 def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | None:

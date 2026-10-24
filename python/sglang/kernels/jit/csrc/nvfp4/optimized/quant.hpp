@@ -27,6 +27,9 @@ namespace sglang::nvfp4_cpu {
 namespace {
 using namespace ::sglang::cpu_experts;
 
+// The layer type of this quant's kernel (entry.h's Nvfp4CpuKernel::Layer).
+using ExpertLayer = ::sglang::cpu_experts::ExpertLayer<SglangNvfp4CpuParams>;
+
 constexpr size_t rounded(size_t x, size_t n) { return (x + n - 1) / n * n; }
 // Inverse address of utils.swizzle_blockscale's reshape/permute.
 inline size_t sf_index(int row, int group, int groups) {
@@ -84,8 +87,7 @@ struct Nvfp4Quant
     static constexpr uint32_t kOptionalSlabs = 1u << kUpAlpha;  // absent: up shares the gate alpha
     static constexpr int kMaxRoutes = 8;      // the forward's k limit
     static constexpr int kMaxRows = 1 << 16;  // the forward's rows limit; arbitrary, it keeps every scratch index in range
-    // The library holds both tiers and runs min(host, the configured cap: SGLANG_EXPERT_STREAM_CPU_MAX_ISA): AVX2 on
-    // an AVX2/FMA host, else scalar.
+    // AVX2 in a build whose -march has AVX2/FMA/F16C (at most), else scalar.
     static constexpr Isa kTopIsa = Isa::Avx2;
     using Params = SglangNvfp4CpuParams;
 
@@ -118,9 +120,9 @@ struct Nvfp4Quant
             return "hidden and intermediate must be multiples of 16 in [16, 2^20]";
         if (p.w13_layout < 0 || p.w13_layout > 2 || (p.w13_layout == 2 && l.intermediate % 64))
             return "w13_layout must be 0, 1 or 2 (2 needs intermediate % 64 == 0)";
-        if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0)
+        if (l.activation != 0 || !is_finite_bits(l.act_limit) || l.act_limit < 0)
             return "the activation must be gated SiLU with a finite, non-negative act_limit";
-        if (!std::isfinite(p.inv_input_scale13) || p.inv_input_scale13 <= 0 || !std::isfinite(p.inv_input_scale2)
+        if (!is_finite_bits(p.inv_input_scale13) || p.inv_input_scale13 <= 0 || !is_finite_bits(p.inv_input_scale2)
             || p.inv_input_scale2 <= 0)
             return "the inverse input scales must be finite and positive";
         return nullptr;
@@ -130,7 +132,7 @@ struct Nvfp4Quant
     static bool usable(const ExpertLayer& l, const Params&, int slot)
     {
         const Expert e = expert(l[slot]);
-        return std::isfinite(e.gate.alpha) && std::isfinite(e.up.alpha) && std::isfinite(e.down.alpha);
+        return is_finite_bits(e.gate.alpha) && is_finite_bits(e.up.alpha) && is_finite_bits(e.down.alpha);
     }
 
     // Defined in kernel.cpp after forward_plan.hpp.

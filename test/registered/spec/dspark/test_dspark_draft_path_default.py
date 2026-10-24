@@ -121,7 +121,7 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
 
 
 class TestDsparkConfidenceCutRefusals(CustomTestCase):
-    """SGLANG_DSPARK_CONFIDENCE_CUT's launch contract: one cut source, calibrated, static, DSpark only."""
+    """SGLANG_DSPARK_CONFIDENCE_CUT's launch contract: one cut source, static, DSpark only."""
 
     def _cut_server_args(self) -> ServerArgs:
         server_args = _make_dspark_server_args(
@@ -144,30 +144,25 @@ class TestDsparkConfidenceCutRefusals(CustomTestCase):
         ), envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             handle_speculative_decoding(self._cut_server_args())
 
-    def test_collect_mode_needs_no_sts_file(self):
-        """Collecting STS data builds the head with no table; the cut stays off, so the launch is admitted."""
+    def test_a_cut_with_no_sts_file_is_admitted(self):
+        """Production cuts at T=1 with no STS file; a gate demanding one refused its launch."""
         server_args = self._cut_server_args()
         server_args.speculative_dspark_confidence_sts_path = None
         with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
             True
-        ), envs.SGLANG_RAGGED_VERIFY_MODE.override(
-            "static"
-        ), envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/captures/sts.jsonl"):
+        ), envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             handle_speculative_decoding(server_args)
 
     def test_each_refusal_names_its_fix(self):
         refusals = {
             "speculative-algorithm DSPARK": dict(speculative_algorithm=None),
             "SGLANG_DSPARK_TOP_PROB_GATE=0": dict(top_prob_gate=0.4),
-            "confidence-sts-path": dict(sts_path=None),
             "SGLANG_RAGGED_VERIFY_MODE=static": dict(mode="compact"),
         }
         for fix, change in refusals.items():
             server_args = self._cut_server_args()
             if "speculative_algorithm" in change:
                 server_args.speculative_algorithm = change["speculative_algorithm"]
-            if "sts_path" in change:
-                server_args.speculative_dspark_confidence_sts_path = change["sts_path"]
             with envs.SGLANG_DSPARK_CONFIDENCE_CUT.override(
                 True
             ), envs.SGLANG_DSPARK_TOP_PROB_GATE.override(

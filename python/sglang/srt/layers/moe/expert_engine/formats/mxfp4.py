@@ -303,7 +303,7 @@ class Mxfp4ExpertFormat:
         Exl3ExpertFormat.attach_hot_cache_manager(self, manager, streamer)
 
     @staticmethod
-    def cpu_trait(*, source: str, ext: Any = None):
+    def cpu_trait(*, source: str):
         """None: MXFP4 has no CPU kernel yet (the C++ build's ``UnsupportedCpuKernel`` stub)."""
         return None
 
