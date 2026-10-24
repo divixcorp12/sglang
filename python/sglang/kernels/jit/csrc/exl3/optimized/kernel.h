@@ -2,7 +2,7 @@
 // compiles in and calls (formats/exl3/format.h), and the one the benches link, with the kernel's own typed plan
 // interface below. Its layers are slab layers only (make_layer). No torch.
 #pragma once
-#include "../../moe/expert_stream/host/cpu_experts/team.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include "entry.h"
 #include <cstdint>
 #include <vector>

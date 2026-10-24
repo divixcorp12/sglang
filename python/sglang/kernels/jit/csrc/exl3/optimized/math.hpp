@@ -57,7 +57,7 @@ constexpr int kActBlock = 128;
 constexpr int CHUNK_M = MAX_M / kActRows;
 // The generic plan's quantized rows per chunk: MAX_M up to 8, whatever the build's MAX_M. Its tile kernels are
 // instantiated per row count, so a larger bound only lengthens the build; the DSV4.1 plan alone takes chunks past 4
-// tokens (register_tiles<M>). Exl3Quant::dispatch splits a generic call at GENERIC_CHUNK_M.
+// tokens (register_tiles<M>). prepare_job splits a generic call at GENERIC_CHUNK_M.
 constexpr int GENERIC_MAX_M = MAX_M < 8 ? MAX_M : 8;
 constexpr int GENERIC_CHUNK_M = GENERIC_MAX_M / kActRows;
 

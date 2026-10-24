@@ -39,7 +39,7 @@ struct Dsv41Shape
     static constexpr int32_t kPlan = kSglangExl3CpuPlanDsv41;
     static constexpr const char* kName = "dsv41";
     // Its register kernels need AVX-512BW (a VNNI build accumulates with vpdpwssd); its chunks hold 1..CHUNK_M tokens
-    // (register_tiles<M>, kRegisterBudget), which Exl3Quant::dispatch makes for this plan.
+    // (register_tiles<M>, kRegisterBudget), which prepare_job makes for this plan.
     static constexpr Isa kMinIsa = Isa::Bw;
     static constexpr int kHidden = 5120, kIntermediate = 2304, kBitsW13 = 3, kBitsW2 = 3, kSwizzled = 0;
     static constexpr float kActLimit = 10.0f;

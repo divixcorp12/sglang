@@ -1,6 +1,6 @@
 // Exl3Quant: the EXL3 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), and its typed view of
-// a layer's expert slots (Experts<Shape>: each projection a Exl3Projection over the slot's ExpertRow). forward_plan.hpp
-// defines Exl3Quant::dispatch.
+// a layer's expert slots (Experts<Shape>: each projection a Exl3Projection over the slot's ExpertRow). EXL3 runs through
+// the job interface (entry.h), not ExpertForward::forward, so Exl3Quant has no dispatch.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
@@ -52,12 +52,10 @@ struct Exl3Quant
     static constexpr const char* kName = "exl3";
     static constexpr int kSlabs = kSlabNames;
     static constexpr uint32_t kOptionalSlabs = 0;
-    static constexpr int kMaxRoutes = 64;     // the forward's k limit: a job's lanes, up to the wire's 64 (dispatch sizes everything from k)
+    static constexpr int kMaxRoutes = 64;     // the forward's k limit: a job's lanes, up to the wire's 64 (prepare_job sizes everything from k)
     static constexpr int kMaxRows = 65536;    // the forward's rows limit
     // The library compiles one tier, the build's (isa.hpp's kBuildIsa).
     static constexpr Isa kTopIsa = Isa::Vbmi;
-    // dispatch waits on ForwardCall::stage_two after GateUp: Middle's down input reads w2_suh.
-    static constexpr bool kStagedForward = true;
     using Params = SglangExl3CpuParams;
 
     static std::array<uint64_t, kSlabs> row_bytes(const ExpertLayer& l, const Params& p)
@@ -82,9 +80,6 @@ struct Exl3Quant
     }
 
     static bool usable(const ExpertLayer&, const Params&, int) { return true; }
-
-    // Defined at the end of forward_plan.hpp.
-    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team);
 };
 
 // The layer's experts as the plans read them: slot e's gate, up and down, each a Exl3Projection over the slot's

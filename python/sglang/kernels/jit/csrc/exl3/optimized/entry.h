@@ -6,6 +6,7 @@
 #include "../../moe/expert_stream/host/cpu_experts/kernel.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -19,8 +20,8 @@ struct SglangExl3CpuParams {
     int16_t bits_w13;      // gate and up trellis bits per weight, 1..8
     int16_t bits_w2;       // down trellis bits per weight, 1..8
     int16_t swizzled;      // 0 or 1: band-contiguous trellis layout; an 8-bit projection is never swizzled
-    int16_t row_weighted;  // 0 or 1: the layer's gate/up and down tiles are split by chunk row count
-                           // (tile_assignment.hpp), the same arithmetic in another worker's hands
+    int16_t row_weighted;  // 0 or 1, and ignored: tasks are claimed by whichever worker is free (job interface), so no
+                           // layer splits its tiles by chunk row count any more
     int32_t plan;          // a SglangExl3CpuPlan (kernel.h); make_layer refuses one that does not accept the layer
 };
 
@@ -38,8 +39,30 @@ struct __attribute__((visibility("hidden"))) Exl3CpuKernel {
     static int32_t max_routes() noexcept;
     static int32_t max_rows() noexcept;
     static void check(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call);
+    // Runs the call on `team` by its job interface below with a static split of each phase and a barrier between the
+    // phases: the engine's path until it admits jobs to a JobWindow, when this goes.
     static void forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team);
     static int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns);
+
+    // The job interface (cpu_experts/binding.hpp's CpuExpertJobKernel): one call as five phases of tasks (forward_plan.hpp
+    // lays them out), PrepareGateUp, GateUp, Middle, DownTiles and DownOut. Middle is the first phase that reads w2
+    // (kGatePhase) and DownOut the one that writes `out` (kOutPhase). A Job is one slot's state, with its scratch.
+    struct __attribute__((visibility("hidden"))) Job {
+        struct Impl;
+        Job();
+        ~Job();
+        Job(const Job&) = delete;
+        Job& operator=(const Job&) = delete;
+        std::unique_ptr<Impl> impl;
+    };
+    static constexpr int kPhases = 5;
+    static constexpr int kGatePhase = 2;
+    static constexpr int kOutPhase = 4;
+    // Throws std::invalid_argument for a plan this build does not compile.
+    static void prepare(Job& job, const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call);
+    static ::sglang::cpu_experts::Tasks tasks(const Job& job, int phase);
+    static void run(Job& job, int phase, int t0, int t1, int worker);
+    static int status(const Job& job);
 
     // The tier this build runs at (isa.hpp's isa_name): scalar, avx2, bw, vnni or vbmi.
     static std::string isa();

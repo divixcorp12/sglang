@@ -1,12 +1,12 @@
 // DSV4.1 CPU expert kernels, derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe.
 // MIT License, Copyright (c) 2025 Turboderp; see ../LICENSE.exllamav3.
 // Optimized residual/block-128 path: original packed weights, register decode,
-// compact activations, parallel preparation/middle stages, fused down transforms,
+// compact activations, parallel preparation/middle stages, a down output transform fused into the weighted sum,
 // and cache-line output partitioning. See README.txt for measured provenance.
 // The arithmetic is math.hpp and each tier's math_scalar.hpp, math_avx2.hpp and math_avx512.hpp (with the register
-// kernels, register_kernels.hpp); the forward is forward_plan.hpp (with tiles.hpp, phases.hpp and shapes.hpp). This
-// file defines the kernel type Exl3CpuKernel (entry.h): the quant's operations (ExpertForward<Exl3Quant>), its params,
-// plans and options.
+// kernels, register_kernels.hpp); the job's phases are forward_plan.hpp (with tiles.hpp, phases.hpp and shapes.hpp). This
+// file defines the kernel type Exl3CpuKernel (entry.h): the quant's operations (ExpertForward<Exl3Quant>), its job
+// interface, params, plans and options.
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
@@ -21,11 +21,37 @@
 #include <vector>
 
 #include "forward_plan.hpp"
+#include "worker_trace.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/binding.hpp"
 
 namespace sglang::exl3_cpu {
 namespace {
 using Forward = ::sglang::cpu_experts::ExpertForward<Exl3Quant>;
 }  // namespace
+
+struct Exl3CpuKernel::Job::Impl
+{
+    ForwardJob job;
+};
+
+static_assert(::sglang::cpu_experts::CpuExpertJobKernel<Exl3CpuKernel>);
+static_assert(Exl3CpuKernel::kPhases == kPhaseCount);
+static_assert(Exl3CpuKernel::kGatePhase == static_cast<int>(Phase::Middle));
+static_assert(Exl3CpuKernel::kOutPhase == static_cast<int>(Phase::DownOut));
+
+Exl3CpuKernel::Job::Job() : impl(std::make_unique<Impl>()) {}
+Exl3CpuKernel::Job::~Job() = default;
+
+void Exl3CpuKernel::prepare(Job& job, const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call)
+{
+    prepare_job(job.impl->job, layer, call);
+}
+
+::sglang::cpu_experts::Tasks Exl3CpuKernel::tasks(const Job& job, int phase) { return job_tasks(job.impl->job.ctx, phase); }
+
+void Exl3CpuKernel::run(Job& job, int phase, int t0, int t1, int) { job_run(job.impl->job.ctx, phase, t0, t1); }
+
+int Exl3CpuKernel::status(const Job&) { return 0; }
 
 const char* Exl3CpuKernel::name() noexcept { return Forward::name(); }
 
@@ -51,7 +77,25 @@ void Exl3CpuKernel::check(const Layer& layer, const ::sglang::cpu_experts::Forwa
 
 void Exl3CpuKernel::forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team)
 {
-    Forward::forward(layer, call, team);
+    // The caller's own job, reached by the other workers through the reference (a thread_local named in the lambda would
+    // be each worker's own).
+    static thread_local Job owned;
+    Job& job = owned;
+    prepare(job, layer, call);
+    team.run([&](int worker, int workers) {
+        for (int phase = 0; phase < kPhases; ++phase) {
+            if (phase == kGatePhase && call.stage_two) {
+                if (worker == 0) call.stage_two->wait();
+                team.barrier();
+            }
+            const ::sglang::cpu_experts::Tasks t = tasks(job, phase);
+            const int units = (t.count + t.align - 1) / t.align;
+            const int t0 = std::min(units * worker / workers * t.align, t.count);
+            const int t1 = std::min(units * (worker + 1) / workers * t.align, t.count);
+            if (t0 < t1) run(job, phase, t0, t1, worker);
+            if (phase + 1 < kPhases) team.barrier();
+        }
+    });
 }
 
 int32_t Exl3CpuKernel::warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns)

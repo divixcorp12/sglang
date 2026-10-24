@@ -28,9 +28,9 @@ measured performance claim. Every chunk size is bit-identical to the generic pla
 Existing scalar, AVX2 and other ISA/bit-width fallbacks are retained.
 
 Both selections include the register decoder, hoisted coefficients, register Hadamard, parallel 128-element
-preparation/middle stages, fused down output transform, cache-line output ownership, compact activation scratch,
-decoder unrolling and T0 prefetching. Experiment selectors, alternate persistent weight layouts and benchmark
-instrumentation have been removed. Scratch is reused per calling thread. Workers are individually pinned; a stable
+preparation/middle stages, a down output transform fused into the weighted sum, cache-line output ownership, compact
+activation scratch, decoder unrolling and T0 prefetching. Experiment selectors, alternate persistent weight layouts and
+benchmark instrumentation have been removed. Scratch is reused per job slot. Workers are individually pinned; a stable
 assignment avoids repeating affinity syscalls on every forward. The caller is worker zero. Each call carries its
 cores (worker i on cores[i]; none: unpinned workers), and forwards on different cores run at once from different
 threads. A layer is owned by its holder (the host's per-tier layer table), which frees it only after every engine has
@@ -105,8 +105,8 @@ Code layout
                         integer accumulate
   register_kernels.hpp  the 3-bit register kernels (register_tiles<M>, kRegisterBudget): the DSV4.1 plan's GEMVs
   tiles.hpp             run_tiles: a chunk's GEMV on the build's tier (register kernels, or Tiles per 128-input block)
-  phases.hpp            ForwardCtx, ForwardArena and the phases' work besides the GEMVs (prepare, transform, SiLU)
-  forward_plan.hpp      PlanTraits, ForwardPlan<Shape>, Exl3Quant::dispatch and the plan registry
+  phases.hpp            ForwardCtx, ForwardArena, ForwardJob and the phases' work besides the GEMVs (prepare, transform, SiLU)
+  forward_plan.hpp      PlanTraits, ForwardPlan<Shape> (the five phases' tasks), prepare_job and the plan registry
   shapes.hpp            the plans' Shapes and Chunk; quant.hpp Exl3Quant and Experts<Shape>; projection.hpp
                         Exl3Projection; half.hpp the fp16 type; kernel.cpp Exl3CpuKernel (entry.h)
 Registration, validation, the worker cores and keep-warm are the CPU experts framework's ExpertForward<Exl3Quant>.
@@ -114,12 +114,22 @@ The tier is compile-time: the build's -march (isa.hpp's kBuildIsa: AVX512VBMI+VN
 AVX2 Avx2, else Scalar), and only that tier is compiled: code holding a tier's instructions sits under isa.hpp's
 SGLANG_CPU_EXPERTS_{AVX2,AVX512,VNNI,VBMI} flags, not per-function target attributes. A lower tier is a build at a lower
 -march (SGLANG_JIT_HOST_MARCH: skylake-avx512 Bw, x86-64-v3 Avx2, x86-64 Scalar). The host installs the worker-trace
-options (Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself. A forward is
-ForwardPlan<Shape>::run (forward_plan.hpp) at the build's tier, picked once per layer, at registration: the layer's
+options (Exl3CpuKernel::configure) when it loads the module; a native harness calls it itself (the worker trace records
+nothing in a -DEXL3_MOE_CPU_WORKER_TRACE=1 build until the engine's window feeds it). A call is one job (entry.h's job
+interface): prepare_job at admission, then five phases of tasks any worker may run, ForwardPlan<Shape> at the build's
+tier, picked once per layer, at registration:
+  PrepareGateUp  (chunk, gate | up, 128-input block): transform and quantize          80 tasks for one DSV4.1 expert
+  GateUp         (chunk, gate | up, tile pair), claimed in runs of 8                  144
+  Middle         (chunk, 128-intermediate block): SiLU and the down input             18   (kGatePhase)
+  DownTiles      (chunk, tile pair) of the down GEMV, into tout_d, runs of 8          160
+  DownOut        a 128-output block over every chunk in order: output transform and
+                 the weighted sum (it zeroes its columns first for kOverwrite)        40   (kOutPhase)
+The scalar tier's PrepareGateUp and Middle tasks are (chunk, gate | up) and a chunk. The grouped multi-band traversal runs
+inside a claimed run. A task's arithmetic does not depend on the worker that runs it. The layer's
 params name a plan id (ForwardPlan<Dsv41Shape>, compiled from the Bw tier up, or ForwardPlan<GenericShape>), Python
 choosing it from the list the host's cpu_kernel_plans returns (each plan's facts, ISA floor and availability) by the
 layer's facts, and make_layer refusing a plan that does not accept the layer or that this build does not compile
-(plan_rejects, forward_plan.hpp). Exl3Quant::dispatch then runs p.plan with no per-call check. The register kernels
+(plan_rejects, forward_plan.hpp). The tasks then run p.plan with no per-task check. The register kernels
 accumulate with the build's instructions: vpdpwssd on a VNNI tier, vpmaddwd + vpaddd on Bw, bit-identically (the 16-bit
 byte sums and activation pairs are unchanged; both forms wrap mod 2^32).
 PlanTraits<Dsv41Shape> is the one specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and
@@ -130,7 +140,7 @@ through its Shape (shapes.hpp): GenericShape from the ExpertLayer, Dsv41Shape as
 3-bit gate/up and down, unswizzled, activation limit 10; a layer with any other value takes the generic plan). The
 generic plan decodes gate/up at bits_w13 and down at bits_w2. Every layer is gated SiLU.
 Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and down, each an Exl3Projection over the
-slot's ExpertRow. Exl3Quant::dispatch groups the call's routes by expert itself (a sort of the call's live routes), which
+slot's ExpertRow. prepare_job groups the call's routes by expert itself (a sort of the call's live routes), which
 fixes the accumulation order.
 
 Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier, each
