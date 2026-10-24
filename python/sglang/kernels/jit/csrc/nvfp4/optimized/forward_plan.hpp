@@ -1,8 +1,9 @@
 // Included by kernel.cpp inside quant.hpp's namespace, after the arithmetic (math.hpp: swiglu, q8_representable,
 // quantize_block; dot_rows<I, M> from math_scalar.hpp and math_avx2.hpp) and kChunkRows.
 //
-// One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
-// dot product's tier, the build's (kBuildIsa, at most Avx2).
+// One job = ForwardPlan<Shape, I>::prepare at admission, then the four phases (Phase) as tasks that any worker runs
+// (tasks, run). Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the dot product's tier, the
+// build's (kBuildIsa, at most Avx2).
 //
 // A call's routes are grouped by slot into units, one per (token, slot), and units into chunks of up to kChunkRows of
 // one slot, so dot_rows decodes each weight row once per chunk. Each token's output is still its own routes' sum in
@@ -52,7 +53,7 @@ struct ForwardCtx
     int rows;
     bool accumulate;
     RouteTable routes;  // each token's live routes in routing order
-    // From the calling thread's ForwardArena; the plan binds everything below.
+    // From the job's scratch; prepare binds everything below.
     RouteBinding* binding;   // [rows][routes.k]
     const Chunk* chunk;      // [chunks]
     int chunks;
@@ -62,103 +63,156 @@ struct ForwardCtx
     block_q8_0* qx;             // [rows][rounded(hidden, 64) / 32]
     float* inter;               // [units][rounded(intermediate, 64)]
     block_q8_0* qi;             // [units][rounded(intermediate, 64) / 32]
-    float* partial;             // [workers][partial_stride]: one down output of every unit
-    size_t partial_stride;
-    // Q8_0 cannot represent the input or an intermediate: the forward returns 2 and leaves out untouched.
+    // Q8_0 cannot represent the input or an intermediate: the job reports status 2 and leaves out untouched.
     std::atomic<bool> invalid{false};
 };
 
-// The forward's phases, in team order; a barrier separates each from the next.
+// The job's phases, in order; a phase's tasks run once the previous phase's have all finished.
 enum class Phase : int
 {
-    PrepareInput = 0,  // every token's fp16 input to fp32, then its Q8_0 blocks
-    GateUp = 1,        // every chunk's gate/up rows, gated SiLU into each unit's intermediate
-    Middle = 2,        // every unit's intermediate to Q8_0 blocks
-    Down = 3,          // every chunk's down rows, each token's routing-weighted sum into out
+    PrepareInput = 0,  // task: a 32-value block of a token's fp16 input to fp32, then its Q8_0 block
+    GateUp = 1,        // task: kRowUnit rows of the flat (chunk, output) range; gated SiLU into each unit's intermediate
+    Middle = 2,        // task: a Q8_0 block of a unit's intermediate
+    Down = 3,          // task: kRowUnit output rows; every chunk's down rows, each token's routing-weighted sum into out
 };
+constexpr int kPhaseCount = 4;
+// The first phase that reads the second stage's slabs (w2, sf2); the down alpha is read by prepare, outside it.
+constexpr int kGatePhase = int(Phase::Down);
 
-// The calling thread's per-forward storage, kept across calls so a steady state allocates nothing.
-struct ForwardArena
+// A job's state: the context and the scratch it points into, kept across jobs so a steady state allocates nothing.
+struct ForwardJob
 {
-    std::vector<float, CacheAligned<float>> xf, inter, partial;
+    ForwardCtx ctx;
+    RouteStore routes;
+    std::vector<float, CacheAligned<float>> xf, inter;
     std::vector<block_q8_0> qx, qi;
     std::vector<RouteBinding> binding;
     std::vector<int> unit_token;
     std::vector<RouteRef> refs;
     std::vector<Chunk> chunk;
-
-    static ForwardArena& get()
-    {
-        static thread_local ForwardArena arena;
-        return arena;
-    }
+    bool mimo = false;  // the MiMo V2.6 Pro plan runs this job (chosen at prepare)
 };
 
-// Output rows per split unit: 16 fp32 outputs fill one cache line. At MiMo V2.6 Pro's shape it splits 2048 gate/up
-// rows into 128 units and 6144 down rows into 384, both even over 16 workers. That shape's plan gains from the Shape's
+// Output rows per task: 16 fp32 outputs fill one cache line. At MiMo V2.6 Pro's shape it splits 2048 gate/up
+// rows into 128 tasks and 6144 down rows into 384, both even over 16 workers. That shape's plan gains from the Shape's
 // constants alone: every loop bound, sf_index group count and row stride is a compile-time value inside the AVX2
 // entries (gate_up_avx2, down_avx2, which inline the dot product), and the SwiGLU clamp compiles away.
 constexpr int kRowUnit = 16;
 
-// Worker `worker`'s contiguous share [first, last) of `total` items, cut on multiples of Unit.
-template <int Unit>
-std::pair<int64_t, int64_t> share(int64_t total, int worker, int workers)
-{
-    const int64_t units = (total + Unit - 1) / Unit;
-    return {std::min(total, units * worker / workers * Unit), std::min(total, units * (worker + 1) / workers * Unit)};
-}
-
 template <class Shape, Isa I>
 struct ForwardPlan
 {
-    // Runs the call's routes through layer l on `team` (its owner is worker 0). Returns 0, or 2 when Q8_0 cannot
-    // represent an input or an intermediate (out is then untouched).
-    static int run(const ExpertLayer& l, const Nvfp4Quant::Params& p, const ForwardCall& c, const RouteTable& r,
-                   Team& team)
+    // Binds the call into `job`: its routes grouped into chunks, its scratch sized. Throws std::invalid_argument for a
+    // call with more tasks in a phase than an int counts.
+    static void prepare(ForwardJob& job, const ExpertLayer& l, const ForwardCall& call)
     {
-        ForwardArena& ar = ForwardArena::get();
-        ForwardCtx ctx;
-        ctx.layer = &l;
-        ctx.params = p;
-        ctx.x = static_cast<const uint8_t*>(c.x);
-        ctx.out = c.out;
-        ctx.rows = c.rows;
-        ctx.accumulate = c.accumulate();
-        ctx.routes = r;
-        bind_routes(ctx, l, ar);
-        prepare_scratch(ctx, ar, team.workers());
-        team.run([&ctx, &team](int worker, int n) {
-            step<Phase::PrepareInput>(ctx, team, worker, n);
-            // `invalid` is read only after a barrier, so every worker takes the same branch.
-            if (!ctx.invalid.load(std::memory_order_relaxed)) {
-                step<Phase::GateUp>(ctx, team, worker, n);
-                step<Phase::Middle>(ctx, team, worker, n);
-                if (!ctx.invalid.load(std::memory_order_relaxed)) phase<Phase::Down>(ctx, worker, n);
+        ForwardCtx& c = job.ctx;
+        c.layer = &l;
+        c.params = l.params;
+        c.x = static_cast<const uint8_t*>(call.x);
+        c.out = call.out;
+        c.rows = call.rows;
+        c.accumulate = call.accumulate();
+        c.routes = RouteTable::build(call.slots, call.weights, call.rows, call.k, job.routes);
+        c.invalid.store(false, std::memory_order_relaxed);
+        bind_routes(c, l, job);
+        prepare_scratch(c, job);
+        const int64_t H = Shape::hidden(l), N = Shape::intermediate(l);
+        const int64_t counts[] = {int64_t(c.rows) * int64_t(rounded(size_t(H), 64) / 32),
+                                  int64_t(c.chunks) * N / kRowUnit,
+                                  int64_t(c.units) * int64_t(rounded(size_t(N), 64) / 32)};
+        for (const int64_t n : counts)
+            if (n > INT32_MAX) throw std::invalid_argument("NVFP4 CPU experts: the call has too many tasks");
+    }
+
+    // Phase `phase`'s tasks. Read when the phase becomes ready, so after `invalid` is set the phases that follow have
+    // none.
+    static Tasks tasks(const ForwardCtx& c, int phase)
+    {
+        const int H = Shape::hidden(*c.layer), N = Shape::intermediate(*c.layer);
+        const size_t Hp = rounded(size_t(H), 64), Np = rounded(size_t(N), 64);
+        const bool invalid = c.invalid.load(std::memory_order_relaxed);
+        switch (Phase(phase)) {
+            case Phase::PrepareInput: return {int(int64_t(c.rows) * int64_t(Hp / 32)), 1};
+            case Phase::GateUp: return {invalid ? 0 : int((int64_t(c.chunks) * N + kRowUnit - 1) / kRowUnit), 1};
+            case Phase::Middle: return {invalid ? 0 : int(int64_t(c.units) * int64_t(Np / 32)), 1};
+            case Phase::Down: return {invalid ? 0 : (H + kRowUnit - 1) / kRowUnit, 1};
+        }
+        return {};
+    }
+
+    // Tasks [t0, t1) of phase `phase`. Which worker runs a task changes none of its arithmetic: a Down task owns whole
+    // output rows and sums each token's routes in routing order inside the task.
+    static void run(ForwardCtx& c, int phase, int t0, int t1)
+    {
+        const int H = Shape::hidden(*c.layer), N = Shape::intermediate(*c.layer);
+        const size_t Hp = rounded(size_t(H), 64), Np = rounded(size_t(N), 64);
+
+        switch (Phase(phase)) {
+            case Phase::PrepareInput: {
+                // Token t's blocks are [t * Hp / 32, (t + 1) * Hp / 32) of the flat range.
+                const int64_t per_row = int64_t(Hp / 32);
+                for (int64_t gb = t0; gb < t1; ++gb) {
+                    const int64_t t = gb / per_row, b = gb % per_row;
+                    const uint8_t* x = c.x + size_t(t) * size_t(H) * 2;
+                    float* xf = c.xf + size_t(t) * Hp;
+                    for (int64_t i = b * 32; i < std::min<int64_t>(b * 32 + 32, H); ++i) {
+                        uint16_t v;
+                        std::memcpy(&v, x + 2 * i, 2);
+                        xf[i] = ggml_compute_fp16_to_fp32(v);
+                    }
+                    if (!q8_representable(xf + b * 32)) c.invalid.store(true, std::memory_order_relaxed);
+                    else quantize_block(xf + b * 32, c.qx[gb]);
+                }
+                break;
             }
-        });
-        return ctx.invalid.load(std::memory_order_relaxed) ? 2 : 0;
+            case Phase::GateUp: {
+                const int64_t r0 = int64_t(t0) * kRowUnit, r1 = std::min(int64_t(c.chunks) * N, int64_t(t1) * kRowUnit);
+                if constexpr (I == Isa::Avx2) gate_up_avx2(c, r0, r1);
+                else gate_up_rows(c, r0, r1);
+                break;
+            }
+            case Phase::Middle: {
+                // Unit u's intermediate is Np floats at u * Np, so block b of the flat range is unit b / (Np / 32)'s.
+                for (int64_t b = t0; b < t1; ++b) {
+                    const float* v = c.inter + b * 32;
+                    if (!q8_representable(v)) c.invalid.store(true, std::memory_order_relaxed);
+                    else quantize_block(v, c.qi[b]);
+                }
+                break;
+            }
+            case Phase::Down: {
+                // One down output of every unit; a worker's own, whichever task it runs.
+                static thread_local std::vector<float, CacheAligned<float>> partial;
+                if (partial.size() < size_t(c.units)) partial.resize(size_t(c.units));
+                const int64_t h0 = int64_t(t0) * kRowUnit, h1 = std::min<int64_t>(H, int64_t(t1) * kRowUnit);
+                if constexpr (I == Isa::Avx2) down_avx2(c, partial.data(), h0, h1);
+                else down_rows(c, partial.data(), h0, h1);
+                break;
+            }
+        }
     }
 
 private:
     // Groups the live routes into units and chunks, and binds each chunk's projections and scaled alphas and each
-    // route's unit and down alpha; the team reads only these.
-    static void bind_routes(ForwardCtx& c, const ExpertLayer& l, ForwardArena& ar)
+    // route's unit and down alpha; the tasks read only these.
+    static void bind_routes(ForwardCtx& c, const ExpertLayer& l, ForwardJob& job)
     {
         const RouteTable& r = c.routes;
-        if (ar.binding.size() < size_t(r.rows) * r.k) ar.binding.resize(size_t(r.rows) * r.k);
-        ar.refs.clear();
+        if (job.binding.size() < size_t(r.rows) * r.k) job.binding.resize(size_t(r.rows) * r.k);
+        job.refs.clear();
         for (int t = 0; t < r.rows; ++t)
-            for (int j = 0; j < r.count[t]; ++j) ar.refs.push_back({r.route(t, j).slot, t, j});
-        std::sort(ar.refs.begin(), ar.refs.end(), [](const RouteRef& a, const RouteRef& b) {
+            for (int j = 0; j < r.count[t]; ++j) job.refs.push_back({r.route(t, j).slot, t, j});
+        std::sort(job.refs.begin(), job.refs.end(), [](const RouteRef& a, const RouteRef& b) {
             return a.slot != b.slot ? a.slot < b.slot : a.token != b.token ? a.token < b.token : a.index < b.index;
         });
-        ar.chunk.clear();
-        ar.unit_token.clear();
-        for (size_t i = 0; i < ar.refs.size(); ++i) {
-            const RouteRef& ref = ar.refs[i];
-            const bool same_slot = i && ar.refs[i - 1].slot == ref.slot;
-            if (!same_slot || ar.refs[i - 1].token != ref.token) {
-                if (!same_slot || ar.chunk.back().units == kChunkRows) {
+        job.chunk.clear();
+        job.unit_token.clear();
+        for (size_t i = 0; i < job.refs.size(); ++i) {
+            const RouteRef& ref = job.refs[i];
+            const bool same_slot = i && job.refs[i - 1].slot == ref.slot;
+            if (!same_slot || job.refs[i - 1].token != ref.token) {
+                if (!same_slot || job.chunk.back().units == kChunkRows) {
                     const Nvfp4Quant::Expert e = Nvfp4Quant::expert(l[ref.slot]);
                     Chunk ch;
                     ch.gate = e.gate;
@@ -166,46 +220,43 @@ private:
                     ch.down = e.down;
                     ch.gate_alpha = e.gate.alpha * c.params.inv_input_scale13;
                     ch.up_alpha = e.up.alpha * c.params.inv_input_scale13;
-                    ch.unit0 = int(ar.unit_token.size());
+                    ch.unit0 = int(job.unit_token.size());
                     ch.units = 0;
-                    ar.chunk.push_back(ch);
+                    job.chunk.push_back(ch);
                 }
-                ++ar.chunk.back().units;
-                ar.unit_token.push_back(ref.token);
+                ++job.chunk.back().units;
+                job.unit_token.push_back(ref.token);
             }
-            RouteBinding& b = ar.binding[size_t(ref.token) * r.k + ref.index];
-            b.unit = int(ar.unit_token.size()) - 1;
-            b.down_alpha = ar.chunk.back().down.alpha * c.params.inv_input_scale2 * r.route(ref.token, ref.index).weight;
+            RouteBinding& b = job.binding[size_t(ref.token) * r.k + ref.index];
+            b.unit = int(job.unit_token.size()) - 1;
+            b.down_alpha = job.chunk.back().down.alpha * c.params.inv_input_scale2 * r.route(ref.token, ref.index).weight;
         }
-        c.binding = ar.binding.data();
-        c.chunk = ar.chunk.data();
-        c.chunks = int(ar.chunk.size());
-        c.unit_token = ar.unit_token.data();
-        c.units = int(ar.unit_token.size());
+        c.binding = job.binding.data();
+        c.chunk = job.chunk.data();
+        c.chunks = int(job.chunk.size());
+        c.unit_token = job.unit_token.data();
+        c.units = int(job.unit_token.size());
     }
 
-    // Sizes this call's scratch from the arena. The padded tails are zeroed on every call: the arena is shared by
-    // every layer this thread forwards, and Q8_0 blocks and the dot product read whole 64-value blocks.
-    static void prepare_scratch(ForwardCtx& c, ForwardArena& ar, int threads)
+    // Sizes this job's scratch. The padded tails are zeroed on every job: the scratch is reused by every layer a slot
+    // runs, and Q8_0 blocks and the dot product read whole 64-value blocks.
+    static void prepare_scratch(ForwardCtx& c, ForwardJob& job)
     {
         const size_t H = size_t(Shape::hidden(*c.layer)), N = size_t(Shape::intermediate(*c.layer));
         const size_t Hp = rounded(H, 64), Np = rounded(N, 64), rows = size_t(c.rows), units = size_t(c.units);
         auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-        grow(ar.xf, rows * Hp);
-        grow(ar.qx, rows * Hp / 32);
-        grow(ar.inter, units * Np);
-        grow(ar.qi, units * Np / 32);
+        grow(job.xf, rows * Hp);
+        grow(job.qx, rows * Hp / 32);
+        grow(job.inter, units * Np);
+        grow(job.qi, units * Np / 32);
         for (size_t t = 0; t < rows; ++t)
-            std::fill(ar.xf.begin() + t * Hp + H, ar.xf.begin() + (t + 1) * Hp, 0.f);
+            std::fill(job.xf.begin() + t * Hp + H, job.xf.begin() + (t + 1) * Hp, 0.f);
         for (size_t u = 0; u < units; ++u)
-            std::fill(ar.inter.begin() + u * Np + N, ar.inter.begin() + (u + 1) * Np, 0.f);
-        c.xf = ar.xf.data();
-        c.qx = ar.qx.data();
-        c.inter = ar.inter.data();
-        c.qi = ar.qi.data();
-        c.partial_stride = rounded(std::max<size_t>(units, 1), 16);  // whole cache lines per worker
-        grow(ar.partial, size_t(threads) * c.partial_stride);
-        c.partial = ar.partial.data();
+            std::fill(job.inter.begin() + u * Np + N, job.inter.begin() + (u + 1) * Np, 0.f);
+        c.xf = job.xf.data();
+        c.qx = job.qx.data();
+        c.inter = job.inter.data();
+        c.qi = job.qi.data();
     }
 
     // Projection p's weight row `row` (k columns) against a chunk's m Q8_0 vectors xs, at tier I.
@@ -244,8 +295,8 @@ private:
         }
     }
 
-    // Down rows [h0, h1): every chunk's down dot products into this worker's partial, then each token's
-    // routing-weighted sum, in routing order, into out.
+    // Down rows [h0, h1): every chunk's down dot products into `partial`, then each token's routing-weighted sum, in
+    // routing order, into out.
     static inline void down_rows(ForwardCtx& c, float* partial, int64_t h0, int64_t h1)
     {
         const int H = Shape::hidden(*c.layer), N = Shape::intermediate(*c.layer);
@@ -267,7 +318,7 @@ private:
         }
     }
 
-    // The AVX2 tier's entries: one call per phase per worker, with everything below inlined (flatten), so the dot
+    // The AVX2 tier's entries: one call per run of tasks, with everything below inlined (flatten), so the dot
     // product, GpuRow, swiglu and the down sum are one function and the Shape's constants fold into them.
     __attribute__((flatten)) static void gate_up_avx2(ForwardCtx& c, int64_t r0, int64_t r1)
     {
@@ -277,57 +328,5 @@ private:
     __attribute__((flatten)) static void down_avx2(ForwardCtx& c, float* partial, int64_t h0, int64_t h1)
     {
         down_rows(c, partial, h0, h1);
-    }
-
-    // One phase, then wait for the whole team (team.hpp's barrier).
-    template <Phase P>
-    static void step(ForwardCtx& c, Team& team, int worker, int workers)
-    {
-        phase<P>(c, worker, workers);
-        team.barrier();
-    }
-
-    // One phase for this worker; P picks the phase at compile time.
-    template <Phase P>
-    static void phase(ForwardCtx& c, int worker, int workers)
-    {
-        const int H = Shape::hidden(*c.layer), N = Shape::intermediate(*c.layer);
-        const size_t Hp = rounded(size_t(H), 64), Np = rounded(size_t(N), 64);
-
-        if constexpr (P == Phase::PrepareInput) {
-            // Token t's blocks are [t * Hp / 32, (t + 1) * Hp / 32) of the flat range.
-            const int64_t per_row = int64_t(Hp / 32);
-            const auto [b0, b1] = share<1>(int64_t(c.rows) * per_row, worker, workers);
-            for (int64_t gb = b0; gb < b1; ++gb) {
-                const int64_t t = gb / per_row, b = gb % per_row;
-                const uint8_t* x = c.x + size_t(t) * size_t(H) * 2;
-                float* xf = c.xf + size_t(t) * Hp;
-                for (int64_t i = b * 32; i < std::min<int64_t>(b * 32 + 32, H); ++i) {
-                    uint16_t v;
-                    std::memcpy(&v, x + 2 * i, 2);
-                    xf[i] = ggml_compute_fp16_to_fp32(v);
-                }
-                if (!q8_representable(xf + b * 32)) c.invalid.store(true, std::memory_order_relaxed);
-                else quantize_block(xf + b * 32, c.qx[gb]);
-            }
-        } else if constexpr (P == Phase::GateUp) {
-            const auto [r0, r1] = share<kRowUnit>(int64_t(c.chunks) * N, worker, workers);
-            if constexpr (I == Isa::Avx2) gate_up_avx2(c, r0, r1);
-            else gate_up_rows(c, r0, r1);
-        } else if constexpr (P == Phase::Middle) {
-            // Unit u's intermediate is Np floats at u * Np, so block b of the flat range is unit b / (Np / 32)'s.
-            const auto [b0, b1] = share<1>(int64_t(c.units) * int64_t(Np / 32), worker, workers);
-            for (int64_t b = b0; b < b1; ++b) {
-                const float* v = c.inter + b * 32;
-                if (!q8_representable(v)) c.invalid.store(true, std::memory_order_relaxed);
-                else quantize_block(v, c.qi[b]);
-            }
-        } else {
-            static_assert(P == Phase::Down);
-            float* partial = c.partial + size_t(worker) * c.partial_stride;
-            const auto [h0, h1] = share<kRowUnit>(H, worker, workers);
-            if constexpr (I == Isa::Avx2) down_avx2(c, partial, h0, h1);
-            else down_rows(c, partial, h0, h1);
-        }
     }
 };

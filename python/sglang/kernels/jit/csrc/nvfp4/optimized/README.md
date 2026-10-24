@@ -109,12 +109,26 @@ blocks whose delta rounds to zero contribute zero.
 
 ## Threading and lifetime
 
-Each forward runs on a `Team` (`expert_stream/host/cpu_experts/team.hpp`) of `threads` workers, the calling thread
-as worker 0, in four phases separated by the team's barriers: every token's input to Q8_0; every routed expert's
-gate/up rows and SiLU; every intermediate to Q8_0; every expert's down rows, each token's summed in its routing order
-into its row of `out`. The CPU expert engine keeps one team for its lifetime and passes it to every forward; the
-`forward_alone<Nvfp4CpuKernel>(layer, call, cores, threads)` (tests, the bench) makes a team for the call alone,
-pinning worker i to `cores[i]` (no cores: unpinned). A team may have any size up to its cores (more is refused:
+A forward is a job of the kernel's job interface (`entry.h`; `cpu_experts/job_window.hpp` schedules it): `prepare` at
+admission groups the routes and sizes the job's scratch, then four phases of tasks that any worker of a `Team`
+(`expert_stream/host/cpu_experts/team.hpp`) runs, each phase after the previous one has finished:
+
+| # | phase | one task | count (MiMo V2.6 Pro, 1 token, 8 experts) |
+|---|---|---|---|
+| 0 | PrepareInput | a 32-value block of a token's input: fp16 to fp32, then its Q8_0 block | 192 |
+| 1 | GateUp | 16 rows of the flat (chunk, output) range: gate/up dot products and gated SiLU | 8 x 2048 / 16 = 1024 |
+| 2 | Middle | a Q8_0 block of a unit's intermediate | 8 x 64 = 512 |
+| 3 | Down (`kGatePhase`, the out phase) | 16 output rows: every chunk's down dot product, then each token's sum in its routing order | 6144 / 16 = 384 |
+
+Every task is claimed in runs of `ceil(count / workers)` (align 1: a task is already a cache line of output, or a block).
+A Down task owns whole output rows and sums each token's routes in routing order inside the task, so no reduction crosses
+tasks and the result is the same bits whichever worker runs which task. The per-task scratch of the dot products (one
+down output of every unit) is a thread-local vector of the worker that runs the task. After a Q8_0 check fails the phases
+that follow have no tasks and `status` is 2. `Nvfp4CpuKernel::forward` runs the same phases as a static split between a
+team's barriers (waiting on the stage-two gate before Down), until the engine admits jobs to a window. The CPU expert
+engine keeps one team for its lifetime; `forward_alone<Nvfp4CpuKernel>(layer, call, cores, threads)` (tests, the
+harnesses) runs the call as one job of a `JobRunner` on a team made for the call alone, pinning worker i to `cores[i]`
+(no cores: unpinned); the bench keeps one `JobRunner`. A team may have any size up to its cores (more is refused:
 `std::invalid_argument`); a worker that cannot be pinned fails the call and leaves `out` untouched. No OpenMP
 variable reaches the team. Forwards on any cores run at once from different threads. Between jobs the engine's team
 runs the kernel's `warm` loop, register-only work at the forward's vector width, then PAUSE. Stop/join the engine
@@ -138,13 +152,13 @@ Layer and argument validation, worker cores and keep-warm are the shared CPU exp
 `row_bytes`, each slab's minimum stride; parameter validation; `Expert`, a slot's three projections read from its
 `ExpertRow`); `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and
 `dot_rows<Isa, M>`, whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (present when the `-march` has AVX2); `forward_plan.hpp`
-holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-thread scratch, `ForwardArena`;
-`kernel.cpp` defines `Nvfp4Quant::dispatch` and the kernel's accessor (`nvfp4_cpu_kernel`). A forward is
-`ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the build's
+holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and a job's state and scratch, `ForwardJob`;
+`kernel.cpp` defines the kernel type's job interface. A job runs `ForwardPlan<Shape, Isa>` (`forward_plan.hpp`: `prepare`,
+`tasks`, `run`), picked once per call in `prepare` from the build's
 tier: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer at the AVX2 tier, else
 `ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.
 An AVX2 plan enters its gate/up and down row loops through `gate_up_avx2`/`down_avx2`, with everything they call
-inlined (`flatten`), once per phase per worker.
+inlined (`flatten`), once per run of tasks.
 `kRowUnit` is the plans' split unit. The plan builds the call's `RouteTable` and groups a call's routes into
 units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows<Isa, M>` decodes
 each weight row once per chunk. A plan reads every layer fact it may fix
@@ -154,7 +168,8 @@ Plans read a slot's projections through `Nvfp4Quant::expert(layer[slot])`.
 
 Checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (the avx2 and scalar tiers, each its
 own build, against a baseline worktree's dumps at a tolerance), and
-`test/registered/unit/kernels/test_nvfp4_cpu_{build,experts}.py`.
+`test/registered/unit/kernels/test_nvfp4_cpu_{build,job_interface,experts}.py` (`test_nvfp4_cpu_job_interface.py` requires
+the same bits from a one-worker runner, a several-worker runner and the static split).
 
 ## Validation boundaries
 

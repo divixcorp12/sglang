@@ -1,7 +1,8 @@
 // CPU experts derived from pinned GGML NVFP4 x Q8 kernels.
 // GPU weight slabs stay unchanged; see ../upstream/README.md for provenance.
-// A forward is ExpertForward<Nvfp4Quant> (expert_stream/host/cpu_experts/expert_forward.hpp) dispatching to
-// ForwardPlan<Shape, Isa>::run (forward_plan.hpp) at the build's tier; Nvfp4Quant (quant.hpp) reads a
+// A forward is a job of four phases of tasks, ForwardPlan<Shape, Isa> (forward_plan.hpp) at the build's tier, behind the
+// job interface of Nvfp4CpuKernel (entry.h); ExpertForward<Nvfp4Quant> (expert_stream/host/cpu_experts/expert_forward.hpp)
+// holds the layer and call checks. Nvfp4Quant (quant.hpp) reads a
 // layer's slots under a Shape (shapes.hpp), and each tier's dot product is in math_scalar.hpp or math_avx2.hpp.
 #include "kernel.h"
 #include "quant.hpp"
@@ -25,26 +26,62 @@ constexpr int kChunkRows = 4;
 
 // The build's tier (min(kBuildIsa, kTopIsa)) picks the plan: the MiMo plan when the layer is that model's routed
 // expert at the AVX2 tier, else the generic plan at the tier.
-template <Isa I>
-int dispatch_at(const ExpertLayer& l, const Nvfp4Quant::Params& p, const ForwardCall& c, Team& team)
+constexpr Isa kIsa = ::sglang::cpu_experts::ExpertForward<Nvfp4Quant>::isa();
+
+void prepare_job(ForwardJob& job, const ExpertLayer& l, const ForwardCall& c)
 {
-    const RouteTable r = RouteTable::build(c.slots, c.weights, c.rows, c.k);
-    if constexpr (I >= Isa::Avx2) {
-        if (MimoV26ProShape::accepts(l)) return ForwardPlan<MimoV26ProShape, I>::run(l, p, c, r, team);
+    if constexpr (kIsa >= Isa::Avx2) {
+        if (MimoV26ProShape::accepts(l)) {
+            job.mimo = true;
+            ForwardPlan<MimoV26ProShape, kIsa>::prepare(job, l, c);
+            return;
+        }
     }
-    return ForwardPlan<GenericShape, I>::run(l, p, c, r, team);
+    job.mimo = false;
+    ForwardPlan<GenericShape, kIsa>::prepare(job, l, c);
 }
 
-int Nvfp4Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa, Team& team)
+Tasks job_tasks(const ForwardJob& job, int phase)
 {
-    return dispatch_at<ExpertForward<Nvfp4Quant>::isa()>(l, p, c, team);
+    if constexpr (kIsa >= Isa::Avx2) {
+        if (job.mimo) return ForwardPlan<MimoV26ProShape, kIsa>::tasks(job.ctx, phase);
+    }
+    return ForwardPlan<GenericShape, kIsa>::tasks(job.ctx, phase);
 }
 
-}  // namespace
+void job_run(ForwardJob& job, int phase, int t0, int t1)
+{
+    if constexpr (kIsa >= Isa::Avx2) {
+        if (job.mimo) return ForwardPlan<MimoV26ProShape, kIsa>::run(job.ctx, phase, t0, t1);
+    }
+    ForwardPlan<GenericShape, kIsa>::run(job.ctx, phase, t0, t1);
+}
 
-namespace {
 using Forward = ::sglang::cpu_experts::ExpertForward<Nvfp4Quant>;
 }  // namespace
+
+struct Nvfp4CpuKernel::Job::Impl
+{
+    ForwardJob job;
+};
+
+static_assert(::sglang::cpu_experts::CpuExpertJobKernel<Nvfp4CpuKernel>);
+static_assert(Nvfp4CpuKernel::kPhases == kPhaseCount);
+static_assert(Nvfp4CpuKernel::kGatePhase == kGatePhase);
+
+Nvfp4CpuKernel::Job::Job() : impl(std::make_unique<Impl>()) {}
+Nvfp4CpuKernel::Job::~Job() = default;
+
+void Nvfp4CpuKernel::prepare(Job& job, const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call)
+{
+    prepare_job(job.impl->job, layer, call);
+}
+
+::sglang::cpu_experts::Tasks Nvfp4CpuKernel::tasks(const Job& job, int phase) { return job_tasks(job.impl->job, phase); }
+
+void Nvfp4CpuKernel::run(Job& job, int phase, int t0, int t1, int) { job_run(job.impl->job, phase, t0, t1); }
+
+int Nvfp4CpuKernel::status(const Job& job) { return job.impl->job.ctx.invalid.load(std::memory_order_relaxed) ? 2 : 0; }
 
 const char* Nvfp4CpuKernel::name() noexcept { return Forward::name(); }
 Nvfp4CpuKernel::Layer Nvfp4CpuKernel::make_layer(const Layer& shape) { return Forward::make_layer(shape); }
@@ -54,7 +91,26 @@ void Nvfp4CpuKernel::check(const Layer& layer, const ::sglang::cpu_experts::Forw
 
 void Nvfp4CpuKernel::forward(const Layer& layer, const ::sglang::cpu_experts::ForwardCall& call, ::sglang::cpu_experts::Team& team)
 {
-    Forward::forward(layer, call, team);
+    // The caller's own job, reached by the other workers through the reference (a thread_local named in the lambda would
+    // be each worker's own).
+    static thread_local Job owned;
+    Job& job = owned;
+    prepare(job, layer, call);
+    team.run([&](int worker, int workers) {
+        for (int phase = 0; phase < kPhases; ++phase) {
+            if (phase == kGatePhase && call.stage_two) {
+                if (worker == 0) call.stage_two->wait();
+                team.barrier();
+            }
+            const ::sglang::cpu_experts::Tasks t = tasks(job, phase);
+            const int units = (t.count + t.align - 1) / t.align;
+            const int t0 = std::min(units * worker / workers * t.align, t.count);
+            const int t1 = std::min(units * (worker + 1) / workers * t.align, t.count);
+            if (t0 < t1) run(job, phase, t0, t1, worker);
+            if (phase + 1 < kPhases) team.barrier();
+        }
+    });
+    if (status(job) == 2) throw std::invalid_argument("nvfp4 CPU experts: the forward refused its input (status 2)");
 }
 
 int32_t Nvfp4CpuKernel::warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns)

@@ -1,6 +1,7 @@
 // Nvfp4Quant: the NVFP4 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), and its typed view of
 // an expert slot (Expert: three Projections over the slot's ExpertRow). The arithmetic is math.hpp's and its tiers'
-// (math_scalar.hpp, math_avx2.hpp); kernel.cpp includes forward_plan.hpp and defines Nvfp4Quant::dispatch after it.
+// (math_scalar.hpp, math_avx2.hpp); kernel.cpp includes forward_plan.hpp, whose plan runs the job interface (entry.h), so
+// Nvfp4Quant has no dispatch.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error The NVFP4 CPU expert kernel requires Linux and OpenMP.
@@ -134,9 +135,6 @@ struct Nvfp4Quant
         const Expert e = expert(l[slot]);
         return is_finite_bits(e.gate.alpha) && is_finite_bits(e.up.alpha) && is_finite_bits(e.down.alpha);
     }
-
-    // Defined in kernel.cpp after forward_plan.hpp.
-    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team);
 };
 
 }  // namespace
