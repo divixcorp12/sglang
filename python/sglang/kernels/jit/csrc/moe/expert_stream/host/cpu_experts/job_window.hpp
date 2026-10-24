@@ -11,7 +11,9 @@
 //               done.
 //
 // A slot lives Free -> Active -> (Complete ->) Free. A job of the published kind stays Complete until the done word has
-// passed its sequence, so a later job finishing first never lets the word skip an unfinished one.
+// passed its sequence, so a later job finishing first never lets the word skip an unfinished one. Sequences of that kind
+// need not be consecutive (a sequence nobody admitted is skipped), only increasing in admission order: the word moves to
+// the lowest sequence above it once no admitted job of the kind with a lower one is unfinished.
 //
 // Stale views: a worker may scan a slot that finished and was re-admitted since it read it. Everything a scan reads is
 // an atomic, and a claim (one CAS on the phase's cursor) carries the job's generation, so a stale view claims nothing.
@@ -27,6 +29,22 @@
 #include <cstdint>
 
 namespace sglang::cpu_experts {
+
+/// \brief Nanoseconds per TSC cycle, measured once against the monotonic clock over 2 ms: the first call takes that long.
+inline double tsc_ns_per_cycle()
+{
+    static const double ratio = [] {
+        const int64_t n0 = team_now_ns();
+        const uint64_t c0 = __rdtsc();
+        int64_t n1;
+        do {
+            _mm_pause();
+            n1 = team_now_ns();
+        } while (n1 - n0 < 2'000'000);
+        return double(n1 - n0) / double(__rdtsc() - c0);
+    }();
+    return ratio;
+}
 
 /// \brief The kernel's out phase: Kernel::kOutPhase when it declares one, else its last phase.
 template <class Kernel>
@@ -81,7 +99,6 @@ public:
         const Layer* layer = nullptr;
         ForwardCall call{};  // stage_two is cleared: the scheduler owns the gate
         uint64_t out_key = kNoOutKey;
-        int64_t admit_ns = 0;
         uint32_t gen = 0;
 
         // The staged job's gate stats, as StageGate records them (hook). Written once each: calls and spun when the
@@ -94,6 +111,14 @@ public:
 
         uint32_t seq() const { return seq_.load(std::memory_order_relaxed); }
         int kind() const { return kind_.load(std::memory_order_relaxed); }
+        // The admitter's name for the job (a target job's row, a draft record's sequence), and the clock at admission.
+        int64_t id() const { return id_.load(std::memory_order_relaxed); }
+        int64_t admit_ns() const { return admit_ns_.load(std::memory_order_relaxed); }
+        int index() const { return index_; }
+        // In flight: admitted and not yet finished (a Complete slot waiting for the done word is not).
+        bool active() const { return state_.load(std::memory_order_acquire) == kActive; }
+        // The phase the job is in, -1 between phases or when it has finished.
+        int phase() const { return int(uint32_t(ready_.load(std::memory_order_relaxed))) - 1; }
         // The summed TSC cycles of every run of this job, on every worker (hook; final once the job is complete).
         uint64_t worker_tsc() const { return worker_tsc_.load(std::memory_order_relaxed); }
         int status() const { return Kernel::status(job); }
@@ -108,8 +133,11 @@ public:
             std::atomic<int> v{0};
         };
 
+        int index_ = 0;
         std::atomic<uint8_t> state_{kFree};
         std::atomic<uint32_t> seq_{0};
+        std::atomic<int64_t> id_{0};
+        std::atomic<int64_t> admit_ns_{0};
         std::atomic<int> kind_{0};
         std::atomic<uint64_t> order_{0};  // admission order: the age the scheduler sorts by
         // (generation << 32 | phase + 1) of the phase a worker may scan; low half 0: none.
@@ -129,7 +157,10 @@ public:
     };
 
     /// \brief A window over `team`'s workers. The caller of the Team is worker 0, the only admitter.
-    explicit JobWindow(Team& team, Hooks hooks = {}) : team_(team), hooks_(std::move(hooks)) {}
+    explicit JobWindow(Team& team, Hooks hooks = {}) : team_(team), hooks_(std::move(hooks))
+    {
+        for (int i = 0; i < W; ++i) slots_[i].index_ = i;
+    }
     JobWindow(const JobWindow&) = delete;
     JobWindow& operator=(const JobWindow&) = delete;
 
@@ -150,16 +181,38 @@ public:
     /// for none: an earlier job still in the window with the same key is this one's predecessor.
     /// \throws whatever Kernel::prepare throws (std::invalid_argument); the window is then unchanged.
     bool admit(uint32_t seq, int kind, const Layer& layer, const ForwardCall& call, uint64_t out_key,
-               const StageGate* gate)
+               const StageGate* gate, int64_t id = 0)
     {
         if (closed_.load(std::memory_order_relaxed)) return false;
-        Slot* const s = free_slot();
-        if (s == nullptr) {
+        const int free = reserve();
+        if (free < 0) {
             full_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        return admit_at(free, seq, kind, layer, call, out_key, gate, id);
+    }
+
+    /// \brief The slot the next admit() takes, -1 when the window is full. Worker 0 only: nothing but its own admit
+    /// takes a Free slot, so the index stays good until then and the admitter can build the job's buffers in storage of
+    /// its own indexed by it before admit_at(). Slots turn Free as jobs finish, so a full window can open at any time.
+    int reserve() const
+    {
+        for (int i = 0; i < W; ++i)
+            if (slots_[i].state_.load(std::memory_order_acquire) == kFree) return i;
+        return -1;
+    }
+
+    /// \brief admit() into the slot reserve() returned. `id` is the admitter's name for the job, for Slot::id().
+    bool admit_at(int free, uint32_t seq, int kind, const Layer& layer, const ForwardCall& call, uint64_t out_key,
+                  const StageGate* gate, int64_t id = 0)
+    {
+        if (closed_.load(std::memory_order_relaxed)) return false;
+        Slot* const s = &slots_[free];
         s->call = call;
         s->call.stage_two = nullptr;
+        s->call.team_workers = team_.workers();
+        s->call.team_core = team_.cores().empty() ? -1 : team_.cores().front();
+        s->call.staged = gate != nullptr;
         s->layer = &layer;
         Kernel::prepare(s->job, layer, s->call);  // the slot is still Free: a throw leaves nothing behind
 
@@ -167,7 +220,8 @@ public:
         const uint32_t gen = uint32_t(order_);
         s->gen = gen;
         s->out_key = out_key;
-        s->admit_ns = team_now_ns();
+        s->admit_ns_.store(team_now_ns(), std::memory_order_relaxed);
+        s->id_.store(id, std::memory_order_relaxed);
         s->seq_.store(seq, std::memory_order_relaxed);
         s->kind_.store(kind, std::memory_order_relaxed);
         s->order_.store(order_, std::memory_order_relaxed);
@@ -312,6 +366,8 @@ public:
 
     /// \brief The engine counts admissions that found both sources pending here.
     void note_both_pending() { both_pending_.fetch_add(1, std::memory_order_relaxed); }
+    /// \brief The engine counts a spell with work pending and no free slot here.
+    void note_full() { full_.fetch_add(1, std::memory_order_relaxed); }
 
     WindowCounters counters() const
     {
@@ -355,13 +411,6 @@ private:
     };
 
     void bump() { word_.fetch_add(1, std::memory_order_release); }
-
-    Slot* free_slot()
-    {
-        for (Slot& s : slots_)
-            if (s.state_.load(std::memory_order_acquire) == kFree) return &s;
-        return nullptr;
-    }
 
     // Takes a run of tasks of phase `ph`: count / n rounded up to align, at most what remains. That is the static
     // split's share: a run is one contiguous range, which the EXL3 band traversal needs long (shrinking runs of
@@ -473,23 +522,34 @@ private:
         bump();
     }
 
-    // Moves the done word over the Complete slots in sequence order. The CAS publishes each value once, by the one
-    // thread that moved it, and that thread frees the slot; a job whose predecessor is unfinished is not found.
+    // Moves the done word to the lowest sequence of the published kind above it, once that job is Complete and no
+    // admitted job of the kind with a lower sequence is unfinished: the admitter admits in sequence order, so a job not
+    // yet admitted has a higher one, and a sequence nobody admitted is skipped. The CAS publishes each value once, by
+    // the one thread that moved it, and that thread frees the slot.
     void publish_done() noexcept
     {
         for (;;) {
             uint32_t p = done_word_->load(std::memory_order_seq_cst);  // seq_cst: see complete()
-            Slot* hit = nullptr;
-            for (Slot& s : slots_)
-                if (s.state_.load(std::memory_order_seq_cst) == kComplete && s.kind() == done_kind_
-                    && s.seq() == p + 1) {
-                    hit = &s;
+            Slot* next = nullptr;
+            uint32_t next_seq = 0;
+            bool recycled = false;
+            for (Slot& s : slots_) {
+                // The sequence is read on both sides of the state: a slot recycled in between shows another one.
+                const uint32_t q = s.seq();
+                if (s.state_.load(std::memory_order_seq_cst) == kFree || s.kind() != done_kind_) continue;
+                if (s.seq() != q) {
+                    recycled = true;
                     break;
                 }
-            if (hit == nullptr) return;
+                if (int32_t(q - p) <= 0) continue;
+                if (next == nullptr || int32_t(q - next_seq) < 0) next = &s, next_seq = q;
+            }
+            if (recycled) continue;
+            if (next == nullptr || next->state_.load(std::memory_order_seq_cst) != kComplete) return;
+            if (next->seq() != next_seq) continue;
             // Release: the engine that reads the word sees the job's outputs and its on_complete bookkeeping.
-            if (done_word_->compare_exchange_strong(p, p + 1, std::memory_order_seq_cst, std::memory_order_seq_cst))
-                hit->state_.store(kFree, std::memory_order_release);
+            if (done_word_->compare_exchange_strong(p, next_seq, std::memory_order_seq_cst, std::memory_order_seq_cst))
+                next->state_.store(kFree, std::memory_order_release);
         }
     }
 

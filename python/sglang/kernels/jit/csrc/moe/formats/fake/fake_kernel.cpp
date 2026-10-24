@@ -5,6 +5,7 @@
 
 #include <immintrin.h>
 #include <sched.h>
+#include <x86intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -76,55 +77,6 @@ std::vector<FakeCpuKernel::Call> FakeCpuKernel::calls()
 
 void FakeCpuKernel::hold(int64_t core, bool on) { g_held_core.store(on ? core : -1, std::memory_order_release); }
 
-void FakeCpuKernel::forward(const Layer& layer, const ForwardCall& c, ::sglang::cpu_experts::Team& team)
-{
-    team.run([](int, int) {});  // one job through the team's dispatch and end barrier, as a real forward
-    std::vector<double> w13(static_cast<size_t>(std::max(c.rows, 1))), w2(w13.size());
-    for (size_t t = 0; t < w13.size(); ++t)
-        w13[t] = slab_sum(layer, c, static_cast<int32_t>(t), 0, 3);
-    if (c.stage_two) c.stage_two->wait();
-    for (size_t t = 0; t < w2.size(); ++t)
-        w2[t] = slab_sum(layer, c, static_cast<int32_t>(t), 3, 6);
-    const int32_t core = team.cores().empty() ? -1 : team.cores().front();
-    const int64_t until = team_now_ns() + c.k * g_ns.load(std::memory_order_relaxed);
-    while (team_now_ns() < until)
-        _mm_pause();
-    while (core >= 0 && g_held_core.load(std::memory_order_acquire) == core)
-        _mm_pause();
-    if (const int64_t f = g_fail.load(std::memory_order_relaxed); f != 0)
-        throw std::runtime_error("fake CPU expert forward failed (" + std::to_string(f) + ")");
-    const int32_t hidden = std::max(layer.hidden, 1);
-    const bool zero = g_zero.load(std::memory_order_relaxed);
-    for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
-        const int32_t* slots = c.slots + static_cast<int64_t>(t) * c.k;
-        const float* weights = c.weights + static_cast<int64_t>(t) * c.k;
-        float* out = c.out + static_cast<int64_t>(t) * hidden;
-        double sum = 0;
-        for (int32_t i = 0; i < c.k; ++i)
-            sum += static_cast<double>(weights[i]) * (slots[i] + 1);
-        for (int32_t j = 0; j < hidden; ++j) {
-            const double base = c.accumulate() ? static_cast<double>(out[j]) : (zero ? 0.0 : static_cast<double>(j));
-            out[j] = static_cast<float>(zero ? base : base + sum);
-        }
-    }
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    int32_t affinity = -1;
-    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) == 1)
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-            if (CPU_ISSET(cpu, &mask)) affinity = cpu;
-    std::lock_guard<std::mutex> lock(g_mutex);
-    for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
-        Call call{core, affinity, team.workers(), c.accumulate() ? 1 : 0, std::min<int32_t>(c.k, kFakeMaxLanes), {}, {},
-                  layer.capacity, c.stage_two != nullptr ? 1 : 0, w13[t], w2[t]};
-        for (int32_t i = 0; i < call.k; ++i) {
-            call.slots[i] = c.slots[static_cast<int64_t>(t) * c.k + i];
-            call.weights[i] = c.weights[static_cast<int64_t>(t) * c.k + i];
-        }
-        g_calls.push_back(call);
-    }
-}
-
 void FakeCpuKernel::job_reset(const JobTest& test)
 {
     g_test = test;
@@ -151,6 +103,7 @@ void FakeCpuKernel::prepare(Job& job, const Layer& layer, const ForwardCall& c)
     job.status = c.k > 0 && c.slots[0] == kRefuseSlot ? 2 : 0;
     job.layer = &layer;
     job.call = &c;
+    job.team_core = c.team_core;
     for (int p = 0; p < kPhases; ++p) {
         const int32_t n = g_test.count != nullptr ? g_test.count(job.id, p, job.rows) : -1;
         job.count[p] = n < 0 ? job.rows : n;
@@ -158,6 +111,30 @@ void FakeCpuKernel::prepare(Job& job, const Layer& layer, const ForwardCall& c)
     }
     job.w13.assign(size_t(job.rows), 0.0);
     job.w2.assign(size_t(job.rows), 0.0);
+
+    // The thread the job is admitted on: pinned to one core when the engine pinned it.
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    int32_t affinity = -1;
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) == 1)
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &mask)) affinity = cpu;
+    job.calls.assign(size_t(job.rows), {});
+    for (int32_t t = 0; t < job.rows; ++t) {
+        Call& call = job.calls[size_t(t)];
+        call.core = c.team_core;
+        call.affinity = affinity;
+        call.threads = c.team_workers;
+        call.accumulate = c.accumulate() ? 1 : 0;
+        call.k = std::min<int32_t>(c.k, kFakeMaxLanes);
+        call.capacity = layer.capacity;
+        call.staged = c.staged ? 1 : 0;
+        call.w13 = call.w2 = 0;
+        for (int32_t i = 0; i < call.k; ++i) {
+            call.slots[size_t(i)] = c.slots[static_cast<int64_t>(t) * c.k + i];
+            call.weights[size_t(i)] = c.weights[static_cast<int64_t>(t) * c.k + i];
+        }
+    }
 }
 
 ::sglang::cpu_experts::Tasks FakeCpuKernel::tasks(const Job& job, int phase)
@@ -182,12 +159,23 @@ void FakeCpuKernel::run(Job& job, int phase, int t0, int t1, int worker)
         if (g_test.delay_ns != nullptr)
             for (const int64_t until = team_now_ns() + g_test.delay_ns(job.id, phase, t); team_now_ns() < until;)
                 _mm_pause();
+        if (phase == kOutPhase && t == 0) {
+            for (const int64_t until = team_now_ns() + c.k * g_ns.load(std::memory_order_relaxed);
+                 team_now_ns() < until;)
+                _mm_pause();
+            while (job.team_core >= 0 && g_held_core.load(std::memory_order_acquire) == job.team_core)
+                _mm_pause();
+        }
         for (int32_t r = t; r < job.rows; r += count) {
             if (phase == 0) {
-                job.w13[size_t(r)] = slab_sum(layer, c, r, 0, 3) + 1;
+                const double sum = slab_sum(layer, c, r, 0, 3);
+                job.w13[size_t(r)] = sum + 1;
+                job.calls[size_t(r)].w13 = sum;
             } else if (phase == 1) {
                 if (job.count[0] > 0 && job.w13[size_t(r)] == 0) g_violations.fetch_add(1, std::memory_order_relaxed);
-                job.w2[size_t(r)] = slab_sum(layer, c, r, 3, 6) + 1;
+                const double sum = slab_sum(layer, c, r, 3, 6);
+                job.w2[size_t(r)] = sum + 1;
+                job.calls[size_t(r)].w2 = sum;
             } else {
                 if (job.count[1] > 0 && job.w2[size_t(r)] == 0) g_violations.fetch_add(1, std::memory_order_relaxed);
                 const int32_t* slots = c.slots + static_cast<int64_t>(r) * c.k;
@@ -202,7 +190,11 @@ void FakeCpuKernel::run(Job& job, int phase, int t0, int t1, int worker)
             }
         }
     }
-    job.executed[size_t(phase)].fetch_add(t1 - t0, std::memory_order_release);
+    const int32_t before = job.executed[size_t(phase)].fetch_add(t1 - t0, std::memory_order_acq_rel);
+    if (phase == kPhases - 1 && before + (t1 - t0) == count) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_calls.insert(g_calls.end(), job.calls.begin(), job.calls.end());
+    }
     const uint32_t slot = g_event_next.fetch_add(1, std::memory_order_relaxed);
     if (slot < kMaxEvents) g_events[slot] = {job.id, phase, t0, t1, worker, tsc0, __rdtsc()};
 }

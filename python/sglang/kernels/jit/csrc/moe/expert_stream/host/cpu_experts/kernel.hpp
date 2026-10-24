@@ -56,25 +56,20 @@ enum class OutMode : uint8_t {
   kAccumulate,        // out += each row's routes' sum
 };
 
-// A two-stage CPU miss's gate (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): its w2 slabs may still be landing when the forward
-// starts. Worker 0 calls wait() after the gate/up GEMVs and before anything reads w2, the team waiting on it (a kernel
-// that cannot split calls it first); it returns once *word == open, or once *stop is set, recording what it saw.
+// A two-stage CPU miss's gate (SGLANG_EXPERT_STREAM_CPU_TWO_STAGE): its w2 slabs may still be landing when the job is
+// admitted. The window holds the job's kGatePhase, the first phase that reads w2, until *word == open or *stop is set,
+// and records what it saw (job_window.hpp); a kernel never waits on it.
 struct StageGate {
   const std::atomic<uint32_t>* word = nullptr;
   uint32_t open = 0;
   const std::atomic<bool>* stop = nullptr;  // null: no early exit
-  // Read the clock (called_ns, waited_ns): the engine sets it under Build::kMetrics, so a prod forward reads none.
-  // A field, not a template parameter: wait() runs in the kernel's translation unit, which does not see Build.
+  // Read the clock (called_ns, waited_ns): the engine sets it under Build::kMetrics, so a prod job reads none.
   bool timed = false;
 
-  int32_t calls = 0;      // wait()'s calls: one per staged forward
-  int64_t called_ns = 0;  // CLOCK_MONOTONIC at the last call (timed only)
+  int32_t calls = 0;      // the gate phase's arrivals: one per staged job (a JobRunner copies the window's here)
+  int64_t called_ns = 0;  // CLOCK_MONOTONIC at the arrival (timed only)
   bool spun = false;      // the gate was shut on arrival
-  int64_t waited_ns = 0;  // how long it spun (timed only; 0 when it was open on arrival)
-
-  // Defined in stage_gate.hpp (team.hpp includes it); this header stays free of <immintrin.h> because the device
-  // translation units reach it through format.h.
-  inline void wait() noexcept;
+  int64_t waited_ns = 0;  // how long it was shut (timed only; 0 when it was open on arrival)
 };
 
 // A job phase's tasks as the scheduler reads them (job_window.hpp): `count` tasks, claimed in runs of a multiple of
@@ -84,8 +79,8 @@ struct Tasks {
   int align = 1;
 };
 
-// One forward: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped, written to
-// out as out_mode says. Its workers and their cores are the Team's (team.hpp), the forward's own argument.
+// One job's call: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped, written to
+// out as out_mode says. The slots, weights, x and out stay valid until the job has completed.
 struct ForwardCall {
   int32_t rows = 0, k = 0;
   const void* x = nullptr;
@@ -94,6 +89,12 @@ struct ForwardCall {
   float* out = nullptr;
   OutMode out_mode = OutMode::kOverwrite;
   StageGate* stage_two = nullptr;  // a two-stage CPU miss's gate; null: one stage
+  // Set by the window that admits the call (the caller's values are ignored): the team's workers and worker 0's core (-1
+  // unpinned), and whether the call is staged (stage_two is the window's, so a kernel sees it null). For the fake
+  // kernel's records and a kernel's per-team sizing.
+  int32_t team_workers = 0;
+  int32_t team_core = -1;
+  bool staged = false;
 
   bool accumulate() const { return out_mode == OutMode::kAccumulate; }
   bool store_first() const { return out_mode == OutMode::kOverwriteByStore; }
