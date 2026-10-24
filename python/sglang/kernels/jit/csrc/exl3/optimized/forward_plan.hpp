@@ -183,8 +183,8 @@ private:
 
     // One phase for this worker; P picks the phase at compile time, so each instantiation holds one phase's code.
     template <Phase P>
-    static void phase(ForwardCtx& c, const Experts<Shape>& E, int worker, int num_workers, bool grouped, bool wide,
-                      Capture& trace)
+    static void phase(ForwardCtx& c, const Experts<Shape>& E, int worker, int num_workers, bool grouped,
+                      [[maybe_unused]] bool wide, Capture& trace)
     {
         [[maybe_unused]] const int nc = int(c.chunks.size());
         [[maybe_unused]] const int H = Shape::hidden(*c.layer);

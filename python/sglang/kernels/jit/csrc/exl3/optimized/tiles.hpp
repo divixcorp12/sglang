@@ -16,7 +16,8 @@ namespace sglang::exl3_cpu {
 namespace {
 
 // Only this worker's columns [tn0, tn1) of tout are touched, so the sums need no synchronization.
-void run_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped)
+void run_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1,
+               [[maybe_unused]] bool grouped)
 {
     if (tn0 >= tn1) return;
 #if defined(SGLANG_CPU_EXPERTS_AVX512)

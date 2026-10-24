@@ -471,7 +471,7 @@ void prepare_block(const void* srcv, bool f16, const Fp16* suh, float* dst)
 
 // The scalar tier's input: m rows gathered by token index from src (fp16 or fp32, one of them non-null), transformed
 // into p.tin. Its tiles read the fp32 rows themselves, so nothing is quantized.
-void prepare_rows_scalar(const Exl3Projection& mat, const Fp16* src_f16, const float* src_f32, int src_stride,
+[[maybe_unused]] void prepare_rows_scalar(const Exl3Projection& mat, const Fp16* src_f16, const float* src_f32, int src_stride,
                          const int* token_idx, int m, PreparedIn& p)
 {
     const int k = mat.k;
