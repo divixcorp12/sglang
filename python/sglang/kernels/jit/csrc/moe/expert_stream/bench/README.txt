@@ -46,7 +46,8 @@ From the SGLang checkout, set:
   cmake --build "$build" -j4
 
 Use the same torch C++ ABI as the server; the reference machine's installation
-uses ABI=1. CUDA_HOME is unnecessary for this CPU-only build. Re-running cmake
+uses ABI=1. CUDA_HOME is unnecessary for the CPU-forward build; the full-stack bench (EXL3_TVM_FFI_ROOT) links the
+CUDA driver library and finds the toolkit through CUDAToolkit_ROOT or nvcc on PATH. Re-running cmake
 --build rebuilds changed source and header files. The local CPU's ISA is baked
 into -march=native: rebuild on the machine where the benchmark will run.
 

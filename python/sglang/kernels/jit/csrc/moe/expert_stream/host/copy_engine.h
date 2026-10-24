@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cuda.h>
 #include <future>
 #include <optional>
 #include <sched.h>
@@ -85,6 +86,12 @@ class CopyBackend {
   virtual void shutdown(bool idle) = 0;
 };
 static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPending == CopyBackend::kPending);
+static_assert(CompletionWord::kNotReady == CUDA_ERROR_NOT_READY);
+// With per-thread default streams, cuda.h renames cuMemcpyAsync, cuStreamQuery and the v2 stream memory ops to their
+// _ptsz variants, which the code below does not mean to call.
+#if defined(CUDA_API_PER_THREAD_DEFAULT_STREAM) || defined(__CUDA_API_PER_THREAD_DEFAULT_STREAM)
+#error "the copy engine calls the legacy-stream driver entry points; do not build it with per-thread default streams"
+#endif
 
 /// The production backend: CUDA driver copies on a private stream, completion tracked by a host-mapped word.
 ///
@@ -92,7 +99,7 @@ static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPe
 /// the completion word (completion_word.h). query() is an acquire load of that word, plus one cuStreamQuery per
 /// CompletionWord budget while a job stays pending: no synchronize, module load or allocation per job.
 ///
-/// - The driver is resolved from libcuda.so.1 at init(), so the module builds and loads without a CUDA toolkit.
+/// - The driver API is linked directly (-lcuda), so the module builds with the CUDA toolkit and loads with libcuda.so.1.
 /// - Only the v2 stream memory ops: the plain names are the v1 API, gated by NVreg_EnableStreamMemOPs, whose device
 ///   attribute reads 0 on the reference machine while the v2 ops work (analysis/dsv41-drive/hotpath/results.md 9b).
 /// - The stream has the greatest priority, for a hardware queue of its own. Streams share CUDA_DEVICE_MAX_CONNECTIONS
@@ -107,66 +114,41 @@ class CudaCopyBackend : public CopyBackend {
   CudaCopyBackend(int device, std::string prefix) : device_(device), prefix_(std::move(prefix)) {}
 
   std::string init() override {
-    void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
-    if (lib == nullptr) lib = dlopen("libcuda.so.1", RTLD_NOW);
-    if (lib == nullptr) return "cannot open libcuda.so.1";
-    std::string missing;
-    auto get = [&](auto& fn, const char* name) {
-      fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
-      if (fn == nullptr && missing.empty()) missing = name;
-    };
-    get(cu_init_, "cuInit");
-    get(cu_device_get_, "cuDeviceGet");
-    get(cu_primary_retain_, "cuDevicePrimaryCtxRetain");
-    get(cu_primary_release_, "cuDevicePrimaryCtxRelease_v2");
-    get(cu_ctx_set_current_, "cuCtxSetCurrent");
-    get(cu_stream_create_, "cuStreamCreateWithPriority");
-    get(cu_priority_range_, "cuCtxGetStreamPriorityRange");
-    get(cu_stream_destroy_, "cuStreamDestroy_v2");
-    get(cu_stream_query_, "cuStreamQuery");
-    get(cu_memcpy_async_, "cuMemcpyAsync");
-    get(cu_mem_host_alloc_, "cuMemHostAlloc");
-    get(cu_mem_host_device_ptr_, "cuMemHostGetDevicePointer_v2");
-    get(cu_mem_free_host_, "cuMemFreeHost");
-    get(cu_write_value32_, "cuStreamWriteValue32_v2");
-    get(cu_write_value64_, "cuStreamWriteValue64_v2");
-    get(cu_wait_value32_, "cuStreamWaitValue32_v2");
-    if (!missing.empty()) return "libcuda.so.1 lacks " + missing + ", which the copy engine needs";
-    if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
-    if (int r = cu_device_get_(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
+    if (int r = cuInit(0)) return "cuInit failed: " + std::to_string(r);
+    if (int r = cuDeviceGet(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
     // PyTorch's primary context, so the slabs' registrations and the destination tensors are valid here.
-    if (int r = cu_primary_retain_(&context_, cu_device_))
+    if (int r = cuDevicePrimaryCtxRetain(&context_, cu_device_))
       return "cuDevicePrimaryCtxRetain failed: " + std::to_string(r);
     retained_ = true;
-    if (int r = cu_ctx_set_current_(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
+    if (int r = cuCtxSetCurrent(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
     int least = 0;
     int greatest = 0;
-    if (int r = cu_priority_range_(&least, &greatest))
+    if (int r = cuCtxGetStreamPriorityRange(&least, &greatest))
       return "cuCtxGetStreamPriorityRange failed: " + std::to_string(r);
-    if (int r = cu_stream_create_(&stream_, kNonBlocking, greatest))
+    if (int r = cuStreamCreateWithPriority(&stream_, CU_STREAM_NON_BLOCKING, greatest))
       return "cuStreamCreateWithPriority failed: " + std::to_string(r);
     if (std::string error = init_word(); !error.empty()) return error;
     return probe_stream_wait();
   }
 
   int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
-    return cu_memcpy_async_(dst, src, static_cast<size_t>(bytes), stream_);
+    return cuMemcpyAsync(dst, src, static_cast<size_t>(bytes), stream_);
   }
 
   /// Default flags: the write executes after the stream's prior work and fences that work's memory before it.
   int write64(uint64_t dst, uint64_t value) override {
-    return cu_write_value64_(stream_, dst, value, 0);
+    return cuStreamWriteValue64_v2(stream_, dst, value, 0);
   }
 
   /// The token is the job's sequence number, written into the completion word after the job's copies.
   int mark(int64_t* token) override {
     const uint32_t seq = ++marked_;
     *token = seq;
-    return cu_write_value32_(stream_, word_dev_, seq, 0);  // default flags: after the prior copies, fenced
+    return cuStreamWriteValue32_v2(stream_, word_dev_, seq, 0);  // default flags: after the prior copies, fenced
   }
 
   int query(int64_t token) override {
-    return word_.poll(static_cast<uint32_t>(token), [this] { return cu_stream_query_(stream_); });
+    return word_.poll(static_cast<uint32_t>(token), [this] { return cuStreamQuery(stream_); });
   }
 
   /// Logs the completion word's final value (the exact number of jobs the stream completed). Frees the stream, word and
@@ -183,23 +165,19 @@ class CudaCopyBackend : public CopyBackend {
       std::fflush(stderr);
     }
     if (!idle) return;
-    if (word_host_ != nullptr) cu_mem_free_host_(word_host_);
-    if (stream_ != nullptr) cu_stream_destroy_(stream_);
-    if (retained_) cu_primary_release_(cu_device_);
+    if (word_host_ != nullptr) cuMemFreeHost(word_host_);
+    if (stream_ != nullptr) cuStreamDestroy_v2(stream_);
+    if (retained_) cuDevicePrimaryCtxRelease_v2(cu_device_);
   }
 
  private:
-  static constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING
-  static constexpr unsigned kDeviceMap = 2;    // CU_MEMHOSTALLOC_DEVICEMAP
-  static constexpr unsigned kGeq = 0;          // CU_STREAM_WAIT_VALUE_GEQ
-
   /// Queries the stream every 10 us until it completes or about a second passes; returns the last query.
   int wait_stream() {
     constexpr int kPolls = 100'000;
-    int r = cu_stream_query_(stream_);
+    int r = cuStreamQuery(stream_);
     for (int i = 0; i < kPolls && r == CompletionWord::kNotReady; ++i) {
       std::this_thread::sleep_for(std::chrono::microseconds(10));
-      r = cu_stream_query_(stream_);
+      r = cuStreamQuery(stream_);
     }
     return r;
   }
@@ -207,13 +185,13 @@ class CudaCopyBackend : public CopyBackend {
   /// Allocates the host-mapped completion word and checks that a first write through the stream lands in it.
   std::string init_word() {
     void* host = nullptr;
-    if (int r = cu_mem_host_alloc_(&host, sizeof(uint32_t), kDeviceMap))
+    if (int r = cuMemHostAlloc(&host, sizeof(uint32_t), CU_MEMHOSTALLOC_DEVICEMAP))
       return "cuMemHostAlloc of the completion word failed: " + std::to_string(r);
     word_host_ = static_cast<uint32_t*>(host);
     __atomic_store_n(word_host_, 0xFFFFFFFFu, __ATOMIC_RELEASE);  // not 0: the first write below must change it
-    if (int r = cu_mem_host_device_ptr_(&word_dev_, host, 0))
+    if (int r = cuMemHostGetDevicePointer_v2(&word_dev_, host, 0))
       return "cuMemHostGetDevicePointer of the completion word failed: " + std::to_string(r);
-    if (int r = cu_write_value32_(stream_, word_dev_, 0, 0))
+    if (int r = cuStreamWriteValue32_v2(stream_, word_dev_, 0, 0))
       return "cuStreamWriteValue32_v2 failed (" + std::to_string(r) +
              "): the copy engine needs the v2 stream memory operations for its completion word";
     if (const int r = wait_stream(); r != 0)
@@ -230,23 +208,23 @@ class CudaCopyBackend : public CopyBackend {
   /// without it is refused here instead of hanging the first decode.
   std::string probe_stream_wait() {
     void* host = nullptr;
-    if (int r = cu_mem_host_alloc_(&host, sizeof(uint32_t), kDeviceMap))
+    if (int r = cuMemHostAlloc(&host, sizeof(uint32_t), CU_MEMHOSTALLOC_DEVICEMAP))
       return "cuMemHostAlloc of the stream-wait probe word failed: " + std::to_string(r);
     const std::string error = probe_stream_wait_on(static_cast<uint32_t*>(host));
     // Freed only once the stream no longer waits on it; a probe that never completed leaks its 4 bytes instead.
-    if (error.empty() || cu_stream_query_(stream_) == 0) cu_mem_free_host_(host);
+    if (error.empty() || cuStreamQuery(stream_) == 0) cuMemFreeHost(host);
     return error;
   }
 
   std::string probe_stream_wait_on(uint32_t* word) {
     __atomic_store_n(word, Wire::kLeaseGateClosed, __ATOMIC_RELEASE);  // the production gate encoding
-    uint64_t device_word = 0;
-    if (int r = cu_mem_host_device_ptr_(&device_word, word, 0))
+    CUdeviceptr device_word = 0;
+    if (int r = cuMemHostGetDevicePointer_v2(&device_word, word, 0))
       return "cuMemHostGetDevicePointer of the stream-wait probe word failed: " + std::to_string(r);
-    if (int r = cu_wait_value32_(stream_, device_word, Wire::kLeaseGateOpen, kGeq))
+    if (int r = cuStreamWaitValue32_v2(stream_, device_word, Wire::kLeaseGateOpen, CU_STREAM_WAIT_VALUE_GEQ))
       return "cuStreamWaitValue32_v2 failed (" + std::to_string(r) +
              "): the copy wait needs the v2 stream wait on host-mapped memory";
-    const int held = cu_stream_query_(stream_);
+    const int held = cuStreamQuery(stream_);
     __atomic_store_n(word, Wire::kLeaseGateOpen, __ATOMIC_RELEASE);  // on every path, so nothing stays queued
     if (held == 0)
       return "cuStreamWaitValue32_v2 did not hold its stream: the copy wait could not order the decode stream";
@@ -259,30 +237,14 @@ class CudaCopyBackend : public CopyBackend {
 
   int device_;
   std::string prefix_;
-  int cu_device_ = 0;
-  void* context_ = nullptr;
-  void* stream_ = nullptr;
+  CUdevice cu_device_ = 0;
+  CUcontext context_ = nullptr;
+  CUstream stream_ = nullptr;
   bool retained_ = false;
   uint32_t* word_host_ = nullptr;  // host-mapped pinned memory the stream writes
-  uint64_t word_dev_ = 0;
+  CUdeviceptr word_dev_ = 0;
   CompletionWord word_;
   uint32_t marked_ = 0;  // the last job sequence written (wraps at 2^32)
-  int (*cu_init_)(unsigned) = nullptr;
-  int (*cu_device_get_)(int*, int) = nullptr;
-  int (*cu_primary_retain_)(void**, int) = nullptr;
-  int (*cu_primary_release_)(int) = nullptr;
-  int (*cu_ctx_set_current_)(void*) = nullptr;
-  int (*cu_stream_create_)(void**, unsigned, int) = nullptr;
-  int (*cu_priority_range_)(int*, int*) = nullptr;
-  int (*cu_stream_destroy_)(void*) = nullptr;
-  int (*cu_stream_query_)(void*) = nullptr;
-  int (*cu_memcpy_async_)(uint64_t, uint64_t, size_t, void*) = nullptr;
-  int (*cu_mem_host_alloc_)(void**, size_t, unsigned) = nullptr;
-  int (*cu_mem_host_device_ptr_)(uint64_t*, void*, unsigned) = nullptr;
-  int (*cu_mem_free_host_)(void*) = nullptr;
-  int (*cu_write_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
-  int (*cu_write_value64_)(void*, uint64_t, uint64_t, unsigned) = nullptr;
-  int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
 /// Capacity of each group's job ring and of the copy thread's in-flight FIFO. The device waits on every record with

@@ -26,7 +26,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <dlfcn.h>
 #include <exception>
 #include <fcntl.h>
 #include <functional>

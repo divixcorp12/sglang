@@ -37,7 +37,8 @@ from typing import Iterable, NamedTuple, Optional, Sequence, TYPE_CHECKING
 import msgspec
 import torch
 
-from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, is_arch_support_pdl, load_jit
+from sglang.kernels.jit.utils.compile.toolchain import cuda_home
 from sglang.kernels.ops.moe import expert_lease_block
 from sglang.kernels.ops.moe.cpu_kernel_build import CpuKernelBuild, cpu_kernel_build
 from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKENS_MAX, cpu_row_bytes
@@ -85,6 +86,12 @@ FAKE_BUILD: BuildKey = ("fake", "sqrt_softplus")
 
 _ENGINE_HOST = "moe/expert_stream/engine_host.cpp"
 _ENGINE_DEVICE = "moe/expert_stream/engine_device.cuh"
+
+
+def _driver_ldflags() -> list[str]:
+    """The expert-stream modules call the CUDA driver API (cuda.h) directly: link the toolkit's stub, which the
+    installed libcuda.so.1 replaces at load time."""
+    return [f"-L{cuda_stubs_dir()}", "-lcuda"]
 
 
 def _engine_build(key: BuildKey) -> TransportBuild:
@@ -370,7 +377,8 @@ def _host_module_cached(
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
             *(["-DSGLANG_EXPERT_STREAM_DRAFT_TRIGGER_ONLY=1"] if trigger_only else []),
         ],
-        extra_ldflags=["-luring", "-lpthread", "-ldl", *(kernel.ldflags if kernel else ())],
+        extra_include_paths=[f"{cuda_home()}/include"],  # the host compiler needs cuda.h
+        extra_ldflags=["-luring", "-lpthread", *_driver_ldflags(), *(kernel.ldflags if kernel else ())],
         header_only=False,
     )
 
@@ -401,7 +409,14 @@ def _host_module_tsan(layout: BuildKey, lanes: int, nodes: int, kernel: Optional
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
-        extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread", *(kernel.ldflags if kernel else ())],
+        extra_include_paths=[f"{cuda_home()}/include"],
+        extra_ldflags=[
+            "-luring",
+            "-lpthread",
+            *_driver_ldflags(),
+            "-fsanitize=thread",
+            *(kernel.ldflags if kernel else ()),
+        ],
         header_only=False,
     )
 
@@ -3365,6 +3380,7 @@ def _device_module_cached(layout: BuildKey, lanes: int, nodes: int, stamps: bool
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
+        extra_ldflags=_driver_ldflags(),
     )
 
 
@@ -3393,6 +3409,7 @@ def device_module_with_hooks(
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
+        extra_ldflags=_driver_ldflags(),
     )
 
 

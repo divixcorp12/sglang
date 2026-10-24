@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 from sglang.srt.layers.moe.expert_engine.config import ExpertStreamConfig, stream_config
 
 if TYPE_CHECKING:
@@ -93,6 +93,7 @@ def _device_module_cached(request_trace: bool) -> Module:
         "dspark_draft_channel",
         cuda_files=["moe/expert_stream/draft_kernels.cuh"],
         extra_cuda_cflags=["-DSGLANG_DRAFT_REQUEST_TRACE=1"] if request_trace else [],
+        extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],  # stream_wait.h calls the driver API directly
         cuda_wrappers=[
             ("post", "expert_stream::draft::DraftChannelKernels::post"),
             ("finish", "expert_stream::draft::DraftChannelKernels::finish"),

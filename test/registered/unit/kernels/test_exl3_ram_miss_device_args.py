@@ -305,8 +305,8 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     stream_wait = (CSRC / "expert_stream" / "stream_wait.h").read_text()
     enqueue = stream_wait[stream_wait.index("inline void enqueue_gate_wait("):]
     enqueue = enqueue[: enqueue.index("\n}\n")]
-    assert "channel::kGateOpen" in enqueue and "kStreamWaitValueGeq" in enqueue, enqueue
-    assert "kStreamWaitValueGeq = 0;" in stream_wait and '"cuStreamWaitValue32_v2"' in stream_wait
+    assert "channel::kGateOpen" in enqueue and "CU_STREAM_WAIT_VALUE_GEQ" in enqueue, enqueue
+    assert "cuStreamWaitValue32_v2(" in enqueue, enqueue
     assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(expert_stream_lease_copy_commit_kernel", launcher)
     body = text[text.index("void expert_stream_lease_copy_commit_kernel("):]
     body = body[: body.index("\n}\n")]

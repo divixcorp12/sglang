@@ -106,14 +106,16 @@ foreach(BACKEND baseline optimized)
 endforeach()
 
 # The full-stack bench (docs/superpowers/specs/2026-10-01-expert-stream-full-stack-bench-design.md). The expert-stream
-# host headers need tvm-ffi's headers (reader_base.h) and liburing; nothing loads CUDA (the copy engine's host
-# backend). Built only when EXL3_TVM_FFI_ROOT names the tvm_ffi package, so the CPU-forward bench configures as before.
+# host headers need tvm-ffi's headers (reader_base.h), liburing, and the CUDA driver API (copy_engine.h includes
+# cuda.h and links libcuda; the bench drives the copy engine's host backend, so no CUDA call runs). Built only when
+# EXL3_TVM_FFI_ROOT names the tvm_ffi package, so the CPU-forward bench configures as before.
 set(EXL3_TVM_FFI_ROOT "" CACHE PATH "The tvm_ffi Python package directory (include/ and lib/), for the full-stack bench")
 if(EXL3_TVM_FFI_ROOT)
   find_path(TVM_FFI_INCLUDE tvm/ffi/function.h PATHS "${EXL3_TVM_FFI_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
   find_path(DLPACK_INCLUDE dlpack/dlpack.h PATHS "${EXL3_TVM_FFI_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
   find_library(TVM_FFI tvm_ffi PATHS "${EXL3_TVM_FFI_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
   find_library(URING uring REQUIRED)
+  find_package(CUDAToolkit REQUIRED)
   get_filename_component(MOE_CSRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
   if(NOT EXISTS "${MOE_CSRC}/expert_stream/host/ram_thread.h")
     message(FATAL_ERROR "Cannot locate the expert-stream host headers: ${MOE_CSRC}")
@@ -139,7 +141,7 @@ if(EXL3_TVM_FFI_ROOT)
     endif()
     target_compile_options(${TARGET} PRIVATE -O3 -g)
     target_link_libraries(${TARGET} PRIVATE benchmark::benchmark OpenMP::OpenMP_CXX Threads::Threads
-      "${TORCH_CPU}" "${C10}" "${TVM_FFI}" "${URING}")
+      "${TORCH_CPU}" "${C10}" "${TVM_FFI}" "${URING}" CUDA::cuda_driver)
     set_target_properties(${TARGET} PROPERTIES BUILD_RPATH "${EXL3_TORCH_ROOT}/lib;${EXL3_TVM_FFI_ROOT}/lib")
   endforeach()
 else()

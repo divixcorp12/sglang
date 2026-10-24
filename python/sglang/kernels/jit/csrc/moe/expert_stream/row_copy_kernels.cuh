@@ -19,7 +19,6 @@
 #include "row_layout.h"
 #include "tensor_checks.h"
 #include <bit>
-#include <dlfcn.h>
 
 namespace sglang {
 
@@ -535,7 +534,7 @@ struct RowCopyKernel {
 
   /// Launches CW, the stream's wait on the copy gate, then CC, in that order on one stream. `sm_table_address` is the
   /// raw address of the {source, destination, row bytes} table CW reads when `sm_count` > 0; `cpu_lanes` is empty when
-  /// CPU experts are off. Throws if the driver lacks cuStreamWaitValue32_v2 or the wait cannot be queued.
+  /// CPU experts are off. Throws if the wait cannot be queued.
   static void lease_copy_wait(
       tvm::ffi::TensorView state,
       tvm::ffi::TensorView count,
@@ -578,9 +577,6 @@ struct RowCopyKernel {
     RuntimeCheck(
         lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
         "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
-    RuntimeCheck(
-        expert_stream::stream_wait_value32() != nullptr,
-        "the copy wait needs cuStreamWaitValue32_v2, which libcuda.so.1 does not provide");
     RuntimeCheck(
         sm_count <= static_cast<int64_t>(std::popcount(L::kSmallMask)),
         "sm_table: sm_count must not exceed the layout's small-tensor count");
