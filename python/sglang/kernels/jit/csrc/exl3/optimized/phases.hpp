@@ -25,8 +25,8 @@ enum class Phase : int
     PrepareGateUp = 0,  // quantize gate/up inputs
     GateUp = 1,         // gate/up GEMVs
     Middle = 2,         // gate/up output transform, activation, down input
-    DownTiles = 3,      // down GEMVs, into tout_d
-    DownOut = 4,        // down output transform and the routing-weighted sum into out
+    DownTiles = 3,      // down GEMVs, into tout_d, each block transformed once its tiles are done
+    DownOut = 4,        // routing-weighted sum into out
 };
 constexpr int kPhaseCount = 5;
 
@@ -36,23 +36,25 @@ struct ForwardCtx
     const Fp16* x;
     float* out;
     int m_total;
-    // Overwrite (OutMode::kOverwrite): DownOut zeroes each of its blocks' columns before it sums into them, so a job that
+    // Overwrite (OutMode::kOverwrite): DownOut zeroes each of its units' columns before it sums into them, so a job that
     // never runs leaves out untouched.
     bool zero_first;
     // Overwrite by store (OutMode::kOverwriteByStore): no zeroing; DownOut stores each token's first sum (Chunk::first)
-    // and zeroes the `unrouted` tokens' columns of its blocks.
+    // and zeroes the `unrouted` tokens' columns of its units.
     bool store_first;
     std::vector<int> unrouted;  // store_first: the tokens no chunk row writes
     std::vector<Chunk> chunks;
     bool grouped;  // PlanTraits::kGroupedTraversal and one chunk
     bool wide;     // PlanTraits::kWideSingleExpert and one token through one chunk
-    int out_blocks;  // DownOut's tasks: H / 128 blocks, or 0 when the job writes nothing
+    int out_units;   // DownOut's tasks: H / 16 units, or 0 when the job writes nothing
+    // Down tiles finished per (chunk, 128-output block): the worker that finishes a block's eighth tile transforms it.
+    int* down_tiles_done;
 
     // Per chunk, MAX_M rows each: pointers into the job's ForwardArena (fresh allocations per job cost more in
     // first-touch page faults than the small phases do work).
     float* tout_g;  // [chunks][MAX_M][I]: quant space, then transformed in place
     float* tout_u;
-    float* tout_d;  // [chunks][MAX_M][H]: quant space, transformed by DownOut
+    float* tout_d;  // [chunks][MAX_M][H]: quant space, then transformed in place by DownTiles
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 };
 
@@ -66,6 +68,7 @@ struct ForwardArena
     std::vector<float> tout_g, tout_u, tout_d;
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
+    std::vector<int> down_tiles_done;                 // ForwardCtx::down_tiles_done
     std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
     std::vector<uint8_t> written;                     // store_first: per token, whether a chunk row writes it
 };

@@ -121,9 +121,10 @@ tier, picked once per layer, at registration:
   PrepareGateUp  (chunk, gate | up, 128-input block): transform and quantize          80 tasks for one DSV4.1 expert
   GateUp         (chunk, gate | up, tile pair), claimed in runs of 8                  144
   Middle         (chunk, 128-intermediate block): SiLU and the down input             18   (kGatePhase)
-  DownTiles      (chunk, tile pair) of the down GEMV, into tout_d, runs of 8          160
-  DownOut        a 128-output block over every chunk in order: output transform and
-                 the weighted sum (it zeroes its columns first for kOverwrite)        40   (kOutPhase)
+  DownTiles      (chunk, tile pair) of the down GEMV, into tout_d; the worker that
+                 finishes a 128-output block's last tile transforms it                160
+  DownOut        a 16-output unit over every chunk in order: the weighted sum
+                 (it zeroes its columns first for kOverwrite)                         320  (kOutPhase)
 The scalar tier's PrepareGateUp and Middle tasks are (chunk, gate | up) and a chunk. The grouped multi-band traversal runs
 inside a claimed run. A task's arithmetic does not depend on the worker that runs it. The layer's
 params name a plan id (ForwardPlan<Dsv41Shape>, compiled from the Bw tier up, or ForwardPlan<GenericShape>), Python

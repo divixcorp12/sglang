@@ -11,6 +11,7 @@
 #pragma once
 #include "phases.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -127,7 +128,10 @@ struct ForwardPlan
         }
         ctx.grouped = Traits::kGroupedTraversal && nc == 1;
         ctx.wide = Traits::kWideSingleExpert && ctx.m_total == 1 && nc == 1;
-        ctx.out_blocks = ctx.zero_first || ctx.store_first || nc > 0 ? int(H / 128) : 0;
+        ctx.out_units = ctx.zero_first || ctx.store_first || nc > 0 ? int(H / 16) : 0;
+        grow(ar.down_tiles_done, nc * (H / 128));
+        std::fill_n(ar.down_tiles_done.data(), nc * (H / 128), 0);
+        ctx.down_tiles_done = ar.down_tiles_done.data();
     }
 
     // The phase's tasks:
@@ -135,7 +139,7 @@ struct ForwardPlan
     //   GateUp         (chunk, gate | up, tile pair), claimed in runs of kTileAlign
     //   Middle         (chunk, 128-intermediate block) on the vector tiers; a chunk on the scalar tier
     //   DownTiles      (chunk, tile pair), claimed in runs of kTileAlign
-    //   DownOut        a 128-output block, over every chunk in order
+    //   DownOut        a 16-output unit, over every chunk in order
     static Tasks tasks(const ForwardCtx& c, int phase)
     {
         const int nc = int(c.chunks.size());
@@ -156,7 +160,7 @@ struct ForwardPlan
                 return {nc, 1};
 #endif
             case Phase::DownTiles: return {nc * (H / 32), kTileAlign};
-            case Phase::DownOut: return {c.out_blocks, 1};
+            case Phase::DownOut: return {c.out_units, 1};
         }
         return {};
     }
@@ -184,7 +188,7 @@ struct ForwardPlan
 #endif
                 break;
             case Phase::DownTiles: down_tiles(c, E, t0, t1); break;
-            case Phase::DownOut: down_out(c, E, t0, t1); break;
+            case Phase::DownOut: down_out(c, t0, t1); break;
         }
     }
 
@@ -206,7 +210,8 @@ private:
         }
     }
 
-    // Down GEMVs, GEMV j = chunk j, into tout_d (quant space; DownOut transforms it).
+    // Down GEMVs, GEMV j = chunk j, into tout_d, each 128-output block transformed in place by the worker that completes
+    // its eighth tile. The acq_rel count makes the other workers' tile stores visible to that worker.
     static void down_tiles(ForwardCtx& c, const Experts<Shape>& E, int t0, int t1)
     {
         const int H = Shape::hidden(*c.layer);
@@ -214,43 +219,49 @@ private:
         for (int t = t0; t < t1;) {
             const int j = t / pairs, end = std::min(t1, (j + 1) * pairs);
             const Chunk& ch = c.chunks[j];
-            run_tiles(E.down(ch.expert), c.prep_d[j], c.tout_d + size_t(j) * MAX_M * H, ch.m, (t - j * pairs) * 2,
-                      (end - j * pairs) * 2, c.grouped);
+            const Exl3Projection down = E.down(ch.expert);
+            float* tout = c.tout_d + size_t(j) * MAX_M * H;
+            const int tile0 = (t - j * pairs) * 2, tile1 = (end - j * pairs) * 2;
+            run_tiles(down, c.prep_d[j], tout, ch.m, tile0, tile1, c.grouped);
+            for (int b = tile0 / 8; b * 8 < tile1; ++b) {
+                const int done = std::min(tile1, b * 8 + 8) - std::max(tile0, b * 8);
+                std::atomic_ref<int> count(c.down_tiles_done[size_t(j) * (H / 128) + b]);
+                if (count.fetch_add(done, std::memory_order_acq_rel) + done == 8)
+                    transform_rows_block(down, tout, ch.m, b * 128);
+            }
             t = end;
         }
     }
 
-    // out[token] (+)= weight * down row for the 128-output blocks [b0, b1), over every chunk in order after the block's
-    // output transform.
-    static void down_out(ForwardCtx& c, const Experts<Shape>& E, int b0, int b1)
+    // out[token] (+)= weight * down row for the 16-output units [u0, u1), over every chunk in order.
+    static void down_out(ForwardCtx& c, int u0, int u1)
     {
         const int H = Shape::hidden(*c.layer);
-        for (int b = b0; b < b1; ++b) {
-            const int col = b * 128;
-            if (c.zero_first)
-                for (int t = 0; t < c.m_total; ++t) std::memset(c.out + size_t(t) * H + col, 0, 128 * sizeof(float));
-            for (size_t j = 0; j < c.chunks.size(); ++j) {
-                const Chunk& ch = c.chunks[j];
-                float* d = c.tout_d + j * MAX_M * H;
-                transform_rows_block(E.down(ch.expert), d, ch.m, col);
-                for (int r = 0; r < ch.m; ++r) {
-                    float* dst = c.out + size_t(ch.token[r]) * H + col;
-                    const float* src = d + size_t(r) * H + col;
-                    const float w = ch.weight[r];
-                    if (c.store_first && (ch.first >> r & 1u)) {
-                        // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler cannot
-                        // see keeps the add (and its contraction) under -Ofast, so the bits match.
-                        float zero = 0.0f;
-                        asm("" : "+x"(zero));
-                        for (int i = 0; i < 128; ++i) dst[i] = w * src[i] + zero;
-                    } else {
-                        for (int i = 0; i < 128; ++i) dst[i] += w * src[i];
-                    }
+        // The columns as a run-time range, as the loops below were compiled in the barrier-phased forward: under -Ofast a
+        // fixed 16-wide loop fuses its first element differently on the vector tiers.
+        const int c0 = u0 * 16, c1 = u1 * 16;
+        if (c.zero_first)
+            for (int t = 0; t < c.m_total; ++t) std::memset(c.out + size_t(t) * H + c0, 0, size_t(c1 - c0) * sizeof(float));
+        for (size_t j = 0; j < c.chunks.size(); ++j) {
+            const Chunk& ch = c.chunks[j];
+            const float* d = c.tout_d + j * MAX_M * H;
+            for (int r = 0; r < ch.m; ++r) {
+                float* dst = c.out + size_t(ch.token[r]) * H;
+                const float* src = d + size_t(r) * H;
+                const float w = ch.weight[r];
+                if (c.store_first && (ch.first >> r & 1u)) {
+                    // The zeroed row's sum, 0 + w * src, as the line below computes it: a zero the compiler cannot see
+                    // keeps the add (and its contraction) under -Ofast, so the bits match.
+                    float zero = 0.0f;
+                    asm("" : "+x"(zero));
+                    for (int col = c0; col < c1; ++col) dst[col] = w * src[col] + zero;
+                } else {
+                    for (int col = c0; col < c1; ++col) dst[col] += w * src[col];
                 }
             }
-            if (c.store_first)
-                for (const int t : c.unrouted) std::fill_n(c.out + size_t(t) * H + col, 128, 0.0f);
         }
+        if (c.store_first)
+            for (const int t : c.unrouted) std::fill_n(c.out + size_t(t) * H + c0, c1 - c0, 0.0f);
     }
 };
 
