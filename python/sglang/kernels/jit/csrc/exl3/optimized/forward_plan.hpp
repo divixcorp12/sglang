@@ -51,87 +51,68 @@ struct ForwardPlan
     using Traits = PlanTraits<Shape>;
     static constexpr int kTileAlign = Traits::kTileAlign;
 
-    // Sizes the job's scratch from its arena and points the context at it. ctx.chunks is final.
+    // Lays the job's scratch out for its chunks and points the context into it. ctx.chunks is final but for row0.
     static void prepare_scratch(ForwardJob& job)
     {
         ForwardCtx& ctx = job.ctx;
-        ForwardArena& ar = job.ar;
         constexpr bool compact = Traits::kCompactScratch;
-        const int nc = int(ctx.chunks.size());
+        constexpr bool scalar = kIsa == Isa::Scalar;  // its tiles read the transformed fp32 rows (PreparedIn::tin)
+        const size_t nc = ctx.chunks.size();
         const size_t H = Shape::hidden(*ctx.layer);
         const size_t I_ = Shape::intermediate(*ctx.layer);
-        const auto grow = [](auto& v, size_t n) {
-            if (v.size() < n) v.resize(n);
+        // Each chunk's kActRows * m compact rows follow the previous chunk's (a call of one-token chunks keeps chunk j
+        // at j * kActRows rows).
+        size_t compact_rows = 0;
+        for (Chunk& ch : ctx.chunks) {
+            ch.row0 = int(compact_rows);
+            compact_rows += size_t(kActRows) * ch.m;
+        }
+
+        // The regions' offsets; an absent region's is unused.
+        struct ActRegions { size_t tin, splat, splat_dup, compact, bq, bsum; };
+        ::sglang::cpu_experts::ScratchLayout layout;
+        const auto add_act = [&](size_t k) {
+            ActRegions a{};
+            if constexpr (scalar) a.tin = layout.add<float>(nc * MAX_M * k);
+            if constexpr (compact) a.compact = layout.add<int16_t>(compact_rows * k);
+            else if constexpr (!scalar) {
+                a.splat = layout.add<int32_t>(nc * MAX_M * k);
+                if constexpr (kSplatDup) a.splat_dup = layout.add<int32_t>(nc * MAX_M * k);
+            }
+            // One scale and sum per (128-input block, quantized row).
+            a.bq = layout.add<float>(nc * MAX_M * (k / kActBlock));
+            a.bsum = layout.add<int32_t>(nc * MAX_M * (k / kActBlock));
+            return a;
         };
-        grow(ar.tin_g, nc * MAX_M * H);
-        grow(ar.tin_u, nc * MAX_M * H);
-        grow(ar.tin_d, nc * MAX_M * I_);
-        grow(ar.tout_g, nc * MAX_M * I_);
-        grow(ar.tout_u, nc * MAX_M * I_);
-        grow(ar.tout_d, nc * MAX_M * H);
-        grow(ctx.prep_g, nc);
-        grow(ctx.prep_u, nc);
-        grow(ctx.prep_d, nc);
-        ctx.tout_g = ar.tout_g.data();
-        ctx.tout_u = ar.tout_u.data();
-        ctx.tout_d = ar.tout_d.data();
-        if constexpr (compact) {
-            // Each chunk's kActRows * m rows follow the previous chunk's (a call of one-token chunks keeps chunk j at
-            // j * kActRows rows).
-            size_t rows = 0;
-            for (const Chunk& ch : ctx.chunks) rows += size_t(kActRows) * ch.m;
-            grow(ar.compact_g, rows * H);
-            grow(ar.compact_u, rows * H);
-            grow(ar.compact_d, rows * I_);
-        } else {
-            grow(ar.splat_g, nc * MAX_M * H);
-            grow(ar.splat_u, nc * MAX_M * H);
-            grow(ar.splat_d, nc * MAX_M * I_);
-            if constexpr (kSplatDup) {
-                grow(ar.splat_dup_g, nc * MAX_M * H);
-                grow(ar.splat_dup_u, nc * MAX_M * H);
-                grow(ar.splat_dup_d, nc * MAX_M * I_);
+        const ActRegions rg = add_act(H), ru = add_act(H), rd = add_act(I_);
+        const size_t tout_g = layout.add<float>(nc * MAX_M * I_);
+        const size_t tout_u = layout.add<float>(nc * MAX_M * I_);
+        const size_t tout_d = layout.add<float>(nc * MAX_M * H);
+        const size_t tiles_done = layout.add<int>(nc * (H / 128));
+
+        auto& s = job.scratch;
+        s.fit(layout);
+        const auto act = [&](const ActRegions& a, size_t k) {
+            Activations v{};
+            if constexpr (scalar) v.tin = s.at<float>(a.tin);
+            if constexpr (compact) v.compact = s.at<int16_t>(a.compact);
+            else if constexpr (!scalar) {
+                v.splat32 = s.at<int32_t>(a.splat);
+                if constexpr (kSplatDup) v.splat_dup = s.at<int32_t>(a.splat_dup);
             }
-        }
-        // One scale and sum per (128-input block, quantized row).
-        const size_t sh = MAX_M * (H / kActBlock), si = MAX_M * (I_ / kActBlock);
-        grow(ar.bq_g, nc * sh);
-        grow(ar.bq_u, nc * sh);
-        grow(ar.bq_d, nc * si);
-        grow(ar.bsum_g, nc * sh);
-        grow(ar.bsum_u, nc * sh);
-        grow(ar.bsum_d, nc * si);
-        size_t row0 = 0;
-        for (int j = 0; j < nc; ++j) {
-            const size_t g = j * MAX_M * H, d = j * MAX_M * I_;
-            PreparedIn& pg = ctx.prep_g[j];
-            PreparedIn& pu = ctx.prep_u[j];
-            PreparedIn& pd = ctx.prep_d[j];
-            pg = {ar.tin_g.data() + g, nullptr, nullptr, nullptr, ar.bq_g.data() + j * sh, ar.bsum_g.data() + j * sh, {}, {}};
-            pu = {ar.tin_u.data() + g, nullptr, nullptr, nullptr, ar.bq_u.data() + j * sh, ar.bsum_u.data() + j * sh, {}, {}};
-            pd = {ar.tin_d.data() + d, nullptr, nullptr, nullptr, ar.bq_d.data() + j * si, ar.bsum_d.data() + j * si, {}, {}};
-            if constexpr (compact) {
-                pg.compact = ar.compact_g.data() + row0 * H;
-                pu.compact = ar.compact_u.data() + row0 * H;
-                pd.compact = ar.compact_d.data() + row0 * I_;
-                row0 += size_t(kActRows) * ctx.chunks[j].m;
-            } else {
-                pg.splat32 = ar.splat_g.data() + g;
-                pu.splat32 = ar.splat_u.data() + g;
-                pd.splat32 = ar.splat_d.data() + d;
-                if constexpr (kSplatDup) {
-                    pg.splat_dup = ar.splat_dup_g.data() + g;
-                    pu.splat_dup = ar.splat_dup_u.data() + g;
-                    pd.splat_dup = ar.splat_dup_d.data() + d;
-                }
-            }
-        }
-        ctx.grouped = Traits::kGroupedTraversal && nc == 1;
-        ctx.wide = Traits::kWideSingleExpert && ctx.m_total == 1 && nc == 1;
-        ctx.out_units = ctx.zero_first || ctx.store_first || nc > 0 ? int(H / 16) : 0;
-        grow(ar.down_tiles_done, nc * (H / 128));
-        std::fill_n(ar.down_tiles_done.data(), nc * (H / 128), 0);
-        ctx.down_tiles_done = ar.down_tiles_done.data();
+            v.bq = s.at<float>(a.bq);
+            v.bsum = s.at<int32_t>(a.bsum);
+            v.k = int(k);
+            return v;
+        };
+        ctx.act_g = act(rg, H);
+        ctx.act_u = act(ru, H);
+        ctx.act_d = act(rd, I_);
+        ctx.tout_g = s.at<float>(tout_g);
+        ctx.tout_u = s.at<float>(tout_u);
+        ctx.tout_d = s.at<float>(tout_d);
+        ctx.down_tiles_done = s.at<int>(tiles_done);
+        std::fill_n(ctx.down_tiles_done, nc * (H / 128), 0);
     }
 
     // The phase's tasks:
@@ -160,7 +141,7 @@ struct ForwardPlan
                 return {nc, 1};
 #endif
             case Phase::DownTiles: return {nc * (H / 32), kTileAlign};
-            case Phase::DownOut: return {c.out_units, 1};
+            case Phase::DownOut: return {out_units(c), 1};
         }
         return {};
     }
@@ -172,7 +153,7 @@ struct ForwardPlan
         switch (static_cast<Phase>(phase)) {
             case Phase::PrepareGateUp:
 #if defined(SGLANG_CPU_EXPERTS_AVX2)
-                if (c.wide) prepare_gate_up_blocks<Shape, true>(c, E, t0, t1);
+                if (wide(c)) prepare_gate_up_blocks<Shape, true>(c, E, t0, t1);
                 else prepare_gate_up_blocks<Shape, false>(c, E, t0, t1);
 #else
                 prepare_gate_up_scalar(c, E, t0, t1);
@@ -181,7 +162,7 @@ struct ForwardPlan
             case Phase::GateUp: gate_up(c, E, t0, t1); break;
             case Phase::Middle:
 #if defined(SGLANG_CPU_EXPERTS_AVX2)
-                if (c.wide) middle_blocks<Shape, true>(c, E, t0, t1);
+                if (wide(c)) middle_blocks<Shape, true>(c, E, t0, t1);
                 else middle_blocks<Shape, false>(c, E, t0, t1);
 #else
                 middle_scalar(c, E, t0, t1);
@@ -193,6 +174,16 @@ struct ForwardPlan
     }
 
 private:
+    // The grouped traversal: one expert routed (PlanTraits::kGroupedTraversal).
+    static bool grouped(const ForwardCtx& c) { return Traits::kGroupedTraversal && c.chunks.size() == 1; }
+    // The 512-wide quantization: one token through one expert (PlanTraits::kWideSingleExpert).
+    static bool wide(const ForwardCtx& c) { return Traits::kWideSingleExpert && c.m_total == 1 && c.chunks.size() == 1; }
+    // DownOut's tasks: H / 16 units, or none when the job writes nothing.
+    static int out_units(const ForwardCtx& c)
+    {
+        return c.zero_first || c.store_first || !c.chunks.empty() ? Shape::hidden(*c.layer) / 16 : 0;
+    }
+
     // Gate and up GEMVs, GEMV j = 2 * chunk + (up ? 1 : 0), a run split at the GEMVs' ends.
     static void gate_up(ForwardCtx& c, const Experts<Shape>& E, int t0, int t1)
     {
@@ -202,10 +193,10 @@ private:
             const int j = t / pairs, end = std::min(t1, (j + 1) * pairs);
             const Chunk& ch = c.chunks[j / 2];
             const bool up = j % 2;
-            const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / 2];
+            const PreparedIn p = (up ? c.act_u : c.act_g).chunk(j / 2, ch);
             float* tout = (up ? c.tout_u : c.tout_g) + size_t(j / 2) * MAX_M * I_;
             run_tiles(up ? E.up(ch.expert) : E.gate(ch.expert), p, tout, ch.m, (t - j * pairs) * 2,
-                      (end - j * pairs) * 2, c.grouped);
+                      (end - j * pairs) * 2, grouped(c));
             t = end;
         }
     }
@@ -222,7 +213,7 @@ private:
             const Exl3Projection down = E.down(ch.expert);
             float* tout = c.tout_d + size_t(j) * MAX_M * H;
             const int tile0 = (t - j * pairs) * 2, tile1 = (end - j * pairs) * 2;
-            run_tiles(down, c.prep_d[j], tout, ch.m, tile0, tile1, c.grouped);
+            run_tiles(down, c.act_d.chunk(j, ch), tout, ch.m, tile0, tile1, grouped(c));
             for (int b = tile0 / 8; b * 8 < tile1; ++b) {
                 const int done = std::min(tile1, b * 8 + 8) - std::max(tile0, b * 8);
                 std::atomic_ref<int> count(c.down_tiles_done[size_t(j) * (H / 128) + b]);
@@ -291,7 +282,6 @@ void prepare_job(ForwardJob& job, const ExpertLayer& l, const ForwardCall& c)
     EXL3_CHECK(p.plan == GenericShape::kPlan, "the layer's plan is not compiled into this build");
 #endif
     ForwardCtx& ctx = job.ctx;
-    ForwardArena& ar = job.ar;
     ctx.layer = &l;
     ctx.x = static_cast<const Fp16*>(c.x);
     ctx.out = c.out;
@@ -300,9 +290,9 @@ void prepare_job(ForwardJob& job, const ExpertLayer& l, const ForwardCall& c)
     ctx.store_first = c.store_first();
 
     // The live routes as (slot, route index t * k + j), sorted: each expert's routes in token, then route, order.
-    auto& routes = ar.routes;
-    routes.clear();
+    std::vector<std::pair<int32_t, int32_t>> routes;
     const int n = c.rows * c.k;
+    routes.reserve(size_t(n));
     for (int i = 0; i < n; ++i)
         if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
     std::sort(routes.begin(), routes.end());
@@ -321,8 +311,7 @@ void prepare_job(ForwardJob& job, const ExpertLayer& l, const ForwardCall& c)
     // A token's first write is the first of its rows in DownOut's order (chunk, then row); the rest add to it.
     ctx.unrouted.clear();
     if (ctx.store_first) {
-        auto& written = ar.written;
-        written.assign(size_t(c.rows), 0);
+        std::vector<uint8_t> written(size_t(c.rows), 0);  // per token, whether a chunk row writes it
         for (Chunk& ch : ctx.chunks)
             for (int r = 0; r < ch.m; ++r)
                 if (!written[ch.token[r]]) {

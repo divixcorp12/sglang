@@ -105,7 +105,8 @@ Code layout
                         integer accumulate
   register_kernels.hpp  the 3-bit register kernels (register_tiles<M>, kRegisterBudget): the DSV4.1 plan's GEMVs
   tiles.hpp             run_tiles: a chunk's GEMV on the build's tier (register kernels, or Tiles per 128-input block)
-  phases.hpp            ForwardCtx, ForwardArena, ForwardJob and the phases' work besides the GEMVs (prepare, transform, SiLU)
+  phases.hpp            ForwardCtx, Activations, ForwardJob (the context and its one-buffer scratch) and the phases' work
+                        besides the GEMVs (prepare, transform, SiLU)
   forward_plan.hpp      PlanTraits, ForwardPlan<Shape> (the five phases' tasks), prepare_job and the plan registry
   shapes.hpp            the plans' Shapes and Chunk; quant.hpp Exl3Quant and Experts<Shape>; projection.hpp
                         Exl3Projection; half.hpp the fp16 type; kernel.cpp Exl3CpuKernel (entry.h)

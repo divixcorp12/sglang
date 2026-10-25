@@ -315,7 +315,7 @@ inline void hadamard_128(float* v) { hadamard_128_scalar(v); }
 // m..2m-1) at (b * 2m + i) * kActBlock, its scale and sum at bq / bsum[b * MAX_M + i].
 struct PreparedIn
 {
-    float* tin;          // [2m][k] transformed fp32: token rows, then residual rows; the scalar tier reads the first m
+    float* tin;          // the scalar tier's [m][k] transformed fp32 rows, which its tiles read; null on the vector tiers
     int32_t* splat32;    // the int8 activation replicated x4 (vpdpbusd's signed operand: the Vnni and Vbmi tiles)
     // x8 (two's-complement, read as i16) in both 16-bit halves of the dword: one vpmaddwd per token row against the
     // pair-summed product bytes (the Avx2 and Bw tiles). Null where no kernel reads it.
@@ -423,11 +423,10 @@ void compact_quantize_row512(const float* src, int16_t* dst, float* residual, fl
 #endif
 
 // Quantizes block `block` of token row r (of the chunk's m) from src, the row's transformed block: the token row, then
-// its residual, which is staged in tin row r + m. Wide: the compact rows at 512 bits.
+// its residual, which is staged in `residual` (kActBlock floats, the caller's). Wide: the compact rows at 512 bits.
 template <bool Wide>
-void quantize_block(PreparedIn& p, int r, int m, int k, int block, const float* src)
+void quantize_block(const PreparedIn& p, int r, int m, int block, const float* src, float* residual)
 {
-    float* residual = p.tin + size_t(r + m) * k + block * kActBlock;
     for (int pass = 0; pass < kActRows; ++pass) {
         const int row = r + pass * m;
         const size_t off = size_t(block) * kActRows * m * kActBlock + size_t(row) * kActBlock;

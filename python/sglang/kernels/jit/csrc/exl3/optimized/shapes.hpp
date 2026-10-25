@@ -18,6 +18,7 @@ struct Chunk
     int token[MAX_M];
     float weight[MAX_M];
     unsigned first = 0;  // bit r: row r is token[r]'s first write of the call (ForwardCtx::store_first)
+    int row0 = 0;        // the chunk's first compact activation row: the previous chunks' kActRows * m rows
 };
 
 // Each Shape is one plan's facts, which the host's cpu_kernel_plans lists and registration checks (plan_rejects): its id
