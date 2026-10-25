@@ -50,13 +50,6 @@ struct RouteTable
         }
         return {store.count.data(), store.routes.data(), rows, k};
     }
-
-    // The table points into this thread's store: valid until the next build on the same thread.
-    static RouteTable build(const int32_t* slots, const float* weights, int rows, int k)
-    {
-        static thread_local RouteStore store;
-        return build(slots, weights, rows, k, store);
-    }
 };
 
 }  // namespace

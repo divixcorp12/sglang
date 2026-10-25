@@ -123,7 +123,7 @@ admission groups the routes and sizes the job's scratch, then four phases of tas
 Every task is claimed in runs of `ceil(count / workers)` (align 1: a task is already a cache line of output, or a block).
 A Down task owns whole output rows and sums each token's routes in routing order inside the task, so no reduction crosses
 tasks and the result is the same bits whichever worker runs which task. The per-task scratch of the dot products (one
-down output of every unit) is a thread-local vector of the worker that runs the task. After a Q8_0 check fails the phases
+down output of every unit) is the task's own: on its stack up to 256 units, a local vector past that. After a Q8_0 check fails the phases
 that follow have no tasks and `status` is 2. The CPU expert engine admits jobs to a window over a team it keeps for its
 lifetime (a staged job's gate holds its Down phase in the window); `forward_alone<Nvfp4CpuKernel>(layer, call, cores, threads)` (tests, the
 harnesses) runs the call as one job of a `JobRunner` on a team made for the call alone, pinning worker i to `cores[i]`
