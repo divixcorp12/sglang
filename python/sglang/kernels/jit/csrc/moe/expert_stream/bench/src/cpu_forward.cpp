@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -78,6 +79,7 @@ struct Options {
   // --smt: the workers' SMT siblings join the team after them (SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT)
   bool smt = false;
   int node = 1;
+  bool bind_memory = true;  // MPOL_BIND to `node` before anything loads, unless --inherit-memory-policy
   int warmup = 128;
   int gap_us = 0;
   bool validate_only = false;
@@ -94,6 +96,27 @@ int number(const std::string& text) {
   const int n = std::stoi(text, &end);
   if (end != text.size() || n < 0) throw std::runtime_error("Invalid integer: " + text);
   return n;
+}
+
+// An inherited policy lets the fixture land on the other node when this one is full of page cache: 43% slower
+// forwards on divix01 (DSV_OPTIMIZATION.md 3.17). Binding makes the kernel reclaim this node's cache instead.
+void bind_process_memory(int node) {
+  constexpr int kMpolBind = 2;  // MPOL_BIND
+  if (node >= static_cast<int>(sizeof(unsigned long) * 8))
+    throw std::runtime_error("NUMA node out of range: " + std::to_string(node));
+  const unsigned long mask = 1ul << node;
+  if (syscall(SYS_set_mempolicy, kMpolBind, &mask, sizeof(mask) * 8) != 0)
+    throw std::runtime_error("set_mempolicy(MPOL_BIND, node " + std::to_string(node) + ") failed: " + std::strerror(errno));
+}
+
+// The node's MemFree in MiB, or -1 if unreadable; low values mean setup had to reclaim page cache.
+long node_free_mib(int node) {
+  std::ifstream meminfo("/sys/devices/system/node/node" + std::to_string(node) + "/meminfo");
+  for (std::string line; std::getline(meminfo, line);) {
+    const auto at = line.find("MemFree:");
+    if (at != std::string::npos) return std::stol(line.substr(at + 8)) / 1024;
+  }
+  return -1;
 }
 
 // Parses a CPU list such as "18-33,52": ranges and singles, no duplicates. Throws on an invalid list.
@@ -134,6 +157,8 @@ Options parse_options(int& argc, char** argv) {
       opt.smt = true;
     else if (arg.starts_with("--numa-node="))
       opt.node = number(value("--numa-node="));
+    else if (arg == "--inherit-memory-policy")
+      opt.bind_memory = false;
     else if (arg.starts_with("--warmup-forwards="))
       opt.warmup = number(value("--warmup-forwards="));
     else if (arg.starts_with("--gap-us="))
@@ -157,7 +182,8 @@ Options parse_options(int& argc, char** argv) {
                    ")\n"
                    "--fixture=FILE --reference-dir=DIR --cpus=28-43 --workers=N\n"
                    "--smt adds each of the N workers' SMT siblings to the team, after them (2N workers)\n"
-                   "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
+                   "--numa-node=1 checks the CPUs are on that node and binds all memory to it (MPOL_BIND)\n"
+                   "--inherit-memory-policy skips the bind (e.g. under numactl --membind=0 for remote memory)\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
                    "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
                    "--routed-slots=48 --routed-layers=2\n"
@@ -567,6 +593,9 @@ int main(int argc, char** argv) {
       if (!fs::exists("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/node" + std::to_string(options.node)))
         throw std::runtime_error("Requested CPU is not on the expected NUMA node: " + std::to_string(cpu));
     }
+    const long free_before_mib = node_free_mib(options.node);
+    if (options.bind_memory) bind_process_memory(options.node);
+    const std::string memory_policy = options.bind_memory ? "bound to node " + std::to_string(options.node) : "inherited";
 #ifdef EXL3_BENCH_BASELINE
     // The vendored baseline reads its own variables (moe_mul1.cpp): these two at its first forward, and
     // EXL3_MOE_CPU_MAX_ISA at load, so the scripts export that one.
@@ -629,7 +658,8 @@ int main(int argc, char** argv) {
     std::cerr << "Verified 24 bit-exact layer outputs; individually pinned worker CPUs: ";
     for (int cpu : cores)
       std::cerr << cpu << ' ';
-    std::cerr << "(NUMA " << options.node << "; memory policy inherited)\n";
+    std::cerr << "(NUMA " << options.node << "; memory policy " << memory_policy << "; node MemFree at start "
+              << free_before_mib << " MiB)\n";
     if (!options.validate_only) {
       benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
       benchmark::AddCustomContext("isa_tier", isa_tier);
@@ -643,7 +673,8 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("cgroup", cgroup);
       benchmark::AddCustomContext("workers", std::to_string(options.workers));
       benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
-      benchmark::AddCustomContext("memory_policy", "inherited; no benchmark membind");
+      benchmark::AddCustomContext("memory_policy", memory_policy);
+      benchmark::AddCustomContext("node_mem_free_mib_at_start", std::to_string(free_before_mib));
       benchmark::AddCustomContext("compiler", __VERSION__);
 #ifndef EXL3_BENCH_BASELINE
       benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::Exl3CpuKernel::chunk_m()));

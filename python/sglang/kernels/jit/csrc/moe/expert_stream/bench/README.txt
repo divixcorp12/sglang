@@ -79,12 +79,16 @@ CPU placement:
   cores: the bench form of SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_SMT.
 
 Memory placement:
-  No process-wide NUMA memory policy is imposed. The process inherits its launch
-  policy, and CPU affinity is independent of it, so weights can sit on node 0
-  while computation runs on node 1. To test that remote-memory case, prefix each
-  executable with numactl --membind=0 (scratch follows that policy too). Without
-  a memory policy, fixture loading happens on the pinned caller and normally
-  first-touches node 1. The fixture is ordinary CPU RAM, not CUDA-pinned server
+  The bare bench (exl3_cpu_baseline/optimized) binds all its memory to
+  --numa-node (MPOL_BIND) before it loads the fixture. Without the bind, a node
+  full of page cache sends first-touch pages to the other node: on 2026-10-24,
+  with node 1 at 0.2 GiB free, the inherited policy put the fixture on node 0 and
+  3-expert forwards ran at 1294 us p50 against 900 us bound (DSV_OPTIMIZATION.md
+  3.17). Binding makes setup reclaim that node's cache instead. Each run prints
+  the policy and the node's MemFree at start, also in the Google JSON context
+  (memory_policy, node_mem_free_mib_at_start). To test the remote-memory case,
+  run with --inherit-memory-policy under numactl --membind=0. The full-stack
+  bench mbinds its own slabs per group. The fixture is ordinary CPU RAM, not CUDA-pinned server
   slabs; the benchmark excludes PCIe/NVMe transfers and the service job-ring
   handoff.
 

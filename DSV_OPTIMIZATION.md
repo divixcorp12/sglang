@@ -1768,7 +1768,8 @@ and `numactl --membind=1` (`/mnt/nvme1/exl3-tidy/wsweep`):
 
   Remote memory costs the forward ~43%; the missing huge pages (8x the TLB misses) about 1% more. Production places the
   pinned tier per node (`SGLANG_MOE_PINNED_HOST_NUMA_MB`) after the pre-launch floor, so this is a bench hazard: the bare
-  bench inherits its memory policy, and its absolute numbers depend on how full node 1 is.
+  bench inherited its memory policy, and its absolute numbers depended on how full node 1 was. Since then the bare bench
+  binds its memory to `--numa-node` and prints that node's MemFree at start (bench README, "Memory placement").
 
 ## 4. Ideas on record, not started
 
