@@ -1,5 +1,6 @@
 // Standalone ASan/UBSan harness: no Python runtime or CUDA dependencies.
 #include "entry.h"
+#include "../../moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include "quant.hpp"
 #include "../upstream/kernels.h"
 #include <algorithm>

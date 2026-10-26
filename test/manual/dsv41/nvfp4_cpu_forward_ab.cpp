@@ -5,6 +5,7 @@
 // this harness. Batched rows must match their one-row calls within one Q8_0 quantum (check_batch).
 //   nvfp4_cpu_forward_ab OUT CORE [CORE...]     worker i runs on CORE i; the caller is worker 0.
 #include "entry.h"
+#include "../../moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include "quant.hpp"
 #include "../upstream/kernels.h"
 #include <algorithm>
