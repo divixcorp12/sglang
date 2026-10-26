@@ -23,6 +23,7 @@ namespace {
 constexpr int kChunkRows = 4;
 
 #include "forward_plan.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/binding.hpp"
 
 // The build's tier (min(kBuildIsa, kTopIsa)) picks the plan: the MiMo plan when the layer is that model's routed
 // expert at the AVX2 tier, else the generic plan at the tier.
