@@ -10,7 +10,7 @@
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
-#include "kernel.h"
+#include "entry.h"
 #include "quant.hpp"
 
 #include <cstdint>

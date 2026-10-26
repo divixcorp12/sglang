@@ -122,7 +122,7 @@ def _facts(bits_w13, bits_w2, swizzled=0):
 
 
 # The kernel's parameter list (Exl3CpuKernel::params): bits_w13, bits_w2, swizzled, plan.
-GENERIC, DSV41 = 0, 1  # kernel.h's SglangExl3CpuPlan
+GENERIC, DSV41 = 0, 1  # entry.h's SglangExl3CpuPlan
 
 
 def test_the_trait_lists_the_params_make_layer_reads():

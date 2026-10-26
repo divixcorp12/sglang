@@ -3,7 +3,8 @@
 // several workers (dynamic runs, whichever worker is free). A call whose input Q8_0 cannot represent must be refused by
 // both with `out` untouched. Built by
 // test_nvfp4_cpu_job_interface.py with kernel.cpp at the tier under test.
-#include "../../../../python/sglang/kernels/jit/csrc/nvfp4/optimized/kernel.h"
+#include "../../../../python/sglang/kernels/jit/csrc/nvfp4/optimized/entry.h"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdint>

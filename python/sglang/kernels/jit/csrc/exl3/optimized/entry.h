@@ -1,7 +1,7 @@
 // What the expert-stream host sees of the EXL3 CPU kernel: its concrete kernel type (cpu_experts/binding.hpp lists what
 // a kernel type offers), declared here and defined in kernel.cpp, the kernel's own translation unit, which the host
 // module compiles with the kernel flags. Plain std types and no kernel internals, so the host and the device
-// translation units can include it through formats/exl3/format.h. kernel.h adds the kernel's own typed interface.
+// translation units can include it through formats/exl3/format.h. It also carries the kernel's typed plan interface.
 #pragma once
 #include "../../moe/expert_stream/host/cpu_experts/kernel.hpp"
 #include <cstddef>
@@ -20,7 +20,27 @@ struct SglangExl3CpuParams {
     int16_t bits_w13;      // gate and up trellis bits per weight, 1..8
     int16_t bits_w2;       // down trellis bits per weight, 1..8
     int16_t swizzled;      // 0 or 1: band-contiguous trellis layout; an 8-bit projection is never swizzled
-    int32_t plan;          // a SglangExl3CpuPlan (kernel.h); make_layer refuses one that does not accept the layer
+    int32_t plan;          // a SglangExl3CpuPlan; make_layer refuses one that does not accept the layer
+};
+
+// The forward plans this library compiles (forward_plan.hpp's run_plan), by the id a layer's params name. The generic
+// plan runs any layer make_layer accepts; a fixed plan runs only the layer facts its Shape (shapes.hpp) fixes.
+enum SglangExl3CpuPlan : int32_t {
+    kSglangExl3CpuPlanGeneric = 0,  // ForwardPlan<GenericShape>
+    kSglangExl3CpuPlanDsv41 = 1,    // ForwardPlan<Dsv41Shape>
+};
+
+// One compiled plan as exl3_cpu_plans lists it (and the host export expert_stream_cpu_kernel_plans as JSON). A fixed
+// plan accepts exactly the layer facts below; the generic plan (fixed false, facts 0) accepts any layer. available:
+// min_isa is within the build's tier; make_layer refuses an unavailable plan.
+struct SglangExl3CpuPlanInfo {
+    int32_t id;
+    const char* name;
+    bool fixed;
+    int32_t hidden, intermediate, bits_w13, bits_w2, swizzled;
+    float act_limit;
+    const char* min_isa;
+    bool available;
 };
 
 namespace sglang::exl3_cpu {
@@ -61,7 +81,7 @@ struct __attribute__((visibility("hidden"))) Exl3CpuKernel {
 
     // The tier this build runs at (isa.hpp's isa_name): scalar, avx2, bw, vnni or vbmi.
     static std::string isa();
-    // The compiled plans (kernel.h's SglangExl3CpuPlanInfo) as a JSON array of objects, the generic plan first;
+    // The compiled plans (SglangExl3CpuPlanInfo) as a JSON array of objects, the generic plan first;
     // `available` follows the build's -march.
     static std::string plans_json();
     // The most tokens a chunk holds in this build (math.hpp's CHUNK_M = MAX_M / kActRows).
@@ -72,4 +92,11 @@ struct __attribute__((visibility("hidden"))) Exl3CpuKernel {
         std::string worker_trace_prefix, int64_t worker_trace_capacity, int64_t worker_trace_min_us,
         std::string scratch_trace_prefix, std::string trace_gate_path);
 };
+
+// The compiled plans, the generic plan first; `available` follows the build's -march.
+__attribute__((visibility("hidden"))) std::vector<SglangExl3CpuPlanInfo> exl3_cpu_plans();
+// The first available fixed plan that accepts these layer facts, else the generic plan: for native harnesses (the
+// benches); Python chooses from the plans' list itself.
+__attribute__((visibility("hidden"))) int32_t exl3_cpu_match_plan(
+    int32_t hidden, int32_t intermediate, int32_t bits_w13, int32_t bits_w2, int32_t swizzled, float act_limit);
 }  // namespace sglang::exl3_cpu

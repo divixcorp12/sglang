@@ -143,7 +143,7 @@ The optimized build also runs M-row calls, as the DSpark draft's CPU thread does
   --routed-layers=2           fixture layers the routed workloads rotate over (shared by all of them)
 Token t's input is the layer's fixture input rotated by 641 * t elements. There is no frozen reference: validation
 checks the outputs are finite and repeat bit for bit. Every optimized benchmark reports plan, the id its
-layers were registered on (kernel.h's SglangExl3CpuPlan: 0 generic, 1 DSV4.1), and the context records the build's chunk_m (exl3_cpu_chunk_m).
+layers were registered on (entry.h's SglangExl3CpuPlan: 0 generic, 1 DSV4.1), and the context records the build's chunk_m (exl3_cpu_chunk_m).
 
 ab.sh BASE_BUILD HEAD_BUILD NEW_RESULTS_DIR [flags] runs two optimized builds as alternating processes for
 EXL3_BENCH_ROUNDS rounds (default 8) and writes summary.tsv (median p50 per build, head/base, the plan each ran).

@@ -1,5 +1,5 @@
 // Standalone ASan/UBSan harness: no Python runtime or CUDA dependencies.
-#include "kernel.h"
+#include "entry.h"
 #include "quant.hpp"
 #include "../upstream/kernels.h"
 #include <algorithm>

@@ -15,7 +15,7 @@
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h"
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/single_job.hpp"
 #if defined(ENGINE_KERNEL_EXL3)
-#include "../../../../python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h"
+#include "../../../../python/sglang/kernels/jit/csrc/exl3/optimized/entry.h"
 #else
 #include "../../../../python/sglang/kernels/jit/csrc/moe/formats/fake/fake_kernel.h"
 #endif

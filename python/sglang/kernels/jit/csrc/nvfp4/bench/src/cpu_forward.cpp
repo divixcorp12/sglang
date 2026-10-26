@@ -1,5 +1,6 @@
 // Bare CpuExpertForward timing; no Python, CUDA or service transport.
-#include "kernel.h"
+#include "entry.h"
+#include "../../../moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include "quant.hpp"
 #include "../../upstream/kernels.h"
 #include <benchmark/benchmark.h>

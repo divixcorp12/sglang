@@ -14,7 +14,8 @@
 
 #include "device_sim.h"
 #include "job_stream.h"
-#include "kernel.h"
+#include "entry.h"
+#include "../../moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include "placement.h"
 #include "self_test.h"
 #include "stack.h"

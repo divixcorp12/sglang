@@ -40,7 +40,7 @@ the layer's parameter list `[w13_layout, inv_input_scale13 bits, inv_input_scale
 bit patterns in int64 values), from which `Nvfp4CpuKernel::params` builds the `SglangNvfp4CpuParams` (`entry.h`) that
 `make_layer` validates. A layer is a value of views, its params stored in it; the registrant keeps the slabs alive while
 the host may read them. The optimized kernel never repacks or expands full weight rows. A native caller does the same
-through `kernel.h`:
+through `entry.h`:
 
 ```cpp
 using Kernel = ::sglang::nvfp4_cpu::Nvfp4CpuKernel;

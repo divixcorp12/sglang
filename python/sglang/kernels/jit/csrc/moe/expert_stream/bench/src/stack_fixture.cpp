@@ -5,7 +5,7 @@
 
 #include "aligned.h"
 #include "fixture.h"
-#include "kernel.h"
+#include "entry.h"
 #include "placement.h"
 #include <algorithm>
 #include <array>

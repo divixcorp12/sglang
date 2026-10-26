@@ -1,10 +1,10 @@
 // A/B harness for the NVFP4 CPU expert kernel; run_nvfp4_cpu_forward_checks.sh builds and runs it.
-// It calls only the kernel type (Nvfp4CpuKernel, kernel.h). Every one-row output and status (status_of) is
+// It calls only the kernel type (Nvfp4CpuKernel, entry.h). Every one-row output and status (status_of) is
 // written to OUT in a fixed order: two revisions agree when nvfp4_cpu_dump_compare.py finds their files within its
 // tolerance (the kernel is built -Ofast, so they need not be byte-identical), each built with its own revision of
 // this harness. Batched rows must match their one-row calls within one Q8_0 quantum (check_batch).
 //   nvfp4_cpu_forward_ab OUT CORE [CORE...]     worker i runs on CORE i; the caller is worker 0.
-#include "kernel.h"
+#include "entry.h"
 #include "quant.hpp"
 #include "../upstream/kernels.h"
 #include <algorithm>

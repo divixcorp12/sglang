@@ -57,7 +57,7 @@ for side in ("base", "head"):
             name = b["name"].split("/", 1)[1].removesuffix("/manual_time")
             entry = rows.setdefault(name, {}).setdefault(side, {"p50": [], "plan": set()})
             entry["p50"].append(b["p50_us"])
-            entry["plan"].add({0: "generic", 1: "dsv41"}[int(b["plan"])])  # kernel.h's SglangExl3CpuPlan ids
+            entry["plan"].add({0: "generic", 1: "dsv41"}[int(b["plan"])])  # entry.h's SglangExl3CpuPlan ids
 with open(f"{results}/summary.tsv", "w") as out:
     out.write("benchmark\tbase_p50_us\thead_p50_us\thead/base\tbase_plan\thead_plan\n")
     for name, sides in rows.items():

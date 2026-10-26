@@ -56,7 +56,7 @@ Standalone CPU library on divix01 (no CUDA compilation, no torch):
     --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ \
     --output /data/models/exl3_exp/clean_integration/sglang/libexl3_cpu.so
 
-Link the consumer against libexl3_cpu.so and OpenMP and use kernel.h: the kernel's make_layer over the experts' slabs,
+Link the consumer against libexl3_cpu.so and OpenMP and use entry.h: the kernel's make_layer over the experts' slabs,
 then check and forward (below). The vendored per-expert kernel (../moe_mul1.cpp, which the expert-stream bench builds
 as its baseline against baseline_moe_mul1.h) is a separate thing; nothing in this directory declares upstream's API.
 

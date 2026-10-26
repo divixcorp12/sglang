@@ -10,7 +10,7 @@
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
 #include "../../moe/expert_stream/host/cpu_experts/routes.hpp"
 #include "../../moe/expert_stream/host/cpu_experts/scratch.hpp"
-#include "kernel.h"
+#include "entry.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
