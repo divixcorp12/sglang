@@ -457,7 +457,7 @@ class CopyEngine {
     started_.set_value(error);
     if (!error.empty()) return;
     Queue in_flight;
-    uint64_t idle = 0;  // empty polls since the last progress, counted against spin_iters_
+    IdleBackoff backoff{spin_iters_};  // empty polls since the last progress
     while (true) {
       // Read before the rings: stop() comes after the last submit, so a stop seen here has every job in them.
       const bool stopping = stop_.load(std::memory_order_acquire);
@@ -471,8 +471,8 @@ class CopyEngine {
           ((in_flight.empty() && !drip_busy) || now_ns() > drain_deadline_.load(std::memory_order_relaxed)))
         break;
       if (progressed) {
-        idle = 0;
-      } else if (!in_flight.empty() || drip_busy || ++idle < spin_iters_) {
+        backoff.reset();
+      } else if (!in_flight.empty() || drip_busy || backoff.spin()) {
         _mm_pause();
       } else {
         const auto ready = [this] { return !rings_empty() || stop_.load(std::memory_order_acquire); };
@@ -481,7 +481,7 @@ class CopyEngine {
           doorbell_.sleep_unless(ready, kDripPollNs);
         else
           doorbell_.sleep_unless(ready);
-        idle = 0;
+        backoff.reset();
       }
     }
     backend_->shutdown(in_flight.empty() && !(owner_->drip_on() && owner_->drip_busy()) && broken_ == 0);

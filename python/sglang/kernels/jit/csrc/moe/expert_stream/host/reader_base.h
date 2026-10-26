@@ -118,6 +118,16 @@ inline uint64_t idle_budget(int64_t spin_ns) {
   return static_cast<uint64_t>(std::max<int64_t>(1, spin_ns / per_pause));
 }
 
+// Poll-count half of "spin, then sleep": the caller pauses and sleeps itself, so busy-polling and wake-up stay its own.
+struct IdleBackoff {
+  uint64_t budget = 1;  // idle_budget(spin_ns)
+  uint64_t idle = 0;    // empty polls since the last reset()
+
+  void reset() { idle = 0; }
+  // Counts one empty poll; true while the budget has polls left to spin.
+  bool spin() { return ++idle < budget; }
+};
+
 struct StageRecord;
 
 // Count of clock reads taken for trace records, so a test can show that a disabled trace takes none. Written only

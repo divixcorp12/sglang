@@ -213,7 +213,7 @@ class RamThread {
     pinned_[g].set_value(error);
     if (error != 0) return;
     tier_->set_counter(g, kRunning, 1);
-    uint64_t idle = 0;  // empty polls since the last request, counted against spin_iters_
+    IdleBackoff backoff{spin_iters_};  // empty polls since the last request
     while (!stop_.load(std::memory_order_relaxed)) {
       const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
       if (epoch & 1u) {
@@ -221,8 +221,8 @@ class RamThread {
         continue;
       }
       if (tier_->pump_demand(g)) {
-        idle = 0;
-      } else if (++idle < spin_iters_) {
+        backoff.reset();
+      } else if (backoff.spin()) {
         if (!busy_poll_) _mm_pause();
       } else {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
