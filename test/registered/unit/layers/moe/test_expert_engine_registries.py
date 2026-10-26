@@ -87,11 +87,11 @@ def no_bound_service():
 
 def test_get_format_returns_the_registered_class():
     assert get_format("exl3") is Exl3ExpertFormat
-    assert registered_formats() == ("exl3", "mxfp4", "nvfp4")
+    assert registered_formats() == ("exl3", "gptq_int3", "mxfp4", "nvfp4")
 
 
 def test_an_unknown_format_name_raises_naming_the_registered_formats():
-    with pytest.raises(ValueError, match=r"no expert format 'nvfp9'.*\['exl3', 'mxfp4', 'nvfp4'\]"):
+    with pytest.raises(ValueError, match=r"no expert format 'nvfp9'.*\['exl3', 'gptq_int3', 'mxfp4', 'nvfp4'\]"):
         get_format("nvfp9")
 
 

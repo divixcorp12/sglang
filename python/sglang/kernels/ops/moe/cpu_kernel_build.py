@@ -1,10 +1,11 @@
 """How a format's CPU expert kernel is compiled into its expert-stream host module.
 
 The kernel's sources join the host module's ``cpp_files`` (``expert_stream_transport._host_module_cached``) and take
-their own flags (``load_jit``'s ``source_cflags``) in place of the module's: ``-Ofast`` and the resolved ``-march``
+their own flags (``load_jit``'s ``source_cflags``) in place of the module's: EXL3/NVFP4 use ``-Ofast`` and the resolved ``-march``
 (the toolchain's base flags carry it, so ``SGLANG_JIT_HOST_MARCH`` reaches the kernel), never ``-fno-finite-math-only``
 (it changes EXL3's bits). The host's own files keep the module flags. Each kernel is one translation unit, and so is
-each of its C files; a format with no CPU kernel compiles none.
+each of its C files; a format with no CPU kernel compiles none. GPTQ INT3 instead uses ``-O3`` with explicit
+FP16 rounding boundaries and contraction disabled outside explicit SIMD FMAs.
 """
 
 from __future__ import annotations
@@ -126,8 +127,15 @@ def _fake(config: ExpertStreamConfig) -> CpuKernelBuild:
     )
 
 
+def _gptq_int3(config: ExpertStreamConfig) -> CpuKernelBuild:
+    # Preserve explicit FP16 boundaries; use the engine's existing worker pool.
+    flags = ("-std=c++20", "-O3", "-ffp-contract=off", "-pthread", *_HIDDEN)
+    source = "moe/gptq_int3/kernel.cpp"
+    return CpuKernelBuild(cpp_files=(source,), source_cflags=((source, flags),))
+
+
 # The formats that have a CPU kernel; one with none (mxfp4) compiles none.
-_KERNELS = {"exl3": _exl3, "nvfp4": _nvfp4, "fake": _fake}
+_KERNELS = {"exl3": _exl3, "nvfp4": _nvfp4, "fake": _fake, "gptq_int3": _gptq_int3}
 
 
 def cpu_kernel_build(fmt: str, config: ExpertStreamConfig) -> Optional[CpuKernelBuild]:

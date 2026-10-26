@@ -143,6 +143,11 @@ class _FormatEntry(msgspec.Struct, frozen=True):
 # Formats are imported on first use, so the registry loads without torch. A format adds its entry here
 # together with its ``formats/<name>.py``.
 _FORMATS: dict[str, _FormatEntry] = {
+    "gptq_int3": _FormatEntry(
+        target="sglang.srt.layers.moe.expert_engine.formats.gptq_int3:GptqInt3ExpertFormat",
+        # Deliberate explicit opt-in. A generic GPTQ config may have a different bit width, group map or backend.
+        quant_methods=(),
+    ),
     "exl3": _FormatEntry(
         target="sglang.srt.layers.moe.expert_engine.formats.exl3:Exl3ExpertFormat",
         quant_methods=("exl3",),
