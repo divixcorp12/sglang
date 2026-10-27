@@ -10,7 +10,7 @@
 
 #include "aligned.h"
 #include "device_sim.h"
-#include "kernel.h"
+#include "entry.h"
 #include "stack.h"
 #include "stack_fixture.h"
 #include <algorithm>

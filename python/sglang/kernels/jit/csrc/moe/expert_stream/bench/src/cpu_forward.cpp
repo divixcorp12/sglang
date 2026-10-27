@@ -15,7 +15,7 @@
 #include <benchmark/benchmark.h>
 
 #include "fixture.h"
-#include "kernel.h"
+#include "entry.h"
 #ifdef EXL3_BENCH_BASELINE
 #include "baseline_moe_mul1.h"
 #endif

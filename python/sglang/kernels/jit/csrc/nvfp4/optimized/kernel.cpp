@@ -4,7 +4,8 @@
 // job interface of Nvfp4CpuKernel (entry.h); ExpertForward<Nvfp4Quant> (expert_stream/host/cpu_experts/expert_forward.hpp)
 // holds the layer and call checks. Nvfp4Quant (quant.hpp) reads a
 // layer's slots under a Shape (shapes.hpp), and each tier's dot product is in math_scalar.hpp or math_avx2.hpp.
-#include "kernel.h"
+#include "entry.h"
+#include "../../moe/expert_stream/host/cpu_experts/binding.hpp"
 #include "quant.hpp"
 #include "math_scalar.hpp"
 #include "math_avx2.hpp"

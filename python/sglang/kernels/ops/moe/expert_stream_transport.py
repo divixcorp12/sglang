@@ -296,7 +296,7 @@ class CpuKernelOptions:
         self._module = module
 
     def cpu_kernel_plans(self) -> str:
-        """The kernel's compiled plans as JSON (EXL3: kernel.h's ``SglangExl3CpuPlanInfo`` objects); ``available``
+        """The kernel's compiled plans as JSON (EXL3: entry.h's ``SglangExl3CpuPlanInfo`` objects); ``available``
         follows the build's -march."""
         return str(self._module.expert_stream_cpu_kernel_plans())
 

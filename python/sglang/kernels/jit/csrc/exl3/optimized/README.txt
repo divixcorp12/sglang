@@ -56,7 +56,7 @@ Standalone CPU library on divix01 (no CUDA compilation, no torch):
     --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ \
     --output /data/models/exl3_exp/clean_integration/sglang/libexl3_cpu.so
 
-Link the consumer against libexl3_cpu.so and OpenMP and use kernel.h: the kernel's make_layer over the experts' slabs,
+Link the consumer against libexl3_cpu.so and OpenMP and use entry.h: the kernel's make_layer over the experts' slabs,
 then check and forward (below). The vendored per-expert kernel (../moe_mul1.cpp, which the expert-stream bench builds
 as its baseline against baseline_moe_mul1.h) is a separate thing; nothing in this directory declares upstream's API.
 
@@ -105,7 +105,8 @@ Code layout
                         integer accumulate
   register_kernels.hpp  the 3-bit register kernels (register_tiles<M>, kRegisterBudget): the DSV4.1 plan's GEMVs
   tiles.hpp             run_tiles: a chunk's GEMV on the build's tier (register kernels, or Tiles per 128-input block)
-  phases.hpp            ForwardCtx, ForwardArena, ForwardJob and the phases' work besides the GEMVs (prepare, transform, SiLU)
+  phases.hpp            ForwardCtx, Activations, ForwardJob (the context and its one-buffer scratch) and the phases' work
+                        besides the GEMVs (prepare, transform, SiLU)
   forward_plan.hpp      PlanTraits, ForwardPlan<Shape> (the five phases' tasks), prepare_job and the plan registry
   shapes.hpp            the plans' Shapes and Chunk; quant.hpp Exl3Quant and Experts<Shape>; projection.hpp
                         Exl3Projection; half.hpp the fp16 type; kernel.cpp Exl3CpuKernel (entry.h)

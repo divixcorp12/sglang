@@ -1,7 +1,8 @@
 // Standalone harness for the EXL3 CPU kernel's job interface (exl3/optimized/entry.h): random generic-plan layers and calls,
 // each run two ways that must agree bit for bit -- one job through a JobRunner on a one-worker team, and the same on a
 // team of several workers (dynamic runs, whichever worker is free). Built by test_exl3_cpu_job_interface.py with kernel.cpp at the tier under test.
-#include "../../../../python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h"
+#include "../../../../python/sglang/kernels/jit/csrc/exl3/optimized/entry.h"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/single_job.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdint>

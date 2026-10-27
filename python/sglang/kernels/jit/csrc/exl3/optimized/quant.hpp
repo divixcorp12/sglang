@@ -7,7 +7,7 @@
 #endif
 #include "projection.hpp"
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
-#include "kernel.h"
+#include "entry.h"
 #include <array>
 #include <cmath>
 #include <cstddef>

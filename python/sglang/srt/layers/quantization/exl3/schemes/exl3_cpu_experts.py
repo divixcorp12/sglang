@@ -38,7 +38,7 @@ class Exl3LayerFacts(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Exl3CpuPlan(msgspec.Struct, frozen=True, kw_only=True):
-    """One compiled plan, as the host's ``cpu_kernel_plans`` lists it (kernel.h's ``SglangExl3CpuPlanInfo``). A fixed plan
+    """One compiled plan, as the host's ``cpu_kernel_plans`` lists it (entry.h's ``SglangExl3CpuPlanInfo``). A fixed plan
     accepts exactly its facts; the generic plan (``fixed`` false) accepts any layer."""
 
     id: int
@@ -184,7 +184,7 @@ class Exl3CpuQuantTrait:
         return self._plan_list
 
     def _params(self, facts: Exl3LayerFacts, plan: int) -> tuple[int, ...]:
-        """The kernel's parameter list (kernel.h's ``SglangExl3CpuParams`` fields in order); the host builds and
+        """The kernel's parameter list (entry.h's ``SglangExl3CpuParams`` fields in order); the host builds and
         validates the struct."""
         return (facts.bits_w13, facts.bits_w2, facts.swizzled, plan)
 
