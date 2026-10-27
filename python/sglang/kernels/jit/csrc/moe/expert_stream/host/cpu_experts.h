@@ -550,6 +550,7 @@ class BasicCpuExpertEngine {
       else
         team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);
     }
+
     window_->close();
     window_->drain();
     window_->join();

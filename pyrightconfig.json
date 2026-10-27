@@ -1,6 +1,6 @@
 {
   "include": [
-    "python/sglang/srt/models"
+    "analysis"
   ],
   "pythonVersion": "3.11",
   "reportMissingImports": false,

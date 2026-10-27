@@ -1,6 +1,6 @@
 {
   "include": [
-    "analysis/mimo-v8-source-review"
+    "python/sglang/srt/models"
   ],
   "pythonVersion": "3.11",
   "reportMissingImports": false,
