@@ -872,6 +872,9 @@ class MiMoV2Attention(nn.Module):
     def _qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if self.qkv_output_perm is not None:
+            # Moved once: an offloaded qkv_proj's weight is on the host, so the loader cannot know this device.
+            if self.qkv_output_perm.device != qkv.device:
+                self.qkv_output_perm = self.qkv_output_perm.to(qkv.device)
             qkv = qkv.index_select(-1, self.qkv_output_perm)
         return qkv
 
