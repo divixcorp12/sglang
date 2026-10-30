@@ -77,6 +77,42 @@ struct GptqInt3MoeObj : public tvm::ffi::Object {
     runner_->run(layer, call);
   }
 
+  /// The lossless adapter's bit repacking (cpu_experts/gptq_int3.py prepare_projection): canonical qweight int32
+  /// [K/32*3, N], each column a 3-bit code stream, into low2 uint8 [N, K/4] and high1 uint8 [N, K/8] planes.
+  void adapt(const tvm::ffi::TensorView qweight, const tvm::ffi::TensorView low, const tvm::ffi::TensorView high) {
+    check_cpu(qweight, "qweight", 2, kDLInt, 32);
+    check_cpu(low, "low2 plane", 2, kDLUInt, 8);
+    check_cpu(high, "high1 plane", 2, kDLUInt, 8);
+    const int64_t n = qweight.size(1), k = qweight.size(0) / 3 * 32;
+    if (qweight.size(0) % 3 || k % 128 || low.size(0) != n || low.size(1) != k / 4 || high.size(0) != n ||
+        high.size(1) != k / 8)
+      throw std::invalid_argument("GPTQ INT3 MoE: inconsistent adapter shapes");
+    const auto* q = static_cast<const uint32_t*>(qweight.data_ptr());
+    auto* lo = static_cast<uint8_t*>(low.data_ptr());
+    auto* hi = static_cast<uint8_t*>(high.data_ptr());
+#pragma omp parallel for schedule(static)
+    for (int64_t col = 0; col < n; ++col) {
+      for (int64_t k8 = 0; k8 < k; k8 += 8) {
+        uint8_t h = 0, l0 = 0, l1 = 0;
+        for (int j = 0; j < 8; ++j) {
+          const int64_t bit = (k8 + j) * 3, word = bit >> 5;
+          const int shift = static_cast<int>(bit & 31);
+          uint32_t v = q[word * n + col] >> shift;
+          if (shift > 29) v |= q[(word + 1) * n + col] << (32 - shift);
+          v &= 7;
+          h |= static_cast<uint8_t>((v >> 2) << j);
+          if (j < 4)
+            l0 |= static_cast<uint8_t>((v & 3) << (2 * j));
+          else
+            l1 |= static_cast<uint8_t>((v & 3) << (2 * (j - 4)));
+        }
+        hi[col * (k / 8) + k8 / 8] = h;
+        lo[col * (k / 4) + k8 / 4] = l0;
+        lo[col * (k / 4) + k8 / 4 + 1] = l1;
+      }
+    }
+  }
+
   int64_t max_rows() const { return K::max_rows(); }
   int64_t max_routes() const { return K::max_routes(); }
 
@@ -90,6 +126,7 @@ void register_gptq_int3_moe() {
   refl::ObjectDef<GptqInt3MoeObj>()
       .def(refl::init<int64_t>(), "__init__")
       .def("forward", &GptqInt3MoeObj::forward)
+      .def("adapt", &GptqInt3MoeObj::adapt)
       .def("max_rows", &GptqInt3MoeObj::max_rows)
       .def("max_routes", &GptqInt3MoeObj::max_routes);
 }

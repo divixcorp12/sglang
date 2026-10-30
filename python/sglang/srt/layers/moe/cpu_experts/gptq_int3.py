@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping, Optional
 
 import torch
 
@@ -51,6 +51,7 @@ def prepare_projection(
     group_size: int = 128,
     symmetric: bool = True,
     desc_act: bool = False,
+    repack: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]] = None,
 ) -> Projection:
     """Validate policy and exact QDQ, then repack integer bits without rounding scales.
 
@@ -92,12 +93,17 @@ def prepare_projection(
         raise ValueError("scales must be finite nonzero FP16; signed scales are valid")
     if not bool((_unpack(z, n, 1) == 3).all()):
         raise ValueError("symmetric INT3 requires packed zero3 plus GPTQ offset1")
-    code = _unpack(q, k, 0).t().contiguous()
     # All codes must have finite FP16 QDQ, even if a particular code is absent from this projection.
     if not bool(
         torch.isfinite((s.float().unsqueeze(-1) * torch.arange(-4, 4)).half()).all()
     ):
         raise ValueError("FP16 QDQ overflows")
+    if repack is not None:
+        # A native repacking of the same bits (GptqInt3Moe.adapt), held equal to the reference below by the tests.
+        low, high = torch.empty((n, k // 4), dtype=torch.uint8), torch.empty((n, k // 8), dtype=torch.uint8)
+        repack(q, low, high)
+        return Projection(low, high, s.t().contiguous())
+    code = _unpack(q, k, 0).t().contiguous()
     flat = code.flatten().to(torch.int16)
     low = ((flat.reshape(-1, 4) & 3) << torch.arange(0, 8, 2)).sum(-1).to(torch.uint8)
     high = ((flat.reshape(-1, 8) >> 2) << torch.arange(8)).sum(-1).to(torch.uint8)
@@ -154,8 +160,15 @@ class ExportedExperts:
     its owner keys and the export root. Nothing from the checkpoint is executed or modified.
     """
 
-    def __init__(self, root: str | Path, *, expected_manifest_sha256: str):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        expected_manifest_sha256: str,
+        repack: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]] = None,
+    ):
         self.root = Path(root).resolve()
+        self.repack = repack
         raw = self._read("export-manifest.json")
         if hashlib.sha256(raw).hexdigest() != expected_manifest_sha256:
             raise ValueError("export manifest SHA mismatch")
@@ -201,7 +214,9 @@ class ExportedExperts:
             raise ValueError("expert tensor ownership/key mismatch")
         return prepare_expert(
             *(
-                prepare_projection({f: tensors[prefix + n + "." + f] for f in fields})
+                prepare_projection(
+                    {f: tensors[prefix + n + "." + f] for f in fields}, repack=self.repack
+                )
                 for n in names
             )
         )

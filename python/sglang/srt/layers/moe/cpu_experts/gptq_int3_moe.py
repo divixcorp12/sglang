@@ -69,8 +69,10 @@ class GptqInt3Runtime:
         GptqInt3CpuTrait().check_environment()
         if experts_per_layer < 8:
             raise ValueError("SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER must hold at least one token's 8 routes")
-        self.reader = ExportedExperts(root, expected_manifest_sha256=manifest_sha256)
         self.native = gptq_int3_moe_type()(threads)
+        self.reader = ExportedExperts(
+            root, expected_manifest_sha256=manifest_sha256, repack=self.native.adapt
+        )
         self.max_rows = int(self.native.max_rows())
         self.max_routes = int(self.native.max_routes())
         self.pool = ThreadPoolExecutor(max_workers=load_threads, thread_name_prefix="int3-load")

@@ -215,30 +215,32 @@ def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
     return torch.cat(all_q + all_k + all_v, dim=0)
 
 
-def _block_aligned_qkv_reorder(
-    weight: torch.Tensor,
-    scale_shards: Tuple[torch.Tensor, ...],
-    qkv_sizes: Optional[Tuple[int, int, int]],
-    block_size: int,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """De-interleave whole FP8 blocks with their own scales, bit-exact: (weight, scale_inv), or None when a q/k/v slice
-    splits a block and the caller must requantize. ``weight`` is the rank's checkpoint shards concatenated."""
-    if qkv_sizes is None or any(size % block_size for size in qkv_sizes):
-        return None
+
+
+
+
+def _keep_checkpoint_qkv_layout(
+    *,
+    attention: nn.Module,
+    scale_param: torch.nn.Parameter,
+    ckpt_scale: torch.Tensor,
+    qkv_sizes: Tuple[int, int, int],
+    ckpt_tp: int,
+) -> None:
+    """TP 1 holds every checkpoint shard: keep qkv_proj's FP8 rows (already loaded in checkpoint order) and their block
+    scales as stored, and record the output permutation that yields q|k|v, instead of requantizing re-cut blocks."""
+    default_weight_loader(scale_param, ckpt_scale)
     rows = sum(qkv_sizes)
-    shards = len(scale_shards)
-    if weight.shape[0] != shards * rows or any(s.shape[0] * block_size != rows for s in scale_shards):
-        return None
     offsets = (0, qkv_sizes[0], qkv_sizes[0] + qkv_sizes[1])
     perm = torch.cat(
         [
             torch.arange(i * rows + offset, i * rows + offset + size, device="cpu")
             for offset, size in zip(offsets, qkv_sizes)
-            for i in range(shards)
+            for i in range(ckpt_tp)
         ]
     )
-    scale = torch.cat(scale_shards, dim=0)
-    return weight[perm.to(weight.device)], scale[perm[::block_size] // block_size]
+    attention.qkv_output_perm = perm.to(scale_param.device)
+    logger.info(f"qkv_proj of {type(attention).__name__}: checkpoint FP8 blocks kept, output permuted to q|k|v")
 
 
 
@@ -277,16 +279,17 @@ def _resolve_deferred_qkv_scale_inv(
         rows_per_ckpt_shard = weight_rows // shards_per_rank
         block_k = ckpt_scale.shape[1]
 
-        reordered = _block_aligned_qkv_reorder(
-            weight_data,
-            my_scale_shards,
-            _get_ckpt_qkv_shard_sizes(config, scale_name, ckpt_tp) if config else None,
-            block_size,
+        layout = (
+            _get_ckpt_qkv_shard_sizes(config, scale_name, ckpt_tp) if config is not None else None
         )
-        if reordered is not None:
-            weight_param.data.copy_(reordered[0])
-            default_weight_loader(scale_param, reordered[1])
-            logger.info(f"Reordered qkv {scale_name}: whole FP8 blocks, no requant")
+        if shards_per_rank == ckpt_tp and layout is not None:
+            _keep_checkpoint_qkv_layout(
+                attention=model.get_submodule(weight_name.rsplit(".", 2)[0]),
+                scale_param=scale_param,
+                ckpt_scale=ckpt_scale,
+                qkv_sizes=layout,
+                ckpt_tp=ckpt_tp,
+            )
             continue
 
         device = weight_data.device
@@ -849,6 +852,14 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
+        # Set by the loader when qkv_proj keeps the checkpoint's interleaved row order (_keep_checkpoint_qkv_layout).
+        self.qkv_output_perm: Optional[torch.Tensor] = None
+
+    def _qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.qkv_output_perm is not None:
+            qkv = qkv.index_select(-1, self.qkv_output_perm)
+        return qkv
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -870,7 +881,7 @@ class MiMoV2Attention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self._qkv(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
@@ -917,7 +928,7 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self._qkv(hidden_states)
         if (
             forward_batch.forward_mode.is_target_verify()
             and qkv.shape[0] > 0

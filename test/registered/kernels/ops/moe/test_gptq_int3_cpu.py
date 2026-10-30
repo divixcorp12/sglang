@@ -197,6 +197,22 @@ def test_adapter_preserves_every_code_and_scale_bit():
     assert p.scales.data_ptr() != t["scales"].data_ptr()
 
 
+def test_native_repack_equals_reference_adapter():
+    """The serving path's native plane repacking (GptqInt3Moe.adapt) must give the reference adapter's exact bytes."""
+    if not NATIVE:
+        pytest.skip("requires x86-64 Linux and a C++20 compiler")
+    from sglang.kernels.ops.moe.gptq_int3_moe import gptq_int3_moe_type
+
+    native = gptq_int3_moe_type()(1)
+    for n, k, seed in ((256, 384, 11), (384, 1024, 12)):
+        t, _ = projection(n, k, seed)
+        reference = prepare_projection(t)
+        repacked = prepare_projection(t, repack=native.adapt)
+        assert torch.equal(repacked.low2, reference.low2)
+        assert torch.equal(repacked.high1, reference.high1)
+        assert torch.equal(repacked.scales.view(torch.int16), reference.scales.view(torch.int16))
+
+
 def test_format_is_explicit_cpu_only_and_keeps_slab_lifetimes():
     from sglang.srt.layers.moe.expert_engine.formats import (
         format_for_quantization_config,

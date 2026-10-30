@@ -299,30 +299,27 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
             load_deferred(model, fp8_projection)
 
 
-    def test_block_aligned_shards_deinterleave_without_requant(self):
-        """With whole 128-row q/k/v slices, merging TP=4 checkpoint shards keeps every FP8 byte and scale: the result
-        dequantizes to exactly the reference de-interleave of the dequantized shards."""
+    def test_tp1_keeps_checkpoint_blocks_and_permutes_output(self):
+        """At TP 1 every checkpoint shard is local: the FP8 rows and block scales stay as stored (no requant), and the
+        recorded output permutation turns the interleaved projection into exactly the reference q|k|v layout."""
         from sglang.srt.models.mimo_v2 import (
-            _block_aligned_qkv_reorder,
             _deinterleave_qkv_shards,
+            _keep_checkpoint_qkv_layout,
         )
 
-        sizes, k, shards = (256, 128, 128), 256, 4
-        rows = sum(sizes)
+        sizes, ckpt_tp, k = (24, 6, 4), 8, 16
         g = torch.Generator().manual_seed(0)
-        weight = (torch.randn(shards * rows, k, generator=g) * 100).to(torch.float8_e4m3fn)
-        scale_shards = tuple(torch.rand(rows // 128, k // 128, generator=g) + 0.5 for _ in range(shards))
-
-        def dequant(w, s):
-            return w.float() * s.repeat_interleave(128, 0).repeat_interleave(128, 1)
-
-        expected = _deinterleave_qkv_shards(
-            [dequant(w, s) for w, s in zip(weight.chunk(shards), scale_shards)], *sizes
+        weight = torch.randint(-8, 8, (ckpt_tp * sum(sizes), k), generator=g).double()
+        ckpt_scale = torch.rand(3, 1, generator=g)
+        attention = torch.nn.Module()
+        scale_param = torch.nn.Parameter(torch.empty_like(ckpt_scale), requires_grad=False)
+        _keep_checkpoint_qkv_layout(
+            attention=attention, scale_param=scale_param, ckpt_scale=ckpt_scale, qkv_sizes=sizes, ckpt_tp=ckpt_tp
         )
-        new_weight, new_scale = _block_aligned_qkv_reorder(weight, scale_shards, sizes, 128)
-        self.assertEqual(new_weight.dtype, torch.float8_e4m3fn)
-        self.assertTrue(torch.equal(dequant(new_weight, new_scale), expected))
-        self.assertIsNone(_block_aligned_qkv_reorder(weight, scale_shards, (192, 128, 128), 128))
+        self.assertTrue(torch.equal(scale_param.data, ckpt_scale))
+        x = torch.randint(-8, 8, (5, k), generator=g).double()
+        expected = x @ _deinterleave_qkv_shards(list(weight.chunk(ckpt_tp)), *sizes).t()
+        self.assertTrue(torch.equal((x @ weight.t()).index_select(-1, attention.qkv_output_perm), expected))
 
 
 if __name__ == "__main__":
