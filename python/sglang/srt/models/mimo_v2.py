@@ -222,24 +222,36 @@ def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
 def _keep_checkpoint_qkv_layout(
     *,
     attention: nn.Module,
+    weight_param: torch.nn.Parameter,
     scale_param: torch.nn.Parameter,
     ckpt_scale: torch.Tensor,
     qkv_sizes: Tuple[int, int, int],
     ckpt_tp: int,
+    block_size: int = 128,
 ) -> None:
-    """TP 1 holds every checkpoint shard: keep qkv_proj's FP8 rows (already loaded in checkpoint order) and their block
-    scales as stored, and record the output permutation that yields q|k|v, instead of requantizing re-cut blocks."""
-    default_weight_loader(scale_param, ckpt_scale)
+    """TP 1 holds every checkpoint shard. Each shard was block-quantized on its own, so keep its FP8 rows (loaded in
+    checkpoint order) zero-padded to its block boundary, keep every block scale as stored, and record the output
+    permutation that yields q|k|v; the padded rows' outputs are never read. Nothing is requantized."""
     rows = sum(qkv_sizes)
+    padded = -(-rows // block_size) * block_size
+    if ckpt_scale.shape[0] != ckpt_tp * padded // block_size:
+        raise ValueError(
+            f"qkv scale rows {ckpt_scale.shape[0]} are not {ckpt_tp} shards of {padded // block_size} blocks"
+        )
+    weight = weight_param.data
+    kept = torch.zeros((ckpt_tp * padded, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+    kept.view(ckpt_tp, padded, -1)[:, :rows].copy_(weight.view(ckpt_tp, rows, -1))
+    weight_param.data = kept
+    scale_param.data = ckpt_scale.to(device=scale_param.device, dtype=scale_param.dtype).contiguous()
     offsets = (0, qkv_sizes[0], qkv_sizes[0] + qkv_sizes[1])
     perm = torch.cat(
         [
-            torch.arange(i * rows + offset, i * rows + offset + size, device="cpu")
+            torch.arange(i * padded + offset, i * padded + offset + size, device="cpu")
             for offset, size in zip(offsets, qkv_sizes)
             for i in range(ckpt_tp)
         ]
     )
-    attention.qkv_output_perm = perm.to(scale_param.device)
+    attention.qkv_output_perm = perm.to(weight.device)
     logger.info(f"qkv_proj of {type(attention).__name__}: checkpoint FP8 blocks kept, output permuted to q|k|v")
 
 
@@ -285,10 +297,12 @@ def _resolve_deferred_qkv_scale_inv(
         if shards_per_rank == ckpt_tp and layout is not None:
             _keep_checkpoint_qkv_layout(
                 attention=model.get_submodule(weight_name.rsplit(".", 2)[0]),
+                weight_param=weight_param,
                 scale_param=scale_param,
                 ckpt_scale=ckpt_scale,
                 qkv_sizes=layout,
                 ckpt_tp=ckpt_tp,
+                block_size=block_size,
             )
             continue
 

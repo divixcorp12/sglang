@@ -300,26 +300,38 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
 
 
     def test_tp1_keeps_checkpoint_blocks_and_permutes_output(self):
-        """At TP 1 every checkpoint shard is local: the FP8 rows and block scales stay as stored (no requant), and the
-        recorded output permutation turns the interleaved projection into exactly the reference q|k|v layout."""
+        """At TP 1 every checkpoint shard is local. Each shard's rows stay as stored (zero-padded to its own block
+        boundary), its block scales stay as stored (no requant), and the recorded output permutation turns the
+        interleaved projection into exactly the reference q|k|v layout."""
         from sglang.srt.models.mimo_v2 import (
             _deinterleave_qkv_shards,
             _keep_checkpoint_qkv_layout,
         )
 
-        sizes, ckpt_tp, k = (24, 6, 4), 8, 16
+        sizes, ckpt_tp, k, block = (24, 6, 4), 8, 16, 16
         g = torch.Generator().manual_seed(0)
         weight = torch.randint(-8, 8, (ckpt_tp * sum(sizes), k), generator=g).double()
-        ckpt_scale = torch.rand(3, 1, generator=g)
+        ckpt_scale = torch.rand(ckpt_tp * 3, 1, generator=g)
         attention = torch.nn.Module()
-        scale_param = torch.nn.Parameter(torch.empty_like(ckpt_scale), requires_grad=False)
+        weight_param = torch.nn.Parameter(weight.clone(), requires_grad=False)
+        scale_param = torch.nn.Parameter(torch.empty(1, 1), requires_grad=False)
         _keep_checkpoint_qkv_layout(
-            attention=attention, scale_param=scale_param, ckpt_scale=ckpt_scale, qkv_sizes=sizes, ckpt_tp=ckpt_tp
+            attention=attention,
+            weight_param=weight_param,
+            scale_param=scale_param,
+            ckpt_scale=ckpt_scale,
+            qkv_sizes=sizes,
+            ckpt_tp=ckpt_tp,
+            block_size=block,
         )
         self.assertTrue(torch.equal(scale_param.data, ckpt_scale))
+        kept = weight_param.data.view(ckpt_tp, 48, k)
+        self.assertTrue(torch.equal(kept[:, :34], weight.view(ckpt_tp, 34, k)))
+        self.assertFalse(kept[:, 34:].any())
         x = torch.randint(-8, 8, (5, k), generator=g).double()
         expected = x @ _deinterleave_qkv_shards(list(weight.chunk(ckpt_tp)), *sizes).t()
-        self.assertTrue(torch.equal((x @ weight.t()).index_select(-1, attention.qkv_output_perm), expected))
+        out = (x @ weight_param.data.t()).index_select(-1, attention.qkv_output_perm)
+        self.assertTrue(torch.equal(out, expected))
 
 
 if __name__ == "__main__":
