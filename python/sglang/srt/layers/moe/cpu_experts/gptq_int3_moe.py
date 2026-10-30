@@ -130,14 +130,15 @@ class GptqInt3LayerCache:
         self.capacity = min(runtime.experts_per_layer, num_experts)
         # torch.empty commits no pages: a slot costs memory once an expert is copied into it.
         self.slabs = {
-            name: torch.empty((self.capacity, *shape), dtype=dtype)
+            name: torch.empty((self.capacity, *shape), dtype=dtype, device="cpu")
             for name, (shape, dtype) in _slab_shapes(hidden, intermediate).items()
         }
         spec = GptqInt3CpuTrait(act_limit=0.0).layer_spec(self.slabs, self.capacity)
         self.hidden, self.intermediate = spec.hidden, spec.intermediate
-        self.slab_ptrs = torch.tensor([p for p, _ in spec.slabs], dtype=torch.int64)
-        self.slab_bytes = torch.tensor([b for _, b in spec.slabs], dtype=torch.int64)
-        self.lookup = torch.full((num_experts,), -1, dtype=torch.int32)
+        # The model is built under a CUDA default device; every host tensor names its device.
+        self.slab_ptrs = torch.tensor([p for p, _ in spec.slabs], dtype=torch.int64, device="cpu")
+        self.slab_bytes = torch.tensor([b for _, b in spec.slabs], dtype=torch.int64, device="cpu")
+        self.lookup = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
         self.slot_of: OrderedDict[int, int] = OrderedDict()
         self.free: list[int] = list(range(self.capacity))
 
@@ -206,7 +207,7 @@ class GptqInt3CpuExperts(nn.Module):
         x = hidden_states.to(device="cpu", dtype=torch.float16).contiguous()
         ids = topk_output.topk_ids.to(device="cpu", dtype=torch.int64)
         weights = topk_output.topk_weights.to(device="cpu", dtype=torch.float32).contiguous()
-        out = torch.empty((rows, self.hidden_size), dtype=torch.float32)
+        out = torch.empty((rows, self.hidden_size), dtype=torch.float32, device="cpu")
         for start in range(0, rows, self.rows_per_call):
             chunk = slice(start, start + self.rows_per_call)
             self._forward_chunk(x[chunk], ids[chunk], weights[chunk], out[chunk])

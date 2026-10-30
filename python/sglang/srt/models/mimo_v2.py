@@ -232,7 +232,7 @@ def _block_aligned_qkv_reorder(
     offsets = (0, qkv_sizes[0], qkv_sizes[0] + qkv_sizes[1])
     perm = torch.cat(
         [
-            torch.arange(i * rows + offset, i * rows + offset + size)
+            torch.arange(i * rows + offset, i * rows + offset + size, device="cpu")
             for offset, size in zip(offsets, qkv_sizes)
             for i in range(shards)
         ]
