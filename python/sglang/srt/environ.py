@@ -366,6 +366,19 @@ class Envs:
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
     # ===================================================================
+    # Experimental MiMo GPTQ INT3 CPU experts (no expert engine)
+    # ===================================================================
+    # The trusted export-manifest SHA256 of a mimo-hybrid-gptq-v1 checkpoint, from its verification receipt. Setting
+    # it is the opt-in; a checkpoint that declares the format is refused without it.
+    SGLANG_GPTQ_INT3_MANIFEST_SHA256 = EnvStr(None)
+    # Adapted experts kept in host memory per MoE layer (about 14.7 MB each for MiMo V2.6 Pro).
+    SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER = EnvInt(64)
+    # CPU expert worker threads, including the calling thread (unpinned).
+    SGLANG_GPTQ_INT3_THREADS = EnvInt(16)
+    # Threads that read, verify and adapt missing experts.
+    SGLANG_GPTQ_INT3_LOAD_THREADS = EnvInt(16)
+
+    # ===================================================================
     # Expert streaming engine: master switch and tiers
     # ===================================================================
     # Every name in the "Expert streaming engine" sections is read once, by sglang.srt.layers.moe.expert_engine.config

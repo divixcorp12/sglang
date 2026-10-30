@@ -146,62 +146,77 @@ def prepare_expert(
     )
 
 
-def load_exported_expert(
-    root: str | Path, layer: int, expert: int, *, expected_manifest_sha256: str
-) -> dict[str, torch.Tensor]:
-    """Read one original portable expert through an explicitly trusted manifest SHA.
+class ExportedExperts:
+    """A sealed export's expert reader whose manifest is verified once, at construction.
 
-    Hash the same bytes that safetensors decodes, bind every key to its requested owner, and
-    reject path escapes, incomplete manifests and other quant policies. This does not load
-    arbitrary Python from the checkpoint, nor modify it. The caller supplies the SHA from
-    its verified export receipt, rather than trusting an adjacent mutable seal alone.
+    The manifest bytes must hash to the caller's trusted SHA and declare a completed export with exactly ``POLICY``.
+    Each ``load`` then binds one payload to its manifest entry (size and SHA of the same bytes safetensors decodes),
+    its owner keys and the export root. Nothing from the checkpoint is executed or modified.
     """
-    from safetensors.torch import load
 
-    root = Path(root).resolve()
-    if (
-        type(layer) is not int
-        or type(expert) is not int
-        or not 1 <= layer <= 69
-        or not 0 <= expert < 288
-    ):
-        raise ValueError("invalid expert owner")
+    def __init__(self, root: str | Path, *, expected_manifest_sha256: str):
+        self.root = Path(root).resolve()
+        raw = self._read("export-manifest.json")
+        if hashlib.sha256(raw).hexdigest() != expected_manifest_sha256:
+            raise ValueError("export manifest SHA mismatch")
+        manifest = json.loads(raw)
+        if (
+            manifest.get("status") != "completed"
+            or manifest.get("format") != "mimo-hybrid-gptq-v1"
+            or manifest.get("expert_policy") != POLICY
+            or any(
+                type(manifest["expert_policy"][k]) is not type(v)
+                for k, v in POLICY.items()
+            )
+        ):
+            raise ValueError("export manifest policy/format/status mismatch")
+        self.files: dict = manifest["files"]
 
-    def read(relative):
-        path = (root / relative).resolve()
-        if root not in path.parents:
+    def _read(self, relative: str) -> bytes:
+        path = (self.root / relative).resolve()
+        if self.root not in path.parents:
             raise ValueError("export path escapes root")
         return path.read_bytes()
 
-    raw = read("export-manifest.json")
-    if hashlib.sha256(raw).hexdigest() != expected_manifest_sha256:
-        raise ValueError("export manifest SHA mismatch")
-    manifest = json.loads(raw)
-    if (
-        manifest.get("status") != "completed"
-        or manifest.get("format") != "mimo-hybrid-gptq-v1"
-        or manifest.get("expert_policy") != POLICY
-        or any(
-            type(manifest["expert_policy"][k]) is not type(v) for k, v in POLICY.items()
+    def load(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
+        from safetensors.torch import load
+
+        if (
+            type(layer) is not int
+            or type(expert) is not int
+            or not 1 <= layer <= 69
+            or not 0 <= expert < 288
+        ):
+            raise ValueError("invalid expert owner")
+        relative = f"experts/layer-{layer:02d}/expert-{expert:03d}/weights.safetensors"
+        entry = self.files[relative]
+        raw = self._read(relative)
+        if len(raw) != entry["bytes"] or hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+            raise ValueError("expert payload SHA/size mismatch")
+        tensors = load(raw)
+        prefix = f"model.layers.{layer}.mlp.experts.{expert}."
+        names = ("gate_proj", "up_proj", "down_proj")
+        fields = ("qweight", "qzeros", "scales", "g_idx")
+        if set(tensors) != {prefix + n + "." + f for n in names for f in fields}:
+            raise ValueError("expert tensor ownership/key mismatch")
+        return prepare_expert(
+            *(
+                prepare_projection({f: tensors[prefix + n + "." + f] for f in fields})
+                for n in names
+            )
         )
-    ):
-        raise ValueError("export manifest policy/format/status mismatch")
-    relative = f"experts/layer-{layer:02d}/expert-{expert:03d}/weights.safetensors"
-    entry = manifest["files"][relative]
-    raw = read(relative)
-    if len(raw) != entry["bytes"] or hashlib.sha256(raw).hexdigest() != entry["sha256"]:
-        raise ValueError("expert payload SHA/size mismatch")
-    tensors = load(raw)
-    prefix = f"model.layers.{layer}.mlp.experts.{expert}."
-    names = ("gate_proj", "up_proj", "down_proj")
-    fields = ("qweight", "qzeros", "scales", "g_idx")
-    if set(tensors) != {prefix + n + "." + f for n in names for f in fields}:
-        raise ValueError("expert tensor ownership/key mismatch")
-    return prepare_expert(
-        *(
-            prepare_projection({f: tensors[prefix + n + "." + f] for f in fields})
-            for n in names
-        )
+
+
+
+def load_exported_expert(
+    root: str | Path, layer: int, expert: int, *, expected_manifest_sha256: str
+) -> dict[str, torch.Tensor]:
+    """Read one original portable expert through an explicitly trusted manifest SHA (``ExportedExperts``).
+
+    The caller supplies the SHA from its verified export receipt, rather than trusting an adjacent mutable seal alone.
+    """
+    return ExportedExperts(root, expected_manifest_sha256=expected_manifest_sha256).load(
+        layer, expert
     )
 
 

@@ -406,6 +406,44 @@ class MoEGate(nn.Module):
         return logits.to(torch.float32)
 
 
+def _routed_experts(
+    *,
+    config: MiMoV2Config,
+    layer_id: int,
+    quant_config: Optional[QuantizationConfig],
+    prefix: str,
+    gptq_int3_cpu: bool,
+) -> nn.Module:
+    """The layer's routed experts: the quant config's FusedMoE, or the experimental GPTQ INT3 CPU experts."""
+    if gptq_int3_cpu:
+        from sglang.srt.layers.moe.cpu_experts.gptq_int3_moe import GptqInt3CpuExperts
+
+        if get_parallel().tp_size != 1 or get_exec().moe.ep_num_redundant_experts:
+            raise ValueError(
+                "GPTQ INT3 CPU experts serve tensor parallel size 1 without redundant experts"
+            )
+        return GptqInt3CpuExperts(
+            config=config,
+            layer_id=layer_id,
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+        )
+    experts_type = get_moe_impl_class(quant_config)
+    return experts_type(
+        num_experts=config.n_routed_experts + get_exec().moe.ep_num_redundant_experts,
+        top_k=config.num_experts_per_tok,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.moe_intermediate_size,
+        layer_id=layer_id,
+        quant_config=quant_config,
+        routed_scaling_factor=1.0,
+        prefix=prefix,
+    )
+
+
+
 class MiMoV2MoE(nn.Module):
     def __init__(
         self,
@@ -440,17 +478,17 @@ class MiMoV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
-        experts_type = get_moe_impl_class(quant_config)
-        self.experts = experts_type(
-            num_experts=config.n_routed_experts
-            + get_exec().moe.ep_num_redundant_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
+        from sglang.srt.layers.moe.cpu_experts.gptq_int3_moe import (
+            declares_gptq_int3_experts,
+        )
+
+        self.gptq_int3_cpu = declares_gptq_int3_experts(config) and not is_nextn
+        self.experts = _routed_experts(
+            config=config,
             layer_id=self.layer_id,
             quant_config=quant_config,
-            routed_scaling_factor=1.0,
             prefix=add_prefix("experts", prefix),
+            gptq_int3_cpu=self.gptq_int3_cpu,
         )
 
         # Streamed MXFP4 experts take slot ids from the engine's gather, which needs explicit STANDARD top-k ids.
@@ -468,7 +506,8 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
-            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False)
+            and not self.gptq_int3_cpu,
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -477,7 +516,7 @@ class MiMoV2MoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=(
                 TopKOutputFormat.STANDARD
-                if quant_config is None or self.streams_experts
+                if quant_config is None or self.streams_experts or self.gptq_int3_cpu
                 else None
             ),
         )
@@ -1285,6 +1324,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
         # None unless streamed MXFP4 routed experts can be skipped; see Source.init_new.
         self.skip_checkpoint_weight = self._streamed_expert_skip_hook()
+        # The hybrid GPTQ INT3 export keeps its unchanged tensors under nonexpert/; its experts are read per layer
+        # by GptqInt3CpuExperts, so the loader never opens their 19,872 files.
+        from sglang.srt.layers.moe.cpu_experts.gptq_int3_moe import (
+            declares_gptq_int3_experts,
+        )
+
+        if declares_gptq_int3_experts(config):
+            self.allow_patterns_overrides = ["nonexpert/*/weights.safetensors"]
 
         if not self.config.encoder_only:
             self.model = MiMoV2Model(

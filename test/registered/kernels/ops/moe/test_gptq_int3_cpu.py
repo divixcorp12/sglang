@@ -493,6 +493,70 @@ def test_actual_exported_expert(native, owner):
     )
 
 
+def test_model_layer_cpu_experts_on_real_export(monkeypatch):
+    """The model's MoE stand-in (verified reader, LRU slots, JIT FFI Team) against the independent decoder.
+
+    Eight slots serve four rows of eight distinct real experts each, so every call evicts the previous row's experts;
+    a slot mix-up, a stale lookup or a skipped padding route changes the sum.
+    """
+    path = os.environ.get("GPTQ_INT3_REAL_ROOT")
+    if not path or not NATIVE:
+        pytest.skip("set GPTQ_INT3_REAL_ROOT on x86-64 Linux for the model-layer path")
+    from types import SimpleNamespace
+
+    from safetensors.torch import load_file
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts import gptq_int3_moe
+
+    monkeypatch.setattr(gptq_int3_moe, "_RUNTIME", None)
+    config = SimpleNamespace(
+        name_or_path=path,
+        experimental_quantization=dict(
+            format="mimo-hybrid-gptq-v1",
+            routed_experts=dict(quant_method="gptq", bits=3, group_size=128, sym=True, desc_act=False),
+        ),
+    )
+    layer = 32
+    ids = torch.arange(32, dtype=torch.int64).reshape(4, 8) * 9 % 288
+    ids[2, 5] = -1
+    weights = torch.rand((4, 8), generator=torch.Generator().manual_seed(7)) / 4
+    with (
+        envs.SGLANG_GPTQ_INT3_MANIFEST_SHA256.override(
+            "7b1445ed9cd90d94cfc98e3cde385c618d4a133dc8adcd0cf031f890aa6b5c65"
+        ),
+        envs.SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER.override(8),
+        envs.SGLANG_GPTQ_INT3_THREADS.override(8),
+        envs.SGLANG_GPTQ_INT3_LOAD_THREADS.override(4),
+    ):
+        experts = gptq_int3_moe.GptqInt3CpuExperts(
+            config=config, layer_id=layer, num_experts=288, top_k=8, hidden_size=6144, intermediate_size=2048
+        )
+    assert experts.rows_per_call == 1
+    x = (torch.randn(4, 6144, generator=torch.Generator().manual_seed(3)) * 0.02).half().float()
+    topk = SimpleNamespace(topk_ids=ids, topk_weights=weights)
+    first = experts(x, topk)
+    second = experts(x, topk)
+    assert torch.equal(first, second)
+
+    expected = torch.zeros_like(first)
+    for t in range(4):
+        for r in range(8):
+            e = int(ids[t, r])
+            if e < 0:
+                continue
+            tensor = load_file(f"{path}/experts/layer-{layer:02d}/expert-{e:03d}/weights.safetensors")
+            decoded = [
+                canonical_decode({k.split(f".{n}.")[1]: v for k, v in tensor.items() if f".{n}." in k})
+                for n in ("gate_proj", "up_proj", "down_proj")
+            ]
+            one = reference(decoded, x[t : t + 1].half(), torch.zeros((1, 1), dtype=torch.int32), weights[t : t + 1, r : r + 1])
+            expected[t] += one[0]
+    rel = torch.linalg.vector_norm(first - expected) / torch.linalg.vector_norm(expected)
+    assert rel < 0.002, float(rel)
+    print(json.dumps(dict(model_layer=layer, relative_l2=float(rel), loads=experts.runtime.loads)))
+
+
 def test_native_sanitizers(tmp_path):
     if not NATIVE:
         pytest.skip("requires Linux x86-64 compiler")
