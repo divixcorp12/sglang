@@ -339,6 +339,8 @@ class ServerArgs:
         "Qwen4ExpForConditionalGeneration",
         # V4.1 configs load under the V4 name; the flag zeroes vision_n_layers (ModelConfig).
         "DeepseekV4ForCausalLM",
+        # MiMoV2ForCausalLM then builds no vision/audio encoder and skips their weights.
+        "MiMoV2ForCausalLM",
     )
 
     # The attention-backend allow-list is enforced via
