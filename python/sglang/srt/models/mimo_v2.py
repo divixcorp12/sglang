@@ -215,6 +215,33 @@ def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
     return torch.cat(all_q + all_k + all_v, dim=0)
 
 
+def _block_aligned_qkv_reorder(
+    weight: torch.Tensor,
+    scale_shards: Tuple[torch.Tensor, ...],
+    qkv_sizes: Optional[Tuple[int, int, int]],
+    block_size: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """De-interleave whole FP8 blocks with their own scales, bit-exact: (weight, scale_inv), or None when a q/k/v slice
+    splits a block and the caller must requantize. ``weight`` is the rank's checkpoint shards concatenated."""
+    if qkv_sizes is None or any(size % block_size for size in qkv_sizes):
+        return None
+    rows = sum(qkv_sizes)
+    shards = len(scale_shards)
+    if weight.shape[0] != shards * rows or any(s.shape[0] * block_size != rows for s in scale_shards):
+        return None
+    offsets = (0, qkv_sizes[0], qkv_sizes[0] + qkv_sizes[1])
+    perm = torch.cat(
+        [
+            torch.arange(i * rows + offset, i * rows + offset + size)
+            for offset, size in zip(offsets, qkv_sizes)
+            for i in range(shards)
+        ]
+    )
+    scale = torch.cat(scale_shards, dim=0)
+    return weight[perm.to(weight.device)], scale[perm[::block_size] // block_size]
+
+
+
 def _resolve_deferred_qkv_scale_inv(
     params_dict: Dict[str, torch.nn.Parameter],
     deferred_scale_inv: Dict[str, torch.Tensor],
@@ -249,6 +276,18 @@ def _resolve_deferred_qkv_scale_inv(
         weight_rows = weight_data.shape[0]
         rows_per_ckpt_shard = weight_rows // shards_per_rank
         block_k = ckpt_scale.shape[1]
+
+        reordered = _block_aligned_qkv_reorder(
+            weight_data,
+            my_scale_shards,
+            _get_ckpt_qkv_shard_sizes(config, scale_name, ckpt_tp) if config else None,
+            block_size,
+        )
+        if reordered is not None:
+            weight_param.data.copy_(reordered[0])
+            default_weight_loader(scale_param, reordered[1])
+            logger.info(f"Reordered qkv {scale_name}: whole FP8 blocks, no requant")
+            continue
 
         device = weight_data.device
         dequant_shards = []

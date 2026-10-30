@@ -8,8 +8,8 @@
 #include <memory>
 #include <stdexcept>
 
-#include "moe/expert_stream/host/cpu_experts/single_job.hpp"
-#include "moe/gptq_int3/entry.h"
+#include "../expert_stream/host/cpu_experts/single_job.hpp"
+#include "entry.h"
 
 namespace sglang::gptq_int3 {
 namespace {
