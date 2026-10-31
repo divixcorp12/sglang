@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.layers.moe.cpu_experts.gptq_int3 import (
     SLAB_NAMES,
+    ExportedExperts,
     GptqInt3CpuTrait,
     load_exported_expert,
     prepare_expert,
@@ -268,7 +269,7 @@ def test_adapter_rejects_invalid_contract(bad):
 
 
 @pytest.mark.parametrize(
-    "bad", [None, "manifest", "policy", "owner", "payload", "escape"]
+    "bad", [None, "manifest", "policy", "owner", "payload", "escape", "replaced"]
 )
 def test_export_reader_binds_manifest_payload_and_owner(tmp_path, bad):
     from safetensors.torch import save
@@ -315,6 +316,16 @@ def test_export_reader_binds_manifest_payload_and_owner(tmp_path, bad):
         outside.write_bytes(raw)
         target.unlink()
         target.symlink_to(outside)
+    elif bad == "replaced":
+        # A reload skips the SHA only for the file it already hashed; a same-size swap must be hashed and refused.
+        reader = ExportedExperts(tmp_path, expected_manifest_sha256=expected)
+        reader.load(1, 0)
+        swapped = target.with_suffix(".new")
+        swapped.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        os.replace(swapped, target)
+        with pytest.raises(ValueError):
+            reader.load(1, 0)
+        return
     if bad is not None:
         with pytest.raises(ValueError):
             load_exported_expert(tmp_path, 1, 0, expected_manifest_sha256=expected)

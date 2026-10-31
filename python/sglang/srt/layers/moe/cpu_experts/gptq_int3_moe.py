@@ -144,8 +144,6 @@ class GptqInt3LayerCache:
         self.slot_of: OrderedDict[int, int] = OrderedDict()
         self.free: list[int] = list(range(self.capacity))
 
-    
-
     def ensure(self, experts: list[int]) -> None:
         """Make every expert in ``experts`` resident; ``lookup`` then maps each to its slot."""
         if len(experts) > self.capacity:

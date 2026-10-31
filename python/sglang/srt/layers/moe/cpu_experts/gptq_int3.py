@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -93,10 +94,9 @@ def prepare_projection(
         raise ValueError("scales must be finite nonzero FP16; signed scales are valid")
     if not bool((_unpack(z, n, 1) == 3).all()):
         raise ValueError("symmetric INT3 requires packed zero3 plus GPTQ offset1")
-    # All codes must have finite FP16 QDQ, even if a particular code is absent from this projection.
-    if not bool(
-        torch.isfinite((s.float().unsqueeze(-1) * torch.arange(-4, 4)).half()).all()
-    ):
+    # All codes must have finite FP16 QDQ, even if a particular code is absent from this projection. Code -4 has the
+    # largest magnitude, the float product is exact and rounding to FP16 is monotone, so it bounds every code.
+    if not bool(torch.isfinite((s.float() * -4).half()).all()):
         raise ValueError("FP16 QDQ overflows")
     if repack is not None:
         # A native repacking of the same bits (GptqInt3Moe.adapt), held equal to the reference below by the tests.
@@ -184,12 +184,24 @@ class ExportedExperts:
         ):
             raise ValueError("export manifest policy/format/status mismatch")
         self.files: dict = manifest["files"]
+        # Payloads whose SHA matched, by the identity of the file that was hashed (``_read_identified``).
+        self._verified: dict[str, tuple[int, int, int, int]] = {}
 
     def _read(self, relative: str) -> bytes:
         path = (self.root / relative).resolve()
         if self.root not in path.parents:
             raise ValueError("export path escapes root")
         return path.read_bytes()
+
+    def _read_identified(self, relative: str) -> tuple[bytes, tuple[int, int, int, int]]:
+        """The payload and the identity of the file it came from (device, inode, size, mtime), taken from the open file."""
+        path = (self.root / relative).resolve()
+        if self.root not in path.parents:
+            raise ValueError("export path escapes root")
+        with open(path, "rb") as f:
+            st = os.fstat(f.fileno())
+            return f.read(), (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
 
     def load(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
         from safetensors.torch import load
@@ -203,9 +215,15 @@ class ExportedExperts:
             raise ValueError("invalid expert owner")
         relative = f"experts/layer-{layer:02d}/expert-{expert:03d}/weights.safetensors"
         entry = self.files[relative]
-        raw = self._read(relative)
-        if len(raw) != entry["bytes"] or hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+        raw, identity = self._read_identified(relative)
+        if len(raw) != entry["bytes"]:
             raise ValueError("expert payload SHA/size mismatch")
+        # The SHA (~30 ms per expert) is checked on a file's first read; a cache eviction rereads the same file, which
+        # is hashed again only if its identity changed. The sealed export is never rewritten in place.
+        if self._verified.get(relative) != identity:
+            if hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+                raise ValueError("expert payload SHA/size mismatch")
+            self._verified[relative] = identity
         tensors = load(raw)
         prefix = f"model.layers.{layer}.mlp.experts.{expert}."
         names = ("gate_proj", "up_proj", "down_proj")
@@ -220,7 +238,6 @@ class ExportedExperts:
                 for n in names
             )
         )
-
 
 
 def load_exported_expert(

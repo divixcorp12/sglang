@@ -4,7 +4,9 @@
 #include <sgl_kernel/tensor.h>
 #include <tvm/ffi/reflection/registry.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 
@@ -90,25 +92,30 @@ struct GptqInt3MoeObj : public tvm::ffi::Object {
     const auto* q = static_cast<const uint32_t*>(qweight.data_ptr());
     auto* lo = static_cast<uint8_t*>(low.data_ptr());
     auto* hi = static_cast<uint8_t*>(high.data_ptr());
-#pragma omp parallel for schedule(static)
-    for (int64_t col = 0; col < n; ++col) {
-      for (int64_t k8 = 0; k8 < k; k8 += 8) {
-        uint8_t h = 0, l0 = 0, l1 = 0;
-        for (int j = 0; j < 8; ++j) {
-          const int64_t bit = (k8 + j) * 3, word = bit >> 5;
-          const int shift = static_cast<int>(bit & 31);
-          uint32_t v = q[word * n + col] >> shift;
-          if (shift > 29) v |= q[(word + 1) * n + col] << (32 - shift);
-          v &= 7;
-          h |= static_cast<uint8_t>((v >> 2) << j);
-          if (j < 4)
-            l0 |= static_cast<uint8_t>((v & 3) << (2 * j));
-          else
-            l1 |= static_cast<uint8_t>((v & 3) << (2 * (j - 4)));
+    // Column blocks keep the row-major reads contiguous and the block's output rows in L1. 64 is arbitrary.
+    constexpr int64_t kCols = 64;
+    for (int64_t c0 = 0; c0 < n; c0 += kCols) {
+      const int64_t c1 = std::min(n, c0 + kCols);
+      for (int64_t g = 0; g < k / 32; ++g) {
+        const uint32_t* r0 = q + 3 * g * n;
+        for (int64_t col = c0; col < c1; ++col) {
+          // 32 codes in three words; code 21 (bit 63) spans the second and third.
+          const uint64_t w01 = uint64_t{r0[col]} | (uint64_t{r0[n + col]} << 32);
+          const uint32_t w2 = r0[2 * n + col];
+          uint64_t l = 0;
+          uint32_t h = 0;
+          for (int j = 0; j < 32; ++j) {
+            const int bit = 3 * j;
+            const uint32_t v = bit > 63    ? (w2 >> (bit - 64)) & 7
+                               : bit == 63 ? static_cast<uint32_t>((w01 >> 63) | (uint64_t{w2} << 1)) & 7
+                                           : static_cast<uint32_t>(w01 >> bit) & 7;
+            l |= uint64_t{v & 3} << (2 * j);
+            h |= (v >> 2) << j;
+          }
+          // Little-endian: low byte b holds codes 4b..4b+3, high byte b codes 8b..8b+7, lowest bits first.
+          std::memcpy(lo + col * (k / 4) + g * 8, &l, 8);
+          std::memcpy(hi + col * (k / 8) + g * 4, &h, 4);
         }
-        hi[col * (k / 8) + k8 / 8] = h;
-        lo[col * (k / 4) + k8 / 4] = l0;
-        lo[col * (k / 4) + k8 / 4 + 1] = l1;
       }
     }
   }

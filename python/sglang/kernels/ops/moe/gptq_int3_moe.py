@@ -7,8 +7,6 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 _FFI, _KERNEL = "moe/gptq_int3/moe_ffi.cpp", "moe/gptq_int3/kernel.cpp"
 # The kernel's own flags (cpu_kernel_build._gptq_int3): explicit FP16 boundaries, no contraction outside explicit FMAs.
 _FLAGS = ("-std=c++20", "-O3", "-ffp-contract=off", "-pthread")
-# The FFI's integer plane repacking runs on OpenMP threads; no floating point there.
-_FFI_FLAGS = (*_FLAGS, "-fopenmp")
 
 
 @cache_once
@@ -21,8 +19,7 @@ def gptq_int3_moe_type():
         "gptq_int3_moe",
         cpp_files=[_FFI, _KERNEL],
         header_only=False,
-        source_cflags={_FFI: list(_FFI_FLAGS), _KERNEL: list(_FLAGS)},
-        extra_ldflags=["-fopenmp"],
+        source_cflags={_FFI: list(_FLAGS), _KERNEL: list(_FLAGS)},
     )
     module.register_once()
 
