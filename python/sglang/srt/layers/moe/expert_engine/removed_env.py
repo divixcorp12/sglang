@@ -5,8 +5,9 @@ with the name that replaces it, so a launch script cannot quietly lose its setti
 once, at process start, before the config is resolved; it reads only the environment passed in, so it works on a
 launcher's merged env dict as well as on ``os.environ``.
 
-Names retired earlier with no replacement (the lease-chain modes, the doorbell, ``SGLANG_DSV41_RAM_MISS_HIT_WAIT_US``)
-are not here: ``environ._DEPRECATED_ENVS`` still warns and ignores them.
+Names retired with no replacement (the lease-chain modes, the doorbell, ``SGLANG_DSV41_RAM_MISS_HIT_WAIT_US``, the
+always-on prefill fills, route plan, split gather and lease PDL under both spellings) are not here:
+``environ._DEPRECATED_ENVS`` warns and ignores them.
 
 Stdlib and msgspec only, so a launcher can load this file by path without importing sglang.
 """
@@ -44,6 +45,19 @@ class RemovedEnvError(ValueError):
 
 # Replacement.env of a name that was removed outright: nothing is set in its place.
 NO_REPLACEMENT = ""
+
+# Pre-rename names that environ._DEPRECATED_ENVS ignores with a warning: translate_env drops them.
+RETIRED_IGNORED_ENV = frozenset(
+    (
+        "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US",
+        "SGLANG_DSV41_ENABLE_LEASE_PDL",
+        "SGLANG_DSV41_ENABLE_PREFILL_FILLS",
+        "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN",
+        "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER",
+        "SGLANG_DSV41_ENABLE_LAYER_FUSION",
+        "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION",
+    )
+)
 ISA_CAP_NOTE = (
     "the CPU kernel's ISA tier is compile-time now, from the JIT host -march: set SGLANG_JIT_HOST_MARCH to "
     "skylake-avx512 (bw), x86-64-v3 (avx2) or x86-64 (scalar) for a lower tier"
@@ -95,7 +109,6 @@ REMOVED_ENV: dict[str, Replacement] = {
     "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": _R("SGLANG_EXPERT_STREAM_COPY_MODE", "copy.mode", '1 -> copy_engine, 0 -> sm_copy'),
     "SGLANG_DSV41_RAM_HIT_COPY": _R("SGLANG_EXPERT_STREAM_RAM_HIT_COPY", "copy.ram_hit_copy"),
     "SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES": _R("SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES", "copy.sm_small_copies"),
-    "SGLANG_DSV41_ENABLE_LEASE_PDL": _R("SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL", "copy.lease_pdl"),
     "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": _R("SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS", "copy.timeout_ms"),
     "SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US": _R("SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US", "copy.idle_spin_us"),
     "SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US": _R("SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US", "copy.copy_idle_spin_us"),
@@ -104,11 +117,8 @@ REMOVED_ENV: dict[str, Replacement] = {
     "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS": _R("SGLANG_EXPERT_STREAM_GRAPH_GATHER_SCRATCH_ROWS", "copy.graph_gather_scratch_rows"),
     "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": _R("SGLANG_EXPERT_STREAM_GRAPH_GATHER_MISS_LANES", "copy.graph_gather_miss_lanes"),
     "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": _R("SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES", "copy.graph_gather_victim_lanes"),
-    "SGLANG_DSV41_ENABLE_PREFILL_FILLS": _R("SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS", "copy.prefill.fills"),
     "SGLANG_DSV41_ENABLE_PREFILL_SHARE": _R("SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE", "copy.prefill.share"),
     "SGLANG_DSV41_FORCE_PREFILL_SHARE_ROWS": _R("SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS", "copy.prefill.share_rows"),
-    "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN": _R("SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN", "copy.prefill.route_plan"),
-    "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER": _R("SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER", "copy.prefill.split_gather"),
     "SGLANG_DSV41_GPU_DRIP_SLOTS": _R("SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS", "copy.gpu_drip.slots"),
     "SGLANG_DSV41_GPU_DRIP_PICKS": _R("SGLANG_EXPERT_STREAM_GPU_DRIP_PICKS", "copy.gpu_drip.picks"),
     "SGLANG_DSV41_GPU_DRIP_CHUNK_KB": _R("SGLANG_EXPERT_STREAM_GPU_DRIP_CHUNK_KB", "copy.gpu_drip.chunk_kb"),
@@ -320,7 +330,7 @@ def translate_env(old_env: Mapping[str, str], node_of_cpu) -> dict[str, str]:
     """A recipe written with the removed names, as the same settings under the new names.
 
     ``node_of_cpu(cpu) -> node`` says where a core named by the retired single-core spellings lives. Names the rename
-    left alone pass through; the retired ``SGLANG_DSV41_RAM_MISS_HIT_WAIT_US`` is dropped (it was already ignored).
+    left alone pass through; the retired ``RETIRED_IGNORED_ENV`` names are dropped (they were already ignored).
     Group members become one JSON object per group, typed by the config field; the two stream switches merge into
     ``SGLANG_EXPERT_STREAM_ENABLE`` and the copy mechanisms into ``SGLANG_EXPERT_STREAM_COPY_MODE``.
     """
@@ -330,7 +340,7 @@ def translate_env(old_env: Mapping[str, str], node_of_cpu) -> dict[str, str]:
     enable = None
     backend, engine = None, None
     for name, value in old_env.items():
-        if name == "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US":
+        if name in RETIRED_IGNORED_ENV:
             continue
         if name not in REMOVED_ENV:
             new[name] = value

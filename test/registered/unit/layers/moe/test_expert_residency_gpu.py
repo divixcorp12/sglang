@@ -22,6 +22,7 @@ import torch
 from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
 from sglang.srt.layers.moe.expert_stream import NVFP4_STREAM_TENSORS, ExpertStreamer
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.exl3_layer_fusion_reference import gather_destinations, install_torch_chains
 
 register_cuda_ci(est_time=30, stage="base-a", runner_config="1-gpu-small")
 
@@ -1347,11 +1348,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def test_the_fused_remap_rows_hold_the_routes(self):
         """Layer fusion's remap rows are as wide as a gather's routes: one token's at BS1, unchanged, and every
         route of a verify whose misses are narrower."""
-        from sglang.srt.environ import envs
-
-        with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
-            one = _manager(_model(), gpu=True, **DIRECT)
-            verify = _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **DIRECT)
+        one = _manager(_model(), gpu=True, **DIRECT)
+        verify = _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **DIRECT)
         for manager, routes in ((one, TOP_K), (verify, 3 * TOP_K)):
             for remaps in manager.gpu_residency.fused_remaps.values():
                 self.assertEqual(tuple(remaps.shape), (LAYERS, routes))
@@ -1383,14 +1381,15 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def _narrow(self, model, lanes, fused):
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused):
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused):
             # Zero seed scores fill every layer evenly (8 slots each) whatever its floor, so the narrow and the wide
             # twin hold the same capacities.
             manager = _manager(
                 model, gpu=True, seed_scale=(0, 0, 0), graph_gather_batch_size=2, graph_gather_miss_lanes=lanes,
                 budget_bytes=56 * LAYERS * 8, **DIRECT,
             )
-        self.assertEqual(manager.gpu_residency.layer_fusion, fused)
+        if not fused:
+            install_torch_chains(manager.gpu_residency)
         return manager
 
     def test_a_narrow_gather_is_the_wide_gather_until_it_overflows(self):
@@ -1553,11 +1552,12 @@ class TestInsertOnMissDirect(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as trace:
             from sglang.srt.environ import envs
 
-            with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(False):
+            with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False):
                 manager = _manager(
                     self.model, gpu=True, seed_scale=(0, 0, 0), graph_gather_batch_size=2, graph_gather_miss_lanes=2,
                     budget_bytes=56 * LAYERS * 8, metrics_path=trace.name, log_interval=1, **DIRECT,
                 )
+            install_torch_chains(manager.gpu_residency)
             graph, static, outputs = self.capture(manager, tokens=2)
             self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
             self.assertTrue(manager.take_verify_overflow())
@@ -1864,14 +1864,14 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
 
     def test_layer_fusion_with_the_miss_order_off_drives_direct_exactly_like_the_generic_planner(self):
-        """CPU experts off: the fused planner and SGLANG_DSV41_ENABLE_LAYER_FUSION's gather and commit kernels, with no
-        miss keys, must leave every mapping, slot and counter bit-identical to the generic path's."""
+        """CPU experts off: the fused planner and the layer fusion's gather and commit kernels, with no miss keys, must
+        leave every mapping, slot and counter bit-identical to the generic planner running the torch chains."""
         from sglang.srt.environ import envs
 
         generic = _manager(self.model, gpu=True, **DIRECT)
-        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+        install_torch_chains(generic.gpu_residency)
+        with envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override("true"):
             fused = _manager(_model(), gpu=True, **DIRECT)
-        self.assertTrue(fused.gpu_residency.layer_fusion)
         self.assertIsNone(fused.gpu_residency.miss_keys)
         for streamer in fused.streamers.values():
             self.assertIsNone(streamer._plan_miss_keys)
@@ -2232,7 +2232,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         updater.victim_valid[0].copy_(torch.tensor([True, False, False, False], device="cuda"))
         streamer._graph_miss_count.fill_(2)
         remap = torch.tensor([base, base + 1, base + 1, base], dtype=torch.int64, device="cuda")
-        got = updater.gather_destinations(0, remap, torch.full((4,), -1, dtype=torch.int64, device="cuda"), base)
+        got = gather_destinations(updater, 0, remap, torch.full((4,), -1, dtype=torch.int64, device="cuda"), base)
         _, _, destinations, live = updater._pending_commit
         self.assertEqual(destinations.tolist(), [3, dump, dump, dump])
         self.assertEqual(live.tolist(), [True, False, False, False])

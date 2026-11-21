@@ -547,9 +547,9 @@ def _check_cpu_experts(budgets) -> None:
     """Check the prerequisites of ``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS``.
 
     The RAM-miss service's grant sends resident lanes to the CPU, the copy engine's
-    copy wait completes them, and layer fusion's route tables and the DIRECT commit
-    leave them out of the fused MoE and the residency. Each piece must be on, so this
-    names every missing switch at once.
+    copy wait completes them, and the fused MoE's route tables and the DIRECT commit
+    leave them out of the fused MoE and the residency. Each switch must be on, so this
+    names every missing one at once.
     """
     stream = resolved_config().stream
     if not stream.cpu_experts.enabled:
@@ -557,10 +557,6 @@ def _check_cpu_experts(budgets) -> None:
     needs = [
         ("SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=1", budgets.graph_gather),
         ("SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine", stream.copy.mode is CopyMode.COPY_ENGINE),
-        (
-            "SGLANG_DSV41_ENABLE_LAYER_FUSION=1",
-            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
-        ),
         # DIRECT residency ranks the keys the fused plan sorts the miss lanes by,
         # so the CPU takes the coldest ones.
         ("SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=1", stream.residency.gpu_update),

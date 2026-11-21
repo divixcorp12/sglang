@@ -203,8 +203,7 @@ class Exl3ExpertFormat:
         it, or is loading it, into a slot. The callable looks the hot cache up at
         eviction time, because the pinned tier is built before the hot cache and
         residency changes. With ``SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER`` it also returns
-        ``slot_table`` (and ``row_fills`` under
-        ``SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS``).
+        ``slot_table`` and ``row_fills`` (the prefill fills).
         """
         copy = stream_config().copy
 
@@ -240,13 +239,7 @@ class Exl3ExpertFormat:
                 self.layer_id,
                 lambda: expert_streamer_of(layer),
             )
-            if copy.prefill.fills:
-                options["row_fills"] = options["slot_table"]
-        elif copy.prefill.fills:
-            raise RuntimeError(
-                "exl3: SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS needs SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER: the "
-                "fills are the RAM-miss service's reads, and only option C runs that service"
-            )
+            options["row_fills"] = options["slot_table"]
         return options
 
     def plan_graph_gather(self, streamer, rows: int, routes: int = 0) -> None:
@@ -424,8 +417,8 @@ class Exl3ExpertFormat:
     def moe_apply(self, layer, x, slot_ids, weights, slot_tensors) -> torch.Tensor:
         """The fused EXL3 MoE over the hot-cache slots the gather filled (fp32 output).
 
-        ``slot_ids`` is the router's int32 remap of this batch's expert ids to slot ids. Layer fusion takes it as it
-        is and writes the int64 copy inside its one kernel; the unfused kernel reads int64.
+        ``slot_ids`` is the router's int32 remap of this batch's expert ids to slot ids; the fused route-tables
+        kernel takes it as it is and writes the int64 copy itself.
         """
         from sglang.srt.layers.quantization.exl3.fused_moe import exl3_fused_moe_for
 
@@ -434,7 +427,7 @@ class Exl3ExpertFormat:
         return fused.run(
             x,
             weights.reshape(-1),
-            flat_ids if fused.layer_fusion else flat_ids.long(),
+            flat_ids,
             slot_tensors.keep,
             slot_tensors.swiglu_limit,
             cpu=slot_tensors.cpu,

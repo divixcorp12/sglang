@@ -1,11 +1,10 @@
-"""JIT wrappers for the EXL3 decode cast fusion (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION).
+"""JIT wrappers for the EXL3 decode cast fusion.
 
 * ``exl3_silu_mul_clamp_half`` -- the shared expert's ``gate_up.to(bf16)``, ``silu_and_mul_clamp`` and the down
   projection's ``.to(fp16)`` as one kernel on exl3_gemm's fp16 output;
 * ``exl3_scale_to_bf16`` -- the routed MoE output's ``out.to(bf16) * routed_scaling_factor``.
 
-Both are bit-identical to the torch chains; the flag-off path runs those chains, and the parity tests compare against
-them. The two kernels need opposite fast-math flags, and each loader carries its own: ``_silu_module`` builds with
+Both are bit-identical to the torch chains they replace, which the parity tests run as references. The two kernels need opposite fast-math flags, and each loader carries its own: ``_silu_module`` builds with
 ``-use_fast_math``, ``_scale_module`` without it.
 """
 

@@ -2,7 +2,8 @@
 
 Plan: docs/superpowers/plans/2026-09-25-dsv41-per-expert-compute.md, sections 3.2, 3.3 and 6 step 1.
 
-The reference is the production call, ``Exl3FusedMoE.run``, with layer fusion off and on. The split is:
+The reference is the production call, ``Exl3FusedMoE.run``, and the torch-chain run its route-tables kernel replaced
+(``unfused_run`` in ``sglang.test.exl3_layer_fusion_reference``). The split is:
 
 1. the full-route placement: ``route_tables`` with keep = 1, so ``det[0]`` (every route's scratch row), ``inv_order``
    and ``det[2]`` come from all six routes, whatever the masks are;
@@ -29,6 +30,8 @@ import os
 import msgspec
 import pytest
 import torch
+
+from sglang.test.exl3_layer_fusion_reference import route_tables, unfused_run
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and os.environ.get("SGLANG_EXL3_SRC")),
@@ -127,11 +130,10 @@ class SplitState(msgspec.Struct):
 
 def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between=None, num_active: int = 6):
     """Resident launch, then missed launch, then one gather; ``between(stage)`` observes the buffers between steps."""
-    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
-
     fused.x16.copy_(x)
     # Placement from every route. keep = 1 here: the resident launch cannot know keep.
-    inv_order, weight_full, det = route_tables(remap, state.full_count, fused.ones, weights, state.ones_keep)
+    ones = torch.ones(TOP_K, dtype=torch.int64, device=remap.device)
+    inv_order, weight_full, det = route_tables(remap, state.full_count, ones, weights, state.ones_keep)
     split_route_tables(remap, weights, hit, state.resident)
     split_route_tables(remap, weights, ~hit, state.missed)
     fused.out.zero_()
@@ -152,20 +154,18 @@ def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between
     return fused.out
 
 
-def _fused(slot_rows, device, layer_fusion: bool):
-    from sglang.srt.environ import envs
+def _fused(slot_rows, device):
     from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
 
     slots = slot_rows["w13_trellis"].shape[0]
-    with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(layer_fusion):
-        return Exl3FusedMoE(
-            slot_rows,
-            slots,
-            hidden=slot_rows["w13_suh"].shape[-1],
-            inter=slot_rows["w2_suh"].shape[-1],
-            top_k=TOP_K,
-            device=device,
-        )
+    return Exl3FusedMoE(
+        slot_rows,
+        slots,
+        hidden=slot_rows["w13_suh"].shape[-1],
+        inter=slot_rows["w2_suh"].shape[-1],
+        top_k=TOP_K,
+        device=device,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -202,14 +202,14 @@ def _bench_module():
     return mod
 
 
-@pytest.mark.parametrize("layer_fusion", [False, True])
-def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
+@pytest.mark.parametrize("torch_chain", [True, False], ids=["torch_chain", "fused"])
+def test_split_launch_is_bitwise_the_single_launch(slot_rows, torch_chain):
     device = slot_rows["w13_trellis"].device
-    ref = _fused(slot_rows, device, layer_fusion)
-    split = _fused(slot_rows, device, False)
+    ref = _fused(slot_rows, device)
+    split = _fused(slot_rows, device)
     state = SplitState.empty(split.slots, device)
     hidden = slot_rows["w13_suh"].shape[-1]
-    gen = torch.Generator().manual_seed(4242 + layer_fusion)
+    gen = torch.Generator().manual_seed(4242 + (not torch_chain))
     nan_bits = torch.full((), float("nan"), dtype=torch.float32).view(torch.int32).item()
     cases = 0
     for keep_value in (1.0, 0.0):
@@ -217,7 +217,8 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
         for hits in range(TOP_K + 1):
             for trial in range(TRIALS):
                 x, weights, remap, hit = _inputs(gen, split.slots, hidden, device, hits)
-                want = ref.run(x, weights, remap, keep, ACT_LIMIT).clone()
+                run = unfused_run if torch_chain else type(ref).run
+                want = run(ref, x, weights, remap, keep, ACT_LIMIT).clone()
                 want_scratch = ref.scratch.clone()
                 label = f"keep={keep_value} hits={hits} trial={trial} remap={remap.tolist()} hit={hit.tolist()}"
 
@@ -254,16 +255,14 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
                 )
                 cases += 1
     assert cases == 2 * (TOP_K + 1) * TRIALS
-    print(f"layer_fusion={layer_fusion}: {cases} cases bitwise equal")
+    print(f"torch_chain={torch_chain}: {cases} cases bitwise equal")
 
 
 def test_full_weight_table_misplaces_masked_weights(slot_rows):
     """The hazard the compacted weights avoid: a masked launch indexes weight_sorted by its own running prefix."""
-    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
-
     device = slot_rows["w13_trellis"].device
-    ref = _fused(slot_rows, device, False)
-    split = _fused(slot_rows, device, False)
+    ref = _fused(slot_rows, device)
+    split = _fused(slot_rows, device)
     state = SplitState.empty(split.slots, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     keep = torch.ones(1, device=device)
@@ -275,7 +274,8 @@ def test_full_weight_table_misplaces_masked_weights(slot_rows):
     want = ref.run(x, weights, remap, keep, ACT_LIMIT).clone()
 
     split.x16.copy_(x)
-    inv_order, weight_full, det = route_tables(remap, state.full_count, split.ones, weights, keep)
+    ones = torch.ones(TOP_K, dtype=torch.int64, device=device)
+    inv_order, weight_full, det = route_tables(remap, state.full_count, ones, weights, keep)
     split_route_tables(remap, weights, hit, state.resident)
     split_route_tables(remap, weights, ~hit, state.missed)
     split.out.zero_()
@@ -296,8 +296,8 @@ def test_num_active_must_stay_six(slot_rows):
     what the alternative does.
     """
     device = slot_rows["w13_trellis"].device
-    ref = _fused(slot_rows, device, False)
-    split = _fused(slot_rows, device, False)
+    ref = _fused(slot_rows, device)
+    split = _fused(slot_rows, device)
     state = SplitState.empty(split.slots, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     keep = torch.ones(1, device=device)
@@ -305,7 +305,7 @@ def test_num_active_must_stay_six(slot_rows):
     differs = 0
     for _ in range(4):
         x, weights, remap, hit = _inputs(gen, split.slots, hidden, device, 4)
-        want = ref.run(x, weights, remap, keep, ACT_LIMIT).clone()
+        want = unfused_run(ref, x, weights, remap, keep, ACT_LIMIT).clone()
         got = split_run(split, state, x, weights, remap, hit, keep, num_active=4).clone()
         torch.cuda.synchronize()
         differs += not torch.equal(got, want)
@@ -368,7 +368,7 @@ def test_cpu_lanes_with_a_zero_partial_are_the_gpu_run_without_them(slot_rows):
     """Bitwise: a CPU route is not computed at all and the other routes keep their weights. Ranking a CPU route by its
     real slot instead would shift the fused kernel's running weight prefix and give its neighbours wrong weights."""
     device = slot_rows["w13_trellis"].device
-    fused = _fused(slot_rows, device, True)
+    fused = _fused(slot_rows, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     zero = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
     seed = torch.full((1, hidden), 3.0, dtype=torch.float32).pin_memory()
@@ -391,7 +391,7 @@ def test_cpu_lanes_past_32_rank_their_routes_out(slot_rows):
     lanes 0-31 naming no slot) leave the fused MoE exactly as low lanes do, bit for bit against the masked run.
     Mutation: read only the low word -- the routes stay in."""
     device = slot_rows["w13_trellis"].device
-    fused = _fused(slot_rows, device, True)
+    fused = _fused(slot_rows, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     zero = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
     keep = torch.ones(1, device=device)
@@ -412,7 +412,7 @@ def test_the_cpu_partial_seeds_the_output(slot_rows):
     """The GPU's own partial of the CPU routes, fed back as the CPU partial, reproduces the full run up to fp32
     reassociation."""
     device = slot_rows["w13_trellis"].device
-    fused = _fused(slot_rows, device, True)
+    fused = _fused(slot_rows, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     partial = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
     keep = torch.ones(1, device=device)
@@ -432,7 +432,7 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
     only CPU lanes are misses never adds part 0's stale sum. Mutations: seed part 0 whenever any lane is CPU; read part
     1 at part 0's address; ignore bit 9."""
     device = slot_rows["w13_trellis"].device
-    fused = _fused(slot_rows, device, True)
+    fused = _fused(slot_rows, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     two = torch.empty((1, 2, hidden), dtype=torch.float32).pin_memory()
     two[:, 0], two[:, 1] = 3.0, 5.0
@@ -468,7 +468,7 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
     monkeypatch.setenv("SGLANG_EXL3_MOE_CPU_PIN", "0")
     threads = min(4, len(os.sched_getaffinity(0)))
     device = slot_rows["w13_trellis"].device
-    fused = _fused(slot_rows, device, True)
+    fused = _fused(slot_rows, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     trait = Exl3CpuQuantTrait(act_limit=ACT_LIMIT)
     trait.attach_host(es.cpu_kernel_options(variant="instr"))
@@ -502,14 +502,12 @@ VERIFY_TOKENS = 4
 
 
 def _fused_tokens(slot_rows, device, tokens):
-    from sglang.srt.environ import envs
     from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
 
-    with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
-        return Exl3FusedMoE(
-            slot_rows, slot_rows["w13_trellis"].shape[0], hidden=slot_rows["w13_suh"].shape[-1],
-            inter=slot_rows["w2_suh"].shape[-1], top_k=TOP_K, device=device, tokens=tokens,
-        )
+    return Exl3FusedMoE(
+        slot_rows, slot_rows["w13_trellis"].shape[0], hidden=slot_rows["w13_suh"].shape[-1],
+        inter=slot_rows["w2_suh"].shape[-1], top_k=TOP_K, device=device, tokens=tokens,
+    )
 
 
 def test_a_verify_cpu_partial_seeds_every_token(slot_rows):

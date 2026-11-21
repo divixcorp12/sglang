@@ -6,7 +6,7 @@ parameters. Bars:
   * parity: run() over all resident experts matches a dense fp32 reference, rel <= 2e-2, for M in (1, 2, 5, 6, 10);
     10 is the most a call holds at top-k 6 (64 routes, exl3_route_tables.cuh), and 11 is refused;
   * the sink: with resident {0, 2, 5}, routes to 1, 7 (not resident), -1 and 9 (out of range) add nothing, so run()
-    matches exl3_moe_accumulate over experts [0, 2, 5]; with layer fusion on and off;
+    matches exl3_moe_accumulate over experts [0, 2, 5];
   * capture: a graph captured at M = 5 replays rewritten ids, weights and inputs bitwise equal to an eager run;
   * no host read: an eager run() after prepare() passes torch.cuda.set_sync_debug_mode("error").
 """
@@ -18,7 +18,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.exl3.ops import exl3_dense_weight, exl3_moe_accumulate, random_exl3_tensors
 
 pytestmark = pytest.mark.skipif(
@@ -49,12 +48,11 @@ def layer():
     return SimpleNamespace(top_k=TOP_K, exl3_w13=w13, exl3_w2=w2, **slab)
 
 
-def _moe(layer, resident, *, layer_fusion=True):
+def _moe(layer, resident):
     from sglang.srt.layers.quantization.exl3.draft_moe import DraftResidentMoe
 
-    with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(layer_fusion):
-        moe = DraftResidentMoe(layer, resident, EXPERTS, torch.device("cuda"))
-        moe.prepare()
+    moe = DraftResidentMoe(layer, resident, EXPERTS, torch.device("cuda"))
+    moe.prepare()
     return moe
 
 
@@ -101,11 +99,10 @@ def test_a_call_past_the_stages_tokens_is_refused(layer):
         moe.run(x, ids, weights, LIMIT)
 
 
-@pytest.mark.parametrize("layer_fusion", [True, False])
 @pytest.mark.parametrize("m", [1, 6])
-def test_the_sink_drops_every_route_that_is_not_resident(layer, layer_fusion, m):
+def test_the_sink_drops_every_route_that_is_not_resident(layer, m):
     resident = [0, 2, 5]
-    moe = _moe(layer, resident, layer_fusion=layer_fusion)
+    moe = _moe(layer, resident)
     assert moe.slots == 3
     gen = torch.Generator().manual_seed(7 + m)
     x, ids, weights = _inputs(gen, m, [0, 1, 2, 5, 7, -1, 9])

@@ -29,6 +29,7 @@ from typing import Callable, Mapping, Optional
 
 import torch
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
 from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
@@ -313,7 +314,7 @@ class ExpertEngineService:
         self._split_model_refiner = None
         self._split_model_refine_batches = 0
         self._split_model_batches = 0
-        # SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
+        # The lease chain's kernels launch with PDL when the GPU supports it (sm_90+).
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
         self._gather_planned: Optional[int] = None
@@ -560,7 +561,7 @@ class ExpertEngineService:
                 "exl3 RAM miss: SGLANG_EXPERT_STREAM_TRACE's residency_capture needs its router_capture_path: the "
                 "residency capture is written beside the router capture"
             )
-        # The DSV4.1 knobs outside the engine config: layer fusion and the test fault.
+        # The DSV4.1 knob outside the engine config: the test fault.
         cfg = Dsv41Config.from_envs()
         streamers = {
             layer_id: table.streamer_of()
@@ -688,7 +689,7 @@ class ExpertEngineService:
             cpu_experts = None
             if stream.cpu_experts.enabled:
                 cpu_experts = self._start_cpu_experts(
-                    cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned, stream=stream
+                    host, fmt, streamers, pin, numa, self._gather_routes_planned, stream=stream
                 )
             spec_gpu = (
                 self._enable_ram_prefetch(
@@ -756,7 +757,7 @@ class ExpertEngineService:
         self._cpu_retune_batches = stream.cpu_experts.split.retune_batches
         self._split_model_refine_batches = stream.cpu_experts.split.model_refine_batches
         self.sm_small_copies = stream.copy.sm_small_copies
-        self.lease_pdl = stream.copy.lease_pdl
+        self.lease_pdl = is_arch_support_pdl()
         self.fill_timeout_s = stream.copy.fill_timeout_s()
         # Order matters. atexit runs last-registered first, and weakref.finalize
         # installs its single exit hook when the first finalizer (any tier's slab
@@ -783,7 +784,6 @@ class ExpertEngineService:
 
     @staticmethod
     def _start_cpu_experts(
-        cfg: Dsv41Config,
         host,
         fmt,
         streamers,
@@ -797,9 +797,9 @@ class ExpertEngineService:
         config (``resolved_config().stream`` when None).
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
-        lanes complete in the copy wait and leave the fused MoE through layer fusion's
-        route tables, so the copy engine and layer fusion are both required; so is the
-        fused plan, and the prefetch pull join must be off.
+        lanes complete in the copy wait and leave the fused MoE through its fused route
+        tables, so the copy engine is required; so is the fused plan, and the prefetch
+        pull join must be off.
         """
         from sglang.srt.layers.moe.cpu_experts.service import (
             CpuExpertGroups,
@@ -811,10 +811,6 @@ class ExpertEngineService:
         if stream.copy.mode is not CopyMode.COPY_ENGINE:
             raise RuntimeError(
                 "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs SGLANG_EXPERT_STREAM_COPY_MODE=copy_engine"
-            )
-        if not cfg.enable_layer_fusion:
-            raise RuntimeError(
-                "exl3 RAM miss: SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION"
             )
         if stream.prefetch.shadow.pull_mode is not PullMode.OFF:
             raise RuntimeError(

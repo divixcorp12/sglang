@@ -1,8 +1,8 @@
-"""JIT wrapper for the EXL3 fused MoE's route tables (SGLANG_DSV41_ENABLE_LAYER_FUSION).
+"""JIT wrapper for the EXL3 fused MoE's route tables (the layer fusion).
 
-``exl3_moe_route_tables`` launches one kernel in place of ``exl3.fused_moe.route_tables`` and the copies around it in
-``Exl3FusedMoE.run`` (22 kernels per layer), with bit-identical results; the flag-off path runs the torch chain, and
-the parity test compares against it.
+``exl3_moe_route_tables`` launches one kernel in place of a chain of torch ops (``route_tables`` and the copies around
+it in ``Exl3FusedMoE.run``, 22 kernels per layer), with bit-identical results; the chain is kept as the parity tests'
+reference in ``sglang.test.exl3_layer_fusion_reference``.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def exl3_moe_route_tables(
     cpu_part_stride: int = 0,
     token_sorted_out: Optional[torch.Tensor] = None,
 ) -> None:
-    """The fused MoE's route tables and input staging; see ``exl3.fused_moe.route_tables``.
+    """The fused MoE's route tables and input staging; see ``sglang.test.exl3_layer_fusion_reference.route_tables``.
 
     ``x`` and the staging buffers ``x16_out`` and ``out_zero`` are the M tokens' ``[M, H]`` rows; ``remap`` holds
     their routes token-major, a multiple of M and at most 64. Writes ``remap64_out`` (``remap`` as int64), ``x16_out``

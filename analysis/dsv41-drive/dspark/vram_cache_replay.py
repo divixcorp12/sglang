@@ -7,7 +7,7 @@ token and tokens 1.. the drafts), ``misses[layer]`` (the gather's miss count) an
 residents when the forward was planned). Two consecutive snapshots tell what the live policy did between them:
 ``hot[t+1] - hot[t]`` are the experts the gathers of forward t inserted (the lanes the GPU served: HitCopy, SM copy,
 streamed misses), and the misses of forward t that are not in ``hot[t+1]`` were served without insertion (the CPU
-lanes, expert_residency_gpu._fused_commit_gather leaves them unmapped). ``verify-accept.<pid>.jsonl`` (rid, k,
+lanes, expert_residency_gpu.GpuResidencyUpdater.commit_gather leaves them unmapped). ``verify-accept.<pid>.jsonl`` (rid, k,
 num_correct_drafts) joined by rid order says which tokens were accepted, and ``draft-top-prob.<pid>.jsonl`` gives the
 draft's confidence per drafted token, a gather-time proxy for acceptance.
 

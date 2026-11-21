@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_engine.config import (
     ExpertStreamConfig,
     PullMode,
@@ -473,12 +472,9 @@ class GpuResidencyUpdater:
         self.narrow_gather = self.victim_lanes < width or any(
             streamer.graph_miss_width < streamer.graph_gather_rows for streamer in self.streamers
         )
-        # SGLANG_DSV41_ENABLE_LAYER_FUSION fuses gather_destinations and commit_gather
-        # into one kernel each. Their per-layer outputs live in per-layer rows, so a
-        # commit forked onto the side stream reads buffers nothing else reuses.
-        self.layer_fusion = envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()
-        if self.layer_fusion:
-            self._init_layer_fusion()
+        # The gather and commit kernels' outputs live in per-layer rows, so a commit
+        # forked onto the side stream reads buffers nothing else reuses.
+        self._init_layer_fusion()
 
     def _init_layer_fusion(self) -> None:
         """Allocate the per-layer output rows of the fused gather and commit kernels."""
@@ -958,7 +954,7 @@ class GpuResidencyUpdater:
 
         This is only a proposal. It is ranked before the next forward's routing is
         known, so it may name a slot that forward reads; the gather that commits
-        removes those itself (:meth:`gather_destinations`). Routed residents are
+        removes those itself (:meth:`fused_gather_destinations`). Routed residents are
         ranked last, not dropped: a short prefill routes every resident, and an emptied
         shortlist would send every miss of the next forward to slot 0.
         """
@@ -1031,52 +1027,6 @@ class GpuResidencyUpdater:
             + routed.to(torch.int64) * _ROUTED_RANK_OFFSET
         )
 
-    def gather_destinations(
-        self,
-        row: int,
-        remap: torch.Tensor,
-        route_slots: torch.Tensor,
-        scratch_base: int,
-    ) -> torch.Tensor:
-        """Point one layer's gather at victim slots instead of scratch rows.
-
-        ``route_slots`` is the gather's own ``expert_to_slot`` lookup of every route:
-        a slot for a hit, ``-1`` for a miss. A shortlist entry equal to one of those
-        slots is a row this forward reads, so it is dropped here. That is the whole
-        safety argument: the choice is made with the forward's routing in hand even
-        though the shortlist was ranked before it. The surviving entries take the miss
-        lanes in rank order, and ``_init_insert_direct`` proves there are always
-        enough of them.
-
-        Writes the destinations into the gather's own plan slots and returns the remap
-        with every miss lane translated. Fixed shape, device only.
-        """
-        streamer = self.streamers[row]
-        victims, valid = self.victims[row], self.victim_valid[row]
-        # A miss lane's slot is -1 and a padded column is clamped to the dump index, so
-        # only genuine hits disqualify an entry.
-        hazard = (route_slots.unsqueeze(1) == victims.unsqueeze(0)).any(dim=0)
-        order = torch.argsort((hazard | ~valid).to(torch.uint8), stable=True)
-        usable = victims.index_select(0, order)
-        usable_valid = (valid & ~hazard).index_select(0, order)
-        live = (self.gather_lanes < streamer._graph_miss_count.long()) & usable_valid
-        # Lanes past the miss count are never copied (the copy reads the same count) or
-        # remapped to. A counted lane that is not live would copy to slot 0; the full
-        # shortlist rules that out and _commit_gather counts it if it happens.
-        idle, idle_slot = self._idle_destination()
-        destinations = torch.where(live, usable, torch.full_like(usable, idle))
-        # The plan's slot buffer has a row per route; the lanes are the first miss_rows.
-        streamer._graph_destination_slots[: self.miss_rows].copy_(
-            torch.where(live, destinations, torch.full_like(destinations, idle_slot)).to(torch.int32)
-        )
-        self._pending_commit = (row, streamer, destinations, live)
-        # The fused planner keeps the router's native ids, so remap may be int32, but
-        # index_select takes int64 only. The caller casts the result back.
-        rank = (remap - scratch_base).clamp(min=0, max=self.miss_rows - 1).long()
-        return torch.where(
-            remap >= scratch_base, destinations.index_select(0, rank), remap
-        )
-
     def fused_gather_destinations(
         self,
         row: int,
@@ -1086,10 +1036,18 @@ class GpuResidencyUpdater:
         scratch_base: int,
         remap_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """:meth:`gather_destinations` as one kernel that also looks up ``flat`` itself.
+        """Point one layer's gather at victim slots instead of scratch rows, in one kernel.
 
-        ``flat`` is the gather's routes; the kernel reads ``expert_to_slot`` for them.
-        Returns the translated remap in ``remap_dtype``, a view of a per-layer buffer.
+        ``flat`` is the gather's routes; the kernel reads ``expert_to_slot`` for them: a
+        slot for a hit, ``-1`` for a miss. A shortlist entry equal to one of those slots
+        is a row this forward reads, so it is dropped. That is the whole safety argument:
+        the choice is made with the forward's routing in hand even though the shortlist
+        was ranked before it. The surviving entries take the miss lanes in rank order,
+        and ``_init_insert_direct`` proves there are always enough of them.
+
+        Writes the destinations into the gather's own plan slots and returns the remap
+        with every miss lane translated, in ``remap_dtype``, a view of a per-layer buffer.
+        Fixed shape, device only.
         """
         from sglang.kernels.ops.moe.expert_residency_direct_gather import (
             direct_gather_destinations,
@@ -1122,7 +1080,7 @@ class GpuResidencyUpdater:
 
         Only for a gather whose miss width is below its routes (a verify). There, the misses can exceed the shortlist,
         and the hits can disqualify more entries than the shortlist has to spare. The lanes
-        :meth:`gather_destinations` made live are a prefix (usable entries first, then ``lane < count``), so their sum
+        :meth:`fused_gather_destinations` made live are a prefix (usable entries first, then ``lane < count``), so their sum
         is the number served. The shared miss count, which the copy, the lease record and the commit all read, drops
         to it: every row copied is committed, and nothing is copied into slot 0. The unserved misses' routes read
         slot 0 (a lane that is not live has destination 0; a rank past the shortlist reads its last lane), which may
@@ -1148,78 +1106,21 @@ class GpuResidencyUpdater:
         return destinations, live
 
     def commit_gather(self) -> None:
-        """Commit the residency of the gather whose copies were just issued.
+        """Commit the residency of the gather whose copies were just issued, in one kernel.
 
-        Consumes the commit that ``gather_destinations`` or its fused form recorded.
-        Raises when CPU experts run without the fused commit, which alone leaves CPU
-        lanes unmapped.
+        Consumes the commit that ``fused_gather_destinations`` recorded; ``live`` is
+        narrowed to the delivered lanes inside the kernel. The mask is the same
+        ``_graph_miss_count`` the copy kernel reads, so the mapping can never claim a
+        row the copy did not write. The writes are issued after the copy on the
+        gather's own stream, and every backend that could write a slot from another
+        stream is refused at startup (:meth:`check_miss_plans`).
         """
-        row, streamer, destinations, live = self._pending_commit
-        self._pending_commit = None
-        backend = streamer.row_backend
-        if self.layer_fusion:
-            self._fused_commit_gather(row, streamer, destinations, live)
-            return
-        if backend.leased and backend.cpu_experts:
-            raise RuntimeError(
-                "CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its commit leaves CPU lanes out"
-            )
-        if backend.leased:
-            delivered = backend.delivered_count.long()
-            live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
-        self._commit_gather(row, streamer, destinations, live)
-
-    def _commit_gather(
-        self, row: int, streamer, destinations: torch.Tensor, live: torch.Tensor
-    ) -> None:
-        """Move residency onto the rows this gather is about to copy.
-
-        The mask is the same ``_graph_miss_count`` the copy kernel reads, so the
-        mapping can never claim a row the copy did not write: there is one count, not
-        two that could disagree. The writes are issued after the copy on the gather's
-        own stream, and every backend that could write a slot from another stream is
-        refused at startup (:meth:`check_miss_plans`).
-        """
-        experts, slot_dump = self.num_experts, self.max_capacity
-        new_experts = streamer._graph_source_rows[: self.miss_rows]
-        slots = self.slot_to_expert[row]
-        targets = torch.where(live, destinations, slot_dump)
-        evicted = live & (slots.gather(0, destinations) >= 0)
-        mapping = self.mapping[row]
-        mapping.scatter_(
-            0, torch.where(evicted, slots.gather(0, destinations), experts), -1
-        )
-        mapping.scatter_(0, torch.where(live, new_experts, experts), targets)
-        slots.scatter_(0, targets, torch.where(live, new_experts, -1))
-        self.slot_state[row].scatter_(0, targets, _READY)
-        self.slot_generations[row].scatter_add_(0, targets, live.to(torch.long))
-        # ``tensor[i, j] = scalar`` stages through a pageable CPU tensor, which graph
-        # capture refuses. Fill a one-element view, which stays on the device.
-        self.slot_state[row, slot_dump : slot_dump + 1].fill_(_FREE)
-        slots[slot_dump : slot_dump + 1].fill_(-1)
-        self.slot_generations[row, slot_dump : slot_dump + 1].fill_(0)
-        self.gather_insertions[row].add_(live.sum())
-        self.gather_evictions[row].add_(evicted.sum())
-        backend = streamer.row_backend
-        if backend.leased:
-            delivered = backend.delivered_count.long()
-            good = backend.keep[0] > 0
-            self.insertion_truncated[row].add_(
-                ((delivered > live.sum()) & good).long().sum()
-            )
-        else:
-            self.insertion_truncated[row].add_(
-                (streamer._graph_miss_count.long() > live.sum()).long().sum()
-            )
-
-    def _fused_commit_gather(
-        self, row: int, streamer, destinations: torch.Tensor, live: torch.Tensor
-    ) -> None:
-        """:meth:`commit_gather` as one kernel; ``live`` is narrowed to the delivered lanes inside it."""
         from sglang.kernels.ops.moe.expert_residency_direct_gather import (
             direct_commit_gather,
         )
 
+        row, streamer, destinations, live = self._pending_commit
+        self._pending_commit = None
         backend = streamer.row_backend
         leased = backend.leased
         direct_commit_gather(

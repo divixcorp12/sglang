@@ -1,7 +1,7 @@
-"""SGLANG_DSV41_ENABLE_LAYER_FUSION's three kernels against the torch chains they replace, bit for bit.
+"""The layer fusion's three kernels against the torch chains they replace, bit for bit.
 
-The references are the production methods themselves (``GpuResidencyUpdater.gather_destinations`` and
-``commit_gather``, ``exl3.fused_moe.route_tables``), run on a clone of the same state. Every op in those chains is
+The references are those chains (``sglang.test.exl3_layer_fusion_reference``: the DIRECT gather destinations and
+commit, and the fused MoE's route tables), run on a clone of the same state. Every op in those chains is
 integer bookkeeping or an exact conversion, so the comparison is exact equality of every output and every piece of
 residency state, dump columns included. Shapes cover the production one (six routes, six lanes) and odd ones.
 """
@@ -11,14 +11,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.test.exl3_layer_fusion_reference import commit_gather, commit_live, gather_destinations, route_tables
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 READY, FREE = 3, 0
 
 
-def _updater(
-    width: int, experts: int, capacity: int, fused: bool, state: dict, streamer
-):
+def _updater(width: int, experts: int, capacity: int, state: dict, streamer):
     from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
 
     u = object.__new__(GpuResidencyUpdater)
@@ -34,9 +34,7 @@ def _updater(
     u._pending_commit = None
     for name, value in state.items():
         setattr(u, name, value.clone())
-    u.layer_fusion = fused
-    if fused:
-        u._init_layer_fusion()
+    u._init_layer_fusion()
     return u
 
 
@@ -198,12 +196,12 @@ def test_gather_and_commit_match_the_torch_chain(
         fused_streamer = _streamer(
             source_rows, miss_count, delivered, keep, leased, width, routes=routes
         )
-        ref = _updater(width, experts, capacity, False, state, ref_streamer)
-        fused = _updater(width, experts, capacity, True, state, fused_streamer)
+        ref = _updater(width, experts, capacity, state, ref_streamer)
+        fused = _updater(width, experts, capacity, state, fused_streamer)
         expert_to_slot = state["mapping"][0, :experts].contiguous()
 
-        want = ref.gather_destinations(
-            0, remap, expert_to_slot.index_select(0, flat.long()), base
+        want = gather_destinations(
+            ref, 0, remap, expert_to_slot.index_select(0, flat.long()), base
         )
         _, _, want_dest, want_live = ref._pending_commit
         for out_dtype in (id_dtype, torch.int64):
@@ -220,7 +218,7 @@ def test_gather_and_commit_match_the_torch_chain(
             ref_streamer._graph_destination_slots,
         )
 
-        ref.commit_gather()
+        commit_gather(ref)
         fused.commit_gather()
         for name in STATE:
             assert torch.equal(getattr(fused, name), getattr(ref, name)), (
@@ -250,15 +248,15 @@ def test_the_commit_leaves_cpu_lanes_unmapped_and_out_of_the_truncation_count():
         fused_streamer = _streamer(
             source_rows, miss_count, delivered, keep, True, width, cpu_lanes=cpu
         )
-        ref = _updater(width, experts, capacity, False, state, ref_streamer)
-        fused = _updater(width, experts, capacity, True, state, fused_streamer)
+        ref = _updater(width, experts, capacity, state, ref_streamer)
+        fused = _updater(width, experts, capacity, state, fused_streamer)
         expert_to_slot = state["mapping"][0, :experts].contiguous()
-        ref.gather_destinations(0, remap, expert_to_slot.index_select(0, flat.long()), base)
+        gather_destinations(ref, 0, remap, expert_to_slot.index_select(0, flat.long()), base)
         fused.fused_gather_destinations(0, remap, flat, expert_to_slot, base, torch.int64)
         _, _, destinations, live = ref._pending_commit
         ref._pending_commit = None
         live = live & (lanes < delivered) & (keep > 0) & ~cpu_bits
-        ref._commit_gather(0, ref_streamer, destinations, live)
+        commit_live(ref, 0, ref_streamer, destinations, live)
         fused.commit_gather()
         for name in STATE:
             assert torch.equal(getattr(fused, name), getattr(ref, name)), (
@@ -277,7 +275,7 @@ def test_captured_gather_and_commit_replay_new_inputs():
         gen, width, routes, experts, capacity
     )
     streamer = _streamer(source_rows, miss_count, delivered, keep, True, width)
-    fused = _updater(width, experts, capacity, True, state, streamer)
+    fused = _updater(width, experts, capacity, state, streamer)
     flat, remap = flat.to(torch.int32).clone(), remap.to(torch.int32).clone()
     expert_to_slot = fused.mapping[0, :experts]
 
@@ -300,11 +298,11 @@ def test_captured_gather_and_commit_replay_new_inputs():
             _scenario(gen, width, routes, experts, capacity)
         )
         ref_streamer = _streamer(new_rows, miss_count, delivered, keep, True, width)
-        ref = _updater(width, experts, capacity, False, state, ref_streamer)
-        want = ref.gather_destinations(
-            0, new_remap, state["mapping"][0, new_flat], base
+        ref = _updater(width, experts, capacity, state, ref_streamer)
+        want = gather_destinations(
+            ref, 0, new_remap, state["mapping"][0, new_flat], base
         )
-        ref.commit_gather()
+        commit_gather(ref)
         for name in (*STATE, "victims", "victim_valid"):
             getattr(fused, name).copy_(state[name])
         flat.copy_(new_flat)
@@ -342,7 +340,6 @@ def test_route_tables_match_the_torch_chain(
     routes, slots, hidden, remap_dtype, weight_dtype, x_dtype
 ):
     from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
-    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     gen = torch.Generator().manual_seed(routes * 31 + slots + hidden)
     dev = "cuda"
@@ -393,7 +390,6 @@ def test_route_tables_match_the_torch_chain_for_several_tokens(tokens, top_k, sl
     """Each token routes top_k distinct slots; tokens share slots. Stable ranks make kernel and chain agree bit for
     bit, token_sorted included."""
     from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
-    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     gen = torch.Generator().manual_seed(tokens * 131 + top_k * 7 + slots)
     dev = "cuda"

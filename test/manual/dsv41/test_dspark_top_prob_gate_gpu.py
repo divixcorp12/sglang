@@ -166,7 +166,7 @@ def test_the_dedup_plan_leaves_dead_rows_out_of_the_route_counts_and_nothing_els
         assert torch.equal(masked["route_counts"], plain["route_counts"])
 
 
-@pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
+@pytest.mark.parametrize("fused", [False, True], ids=["generic_plan", "fused_plan"])
 def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.expert_engine import service as service_module
@@ -191,7 +191,6 @@ def test_the_cut_rows_of_a_captured_verify_route_no_experts(tmp_path, fused):
             envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
             envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override(json.dumps({"pull_mode": "off"})),
             envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused),
-            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused),
         ):
             model = torch.nn.Module()
             layer = torch.nn.Module()

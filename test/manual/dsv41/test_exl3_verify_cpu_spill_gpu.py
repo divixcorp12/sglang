@@ -65,7 +65,6 @@ def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_on
             envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
             envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'),
             envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(True),
-            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True),
             envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"),
             envs.SGLANG_EXPERT_STREAM_CPU_SPLIT.override('{"calibration": false}'),
             envs.SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES.override(VICTIMS),

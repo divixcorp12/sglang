@@ -25,7 +25,7 @@ constexpr int kDirectGatherWarp = 32;
 // Routes a gather may carry: a verify's tokens x top_k, the dedup planner's bound (expert_route_plan.cuh).
 constexpr int kDirectGatherMaxRoutes = 64;
 
-// GpuResidencyUpdater.gather_destinations, for one layer. One warp; lane j owns shortlist entry j (width <= 32).
+// The DIRECT gather destinations (sglang.test.exl3_layer_fusion_reference.gather_destinations), for one layer. One warp; lane j owns shortlist entry j (width <= 32).
 //
 // A shortlist entry is usable when it is valid and no route of this forward reads its slot. Usable entries move to
 // the front in shortlist order, the others follow in shortlist order (the stable argsort of the torch chain). Lane k
@@ -160,7 +160,7 @@ __global__ __launch_bounds__(2 * kDirectGatherWarp, 1) void direct_gather_destin
   }
 }
 
-// GpuResidencyUpdater.commit_gather + _commit_gather, for one layer. One thread, in the torch chain's order: the
+// The DIRECT commit chain (sglang.test.exl3_layer_fusion_reference.commit_gather), for one layer. One thread, in the torch chain's order: the
 // chain is a sequence of scatters whose later writes overwrite earlier ones on shared indices (the dump columns), so
 // running it serially is what keeps every final value, dump columns included, identical.
 //

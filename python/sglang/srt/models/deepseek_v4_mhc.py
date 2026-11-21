@@ -78,6 +78,8 @@ class HcSubLayer(NamedTuple):
     norm: RMSNorm
     tf32_parts: Optional[Any] = None
     bf16_parts: Optional[Any] = None
+    # The sublayer's linears are EXL3: a BS1 combine also writes their shared fp16 input.
+    exl3_half_input: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +454,7 @@ def _combine(
             )
             quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
             return y
-        if x.shape[0] == 1 and envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get():
+        if x.shape[0] == 1 and hc.exl3_half_input:
             from sglang.kernels.ops.layernorm.hc_combine_norm import (
                 hc_combine_norm_half,
             )

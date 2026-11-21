@@ -249,13 +249,12 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
 
 def test_cpu_experts_refuse_the_generic_route_plan():
     """Only the fused plan sorts the miss lanes; refused before the host is touched."""
-    cfg = SimpleNamespace(enable_layer_fusion=True)
     with envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'), \
             envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"), \
             envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(False):
         with pytest.raises(RuntimeError, match="needs SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN"):
             module.ExpertEngineService._start_cpu_experts(
-                cfg, None, None, {}, False, None, stream=resolved_config().stream
+                None, None, {}, False, None, stream=resolved_config().stream
             )
 
 

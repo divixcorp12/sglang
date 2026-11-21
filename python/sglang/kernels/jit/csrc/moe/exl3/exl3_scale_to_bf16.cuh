@@ -1,6 +1,6 @@
 // REQUIRED BUILD FLAG: none; never -use_fast_math. Fast math flushes subnormal fp32 products to zero, which
-// torch's bf16 multiply keeps, and bit parity with the unfused chain breaks. Part of the EXL3 decode cast fusion
-// (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION): it keeps each rounding of the unfused chain and only drops a memory trip.
+// torch's bf16 multiply keeps, and bit parity with the unfused chain breaks. Part of the EXL3 decode cast fusion:
+// it keeps each rounding of the unfused chain and only drops a memory trip.
 #pragma once
 
 #include <sgl_kernel/tensor.h>

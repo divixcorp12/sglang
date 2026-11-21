@@ -3,7 +3,8 @@
 16 real experts of one layer fill 16 slots. Every M in (1, 2, 4, 6) draws 8 route sets of top-6 slots per token,
 so tokens share slots. Bars, per token:
   * rel(fused) <= 1.2e-2 and rel(fused) <= 2 * rel(exl3_moe_loop) + 1e-3, against the probe's fp32 reference;
-  * the layer-fusion and torch-chain route tables give the same output bitwise, and a second eager run repeats it;
+  * the fused and torch-chain route tables (sglang.test.exl3_layer_fusion_reference) give the same output bitwise,
+    and a second eager run repeats it;
   * a graph captured at M replays rewritten routes and inputs bitwise equal to an eager run;
   * one object serving M = 6 then M = 1 gives what a fresh object gives at M = 1.
 Reports eager and replay microseconds per M to DSV41_MULTITOKEN_OUT (JSON) when set.
@@ -17,6 +18,8 @@ import time
 
 import pytest
 import torch
+
+from sglang.test.exl3_layer_fusion_reference import unfused_run
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_exl3_moe_probe_gpu import (  # noqa: E402
@@ -52,20 +55,18 @@ def rows():
     return tensors, [_views(tensors, s) for s in range(len(EXPERTS))]
 
 
-def _fused(tensors, layer_fusion):
-    from sglang.srt.environ import envs
+def _fused(tensors):
     from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
 
-    with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(layer_fusion):
-        return Exl3FusedMoE(
-            tensors,
-            len(EXPERTS),
-            hidden=tensors["w13_suh"].shape[-1],
-            inter=tensors["w2_suh"].shape[-1],
-            top_k=TOP_K,
-            device=tensors["w13_suh"].device,
-            tokens=TOKENS,
-        )
+    return Exl3FusedMoE(
+        tensors,
+        len(EXPERTS),
+        hidden=tensors["w13_suh"].shape[-1],
+        inter=tensors["w2_suh"].shape[-1],
+        top_k=TOP_K,
+        device=tensors["w13_suh"].device,
+        tokens=TOKENS,
+    )
 
 
 def _inputs(gen, m, hidden, device):
@@ -77,7 +78,12 @@ def _inputs(gen, m, hidden, device):
 
 def _run(fused, x16, weights, remap):
     keep = torch.ones(1, device=x16.device)
-    return fused.run(x16, weights, remap if fused.layer_fusion else remap.long(), keep, ACT_LIMIT).clone()
+    return fused.run(x16, weights, remap, keep, ACT_LIMIT).clone()
+
+
+def _run_chain(fused, x16, weights, remap):
+    keep = torch.ones(1, device=x16.device)
+    return unfused_run(fused, x16, weights, remap.long(), keep, ACT_LIMIT).clone()
 
 
 def test_multitoken_fused_moe(rows):
@@ -87,7 +93,7 @@ def test_multitoken_fused_moe(rows):
     hidden = tensors["w13_suh"].shape[-1]
     device = tensors["w13_suh"].device
     w13, w2 = [v[0] for v in views], [v[1] for v in views]
-    chain, fusion = _fused(tensors, False), _fused(tensors, True)
+    chain, fusion = _fused(tensors), _fused(tensors)
     gen = torch.Generator().manual_seed(4321)
     report = {"layer": LAYER, "experts": EXPERTS, "widths": {}}
     failures = []
@@ -95,7 +101,7 @@ def test_multitoken_fused_moe(rows):
         entry = {"route_sets": []}
         for _ in range(ROUTE_SETS):
             x16, weights, remap = _inputs(gen, m, hidden, device)
-            a = _run(chain, x16, weights, remap)
+            a = _run_chain(chain, x16, weights, remap)
             b = _run(fusion, x16, weights, remap)
             again = _run(fusion, x16, weights, remap)
             loop = exl3_moe_loop(x16, weights.view(m, TOP_K), remap.view(m, TOP_K), w13, w2, ACT_LIMIT).float()
@@ -143,7 +149,7 @@ def test_multitoken_fused_moe(rows):
     # A wider run leaves nothing behind for a narrower one.
     x16, weights, remap = _inputs(gen, 1, hidden, device)
     _run(fusion, *_inputs(gen, TOKENS, hidden, device))
-    if not torch.equal(_run(fusion, x16, weights, remap), _run(_fused(tensors, True), x16, weights, remap)):
+    if not torch.equal(_run(fusion, x16, weights, remap), _run(_fused(tensors), x16, weights, remap)):
         failures.append("M=1 after M=6 differs from a fresh object")
     report["failures"] = failures
     if OUT:

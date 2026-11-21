@@ -386,7 +386,6 @@ if __name__ == "__main__":
 CPU_EXPERTS_ENV = dict(
     SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER=True,
     SGLANG_EXPERT_STREAM_COPY_MODE="copy_engine",
-    SGLANG_DSV41_ENABLE_LAYER_FUSION=True,
     SGLANG_EXPERT_STREAM_ENABLE_GPU_RESIDENCY_UPDATE=True,
     SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE=2,
     SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN=True,
@@ -396,9 +395,9 @@ CPU_EXPERTS_ENV = dict(
 
 @pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS"])
 def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
-    """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused
-    MoE (layer fusion), not the lowest-scored misses (DIRECT residency's keys, which only the fused plan sorts by), or
-    run on no cores; the refusal names the one that is off."""
+    """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), not the lowest-scored
+    misses (DIRECT residency's keys, which only the fused plan sorts by), or run on no cores; the refusal names the one
+    that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
     off = {"SGLANG_EXPERT_STREAM_HOT_INSERT_ON_MISS_STAGE": 1, "SGLANG_EXPERT_STREAM_COPY_MODE": "sm_copy"}.get(missing, False)
     with pytest.raises(ValueError, match=f"SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS needs {missing}"):

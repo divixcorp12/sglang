@@ -3,7 +3,7 @@
 // ram_tier.h, never this file.
 #pragma once
 
-  // ---- Prefill fills (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS) ----
+  // ---- Prefill fills ----
   //
   // A prefill fill reads the rows of many experts into RAM slots on a helper thread while the caller gathers.
   //   - fill_begin: a caller that owns the tier claims slots for `experts` of `row`, in order, until one cannot be

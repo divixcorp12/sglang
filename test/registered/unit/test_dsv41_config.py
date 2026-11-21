@@ -1,5 +1,7 @@
 """Dsv41Config resolves the DSV41 knobs afresh on every call, so envs.X.override() is observed."""
 
+import os
+
 import msgspec
 import pytest
 
@@ -23,8 +25,6 @@ def test_defaults_match_the_env_declarations():
         enable_engram_device_wait=False,
         engram_verify_in_graph=True,
         ram_miss_fault="",
-        enable_layer_fusion=False,
-        enable_exl3_cast_fusion=False,
         torch_prefill_indexer=False,
         torch_prefill_indexer_score_budget_mb=0,
         fused_wo_a=True,
@@ -133,12 +133,44 @@ def test_removed_ram_miss_knobs_warn(monkeypatch):
     Dsv41Config.from_envs()  # the set values do not break the config a service starts from
 
 
-def test_the_lease_pdl_flag_is_off_by_default_and_observed_when_overridden():
-    assert envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.get() is False
-    assert ExpertStreamConfig.from_envs().copy.lease_pdl is False
-    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(True):
-        assert ExpertStreamConfig.from_envs().copy.lease_pdl is True
-    assert ExpertStreamConfig.from_envs().copy.lease_pdl is False
+RETIRED_ALWAYS_ON_KNOBS = (
+    "SGLANG_DSV41_ENABLE_LAYER_FUSION",
+    "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION",
+    "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS",
+    "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN",
+    "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER",
+    "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL",
+    "SGLANG_DSV41_ENABLE_PREFILL_FILLS",
+    "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN",
+    "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER",
+    "SGLANG_DSV41_ENABLE_LEASE_PDL",
+)
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_retired_always_on_knobs_warn_and_are_ignored(monkeypatch, value):
+    """Six switches production always set are unconditional: a launch that still sets one, under either spelling and
+    to either value, warns and starts, and no config field reads it."""
+    import warnings
+
+    from sglang.srt import environ
+    from sglang.srt.layers.moe.expert_engine import removed_env
+
+    for name in RETIRED_ALWAYS_ON_KNOBS:
+        monkeypatch.setenv(name, value)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        environ._handle_deprecated_envs()
+    text = " ".join(str(w.message) for w in caught)
+    for name in RETIRED_ALWAYS_ON_KNOBS:
+        assert f"{name} is deprecated" in text, name
+        assert not hasattr(environ.envs, name), name
+        assert environ._DEPRECATED_ENVS[name].replacement is None, name
+    assert "Always on" in text
+    removed_env.check_removed_env(dict(os.environ))  # warned, not refused
+    assert ExpertStreamConfig.from_envs() == ExpertStreamConfig()
+    fields = {f.name for f in msgspec.structs.fields(Dsv41Config)}
+    assert not {"enable_layer_fusion", "enable_exl3_cast_fusion"} & fields
 
 
 if __name__ == "__main__":
