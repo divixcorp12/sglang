@@ -333,6 +333,32 @@ class TestMiMoFusedQkvLoaderLayout(CustomTestCase):
         out = (x @ weight_param.data.t()).index_select(-1, attention.qkv_output_perm)
         self.assertTrue(torch.equal(out, expected))
 
+    def test_tp1_layout_keeps_an_offloaded_weight_pinned(self):
+        """With --cpu-offload-gb the qkv weight and scale live in pinned host memory and are copied to the GPU every
+        forward; the kept layout must stay pinned, or each copy runs at pageable bandwidth."""
+        if not torch.cuda.is_available():
+            self.skipTest("pinned host memory needs CUDA")
+        from sglang.srt.models.mimo_v2 import _keep_checkpoint_qkv_layout
+
+        sizes, ckpt_tp, k, block = (24, 6, 4), 8, 16, 16
+        attention = torch.nn.Module()
+        weight_param = torch.nn.Parameter(
+            torch.ones(ckpt_tp * sum(sizes), k, device="cpu").pin_memory(), requires_grad=False
+        )
+        scale_param = torch.nn.Parameter(torch.empty(1, 1, device="cpu").pin_memory(), requires_grad=False)
+        _keep_checkpoint_qkv_layout(
+            attention=attention,
+            weight_param=weight_param,
+            scale_param=scale_param,
+            ckpt_scale=torch.rand(ckpt_tp * 3, 1, device="cpu"),
+            qkv_sizes=sizes,
+            ckpt_tp=ckpt_tp,
+            block_size=block,
+        )
+        self.assertTrue(weight_param.data.is_pinned())
+        self.assertTrue(scale_param.data.is_pinned())
+
+
 
 if __name__ == "__main__":
     unittest.main()
