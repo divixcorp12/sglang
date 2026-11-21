@@ -35,6 +35,7 @@ def test_the_builds_are_registered_as_format_router_pairs():
         ("nvfp4", "sqrt_softplus"),
         ("nvfp4", "sigmoid"),
         ("mxfp4", "sigmoid"),
+        ("gptq_int3", "sigmoid"),
         ("fake", "sqrt_softplus"),
     }
     assert ops.NVFP4_MIMO_BUILD == ("nvfp4", "sigmoid")
