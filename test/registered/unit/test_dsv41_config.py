@@ -140,6 +140,9 @@ RETIRED_ALWAYS_ON_KNOBS = (
     "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN",
     "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER",
     "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL",
+)
+# Their pre-rename spellings: F145 refuses them at startup, now with no replacement.
+REFUSED_PRE_RENAME_KNOBS = (
     "SGLANG_DSV41_ENABLE_PREFILL_FILLS",
     "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN",
     "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER",
@@ -149,8 +152,8 @@ RETIRED_ALWAYS_ON_KNOBS = (
 
 @pytest.mark.parametrize("value", ["0", "1"])
 def test_retired_always_on_knobs_warn_and_are_ignored(monkeypatch, value):
-    """Six switches production always set are unconditional: a launch that still sets one, under either spelling and
-    to either value, warns and starts, and no config field reads it."""
+    """Six switches production always set are unconditional: a launch that still sets one, to either value, warns and
+    starts, and no config field reads it."""
     import warnings
 
     from sglang.srt import environ
@@ -171,6 +174,17 @@ def test_retired_always_on_knobs_warn_and_are_ignored(monkeypatch, value):
     assert ExpertStreamConfig.from_envs() == ExpertStreamConfig()
     fields = {f.name for f in msgspec.structs.fields(Dsv41Config)}
     assert not {"enable_layer_fusion", "enable_exl3_cast_fusion"} & fields
+
+
+@pytest.mark.parametrize("name", REFUSED_PRE_RENAME_KNOBS)
+def test_the_pre_rename_spellings_still_refuse_startup(name):
+    from sglang.srt import environ
+    from sglang.srt.layers.moe.expert_engine import removed_env
+
+    assert name not in environ._DEPRECATED_ENVS
+    assert removed_env.REMOVED_ENV[name].env == removed_env.NO_REPLACEMENT
+    with pytest.raises(removed_env.RemovedEnvError, match=f"{name} \\(removed, no replacement\\): always on"):
+        removed_env.check_removed_env({name: "1"})
 
 
 if __name__ == "__main__":

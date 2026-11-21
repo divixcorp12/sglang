@@ -2653,7 +2653,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": _DeprecatedEnv(note=_HIT_WAIT_GONE_NOTE),
     "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": _DeprecatedEnv(note=_ROW_WEIGHTED_REMOVED_NOTE),
     # Six EXL3 decode/prefill switches production always set to 1, now unconditional. Archived arms and dated study
-    # scripts still set them (some under their pre-rename SGLANG_DSV41_* spellings), so a set value warns.
+    # scripts still set them, so a set value warns. Their pre-rename SGLANG_DSV41_* spellings refuse startup instead
+    # (expert_engine/removed_env.py).
     **{
         name: _DeprecatedEnv(note=_ALWAYS_ON_DSV41_NOTE)
         for name in (
@@ -2663,10 +2664,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
             "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN",
             "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER",
             "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL",
-            "SGLANG_DSV41_ENABLE_PREFILL_FILLS",
-            "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN",
-            "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER",
-            "SGLANG_DSV41_ENABLE_LEASE_PDL",
         )
     },
 }
