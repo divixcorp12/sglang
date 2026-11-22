@@ -239,10 +239,15 @@ def _keep_checkpoint_qkv_layout(
             f"qkv scale rows {ckpt_scale.shape[0]} are not {ckpt_tp} shards of {padded // block_size} blocks"
         )
     weight = weight_param.data
-    kept = torch.zeros((ckpt_tp * padded, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+    # An offloaded weight lives in pinned host memory; a pageable replacement makes every forward's copy ~3x slower.
+    pinned = weight.device.type == "cpu" and weight.is_pinned()
+    kept = torch.zeros(
+        (ckpt_tp * padded, weight.shape[1]), dtype=weight.dtype, device=weight.device, pin_memory=pinned
+    )
     kept.view(ckpt_tp, padded, -1)[:, :rows].copy_(weight.view(ckpt_tp, rows, -1))
     weight_param.data = kept
-    scale_param.data = ckpt_scale.to(device=scale_param.device, dtype=scale_param.dtype).contiguous()
+    scale = ckpt_scale.to(device=scale_param.device, dtype=scale_param.dtype).contiguous()
+    scale_param.data = scale.pin_memory() if scale_param.device.type == "cpu" and scale_param.is_pinned() else scale
     offsets = (0, qkv_sizes[0], qkv_sizes[0] + qkv_sizes[1])
     perm = torch.cat(
         [
