@@ -1051,15 +1051,19 @@ def test_server_args_includes_decode_log_interval_when_set():
 # --- arm_env: expert-row mirroring is on by default, and an arm turns it off by value ---
 
 
-def test_base_env_launches_the_lease_chain_with_pdl():
+def test_base_env_sets_none_of_the_retired_always_on_knobs():
     env = arm_env.base_env()
-    assert env["SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL"] == "1"
-    # Lease mode, row images and the packed path's workers are no longer knobs (2026-09-29): a set value only warns,
-    # so the recipe sets none of them.
+    # These are no longer knobs: a set value only warns, so the recipe sets none of them.
     for removed in (
         "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES",
         "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES",
         "SGLANG_DSV41_RAM_MISS_PACK_WORKERS",
+        "SGLANG_DSV41_ENABLE_LAYER_FUSION",
+        "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN",
+        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER",
+        "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL",
     ):
         assert removed not in env, removed
 

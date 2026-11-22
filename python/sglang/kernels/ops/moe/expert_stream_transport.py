@@ -3611,8 +3611,7 @@ class ExpertStreamDevice:
     ``SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS_MISSES``; ``miss_cut``/``miss_cut_max`` carry the experiment
     ``SGLANG_EXPERT_STREAM_CPU_SPLIT``'s miss_cut/miss_cut_max (ram_slot_map.type_lanes); ``split_model`` carries the
     experiment ``SGLANG_EXPERT_STREAM_CPU_SPLIT`` model's cost words (ram_slot_map.split_model_words); ``lease_pdl``
-    (``SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
-    PDL.
+    (on when the GPU supports it, sm_90+) launches every chain kernel but C1 and CC with PDL.
 
     ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
     ``[layers, experts]`` starts at -1 and changes only through the deltas the post

@@ -1,12 +1,13 @@
-"""JIT wrappers for the DIRECT residency kernels of ``GpuResidencyUpdater`` (SGLANG_DSV41_ENABLE_LAYER_FUSION).
+"""JIT wrappers for the DIRECT residency kernels of ``GpuResidencyUpdater`` (the layer fusion).
 
 Each wrapper launches one kernel in place of a per-layer chain of small torch ops, with bit-identical results:
 
-* ``direct_gather_destinations`` -- ``GpuResidencyUpdater.gather_destinations`` (26 kernels per layer), with the
-  route-slot lookup ``expert_to_slot.index_select(0, flat.long())`` folded in;
-* ``direct_commit_gather`` -- ``GpuResidencyUpdater.commit_gather`` (41 kernels per layer).
+* ``direct_gather_destinations`` -- the gather-destination chain (26 kernels per layer), with the route-slot lookup
+  ``expert_to_slot.index_select(0, flat.long())`` folded in;
+* ``direct_commit_gather`` -- the commit chain (41 kernels per layer).
 
-The torch chains stay the reference: the flag-off path runs them, and the parity tests compare against them.
+The torch chains stay the reference, in ``sglang.test.exl3_layer_fusion_reference``; the parity tests compare
+against them.
 """
 
 from __future__ import annotations

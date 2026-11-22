@@ -1038,7 +1038,7 @@ class _OperationalCounters:
     host_read_ns: int = 0
     host_split_ns: int = 0
     # Rows prefill fills read for the gathers (ExpertGatherStats.host_fill_rows): with
-    # SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS, a prefill's reads are host_read_rows plus these.
+    # the native slot table's fills, a prefill's reads are host_read_rows plus these.
     host_fill_rows: int = 0
 
 

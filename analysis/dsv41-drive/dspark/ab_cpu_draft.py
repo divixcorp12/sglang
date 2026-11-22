@@ -40,8 +40,6 @@ COMMON = {
     "SGLANG_SM120_FLASHMLA_BACKEND": "triton",
     # Layer-major prefill needs --max-running-requests 1; trace_corpus launches with 4.
     "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
-    # Prefill fills are the RAM-miss service's reads, which only run with graph gather (option C).
-    "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS": "0",
 }
 ARMS = {
     "resident": {"SGLANG_EXPERT_STREAM_HOT_GPU_MB": "7168"},

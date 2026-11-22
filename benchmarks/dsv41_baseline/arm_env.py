@@ -262,9 +262,6 @@ def base_env() -> dict[str, str]:
         "SGLANG_EXPERT_STREAM_ENABLE_CPU_EXPERTS": "1",
         "SGLANG_EXPERT_STREAM_CPU_EXPERTS_THREADS": str(CPU_EXPERTS_THREADS),
         "SGLANG_EXL3_MOE_CPU_PIN": "0",
-        # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
-        # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
-        "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
         # Engram lookups by device post/wait instead of graph host nodes: no host nodes in the decode graph,
         # byte-identical (docs/superpowers/plans/2026-09-25-dsv41-engram-no-hostnode.md).
         "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT": "1",
@@ -277,33 +274,16 @@ def base_env() -> dict[str, str]:
         # copy engine arms fail-stopped the soak deterministically, never under EAGER
         # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). Costs ~1 GiB, hence MEM_FRACTION_STATIC.
         "CUDA_MODULE_LOADING": "EAGER",
-        # Prefill's pinned-tier misses read by the RAM-miss service's reader straight into the slabs, a layer's reads
-        # issued up front: TTFT 21.06/17.79 -> 12.05/11.14 s, decode unchanged, byte-identical (DSV41_REFERENCE.md 27.6).
-        # Reads the row images the RAM-miss service always reads (built on every mirror root by
-        # scripts/dsv41/build_row_images.py; startup refuses a root without a matching set).
-        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS": "1",
         # A prefill's pinned-tier admissions own at most 64 rows per layer, then evict their own LRU row instead of
         # decode's. Served A/B 2026-10-16 (DSpark -mergechunk-expseg arm, one pair): -3.46 ms/token, 95% CI
         # -4.91..-1.55, TTFT -0.48 s; 56-59% of decode's NVMe-cold GPU lanes had been evicted by a prefill
         # (DSV_OPTIMIZATION.md 3.8, /mnt/nvme1/share64-ab-20261016). Needs --expert-distribution-recorder-mode
         # (passed below); the service refuses to start without it. On by the owner's decision, 2026-10-16.
         "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE": "1",
-        # Fewer fp16/bf16 casts around the EXL3 gemvs at BS1 decode: 358 fewer kernels per step, bit-identical,
-        # 112.4 -> 111.8 ms/token (within noise; DSV41_REFERENCE.md 27.8).
-        "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION": "1",
-        # The eager streamed MoE queues each chunk's compute behind its gather instead of waiting for it: TTFT
-        # 12.6 -> 9.9 s on a 260-token prompt, outputs identical (DSV41_REFERENCE.md 27.11).
-        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN": "1",
-        # A prefill chunk copies its rows already in the pinned tier before waiting for its fills: TTFT 9.9 -> 8.6 s,
-        # outputs identical (DSV41_REFERENCE.md 27.12).
-        "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER": "1",
         # CW reads each RAM-hit row's four small tensors itself, so the copy engine sends 2 copies per row, not 6:
         # outputs identical, ~1 ms/step in a node-mode trace, within noise untraced (DSV41_REFERENCE.md 27.14).
         # Needs the copy engine above.
         "SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES": "1",
-        # The lease chain's kernels launch with PDL: at most ~1 us/layer, outputs identical
-        # (analysis/dsv41-drive/chain-pdl/results.md, on expert-stream-transfer-measurement). Needs the leases above.
-        "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL": "1",
         # Suffixes of 8192+ uncached tokens prefill layer-major: token 0 identical to chunked at 8k-33k
         # (DSV41_REFERENCE.md 27.19, 27.20). Not yet measured at 128k+. An arm sets "0" to force chunked.
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
@@ -590,8 +570,8 @@ def new_names_env(env: dict[str, str]) -> dict[str, str]:
     names. The recipes above already use the new names; this is for translating a recipe saved before the rename.
 
     The translation is expert_engine/removed_env.translate_env: group members become one JSON object per group, the
-    stream switches and copy mechanisms merge, SPIN_CORE becomes a NUMA_CORES entry, and the retired HIT_WAIT_US is
-    dropped.
+    stream switches and copy mechanisms merge, SPIN_CORE becomes a NUMA_CORES entry, and the retired names it ignores
+    (RETIRED_IGNORED_ENV: HIT_WAIT_US and the always-on switches) are dropped.
     """
     import importlib.util
     from pathlib import Path

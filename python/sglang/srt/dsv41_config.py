@@ -1,7 +1,7 @@
 """The DeepSeek-V4.1 runtime knobs outside expert streaming, resolved from the environment into one value.
 
 ``Dsv41Config.from_envs`` reads the model's own ``SGLANG_*DSV41*`` environment variables (reasoning effort, Engram,
-the fused kernels, the prefill indexer, the RAM-miss fault test hook) once and returns a frozen struct, so a component
+the fused wo_a, the prefill indexer, the RAM-miss fault test hook) once and returns a frozen struct, so a component
 reads a field instead of the process environment. The variables are documented where they are declared, in
 ``sglang.srt.environ``.
 
@@ -35,8 +35,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_engram_device_wait: bool
     engram_verify_in_graph: bool
     ram_miss_fault: str
-    enable_layer_fusion: bool
-    enable_exl3_cast_fusion: bool
     torch_prefill_indexer: bool
     torch_prefill_indexer_score_budget_mb: int
     fused_wo_a: bool
@@ -55,8 +53,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_engram_device_wait=envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get(),
             engram_verify_in_graph=envs.SGLANG_DSV41_ENGRAM_VERIFY_IN_GRAPH.get(),
             ram_miss_fault=envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get(),
-            enable_layer_fusion=envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
-            enable_exl3_cast_fusion=envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
             torch_prefill_indexer_score_budget_mb=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB.get(),
             fused_wo_a=envs.SGLANG_DSV41_FUSED_WO_A.get(),

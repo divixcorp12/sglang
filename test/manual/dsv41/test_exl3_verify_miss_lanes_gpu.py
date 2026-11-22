@@ -23,7 +23,7 @@ ACT_LIMIT = 10.0
 TOP_K, TOKENS, LANES, EXPERTS = 6, 6, 8, 48
 
 
-@pytest.mark.parametrize("fused", [False, True], ids=["generic", "layer_fusion"])
+@pytest.mark.parametrize("fused", [False, True], ids=["generic_plan", "fused_plan"])
 def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fused):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.expert_engine import service as service_module
@@ -49,7 +49,6 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
             envs.SGLANG_EXPERT_STREAM_ENABLE_GRAPH_GATHER.override(True),
             envs.SGLANG_EXPERT_STREAM_SHADOW_PREFETCH.override('{"pull_mode": "off"}'),
             envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(fused),
-            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused),
         ):
             model = torch.nn.Module()
             layer = torch.nn.Module()
@@ -73,7 +72,6 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
             assert streamer.graph_gather_rows == TOKENS * TOP_K and streamer.graph_miss_width == LANES
             assert service.lanes == LANES and updater.miss_rows == LANES
             assert manager.caches[0].capacity == 2 * LANES and manager.caches[0].scratch_rows == 0
-            assert updater.layer_fusion is fused
 
             generator = torch.Generator(device="cpu").manual_seed(37)
             x = (torch.randn((TOKENS, HIDDEN), generator=generator) * 0.5).to("cuda", torch.bfloat16)

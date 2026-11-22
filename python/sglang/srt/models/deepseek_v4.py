@@ -2911,6 +2911,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             else boundary_pre_from_prev
         )
         self.boundary_mhc_fusions = boundary_mhc_fusions
+        # EXL3 linears take a shared fp16 copy of the BS1 sublayer input (the cast fusion).
+        moe_quant_config = moe_quant_config_override or quant_config
+        self._exl3_attn_input = quant_config is not None and quant_config.get_name() == "exl3"
+        self._exl3_ffn_input = moe_quant_config is not None and moe_quant_config.get_name() == "exl3"
         self.self_attn = self._build_self_attn(
             config=config,
             layer_id=layer_id,
@@ -3029,6 +3033,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.input_layernorm,
             self._hc_attn_tf32_parts,
             self._hc_attn_bf16_parts,
+            self._exl3_attn_input,
         )
         self.ffn_hc = mhc.HcSubLayer(
             self.hc_cfg,
@@ -3038,6 +3043,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.post_attention_layernorm,
             self._hc_ffn_tf32_parts,
             self._hc_ffn_bf16_parts,
+            self._exl3_ffn_input,
         )
 
     def refresh_mhc_norm_weight_cache(self):

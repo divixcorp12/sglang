@@ -616,7 +616,7 @@ def test_router_capture_rides_the_route_log_only_when_its_path_is_set(tiers, mon
     assert log.router_x is None  # sized by the first warmup forward's record_router
 
 
-def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
+def _apply_graph_ops(monkeypatch, route_log):
     """Every aten op _apply_graph issues around a gather that itself issues none (its post is not under test)."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -634,7 +634,7 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
 
     monkeypatch.setattr(exl3_fused_moe, "exl3_fused_moe_for",
                         lambda layer, streamer: SimpleNamespace(
-                            layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
+                            run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
     backend = row_backend.ExpertEngineRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(8)), 0, 6, {0: None},
         route_log=route_log
@@ -652,23 +652,22 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
     return mode.ops
 
 
-@pytest.mark.parametrize("layer_fusion", [False, True], ids=["unfused", "fused"])
-def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_path, layer_fusion):
+def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_path):
     """Trace off (no route log) and trace on without router capture build the same captured chain; router
     capture adds exactly its three ring copies. A regression here puts kernels in the production graph."""
     from collections import Counter
 
     from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 
-    off = _apply_graph_ops(monkeypatch, None, layer_fusion)
-    routes_only = _apply_graph_ops(monkeypatch, GraphRouteLog(1, 8, "cpu"), layer_fusion)
+    off = _apply_graph_ops(monkeypatch, None)
+    routes_only = _apply_graph_ops(monkeypatch, GraphRouteLog(1, 8, "cpu"))
     assert routes_only == off
     log = GraphRouteLog(1, 8, "cpu", depth=32)
     log.enable_router(str(tmp_path / "router"))
     log.router_x = torch.zeros((32, 1, 1, 16), dtype=torch.bfloat16)  # as the warmup forward sizes them
     log.router_ids = torch.zeros((32, 1, 1, 6), dtype=torch.int64)
     log.router_w = torch.zeros((32, 1, 1, 6))
-    captured = _apply_graph_ops(monkeypatch, log, layer_fusion)
+    captured = _apply_graph_ops(monkeypatch, log)
     added = Counter(captured) - Counter(off)
     assert added["aten.index_copy_.default"] == 3
     views = {"aten.select.int", "aten.slice.Tensor", "aten.view.default", "aten._unsafe_view.default",
@@ -689,16 +688,16 @@ def tier_sim_load_forwards(path):
 
 
 @pytest.mark.parametrize("pdl", [False, True], ids=["pdl_off", "pdl_on"])
-def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl):
-    """SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
-    it to the six chain launchers (test_exl3_ram_miss_device_args.py)."""
+def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, monkeypatch, pdl):
+    """The GPU's PDL support (sm_90+) -> the service -> ExpertStreamDevice(lease_pdl=...), which passes it to the six
+    chain launchers (test_exl3_ram_miss_device_args.py)."""
     service, streamers, caches = tiers
-    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(pdl):
-        _reconfigure(service)
-        _attach_all(service, streamers)
+    monkeypatch.setattr(module, "is_arch_support_pdl", lambda: pdl)
+    _reconfigure(service)
+    _attach_all(service, streamers)
     assert service.lease_pdl is pdl and service.device_side.lease_pdl is pdl
-    with envs.SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL.override(not pdl):
-        service.ensure_started()  # the config was resolved once: a later env change is not seen
+    monkeypatch.setattr(module, "is_arch_support_pdl", lambda: not pdl)
+    service.ensure_started()  # read once at start: a later answer is not seen
     assert service.device_side.lease_pdl is pdl
 
 
@@ -1663,7 +1662,6 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
         "cpu_trait_for",
         lambda key, *, source: sources.append(source) or SimpleNamespace(hidden_size=lambda slabs: 8),
     )
-    cfg = SimpleNamespace(enable_layer_fusion=True)
     streamers = {
         3: SimpleNamespace(
             pinned_host_cache=SimpleNamespace(tensors={}), layer=SimpleNamespace(layer_id=3), graph_gather_rows=36
@@ -1672,7 +1670,7 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
     with envs.SGLANG_EXPERT_STREAM_COPY_MODE.override("copy_engine"), envs.SGLANG_EXPERT_STREAM_ENABLE_FUSED_PLAN.override(True):
         with pytest.raises(RuntimeError, match="layer 3.*top_k"):
             module.ExpertEngineService._start_cpu_experts(
-                cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36,
+                object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36,
                 stream=resolved_config().stream,
             )
     assert sources == ["target"]

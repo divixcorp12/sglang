@@ -296,6 +296,17 @@ def test_the_retired_hit_wait_is_not_a_removed_name():
     rem.check_removed_env({"SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100"})
 
 
+@pytest.mark.parametrize("old", sorted(rem.RETIRED_IGNORED_ENV))
+def test_a_retired_ignored_name_passes_the_check_and_is_dropped_by_the_translation(old):
+    from sglang.srt import environ
+
+    assert old not in rem.REMOVED_ENV and old in environ._DEPRECATED_ENVS
+    rem.check_removed_env({old: "1"})
+    assert rem.translate_env({old: "1", "SGLANG_EXPERT_STREAM_ENABLE": "1"}, lambda cpu: 0) == {
+        "SGLANG_EXPERT_STREAM_ENABLE": "1"
+    }
+
+
 @pytest.mark.parametrize("old", sorted(rem.REMOVED_ENV))
 def test_each_removed_name_raises_naming_its_replacement(old):
     with pytest.raises(rem.RemovedEnvError) as error:

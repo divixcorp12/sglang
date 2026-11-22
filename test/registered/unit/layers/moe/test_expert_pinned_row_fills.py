@@ -1,4 +1,4 @@
-"""The pinned tier's native fills (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS) as ExpertPinnedHostCache drives them (CPU).
+"""The pinned tier's native fills (the prefill fills) as ExpertPinnedHostCache drives them (CPU).
 
 A fake PinnedRowFills stands in for the RAM-miss service: its rows land only when waited for or joined (or, to stand
 in for the reader running ahead, ``progress`` rows per ``fill_landed`` poll), so a copy that ran before its row landed
@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_host_tier import PinnedSlotLRU
 from sglang.srt.layers.moe.expert_stream import (
     ExpertGatherStats,
@@ -150,8 +149,7 @@ def test_gather_rows_waits_for_each_chunks_own_prefetched_rows_before_copying():
 
 @pytest.mark.parametrize("split", [False, True])
 def test_a_chunk_miss_outside_the_prefetch_joins_it_before_admitting(split):
-    with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER.override(split):
-        streamer, cache, fills, reference = _setup()
+    streamer, cache, fills, reference = _split_setup(split)
     with cache.host_use():
         cache.prefetch_rows([1, 2], protected=[1, 2])
         outputs = _outputs(reference, 2)
@@ -230,9 +228,13 @@ def test_copy_rows_copies_only_the_named_rows_and_leaves_the_rest():
         assert (outputs[name][1] == SENTINEL).all()
 
 
-def _split_setup(**kwargs):
-    with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER.override(True):
-        return _setup(**kwargs)
+def _split_setup(split=True, **kwargs):
+    """``_setup``; with ``split`` False the tier gathers unsplit, the reference the split gather must match."""
+    streamer, cache, fills, reference = _setup(**kwargs)
+    if not split:
+        # The unsplit gather waits for every fill first: no chunk position counts as still filling.
+        cache._filling_positions = lambda chunk_ids: []
+    return streamer, cache, fills, reference
 
 
 def _sentinel_outputs(reference, rows):
@@ -258,11 +260,10 @@ def test_split_gather_copies_resident_rows_before_waiting_for_the_fills():
 
 
 def test_split_gather_places_every_chunks_rows_like_the_unsplit_gather():
-    """Two chunks with filling rows at different positions: byte-identical to the flag-off gather."""
+    """Two chunks with filling rows at different positions: byte-identical to the unsplit gather."""
     got = None
     for split in (False, True):
-        with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER.override(split):
-            streamer, cache, fills, reference = _setup(capacity=6, experts=8)
+        streamer, cache, fills, reference = _split_setup(split, capacity=6, experts=8)
         cache.ensure_rows(torch.tensor([0, 5]))
         with cache.host_use():
             cache.prefetch_rows([0, 2, 3, 5, 7], protected=[0, 2, 3, 5, 7])
@@ -377,8 +378,7 @@ def test_three_chunks_with_resident_landed_and_filling_rows_place_like_the_unspl
     got = None
     chunks = ([9, 0, 2, 11], [3, 5, 12, 4], [13, 7, 1, 10])
     for split in (False, True):
-        with envs.SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER.override(split):
-            streamer, cache, fills, reference = _setup(capacity=14, experts=14)
+        streamer, cache, fills, reference = _split_setup(split, capacity=14, experts=14)
         cache.ensure_rows(torch.tensor([0, 5, 7]))
         fills.progress = progress
         with cache.host_use():

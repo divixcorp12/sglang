@@ -20,7 +20,6 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
     # Budget A (mem-budget-report.md L2): the DSpark arms trade hot cache for prefill headroom.
     assert env["SGLANG_EXPERT_STREAM_HOT_GPU_MB"] == "10840"
-    assert env["SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS"] == "1"  # the recipe's, kept
 
 
 def test_the_pinned_row_sizes_are_the_served_checkpoints():

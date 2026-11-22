@@ -99,7 +99,7 @@ class HeldBackSlots(Protocol):
 class PinnedRowFills(Protocol):
     """Asynchronous reads of a layer's missing rows into its pinned slots.
 
-    Enabled by ``copy.prefill.fills``. Driven by
+    Provided by the native slot table (graph gather). Driven by
     ``ExpertPinnedHostCache`` inside one host use.
 
     * ``fill_begin`` claims slots for ``experts`` in order, until one has no victim

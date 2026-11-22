@@ -434,8 +434,6 @@ class Envs:
     # The copy engine copies only each RAM-hit row's big tensors; the copy wait reads the layout's small ones from the
     # pinned slot with SM loads. Needs the copy engine.
     SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES = EnvBool(False)
-    # Lease-chain kernels launch with programmatic dependent launch (at most ~1 us per layer).
-    SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL = EnvBool(False)
     # How long the in-graph wait for the RAM-miss thread may take per MoE layer, in ms, before the process fails
     # stop. The thread's watchdog aborts after max(30 s, 3x this) (CopyConfig.watchdog_wait_s), so it outlasts this
     # wait and the eager pause bound (2x this + 1 s).
@@ -457,17 +455,11 @@ class Envs:
     # Spill: only the first V of a gather's miss lanes in plan order take a VRAM victim and a staging slot; every later
     # lane is a CPU lane. 0: every miss lane may take a victim. 1 <= V < the routes.
     SGLANG_EXPERT_STREAM_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
-    # Prefill misses are read by the native reader straight into the pinned slabs; needs GRAPH_GATHER.
-    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS = EnvBool(False)
     # A prefill's pinned-tier admissions own at most one gather chunk of rows per layer, then evict their own LRU row.
     SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE = EnvBool(False)
     # With the prefill share on: a fixed share in rows per layer instead of the computed one, for A/B arms. Unset uses
     # the computed size.
     SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS = EnvInt(None)
-    # The eager streamed MoE reads a layer's topk_ids to the host once and takes each chunk's expert ids as host lists.
-    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
-    # A prefill gather chunk copies its already-pinned rows before waiting for the layer's fill.
-    SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
     # GPU drip: this many VRAM scratch slots, one expert row each, which the copy engine fills from pinned RAM with
     # the experts the GPU scorer predicts. 0 is off. Needs the RAM prefetch with the GPU scorer, and the copy engine.
     SGLANG_EXPERT_STREAM_GPU_DRIP_SLOTS = EnvInt(0)
@@ -2098,16 +2090,6 @@ class Envs:
     # residency commit run on one side stream, joined before the shared-expert add, so they overlap the RAM-miss
     # copies and the routed MoE kernel instead of running in line. Read once per process. Off by default.
     SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM = EnvBool(False)
-    # DSV4 EXL3 decode layer fusion (plan 2026-09-25-dsv41-layer-fusion): one JIT kernel each for DIRECT's
-    # gather_destinations and commit_gather and for the fused MoE's route tables, in place of their ~89 small torch
-    # kernels per layer. Bit-identical to the torch chains. Read once when each layer's buffers are built. Off by default.
-    SGLANG_DSV41_ENABLE_LAYER_FUSION = EnvBool(False)
-    # DSV4 EXL3 decode cast fusion (plan 2026-09-25-dsv41-decode-fusion-2): at BS1, the sublayer input's fp16 copy is
-    # written by hc_combine_norm and shared by the EXL3 linears that read it, merged linears cast once into one buffer,
-    # the shared expert keeps its gate/up/down activations in fp16, and the routed output is cast and scaled in one
-    # kernel. Bit-identical to the unfused casts. Read once when each module is built, and per BS1 call where the
-    # sublayer input is combined. Off by default.
-    SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
     # Test only: test/manual/dsv41/test_bs1_build_digest.py skips, instead of failing, when nvcc or the GPU arch differs
     # from its golden's (the golden is then stale: re-record it). Off by default.
     SGLANG_TEST_BS1_DIGEST_TOOLCHAIN_ACKNOWLEDGED = EnvBool(False)
@@ -2566,6 +2548,11 @@ _LEASES_ALWAYS_ON_NOTE = (
     "Unset this env."
 )
 
+_ALWAYS_ON_DSV41_NOTE = (
+    "Always on since 2026-11-21 (lease PDL: on when the GPU supports it, sm_90+); a set value is ignored. "
+    "Unset this env."
+)
+
 _ROW_WEIGHTED_REMOVED_NOTE = (
     "Row-weighted tile assignment was removed on 2026-10-24: EXL3 CPU tasks go to whichever worker is free. A set "
     "value is ignored. Unset this env."
@@ -2665,6 +2652,20 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     },
     "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": _DeprecatedEnv(note=_HIT_WAIT_GONE_NOTE),
     "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": _DeprecatedEnv(note=_ROW_WEIGHTED_REMOVED_NOTE),
+    # Six EXL3 decode/prefill switches production always set to 1, now unconditional. Archived arms and dated study
+    # scripts still set them, so a set value warns. Their pre-rename SGLANG_DSV41_* spellings refuse startup instead
+    # (expert_engine/removed_env.py).
+    **{
+        name: _DeprecatedEnv(note=_ALWAYS_ON_DSV41_NOTE)
+        for name in (
+            "SGLANG_DSV41_ENABLE_LAYER_FUSION",
+            "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION",
+            "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS",
+            "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN",
+            "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER",
+            "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL",
+        )
+    },
 }
 
 

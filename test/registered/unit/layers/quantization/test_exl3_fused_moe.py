@@ -1,10 +1,12 @@
-"""Pointer tables and route tables of the fused EXL3 MoE over hot-cache slots (CPU)."""
+"""Pointer tables of the fused EXL3 MoE over hot-cache slots, and the torch route tables its route-tables kernel must
+match (CPU)."""
 
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.exl3.fused_moe import route_tables, slot_pointer_tables
+from sglang.srt.layers.quantization.exl3.fused_moe import slot_pointer_tables
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.exl3_layer_fusion_reference import route_tables, route_tables_kernel
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -191,8 +193,12 @@ class _FakeExt:
 def _fused(monkeypatch, tokens, hidden=8, slots=10):
     from sglang.srt.layers.quantization.exl3 import fused_moe as module
 
+    from sglang.kernels.ops.moe import exl3_route_tables
+
     ext = _FakeExt()
     monkeypatch.setattr(module, "exl3_ext", lambda: ext)
+    # The route-tables kernel is CUDA only; on the CPU its torch reference stands in.
+    monkeypatch.setattr(exl3_route_tables, "exl3_moe_route_tables", route_tables_kernel)
     module._SHARED_TEMPS.clear()
     tensors = {n: torch.zeros((slots, 2 if n.startswith("w13") else 1, hidden), dtype=torch.int16) for n in NAMES}
     tensors["w13_trellis"] = torch.zeros((slots, 2, 16 * 3), dtype=torch.int16)

@@ -208,19 +208,13 @@ class TiersConfig(_Config):
 
 class PrefillConfig(_Config):
     _ENV: ClassVar[dict[str, str]] = {
-        "fills": "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS",
         "share": "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SHARE",
         "share_rows": "SGLANG_EXPERT_STREAM_FORCE_PREFILL_SHARE_ROWS",
-        "route_plan": "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_ROUTE_PLAN",
-        "split_gather": "SGLANG_EXPERT_STREAM_ENABLE_PREFILL_SPLIT_GATHER",
     }
 
-    fills: bool = False
     share: bool = False
     # An A/B override of the share's computed size, in rows per layer; None uses the computed size.
     share_rows: Optional[int] = None
-    route_plan: bool = False
-    split_gather: bool = False
 
 
 class GpuDripConfig(_Config):
@@ -240,7 +234,6 @@ class CopyConfig(_Config):
         "mode": "SGLANG_EXPERT_STREAM_COPY_MODE",
         "ram_hit_copy": "SGLANG_EXPERT_STREAM_RAM_HIT_COPY",
         "sm_small_copies": "SGLANG_EXPERT_STREAM_ENABLE_SM_SMALL_COPIES",
-        "lease_pdl": "SGLANG_EXPERT_STREAM_ENABLE_LEASE_PDL",
         "timeout_ms": "SGLANG_EXPERT_STREAM_RAM_MISS_TIMEOUT_MS",
         "idle_spin_us": "SGLANG_EXPERT_STREAM_RAM_MISS_IDLE_SPIN_US",
         "copy_idle_spin_us": "SGLANG_EXPERT_STREAM_COPY_IDLE_SPIN_US",
@@ -255,7 +248,6 @@ class CopyConfig(_Config):
     # What moves a captured decode post's RAM hits once the copy engine is armed: "ce" (its DMA) or "sm" (the SM copy).
     ram_hit_copy: str = "ce"
     sm_small_copies: bool = False
-    lease_pdl: bool = False
     # How long the in-graph wait for the RAM-miss thread may take per MoE layer before the process fails stop.
     timeout_ms: int = 2000
     idle_spin_us: int = 5000

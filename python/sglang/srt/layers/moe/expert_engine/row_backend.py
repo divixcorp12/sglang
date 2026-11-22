@@ -141,7 +141,7 @@ class NativePinnedSlotTable:
     def mapping(self, num_experts: int) -> list[int]:
         return self.service.host.mapping(self._row)
 
-    # PinnedRowFills (SGLANG_EXPERT_STREAM_ENABLE_PREFILL_FILLS): the service's reader fills
+    # PinnedRowFills (the prefill fills): the service's reader fills
     # this layer's slots while the tier's host use holds the thread paused.
     def fill_begin(self, experts, protected, fallback: bool) -> tuple[list[int], int]:
         return self.service.host.fill_begin(self._row, experts, protected, fallback)
