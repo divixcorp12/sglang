@@ -246,23 +246,34 @@ class GptqInt3CpuExperts(nn.Module):
         """Run a batch expert group by expert group, so a layer loads each expert at most once per batch.
 
         A prefill routes to most experts; row chunks of ``rows_per_call`` would evict and reload them every chunk.
-        Each group fits the slots; its calls mask the other routes out (slot -1) and their partial sums add up.
+        Each group fits the slots; its calls mask the other routes out (slot -1) and the groups' partial sums add up.
         """
-        out.zero_()
         experts = ids[ids >= 0].unique().tolist()
-        # Resident experts first: the later groups then evict only experts this batch is done with.
-        experts.sort(key=lambda e: e not in self.cache.slot_of)
-        for start in range(0, len(experts), self.cache.capacity):
-            group = torch.tensor(experts[start : start + self.cache.capacity], dtype=torch.int64, device="cpu")
-            member = torch.isin(ids, group)
-            rows = member.any(dim=1).nonzero().squeeze(1)
-            self.cache.ensure(group.tolist())
-            masked = torch.where(member, ids, -1)
-            for begin in range(0, rows.numel(), self.rows_per_group_call):
-                chunk = rows[begin : begin + self.rows_per_group_call]
-                part = torch.empty((chunk.numel(), self.hidden_size), dtype=torch.float32, device="cpu")
-                self._forward_chunk(x[chunk], masked[chunk], weights[chunk], part)
-                out.index_add_(0, chunk, part)
+        capacity = self.cache.capacity
+        groups = [experts[start : start + capacity] for start in range(0, len(experts), capacity)]
+        partials: list[Optional[torch.Tensor]] = [None] * len(groups)
+        # The most-resident group runs first, so the later ones evict only experts this batch is done with.
+        for index in sorted(range(len(groups)), key=lambda g: -sum(e in self.cache.slot_of for e in groups[g])):
+            partials[index] = self._group_partial(x, ids, weights, groups[index])
+        # Summing in group order, not run order, keeps the output independent of what an earlier batch left resident.
+        out.zero_()
+        for partial in partials:
+            out.add_(partial)
+
+    def _group_partial(
+        self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, group: list[int]
+    ) -> torch.Tensor:
+        member = torch.isin(ids, torch.tensor(group, dtype=torch.int64, device="cpu"))
+        rows = member.any(dim=1).nonzero().squeeze(1)
+        masked = torch.where(member, ids, -1)
+        self.cache.ensure(group)
+        partial = torch.zeros((ids.shape[0], self.hidden_size), dtype=torch.float32, device="cpu")
+        for begin in range(0, rows.numel(), self.rows_per_group_call):
+            chunk = rows[begin : begin + self.rows_per_group_call]
+            part = torch.empty((chunk.numel(), self.hidden_size), dtype=torch.float32, device="cpu")
+            self._forward_chunk(x[chunk], masked[chunk], weights[chunk], part)
+            partial[chunk] = part
+        return partial
 
 
 

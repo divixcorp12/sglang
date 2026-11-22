@@ -589,8 +589,8 @@ def test_model_layer_cpu_experts_on_real_export(monkeypatch):
 
 
 def test_a_batch_over_more_experts_than_slots_loads_each_expert_once(monkeypatch):
-    """A prefill-sized batch routing to more experts than the layer's slots: every needed expert is read once per batch
-    (a repeat batch reads only the ones not left resident) and the output is the routed sum, slot mix-ups included."""
+    """A prefill-sized batch routing to more experts than the layer's slots: every needed expert is read once per batch,
+    not once per row chunk, and the output is the routed sum, bitwise the same whatever an earlier batch left resident."""
     from types import SimpleNamespace
 
     from sglang.srt.layers.moe.cpu_experts import gptq_int3_moe
@@ -642,8 +642,8 @@ def test_a_batch_over_more_experts_than_slots_loads_each_expert_once(monkeypatch
     torch.testing.assert_close(first, expected)
     loads.clear()
     second = experts(x, topk)
-    assert sum(loads) == needed - slots  # the resident group needs no reads
-    torch.testing.assert_close(second, expected)
+    assert sum(loads) < needed  # what the first batch left resident is reused
+    assert torch.equal(second, first)  # whatever was resident
     # A call within one native call keeps the row path.
     small = SimpleNamespace(topk_ids=ids[:2], topk_weights=weights[:2])
     torch.testing.assert_close(experts(x[:2], small), expected[:2])
