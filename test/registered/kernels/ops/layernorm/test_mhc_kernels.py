@@ -229,6 +229,8 @@ def _hopper_mhc_layer(norm, w, scale, base):
         hc_sinkhorn_iters=20,
         rms_norm_eps=1e-6,
         hc_eps=1e-6,
+        _exl3_attn_input=False,
+        _exl3_ffn_input=False,
     )
     layer._init_hyper_connections = lambda: (
         DeepseekV4DecoderLayer._init_hyper_connections(layer)

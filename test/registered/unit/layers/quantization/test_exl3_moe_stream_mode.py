@@ -237,14 +237,18 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     """A route set the streamer's graph gather serves goes to _apply_graph, without the capture guard."""
     calls = []
 
-    def fake_apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+    def fake_apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit, cast=True):
         calls.append((layer, streamer, x, topk_weights, topk_ids, swiglu_limit))
-        return torch.ones_like(x)
+        return torch.ones_like(x) if cast else torch.ones(x.shape, dtype=torch.float32)
 
     def refuse(name):
         raise AssertionError(f"{name} guarded against capture on the in-graph path")
 
+    from sglang.kernels.ops.moe import exl3_cast_fusion
+
     monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
+    # The fused cast-and-scale kernel is CUDA only; on the CPU the chain it replaces stands in.
+    monkeypatch.setattr(exl3_cast_fusion, "exl3_scale_to_bf16", lambda out, scale: out.to(torch.bfloat16) * scale)
     monkeypatch.setattr(exl3_mod, "assert_not_capturing", refuse)
     with envs.SGLANG_EXPERT_STREAM_ENABLE.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
