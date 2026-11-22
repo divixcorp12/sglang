@@ -34,6 +34,8 @@ HYBRID_FORMAT = "mimo-hybrid-gptq-v1"
 _DECLARED_POLICY = {"quant_method": "gptq", "bits": 3, "group_size": 128, "sym": True, "desc_act": False}
 # A load summary is logged after this many expert reads; arbitrary.
 _LOG_EVERY_LOADS = 2000
+# The native job refuses a call whose float scratch exceeds 512 MiB (kernel.cpp, GptqInt3CpuKernel::prepare).
+_SCRATCH_FLOATS = 512 * 1024 * 1024 // 4
 
 
 def declares_gptq_int3_experts(config: Any) -> bool:
@@ -199,6 +201,9 @@ class GptqInt3CpuExperts(nn.Module):
         )
         # Rows per native call: every route of a call must be resident at once.
         self.rows_per_call = max(1, min(self.runtime.max_rows, self.cache.capacity // top_k))
+        # Rows per call of a grouped batch, within the kernel's float scratch (x, result, and per route middle, down).
+        per_row = 2 * hidden_size + top_k * (hidden_size + intermediate_size)
+        self.rows_per_group_call = max(1, min(self.runtime.max_rows, _SCRATCH_FLOATS // per_row))
 
     def forward(self, hidden_states: torch.Tensor, topk_output: Any) -> torch.Tensor:
         rows = hidden_states.shape[0]
@@ -208,9 +213,10 @@ class GptqInt3CpuExperts(nn.Module):
         ids = topk_output.topk_ids.to(device="cpu", dtype=torch.int64)
         weights = topk_output.topk_weights.to(device="cpu", dtype=torch.float32).contiguous()
         out = torch.empty((rows, self.hidden_size), dtype=torch.float32, device="cpu")
-        for start in range(0, rows, self.rows_per_call):
-            chunk = slice(start, start + self.rows_per_call)
-            self._forward_chunk(x[chunk], ids[chunk], weights[chunk], out[chunk])
+        if rows <= self.rows_per_call:
+            self._forward_chunk(x, ids, weights, out)
+        else:
+            self._forward_grouped(x, ids, weights, out)
         return out.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
     def _forward_chunk(
@@ -233,5 +239,30 @@ class GptqInt3CpuExperts(nn.Module):
             out,
         )
         self.runtime.forward_seconds += time.perf_counter() - start
+
+    def _forward_grouped(
+        self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Run a batch expert group by expert group, so a layer loads each expert at most once per batch.
+
+        A prefill routes to most experts; row chunks of ``rows_per_call`` would evict and reload them every chunk.
+        Each group fits the slots; its calls mask the other routes out (slot -1) and their partial sums add up.
+        """
+        out.zero_()
+        experts = ids[ids >= 0].unique().tolist()
+        # Resident experts first: the later groups then evict only experts this batch is done with.
+        experts.sort(key=lambda e: e not in self.cache.slot_of)
+        for start in range(0, len(experts), self.cache.capacity):
+            group = torch.tensor(experts[start : start + self.cache.capacity], dtype=torch.int64, device="cpu")
+            member = torch.isin(ids, group)
+            rows = member.any(dim=1).nonzero().squeeze(1)
+            self.cache.ensure(group.tolist())
+            masked = torch.where(member, ids, -1)
+            for begin in range(0, rows.numel(), self.rows_per_group_call):
+                chunk = rows[begin : begin + self.rows_per_group_call]
+                part = torch.empty((chunk.numel(), self.hidden_size), dtype=torch.float32, device="cpu")
+                self._forward_chunk(x[chunk], masked[chunk], weights[chunk], part)
+                out.index_add_(0, chunk, part)
+
 
 
