@@ -48,18 +48,14 @@ constexpr int kRun = 32;
 
 // Tile-local decode, never an FP16 copy of the full layer. Rounding each weight before the dot is intentional;
 // moving scale multiplication outside the dot would change the exported FP16 QDQ weights.
-// One weight row against `count` inputs: a group is decoded once, and each input's sum runs in the same order a
-// single-input dot would, so every total is bitwise independent of `count`.
-void dot_many(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, int width, const float* const* xs,
-              int count, float* totals) {
+// A group's 128 weights of one row, rounded to FP16 as the export's QDQ does; false for a non-finite weight or scale.
+bool decode_group(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, int width, int g, float* w) {
   lo += size_t(row) * width / 4;
   hi += size_t(row) * width / 8;
   scales += size_t(row) * (width / 128) * 2;
-  std::fill(totals, totals + count, 0.f);
-  const auto invalid = [&] { std::fill(totals, totals + count, std::bit_cast<float>(0x7fc00000u)); };
-  for (int g = 0; g < width / 128; ++g) {
-    const float scale = from_half(half_at(scales + g * 2));
-    if (!finite(scale) || scale == 0) return invalid();
+  const float scale = from_half(half_at(scales + g * 2));
+  if (!finite(scale) || scale == 0) return false;
+  {
     alignas(64) int8_t codes[128];
 #ifdef SGLANG_CPU_EXPERTS_AVX512
     bestla::avx512(lo + g * 32, hi + g * 16, codes);
@@ -70,7 +66,6 @@ void dot_many(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int r
 #else
     bestla::scalar(lo + g * 32, hi + g * 16, codes, 128);
 #endif
-    alignas(64) float w[128];
 #ifdef SGLANG_CPU_EXPERTS_AVX512
     for (int j = 0; j < 128; j += 16) {
       auto v = _mm512_mul_ps(
@@ -89,30 +84,52 @@ void dot_many(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int r
     for (int j = 0; j < 128; ++j)
       w[j] = round_half(float(codes[j]) * scale);
 #endif
-    for (int j = 0; j < 128; ++j) {
-      if (!finite(w[j])) return invalid();
-    }
-    for (int r = 0; r < count; ++r) {
-      const float* x = xs[r];
-#ifdef SGLANG_CPU_EXPERTS_AVX512
-      auto sum = _mm512_setzero_ps();
-      for (int j = 0; j < 128; j += 16)
-        sum = _mm512_fmadd_ps(_mm512_load_ps(w + j), _mm512_loadu_ps(x + g * 128 + j), sum);
-      totals[r] += _mm512_reduce_add_ps(sum);
-#elif defined(SGLANG_CPU_EXPERTS_AVX2)
-      auto sum = _mm256_setzero_ps();
-      for (int j = 0; j < 128; j += 8)
-        sum = _mm256_fmadd_ps(_mm256_load_ps(w + j), _mm256_loadu_ps(x + g * 128 + j), sum);
-      alignas(32) float lanes[8];
-      _mm256_store_ps(lanes, sum);
-      for (float v : lanes)
-        totals[r] += v;
-#else
-      for (int j = 0; j < 128; ++j)
-        totals[r] += w[j] * x[g * 128 + j];
-#endif
-    }
   }
+  for (int j = 0; j < 128; ++j)
+    if (!finite(w[j])) return false;
+  return true;
+}
+
+// Adds one group's dot of a decoded row and an input slice to `total`, in a whole-row dot's per-group order.
+void group_dot(float& total, const float* w, const float* x) {
+#ifdef SGLANG_CPU_EXPERTS_AVX512
+  auto sum = _mm512_setzero_ps();
+  for (int j = 0; j < 128; j += 16)
+    sum = _mm512_fmadd_ps(_mm512_load_ps(w + j), _mm512_loadu_ps(x + j), sum);
+  total += _mm512_reduce_add_ps(sum);
+#elif defined(SGLANG_CPU_EXPERTS_AVX2)
+  auto sum = _mm256_setzero_ps();
+  for (int j = 0; j < 128; j += 8)
+    sum = _mm256_fmadd_ps(_mm256_load_ps(w + j), _mm256_loadu_ps(x + j), sum);
+  alignas(32) float lanes[8];
+  _mm256_store_ps(lanes, sum);
+  for (float v : lanes)
+    total += v;
+#else
+  for (int j = 0; j < 128; ++j)
+    total += w[j] * x[j];
+#endif
+}
+
+constexpr int kTile = 16;
+// kTile weight rows from `row` against `count` inputs, totals[i * kRun + r] for row + i and input r. Each group of the
+// tile is decoded once and reused by every input while it is in cache; each total still adds its groups in order, so
+// it is bitwise what one row against one input gives, whatever `count` is.
+void dot_tile(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, int width, const float* const* xs,
+              int count, float* totals) {
+  bool valid[kTile];
+  std::fill(valid, valid + kTile, true);
+  std::fill(totals, totals + kTile * kRun, 0.f);
+  alignas(64) float w[kTile][128];
+  for (int g = 0; g < width / 128; ++g) {
+    for (int i = 0; i < kTile; ++i)
+      valid[i] = valid[i] && decode_group(lo, hi, scales, row + i, width, g, w[i]);
+    for (int r = 0; r < count; ++r)
+      for (int i = 0; i < kTile; ++i)
+        if (valid[i]) group_dot(totals[i * kRun + r], w[i], xs[r] + g * 128);
+  }
+  for (int i = 0; i < kTile; ++i)
+    if (!valid[i]) std::fill(totals + i * kRun, totals + (i + 1) * kRun, std::bit_cast<float>(0x7fc00000u));
 }
 }  // namespace
 const char* GptqInt3CpuKernel::name() noexcept {
@@ -243,14 +260,16 @@ void GptqInt3CpuKernel::run(Job& j, int phase, int t0, int t1, int) {
         xs[k] = phase == 0 ? p.x.data() + size_t(p.routes[r].token) * l.hidden
                            : p.middle.data() + size_t(r) * l.intermediate;
       }
-      for (int n = start; n < start + 16; ++n) {
-        float first_dot[kRun], second_dot[kRun];
-        if (phase == 0) {
-          dot_many(row.slab[0], row.slab[1], row.slab[2], n, l.hidden, xs, count, first_dot);
-          dot_many(row.slab[0], row.slab[1], row.slab[2], n + l.intermediate, l.hidden, xs, count, second_dot);
-        } else {
-          dot_many(row.slab[3], row.slab[4], row.slab[5], n, l.intermediate, xs, count, first_dot);
-        }
+      float first_tile[kTile * kRun], second_tile[kTile * kRun];
+      if (phase == 0) {
+        dot_tile(row.slab[0], row.slab[1], row.slab[2], start, l.hidden, xs, count, first_tile);
+        dot_tile(row.slab[0], row.slab[1], row.slab[2], start + l.intermediate, l.hidden, xs, count, second_tile);
+      } else {
+        dot_tile(row.slab[3], row.slab[4], row.slab[5], start, l.intermediate, xs, count, first_tile);
+      }
+      for (int n = start; n < start + kTile; ++n) {
+        const float* first_dot = first_tile + (n - start) * kRun;
+        const float* second_dot = second_tile + (n - start) * kRun;
         for (int k = 0; k < count; ++k) {
           const size_t r = p.order[first + k];
           float v;
