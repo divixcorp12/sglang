@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <numeric>
+#include <utility>
 #include <vector>
 
 namespace sglang::gptq_int3 {
@@ -41,16 +43,23 @@ uint16_t half_at(const uint8_t* p) {
   return h;
 }
 
+// Routes of one expert a task serves together: each decoded weight group is applied to all of them.
+constexpr int kRun = 32;
+
 // Tile-local decode, never an FP16 copy of the full layer. Rounding each weight before the dot is intentional;
 // moving scale multiplication outside the dot would change the exported FP16 QDQ weights.
-float dot(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, int width, const float* x) {
+// One weight row against `count` inputs: a group is decoded once, and each input's sum runs in the same order a
+// single-input dot would, so every total is bitwise independent of `count`.
+void dot_many(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, int width, const float* const* xs,
+              int count, float* totals) {
   lo += size_t(row) * width / 4;
   hi += size_t(row) * width / 8;
   scales += size_t(row) * (width / 128) * 2;
-  float total = 0;
+  std::fill(totals, totals + count, 0.f);
+  const auto invalid = [&] { std::fill(totals, totals + count, std::bit_cast<float>(0x7fc00000u)); };
   for (int g = 0; g < width / 128; ++g) {
     const float scale = from_half(half_at(scales + g * 2));
-    if (!finite(scale) || scale == 0) return std::bit_cast<float>(0x7fc00000u);
+    if (!finite(scale) || scale == 0) return invalid();
     alignas(64) int8_t codes[128];
 #ifdef SGLANG_CPU_EXPERTS_AVX512
     bestla::avx512(lo + g * 32, hi + g * 16, codes);
@@ -81,27 +90,29 @@ float dot(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, 
       w[j] = round_half(float(codes[j]) * scale);
 #endif
     for (int j = 0; j < 128; ++j) {
-      if (!finite(w[j])) return std::bit_cast<float>(0x7fc00000u);
+      if (!finite(w[j])) return invalid();
     }
+    for (int r = 0; r < count; ++r) {
+      const float* x = xs[r];
 #ifdef SGLANG_CPU_EXPERTS_AVX512
-    auto sum = _mm512_setzero_ps();
-    for (int j = 0; j < 128; j += 16)
-      sum = _mm512_fmadd_ps(_mm512_load_ps(w + j), _mm512_loadu_ps(x + g * 128 + j), sum);
-    total += _mm512_reduce_add_ps(sum);
+      auto sum = _mm512_setzero_ps();
+      for (int j = 0; j < 128; j += 16)
+        sum = _mm512_fmadd_ps(_mm512_load_ps(w + j), _mm512_loadu_ps(x + g * 128 + j), sum);
+      totals[r] += _mm512_reduce_add_ps(sum);
 #elif defined(SGLANG_CPU_EXPERTS_AVX2)
-    auto sum = _mm256_setzero_ps();
-    for (int j = 0; j < 128; j += 8)
-      sum = _mm256_fmadd_ps(_mm256_load_ps(w + j), _mm256_loadu_ps(x + g * 128 + j), sum);
-    alignas(32) float lanes[8];
-    _mm256_store_ps(lanes, sum);
-    for (float v : lanes)
-      total += v;
+      auto sum = _mm256_setzero_ps();
+      for (int j = 0; j < 128; j += 8)
+        sum = _mm256_fmadd_ps(_mm256_load_ps(w + j), _mm256_loadu_ps(x + g * 128 + j), sum);
+      alignas(32) float lanes[8];
+      _mm256_store_ps(lanes, sum);
+      for (float v : lanes)
+        totals[r] += v;
 #else
-    for (int j = 0; j < 128; ++j)
-      total += w[j] * x[g * 128 + j];
+      for (int j = 0; j < 128; ++j)
+        totals[r] += w[j] * x[g * 128 + j];
 #endif
+    }
   }
-  return total;
 }
 }  // namespace
 const char* GptqInt3CpuKernel::name() noexcept {
@@ -138,6 +149,9 @@ struct GptqInt3CpuKernel::Job::Impl {
     float weight;
   };
   std::vector<Route> routes;
+  // Route indices sorted by slot, cut into runs of at most kRun routes of one expert: [first, last) into `order`.
+  std::vector<int> order;
+  std::vector<std::pair<int, int>> runs;
   std::vector<size_t> offsets;
   std::vector<float> scratch;
   std::span<float> x, middle, down, result;
@@ -161,6 +175,16 @@ void GptqInt3CpuKernel::prepare(Job& j, const Layer& l, const ce::ForwardCall& c
     }
   }
   p.offsets[c.rows] = p.routes.size();
+  p.order.resize(p.routes.size());
+  std::iota(p.order.begin(), p.order.end(), 0);
+  std::stable_sort(p.order.begin(), p.order.end(), [&](int a, int b) { return p.routes[a].slot < p.routes[b].slot; });
+  p.runs.clear();
+  for (int first = 0, last; first < int(p.order.size()); first = last) {
+    for (last = first + 1; last < int(p.order.size()) && last - first < kRun &&
+                           p.routes[p.order[last]].slot == p.routes[p.order[first]].slot;)
+      ++last;
+    p.runs.emplace_back(first, last);
+  }
   const uint64_t values = uint64_t(c.rows) * l.hidden * 2 + uint64_t(p.routes.size()) * (l.hidden + l.intermediate);
   if (values > 512ull * 1024 * 1024 / sizeof(float)) throw std::invalid_argument("gptq_int3 job scratch exceeds512MiB");
   // One allocation prevents unrelated high-water marks in four vectors from adding up across reused jobs.
@@ -186,7 +210,7 @@ ce::Tasks GptqInt3CpuKernel::tasks(const Job& j, int phase) {
   if (p.error.load()) return {};
   if (phase == 3) return {1, 1};
   return {
-      int((phase < 2 ? p.routes.size() : size_t(p.call.rows)) *
+      int((phase < 2 ? p.runs.size() : size_t(p.call.rows)) *
           size_t(phase == 0 ? p.layer.intermediate : p.layer.hidden) / 16),
       1};
 }
@@ -209,32 +233,42 @@ void GptqInt3CpuKernel::run(Job& j, int phase, int t0, int t1, int) {
   for (int task = t0; task < t1; ++task) {
     const int idx = task / tiles, start = (task % tiles) * 16;
     if (phase < 2) {
-      const auto r = p.routes[idx];
-      const auto row = l[r.slot];
+      // `idx` is a run: up to kRun routes of one expert share every decoded weight group.
+      const auto [first, last] = p.runs[idx];
+      const int count = last - first;
+      const auto row = l[p.routes[p.order[first]].slot];
+      const float* xs[kRun];
+      for (int k = 0; k < count; ++k) {
+        const int r = p.order[first + k];
+        xs[k] = phase == 0 ? p.x.data() + size_t(p.routes[r].token) * l.hidden
+                           : p.middle.data() + size_t(r) * l.intermediate;
+      }
       for (int n = start; n < start + 16; ++n) {
-        float v;
+        float first_dot[kRun], second_dot[kRun];
         if (phase == 0) {
-          const auto* x = p.x.data() + size_t(r.token) * l.hidden;
-          float gate = round_half(dot(row.slab[0], row.slab[1], row.slab[2], n, l.hidden, x));
-          float up = round_half(dot(row.slab[0], row.slab[1], row.slab[2], n + l.intermediate, l.hidden, x));
-          if (!finite(gate) || !finite(up)) p.error.store(2);
-          if (l.act_limit > 0) {
-            gate = round_half(std::min(gate, l.act_limit));
-            up = round_half(std::clamp(up, -l.act_limit, l.act_limit));
-          }
-          v = round_half(round_half(gate / (1.f + std::exp(-gate))) * up);
-          p.middle[size_t(idx) * l.intermediate + n] = v;
+          dot_many(row.slab[0], row.slab[1], row.slab[2], n, l.hidden, xs, count, first_dot);
+          dot_many(row.slab[0], row.slab[1], row.slab[2], n + l.intermediate, l.hidden, xs, count, second_dot);
         } else {
-          v = round_half(
-              dot(row.slab[3],
-                  row.slab[4],
-                  row.slab[5],
-                  n,
-                  l.intermediate,
-                  p.middle.data() + size_t(idx) * l.intermediate));
-          p.down[size_t(idx) * l.hidden + n] = v;
+          dot_many(row.slab[3], row.slab[4], row.slab[5], n, l.intermediate, xs, count, first_dot);
         }
-        if (!finite(v)) p.error.store(2);
+        for (int k = 0; k < count; ++k) {
+          const size_t r = p.order[first + k];
+          float v;
+          if (phase == 0) {
+            float gate = round_half(first_dot[k]), up = round_half(second_dot[k]);
+            if (!finite(gate) || !finite(up)) p.error.store(2);
+            if (l.act_limit > 0) {
+              gate = round_half(std::min(gate, l.act_limit));
+              up = round_half(std::clamp(up, -l.act_limit, l.act_limit));
+            }
+            v = round_half(round_half(gate / (1.f + std::exp(-gate))) * up);
+            p.middle[r * l.intermediate + n] = v;
+          } else {
+            v = round_half(first_dot[k]);
+            p.down[r * l.hidden + n] = v;
+          }
+          if (!finite(v)) p.error.store(2);
+        }
       }
     } else
       for (int n = start; n < start + 16; ++n) {

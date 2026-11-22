@@ -397,6 +397,27 @@ def test_real_kernel_route_order_modes_and_job_window(native, mode, limit):
     )
 
 
+def test_routes_of_one_expert_share_decodes_without_changing_any_bit(native):
+    """A call batches each expert's routes (runs of up to 32 across rows) over one weight decode; every row must be
+    bitwise what it is alone, so a prefill and a decode of the same token agree."""
+    _, decoded, slab, _, _, _ = fixture()
+    g = torch.Generator().manual_seed(5)
+    rows = 70
+    x = (torch.randn((rows, 256), generator=g) * 0.1).half()
+    slots = torch.randint(-1, 2, (rows, 3), generator=g, dtype=torch.int32)
+    weights = torch.rand((rows, 3), generator=g)
+    batch = torch.zeros((rows, 256))
+    status, error = invoke(native, slab, x, slots, weights, batch)
+    assert status == 0, error
+    alone = torch.zeros_like(batch)
+    for t in range(rows):
+        status, error = invoke(native, slab, x[t : t + 1], slots[t : t + 1].contiguous(), weights[t : t + 1], alone[t : t + 1])
+        assert status == 0, error
+    assert torch.equal(batch, alone)
+    torch.testing.assert_close(batch, reference(decoded, x, slots, weights), atol=2e-6, rtol=0.003)
+
+
+
 @pytest.mark.parametrize(
     "bad",
     ["x", "scale", "down", "gate_overflow", "slot", "weight", "accumulate", "mode"],
