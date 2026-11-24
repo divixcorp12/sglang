@@ -4,6 +4,9 @@
 #include <sgl_kernel/tensor.h>
 #include <tvm/ffi/reflection/registry.h>
 
+#include <pthread.h>
+#include <sched.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -29,13 +32,17 @@ void check_cpu(const tvm::ffi::TensorView& t, const char* name, int64_t ndim, DL
 struct GptqInt3MoeObj : public tvm::ffi::Object {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.GptqInt3Moe", GptqInt3MoeObj, tvm::ffi::Object);
 
-  /// cores int32 [n]: worker i on cores[i], and worker 0 is the calling (scheduler) thread, so it is pinned too; empty:
-  /// unpinned.
+  /// cores int32 [n]: worker i on cores[i] for i >= 1; empty: unpinned. Worker 0 is the calling scheduler thread, which
+  /// keeps its own affinity: torch's intra-op threads inherit its mask, and the Team would leave it one core.
   GptqInt3MoeObj(int64_t threads, const tvm::ffi::TensorView cores)
-      : cores_(core_list(cores)),
+      : caller_affinity_(current_affinity()),
+        cores_(core_list(cores)),
         team_(std::make_unique<ce::Team>(std::span<const int>(cores_), static_cast<int>(threads), &K::warm, 0,
                                          "int3-moe")),
-        runner_(std::make_unique<ce::JobRunner<K>>(*team_)) {}
+        runner_(std::make_unique<ce::JobRunner<K>>(*team_)) {
+    if (!cores_.empty() && pthread_setaffinity_np(pthread_self(), sizeof(caller_affinity_), &caller_affinity_) != 0)
+      throw std::runtime_error("GPTQ INT3 MoE: cannot restore the calling thread's affinity");
+  }
 
   ~GptqInt3MoeObj() {
     runner_.reset();
@@ -134,6 +141,15 @@ struct GptqInt3MoeObj : public tvm::ffi::Object {
     return std::vector<int>(data, data + cores.size(0));
   }
 
+  static cpu_set_t current_affinity() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(set), &set) != 0)
+      throw std::runtime_error("GPTQ INT3 MoE: cannot read the calling thread's affinity");
+    return set;
+  }
+
+  cpu_set_t caller_affinity_;
   // The Team keeps a span over it: declared, so constructed, before team_.
   std::vector<int> cores_;
   std::unique_ptr<ce::Team> team_;
