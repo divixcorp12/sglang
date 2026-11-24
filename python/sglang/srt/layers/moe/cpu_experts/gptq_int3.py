@@ -6,9 +6,11 @@ requantizes, changes scale signs, writes a checkpoint, or enables a GPU serving 
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
+import mmap
 import os
 import struct
 import threading
@@ -158,7 +160,45 @@ def prepare_expert(
 _SAFETENSORS_DTYPES = {"I32": torch.int32, "F16": torch.float16}
 
 
-def _safetensors_views(buffer: bytearray, size: int) -> dict[str, torch.Tensor]:
+_PAGE_BYTES = 4096
+
+
+def _page_buffer(size: int) -> mmap.mmap:
+    """Anonymous memory of ``size`` rounded up to whole pages: page-aligned, as O_DIRECT reads require."""
+    return mmap.mmap(-1, max(_PAGE_BYTES, -(-size // _PAGE_BYTES) * _PAGE_BYTES))
+
+
+def _read_whole(path: Path, buffer: mmap.mmap) -> tuple[int, tuple[int, int, int, int]]:
+    """Reads the file at ``path`` into ``buffer`` and returns its size and identity (device, inode, size, mtime).
+
+    O_DIRECT where the filesystem takes it: a miss re-reads its file from the drive instead of keeping a second copy of
+    every expert in the page cache next to the slots. The identity comes from the descriptor that was read.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECT)
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if st.st_size > len(buffer):
+            raise ValueError("expert payload SHA/size mismatch")
+        view = memoryview(buffer)
+        read = 0
+        while read < st.st_size:
+            # Every read but the last returns whole pages, so the next offset stays page-aligned.
+            count = os.preadv(fd, [view[read:]], read)
+            if count <= 0 or (read + count < st.st_size and count % _PAGE_BYTES):
+                raise OSError(f"short read of {path}")
+            read += count
+        return st.st_size, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    finally:
+        os.close(fd)
+
+
+
+def _safetensors_views(buffer: mmap.mmap, size: int) -> dict[str, torch.Tensor]:
     """A safetensors payload in ``buffer[:size]`` as tensors viewing the buffer, nothing copied."""
     (header_size,) = struct.unpack_from("<Q", buffer, 0)
     base = 8 + header_size
@@ -247,9 +287,9 @@ class ExportedExperts:
         path = (self.root / relative).resolve()
         if self.root not in path.parents:
             raise ValueError("export path escapes root")
-        with open(path, "rb") as f:
-            st = os.fstat(f.fileno())
-            return f.read(), (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        buffer = self._buffer(self.files[relative]["bytes"])
+        size, identity = _read_whole(path, buffer)
+        return buffer[:size], identity
 
 
     def load(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
@@ -310,34 +350,21 @@ class ExportedExperts:
         for name in SLAB_NAMES:
             planes[name].copy_(row[name])
 
-    def _buffer(self, size: int) -> bytearray:
+    def _buffer(self, size: int) -> mmap.mmap:
         buffer = getattr(self._buffers, "data", None)
         if buffer is None or len(buffer) < size:
-            buffer = self._buffers.data = bytearray(size)
+            buffer = self._buffers.data = _page_buffer(size)
         return buffer
 
     def _read_identified_into(
-        self, relative: str, buffer: bytearray, size: int
+        self, relative: str, buffer: mmap.mmap, size: int
     ) -> Optional[tuple[int, int, int, int]]:
-        """``_read_identified`` into ``buffer[:size]``; None when the file is not exactly ``size`` bytes."""
+        """``_read_identified`` into ``buffer``; None when the file is not exactly ``size`` bytes."""
         path = (self.root / relative).resolve()
         if self.root not in path.parents:
             raise ValueError("export path escapes root")
-        with open(path, "rb", buffering=0) as f:
-            st = os.fstat(f.fileno())
-            view = memoryview(buffer)[:size]
-            read = 0
-            while read < size:
-                count = f.readinto(view[read:])
-                if not count:
-                    return None
-                read += count
-            if st.st_size != size:
-                return None
-            return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-
-    
-
+        read, identity = _read_whole(path, buffer)
+        return identity if read == size else None
 
 
 def load_exported_expert(
