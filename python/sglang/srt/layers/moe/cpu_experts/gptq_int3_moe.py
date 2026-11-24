@@ -109,27 +109,47 @@ class GptqInt3Runtime:
 
     def _verify_all(self, threads: int) -> None:
         """Every expert file through ``load`` once, so later misses of each take ``load_into``'s fast path."""
-        owners = [
+        owners = iter([
             (layer, expert)
             for layer in range(1, 70)
             for expert in range(288)
             if f"experts/layer-{layer:02d}/expert-{expert:03d}/weights.safetensors" in self.reader.files
-        ]
+        ])
+        lock = threading.Lock()
+        counts = {"verified": 0, "failed": 0}
+
+        def work() -> None:
+            while True:
+                with lock:
+                    owner = next(owners, None)
+                if owner is None:
+                    return
+                try:
+                    self.reader.load(*owner)
+                    ok = True
+                except Exception:
+                    # Not fatal here: that file's own miss goes through load() and raises there.
+                    ok = False
+                with lock:
+                    counts["verified" if ok else "failed"] += 1
+
         start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="int3-verify") as pool:
-            # _verify_one returns nothing: a future that held load()'s planes would keep every expert (~300 GB).
-            failures = sum(future.exception() is not None for future in [
-                pool.submit(self._verify_one, layer, expert) for layer, expert in owners
-            ])
-        # A failure is not fatal here: that file's own miss goes through load() and raises there.
+        # Daemon threads, not an executor: concurrent.futures joins its workers at interpreter exit, and a shutdown
+        # would wait for the whole pass.
+        workers = [
+            threading.Thread(target=work, name=f"int3-verify_{i}", daemon=True) for i in range(threads)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
         logger.info(
             "GPTQ INT3 CPU experts: verified %d expert files in %.0f s (%d failed)",
-            len(owners) - failures, time.perf_counter() - start, failures,
+            counts["verified"], time.perf_counter() - start, counts["failed"],
         )
 
 
-    def _verify_one(self, layer: int, expert: int) -> None:
-        self.reader.load(layer, expert)
+    
 
 
     def record_loads(self, count: int, seconds: float) -> None:
