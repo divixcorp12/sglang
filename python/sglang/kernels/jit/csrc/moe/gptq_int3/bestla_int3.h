@@ -34,7 +34,8 @@ inline void avx2(const uint8_t* lo, const uint8_t* hi, int8_t* dst) {
 }
 #endif
 #ifdef SGLANG_CPU_EXPERTS_AVX512
-inline void avx512(const uint8_t* lo, const uint8_t* hi, int8_t* dst) {
+// 64 unsigned 3-bit values (code + 4, 0..7), one per byte: avx512() before its final -4.
+inline __m512i avx512_values(const uint8_t* lo, const uint8_t* hi) {
   auto raw = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(lo)));
   auto ordered = _mm512_permutexvar_epi32(_mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0), raw);
   auto low = _mm512_and_si512(
@@ -45,7 +46,10 @@ inline void avx512(const uint8_t* lo, const uint8_t* hi, int8_t* dst) {
   uint64_t bits;
   std::memcpy(&bits, hi, 8);
   auto high = _mm512_maskz_mov_epi8(__mmask64(bits), _mm512_set1_epi8(4));
-  _mm512_storeu_si512(dst, _mm512_sub_epi8(_mm512_or_si512(low, high), _mm512_set1_epi8(4)));
+  return _mm512_or_si512(low, high);
+}
+inline void avx512(const uint8_t* lo, const uint8_t* hi, int8_t* dst) {
+  _mm512_storeu_si512(dst, _mm512_sub_epi8(avx512_values(lo, hi), _mm512_set1_epi8(4)));
 }
 #endif
 }  // namespace sglang::gptq_int3::bestla

@@ -112,14 +112,55 @@ void group_dot(float& total, const float* w, const float* x) {
 }
 
 constexpr int kTile = 16;
-// kTile weight rows from `row` against `count` inputs, totals[i * kRun + r] for row + i and input r. Each group of the
-// tile is decoded once and reused by every input while it is in cache; each total still adds its groups in order, so
-// it is bitwise what one row against one input gives, whatever `count` is.
+// kTile weight rows from `row` against `count` inputs, totals[i * kRun + r] for row + i and input r. Each weight group
+// is decoded once and reused by every input; each total still adds its groups in order, so it is bitwise what one row
+// against one input gives, whatever `count` is.
 void dot_tile(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int row, int width, const float* const* xs,
               int count, float* totals) {
+  std::fill(totals, totals + kTile * kRun, 0.f);
+#ifdef SGLANG_CPU_EXPERTS_AVX512
+  // A group has 8 distinct weights, round_half((v - 4) * scale) for value v: an FP16-rounded table looked up in
+  // registers gives decode_group's exact weights. A table with a non-finite entry takes decode_group itself, which
+  // fails only when an absent code would not, so a row's validity is decode_group's.
+  const auto codes = _mm512_set_ps(0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 1, 0, -1, -2, -3, -4);
+  const auto inf = _mm512_set1_ps(std::bit_cast<float>(0x7f800000u));
+  for (int i = 0; i < kTile; ++i) {
+    const uint8_t* row_lo = lo + size_t(row + i) * width / 4;
+    const uint8_t* row_hi = hi + size_t(row + i) * width / 8;
+    const uint8_t* row_scales = scales + size_t(row + i) * (width / 128) * 2;
+    float* row_totals = totals + i * kRun;
+    bool valid = true;
+    for (int g = 0; g < width / 128 && valid; ++g) {
+      __m512 w[8];
+      const float scale = from_half(half_at(row_scales + g * 2));
+      const auto table = _mm512_cvtph_ps(_mm512_cvtps_ph(_mm512_mul_ps(codes, _mm512_set1_ps(scale)),
+                                                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+      if (finite(scale) && scale != 0 && (_mm512_cmp_ps_mask(_mm512_abs_ps(table), inf, _CMP_LT_OQ) & 0xff) == 0xff) {
+        const __m512i values[2] = {bestla::avx512_values(row_lo + g * 32, row_hi + g * 16),
+                                   bestla::avx512_values(row_lo + g * 32 + 16, row_hi + g * 16 + 8)};
+        for (int j = 0; j < 8; ++j)
+          w[j] = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(values[j / 4], j % 4)), table);
+      } else {
+        alignas(64) float decoded[128];
+        valid = decode_group(lo, hi, scales, row + i, width, g, decoded);
+        for (int j = 0; j < 8; ++j)
+          w[j] = _mm512_load_ps(decoded + 16 * j);
+      }
+      if (!valid) break;
+      // group_dot's arithmetic: one FMA chain over the group's 8 vectors, then one reduction added to the total.
+      for (int r = 0; r < count; ++r) {
+        const float* x = xs[r] + g * 128;
+        auto sum = _mm512_setzero_ps();
+        for (int j = 0; j < 8; ++j)
+          sum = _mm512_fmadd_ps(w[j], _mm512_loadu_ps(x + 16 * j), sum);
+        row_totals[r] += _mm512_reduce_add_ps(sum);
+      }
+    }
+    if (!valid) std::fill(row_totals, row_totals + kRun, std::bit_cast<float>(0x7fc00000u));
+  }
+#else
   bool valid[kTile];
   std::fill(valid, valid + kTile, true);
-  std::fill(totals, totals + kTile * kRun, 0.f);
   alignas(64) float w[kTile][128];
   for (int g = 0; g < width / 128; ++g) {
     for (int i = 0; i < kTile; ++i)
@@ -130,6 +171,7 @@ void dot_tile(const uint8_t* lo, const uint8_t* hi, const uint8_t* scales, int r
   }
   for (int i = 0; i < kTile; ++i)
     if (!valid[i]) std::fill(totals + i * kRun, totals + (i + 1) * kRun, std::bit_cast<float>(0x7fc00000u));
+#endif
 }
 }  // namespace
 const char* GptqInt3CpuKernel::name() noexcept {
