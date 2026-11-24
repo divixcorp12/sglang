@@ -378,8 +378,8 @@ def test_slot_load_fast_path_writes_load_bytes_and_still_refuses_a_swapped_file(
         planes = {name: torch.full(reference[name].shape, 0x55, dtype=reference[name].dtype) for name in SLAB_NAMES}
         reader.load_into(1, 0, planes)
         for name in SLAB_NAMES:
-            expected = reference[name].contiguous().view(torch.uint8)
-            assert torch.equal(planes[name].view(torch.uint8), expected), name
+            expected = reference[name].reshape(-1).view(torch.uint8)
+            assert torch.equal(planes[name].reshape(-1).view(torch.uint8), expected), name
     swapped = target.with_suffix(".new")
     swapped.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
     os.replace(swapped, target)
