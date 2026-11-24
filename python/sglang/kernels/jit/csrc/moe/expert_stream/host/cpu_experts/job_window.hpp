@@ -144,6 +144,7 @@ public:
         alignas(64) std::atomic<uint64_t> ready_{0};
         std::array<std::atomic<int>, kPhases> count_{};
         std::array<std::atomic<int>, kPhases> align_{};
+        std::array<std::atomic<int>, kPhases> share_{};
         std::atomic<uint32_t> out_complete_{0};  // generation of the last job whose out phase finished in this slot
         std::atomic<int> pred_{-1};              // slot of the previous job on the same output, -1: none
         std::atomic<uint32_t> pred_gen_{0};
@@ -254,6 +255,7 @@ public:
             s->done_[p].v.store(0, std::memory_order_relaxed);
             s->count_[p].store(0, std::memory_order_release);  // after the cursor: see step()
             s->align_[p].store(1, std::memory_order_relaxed);
+            s->share_[p].store(0, std::memory_order_relaxed);
         }
         s->ready_.store(pack(gen, 0), std::memory_order_relaxed);
         // Release: a worker that sees Active sees every field above.
@@ -412,7 +414,8 @@ private:
 
     void bump() { word_.fetch_add(1, std::memory_order_release); }
 
-    // Takes a run of tasks of phase `ph`: count / n rounded up to align, at most what remains. That is the static
+    // Takes a run of tasks of phase `ph`: the kernel's Tasks::share, else count / n, rounded up to align and at most
+    // what remains. count / n is the static
     // split's share: a run is one contiguous range, which the EXL3 band traversal needs long (shrinking runs of
     // remaining / 2n put half its time in single-band kernels, experts:3 at 1.15x), and a worker that finishes early
     // still takes the next. A CAS and not a fetch_add: a stale view of a recycled slot must be able to fail without
@@ -422,7 +425,8 @@ private:
     {
         const int align = std::max(s.align_[ph].load(std::memory_order_relaxed), 1);
         const int n = team_.workers();
-        const int share = ((count + n - 1) / n + align - 1) / align * align;
+        const int asked = s.share_[ph].load(std::memory_order_relaxed);
+        const int share = ((asked > 0 ? asked : (count + n - 1) / n) + align - 1) / align * align;
         std::atomic<uint64_t>& cursor = s.cursor_[ph].v;
         uint64_t v = cursor.load(std::memory_order_relaxed);
         for (;;) {
@@ -498,6 +502,7 @@ private:
             const Tasks t = Kernel::tasks(s.job, ph);
             s.count_[ph].store(t.count, std::memory_order_release);
             s.align_[ph].store(std::max(t.align, 1), std::memory_order_relaxed);
+            s.share_[ph].store(std::max(t.share, 0), std::memory_order_relaxed);
             if (ph == kGatePhase && s.gate_word_.load(std::memory_order_relaxed) != nullptr) arrive(s);
             if (t.count == 0 && deps_ok(s, ph)) continue;
             // Release: publishes the phase's count and the previous phases' outputs to the workers that scan it.

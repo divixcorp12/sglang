@@ -77,6 +77,9 @@ struct StageGate {
 struct Tasks {
   int count = 0;
   int align = 1;
+  // Tasks per claim, rounded up to align. 0: the static split, count / workers per claim (job_window.hpp, claim). A
+  // kernel whose tasks are short and independent asks for small claims, so one slow worker holds up only its claim.
+  int share = 0;
 };
 
 // One job's call: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped, written to

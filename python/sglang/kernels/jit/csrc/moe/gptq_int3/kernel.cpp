@@ -268,10 +268,14 @@ ce::Tasks GptqInt3CpuKernel::tasks(const Job& j, int phase) {
   const auto& p = *j.impl;
   if (p.error.load()) return {};
   if (phase == 3) return {1, 1};
-  return {
-      int((phase < 2 ? p.runs.size() : size_t(p.call.rows)) *
-          size_t(phase == 0 ? p.layer.intermediate : p.layer.hidden) / 16),
-      1};
+  const int count = int((phase < 2 ? p.runs.size() : size_t(p.call.rows)) *
+                        size_t(phase == 0 ? p.layer.intermediate : p.layer.hidden) / 16);
+  // Claims of about kClaimWeights weights (~0.1 ms) instead of the static split: a decode call is a few ms over
+  // dozens of workers, and a worker the OS shares with another thread would hold its whole share up. Phase 2 tasks
+  // are a few adds each and keep the split.
+  constexpr int64_t kClaimWeights = 512 * 1024;
+  const int64_t task_weights = phase == 0 ? 2 * 16 * int64_t(p.layer.hidden) : 16 * int64_t(p.layer.intermediate);
+  return {count, 1, phase < 2 ? int(std::max<int64_t>(1, kClaimWeights / task_weights)) : 0};
 }
 void GptqInt3CpuKernel::run(Job& j, int phase, int t0, int t1, int) {
   auto& p = *j.impl;
