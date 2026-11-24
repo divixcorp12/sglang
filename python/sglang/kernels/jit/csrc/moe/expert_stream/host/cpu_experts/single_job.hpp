@@ -21,7 +21,13 @@ class JobRunner {
 public:
     using Layer = typename Kernel::Layer;
 
-    explicit JobRunner(Team& team) : window_(team, GateStats{&gate_}) { window_.start(); }
+    /// \param caller_works false: the caller only admits each job and waits for it, taking no tasks. For a caller that
+    /// is not pinned with the team, whose tasks would run wherever the OS puts it.
+    explicit JobRunner(Team& team, bool caller_works = true)
+        : window_(team, GateStats{&gate_}), caller_works_(caller_works)
+    {
+        window_.start();
+    }
     ~JobRunner()
     {
         window_.close();
@@ -41,7 +47,7 @@ public:
             throw std::logic_error("CPU experts: the single-job window refused a job");
         for (;;) {
             const uint32_t seen = window_.word();
-            const WindowStep r = window_.step(0);
+            const WindowStep r = caller_works_ ? window_.step(0) : WindowStep::kIdle;
             if (r == WindowStep::kRan) continue;
             // After `seen`: a job another worker completed before it moved the word already, and would never wake us.
             if (!window_.any_active()) break;
@@ -71,6 +77,7 @@ private:
 
     StageGate* gate_ = nullptr;
     JobWindow<Kernel, 1, GateStats> window_;
+    const bool caller_works_;
     uint32_t seq_ = 0;
 };
 

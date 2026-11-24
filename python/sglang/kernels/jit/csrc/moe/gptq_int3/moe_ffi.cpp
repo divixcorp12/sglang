@@ -64,14 +64,16 @@ inline void split_codes(uint64_t w01, uint32_t w2, uint64_t& low, uint32_t& high
 struct GptqInt3MoeObj : public tvm::ffi::Object {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.GptqInt3Moe", GptqInt3MoeObj, tvm::ffi::Object);
 
-  /// cores int32 [n]: worker i on cores[i] for i >= 1; empty: unpinned. Worker 0 is the calling scheduler thread, which
-  /// keeps its own affinity: torch's intra-op threads inherit its mask, and the Team would leave it one core.
+  /// cores int32 [n]: worker i on cores[i] for i >= 1, and worker 0, the calling scheduler thread, takes no tasks; empty:
+  /// unpinned, every worker working. The caller keeps its own affinity: torch's intra-op threads inherit its mask, and
+  /// the Team would leave it one core.
   GptqInt3MoeObj(int64_t threads, const tvm::ffi::TensorView cores)
       : caller_affinity_(current_affinity()),
         cores_(core_list(cores)),
         team_(std::make_unique<ce::Team>(std::span<const int>(cores_), static_cast<int>(threads), &K::warm, 0,
                                          "int3-moe")),
-        runner_(std::make_unique<ce::JobRunner<K>>(*team_)) {
+        // A pinned team leaves its unpinned caller out of the work: its share ran wherever the OS put it.
+        runner_(std::make_unique<ce::JobRunner<K>>(*team_, cores_.empty())) {
     if (!cores_.empty() && pthread_setaffinity_np(pthread_self(), sizeof(caller_affinity_), &caller_affinity_) != 0)
       throw std::runtime_error("GPTQ INT3 MoE: cannot restore the calling thread's affinity");
   }
