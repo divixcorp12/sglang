@@ -36,8 +36,8 @@ HYBRID_FORMAT = "mimo-hybrid-gptq-v1"
 _DECLARED_POLICY = {"quant_method": "gptq", "bits": 3, "group_size": 128, "sym": True, "desc_act": False}
 # A load summary is logged after this many expert reads; arbitrary.
 _LOG_EVERY_LOADS = 2000
-# A native-call summary is logged after this many calls: 60 decode steps of MiMo V2.6 Pro's 69 MoE layers; arbitrary.
-_LOG_EVERY_CALLS = 4140
+# A native-call summary is logged after this many calls: 20 decode steps of MiMo V2.6 Pro's 69 MoE layers; arbitrary.
+_LOG_EVERY_CALLS = 1380
 # The native job refuses a call whose float scratch exceeds 512 MiB (kernel.cpp, GptqInt3CpuKernel::prepare).
 _SCRATCH_FLOATS = 512 * 1024 * 1024 // 4
 
@@ -97,7 +97,8 @@ class GptqInt3Runtime:
         self.load_seconds = 0.0
         self.forward_seconds = 0.0
         self.forward_calls = self.forward_rows = 0
-        self._window_calls, self._window_seconds = 0, 0.0
+        self._window_calls = self._window_single_calls = 0
+        self._window_single_seconds = 0.0
         logger.info(
             "GPTQ INT3 CPU experts: export %s (manifest %s), %d threads, %d loaders, %d experts per layer",
             root, manifest_sha256, threads, load_threads, experts_per_layer,
@@ -168,14 +169,18 @@ class GptqInt3Runtime:
         self.forward_calls += 1
         self.forward_rows += rows
         self._window_calls += 1
-        self._window_seconds += seconds
+        if rows == 1:
+            self._window_single_calls += 1
+            self._window_single_seconds += seconds
         if self._window_calls == _LOG_EVERY_CALLS:
             logger.info(
-                "GPTQ INT3 CPU experts: %d native calls, %d rows, %.1f s; last %d calls %.2f ms each",
-                self.forward_calls, self.forward_rows, self.forward_seconds,
-                self._window_calls, 1000 * self._window_seconds / self._window_calls,
+                "GPTQ INT3 CPU experts: %d native calls, %d rows, %.1f s; of the last %d calls, %d single-row "
+                "(decode) took %.2f ms each",
+                self.forward_calls, self.forward_rows, self.forward_seconds, self._window_calls,
+                self._window_single_calls, 1000 * self._window_single_seconds / max(1, self._window_single_calls),
             )
-            self._window_calls, self._window_seconds = 0, 0.0
+            self._window_calls = self._window_single_calls = 0
+            self._window_single_seconds = 0.0
 
 
 
