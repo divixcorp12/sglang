@@ -689,7 +689,7 @@ def test_a_batch_over_more_experts_than_slots_loads_each_expert_once(monkeypatch
         reader=SimpleNamespace(load_into=load_into),
         pool=SimpleNamespace(map=lambda fn, items: [fn(e) for e in items]),
         record_loads=lambda count, seconds: loads.append(count),
-        forward_seconds=0.0,
+        record_forward=lambda rows, seconds: None,
     )
     monkeypatch.setattr(gptq_int3_moe, "gptq_int3_runtime", lambda config: runtime)
     experts = gptq_int3_moe.GptqInt3CpuExperts(

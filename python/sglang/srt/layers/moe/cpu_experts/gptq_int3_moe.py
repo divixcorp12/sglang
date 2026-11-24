@@ -36,6 +36,8 @@ HYBRID_FORMAT = "mimo-hybrid-gptq-v1"
 _DECLARED_POLICY = {"quant_method": "gptq", "bits": 3, "group_size": 128, "sym": True, "desc_act": False}
 # A load summary is logged after this many expert reads; arbitrary.
 _LOG_EVERY_LOADS = 2000
+# A native-call summary is logged after this many calls: 60 decode steps of MiMo V2.6 Pro's 69 MoE layers; arbitrary.
+_LOG_EVERY_CALLS = 4140
 # The native job refuses a call whose float scratch exceeds 512 MiB (kernel.cpp, GptqInt3CpuKernel::prepare).
 _SCRATCH_FLOATS = 512 * 1024 * 1024 // 4
 
@@ -94,6 +96,8 @@ class GptqInt3Runtime:
         self.loads = 0
         self.load_seconds = 0.0
         self.forward_seconds = 0.0
+        self.forward_calls = self.forward_rows = 0
+        self._window_calls, self._window_seconds = 0, 0.0
         logger.info(
             "GPTQ INT3 CPU experts: export %s (manifest %s), %d threads, %d loaders, %d experts per layer",
             root, manifest_sha256, threads, load_threads, experts_per_layer,
@@ -137,6 +141,22 @@ class GptqInt3Runtime:
                 "GPTQ INT3 CPU experts: %d expert loads in %.1f s; %.1f s in native forwards",
                 self.loads, self.load_seconds, self.forward_seconds,
             )
+
+
+    def record_forward(self, rows: int, seconds: float) -> None:
+        self.forward_seconds += seconds
+        self.forward_calls += 1
+        self.forward_rows += rows
+        self._window_calls += 1
+        self._window_seconds += seconds
+        if self._window_calls == _LOG_EVERY_CALLS:
+            logger.info(
+                "GPTQ INT3 CPU experts: %d native calls, %d rows, %.1f s; last %d calls %.2f ms each",
+                self.forward_calls, self.forward_rows, self.forward_seconds,
+                self._window_calls, 1000 * self._window_seconds / self._window_calls,
+            )
+            self._window_calls, self._window_seconds = 0, 0.0
+
 
 
 _RUNTIME: Optional[GptqInt3Runtime] = None
@@ -282,7 +302,7 @@ class GptqInt3CpuExperts(nn.Module):
             weights,
             out,
         )
-        self.runtime.forward_seconds += time.perf_counter() - start
+        self.runtime.record_forward(int(x.shape[0]), time.perf_counter() - start)
 
     def _forward_grouped(
         self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, out: torch.Tensor
