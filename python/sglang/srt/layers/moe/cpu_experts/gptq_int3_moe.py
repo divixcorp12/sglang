@@ -12,6 +12,7 @@ serving: no GPU experts, graphs, prefetch or speculative draft.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +73,7 @@ class GptqInt3Runtime:
         threads: int,
         cores: list[int],
         load_threads: int,
+        verify_threads: int,
         experts_per_layer: int,
     ):
         from sglang.kernels.ops.moe.gptq_int3_moe import gptq_int3_moe_type
@@ -95,6 +97,29 @@ class GptqInt3Runtime:
         logger.info(
             "GPTQ INT3 CPU experts: export %s (manifest %s), %d threads, %d loaders, %d experts per layer",
             root, manifest_sha256, threads, load_threads, experts_per_layer,
+        )
+        if verify_threads > 0:
+            threading.Thread(
+                target=self._verify_all, args=(verify_threads,), name="int3-verify", daemon=True
+            ).start()
+
+    def _verify_all(self, threads: int) -> None:
+        """Every expert file through ``load`` once, so later misses of each take ``load_into``'s fast path."""
+        owners = [
+            (layer, expert)
+            for layer in range(1, 70)
+            for expert in range(288)
+            if f"experts/layer-{layer:02d}/expert-{expert:03d}/weights.safetensors" in self.reader.files
+        ]
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="int3-verify") as pool:
+            failures = sum(future.exception() is not None for future in [
+                pool.submit(self.reader.load, layer, expert) for layer, expert in owners
+            ])
+        # A failure is not fatal here: that file's own miss goes through load() and raises there.
+        logger.info(
+            "GPTQ INT3 CPU experts: verified %d expert files in %.0f s (%d failed)",
+            len(owners) - failures, time.perf_counter() - start, failures,
         )
 
     def record_loads(self, count: int, seconds: float) -> None:
@@ -130,6 +155,7 @@ def gptq_int3_runtime(config: Any) -> GptqInt3Runtime:
             threads=envs.SGLANG_GPTQ_INT3_THREADS.get(),
             cores=parse_cpu_list(envs.SGLANG_GPTQ_INT3_CORES.get()),
             load_threads=envs.SGLANG_GPTQ_INT3_LOAD_THREADS.get(),
+            verify_threads=envs.SGLANG_GPTQ_INT3_VERIFY_THREADS.get(),
             experts_per_layer=envs.SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER.get(),
         )
     return _RUNTIME

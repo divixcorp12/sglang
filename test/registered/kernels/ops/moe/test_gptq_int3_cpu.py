@@ -624,6 +624,7 @@ def test_model_layer_cpu_experts_on_real_export(monkeypatch):
         envs.SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER.override(8),
         envs.SGLANG_GPTQ_INT3_THREADS.override(8),
         envs.SGLANG_GPTQ_INT3_LOAD_THREADS.override(4),
+        envs.SGLANG_GPTQ_INT3_VERIFY_THREADS.override(0),
     ):
         experts = gptq_int3_moe.GptqInt3CpuExperts(
             config=config, layer_id=layer, num_experts=288, top_k=8, hidden_size=6144, intermediate_size=2048
@@ -666,9 +667,10 @@ def test_a_batch_over_more_experts_than_slots_loads_each_expert_once(monkeypatch
     h, i, num_experts, slots, k, rows = 256, 128, 40, 16, 8, 50
     loads = []
 
-    def load(layer, expert):
+    def load_into(layer, expert, planes):
         # The expert's id is written into its slot, where the stand-in kernel reads it back.
-        return {name: torch.full(shape, expert, dtype=dtype) for name, (shape, dtype) in shapes.items()}
+        for plane in planes.values():
+            plane.fill_(expert)
 
     def forward(hidden, intermediate, capacity, limit, ptrs, sizes, x, slot_ids, w, out):
         assert x.shape[0] <= experts.rows_per_group_call or x.shape[0] <= experts.rows_per_call
@@ -683,7 +685,7 @@ def test_a_batch_over_more_experts_than_slots_loads_each_expert_once(monkeypatch
         max_rows=4096,
         max_routes=8,
         native=SimpleNamespace(forward=forward),
-        reader=SimpleNamespace(load=load),
+        reader=SimpleNamespace(load_into=load_into),
         pool=SimpleNamespace(map=lambda fn, items: [fn(e) for e in items]),
         record_loads=lambda count, seconds: loads.append(count),
         forward_seconds=0.0,

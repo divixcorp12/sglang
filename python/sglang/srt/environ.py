@@ -380,6 +380,9 @@ class Envs:
     SGLANG_GPTQ_INT3_CORES = EnvStr("")
     # Threads that read, verify and adapt missing experts.
     SGLANG_GPTQ_INT3_LOAD_THREADS = EnvInt(16)
+    # Background threads that check every expert file once at startup (SHA and policy), so a decode-time miss
+    # takes the validated fast path instead of hashing. 0: files are checked on their first miss.
+    SGLANG_GPTQ_INT3_VERIFY_THREADS = EnvInt(4)
 
     # ===================================================================
     # Expert streaming engine: master switch and tiers
