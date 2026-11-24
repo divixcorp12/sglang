@@ -4,6 +4,7 @@
 #include <sgl_kernel/tensor.h>
 #include <tvm/ffi/reflection/registry.h>
 
+#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -28,6 +29,37 @@ void check_cpu(const tvm::ffi::TensorView& t, const char* name, int64_t ndim, DL
       !t.IsContiguous())
     throw std::invalid_argument(std::string("GPTQ INT3 MoE: invalid ") + name);
 }
+
+// Bits of a 3-bit code stream: `low` the positions holding a code's bits 0-1, `high` its bit 2, from stream position
+// `first` on. 32 codes take 96 bits, words w01 (positions 0-63) and w2 (64-95).
+constexpr uint64_t code_bits(int first, int count, bool high) {
+  uint64_t mask = 0;
+  for (int b = 0; b < count; ++b)
+    if (((first + b) % 3 == 2) == high) mask |= uint64_t{1} << b;
+  return mask;
+}
+
+// One column's 32 codes as the low2 word (code j's bits 0-1 at bits 2j, 2j+1) and the high1 word (its bit 2 at bit j).
+inline void split_codes(uint64_t w01, uint32_t w2, uint64_t& low, uint32_t& high) {
+#ifdef __BMI2__
+  // pext keeps the selected bits in stream order: w01 holds codes 0-20 and bit 0 of code 21 (43 low, 21 high bits).
+  low = _pext_u64(w01, code_bits(0, 64, false)) | (_pext_u64(w2, code_bits(64, 32, false)) << 43);
+  high = uint32_t(_pext_u64(w01, code_bits(0, 64, true)) | (_pext_u64(w2, code_bits(64, 32, true)) << 21));
+#else
+  low = 0;
+  high = 0;
+  for (int j = 0; j < 32; ++j) {
+    const int bit = 3 * j;
+    // Code 21 (bit 63) spans the two words.
+    const uint32_t v = bit > 63    ? (w2 >> (bit - 64)) & 7
+                       : bit == 63 ? static_cast<uint32_t>((w01 >> 63) | (uint64_t{w2} << 1)) & 7
+                                   : static_cast<uint32_t>(w01 >> bit) & 7;
+    low |= uint64_t{v & 3} << (2 * j);
+    high |= (v >> 2) << j;
+  }
+#endif
+}
+
 
 struct GptqInt3MoeObj : public tvm::ffi::Object {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.GptqInt3Moe", GptqInt3MoeObj, tvm::ffi::Object);
@@ -110,19 +142,9 @@ struct GptqInt3MoeObj : public tvm::ffi::Object {
       for (int64_t g = 0; g < k / 32; ++g) {
         const uint32_t* r0 = q + 3 * g * n;
         for (int64_t col = c0; col < c1; ++col) {
-          // 32 codes in three words; code 21 (bit 63) spans the second and third.
-          const uint64_t w01 = uint64_t{r0[col]} | (uint64_t{r0[n + col]} << 32);
-          const uint32_t w2 = r0[2 * n + col];
-          uint64_t l = 0;
-          uint32_t h = 0;
-          for (int j = 0; j < 32; ++j) {
-            const int bit = 3 * j;
-            const uint32_t v = bit > 63    ? (w2 >> (bit - 64)) & 7
-                               : bit == 63 ? static_cast<uint32_t>((w01 >> 63) | (uint64_t{w2} << 1)) & 7
-                                           : static_cast<uint32_t>(w01 >> bit) & 7;
-            l |= uint64_t{v & 3} << (2 * j);
-            h |= (v >> 2) << j;
-          }
+          uint64_t l;
+          uint32_t h;
+          split_codes(uint64_t{r0[col]} | (uint64_t{r0[n + col]} << 32), r0[2 * n + col], l, h);
           // Little-endian: low byte b holds codes 4b..4b+3, high byte b codes 8b..8b+7, lowest bits first.
           std::memcpy(lo + col * (k / 4) + g * 8, &l, 8);
           std::memcpy(hi + col * (k / 8) + g * 4, &h, 4);

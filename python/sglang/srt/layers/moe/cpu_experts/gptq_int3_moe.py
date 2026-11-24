@@ -171,12 +171,13 @@ class GptqInt3LayerCache:
         if not missing:
             return
         start = time.perf_counter()
-        rows = self.runtime.pool.map(lambda e: self.runtime.reader.load(self.layer_id, e), missing)
-        for e, row in zip(missing, rows):
-            slot = self.slot_of[e]
-            for name in SLAB_NAMES:
-                self.slabs[name][slot].copy_(row[name])
+        # list() waits for every load and re-raises the first failure.
+        list(self.runtime.pool.map(self._load, missing))
         self.runtime.record_loads(len(missing), time.perf_counter() - start)
+
+    def _load(self, expert: int) -> None:
+        slot = self.slot_of[expert]
+        self.runtime.reader.load_into(self.layer_id, expert, {name: self.slabs[name][slot] for name in SLAB_NAMES})
 
     def _assign(self, expert: int, needed: set[int]) -> None:
         if self.free:

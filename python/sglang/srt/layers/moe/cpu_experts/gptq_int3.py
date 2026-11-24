@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import struct
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -152,6 +155,48 @@ def prepare_expert(
     )
 
 
+_SAFETENSORS_DTYPES = {"I32": torch.int32, "F16": torch.float16}
+
+
+def _safetensors_views(buffer: bytearray, size: int) -> dict[str, torch.Tensor]:
+    """A safetensors payload in ``buffer[:size]`` as tensors viewing the buffer, nothing copied."""
+    (header_size,) = struct.unpack_from("<Q", buffer, 0)
+    base = 8 + header_size
+    if base > size:
+        raise ValueError("safetensors header exceeds the payload")
+    header = json.loads(bytes(buffer[8:base]))
+    header.pop("__metadata__", None)
+    views = {}
+    for name, info in header.items():
+        dtype = _SAFETENSORS_DTYPES[info["dtype"]]
+        begin, end = info["data_offsets"]
+        count = math.prod(info["shape"])
+        if end - begin != count * dtype.itemsize or not 0 <= begin <= end <= size - base:
+            raise ValueError(f"safetensors entry {name} does not fit its payload")
+        views[name] = torch.frombuffer(buffer, dtype=dtype, count=count, offset=base + begin).view(info["shape"])
+    return views
+
+
+
+def _repack_into(
+    repack: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None],
+    layer: int,
+    expert: int,
+    tensors: Mapping[str, torch.Tensor],
+    planes: Mapping[str, torch.Tensor],
+) -> None:
+    """``prepare_expert``'s six planes of one expert's checked tensors, repacked and transposed into ``planes``."""
+    prefix = f"model.layers.{layer}.mlp.experts.{expert}."
+    intermediate = planes["w13_low2"].shape[0] // 2
+    for index, name in enumerate(("gate_proj", "up_proj")):
+        rows = slice(index * intermediate, (index + 1) * intermediate)
+        repack(tensors[prefix + name + ".qweight"], planes["w13_low2"][rows], planes["w13_high1"][rows])
+        planes["w13_scales"][rows].copy_(tensors[prefix + name + ".scales"].t())
+    repack(tensors[prefix + "down_proj.qweight"], planes["w2_low2"], planes["w2_high1"])
+    planes["w2_scales"].copy_(tensors[prefix + "down_proj.scales"].t())
+
+
+
 class ExportedExperts:
     """A sealed export's expert reader whose manifest is verified once, at construction.
 
@@ -186,6 +231,10 @@ class ExportedExperts:
         self.files: dict = manifest["files"]
         # Payloads whose SHA matched, by the identity of the file that was hashed (``_read_identified``).
         self._verified: dict[str, tuple[int, int, int, int]] = {}
+        # Payloads that also passed every policy and shape check of ``load``, by file identity (``load_into``).
+        self._validated: dict[str, tuple[int, int, int, int]] = {}
+        # Each loader thread's reusable read buffer.
+        self._buffers = threading.local()
 
     def _read(self, relative: str) -> bytes:
         path = (self.root / relative).resolve()
@@ -230,7 +279,7 @@ class ExportedExperts:
         fields = ("qweight", "qzeros", "scales", "g_idx")
         if set(tensors) != {prefix + n + "." + f for n in names for f in fields}:
             raise ValueError("expert tensor ownership/key mismatch")
-        return prepare_expert(
+        row = prepare_expert(
             *(
                 prepare_projection(
                     {f: tensors[prefix + n + "." + f] for f in fields}, repack=self.repack
@@ -238,6 +287,57 @@ class ExportedExperts:
                 for n in names
             )
         )
+        self._validated[relative] = identity
+        return row
+
+    def load_into(self, layer: int, expert: int, planes: Mapping[str, torch.Tensor]) -> None:
+        """Writes ``load(layer, expert)``'s six planes into ``planes``, one cache slot's views of the six slabs.
+
+        A payload's first read goes through ``load`` and all of its checks. A later read of the same file (same
+        identity, so the same bytes) reads into this thread's reused buffer and repacks straight into ``planes``,
+        without the SHA, the policy checks or intermediate tensors: the bytes are ``load``'s.
+        """
+        relative = f"experts/layer-{layer:02d}/expert-{expert:03d}/weights.safetensors"
+        validated = self._validated.get(relative)
+        repack = self.repack
+        if repack is not None and validated is not None:
+            size = self.files[relative]["bytes"]
+            buffer = self._buffer(size)
+            if self._read_identified_into(relative, buffer, size) == validated:
+                _repack_into(repack, layer, expert, _safetensors_views(buffer, size), planes)
+                return
+        row = self.load(layer, expert)
+        for name in SLAB_NAMES:
+            planes[name].copy_(row[name])
+
+    def _buffer(self, size: int) -> bytearray:
+        buffer = getattr(self._buffers, "data", None)
+        if buffer is None or len(buffer) < size:
+            buffer = self._buffers.data = bytearray(size)
+        return buffer
+
+    def _read_identified_into(
+        self, relative: str, buffer: bytearray, size: int
+    ) -> Optional[tuple[int, int, int, int]]:
+        """``_read_identified`` into ``buffer[:size]``; None when the file is not exactly ``size`` bytes."""
+        path = (self.root / relative).resolve()
+        if self.root not in path.parents:
+            raise ValueError("export path escapes root")
+        with open(path, "rb", buffering=0) as f:
+            st = os.fstat(f.fileno())
+            view = memoryview(buffer)[:size]
+            read = 0
+            while read < size:
+                count = f.readinto(view[read:])
+                if not count:
+                    return None
+                read += count
+            if st.st_size != size:
+                return None
+            return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+    
+
 
 
 def load_exported_expert(

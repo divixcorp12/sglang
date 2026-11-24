@@ -339,6 +339,53 @@ def test_export_reader_binds_manifest_payload_and_owner(tmp_path, bad):
             )
 
 
+def test_slot_load_fast_path_writes_load_bytes_and_still_refuses_a_swapped_file(tmp_path):
+    """A validated file's reload repacks straight into a cache slot, skipping the SHA and checks: it must write
+    exactly load()'s planes, and a same-size file swapped in afterwards must still be hashed and refused."""
+    if not NATIVE:
+        pytest.skip("requires x86-64 Linux and a C++20 compiler")
+    from safetensors.torch import save
+
+    from sglang.kernels.ops.moe.gptq_int3_moe import gptq_int3_moe_type
+
+    canonical, _, _, _, _, _ = fixture()
+    prefix = "model.layers.1.mlp.experts.0."
+    raw = save(
+        {
+            prefix + n + "." + f: t
+            for n, p in zip(("gate_proj", "up_proj", "down_proj"), canonical)
+            for f, t in p.items()
+        }
+    )
+    relative = "experts/layer-01/expert-000/weights.safetensors"
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(raw)
+    manifest = {
+        "status": "completed",
+        "format": "mimo-hybrid-gptq-v1",
+        "expert_policy": {"quant_method": "gptq", "bits": 3, "group_size": 128, "sym": True, "desc_act": False},
+        "files": {relative: {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}},
+    }
+    encoded = json.dumps(manifest).encode()
+    (tmp_path / "export-manifest.json").write_bytes(encoded)
+    native = gptq_int3_moe_type()(1, torch.empty(0, dtype=torch.int32))
+    reader = ExportedExperts(
+        tmp_path, expected_manifest_sha256=hashlib.sha256(encoded).hexdigest(), repack=native.adapt
+    )
+    reference = prepare_expert(*(prepare_projection(p) for p in canonical))
+    for _ in range(2):  # The first read takes load(), the second the validated fast path.
+        planes = {name: torch.full_like(reference[name], 0x55) for name in SLAB_NAMES}
+        reader.load_into(1, 0, planes)
+        for name in SLAB_NAMES:
+            assert torch.equal(planes[name].view(torch.uint8), reference[name].view(torch.uint8)), name
+    swapped = target.with_suffix(".new")
+    swapped.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+    os.replace(swapped, target)
+    with pytest.raises(ValueError):
+        reader.load_into(1, 0, {name: torch.empty_like(reference[name]) for name in SLAB_NAMES})
+
+
 def test_half_and_bestla_bits(native):
     half = np.empty(65536, dtype=np.uint16)
     native.half_roundtrip(half.ctypes.data)
