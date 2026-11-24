@@ -397,6 +397,27 @@ def test_real_kernel_route_order_modes_and_job_window(native, mode, limit):
     )
 
 
+def test_routes_of_one_expert_share_decodes_without_changing_any_bit(native):
+    """A call batches each expert's routes (runs of up to 32 across rows) over one weight decode; every row must be
+    bitwise what it is alone, so a prefill and a decode of the same token agree."""
+    _, decoded, slab, _, _, _ = fixture()
+    g = torch.Generator().manual_seed(5)
+    rows = 70
+    x = (torch.randn((rows, 256), generator=g) * 0.1).half()
+    slots = torch.randint(-1, 2, (rows, 3), generator=g, dtype=torch.int32)
+    weights = torch.rand((rows, 3), generator=g)
+    batch = torch.zeros((rows, 256))
+    status, error = invoke(native, slab, x, slots, weights, batch)
+    assert status == 0, error
+    alone = torch.zeros_like(batch)
+    for t in range(rows):
+        status, error = invoke(native, slab, x[t : t + 1], slots[t : t + 1].contiguous(), weights[t : t + 1], alone[t : t + 1])
+        assert status == 0, error
+    assert torch.equal(batch, alone)
+    torch.testing.assert_close(batch, reference(decoded, x, slots, weights), atol=2e-6, rtol=0.003)
+
+
+
 @pytest.mark.parametrize(
     "bad",
     ["x", "scale", "down", "gate_overflow", "slot", "weight", "accumulate", "mode"],
@@ -523,8 +544,9 @@ def test_actual_exported_expert(native, owner):
 def test_model_layer_cpu_experts_on_real_export(monkeypatch):
     """The model's MoE stand-in (verified reader, LRU slots, JIT FFI Team) against the independent decoder.
 
-    Eight slots serve four rows of eight distinct real experts each, so every call evicts the previous row's experts;
-    a slot mix-up, a stale lookup or a skipped padding route changes the sum.
+    Eight slots serve four rows of eight distinct real experts each: the batch runs as four expert groups and each row
+    alone as one call evicting the previous row's experts; a slot mix-up, a stale lookup, a lost partial sum or a
+    skipped padding route changes the sum.
     """
     path = os.environ.get("GPTQ_INT3_REAL_ROOT")
     if not path or not NATIVE:
@@ -581,7 +603,72 @@ def test_model_layer_cpu_experts_on_real_export(monkeypatch):
             expected[t] += one[0]
     rel = torch.linalg.vector_norm(first - expected) / torch.linalg.vector_norm(expected)
     assert rel < 0.002, float(rel)
+    rows = torch.cat([experts(x[t : t + 1], SimpleNamespace(topk_ids=ids[t : t + 1], topk_weights=weights[t : t + 1]))
+                      for t in range(4)])
+    torch.testing.assert_close(rows, first, rtol=1e-5, atol=1e-6)
     print(json.dumps(dict(model_layer=layer, relative_l2=float(rel), loads=experts.runtime.loads)))
+
+
+def test_a_batch_over_more_experts_than_slots_loads_each_expert_once(monkeypatch):
+    """A prefill-sized batch routing to more experts than the layer's slots: every needed expert is read once per batch,
+    not once per row chunk, and the output is the routed sum, bitwise the same whatever an earlier batch left resident."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.cpu_experts import gptq_int3_moe
+
+    h, i, num_experts, slots, k, rows = 256, 128, 40, 16, 8, 50
+    loads = []
+
+    def load(layer, expert):
+        # The expert's id is written into its slot, where the stand-in kernel reads it back.
+        return {name: torch.full(shape, expert, dtype=dtype) for name, (shape, dtype) in shapes.items()}
+
+    def forward(hidden, intermediate, capacity, limit, ptrs, sizes, x, slot_ids, w, out):
+        assert x.shape[0] <= experts.rows_per_group_call or x.shape[0] <= experts.rows_per_call
+        tag = experts.cache.slabs[SLAB_NAMES[0]][:, 0, 0].to(torch.float32)
+        valid = slot_ids >= 0
+        scale = torch.where(valid, w * (tag[slot_ids.clamp(min=0).long()] + 1), torch.zeros_like(w))
+        out.copy_(scale.sum(1, keepdim=True) * x.float())
+
+    shapes = gptq_int3_moe._slab_shapes(h, i)
+    runtime = SimpleNamespace(
+        experts_per_layer=slots,
+        max_rows=4096,
+        max_routes=8,
+        native=SimpleNamespace(forward=forward),
+        reader=SimpleNamespace(load=load),
+        pool=SimpleNamespace(map=lambda fn, items: [fn(e) for e in items]),
+        record_loads=lambda count, seconds: loads.append(count),
+        forward_seconds=0.0,
+    )
+    monkeypatch.setattr(gptq_int3_moe, "gptq_int3_runtime", lambda config: runtime)
+    experts = gptq_int3_moe.GptqInt3CpuExperts(
+        config=None, layer_id=1, num_experts=num_experts, top_k=k, hidden_size=h, intermediate_size=i
+    )
+    assert experts.rows_per_call == slots // k
+    experts.rows_per_group_call = 7  # several calls per group
+
+    g = torch.Generator().manual_seed(11)
+    ids = torch.stack([torch.randperm(num_experts, generator=g)[:k] for _ in range(rows)])
+    ids[3, 2] = -1
+    ids[9] = -1  # a padding row
+    weights = torch.rand((rows, k), generator=g)
+    x = torch.randn((rows, h), generator=g).half().float()
+    topk = SimpleNamespace(topk_ids=ids, topk_weights=weights)
+    expected = (torch.where(ids >= 0, weights * (ids + 1), torch.zeros_like(weights)).sum(1, keepdim=True)) * x
+    needed = ids[ids >= 0].unique().numel()
+
+    first = experts(x, topk)
+    assert sum(loads) == needed
+    torch.testing.assert_close(first, expected)
+    loads.clear()
+    second = experts(x, topk)
+    assert sum(loads) < needed  # what the first batch left resident is reused
+    assert torch.equal(second, first)  # whatever was resident
+    # A call within one native call keeps the row path.
+    small = SimpleNamespace(topk_ids=ids[:2], topk_weights=weights[:2])
+    torch.testing.assert_close(experts(x[:2], small), expected[:2])
+
 
 
 def test_native_sanitizers(tmp_path):
