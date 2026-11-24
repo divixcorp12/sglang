@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import torch
+
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 _FFI, _KERNEL = "moe/gptq_int3/moe_ffi.cpp", "moe/gptq_int3/kernel.cpp"
@@ -11,7 +13,7 @@ _FLAGS = ("-std=c++20", "-O3", "-ffp-contract=off", "-pthread")
 
 @cache_once
 def gptq_int3_moe_type():
-    """The FFI class ``GptqInt3Moe(threads)``: ``forward(hidden, intermediate, capacity, act_limit, slab_ptrs,
+    """The FFI class ``GptqInt3Moe(threads, cores)``, cores int32 (empty: unpinned): ``forward(hidden, intermediate, capacity, act_limit, slab_ptrs,
     slab_bytes, x, slots, weights, out)`` runs one job on its Team; ``max_rows()`` / ``max_routes()`` bound a call."""
     import tvm_ffi
 
@@ -27,7 +29,7 @@ def gptq_int3_moe_type():
     class GptqInt3MoeFFI(tvm_ffi.Object):
         __slots__ = ("__dict__",)
 
-        def __init__(self, threads: int) -> None:
-            self.__ffi_init__(threads)
+        def __init__(self, threads: int, cores: torch.Tensor) -> None:
+            self.__ffi_init__(threads, cores)
 
     return GptqInt3MoeFFI

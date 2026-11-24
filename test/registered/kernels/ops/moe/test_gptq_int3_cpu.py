@@ -204,7 +204,7 @@ def test_native_repack_equals_reference_adapter():
         pytest.skip("requires x86-64 Linux and a C++20 compiler")
     from sglang.kernels.ops.moe.gptq_int3_moe import gptq_int3_moe_type
 
-    native = gptq_int3_moe_type()(1)
+    native = gptq_int3_moe_type()(1, torch.empty(0, dtype=torch.int32))
     for n, k, seed in ((256, 384, 11), (384, 1024, 12)):
         t, _ = projection(n, k, seed)
         reference = prepare_projection(t)

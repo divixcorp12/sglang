@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include "../expert_stream/host/cpu_experts/single_job.hpp"
 #include "entry.h"
@@ -28,9 +29,12 @@ void check_cpu(const tvm::ffi::TensorView& t, const char* name, int64_t ndim, DL
 struct GptqInt3MoeObj : public tvm::ffi::Object {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.GptqInt3Moe", GptqInt3MoeObj, tvm::ffi::Object);
 
-  // Unpinned: a Team given cores pins its caller, which is the scheduler thread here.
-  explicit GptqInt3MoeObj(int64_t threads)
-      : team_(std::make_unique<ce::Team>(std::span<const int>{}, static_cast<int>(threads), &K::warm, 0, "int3-moe")),
+  /// cores int32 [n]: worker i on cores[i], and worker 0 is the calling (scheduler) thread, so it is pinned too; empty:
+  /// unpinned.
+  GptqInt3MoeObj(int64_t threads, const tvm::ffi::TensorView cores)
+      : cores_(core_list(cores)),
+        team_(std::make_unique<ce::Team>(std::span<const int>(cores_), static_cast<int>(threads), &K::warm, 0,
+                                         "int3-moe")),
         runner_(std::make_unique<ce::JobRunner<K>>(*team_)) {}
 
   ~GptqInt3MoeObj() {
@@ -124,6 +128,14 @@ struct GptqInt3MoeObj : public tvm::ffi::Object {
   int64_t max_routes() const { return K::max_routes(); }
 
  private:
+  static std::vector<int> core_list(const tvm::ffi::TensorView& cores) {
+    check_cpu(cores, "cores", 1, kDLInt, 32);
+    const auto* data = static_cast<const int32_t*>(cores.data_ptr());
+    return std::vector<int>(data, data + cores.size(0));
+  }
+
+  // The Team keeps a span over it: declared, so constructed, before team_.
+  std::vector<int> cores_;
   std::unique_ptr<ce::Team> team_;
   std::unique_ptr<ce::JobRunner<K>> runner_;
 };
@@ -131,7 +143,7 @@ struct GptqInt3MoeObj : public tvm::ffi::Object {
 void register_gptq_int3_moe() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<GptqInt3MoeObj>()
-      .def(refl::init<int64_t>(), "__init__")
+      .def(refl::init<int64_t, tvm::ffi::TensorView>(), "__init__")
       .def("forward", &GptqInt3MoeObj::forward)
       .def("adapt", &GptqInt3MoeObj::adapt)
       .def("max_rows", &GptqInt3MoeObj::max_rows)

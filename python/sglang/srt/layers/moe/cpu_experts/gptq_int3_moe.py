@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.cpu_experts.gptq_int3 import (
     ExportedExperts,
     GptqInt3CpuTrait,
 )
+from sglang.srt.layers.moe.cpu_experts.threading_config import parse_cpu_list
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +65,23 @@ class GptqInt3Runtime:
     """Process-wide state: the verified export reader, the native Team and the loader pool."""
 
     def __init__(
-        self, *, root: str, manifest_sha256: str, threads: int, load_threads: int, experts_per_layer: int
+        self,
+        *,
+        root: str,
+        manifest_sha256: str,
+        threads: int,
+        cores: list[int],
+        load_threads: int,
+        experts_per_layer: int,
     ):
         from sglang.kernels.ops.moe.gptq_int3_moe import gptq_int3_moe_type
 
         GptqInt3CpuTrait().check_environment()
         if experts_per_layer < 8:
             raise ValueError("SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER must hold at least one token's 8 routes")
-        self.native = gptq_int3_moe_type()(threads)
+        if cores and len(cores) < threads:
+            raise ValueError(f"SGLANG_GPTQ_INT3_CORES names {len(cores)} cores for {threads} threads")
+        self.native = gptq_int3_moe_type()(threads, torch.tensor(cores[:threads], dtype=torch.int32, device="cpu"))
         self.reader = ExportedExperts(
             root, expected_manifest_sha256=manifest_sha256, repack=self.native.adapt
         )
@@ -118,6 +128,7 @@ def gptq_int3_runtime(config: Any) -> GptqInt3Runtime:
             root=config.name_or_path,
             manifest_sha256=sha,
             threads=envs.SGLANG_GPTQ_INT3_THREADS.get(),
+            cores=parse_cpu_list(envs.SGLANG_GPTQ_INT3_CORES.get()),
             load_threads=envs.SGLANG_GPTQ_INT3_LOAD_THREADS.get(),
             experts_per_layer=envs.SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER.get(),
         )

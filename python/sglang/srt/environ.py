@@ -373,8 +373,11 @@ class Envs:
     SGLANG_GPTQ_INT3_MANIFEST_SHA256 = EnvStr(None)
     # Adapted experts kept in host memory per MoE layer (about 14.7 MB each for MiMo V2.6 Pro).
     SGLANG_GPTQ_INT3_EXPERTS_PER_LAYER = EnvInt(64)
-    # CPU expert worker threads, including the calling thread (unpinned).
+    # CPU expert worker threads, including the calling thread.
     SGLANG_GPTQ_INT3_THREADS = EnvInt(16)
+    # Cores for those workers in order, as a cpulist ("1-27,28-51"); the first is the calling scheduler thread's.
+    # Empty: unpinned. It must name at least SGLANG_GPTQ_INT3_THREADS cores.
+    SGLANG_GPTQ_INT3_CORES = EnvStr("")
     # Threads that read, verify and adapt missing experts.
     SGLANG_GPTQ_INT3_LOAD_THREADS = EnvInt(16)
 
