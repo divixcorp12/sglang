@@ -113,14 +113,20 @@ class GptqInt3Runtime:
         ]
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="int3-verify") as pool:
+            # _verify_one returns nothing: a future that held load()'s planes would keep every expert (~300 GB).
             failures = sum(future.exception() is not None for future in [
-                pool.submit(self.reader.load, layer, expert) for layer, expert in owners
+                pool.submit(self._verify_one, layer, expert) for layer, expert in owners
             ])
         # A failure is not fatal here: that file's own miss goes through load() and raises there.
         logger.info(
             "GPTQ INT3 CPU experts: verified %d expert files in %.0f s (%d failed)",
             len(owners) - failures, time.perf_counter() - start, failures,
         )
+
+
+    def _verify_one(self, layer: int, expert: int) -> None:
+        self.reader.load(layer, expert)
+
 
     def record_loads(self, count: int, seconds: float) -> None:
         before = self.loads // _LOG_EVERY_LOADS
